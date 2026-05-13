@@ -678,17 +678,11 @@ impl App {
                     // the view so PTY capture takes over naturally.
                     self.focus = PaneFocus::View;
                 }
-                // Most shells (bash) don't repaint on SIGWINCH alone — they
-                // wait for the next readline operation. Send `Ctrl-L` so
-                // the prompt redraws against the new geometry immediately.
-                // Harmless for vim/claude/htop (they treat C-l as redraw).
-                let nudge_target = self
-                    .selected_session()
-                    .filter(|s| s.has_pty && !s.state.is_terminal())
-                    .map(|s| s.id.clone());
-                if let Some(id) = nudge_target {
-                    let _ = self.client.pty_input(&id, vec![0x0C]).await;
-                }
+                // The parser is re-sized in render and `pty_resize` propagates
+                // SIGWINCH to the child. We intentionally do NOT send Ctrl-L
+                // here — that would clear the screen in bash, wiping the
+                // user's scrollback. Existing output stays put; new output
+                // continues at the cursor's current row.
                 self.set_status(
                     if self.zoomed {
                         "zoomed — C-x z to unzoom"
