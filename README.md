@@ -111,7 +111,7 @@ default — `C-x` is the escape prefix back to agentd commands.
 | `C-x d` | show diff |
 | `C-x r` | refresh |
 | `C-c C-c` | interrupt |
-| `M-x` | command palette |
+| `M-x` / `C-x x` | command palette (the `C-x x` alias is Meta-free, useful on macOS Terminal.app without "Use Option as Meta") |
 | `C-v` / `M-v` | scroll page down / up |
 | `g g` / `G` | scroll top / bottom |
 | `?` | toggle help |

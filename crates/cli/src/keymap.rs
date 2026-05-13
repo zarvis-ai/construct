@@ -166,8 +166,11 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('r')]), Refresh),
         // Interrupt the running adapter (emacs comint convention)
         (Chord(vec![ctrl('c'), ctrl('c')]), Interrupt),
-        // Command palette
+        // Command palette — `M-x` is the canonical emacs binding; `C-x x` is
+        // a Meta-free alias so it works on macOS Terminal.app without setting
+        // "Use Option as Meta key".
         (Chord(vec![alt('x')]), OpenCommandPalette),
+        (Chord(vec![ctrl('x'), ch('x')]), OpenCommandPalette),
         // Scroll
         (Chord(vec![ctrl('v')]), ScrollPageDown),
         (Chord(vec![alt('v')]), ScrollPageUp),

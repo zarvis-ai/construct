@@ -225,9 +225,9 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &App) {
             && app.view == ViewMode::Terminal
             && app.selected_session().map(|s| s.has_pty).unwrap_or(false)
         {
-            "C-x o focus list   C-x t transcript   C-x ? help".to_string()
+            "C-x o focus list   C-x x palette   C-x t transcript   ? help".to_string()
         } else {
-            "? for help   M-x for commands   C-x o other-window".to_string()
+            "? for help   M-x or C-x x for commands   C-x o other-window".to_string()
         };
         let para = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
         f.render_widget(para, area);
@@ -277,7 +277,7 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
     g g / G         scroll top / bottom
 
   global
-    M-x             command palette
+    M-x / C-x x     command palette (C-x x is Meta-free)
     ?               toggle this help
     C-x C-c / q     quit
 
