@@ -60,7 +60,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let inner_rows = detail_area.height.saturating_sub(2);
     app.terminal_pane_size = (inner_cols, inner_rows);
     for parser in app.terminals.values_mut() {
-        parser.set_size(inner_rows.max(1), inner_cols.max(1));
+        parser
+            .screen_mut()
+            .set_size(inner_rows.max(1), inner_cols.max(1));
     }
     apply_focused_scrollback(app);
 
@@ -82,20 +84,12 @@ fn pin_strip_height(total_h: u16) -> u16 {
 
 /// Apply the user's scrollback offset to the currently-focused session's
 /// vt100 parser so the rendered view shows older content when the user
-/// has scrolled up with the mouse wheel.
-///
-/// Clamps `view_scrollback` to the parser's current row count first —
-/// vt100 0.15.2 will otherwise underflow in `visible_rows()` when the
-/// offset exceeds the visible pane height.
+/// has scrolled up with the mouse wheel. vt100 0.16+ clamps internally,
+/// so we just hand it whatever the user dialed in.
 fn apply_focused_scrollback(app: &mut App) {
     let Some(id) = app.selected_id() else { return; };
     let Some(parser) = app.terminals.get_mut(&id) else { return; };
-    let (rows, _) = parser.screen().size();
-    let max_offset = rows as usize;
-    if app.view_scrollback > max_offset {
-        app.view_scrollback = max_offset;
-    }
-    parser.set_scrollback(app.view_scrollback);
+    parser.screen_mut().set_scrollback(app.view_scrollback);
 }
 
 /// Zoom layout: the session view takes the entire screen except for the
@@ -115,7 +109,9 @@ fn render_zoomed(f: &mut Frame, area: Rect, app: &mut App) {
     // Match the parsers to the zoomed area before drawing (see comment in
     // the normal-layout branch).
     for parser in app.terminals.values_mut() {
-        parser.set_size(main_area.height.max(1), main_area.width.max(1));
+        parser
+            .screen_mut()
+            .set_size(main_area.height.max(1), main_area.width.max(1));
     }
     apply_focused_scrollback(app);
 
