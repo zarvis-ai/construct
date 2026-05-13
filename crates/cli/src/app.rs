@@ -482,12 +482,17 @@ impl App {
     /// Adjust the focused session's scrollback offset. Positive `delta` =
     /// scroll up (older); negative = scroll down (newer). No-op unless the
     /// view is on a PTY-backed session in terminal mode.
+    ///
+    /// Important: vt100 0.15.2 panics on `visible_rows()` if the offset
+    /// exceeds the visible pane row count (the rows_len-offset subtraction
+    /// underflows). We clamp here AND in render to keep that safe.
     fn adjust_scrollback(&mut self, delta: i32) {
         if self.view != ViewMode::Terminal || !self.in_pty_session() {
             return;
         }
+        let max_safe = (self.terminal_pane_size.1 as i32).max(0);
         let cur = self.view_scrollback as i32;
-        let next = (cur + delta).max(0).min(SCROLLBACK_MAX as i32);
+        let next = (cur + delta).max(0).min(max_safe).min(SCROLLBACK_MAX as i32);
         self.view_scrollback = next as usize;
     }
 
