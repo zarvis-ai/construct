@@ -31,6 +31,8 @@ pub mod ahp_method {
     pub const INITIALIZE: &str = "initialize";
     pub const SESSION_START: &str = "session.start";
     pub const SESSION_INPUT: &str = "session.input";
+    pub const SESSION_PTY_INPUT: &str = "session.pty_input";
+    pub const SESSION_PTY_RESIZE: &str = "session.pty_resize";
     pub const SESSION_INTERRUPT: &str = "session.interrupt";
     pub const SESSION_STOP: &str = "session.stop";
     pub const SHUTDOWN: &str = "shutdown";
@@ -76,6 +78,10 @@ pub struct Capabilities {
     pub supports_diff: bool,
     #[serde(default)]
     pub supports_cost: bool,
+    /// Adapter owns a PTY for this session: emits [`SessionEvent::Pty`]
+    /// events and accepts `session.pty_input` / `session.pty_resize`.
+    #[serde(default)]
+    pub supports_pty: bool,
     #[serde(default)]
     pub models: Vec<String>,
 }
@@ -88,10 +94,52 @@ pub struct SessionStartParams {
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Adapter-defined session mode (e.g. `"interactive"` / `"headless"`).
+    /// Each adapter chooses its own default if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Initial PTY size — set by the client when starting in PTY mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty_size: Option<PtySize>,
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PtySize {
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPtyInputParams {
+    pub session_id: String,
+    /// Base64-encoded raw bytes to write to the child's PTY.
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPtyResizeParams {
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl SessionPtyInputParams {
+    pub fn decode(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.decode(&self.data)
+    }
+
+    pub fn from_bytes(session_id: impl Into<String>, bytes: &[u8]) -> Self {
+        use base64::Engine;
+        Self {
+            session_id: session_id.into(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,6 +210,32 @@ pub enum SessionEvent {
         #[serde(default)]
         exit_code: i32,
     },
+    /// Raw byte chunk from the session's PTY. `data` is base64-encoded so the
+    /// JSON transport doesn't have to deal with arbitrary byte sequences.
+    Pty {
+        data: String,
+    },
+}
+
+impl SessionEvent {
+    /// Build a [`SessionEvent::Pty`] from raw bytes.
+    pub fn pty(bytes: &[u8]) -> Self {
+        use base64::Engine;
+        SessionEvent::Pty {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    /// Decode a [`SessionEvent::Pty`] payload back to raw bytes.
+    pub fn pty_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            SessionEvent::Pty { data } => {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.decode(data).ok()
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +297,9 @@ pub mod ipc_method {
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_GET: &str = "session.get";
     pub const SESSION_INPUT: &str = "session.input";
+    pub const SESSION_PTY_INPUT: &str = "session.pty_input";
+    pub const SESSION_PTY_RESIZE: &str = "session.pty_resize";
+    pub const SESSION_PTY_REPLAY: &str = "session.pty_replay";
     pub const SESSION_INTERRUPT: &str = "session.interrupt";
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_KILL: &str = "session.kill";
@@ -272,6 +349,24 @@ pub struct SessionSummary {
     pub last_prompt: Option<String>,
     #[serde(default)]
     pub event_count: u64,
+    /// True if the session's adapter owns a PTY (clients should default the
+    /// view to terminal mode).
+    #[serde(default)]
+    pub has_pty: bool,
+    /// The session's mode, as reported when it was started (e.g. "interactive"
+    /// or "headless"). Adapter-defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyReplayResult {
+    /// Base64-encoded raw bytes representing the recent PTY history (best
+    /// effort — the daemon keeps a bounded ring buffer).
+    pub data: String,
+    /// Most recent known PTY size for the session, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<PtySize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +392,13 @@ pub struct CreateSessionParams {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Adapter-defined mode. Conventional values: `"interactive"` (PTY) or
+    /// `"headless"` (structured stream). Adapters pick their own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Initial PTY size if the adapter is going to allocate a PTY.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty_size: Option<PtySize>,
     #[serde(default)]
     pub worktree: bool,
     #[serde(default)]

@@ -4,7 +4,7 @@ use crate::client::Client;
 use crate::keymap::{self, ChordState, KeyAction, Keymap, KeymapResult, Profile};
 use crate::ui;
 use agentd_protocol::{
-    EventNotificationPayload, HarnessInfo, SessionSummary, StateNotificationPayload,
+    EventNotificationPayload, HarnessInfo, SessionEvent, SessionSummary, StateNotificationPayload,
     TimestampedEvent,
 };
 use anyhow::{Context, Result};
@@ -23,6 +23,15 @@ use std::time::{Duration, Instant};
 pub enum Focus {
     List,
     Transcript,
+}
+
+/// What the right pane is currently showing for the selected session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// Structured transcript renderer (default for headless / non-PTY sessions).
+    Transcript,
+    /// Live PTY emulator (default for sessions whose adapter has supports_pty).
+    Terminal,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +70,13 @@ pub struct App {
     pub last_diff: Option<String>,
     pub should_quit: bool,
     pub connected: bool,
+    // Terminal-pane state.
+    pub view: ViewMode,
+    pub terminals: HashMap<String, vt100::Parser>,
+    pub terminal_pane_size: (u16, u16), // (cols, rows) of the right pane.
+    /// True after `C-b` in terminal mode: next key is treated as an agentd
+    /// command instead of a PTY keystroke.
+    pub pending_escape: bool,
 }
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
@@ -90,7 +106,15 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         last_diff: None,
         should_quit: false,
         connected: true,
+        view: ViewMode::Transcript,
+        terminals: HashMap::new(),
+        terminal_pane_size: (100, 30),
+        pending_escape: false,
     };
+    // Default to Terminal view when the currently-selected session has a PTY.
+    if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
+        app.view = ViewMode::Terminal;
+    }
 
     // Subscribe to all session events.
     if let Err(e) = client.subscribe(None).await {
@@ -127,8 +151,16 @@ async fn run_loop(
         .context("notifications channel already taken")?;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
 
+    let mut last_size_sent: (u16, u16) = (0, 0);
     while !app.should_quit {
         terminal.draw(|f| ui::render(f, app))?;
+        // If the right pane changed size, push pty_resize for the current
+        // PTY session (if any). Skip the very first frame (0,0).
+        let cur = app.terminal_pane_size;
+        if cur != last_size_sent && cur.0 > 0 && cur.1 > 0 {
+            app.notify_pane_size(cur.0, cur.1).await;
+            last_size_sent = cur;
+        }
         tokio::select! {
             ev = input_stream.next() => {
                 match ev {
@@ -186,13 +218,45 @@ impl App {
         match self.client.transcript(&id, 0, None).await {
             Ok(t) => {
                 self.transcript = t.events;
-                self.transcript_session = Some(id);
+                self.transcript_session = Some(id.clone());
                 self.transcript_scroll = u16::MAX; // sentinel = bottom
             }
             Err(e) => {
                 self.set_status(format!("load transcript: {e}"));
             }
         }
+        // If this session has a PTY, prefer the live terminal view and
+        // bootstrap the local emulator from the daemon's replay snapshot.
+        if self.in_pty_session() {
+            self.view = ViewMode::Terminal;
+            self.bootstrap_terminal(&id).await;
+        } else {
+            self.view = ViewMode::Transcript;
+        }
+    }
+
+    async fn bootstrap_terminal(&mut self, id: &str) {
+        if self.terminals.contains_key(id) {
+            return;
+        }
+        let (cols, rows) = self.terminal_pane_size;
+        let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), 5_000);
+        match self.client.pty_replay(id).await {
+            Ok(snap) => {
+                use base64::Engine;
+                if let Ok(bytes) =
+                    base64::engine::general_purpose::STANDARD.decode(&snap.data)
+                {
+                    parser.process(&bytes);
+                }
+            }
+            Err(e) => {
+                self.set_status(format!("pty_replay: {e}"));
+            }
+        }
+        self.terminals.insert(id.to_string(), parser);
+        // Tell the daemon what size we'd like.
+        let _ = self.client.pty_resize(id, cols, rows).await;
     }
 
     async fn refresh_sessions(&mut self) {
@@ -217,6 +281,20 @@ impl App {
             m if m == agentd_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
+                        // PTY events: feed into the per-session terminal emulator.
+                        if let SessionEvent::Pty { .. } = &payload.event {
+                            if let Some(bytes) = payload.event.pty_bytes() {
+                                let parser = self
+                                    .terminals
+                                    .entry(payload.session_id.clone())
+                                    .or_insert_with(|| {
+                                        let (cols, rows) = self.terminal_pane_size;
+                                        vt100::Parser::new(rows.max(1), cols.max(1), 5_000)
+                                    });
+                                parser.process(&bytes);
+                            }
+                            return;
+                        }
                         if Some(payload.session_id.as_str())
                             == self.transcript_session.as_deref()
                         {
@@ -250,8 +328,33 @@ impl App {
     async fn on_term_event(&mut self, ev: CtEvent) {
         match ev {
             CtEvent::Key(k) => self.on_key(k).await,
-            CtEvent::Resize(_, _) => {}
+            CtEvent::Resize(_, _) => {
+                // The TUI re-derives the pane size on next render; we trigger
+                // an explicit resize for the current PTY there.
+            }
             _ => {}
+        }
+    }
+
+    /// Called from `ui::render` after computing the terminal pane size. Sends
+    /// `pty_resize` when the size changed for the currently-focused PTY
+    /// session.
+    pub async fn notify_pane_size(&mut self, cols: u16, rows: u16) {
+        if (cols, rows) == self.terminal_pane_size {
+            return;
+        }
+        self.terminal_pane_size = (cols, rows);
+        for parser in self.terminals.values_mut() {
+            parser.set_size(rows.max(1), cols.max(1));
+        }
+        if let Some(id) = self.selected_id() {
+            if self
+                .selected_session()
+                .map(|s| s.has_pty)
+                .unwrap_or(false)
+            {
+                let _ = self.client.pty_resize(&id, cols, rows).await;
+            }
         }
     }
 
@@ -266,9 +369,13 @@ impl App {
             self.help_visible = false;
             return;
         }
-        match self.keymap_clone().bindings.iter().count() {
-            _ => {}
+
+        // Terminal mode: route keystrokes to the PTY (with an escape prefix).
+        if self.view == ViewMode::Terminal && self.in_pty_session() {
+            self.handle_terminal_key(key).await;
+            return;
         }
+
         let res = self.chord_state.handle(key, &self.keymap);
         self.chord_label = self.chord_state.label();
         match res {
@@ -278,9 +385,63 @@ impl App {
         }
     }
 
-    // tiny helper to avoid borrow issues
-    fn keymap_clone(&self) -> &Keymap {
-        &self.keymap
+    fn in_pty_session(&self) -> bool {
+        self.selected_session().map(|s| s.has_pty).unwrap_or(false)
+    }
+
+    async fn handle_terminal_key(&mut self, key: KeyEvent) {
+        // Escape prefix is `C-b` (tmux-style). After C-b, the next key is
+        // interpreted as an agentd command (single chord, hardcoded set).
+        let is_ctrl_b = matches!(key.code, KeyCode::Char('b'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+
+        if self.pending_escape {
+            self.pending_escape = false;
+            self.chord_label.clear();
+            self.run_terminal_escape_chord(key).await;
+            return;
+        }
+        if is_ctrl_b {
+            self.pending_escape = true;
+            self.chord_label = "C-b".to_string();
+            return;
+        }
+        // Plain pass-through: encode and ship as PTY bytes.
+        if let Some(bytes) = encode_key_to_bytes(key) {
+            if let Some(id) = self.selected_id() {
+                if let Err(e) = self.client.pty_input(&id, bytes).await {
+                    self.set_status(format!("pty_input failed: {e}"));
+                }
+            }
+        }
+    }
+
+    async fn run_terminal_escape_chord(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        match (key.code, key.modifiers) {
+            (Char('t'), m) if !m.contains(KeyModifiers::CONTROL) => {
+                self.view = ViewMode::Transcript;
+                self.set_status("transcript view".into());
+            }
+            (Char('?'), _) => self.help_visible = true,
+            (Char('q'), _) | (Char('c'), KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+            }
+            (Char('k'), _) => self.run_action(KeyAction::OpenKillConfirm).await,
+            (Char('d'), _) => self.run_action(KeyAction::OpenDiff).await,
+            (Char('n'), _) => self.run_action(KeyAction::OpenNewSession).await,
+            (Char('p'), _) | (Up, _) => self.run_action(KeyAction::PrevSession).await,
+            (Char('s'), _) | (Down, _) => self.run_action(KeyAction::NextSession).await,
+            (Char('b'), KeyModifiers::CONTROL) => {
+                // C-b C-b → send a literal C-b byte to the PTY.
+                if let Some(id) = self.selected_id() {
+                    let _ = self.client.pty_input(&id, vec![0x02]).await;
+                }
+            }
+            _ => {
+                // Cancel: unknown escape chord, drop it silently.
+            }
+        }
     }
 
     async fn run_action(&mut self, action: KeyAction) {
@@ -383,6 +544,19 @@ impl App {
                 self.focus = match self.focus {
                     Focus::List => Focus::Transcript,
                     Focus::Transcript => Focus::List,
+                };
+            }
+            ToggleView => {
+                let has_pty = self.in_pty_session();
+                self.view = match (self.view, has_pty) {
+                    (ViewMode::Transcript, true) => {
+                        // First time switching → bootstrap from replay snapshot.
+                        if let Some(id) = self.selected_id() {
+                            self.bootstrap_terminal(&id).await;
+                        }
+                        ViewMode::Terminal
+                    }
+                    _ => ViewMode::Transcript,
                 };
             }
             ScrollUp => {
@@ -497,6 +671,11 @@ impl App {
                     prompt: if prompt.is_empty() { None } else { Some(prompt) },
                     model: None,
                     title: None,
+                    mode: None,
+                    pty_size: Some(agentd_protocol::PtySize {
+                        cols: self.terminal_pane_size.0.max(20),
+                        rows: self.terminal_pane_size.1.max(5),
+                    }),
                     worktree: false,
                     env: HashMap::new(),
                     args: Vec::new(),
@@ -571,4 +750,75 @@ pub fn short_id(id: &str) -> &str {
 
 fn byte_pos(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Translate a crossterm `KeyEvent` into the raw byte sequence a PTY would
+/// receive from a real terminal. Returns `None` for keys we don't have a
+/// canonical encoding for (e.g. function keys we don't ship a mapping for).
+fn encode_key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                let byte = if lower.is_ascii_alphabetic() {
+                    (lower as u8) - b'a' + 1
+                } else {
+                    match c {
+                        ' ' | '@' => 0x00,
+                        '[' => 0x1b,
+                        '\\' => 0x1c,
+                        ']' => 0x1d,
+                        '^' => 0x1e,
+                        '_' | '?' => 0x1f,
+                        _ => return None,
+                    }
+                };
+                Some(vec![byte])
+            } else if alt {
+                let mut out = vec![0x1b];
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                Some(out)
+            } else {
+                let mut buf = [0u8; 4];
+                Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
+            }
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::F(n) => {
+            let s: &[u8] = match n {
+                1 => b"\x1bOP",
+                2 => b"\x1bOQ",
+                3 => b"\x1bOR",
+                4 => b"\x1bOS",
+                5 => b"\x1b[15~",
+                6 => b"\x1b[17~",
+                7 => b"\x1b[18~",
+                8 => b"\x1b[19~",
+                9 => b"\x1b[20~",
+                10 => b"\x1b[21~",
+                11 => b"\x1b[23~",
+                12 => b"\x1b[24~",
+                _ => return None,
+            };
+            Some(s.to_vec())
+        }
+        _ => None,
+    }
 }

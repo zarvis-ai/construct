@@ -1,22 +1,25 @@
-//! OpenAI Codex CLI adapter — multi-turn (best-effort).
+//! OpenAI Codex CLI adapter.
 //!
-//! The protocol surface is the same as the claude adapter: each turn spawns a
-//! fresh `codex exec <prompt>` process, stdout streams as assistant messages,
-//! stderr is forwarded as adapter log lines. When the child exits the session
-//! becomes `awaiting_input`; the next `session.input` starts the next turn.
+//! Two modes:
 //!
-//! **Caveat:** unlike `claude --resume`, this adapter does not currently pass
-//! a session id between turns, so each turn starts a fresh codex context.
-//! If your codex build supports session resumption, set
-//! `AGENTD_CODEX_RESUME_FLAG` to the flag name (e.g. `--session-id`) and the
-//! adapter will pass `--<flag> <captured-id>` on subsequent turns; the
-//! adapter captures any `session_id` field it sees in JSON output.
+//! - **interactive (default when a PTY size is provided)** — spawns `codex`
+//!   under a PTY, giving the user the real Codex TUI experience.
 //!
-//! Honors `AGENTD_CODEX_BIN` for the binary path.
+//! - **headless (opt-in)** — multi-turn structured mode that spawns
+//!   `codex exec <prompt>` per turn. Best-effort: if your codex build
+//!   supports session resumption, set `AGENTD_CODEX_RESUME_FLAG` to the flag
+//!   name (e.g. `--session-id`) and the adapter will pass any captured
+//!   `session_id` back in for subsequent turns.
+//!
+//! Pick mode via `--mode interactive|headless` on `agent new`, or via
+//! `AGENTD_CODEX_MODE=interactive|headless`. Honors `AGENTD_CODEX_BIN` for
+//! the binary path.
 
+use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
 use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{
-    Capabilities, InitializeResult, MessageRole, SessionEvent, SessionStartParams, SessionState,
+    Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
+    SessionState,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -35,15 +38,60 @@ async fn main() -> anyhow::Result<()> {
         capabilities: Capabilities {
             supports_input: true,
             supports_interrupt: true,
-            supports_diff: false,
-            supports_cost: false,
-            models: Vec::new(),
+            supports_pty: true,
+            ..Default::default()
         },
     };
     run(metadata, |params, ctx| async move {
-        run_session(params, ctx).await;
+        match resolve_mode(&params) {
+            Mode::Interactive => run_interactive(params, ctx).await,
+            Mode::Headless => run_session(params, ctx).await,
+        }
     })
     .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Interactive,
+    Headless,
+}
+
+fn resolve_mode(params: &SessionStartParams) -> Mode {
+    if let Ok(m) = std::env::var("AGENTD_CODEX_MODE") {
+        match m.as_str() {
+            "interactive" => return Mode::Interactive,
+            "headless" => return Mode::Headless,
+            _ => {}
+        }
+    }
+    match params.mode.as_deref() {
+        Some("interactive") => Mode::Interactive,
+        Some("headless") => Mode::Headless,
+        _ if params.pty_size.is_some() => Mode::Interactive,
+        _ => Mode::Headless,
+    }
+}
+
+async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
+    let bin = std::env::var("AGENTD_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let mut args = params.args.clone();
+    if let Some(m) = params.model.as_ref() {
+        args.push("-m".into());
+        args.push(m.clone());
+    }
+    if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
+        args.push(prompt.clone());
+    }
+    let spec = PtySpec {
+        bin: bin.clone(),
+        args,
+        cwd: std::path::PathBuf::from(&params.cwd),
+        env: params.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
+        status_detail: Some(format!("{bin} (interactive)")),
+    };
+    let _ = run_pty(spec, ctx).await;
 }
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
@@ -81,6 +129,8 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::Input(t)) => t,
                     Some(AdapterInboxMsg::Interrupt) => continue,
                     Some(AdapterInboxMsg::Stop) => break 0,
+                    Some(AdapterInboxMsg::PtyInput(_))
+                    | Some(AdapterInboxMsg::PtyResize { .. }) => continue,
                 }
             }
         };
@@ -187,6 +237,10 @@ async fn drive_turn(
                     Some(AdapterInboxMsg::Input(t)) => {
                         emit.log(format!("queued input for next turn: {}", short(&t, 60)));
                         pending.push_back(t);
+                    }
+                    Some(AdapterInboxMsg::PtyInput(_))
+                    | Some(AdapterInboxMsg::PtyResize { .. }) => {
+                        // headless mode ignores PTY traffic
                     }
                 }
             }

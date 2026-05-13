@@ -1,6 +1,6 @@
 //! Ratatui rendering for the TUI.
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, ViewMode};
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, TimestampedEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
-pub fn render(f: &mut Frame, app: &App) {
+pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -27,8 +27,14 @@ pub fn render(f: &mut Frame, app: &App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(40), Constraint::Min(0)])
         .split(main_area);
+    let detail_area = cols[1];
+    // Inner area inside the borders is the PTY's pane size.
+    let inner_cols = detail_area.width.saturating_sub(2);
+    let inner_rows = detail_area.height.saturating_sub(2);
+    app.terminal_pane_size = (inner_cols, inner_rows);
+
     render_sessions(f, cols[0], app);
-    render_detail(f, cols[1], app);
+    render_detail(f, detail_area, app);
     render_modeline(f, modeline_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
@@ -98,7 +104,8 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(para, area);
         return;
     }
-    let title = match app.selected_session() {
+    let summary = app.selected_session();
+    let title_inner = match summary {
         Some(s) => format!(
             " {} {}  {}  {} ",
             s.state.glyph(),
@@ -108,13 +115,38 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         ),
         None => " no session ".to_string(),
     };
+    let view_label = match app.view {
+        ViewMode::Terminal => " [terminal]",
+        ViewMode::Transcript => " [transcript]",
+    };
+    let title = format!("{title_inner}{view_label}");
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    match app.view {
+        ViewMode::Terminal => render_terminal(f, inner, app),
+        ViewMode::Transcript => render_transcript(f, inner, app),
+    }
+}
+
+fn render_terminal(f: &mut Frame, area: Rect, app: &App) {
+    let Some(id) = app.selected_id() else { return; };
+    let Some(parser) = app.terminals.get(&id) else {
+        let hint = Paragraph::new("(no PTY history yet — interact to populate)")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hint, area);
+        return;
+    };
+    let screen = parser.screen();
+    let term = tui_term::widget::PseudoTerminal::new(screen);
+    f.render_widget(term, area);
+}
+
+fn render_transcript(f: &mut Frame, area: Rect, app: &App) {
     let lines: Vec<Line> = app.transcript.iter().map(format_event).collect();
     let total = lines.len() as u16;
-    let height = inner.height;
+    let height = area.height;
     let max_scroll = total.saturating_sub(height);
     let scroll = if app.transcript_scroll == u16::MAX {
         max_scroll
@@ -124,7 +156,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     let para = Paragraph::new(lines)
         .scroll((scroll, 0))
         .wrap(Wrap { trim: false });
-    f.render_widget(para, inner);
+    f.render_widget(para, area);
 }
 
 fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
@@ -299,6 +331,10 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             format!("   ▢ done (exit {exit_code})"),
             Style::default().fg(Color::Green),
         )],
+        SessionEvent::Pty { data } => vec![Span::styled(
+            format!("   ⌷ pty: {} bytes (switch to terminal view)", data.len()),
+            Style::default().fg(Color::DarkGray),
+        )],
     }
 }
 
@@ -342,6 +378,7 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::Diff { .. } => "diff".to_string(),
         SessionEvent::Error { message } => format!("error: {}", shorten(message, 60)),
         SessionEvent::Done { exit_code } => format!("done (exit {exit_code})"),
+        SessionEvent::Pty { data } => format!("pty: {} bytes", data.len()),
     }
 }
 

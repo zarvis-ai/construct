@@ -35,18 +35,26 @@
 use crate::jsonrpc::{self, MessageKind, Response};
 use crate::{
     ahp_method, ahp_notif, transport, ErrorObject, EventEnvelope, InitializeResult, Notification,
-    Request, SessionEvent, SessionInputParams, SessionStartParams,
+    Request, SessionEvent, SessionInputParams, SessionPtyInputParams, SessionPtyResizeParams,
+    SessionStartParams,
 };
 use anyhow::{Context, Result};
 use std::future::Future;
 use tokio::io::BufReader;
 use tokio::sync::mpsc;
 
+#[cfg(feature = "pty")]
+pub mod pty;
+
 /// Messages the adapter runner can deliver into a running session task.
 #[derive(Debug, Clone)]
 pub enum AdapterInboxMsg {
-    /// Daemon forwarded text from the user.
+    /// Daemon forwarded text from the user (line-oriented).
     Input(String),
+    /// Raw bytes destined for the session's PTY master.
+    PtyInput(Vec<u8>),
+    /// Resize the session's PTY.
+    PtyResize { cols: u16, rows: u16 },
     /// Daemon asks the adapter to interrupt the current operation.
     Interrupt,
     /// Daemon asks the adapter to wind down cleanly.
@@ -82,6 +90,11 @@ impl EventEmitter {
         if let Ok(v) = serde_json::to_value(&notif) {
             let _ = self.out_tx.send(v);
         }
+    }
+
+    /// Convenience: emit raw PTY bytes (base64-encoded by [`SessionEvent::pty`]).
+    pub fn emit_pty(&self, bytes: &[u8]) {
+        self.emit(SessionEvent::pty(bytes));
     }
 
     /// Emit a free-form log line for the daemon's log.
@@ -213,6 +226,64 @@ where
                 };
                 if let Some(tx) = &inbox_tx {
                     let _ = tx.send(AdapterInboxMsg::Input(p.text)).await;
+                }
+                send_ok(serde_json::Value::Null);
+            }
+            ahp_method::SESSION_PTY_INPUT => {
+                let p: SessionPtyInputParams = match req
+                    .params
+                    .clone()
+                    .map(serde_json::from_value)
+                    .transpose()
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        send_err(ErrorObject::invalid_params("missing params"));
+                        continue;
+                    }
+                    Err(e) => {
+                        send_err(ErrorObject::invalid_params(e.to_string()));
+                        continue;
+                    }
+                };
+                let bytes = match p.decode() {
+                    Ok(b) => b,
+                    Err(e) => {
+                        send_err(ErrorObject::invalid_params(format!(
+                            "pty_input base64 decode: {e}"
+                        )));
+                        continue;
+                    }
+                };
+                if let Some(tx) = &inbox_tx {
+                    let _ = tx.send(AdapterInboxMsg::PtyInput(bytes)).await;
+                }
+                send_ok(serde_json::Value::Null);
+            }
+            ahp_method::SESSION_PTY_RESIZE => {
+                let p: SessionPtyResizeParams = match req
+                    .params
+                    .clone()
+                    .map(serde_json::from_value)
+                    .transpose()
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        send_err(ErrorObject::invalid_params("missing params"));
+                        continue;
+                    }
+                    Err(e) => {
+                        send_err(ErrorObject::invalid_params(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Some(tx) = &inbox_tx {
+                    let _ = tx
+                        .send(AdapterInboxMsg::PtyResize {
+                            cols: p.cols,
+                            rows: p.rows,
+                        })
+                        .await;
                 }
                 send_ok(serde_json::Value::Null);
             }

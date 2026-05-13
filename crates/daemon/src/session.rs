@@ -6,12 +6,12 @@ use crate::storage::Storage;
 use crate::worktree;
 use agentd_protocol::{
     ahp_method, CreateSessionParams, EventNotificationPayload, HarnessInfo, MessageRole,
-    SessionDetail, SessionEvent, SessionStartParams, SessionState, SessionSummary,
-    StateNotificationPayload, TimestampedEvent, TranscriptResult,
+    PtyReplayResult, PtySize, SessionDetail, SessionEvent, SessionStartParams, SessionState,
+    SessionSummary, StateNotificationPayload, TimestampedEvent, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,8 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 
 const BROADCAST_CAP: usize = 4096;
 const ADAPTER_DRAIN_CAP: usize = 256;
+/// Per-session PTY history kept in memory for late-attach replay.
+const PTY_RING_CAP: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum BroadcastMsg {
@@ -32,6 +34,36 @@ pub struct SessionEntry {
     summary: RwLock<SessionSummary>,
     transcript_count: AtomicU64,
     adapter: tokio::sync::Mutex<Option<Arc<Adapter>>>,
+    pty: tokio::sync::Mutex<PtyState>,
+}
+
+#[derive(Default)]
+struct PtyState {
+    ring: VecDeque<u8>,
+    size: Option<PtySize>,
+}
+
+impl PtyState {
+    fn push(&mut self, bytes: &[u8]) {
+        if bytes.len() >= PTY_RING_CAP {
+            self.ring.clear();
+            self.ring
+                .extend(&bytes[bytes.len() - PTY_RING_CAP..]);
+            return;
+        }
+        while self.ring.len() + bytes.len() > PTY_RING_CAP {
+            self.ring.pop_front();
+        }
+        self.ring.extend(bytes);
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let (a, b) = self.ring.as_slices();
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out
+    }
 }
 
 impl SessionEntry {
@@ -80,6 +112,7 @@ impl SessionManager {
                 summary: RwLock::new(s.clone()),
                 transcript_count: AtomicU64::new(count),
                 adapter: tokio::sync::Mutex::new(None),
+                pty: tokio::sync::Mutex::new(PtyState::default()),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -225,6 +258,8 @@ impl SessionManager {
             pending_input: false,
             last_prompt: params.prompt.clone(),
             event_count: 0,
+            has_pty: false,
+            mode: params.mode.clone(),
         };
         self.storage.save_summary(&summary)?;
 
@@ -248,6 +283,7 @@ impl SessionManager {
         if summary.model.is_none() {
             summary.model = info.capabilities.models.first().cloned();
         }
+        summary.has_pty = info.capabilities.supports_pty;
         self.storage.save_summary(&summary)?;
 
         // Send session.start.
@@ -256,6 +292,8 @@ impl SessionManager {
             cwd: summary.cwd.clone(),
             prompt: params.prompt.clone(),
             model: summary.model.clone(),
+            mode: params.mode.clone(),
+            pty_size: params.pty_size,
             env: params.env.clone(),
             args: params.args.clone(),
         };
@@ -268,6 +306,10 @@ impl SessionManager {
             summary: RwLock::new(summary.clone()),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(Some(adapter.clone())),
+            pty: tokio::sync::Mutex::new(PtyState {
+                ring: VecDeque::new(),
+                size: params.pty_size,
+            }),
         });
 
         // Record the user's initial prompt as the first transcript event so
@@ -345,6 +387,26 @@ impl SessionManager {
     }
 
     async fn handle_event(&self, entry: &SessionEntry, event: SessionEvent) {
+        // PTY events take a fast path: they go to the in-memory ring + a live
+        // broadcast, but they don't bloat the structured transcript.
+        if let SessionEvent::Pty { .. } = &event {
+            if let Some(bytes) = event.pty_bytes() {
+                entry.pty.lock().await.push(&bytes);
+            }
+            let now = Utc::now();
+            // Latest seq for ordering only; not persisted.
+            let seq = entry.transcript_count.load(Ordering::Relaxed);
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::Event(EventNotificationPayload {
+                    session_id: entry.id.clone(),
+                    at: now,
+                    event,
+                    seq,
+                }));
+            return;
+        }
+
         let seq = entry.transcript_count.fetch_add(1, Ordering::Relaxed) + 1;
         let now = Utc::now();
         let ts = TimestampedEvent {
@@ -390,7 +452,8 @@ impl SessionManager {
                 SessionEvent::Message { .. }
                 | SessionEvent::ToolUse { .. }
                 | SessionEvent::ToolResult { .. }
-                | SessionEvent::Diff { .. } => {}
+                | SessionEvent::Diff { .. }
+                | SessionEvent::Pty { .. } => {}
             }
             let snapshot = s.clone();
             drop(s);
@@ -437,6 +500,60 @@ impl SessionManager {
         })?;
         adapter.request(ahp_method::SESSION_INPUT, params).await?;
         Ok(())
+    }
+
+    pub async fn pty_input(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let adapter = entry
+            .adapter
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let params = serde_json::to_value(
+            &agentd_protocol::SessionPtyInputParams::from_bytes(id, &bytes),
+        )?;
+        adapter.request(ahp_method::SESSION_PTY_INPUT, params).await?;
+        Ok(())
+    }
+
+    pub async fn pty_resize(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        entry.pty.lock().await.size = Some(PtySize { cols, rows });
+        let adapter = entry
+            .adapter
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let params = serde_json::to_value(&agentd_protocol::SessionPtyResizeParams {
+            session_id: id.to_string(),
+            cols,
+            rows,
+        })?;
+        adapter
+            .request(ahp_method::SESSION_PTY_RESIZE, params)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn pty_replay(&self, id: &str) -> Result<PtyReplayResult> {
+        use base64::Engine;
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let pty = entry.pty.lock().await;
+        Ok(PtyReplayResult {
+            data: base64::engine::general_purpose::STANDARD.encode(pty.snapshot()),
+            size: pty.size,
+        })
     }
 
     pub async fn interrupt(&self, id: &str) -> Result<()> {

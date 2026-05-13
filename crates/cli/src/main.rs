@@ -41,7 +41,8 @@ enum Command {
     New {
         /// Harness name (shell, claude, codex, …).
         harness: String,
-        /// Initial prompt (use `--cwd` to set working dir).
+        /// Initial prompt (empty = interactive PTY for adapters that support it).
+        #[arg(default_value = "")]
         prompt: String,
         #[arg(long, default_value = ".")]
         cwd: PathBuf,
@@ -49,6 +50,9 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         title: Option<String>,
+        /// Session mode hint (e.g. "interactive" / "headless"); adapter-defined.
+        #[arg(long)]
+        mode: Option<String>,
         #[arg(long, default_value_t = false)]
         worktree: bool,
     },
@@ -141,6 +145,7 @@ async fn main() -> Result<()> {
             cwd,
             model,
             title,
+            mode,
             worktree,
         } => {
             let c = connect(&socket).await?;
@@ -152,9 +157,11 @@ async fn main() -> Result<()> {
                 .create(agentd_protocol::CreateSessionParams {
                     harness,
                     cwd,
-                    prompt: Some(prompt),
+                    prompt: if prompt.trim().is_empty() { None } else { Some(prompt) },
                     model,
                     title,
+                    mode,
+                    pty_size: None,
                     worktree,
                     env: Default::default(),
                     args: Vec::new(),

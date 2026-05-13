@@ -5,8 +5,8 @@ use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, ipc_notif, transport, CreateSessionParams, ErrorObject, Notification, PingResult,
-    Request, Response, SessionIdParams, SessionInputParams, SubscribeParams, TranscriptParams,
-    IPC_VERSION,
+    Request, Response, SessionIdParams, SessionInputParams, SessionPtyInputParams,
+    SessionPtyResizeParams, SubscribeParams, TranscriptParams, IPC_VERSION,
 };
 use anyhow::Result;
 use serde_json::json;
@@ -232,6 +232,31 @@ async fn dispatch(
             let p = params!(SessionInputParams);
             match manager.send_input(&p.session_id, p.text).await {
                 Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_PTY_INPUT => {
+            let p = params!(SessionPtyInputParams);
+            let bytes = match p.decode() {
+                Ok(b) => b,
+                Err(e) => return Response::err(id.clone(), ErrorObject::invalid_params(e.to_string())),
+            };
+            match manager.pty_input(&p.session_id, bytes).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_PTY_RESIZE => {
+            let p = params!(SessionPtyResizeParams);
+            match manager.pty_resize(&p.session_id, p.cols, p.rows).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_PTY_REPLAY => {
+            let p = params!(SessionIdParams);
+            match manager.pty_replay(&p.session_id).await {
+                Ok(r) => ok!(&r),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }

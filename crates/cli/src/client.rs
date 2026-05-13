@@ -3,8 +3,9 @@
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, transport, CreateSessionParams, DiffResult, ErrorObject, HarnessInfo, Notification,
-    PingResult, Request, Response, SessionDetail, SessionIdParams, SessionInputParams,
-    SessionSummary, SubscribeParams, TranscriptParams, TranscriptResult,
+    PingResult, PtyReplayResult, Request, Response, SessionDetail, SessionIdParams,
+    SessionInputParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSummary,
+    SubscribeParams, TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -156,6 +157,35 @@ impl Client {
             )
             .await?;
         Ok(())
+    }
+    pub async fn pty_input(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_PTY_INPUT,
+                &SessionPtyInputParams::from_bytes(id, &bytes),
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn pty_resize(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_PTY_RESIZE,
+                &SessionPtyResizeParams {
+                    session_id: id.to_string(),
+                    cols,
+                    rows,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn pty_replay(&self, id: &str) -> Result<PtyReplayResult> {
+        self.request(
+            ipc_method::SESSION_PTY_REPLAY,
+            &SessionIdParams { session_id: id.to_string() },
+        )
+        .await
     }
     pub async fn interrupt(&self, id: &str) -> Result<()> {
         let _: serde_json::Value = self

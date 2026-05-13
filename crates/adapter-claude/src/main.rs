@@ -1,23 +1,28 @@
-//! Claude Code adapter — multi-turn.
+//! Claude Code adapter.
 //!
-//! Each conversational turn spawns a fresh `claude -p` process with
-//! `--input-format stream-json --output-format stream-json --verbose`. The
-//! initial turn has no session id; subsequent turns pass `--resume <id>`
-//! so the underlying CLI threads the conversation together.
+//! Two modes:
+//!
+//! - **interactive (default when a PTY size is provided)** — spawns
+//!   `claude` (no `-p`) under a PTY so the right pane is the real Claude TUI.
+//!   You drive it with the keyboard exactly like `claude` standalone:
+//!   `/resume`, slash commands, etc. all work.
+//!
+//! - **headless (opt-in)** — multi-turn structured mode using
+//!   `claude -p --input-format stream-json --output-format stream-json --verbose`
+//!   plus `--resume <session_id>` for follow-up turns. Emits structured
+//!   `Message` / `ToolUse` / `Cost` events.
+//!
+//! Pick mode via `--mode interactive|headless` on `agent new`, or via
+//! `AGENTD_CLAUDE_MODE=interactive|headless`. Default is interactive when the
+//! client supplies a PTY size (the TUI always does); otherwise headless.
 //!
 //! Honors `AGENTD_CLAUDE_BIN` for the binary path.
-//!
-//! Adapter inbox semantics while a turn is running:
-//!   - `Input` → queued for the next turn (echoed as a log line)
-//!   - `Interrupt` → kill current child; loop back to await/run next input
-//!   - `Stop` → kill current child; emit Done and exit
-//!
-//! `Input` arriving while we're already awaiting input is consumed immediately
-//! and dispatched as the next turn's prompt.
 
+use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
 use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{
-    Capabilities, InitializeResult, MessageRole, SessionEvent, SessionStartParams, SessionState,
+    Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
+    SessionState,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
@@ -36,15 +41,62 @@ async fn main() -> anyhow::Result<()> {
         capabilities: Capabilities {
             supports_input: true,
             supports_interrupt: true,
-            supports_diff: false,
             supports_cost: true,
-            models: Vec::new(),
+            supports_pty: true,
+            ..Default::default()
         },
     };
     run(metadata, |params, ctx| async move {
-        run_session(params, ctx).await;
+        match resolve_mode(&params) {
+            Mode::Interactive => run_interactive(params, ctx).await,
+            Mode::Headless => run_session(params, ctx).await,
+        }
     })
     .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Interactive,
+    Headless,
+}
+
+fn resolve_mode(params: &SessionStartParams) -> Mode {
+    if let Ok(m) = std::env::var("AGENTD_CLAUDE_MODE") {
+        match m.as_str() {
+            "interactive" => return Mode::Interactive,
+            "headless" => return Mode::Headless,
+            _ => {}
+        }
+    }
+    match params.mode.as_deref() {
+        Some("interactive") => Mode::Interactive,
+        Some("headless") => Mode::Headless,
+        _ if params.pty_size.is_some() => Mode::Interactive,
+        _ => Mode::Headless,
+    }
+}
+
+async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
+    let bin = std::env::var("AGENTD_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let mut args = params.args.clone();
+    if let Some(m) = params.model.as_ref() {
+        args.push("--model".into());
+        args.push(m.clone());
+    }
+    if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
+        // claude treats trailing positional as the initial prompt.
+        args.push(prompt.clone());
+    }
+    let spec = PtySpec {
+        bin: bin.clone(),
+        args,
+        cwd: std::path::PathBuf::from(&params.cwd),
+        env: params.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
+        status_detail: Some(format!("{bin} (interactive)")),
+    };
+    let _ = run_pty(spec, ctx).await;
 }
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
@@ -82,6 +134,8 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::Input(t)) => t,
                     Some(AdapterInboxMsg::Interrupt) => continue,
                     Some(AdapterInboxMsg::Stop) => break 0,
+                    Some(AdapterInboxMsg::PtyInput(_))
+                    | Some(AdapterInboxMsg::PtyResize { .. }) => continue,
                 }
             }
         };
@@ -203,6 +257,10 @@ async fn drive_turn(
                     Some(AdapterInboxMsg::Input(t)) => {
                         emit.log(format!("queued input for next turn: {}", short(&t, 60)));
                         pending.push_back(t);
+                    }
+                    Some(AdapterInboxMsg::PtyInput(_))
+                    | Some(AdapterInboxMsg::PtyResize { .. }) => {
+                        // headless mode ignores PTY traffic
                     }
                 }
             }

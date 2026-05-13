@@ -2,7 +2,7 @@
 
 A terminal **agent fleet** — run and supervise multiple coding-agent sessions across heterogeneous harnesses (Claude Code, Codex, generic shell, ...) from one TUI.
 
-Status: **milestone 1 — working but unstable. Wire protocols may break.**
+Status: **early — M2 (PTY mode) just landed. Wire protocols may still break.**
 
 ```
 ┌─ sessions ────────────────┬─ session: s4f3...  shell  running ─────┐
@@ -89,6 +89,13 @@ scripts/smoke.sh
 
 ## TUI keys (emacs default)
 
+The right pane has two views — **transcript** (structured event log) and
+**terminal** (live PTY emulator powered by `vt100`+`tui-term`). Sessions whose
+adapter has `supports_pty=true` (shell always, claude/codex in interactive
+mode) open in terminal view; toggle with `C-x t`.
+
+**Outside terminal mode (or for non-PTY sessions):**
+
 | Key | Action |
 |---|---|
 | `C-n` / `↓` | next session |
@@ -99,10 +106,27 @@ scripts/smoke.sh
 | `C-c d` | show diff for selected session |
 | `C-c C-c` | interrupt |
 | `C-c r` | refresh |
+| `C-x t` | toggle transcript ↔ terminal view |
 | `M-x` | command palette |
 | `Tab` | switch focus (list / transcript) |
 | `?` | toggle help |
 | `C-x C-c` / `q` | quit |
+
+**Inside terminal mode** — every keystroke goes straight to the PTY (shell
+readline, vim, claude TUI, etc. all work normally). To run an agentd command,
+press the escape prefix `C-b`, then a single chord:
+
+| Chord | Action |
+|---|---|
+| `C-b t` | back to transcript view |
+| `C-b n` | new session |
+| `C-b k` | kill session |
+| `C-b d` | diff |
+| `C-b s` / `↓` | next session |
+| `C-b p` / `↑` | prev session |
+| `C-b ?` | help |
+| `C-b q` / `C-b C-c` | quit |
+| `C-b C-b` | send literal `C-b` byte to the PTY |
 
 Set `AGENTD_KEYMAP=vim` for the vim profile.
 
@@ -115,16 +139,40 @@ Methods the adapter implements:
 | Method | Payload |
 |---|---|
 | `initialize` | `{protocol_version, client_info}` → `InitializeResult` |
-| `session.start` | `{session_id, cwd, prompt?, model?, env, args}` |
-| `session.input` | `{session_id, text}` |
+| `session.start` | `{session_id, cwd, prompt?, model?, mode?, pty_size?, env, args}` |
+| `session.input` | `{session_id, text}` — line-oriented input |
+| `session.pty_input` | `{session_id, data}` — base64 raw bytes for the PTY master |
+| `session.pty_resize` | `{session_id, cols, rows}` — SIGWINCH equivalent |
 | `session.interrupt` | `{session_id}` |
 | `session.stop` | `{session_id}` |
 | `shutdown` | `{}` |
 
 Notifications the adapter emits:
 
-- `session/event` — one `SessionEvent` (see [`SessionEvent`](crates/protocol/src/lib.rs))
-- `log` — free-form line for the daemon's log
+- `session/event` — one `SessionEvent`. `Pty {data}` (base64 bytes) is the
+  hot path for PTY-backed sessions; structured variants (`Message`,
+  `ToolUse`, `ToolResult`, `Cost`, `Diff`, `Status`, `Done`, ...) are emitted
+  alongside when the adapter has them.
+- `log` — free-form line for the daemon's log.
+
+Adapters that own a PTY can opt into a shared runtime helper:
+
+```rust
+use agentd_protocol::adapter::pty::{run_session, PtySpec};
+
+// in your run(metadata, |params, ctx| async move { ... }) closure:
+let spec = PtySpec {
+    bin: "bash".into(),
+    args: vec!["-il".into()],
+    cwd: params.cwd.into(),
+    env: params.env.into_iter().collect(),
+    size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
+    status_detail: Some("bash -il".into()),
+};
+let _ = run_session(spec, ctx).await;
+```
+
+(Enable the `pty` feature on `agentd-protocol` to pull in `portable-pty`.)
 
 Writing an adapter in Rust is roughly:
 
@@ -170,23 +218,25 @@ Implemented:
 - [x] Config file (`~/.config/agentd/config.toml`)
 - [x] Daemon + client process split (Unix socket)
 
-### Multi-turn semantics
+### Per-adapter modes
 
-Each adapter exposes the same surface to the daemon: a session stays alive
-across many user turns until you `stop` or `kill` it. After the assistant
-finishes a turn, the session enters `awaiting_input`; the next `agent send`
-starts the next turn. Inputs sent while a turn is still in flight queue and
-run in order.
+Each session has a **mode**: `interactive` (PTY-attached, default when the
+TUI is creating sessions) or `headless` (structured stream, default for
+non-PTY-aware clients). Pick explicitly with `agent new ... --mode <m>` or
+the per-adapter env var (`AGENTD_CLAUDE_MODE`, `AGENTD_CODEX_MODE`).
 
-- **`shell`** — true interactive: pipes input straight into the child's stdin.
-- **`claude`** — per-turn `claude -p` process; subsequent turns pass
-  `--resume <session_id>` (captured from the first turn's init event), so the
-  Claude CLI threads the conversation server-side. Cost events come from the
-  `result` payload.
-- **`codex`** — per-turn `codex exec` process. By default each turn starts
-  fresh (no context carry-over) — set `AGENTD_CODEX_RESUME_FLAG=--session-id`
-  (or whichever resume flag your codex build supports) to pass a captured
-  `session_id` field back in on each turn.
+- **`shell`** — always PTY. Empty prompt → `$SHELL -il` (interactive login
+  shell). Non-empty prompt → `$SHELL -lc <prompt>` (one-shot).
+- **`claude`** —
+  - *interactive*: spawns `claude` (no `-p`) under a PTY → full Claude TUI in
+    the right pane (`/resume`, slash commands, all of it).
+  - *headless*: per-turn `claude -p --input-format stream-json --output-format
+    stream-json --verbose` with `--resume <session_id>` for follow-ups. Emits
+    structured `Message`/`ToolUse`/`Cost` events.
+- **`codex`** —
+  - *interactive*: spawns `codex` under a PTY.
+  - *headless*: per-turn `codex exec`. Set `AGENTD_CODEX_RESUME_FLAG`
+    (e.g. `--session-id`) if your codex build supports cross-turn resumption.
 
 Deferred to later milestones:
 
