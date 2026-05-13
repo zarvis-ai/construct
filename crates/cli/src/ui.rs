@@ -122,10 +122,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         None => " no session ".to_string(),
     };
     let view_label = match app.view {
-        ViewMode::Terminal => " [terminal]",
-        ViewMode::Transcript => " [transcript]",
+        ViewMode::Terminal => "[terminal]",
+        ViewMode::Transcript => "[transcript]",
     };
-    let title = format!("{title_inner}{view_label}");
+    let title = format!("{title_inner}{view_label} ");
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(focused))
