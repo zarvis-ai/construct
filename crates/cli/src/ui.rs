@@ -212,8 +212,18 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_minibuffer(f: &mut Frame, area: Rect, app: &App) {
     if let Some(mb) = &app.minibuffer {
-        let text = format!("{}{}", mb.prompt, mb.input);
-        let para = Paragraph::new(text);
+        let mut spans = vec![
+            Span::raw(mb.prompt.clone()),
+            Span::raw(mb.input.clone()),
+        ];
+        if let Some(err) = &mb.error {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                err.clone(),
+                Style::default().fg(Color::Red),
+            ));
+        }
+        let para = Paragraph::new(Line::from(spans));
         f.render_widget(para, area);
         let x = area.x + mb.prompt.width() as u16 + mb.cursor as u16;
         f.set_cursor_position(Position { x, y: area.y });

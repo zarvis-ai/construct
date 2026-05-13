@@ -52,6 +52,9 @@ pub struct Minibuffer {
     pub input: String,
     pub cursor: usize,
     pub intent: MinibufferIntent,
+    /// Inline status appended after the input. Examples: "no such harness",
+    /// "matches: claude, codex". Cleared by the next text edit.
+    pub error: Option<String>,
 }
 
 pub struct App {
@@ -484,6 +487,7 @@ impl App {
                         input: String::new(),
                         cursor: 0,
                         intent: MinibufferIntent::SendInput { session_id: id },
+                        error: None,
                     });
                 } else {
                     self.set_status("no session selected".to_string());
@@ -501,10 +505,11 @@ impl App {
                     .collect::<Vec<_>>()
                     .join("|");
                 self.minibuffer = Some(Minibuffer {
-                    prompt: format!("Harness [{hint}]: "),
+                    prompt: format!("Harness [{hint}] (Tab completes): "),
                     input: String::new(),
                     cursor: 0,
                     intent: MinibufferIntent::NewSessionHarness,
+                    error: None,
                 });
             }
             OpenDeleteConfirm => {
@@ -517,6 +522,7 @@ impl App {
                         input: String::new(),
                         cursor: 0,
                         intent: MinibufferIntent::DeleteConfirm { session_id: id },
+                        error: None,
                     });
                 }
             }
@@ -549,6 +555,7 @@ impl App {
                     input: String::new(),
                     cursor: 0,
                     intent: MinibufferIntent::CommandPalette,
+                    error: None,
                 });
             }
             SwitchFocus => {
@@ -610,6 +617,22 @@ impl App {
     }
 
     async fn handle_minibuffer_key(&mut self, key: KeyEvent) {
+        // Snapshot the data we'll need without holding a borrow on
+        // self.minibuffer across the (possibly &self) lookups.
+        let is_new_harness = matches!(
+            self.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::NewSessionHarness)
+        );
+        let available_harnesses: Vec<String> = if is_new_harness {
+            self.harnesses
+                .iter()
+                .filter(|h| h.available)
+                .map(|h| h.name.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let Some(mb) = self.minibuffer.as_mut() else { return; };
         match key.code {
             KeyCode::Esc => {
@@ -620,7 +643,26 @@ impl App {
                 self.minibuffer = None;
                 return;
             }
+            KeyCode::Tab => {
+                if is_new_harness {
+                    apply_harness_completion(mb, &available_harnesses);
+                }
+                return;
+            }
             KeyCode::Enter => {
+                if is_new_harness {
+                    let trimmed = mb.input.trim().to_string();
+                    if trimmed.is_empty() {
+                        mb.error = Some("pick a harness".to_string());
+                        return;
+                    }
+                    if !available_harnesses.iter().any(|h| h == &trimmed) {
+                        mb.error = Some(format!(
+                            "no such harness: {trimmed} (Tab to complete)"
+                        ));
+                        return;
+                    }
+                }
                 let intent = mb.intent.clone();
                 let input = std::mem::take(&mut mb.input);
                 self.minibuffer = None;
@@ -633,6 +675,7 @@ impl App {
                     mb.input.remove(prev);
                     mb.cursor = prev;
                 }
+                mb.error = None;
             }
             KeyCode::Left => {
                 mb.cursor = mb.cursor.saturating_sub(1);
@@ -648,6 +691,7 @@ impl App {
                 let pos = byte_pos(&mb.input, mb.cursor);
                 mb.input.insert(pos, c);
                 mb.cursor += 1;
+                mb.error = None;
             }
             _ => {}
         }
@@ -760,6 +804,50 @@ pub fn short_id(id: &str) -> &str {
 
 fn byte_pos(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Bash-style Tab completion for the harness-picker minibuffer. Completes
+/// to the longest common prefix of all matches; sets an inline hint listing
+/// the candidates when the result is ambiguous.
+fn apply_harness_completion(mb: &mut Minibuffer, options: &[String]) {
+    let current = mb.input.clone();
+    let matches: Vec<&String> =
+        options.iter().filter(|o| o.starts_with(&current)).collect();
+    if matches.is_empty() {
+        mb.error = if options.is_empty() {
+            Some("(no harnesses available)".to_string())
+        } else {
+            Some(format!("no match for {current}"))
+        };
+        return;
+    }
+    if matches.len() == 1 {
+        mb.input = matches[0].clone();
+        mb.cursor = mb.input.chars().count();
+        mb.error = None;
+        return;
+    }
+    let prefix = longest_common_prefix(&matches);
+    if prefix.len() > mb.input.len() {
+        mb.input = prefix;
+        mb.cursor = mb.input.chars().count();
+    }
+    let listed: Vec<&str> = matches.iter().map(|s| s.as_str()).collect();
+    mb.error = Some(format!("matches: {}", listed.join(", ")));
+}
+
+fn longest_common_prefix(strs: &[&String]) -> String {
+    let mut out = String::new();
+    let Some(first) = strs.first() else { return out };
+    'outer: for (i, c) in first.chars().enumerate() {
+        for s in &strs[1..] {
+            if s.chars().nth(i) != Some(c) {
+                break 'outer;
+            }
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Translate a crossterm `KeyEvent` into the raw byte sequence a PTY would
