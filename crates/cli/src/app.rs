@@ -155,10 +155,12 @@ pub struct App {
 pub const PTY_QUIESCENCE: Duration = Duration::from_millis(600);
 /// Spinner frame cadence — fast enough to feel alive, slow enough to keep
 /// the TUI tick loop cheap.
-pub const SPINNER_FRAME_MS: u128 = 100;
-/// Braille spinner frames (10 frames @ 100ms = 1 Hz cycle).
-pub const SPINNER_FRAMES: [&str; 10] =
-    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+pub const SPINNER_FRAME_MS: u128 = 120;
+/// Pulsing-star spinner: a 4-glyph sparkle whose size "breathes" via a
+/// palindromic frame schedule (small → big → small). Single cell wide so
+/// it slots into the same column as the static state glyph.
+pub const SPINNER_FRAMES: [&str; 8] =
+    ["✦", "✧", "✶", "✷", "✸", "✷", "✶", "✧"];
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
     let profile = Profile::from_env();
@@ -248,8 +250,7 @@ async fn run_loop(
         .take_notifications()
         .await
         .context("notifications channel already taken")?;
-    // Tick fast enough to animate the activity spinner smoothly. Keep ≥
-    // `SPINNER_FRAME_MS` so we redraw on each frame boundary.
+    // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
 
     let mut last_size_sent: (u16, u16) = (0, 0);
