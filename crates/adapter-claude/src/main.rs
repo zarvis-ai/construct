@@ -103,13 +103,17 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
+    // Spawn through the user's login shell so PATH is set up the way an
+    // interactive terminal would (nvm, pyenv, etc.). See login_shell_wrap.
+    let label = bin.clone();
+    let (spawn_bin, spawn_args) = agentd_protocol::adapter::login_shell_wrap(bin, args);
     let spec = PtySpec {
-        bin: bin.clone(),
-        args,
+        bin: spawn_bin,
+        args: spawn_args,
         cwd: std::path::PathBuf::from(&params.cwd),
         env,
         size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
-        status_detail: Some(format!("{bin} (interactive)")),
+        status_detail: Some(format!("{label} (interactive)")),
     };
     let _ = run_pty(spec, ctx).await;
 }
@@ -163,22 +167,30 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             detail: None,
         });
 
-        // Build the per-turn child command.
-        let mut command = Command::new(&bin);
-        command
-            .arg("-p")
-            .arg("--input-format")
-            .arg("stream-json")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--verbose");
+        // Build the per-turn child command args.
+        let mut child_args: Vec<String> = Vec::new();
+        child_args.push("-p".into());
+        child_args.push("--input-format".into());
+        child_args.push("stream-json".into());
+        child_args.push("--output-format".into());
+        child_args.push("stream-json".into());
+        child_args.push("--verbose".into());
         if let Some(sid) = &session_id {
-            command.arg("--resume").arg(sid);
+            child_args.push("--resume".into());
+            child_args.push(sid.clone());
         }
         if let Some(m) = &model {
-            command.arg("--model").arg(m);
+            child_args.push("--model".into());
+            child_args.push(m.clone());
         }
         for a in &extra_args {
+            child_args.push(a.clone());
+        }
+        // Wrap through the user's login shell so nvm/pyenv/etc. set up PATH.
+        let (spawn_bin, spawn_args) =
+            agentd_protocol::adapter::login_shell_wrap(bin.clone(), child_args);
+        let mut command = Command::new(&spawn_bin);
+        for a in &spawn_args {
             command.arg(a);
         }
         command

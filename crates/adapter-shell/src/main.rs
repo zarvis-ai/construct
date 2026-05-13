@@ -32,11 +32,35 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/bash".to_string());
 
+        // Prepend nvm init so e.g. `node` / `codex` (installed via nvm) are
+        // on PATH automatically without the user having to run
+        // `nvm use default` after every session start. Opt out via
+        // `AGENTD_LOGIN_SHELL=0`.
+        let with_nvm = std::env::var("AGENTD_LOGIN_SHELL").as_deref() != Ok("0");
+        let nvm_init = if with_nvm {
+            agentd_protocol::adapter::nvm_init_snippet()
+        } else {
+            ""
+        };
+        let prefix = if nvm_init.is_empty() {
+            String::new()
+        } else {
+            format!("{nvm_init}; ")
+        };
+
         let args: Vec<String> = match params.prompt.as_deref() {
             Some(p) if !p.trim().is_empty() => {
-                vec!["-lc".to_string(), p.to_string()]
+                vec!["-lc".to_string(), format!("{prefix}{p}")]
             }
-            _ => vec!["-il".to_string()],
+            _ => {
+                // Run nvm init in a login shell, then `exec "$0" -i` so the
+                // user lands in an interactive shell with PATH already set.
+                vec![
+                    "-lc".to_string(),
+                    format!("{prefix}exec \"$0\" -i"),
+                    shell.clone(),
+                ]
+            }
         };
 
         let spec = PtySpec {

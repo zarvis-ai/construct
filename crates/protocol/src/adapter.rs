@@ -56,6 +56,53 @@ use std::path::PathBuf;
 ///
 /// Used by the claude/codex adapters in interactive mode to let an agent
 /// running inside an agentd session reach the daemon over MCP.
+/// A shell snippet that loads nvm (if installed) and activates its
+/// `default` Node version. Idempotent and silent: a no-op when there's no
+/// nvm. The motivating case is `npm i -g`-installed agents (`codex`,
+/// `claude`, etc.) that only resolve on PATH once `nvm use default` runs.
+///
+/// Built to be safe to prepend to any `bash -lc` / `zsh -lc` command.
+/// Future extensions could chain in pyenv / asdf / mise here.
+pub fn nvm_init_snippet() -> &'static str {
+    // Prefer `nvm use node` (latest installed) over `default` — the
+    // `default` alias is often pointed at a very old release (or unset),
+    // while `node` is guaranteed to be a real installed version. Falls
+    // back to `default` if `node` isn't installed.
+    r#"export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"; if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh" >/dev/null 2>&1; nvm use --silent node >/dev/null 2>&1 || nvm use --silent default >/dev/null 2>&1 || true; fi"#
+}
+
+/// Wrap a command so it's spawned through the user's login shell instead
+/// of directly. Lets package managers that customize PATH in shell init
+/// files (nvm, pyenv, asdf, conda, mise, …) take effect, so agents
+/// installed via `npm i -g` under nvm-managed Node, etc., are reachable.
+///
+/// The shell is `$SHELL` (falling back to `/bin/bash`). The wrapper uses
+/// `-lc '<nvm-init>; exec "$@"'` so:
+/// - login init files are read (PATH, NVM_DIR, etc.)
+/// - nvm's default Node is activated (no-op if no nvm)
+/// - the shell process exec-replaces itself with the real command,
+///   leaving the process tree as `adapter → <real-cmd>` (not
+///   `adapter → shell → <real-cmd>`).
+///
+/// Opt out with `AGENTD_LOGIN_SHELL=0` (returns `(bin, args)` unchanged).
+pub fn login_shell_wrap(bin: String, args: Vec<String>) -> (String, Vec<String>) {
+    if std::env::var("AGENTD_LOGIN_SHELL").as_deref() == Ok("0") {
+        return (bin, args);
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = format!("{}; exec \"$@\"", nvm_init_snippet());
+    let mut wrapped = vec![
+        "-lc".to_string(),
+        cmd,
+        // Conventional placeholder for $0 (the shell uses this as argv[0]
+        // before the exec; the exec'd program gets its own from $@).
+        "agentd-spawn".to_string(),
+        bin,
+    ];
+    wrapped.extend(args);
+    (shell, wrapped)
+}
+
 pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
     if std::env::var("AGENTD_INJECT_MCP").as_deref() == Ok("0") {
         return None;
