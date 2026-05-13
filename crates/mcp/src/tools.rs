@@ -1,0 +1,299 @@
+//! MCP tool catalog and dispatchers. Each tool wraps one or more methods
+//! on `agentd_client::Client`.
+
+use agentd_client::Client;
+use agentd_protocol::{CreateSessionParams, PtySize};
+use anyhow::{anyhow, Result};
+use base64::Engine;
+use serde_json::{json, Value};
+use std::sync::Arc;
+
+/// Static tool catalog returned by `tools/list`.
+pub fn catalog() -> Vec<Value> {
+    vec![
+        // ----- Read -----
+        tool(
+            "agentd_whoami",
+            "Returns the AGENTD_SESSION_ID env var visible to this MCP server, which is the agentd session id that the calling agent is running inside. Returns null if unset (the MCP server is running outside an agentd-managed session).",
+            schema_empty(),
+        ),
+        tool(
+            "agentd_list_sessions",
+            "List every agentd session known to the daemon (running and finished, ungrouped and grouped). Returns an array of session summaries.",
+            schema_empty(),
+        ),
+        tool(
+            "agentd_list_harnesses",
+            "List the available agent harnesses (shell, claude, codex, …). Each entry includes whether the binary was resolvable on this host.",
+            schema_empty(),
+        ),
+        tool(
+            "agentd_get_session",
+            "Fetch the full detail (summary + structured transcript) for one session.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "agentd_get_transcript",
+            "Fetch a slice of the session's structured event log. `from` is a 1-based sequence number; `limit` bounds the returned events.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "from":       { "type": "integer", "minimum": 0 },
+                    "limit":      { "type": "integer", "minimum": 1 }
+                },
+                "required": ["session_id"]
+            }),
+        ),
+        tool(
+            "agentd_get_output",
+            "Fetch the session's recent PTY scrollback as text (UTF-8 lossy). Use this to read what's on the screen of a PTY-backed session.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "agentd_get_diff",
+            "`git diff HEAD` for the session's worktree (or its cwd if it's a git repo without an isolated worktree). Empty string if not a git repo.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        // ----- Write -----
+        tool(
+            "agentd_create_session",
+            "Spawn a new session. `harness` must match an available harness name (see agentd_list_harnesses). `cwd` defaults to the daemon's process cwd. Set `worktree:true` to start the session in an isolated git worktree.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "harness":  { "type": "string" },
+                    "cwd":      { "type": "string" },
+                    "prompt":   { "type": "string" },
+                    "title":    { "type": "string" },
+                    "mode":     { "type": "string", "enum": ["interactive", "headless"] },
+                    "worktree": { "type": "boolean" }
+                },
+                "required": ["harness"]
+            }),
+        ),
+        tool(
+            "agentd_send_input",
+            "Send a line of text to a session as user input. For PTY sessions a trailing newline is added automatically.",
+            schema_obj(&[
+                ("session_id", "string", true),
+                ("text",       "string", true),
+            ]),
+        ),
+        tool(
+            "agentd_send_keys",
+            "Send raw bytes to a PTY-backed session (base64-encoded). Use this for control characters or arrow keys — e.g. `\\u0003` (C-c) base64 = \"Aw==\".",
+            schema_obj(&[
+                ("session_id", "string", true),
+                ("bytes_b64",  "string", true),
+            ]),
+        ),
+        tool(
+            "agentd_interrupt_session",
+            "Send an interrupt to the session (the adapter decides the exact semantic: usually SIGINT-equivalent to the running child).",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "agentd_stop_session",
+            "Stop the session cleanly (asks the adapter to shut down). Use kill_session for hard kill.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "agentd_kill_session",
+            "SIGKILL the adapter (and its child). The session record stays; use delete_session to also drop the record.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "agentd_delete_session",
+            "Delete a session entirely: kill if running, remove transcript, worktree, and metadata from disk.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "agentd_pin_session",
+            "Pin or unpin a session so it shows as a live tile in the TUI pin strip.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "pinned":     { "type": "boolean" }
+                },
+                "required": ["session_id", "pinned"]
+            }),
+        ),
+        tool(
+            "agentd_rename_session",
+            "Set a user-facing title for the session. Empty or omitted `title` clears it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "title":      { "type": "string" }
+                },
+                "required": ["session_id"]
+            }),
+        ),
+    ]
+}
+
+fn tool(name: &str, description: &str, schema: Value) -> Value {
+    json!({ "name": name, "description": description, "inputSchema": schema })
+}
+
+fn schema_empty() -> Value {
+    json!({ "type": "object", "properties": {} })
+}
+
+fn schema_obj(fields: &[(&str, &str, bool)]) -> Value {
+    let mut props = serde_json::Map::new();
+    let mut required = Vec::new();
+    for (n, ty, req) in fields {
+        props.insert(n.to_string(), json!({ "type": ty }));
+        if *req {
+            required.push(n.to_string());
+        }
+    }
+    json!({
+        "type": "object",
+        "properties": props,
+        "required": required,
+    })
+}
+
+/// Dispatch a `tools/call` to the right method. Returns the full
+/// `tools/call` response payload (a `{content: [...], isError?}` object).
+pub async fn call(
+    client: &Arc<Client>,
+    session_id: Option<&str>,
+    params: Value,
+) -> Result<Value> {
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing tool name"))?
+        .to_string();
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    let result_json: Value = match name.as_str() {
+        // ----- Read -----
+        "agentd_whoami" => json!({ "session_id": session_id }),
+        "agentd_list_sessions" => serde_json::to_value(client.list().await?)?,
+        "agentd_list_harnesses" => serde_json::to_value(client.harnesses().await?)?,
+        "agentd_get_session" => {
+            let sid = arg_str(&args, "session_id")?;
+            serde_json::to_value(client.get(&sid).await?)?
+        }
+        "agentd_get_transcript" => {
+            let sid = arg_str(&args, "session_id")?;
+            let from = arg_u64(&args, "from").unwrap_or(0);
+            let limit = arg_usize(&args, "limit");
+            serde_json::to_value(client.transcript(&sid, from, limit).await?)?
+        }
+        "agentd_get_output" => {
+            let sid = arg_str(&args, "session_id")?;
+            let snap = client.pty_replay(&sid).await?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&snap.data)
+                .unwrap_or_default();
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            json!({ "text": text, "size": snap.size })
+        }
+        "agentd_get_diff" => {
+            let sid = arg_str(&args, "session_id")?;
+            serde_json::to_value(client.diff(&sid).await?)?
+        }
+        // ----- Write -----
+        "agentd_create_session" => {
+            let harness = arg_str(&args, "harness")?;
+            let cwd = arg_str(&args, "cwd").unwrap_or_else(|_| {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| ".".to_string())
+            });
+            let params = CreateSessionParams {
+                harness,
+                cwd,
+                prompt: arg_str(&args, "prompt").ok(),
+                model: None,
+                title: arg_str(&args, "title").ok(),
+                mode: arg_str(&args, "mode").ok(),
+                pty_size: Some(PtySize { cols: 100, rows: 30 }),
+                worktree: args.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
+                env: Default::default(),
+                args: Vec::new(),
+            };
+            let sid = client.create(params).await?;
+            json!({ "session_id": sid })
+        }
+        "agentd_send_input" => {
+            let sid = arg_str(&args, "session_id")?;
+            let text = arg_str(&args, "text")?;
+            client.send_input(&sid, text).await?;
+            json!({ "ok": true })
+        }
+        "agentd_send_keys" => {
+            let sid = arg_str(&args, "session_id")?;
+            let b64 = arg_str(&args, "bytes_b64")?;
+            let bytes = base64::engine::general_purpose::STANDARD.decode(b64.as_bytes())?;
+            client.pty_input(&sid, bytes).await?;
+            json!({ "ok": true })
+        }
+        "agentd_interrupt_session" => {
+            client.interrupt(&arg_str(&args, "session_id")?).await?;
+            json!({ "ok": true })
+        }
+        "agentd_stop_session" => {
+            client.stop(&arg_str(&args, "session_id")?).await?;
+            json!({ "ok": true })
+        }
+        "agentd_kill_session" => {
+            client.kill(&arg_str(&args, "session_id")?).await?;
+            json!({ "ok": true })
+        }
+        "agentd_delete_session" => {
+            client.delete(&arg_str(&args, "session_id")?).await?;
+            json!({ "ok": true })
+        }
+        "agentd_pin_session" => {
+            let sid = arg_str(&args, "session_id")?;
+            let pinned = args
+                .get("pinned")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| anyhow!("missing or non-bool `pinned`"))?;
+            client.set_pinned(&sid, pinned).await?;
+            json!({ "ok": true })
+        }
+        "agentd_rename_session" => {
+            let sid = arg_str(&args, "session_id")?;
+            let title = arg_str(&args, "title").ok().filter(|s| !s.trim().is_empty());
+            client.set_title(&sid, title).await?;
+            json!({ "ok": true })
+        }
+        other => return Err(anyhow!("unknown tool: {other}")),
+    };
+
+    // Per MCP, `tools/call` returns a `content` array. Surface the JSON
+    // result as a single text block — the LLM parses it.
+    let text = serde_json::to_string_pretty(&result_json)?;
+    Ok(json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": false,
+    }))
+}
+
+fn arg_str(args: &Value, name: &str) -> Result<String> {
+    args.get(name)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("missing or non-string `{name}`"))
+}
+
+fn arg_u64(args: &Value, name: &str) -> Result<u64> {
+    args.get(name)
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("missing or non-integer `{name}`"))
+}
+
+fn arg_usize(args: &Value, name: &str) -> Option<usize> {
+    args.get(name).and_then(|v| v.as_u64()).map(|n| n as usize)
+}
+

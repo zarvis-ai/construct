@@ -1,15 +1,15 @@
 [package]
-name = "agentd-cli"
+name = "agentd-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "agent: TUI client for agentd"
+description = "MCP stdio server for agentd: lets an agent inside an agentd session control the daemon"
 
 [[bin]]
-name = "agent"
+name = "agentd-mcp"
 path = "src/main.rs"
 
 [dependencies]
@@ -22,12 +22,4 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-ratatui.workspace = true
-crossterm = { workspace = true, features = ["event-stream"] }
-clap.workspace = true
-chrono.workspace = true
-futures.workspace = true
-unicode-width.workspace = true
-vt100.workspace = true
-tui-term.workspace = true
 base64.workspace = true

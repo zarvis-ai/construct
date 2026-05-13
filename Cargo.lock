@@ -62,6 +62,7 @@ dependencies = [
 name = "agentd-cli"
 version = "0.1.0"
 dependencies = [
+ "agentd-client",
  "agentd-protocol",
  "anyhow",
  "base64",
@@ -79,6 +80,35 @@ dependencies = [
  "tui-term",
  "unicode-width",
  "vt100",
+]
+
+[[package]]
+name = "agentd-client"
+version = "0.1.0"
+dependencies = [
+ "agentd-protocol",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "agentd-mcp"
+version = "0.1.0"
+dependencies = [
+ "agentd-client",
+ "agentd-protocol",
+ "anyhow",
+ "base64",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

@@ -2,8 +2,10 @@
 resolver = "2"
 members = [
     "crates/protocol",
+    "crates/client",
     "crates/daemon",
     "crates/cli",
+    "crates/mcp",
     "crates/adapter-shell",
     "crates/adapter-claude",
     "crates/adapter-codex",
@@ -45,6 +47,7 @@ tui-term = "0.3"
 bytes = "1"
 
 agentd-protocol = { path = "crates/protocol" }
+agentd-client = { path = "crates/client" }
 
 [profile.release]
 lto = "thin"

@@ -79,6 +79,33 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Resolve a sibling binary (an adapter, `agentd-mcp`, etc.) by name.
+/// Search order: absolute path → next to the current executable → `$PATH`.
+/// Returns `None` if not found. Used by the daemon to find adapter
+/// binaries and by adapters to find auxiliary tools like `agentd-mcp`.
+pub fn locate_sibling_binary(name: &str) -> Option<PathBuf> {
+    let p = PathBuf::from(name);
+    if p.is_absolute() {
+        return p.exists().then_some(p);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(&p);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn env_dir(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }

@@ -46,6 +46,51 @@ use tokio::sync::mpsc;
 #[cfg(feature = "pty")]
 pub mod pty;
 
+use crate::paths;
+use std::path::PathBuf;
+
+/// If `AGENTD_INJECT_MCP` is not set to `"0"`, attempt to write a per-session
+/// MCP config (under `state_dir/mcp/<session_id>.json`) that registers
+/// `agentd-mcp` as an MCP server. Returns the config path on success; pass
+/// it to the child CLI via `--mcp-config <path>`.
+///
+/// Used by the claude/codex adapters in interactive mode to let an agent
+/// running inside an agentd session reach the daemon over MCP.
+pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
+    if std::env::var("AGENTD_INJECT_MCP").as_deref() == Ok("0") {
+        return None;
+    }
+    let mcp_bin = paths::locate_sibling_binary("agentd-mcp")?;
+    let paths = paths::Paths::discover();
+    let dir = paths.state_dir.join("mcp");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "agentd MCP inject: mkdir {} failed: {e}",
+            dir.display()
+        );
+        return None;
+    }
+    let cfg_path = dir.join(format!("{session_id}.json"));
+    let config = serde_json::json!({
+        "mcpServers": {
+            "agentd": {
+                "command": mcp_bin.to_string_lossy(),
+                "args": [],
+                "env": { "AGENTD_SESSION_ID": session_id },
+            }
+        }
+    });
+    let text = serde_json::to_string_pretty(&config).ok()?;
+    if let Err(e) = std::fs::write(&cfg_path, text) {
+        eprintln!(
+            "agentd MCP inject: write {} failed: {e}",
+            cfg_path.display()
+        );
+        return None;
+    }
+    Some(cfg_path)
+}
+
 /// Messages the adapter runner can deliver into a running session task.
 #[derive(Debug, Clone)]
 pub enum AdapterInboxMsg {

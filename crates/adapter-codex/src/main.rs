@@ -80,14 +80,27 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         args.push("-m".into());
         args.push(m.clone());
     }
+    // Auto-inject agentd MCP server (see adapter-claude for details). codex's
+    // CLI accepts an MCP config the same way claude's does; opt out with
+    // AGENTD_INJECT_MCP=0.
+    if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&ctx.session_id) {
+        args.push("--mcp-config".into());
+        args.push(cfg.to_string_lossy().to_string());
+    }
     if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
         args.push(prompt.clone());
     }
+    let mut env: Vec<(String, String)> = params
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
     let spec = PtySpec {
         bin: bin.clone(),
         args,
         cwd: std::path::PathBuf::from(&params.cwd),
-        env: params.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        env,
         size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
         status_detail: Some(format!("{bin} (interactive)")),
     };

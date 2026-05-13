@@ -3,12 +3,11 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod app;
-mod client;
 mod keymap;
 mod ui;
 
+use agentd_client::Client;
 use agentd_protocol::paths::Paths;
-use client::Client;
 
 #[derive(Debug, Parser)]
 #[command(

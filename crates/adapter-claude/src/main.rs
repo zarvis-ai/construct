@@ -84,15 +84,30 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         args.push("--model".into());
         args.push(m.clone());
     }
+    // Auto-inject the agentd MCP server so the agent inside this session
+    // can drive the daemon (list other sessions, send input, spawn helpers,
+    // etc.). Opt out with AGENTD_INJECT_MCP=0.
+    if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&ctx.session_id) {
+        args.push("--mcp-config".into());
+        args.push(cfg.to_string_lossy().to_string());
+    }
     if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
         // claude treats trailing positional as the initial prompt.
         args.push(prompt.clone());
     }
+    // Surface the session id to the child's env so agents that aren't using
+    // MCP (or the user, via `echo $AGENTD_SESSION_ID`) can still tell.
+    let mut env: Vec<(String, String)> = params
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
     let spec = PtySpec {
         bin: bin.clone(),
         args,
         cwd: std::path::PathBuf::from(&params.cwd),
-        env: params.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        env,
         size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
         status_detail: Some(format!("{bin} (interactive)")),
     };

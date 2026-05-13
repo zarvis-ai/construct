@@ -753,6 +753,16 @@ impl SessionManager {
             tracing::warn!(%id, error = ?e, "remove_session failed");
         }
 
+        // Best-effort: remove the per-session MCP config the adapter may
+        // have written for an injected `agentd-mcp` server.
+        let mcp_path = agentd_protocol::paths::Paths::discover()
+            .state_dir
+            .join("mcp")
+            .join(format!("{id}.json"));
+        if mcp_path.exists() {
+            let _ = std::fs::remove_file(&mcp_path);
+        }
+
         let _ = self
             .broadcast
             .send(BroadcastMsg::Deleted(DeletedNotificationPayload {

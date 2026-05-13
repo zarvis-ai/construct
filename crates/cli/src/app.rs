@@ -1,6 +1,6 @@
 //! TUI app state and event loop.
 
-use crate::client::Client;
+use agentd_client::Client;
 use crate::keymap::{self, ChordState, KeyAction, Keymap, KeymapResult, Profile};
 use crate::ui;
 use agentd_protocol::{
