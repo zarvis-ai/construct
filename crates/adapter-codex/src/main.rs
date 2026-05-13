@@ -80,12 +80,11 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         args.push("-m".into());
         args.push(m.clone());
     }
-    // Auto-inject agentd MCP server (see adapter-claude for details). codex's
-    // CLI accepts an MCP config the same way claude's does; opt out with
-    // AGENTD_INJECT_MCP=0.
-    if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&ctx.session_id) {
-        args.push("--mcp-config".into());
-        args.push(cfg.to_string_lossy().to_string());
+    // Auto-inject agentd MCP server via codex's `-c` override (codex has no
+    // `--mcp-config` flag — MCP servers live in `[mcp_servers.<name>]`).
+    // Opt out with AGENTD_INJECT_MCP=0.
+    for a in agentd_protocol::adapter::maybe_inject_codex_mcp_args(&ctx.session_id) {
+        args.push(a);
     }
     if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
         args.push(prompt.clone());

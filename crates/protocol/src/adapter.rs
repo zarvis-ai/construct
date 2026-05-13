@@ -63,13 +63,50 @@ pub fn missing_bin_hint(bin: &str, source: &std::io::Error) -> String {
     )
 }
 
+/// Returns codex `-c key=value` flag pairs that register `agentd-mcp` as a
+/// session-scoped MCP server. Codex has no `--mcp-config` flag; MCP servers
+/// live in `[mcp_servers.<name>]` in `config.toml`, and the per-invocation
+/// override surface is `-c <dotted.key>=<toml-value>`.
+///
+/// The returned `Vec<String>` is appended to codex's argv (`-c`, `<value>`,
+/// `-c`, `<value>`, ...). Empty when `AGENTD_INJECT_MCP=0` or the
+/// `agentd-mcp` binary cannot be located.
+pub fn maybe_inject_codex_mcp_args(session_id: &str) -> Vec<String> {
+    if std::env::var("AGENTD_INJECT_MCP").as_deref() == Ok("0") {
+        return Vec::new();
+    }
+    let Some(bin) = paths::locate_sibling_binary("agentd-mcp") else {
+        return Vec::new();
+    };
+    let bin_lit = toml_quote(&bin.to_string_lossy());
+    let sid_lit = toml_quote(session_id);
+    let inline = format!(
+        "{{ command = {bin_lit}, args = [], env = {{ AGENTD_SESSION_ID = {sid_lit} }} }}"
+    );
+    vec!["-c".into(), format!("mcp_servers.agentd={inline}")]
+}
+
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// If `AGENTD_INJECT_MCP` is not set to `"0"`, attempt to write a per-session
 /// MCP config (under `state_dir/mcp/<session_id>.json`) that registers
 /// `agentd-mcp` as an MCP server. Returns the config path on success; pass
-/// it to the child CLI via `--mcp-config <path>`.
+/// it to the child CLI via `--mcp-config <path>` (claude-style).
 ///
-/// Used by the claude/codex adapters in interactive mode to let an agent
-/// running inside an agentd session reach the daemon over MCP.
+/// Used by the claude adapter in interactive mode. Codex uses
+/// [`maybe_inject_codex_mcp_args`] instead.
 pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
     if std::env::var("AGENTD_INJECT_MCP").as_deref() == Ok("0") {
         return None;
