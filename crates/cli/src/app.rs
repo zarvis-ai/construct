@@ -99,7 +99,10 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         client: client.clone(),
         sessions,
         selected: 0,
-        focus: PaneFocus::View,
+        // Start focused on the list so navigation keys (Up/Down, C-n/C-p)
+        // work immediately on first launch. User reaches the view with
+        // `C-x o` or `Tab`.
+        focus: PaneFocus::List,
         transcript: Vec::new(),
         transcript_session: None,
         transcript_scroll: 0,
