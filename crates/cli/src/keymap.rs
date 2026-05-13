@@ -20,6 +20,9 @@ pub enum KeyAction {
     /// in the emacs profile, matching `other-window`.
     SwitchFocus,
     ToggleView,
+    /// Pin / unpin the currently-selected session so it stays in the pin
+    /// strip below the main view.
+    TogglePin,
     ScrollUp,
     ScrollDown,
     ScrollPageUp,
@@ -164,6 +167,9 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('d')]), OpenDiff),
         (Chord(vec![ctrl('x'), ch('i')]), OpenSendInput),
         (Chord(vec![ctrl('x'), ch('r')]), Refresh),
+        // Pin / unpin selected session
+        (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
+        (Chord(vec![ch(' ')]), TogglePin),
         // Interrupt the running adapter (emacs comint convention)
         (Chord(vec![ctrl('c'), ctrl('c')]), Interrupt),
         // Command palette — `M-x` is the canonical emacs binding; `C-x x` is
@@ -199,6 +205,8 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('c')]), Interrupt),
         (Chord(vec![ch('r')]), Refresh),
         (Chord(vec![ch('v')]), ToggleView),
+        (Chord(vec![ch(' ')]), TogglePin),
+        (Chord(vec![ch('p')]), TogglePin),
         (Chord(vec![ch(':')]), OpenCommandPalette),
         (Chord(vec![key(KeyCode::Tab)]), SwitchFocus),
         // PTY-mode escape: C-x is the universal prefix here too, so `C-x o`

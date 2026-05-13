@@ -273,6 +273,7 @@ impl SessionManager {
             event_count: 0,
             has_pty: false,
             mode: params.mode.clone(),
+            pinned: false,
         };
         self.storage.save_summary(&summary)?;
 
@@ -666,6 +667,25 @@ impl SessionManager {
             .broadcast
             .send(BroadcastMsg::Deleted(DeletedNotificationPayload {
                 session_id: id.to_string(),
+            }));
+        Ok(())
+    }
+
+    pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.pinned = pinned;
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
             }));
         Ok(())
     }

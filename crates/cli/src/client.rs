@@ -4,8 +4,8 @@ use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, transport, CreateSessionParams, DiffResult, ErrorObject, HarnessInfo, Notification,
     PingResult, PtyReplayResult, Request, Response, SessionDetail, SessionIdParams,
-    SessionInputParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSummary,
-    SubscribeParams, TranscriptParams, TranscriptResult,
+    SessionInputParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetPinnedParams,
+    SessionSummary, SubscribeParams, TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -219,6 +219,18 @@ impl Client {
             .request(
                 ipc_method::SESSION_DELETE,
                 &SessionIdParams { session_id: id.to_string() },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_SET_PINNED,
+                &SessionSetPinnedParams {
+                    session_id: id.to_string(),
+                    pinned,
+                },
             )
             .await?;
         Ok(())

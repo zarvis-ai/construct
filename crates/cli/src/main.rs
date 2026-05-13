@@ -68,6 +68,10 @@ enum Command {
     /// Delete a session entirely (kill if running, remove transcript + worktree).
     #[command(visible_alias = "rm")]
     Delete { session_id: String },
+    /// Pin a session so it's always shown as a live tile in the TUI pin strip.
+    Pin { session_id: String },
+    /// Unpin a session.
+    Unpin { session_id: String },
     /// Show diff of session's working tree.
     Diff { session_id: String },
     /// Show session detail + transcript.
@@ -192,6 +196,16 @@ async fn main() -> Result<()> {
         Command::Delete { session_id } => {
             let c = connect(&socket).await?;
             c.delete(&session_id).await?;
+            Ok(())
+        }
+        Command::Pin { session_id } => {
+            let c = connect(&socket).await?;
+            c.set_pinned(&session_id, true).await?;
+            Ok(())
+        }
+        Command::Unpin { session_id } => {
+            let c = connect(&socket).await?;
+            c.set_pinned(&session_id, false).await?;
             Ok(())
         }
         Command::Diff { session_id } => {

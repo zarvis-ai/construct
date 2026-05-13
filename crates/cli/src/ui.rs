@@ -27,19 +27,46 @@ pub fn render(f: &mut Frame, app: &mut App) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(40), Constraint::Min(0)])
         .split(main_area);
-    let detail_area = cols[1];
-    // Inner area inside the borders is the PTY's pane size.
+    let right_area = cols[1];
+
+    // Split the right area into main + pin strip if any sessions are pinned.
+    let pinned_ids: Vec<String> = app
+        .sessions
+        .iter()
+        .filter(|s| s.pinned)
+        .map(|s| s.id.clone())
+        .collect();
+    let (detail_area, pin_strip_area) = if pinned_ids.is_empty() {
+        (right_area, None)
+    } else {
+        let strip_h = pin_strip_height(right_area.height);
+        let vsplit = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(strip_h)])
+            .split(right_area);
+        (vsplit[0], Some(vsplit[1]))
+    };
+
+    // The PTY pane size tracks the *main* view's inner area; pinned tiles
+    // are passive tails reading from the same parser.
     let inner_cols = detail_area.width.saturating_sub(2);
     let inner_rows = detail_area.height.saturating_sub(2);
     app.terminal_pane_size = (inner_cols, inner_rows);
 
     render_sessions(f, cols[0], app);
     render_detail(f, detail_area, app);
+    if let Some(strip) = pin_strip_area {
+        render_pin_strip(f, strip, app, &pinned_ids);
+    }
     render_modeline(f, modeline_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
         render_help(f, area);
     }
+}
+
+fn pin_strip_height(total_h: u16) -> u16 {
+    (total_h / 3).clamp(7, 18)
 }
 
 fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
@@ -53,6 +80,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|s| {
             let glyph = s.state.glyph();
+            let pin_glyph = if s.pinned { "*" } else { " " };
             let secondary = s
                 .title
                 .clone()
@@ -60,6 +88,10 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                 .unwrap_or_default();
             let secondary = shorten(&secondary, 32);
             let line = Line::from(vec![
+                Span::styled(
+                    pin_glyph.to_string(),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::styled(format!(" {} ", glyph), state_style(s.state)),
                 Span::styled(
                     short_id(&s.id).to_string(),
@@ -286,6 +318,9 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
     C-v / M-v       scroll page down/up
     g g / G         scroll top / bottom
 
+  pinning (live tile in the pin strip below the main view)
+    Space / C-x p   toggle pin on selected session
+
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
     ?               toggle this help
@@ -385,6 +420,136 @@ fn pane_border_style(focused: bool) -> Style {
         Style::default().fg(Color::Yellow)
     } else {
         Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String]) {
+    if pinned_ids.is_empty() || area.height < 3 || area.width < 6 {
+        return;
+    }
+    let tiles = pin_tile_layout(area, pinned_ids.len());
+    let selected_id = app.selected_id();
+    for (tile_area, id) in tiles.iter().zip(pinned_ids.iter()) {
+        let summary = app.sessions.iter().find(|s| &s.id == id);
+        let is_selected = selected_id.as_deref() == Some(id.as_str());
+        let title = match summary {
+            Some(s) => format!(
+                " * {} {} {} ",
+                s.state.glyph(),
+                short_id(&s.id),
+                s.harness
+            ),
+            None => format!(" * {} ", short_id(id)),
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(pane_border_style(is_selected))
+            .title(title);
+        let inner = block.inner(*tile_area);
+        f.render_widget(block, *tile_area);
+        if let Some(parser) = app.terminals.get(id) {
+            render_pty_tail(f, inner, parser.screen());
+        } else {
+            // No PTY data yet — show a placeholder.
+            let p = Paragraph::new("(no data yet)")
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(p, inner);
+        }
+    }
+}
+
+fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
+    let n = n.max(1);
+    let cols = n.min(4).max(1);
+    let rows = (n + cols - 1) / cols;
+    let row_constraints: Vec<Constraint> =
+        (0..rows).map(|_| Constraint::Ratio(1, rows as u32)).collect();
+    let row_areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(row_constraints)
+        .split(area);
+    let mut tiles: Vec<Rect> = Vec::with_capacity(n);
+    for (r_idx, row_area) in row_areas.iter().enumerate() {
+        let placed = r_idx * cols;
+        let remaining = n.saturating_sub(placed);
+        if remaining == 0 {
+            break;
+        }
+        let cols_here = remaining.min(cols).max(1);
+        let col_constraints: Vec<Constraint> = (0..cols_here)
+            .map(|_| Constraint::Ratio(1, cols_here as u32))
+            .collect();
+        let col_areas = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints(col_constraints)
+            .split(*row_area);
+        for col_area in col_areas.iter() {
+            tiles.push(*col_area);
+        }
+    }
+    tiles
+}
+
+/// Render the bottom rows of a vt100 screen into `area`, preserving colors
+/// and attributes. Used by the pin strip — the screen itself is sized to the
+/// main view, so what fits in a smaller tile is exactly the recent activity.
+fn render_pty_tail(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
+    let (rows, cols) = screen.size();
+    let visible_h = area.height.min(rows);
+    let visible_w = area.width.min(cols);
+    let start_row = rows.saturating_sub(visible_h);
+    let buf = f.buffer_mut();
+    for r in 0..visible_h {
+        for c in 0..visible_w {
+            let src_row = start_row + r;
+            let src_col = c;
+            let Some(cell) = screen.cell(src_row, src_col) else {
+                continue;
+            };
+            let x = area.x + c;
+            let y = area.y + r;
+            if let Some(buf_cell) = buf.cell_mut(Position { x, y }) {
+                let contents = cell.contents();
+                if contents.is_empty() {
+                    buf_cell.set_char(' ');
+                } else {
+                    buf_cell.set_symbol(&contents);
+                }
+                buf_cell.set_style(vt100_cell_style(cell));
+            }
+        }
+    }
+}
+
+fn vt100_cell_style(cell: &vt100::Cell) -> Style {
+    let mut s = Style::default();
+    if let Some(c) = vt100_color(cell.fgcolor()) {
+        s = s.fg(c);
+    }
+    if let Some(c) = vt100_color(cell.bgcolor()) {
+        s = s.bg(c);
+    }
+    let mut mods = Modifier::empty();
+    if cell.bold() {
+        mods.insert(Modifier::BOLD);
+    }
+    if cell.italic() {
+        mods.insert(Modifier::ITALIC);
+    }
+    if cell.underline() {
+        mods.insert(Modifier::UNDERLINED);
+    }
+    if cell.inverse() {
+        mods.insert(Modifier::REVERSED);
+    }
+    s.add_modifier(mods)
+}
+
+fn vt100_color(c: vt100::Color) -> Option<Color> {
+    match c {
+        vt100::Color::Default => None,
+        vt100::Color::Idx(i) => Some(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
     }
 }
 

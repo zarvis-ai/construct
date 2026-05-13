@@ -370,8 +370,9 @@ impl App {
     }
 
     /// Called from `ui::render` after computing the terminal pane size. Sends
-    /// `pty_resize` when the size changed for the currently-focused PTY
-    /// session.
+    /// `pty_resize` for the currently-focused PTY session and for every
+    /// pinned PTY-backed session so their children's view of the world
+    /// tracks what we're actually rendering against.
     pub async fn notify_pane_size(&mut self, cols: u16, rows: u16) {
         if (cols, rows) == self.terminal_pane_size {
             return;
@@ -380,14 +381,18 @@ impl App {
         for parser in self.terminals.values_mut() {
             parser.set_size(rows.max(1), cols.max(1));
         }
-        if let Some(id) = self.selected_id() {
-            if self
-                .selected_session()
-                .map(|s| s.has_pty)
-                .unwrap_or(false)
-            {
-                let _ = self.client.pty_resize(&id, cols, rows).await;
-            }
+        let targets: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|s| {
+                s.has_pty
+                    && !s.state.is_terminal()
+                    && (s.pinned || Some(s.id.as_str()) == self.selected_id().as_deref())
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        for id in targets {
+            let _ = self.client.pty_resize(&id, cols, rows).await;
         }
     }
 
@@ -588,6 +593,43 @@ impl App {
                     }
                     _ => ViewMode::Transcript,
                 };
+            }
+            TogglePin => {
+                let Some(s) = self.selected_session() else {
+                    self.set_status("no session selected".into());
+                    return;
+                };
+                let id = s.id.clone();
+                let was_pinned = s.pinned;
+                let want = !was_pinned;
+                match self.client.set_pinned(&id, want).await {
+                    Ok(()) => {
+                        // Optimistically update the local list so the UI
+                        // reflects the change immediately; the daemon's
+                        // State broadcast will reconcile.
+                        if let Some(i) =
+                            self.sessions.iter().position(|s| s.id == id)
+                        {
+                            self.sessions[i].pinned = want;
+                        }
+                        // Bootstrap a parser for the pinned session so the
+                        // tail starts rendering before the next event.
+                        if want
+                            && self
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == id)
+                                .map(|s| s.has_pty)
+                                .unwrap_or(false)
+                        {
+                            self.bootstrap_terminal(&id).await;
+                        }
+                        self.set_status(
+                            if want { "pinned" } else { "unpinned" }.into(),
+                        );
+                    }
+                    Err(e) => self.set_status(format!("set_pinned failed: {e}")),
+                }
             }
             ScrollUp => {
                 if self.transcript_scroll != u16::MAX {
