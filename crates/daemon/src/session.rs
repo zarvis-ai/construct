@@ -738,6 +738,29 @@ impl SessionManager {
         Ok(())
     }
 
+    pub async fn set_title(&self, id: &str, title: Option<String>) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        // Normalize: trim, treat empty as None.
+        let normalized = title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.title = normalized;
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        Ok(())
+    }
+
     pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
         let entry = self
             .get_entry(id)

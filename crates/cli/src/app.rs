@@ -43,6 +43,7 @@ pub enum MinibufferIntent {
     SendInput { session_id: String },
     NewSessionHarness,
     DeleteConfirm { session_id: String },
+    Rename { session_id: String },
     CommandPalette,
 }
 
@@ -598,6 +599,22 @@ impl App {
                     error: None,
                 });
             }
+            OpenRename => {
+                let Some(s) = self.selected_session() else {
+                    self.set_status("no session selected".into());
+                    return;
+                };
+                let id = s.id.clone();
+                let current = s.title.clone().unwrap_or_default();
+                let cursor = current.chars().count();
+                self.minibuffer = Some(Minibuffer {
+                    prompt: format!("Rename {} to: ", short_id(&id)),
+                    input: current,
+                    cursor,
+                    intent: MinibufferIntent::Rename { session_id: id },
+                    error: None,
+                });
+            }
             OpenDeleteConfirm => {
                 if let Some(id) = self.selected_id() {
                     self.minibuffer = Some(Minibuffer {
@@ -905,6 +922,31 @@ impl App {
                     Err(e) => self.set_status(format!("create failed: {e}")),
                 }
             }
+            MinibufferIntent::Rename { session_id } => {
+                let trimmed = input.trim().to_string();
+                let new_title = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                match self.client.set_title(&session_id, new_title.clone()).await {
+                    Ok(()) => {
+                        // Optimistically reflect locally.
+                        if let Some(i) =
+                            self.sessions.iter().position(|s| s.id == session_id)
+                        {
+                            self.sessions[i].title = new_title.clone();
+                        }
+                        self.set_status(
+                            match &new_title {
+                                Some(t) => format!("renamed → {t}"),
+                                None => "title cleared".into(),
+                            },
+                        );
+                    }
+                    Err(e) => self.set_status(format!("rename failed: {e}")),
+                }
+            }
             MinibufferIntent::DeleteConfirm { session_id } => {
                 let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
                 if !yes {
@@ -936,6 +978,7 @@ impl App {
             "new" | "new-session" => self.run_action(KeyAction::OpenNewSession).await,
             "send" | "send-input" => self.run_action(KeyAction::OpenSendInput).await,
             "delete" | "kill" | "rm" => self.run_action(KeyAction::OpenDeleteConfirm).await,
+            "rename" => self.run_action(KeyAction::OpenRename).await,
             "diff" => self.run_action(KeyAction::OpenDiff).await,
             "interrupt" => self.run_action(KeyAction::Interrupt).await,
             "help" | "?" => self.help_visible = true,

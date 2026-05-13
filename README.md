@@ -109,7 +109,7 @@ default — `C-x` is the escape prefix back to agentd commands.
 | `C-x i` | send input to selected session |
 | `C-x k` | delete selected session (confirms; kills if running, drops transcript + worktree) |
 | `C-x d` | show diff |
-| `C-x r` | refresh |
+| `C-x r` | rename selected session (sets the user-facing title; submit empty to clear back to the hash) |
 | `C-c C-c` | interrupt |
 | `M-x` / `C-x x` | command palette (the `C-x x` alias is Meta-free, useful on macOS Terminal.app without "Use Option as Meta") |
 | `C-v` / `M-v` | scroll page down / up |

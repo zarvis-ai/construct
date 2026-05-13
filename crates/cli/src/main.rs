@@ -72,6 +72,17 @@ enum Command {
     Pin { session_id: String },
     /// Unpin a session.
     Unpin { session_id: String },
+    /// Rename a session — sets the user-facing title (shown instead of the
+    /// session hash). Pass `--clear` to remove the title and fall back to
+    /// the hash.
+    Rename {
+        session_id: String,
+        /// New title. Omit when using `--clear`.
+        #[arg(required_unless_present = "clear")]
+        title: Option<String>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Show diff of session's working tree.
     Diff { session_id: String },
     /// Show session detail + transcript.
@@ -206,6 +217,16 @@ async fn main() -> Result<()> {
         Command::Unpin { session_id } => {
             let c = connect(&socket).await?;
             c.set_pinned(&session_id, false).await?;
+            Ok(())
+        }
+        Command::Rename {
+            session_id,
+            title,
+            clear,
+        } => {
+            let c = connect(&socket).await?;
+            let new_title = if clear { None } else { title };
+            c.set_title(&session_id, new_title).await?;
             Ok(())
         }
         Command::Diff { session_id } => {

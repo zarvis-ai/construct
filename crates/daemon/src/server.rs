@@ -6,8 +6,8 @@ use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, ipc_notif, transport, CreateSessionParams, ErrorObject, Notification, PingResult,
     Request, Response, SessionIdParams, SessionInputParams, SessionMoveParams,
-    SessionPtyInputParams, SessionPtyResizeParams, SessionSetPinnedParams, SubscribeParams,
-    TranscriptParams, IPC_VERSION,
+    SessionPtyInputParams, SessionPtyResizeParams, SessionSetPinnedParams, SessionSetTitleParams,
+    SubscribeParams, TranscriptParams, IPC_VERSION,
 };
 use anyhow::Result;
 use serde_json::json;
@@ -300,6 +300,13 @@ async fn dispatch(
         m if m == ipc_method::SESSION_SET_PINNED => {
             let p = params!(SessionSetPinnedParams);
             match manager.set_pinned(&p.session_id, p.pinned).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_SET_TITLE => {
+            let p = params!(SessionSetTitleParams);
+            match manager.set_title(&p.session_id, p.title).await {
                 Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

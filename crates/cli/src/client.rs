@@ -5,8 +5,8 @@ use agentd_protocol::{
     ipc_method, transport, CreateSessionParams, DiffResult, ErrorObject, HarnessInfo,
     MoveDirection, Notification, PingResult, PtyReplayResult, Request, Response, SessionDetail,
     SessionIdParams, SessionInputParams, SessionMoveParams, SessionPtyInputParams,
-    SessionPtyResizeParams, SessionSetPinnedParams, SessionSummary, SubscribeParams,
-    TranscriptParams, TranscriptResult,
+    SessionPtyResizeParams, SessionSetPinnedParams, SessionSetTitleParams, SessionSummary,
+    SubscribeParams, TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -231,6 +231,18 @@ impl Client {
                 &SessionSetPinnedParams {
                     session_id: id.to_string(),
                     pinned,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn set_title(&self, id: &str, title: Option<String>) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_SET_TITLE,
+                &SessionSetTitleParams {
+                    session_id: id.to_string(),
+                    title,
                 },
             )
             .await?;

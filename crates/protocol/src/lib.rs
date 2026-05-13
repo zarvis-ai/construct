@@ -305,6 +305,7 @@ pub mod ipc_method {
     pub const SESSION_KILL: &str = "session.kill";
     pub const SESSION_DELETE: &str = "session.delete";
     pub const SESSION_SET_PINNED: &str = "session.set_pinned";
+    pub const SESSION_SET_TITLE: &str = "session.set_title";
     pub const SESSION_MOVE: &str = "session.move";
     pub const SESSION_DIFF: &str = "session.diff";
     pub const SESSION_TRANSCRIPT: &str = "session.transcript";
@@ -389,6 +390,14 @@ pub struct SessionMoveParams {
 pub struct SessionSetPinnedParams {
     pub session_id: String,
     pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSetTitleParams {
+    pub session_id: String,
+    /// `None` clears any user-set title (display falls back to the hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

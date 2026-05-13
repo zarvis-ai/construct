@@ -13,6 +13,7 @@ pub enum KeyAction {
     OpenSendInput,
     OpenNewSession,
     OpenDeleteConfirm,
+    OpenRename,
     OpenDiff,
     Interrupt,
     OpenCommandPalette,
@@ -173,7 +174,10 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('k')]), OpenDeleteConfirm),
         (Chord(vec![ctrl('x'), ch('d')]), OpenDiff),
         (Chord(vec![ctrl('x'), ch('i')]), OpenSendInput),
-        (Chord(vec![ctrl('x'), ch('r')]), Refresh),
+        // `C-x r` opens the rename minibuffer (with current title pre-filled).
+        // Refresh moved to the command palette (M-x refresh) — it's rarely
+        // needed since the daemon pushes state changes automatically.
+        (Chord(vec![ctrl('x'), ch('r')]), OpenRename),
         // Pin / unpin selected session
         (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
         (Chord(vec![ch(' ')]), TogglePin),
@@ -218,7 +222,8 @@ fn vim() -> Keymap {
         (Chord(vec![shift('K')]), OpenDeleteConfirm),
         (Chord(vec![ch('d')]), OpenDiff),
         (Chord(vec![ctrl('c')]), Interrupt),
-        (Chord(vec![ch('r')]), Refresh),
+        // `r` opens the rename minibuffer; refresh moved to M-x refresh.
+        (Chord(vec![ch('r')]), OpenRename),
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch(' ')]), TogglePin),
         (Chord(vec![ch('p')]), TogglePin),

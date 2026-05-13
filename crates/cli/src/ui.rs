@@ -81,11 +81,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
         .map(|s| {
             let glyph = s.state.glyph();
             let pin_glyph = if s.pinned { "*" } else { " " };
-            let secondary = s
-                .title
-                .clone()
-                .or_else(|| s.last_prompt.clone())
-                .unwrap_or_default();
+            let label = primary_label(s);
+            let secondary = s.last_prompt.clone().unwrap_or_default();
             let secondary = shorten(&secondary, 32);
             let line = Line::from(vec![
                 Span::styled(
@@ -93,10 +90,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Yellow),
                 ),
                 Span::styled(format!(" {} ", glyph), state_style(s.state)),
-                Span::styled(
-                    short_id(&s.id).to_string(),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(label, Style::default().fg(Color::White)),
                 Span::raw("  "),
                 Span::styled(
                     format!("{:<7}", s.harness),
@@ -147,7 +141,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         Some(s) => format!(
             " {} {}  {}  {} ",
             s.state.glyph(),
-            short_id(&s.id),
+            primary_label(s),
             s.harness,
             s.state.label()
         ),
@@ -212,7 +206,7 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
         profile = app.profile.label(),
         focus = focus_label,
         sel = match s {
-            Some(s) => short_id(&s.id).to_string(),
+            Some(s) => primary_label(s),
             None => "-".into(),
         },
         state = match s {
@@ -311,7 +305,7 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
     C-x i           send input to selected session
     C-x k           delete selected session (confirms; kills if running)
     C-x d           show diff
-    C-x r           refresh
+    C-x r           rename selected session (clears title on empty submit)
     C-c C-c         interrupt
 
   scrollback
@@ -329,6 +323,8 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
+                    palette commands: new send delete rename diff
+                                      interrupt refresh harnesses help
     ?               toggle this help
     C-x C-c / q     quit
 
@@ -442,7 +438,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String])
             Some(s) => format!(
                 " * {} {} {} ",
                 s.state.glyph(),
-                short_id(&s.id),
+                primary_label(s),
                 s.harness
             ),
             None => format!(" * {} ", short_id(id)),
@@ -613,4 +609,13 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
 fn short_id(id: &str) -> &str {
     let n = id.len().min(10);
     &id[..n]
+}
+
+/// User-facing primary label for a session: the user-set title when present,
+/// otherwise the short id (the hash). Trimmed/empty titles count as unset.
+fn primary_label(s: &agentd_protocol::SessionSummary) -> String {
+    match s.title.as_deref() {
+        Some(t) if !t.trim().is_empty() => t.trim().to_string(),
+        _ => short_id(&s.id).to_string(),
+    }
 }
