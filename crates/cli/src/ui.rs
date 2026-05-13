@@ -152,7 +152,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
             }
             match item {
                 AppListItem::Session { summary: s, indented } => {
-                    let pin_glyph = if s.pinned { "◆" } else { " " };
+                    let pin_glyph = if s.pinned { "·" } else { " " };
                     let indent_prefix = if *indented { "  " } else { "" };
                     let secondary = s.last_prompt.clone().unwrap_or_default();
                     let secondary = shorten(&secondary, 28);
@@ -595,12 +595,12 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String])
         let is_selected = selected_id.as_deref() == Some(id.as_str());
         let title = match summary {
             Some(s) => format!(
-                " ◆ {} {} {} ",
+                " · {} {} {} ",
                 session_status_glyph(app, s),
                 primary_label(s),
                 s.harness
             ),
-            None => format!(" ◆ {} ", short_id(id)),
+            None => format!(" · {} ", short_id(id)),
         };
         let block = Block::default()
             .borders(Borders::ALL)
