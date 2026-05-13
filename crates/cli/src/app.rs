@@ -824,7 +824,7 @@ impl App {
                 names.push("group");
                 let hint = names.join("|");
                 self.minibuffer = Some(Minibuffer {
-                    prompt: format!("Harness [{hint}] (Tab completes): "),
+                    prompt: format!("New [{hint}] (Tab completes): "),
                     input: String::new(),
                     cursor: 0,
                     intent: MinibufferIntent::NewSessionHarness,
@@ -1075,7 +1075,7 @@ impl App {
                     }
                     if !available_harnesses.iter().any(|h| h == &trimmed) {
                         mb.error = Some(format!(
-                            "no such harness: {trimmed} (Tab to complete)"
+                            "unknown: {trimmed} (Tab to complete)"
                         ));
                         return;
                     }
