@@ -1,7 +1,7 @@
 //! Ratatui rendering for the TUI.
 
 use crate::app::{App, ListItem as AppListItem, PaneFocus, Selection, ViewMode};
-use agentd_protocol::{MessageRole, SessionEvent, SessionState, TimestampedEvent};
+use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -162,7 +162,10 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                             pin_glyph.to_string(),
                             Style::default().fg(Color::Yellow),
                         ),
-                        Span::styled(format!(" {} ", s.state.glyph()), state_style(s.state)),
+                        Span::styled(
+                            format!(" {} ", session_status_glyph(app, s)),
+                            state_style(s.state),
+                        ),
                         Span::styled(primary_label(s), Style::default().fg(Color::White)),
                         Span::raw("  "),
                         Span::styled(
@@ -234,7 +237,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
     let title_inner = match (summary, app.selected_group()) {
         (Some(s), _) => format!(
             " {} {}  {}  {} ",
-            s.state.glyph(),
+            session_status_glyph(app, s),
             primary_label(s),
             s.harness,
             s.state.label()
@@ -298,7 +301,10 @@ fn render_group_overview(
     } else {
         for s in &members {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", s.state.glyph()), state_style(s.state)),
+                Span::styled(
+                    format!("  {} ", session_status_glyph(app, s)),
+                    state_style(s.state),
+                ),
                 Span::raw(primary_label(s)),
                 Span::raw("  "),
                 Span::styled(s.harness.clone(), Style::default().fg(Color::Cyan)),
@@ -712,6 +718,18 @@ fn vt100_color(c: vt100::Color) -> Option<Color> {
         vt100::Color::Default => None,
         vt100::Color::Idx(i) => Some(Color::Indexed(i)),
         vt100::Color::Rgb(r, g, b) => Some(Color::Rgb(r, g, b)),
+    }
+}
+
+/// Glyph for a session's "what's it doing right now" indicator: an
+/// animated spinner if the session is `Running` and its PTY has produced
+/// bytes within the quiescence window, otherwise the session's static
+/// lifecycle glyph.
+fn session_status_glyph(app: &App, s: &SessionSummary) -> &'static str {
+    if matches!(s.state, SessionState::Running) && app.pty_active(&s.id) {
+        app.spinner_frame()
+    } else {
+        s.state.glyph()
     }
 }
 

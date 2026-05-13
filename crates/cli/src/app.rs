@@ -139,7 +139,26 @@ pub struct App {
     /// decreased by mouse-wheel down. Reset to 0 on user keystroke into
     /// the PTY or on session change.
     pub view_scrollback: usize,
+    /// Per-session "last PTY byte" timestamp, updated locally from incoming
+    /// Pty events. Used to drive the "session looks busy" spinner via a
+    /// short quiescence window. Daemon's `SessionSummary.last_pty_at_ms`
+    /// covers cold-start / freshly-connected clients; this map covers the
+    /// live high-frequency case.
+    pub pty_activity: HashMap<String, Instant>,
+    /// Monotonic clock anchor; spinner frame index is computed against this.
+    pub start_instant: Instant,
 }
+
+/// Window during which a session counts as "busy" after its last PTY byte.
+/// Claude/codex TUIs emit a frame every ~80ms while thinking, so 600ms
+/// covers a missed frame without falsely flapping to idle.
+pub const PTY_QUIESCENCE: Duration = Duration::from_millis(600);
+/// Spinner frame cadence — fast enough to feel alive, slow enough to keep
+/// the TUI tick loop cheap.
+pub const SPINNER_FRAME_MS: u128 = 100;
+/// Braille spinner frames (10 frames @ 100ms = 1 Hz cycle).
+pub const SPINNER_FRAMES: [&str; 10] =
+    ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
     let profile = Profile::from_env();
@@ -182,6 +201,8 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         terminal_pane_size: (100, 30),
         zoomed: false,
         view_scrollback: 0,
+        pty_activity: HashMap::new(),
+        start_instant: Instant::now(),
     };
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
@@ -227,7 +248,9 @@ async fn run_loop(
         .take_notifications()
         .await
         .context("notifications channel already taken")?;
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    // Tick fast enough to animate the activity spinner smoothly. Keep ≥
+    // `SPINNER_FRAME_MS` so we redraw on each frame boundary.
+    let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
 
     let mut last_size_sent: (u16, u16) = (0, 0);
     while !app.should_quit {
@@ -552,6 +575,9 @@ impl App {
                                     });
                                 parser.process(&bytes);
                             }
+                            // Mark the session as freshly active for the spinner.
+                            self.pty_activity
+                                .insert(payload.session_id.clone(), Instant::now());
                             return;
                         }
                         if Some(payload.session_id.as_str())
@@ -637,8 +663,39 @@ impl App {
             self.transcript_session = None;
         }
         self.terminals.remove(id);
+        self.pty_activity.remove(id);
         self.ensure_selection_valid();
         self.refresh_selected_transcript().await;
+    }
+
+    /// Is this session "busy" right now — i.e. has it produced PTY bytes
+    /// recently enough that we should render a spinner instead of a static
+    /// dot? Falls back to the daemon-reported `last_pty_at_ms` so a freshly
+    /// connected client doesn't misread an ongoing turn as idle.
+    pub fn pty_active(&self, session_id: &str) -> bool {
+        if let Some(t) = self.pty_activity.get(session_id) {
+            if t.elapsed() < PTY_QUIESCENCE {
+                return true;
+            }
+        }
+        if let Some(s) = self.sessions.iter().find(|s| s.id == session_id) {
+            if let Some(ms) = s.last_pty_at_ms {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                if now_ms - ms < PTY_QUIESCENCE.as_millis() as i64 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Current spinner frame, ticking on wall-time so all sessions animate
+    /// in phase.
+    pub fn spinner_frame(&self) -> &'static str {
+        let idx =
+            (self.start_instant.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
+                % SPINNER_FRAMES.len();
+        SPINNER_FRAMES[idx]
     }
 
     async fn on_group_state(&mut self, g: GroupSummary) {

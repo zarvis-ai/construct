@@ -385,6 +385,13 @@ pub struct SessionSummary {
     /// the group's header, below the ungrouped region).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<String>,
+    /// Unix epoch ms of the most recent PTY byte received from the adapter,
+    /// or `None` if this session has never produced PTY output. Clients use
+    /// `now - last_pty_at_ms < quiescence_window` as a "session looks busy"
+    /// heuristic (drives the TUI's spinner; useful for MCP-driven agents to
+    /// avoid sending input while the agent is mid-turn).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pty_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

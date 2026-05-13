@@ -6,6 +6,7 @@ use agentd_protocol::{CreateSessionParams, PtySize};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Static tool catalog returned by `tools/list`.
@@ -19,7 +20,7 @@ pub fn catalog() -> Vec<Value> {
         ),
         tool(
             "agentd_list_sessions",
-            "List every agentd session known to the daemon (running and finished, ungrouped and grouped). Returns an array of session summaries.",
+            "List every agentd session known to the daemon (running and finished, ungrouped and grouped). Returns an array of session summaries. Each entry includes `last_pty_at_ms` (Unix epoch ms of the latest PTY byte — use `now - last_pty_at_ms < ~600ms` to tell whether the session looks busy) and, when the session belongs to a group, `group_id` and `group_name`.",
             schema_empty(),
         ),
         tool(
@@ -176,7 +177,32 @@ pub async fn call(
     let result_json: Value = match name.as_str() {
         // ----- Read -----
         "agentd_whoami" => json!({ "session_id": session_id }),
-        "agentd_list_sessions" => serde_json::to_value(client.list().await?)?,
+        "agentd_list_sessions" => {
+            // Enrich each summary with its group name so callers don't need
+            // a separate list_groups round-trip. `last_pty_at_ms` is already
+            // part of SessionSummary.
+            let sessions = client.list().await?;
+            let groups = client.list_groups().await.unwrap_or_default();
+            let group_name_by_id: HashMap<&str, &str> = groups
+                .iter()
+                .map(|g| (g.id.as_str(), g.name.as_str()))
+                .collect();
+            let enriched: Vec<Value> = sessions
+                .iter()
+                .map(|s| {
+                    let mut v = serde_json::to_value(s).unwrap_or_else(|_| json!({}));
+                    if let (Some(gid), Value::Object(map)) =
+                        (s.group_id.as_deref(), &mut v)
+                    {
+                        if let Some(name) = group_name_by_id.get(gid) {
+                            map.insert("group_name".into(), json!(name));
+                        }
+                    }
+                    v
+                })
+                .collect();
+            Value::Array(enriched)
+        }
         "agentd_list_harnesses" => serde_json::to_value(client.harnesses().await?)?,
         "agentd_get_session" => {
             let sid = arg_str(&args, "session_id")?;

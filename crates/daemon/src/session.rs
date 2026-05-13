@@ -356,6 +356,7 @@ impl SessionManager {
             // Negative timestamp so newer sessions sort to the top by default.
             position: -now.timestamp_millis(),
             group_id: None,
+            last_pty_at_ms: None,
         };
         self.storage.save_summary(&summary)?;
 
@@ -510,6 +511,10 @@ impl SessionManager {
                 }
             }
             let now = Utc::now();
+            // Track activity for the "session looks busy" signal. In-memory
+            // only; the value gets persisted next time a lifecycle event
+            // triggers save_summary.
+            entry.summary.write().await.last_pty_at_ms = Some(now.timestamp_millis());
             // Latest seq for ordering only; not persisted.
             let seq = entry.transcript_count.load(Ordering::Relaxed);
             let _ = self
