@@ -449,18 +449,12 @@ impl App {
         }
     }
 
-    /// Called from `ui::render` after computing the terminal pane size. Sends
-    /// `pty_resize` for the currently-focused PTY session and for every
-    /// pinned PTY-backed session so their children's view of the world
-    /// tracks what we're actually rendering against.
+    /// Tell every relevant PTY child about the new pane geometry. The actual
+    /// parser-side `set_size` happens during render (so within a single
+    /// frame the parser's screen size matches the area we draw into);
+    /// this method only sends the SIGWINCH-equivalent down to the adapter
+    /// children.
     pub async fn notify_pane_size(&mut self, cols: u16, rows: u16) {
-        if (cols, rows) == self.terminal_pane_size {
-            return;
-        }
-        self.terminal_pane_size = (cols, rows);
-        for parser in self.terminals.values_mut() {
-            parser.set_size(rows.max(1), cols.max(1));
-        }
         let targets: Vec<String> = self
             .sessions
             .iter()
@@ -683,6 +677,17 @@ impl App {
                     // The list is hidden when zoomed — focus must move to
                     // the view so PTY capture takes over naturally.
                     self.focus = PaneFocus::View;
+                }
+                // Most shells (bash) don't repaint on SIGWINCH alone — they
+                // wait for the next readline operation. Send `Ctrl-L` so
+                // the prompt redraws against the new geometry immediately.
+                // Harmless for vim/claude/htop (they treat C-l as redraw).
+                let nudge_target = self
+                    .selected_session()
+                    .filter(|s| s.has_pty && !s.state.is_terminal())
+                    .map(|s| s.id.clone());
+                if let Some(id) = nudge_target {
+                    let _ = self.client.pty_input(&id, vec![0x0C]).await;
                 }
                 self.set_status(
                     if self.zoomed {

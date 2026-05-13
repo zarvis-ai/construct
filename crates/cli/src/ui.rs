@@ -52,10 +52,16 @@ pub fn render(f: &mut Frame, app: &mut App) {
     };
 
     // The PTY pane size tracks the *main* view's inner area; pinned tiles
-    // are passive tails reading from the same parser.
+    // are passive tails reading from the same parser. Resize all parsers
+    // before drawing so the current frame's parser screen geometry matches
+    // the area we're rendering into (otherwise zoom-in shows blank rows at
+    // the bottom and zoom-out clips content).
     let inner_cols = detail_area.width.saturating_sub(2);
     let inner_rows = detail_area.height.saturating_sub(2);
     app.terminal_pane_size = (inner_cols, inner_rows);
+    for parser in app.terminals.values_mut() {
+        parser.set_size(inner_rows.max(1), inner_cols.max(1));
+    }
 
     render_sessions(f, cols[0], app);
     render_detail(f, detail_area, app);
@@ -87,6 +93,11 @@ fn render_zoomed(f: &mut Frame, area: Rect, app: &mut App) {
     let minibuffer_area = vertical[1];
 
     app.terminal_pane_size = (main_area.width, main_area.height);
+    // Match the parsers to the zoomed area before drawing (see comment in
+    // the normal-layout branch).
+    for parser in app.terminals.values_mut() {
+        parser.set_size(main_area.height.max(1), main_area.width.max(1));
+    }
 
     if let Some(diff) = &app.last_diff {
         let para = Paragraph::new(diff.clone()).wrap(Wrap { trim: false });
