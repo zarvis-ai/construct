@@ -92,41 +92,36 @@ scripts/smoke.sh
 The right pane has two views — **transcript** (structured event log) and
 **terminal** (live PTY emulator powered by `vt100`+`tui-term`). Sessions whose
 adapter has `supports_pty=true` (shell always, claude/codex in interactive
-mode) open in terminal view; toggle with `C-x t`.
+mode) open in terminal view.
 
-**Outside terminal mode (or for non-PTY sessions):**
+Two focusable panes (matching standard emacs window semantics): the **list**
+on the left and the **view** on the right. When the view is focused *and* it's
+in terminal mode for a PTY-backed session, keystrokes go to the child by
+default — `C-x` is the escape prefix back to agentd commands.
 
 | Key | Action |
 |---|---|
+| `C-x o` / `Tab` | switch focus (list ↔ view) — `other-window` |
+| `C-x t` | toggle transcript ↔ terminal view |
 | `C-n` / `↓` | next session |
 | `C-p` / `↑` | prev session |
-| `C-c i` | send input to selected session |
-| `C-c n` | new session (minibuffer wizard) |
-| `C-c k` | kill selected session (confirms) |
-| `C-c d` | show diff for selected session |
+| `C-x C-f` | new session (wizard) |
+| `C-x i` | send input to selected session |
+| `C-x k` | kill selected session (confirms) |
+| `C-x d` | show diff |
+| `C-x r` | refresh |
 | `C-c C-c` | interrupt |
-| `C-c r` | refresh |
-| `C-x t` | toggle transcript ↔ terminal view |
 | `M-x` | command palette |
-| `Tab` | switch focus (list / transcript) |
+| `C-v` / `M-v` | scroll page down / up |
+| `g g` / `G` | scroll top / bottom |
 | `?` | toggle help |
 | `C-x C-c` / `q` | quit |
 
-**Inside terminal mode** — every keystroke goes straight to the PTY (shell
-readline, vim, claude TUI, etc. all work normally). To run an agentd command,
-press the escape prefix `C-b`, then a single chord:
-
-| Chord | Action |
-|---|---|
-| `C-b t` | back to transcript view |
-| `C-b n` | new session |
-| `C-b k` | kill session |
-| `C-b d` | diff |
-| `C-b s` / `↓` | next session |
-| `C-b p` / `↑` | prev session |
-| `C-b ?` | help |
-| `C-b q` / `C-b C-c` | quit |
-| `C-b C-b` | send literal `C-b` byte to the PTY |
+**In PTY-captured mode** (view focused on a PTY session), all keys pass
+through to the child *except* `C-x`, which starts a chord. So everything in
+the table above that begins with `C-x` works without changing focus —
+`C-x o` to jump to the list, `C-x C-f` to start a new session, `C-x C-c` to
+quit, etc. Other commands like `M-x` need focus on the list first.
 
 Set `AGENTD_KEYMAP=vim` for the vim profile.
 

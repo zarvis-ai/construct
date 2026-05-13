@@ -1,6 +1,6 @@
 //! Ratatui rendering for the TUI.
 
-use crate::app::{App, Focus, ViewMode};
+use crate::app::{App, PaneFocus, ViewMode};
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, TimestampedEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,7 +43,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" sessions ");
+    let focused = app.focus == PaneFocus::List;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border_style(focused))
+        .title(" sessions ");
     let items: Vec<ListItem> = app
         .sessions
         .iter()
@@ -73,7 +77,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let highlight_style = if app.focus == Focus::List {
+    let highlight_style = if focused {
         Style::default()
             .bg(Color::Blue)
             .fg(Color::White)
@@ -94,9 +98,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_detail(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.focus == PaneFocus::View;
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_style(pane_border_style(focused))
             .title(" diff (ESC clears; press d to refresh) ");
         let para = Paragraph::new(diff.clone())
             .block(block)
@@ -120,7 +126,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         ViewMode::Transcript => " [transcript]",
     };
     let title = format!("{title_inner}{view_label}");
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border_style(focused))
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -162,9 +171,14 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &App) {
 fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
     let s = app.selected_session();
     let conn = if app.connected { "" } else { " disconnected!" };
+    let focus_label = match app.focus {
+        PaneFocus::List => "list",
+        PaneFocus::View => "view",
+    };
     let modeline = format!(
-        " agentd  [{profile}]  {sel}  {state}  {model}  {chord}{status}{conn} ",
+        " agentd  [{profile}]  focus:{focus}  {sel}  {state}  {model}  {chord}{status}{conn} ",
         profile = app.profile.label(),
+        focus = focus_label,
         sel = match s {
             Some(s) => short_id(&s.id).to_string(),
             None => "-".into(),
@@ -204,11 +218,16 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &App) {
         let x = area.x + mb.prompt.width() as u16 + mb.cursor as u16;
         f.set_cursor_position(Position { x, y: area.y });
     } else {
-        // help hint
+        // Help hint — when the PTY has the keys, all chords need C-x first.
         let hint = if app.help_visible {
             String::new()
+        } else if matches!(app.focus, PaneFocus::View)
+            && app.view == ViewMode::Terminal
+            && app.selected_session().map(|s| s.has_pty).unwrap_or(false)
+        {
+            "C-x o focus list   C-x t transcript   C-x ? help".to_string()
         } else {
-            "? for help   M-x for commands".to_string()
+            "? for help   M-x for commands   C-x o other-window".to_string()
         };
         let para = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
         f.render_widget(para, area);
@@ -239,20 +258,33 @@ fn render_help(f: &mut Frame, area: Rect) {
 const HELP_TEXT: &str = "
 emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
 
-  C-n / down        next session
-  C-p / up          prev session
-  C-c i             send input to selected session
-  C-c n             new session (wizard)
-  C-c k             kill selected session (confirms)
-  C-c d             show diff
-  C-c C-c           interrupt
-  C-c r             refresh
-  M-x               command palette
-  Tab               switch focus
-  C-v / M-v         scroll page down/up
-  g g / G           scroll top / bottom
-  ?                 toggle this help
-  C-x C-c / q       quit
+  focus + view
+    C-x o / Tab     switch focus (list ↔ view)
+    C-x t           toggle transcript ↔ terminal view
+    C-n / down      next session
+    C-p / up        prev session
+
+  session actions
+    C-x C-f         new session
+    C-x i           send input to selected session
+    C-x k           kill selected session (confirms)
+    C-x d           show diff
+    C-x r           refresh
+    C-c C-c         interrupt
+
+  scrollback
+    C-v / M-v       scroll page down/up
+    g g / G         scroll top / bottom
+
+  global
+    M-x             command palette
+    ?               toggle this help
+    C-x C-c / q     quit
+
+When the right pane is showing a PTY-backed session (shell / interactive
+claude / interactive codex) and focus is on the view, keystrokes go to the
+child. `C-x` is the escape prefix — start any `C-x …` chord above to run
+an agentd command without changing focus.
 ";
 
 fn format_event(ev: &TimestampedEvent) -> Line<'static> {
@@ -335,6 +367,14 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             format!("   ⌷ pty: {} bytes (switch to terminal view)", data.len()),
             Style::default().fg(Color::DarkGray),
         )],
+    }
+}
+
+fn pane_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
     }
 }
 

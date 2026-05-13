@@ -16,7 +16,9 @@ pub enum KeyAction {
     OpenDiff,
     Interrupt,
     OpenCommandPalette,
-    TogglePane,
+    /// Cycle keyboard focus across the panes (list ↔ view). Bound to `C-x o`
+    /// in the emacs profile, matching `other-window`.
+    SwitchFocus,
     ToggleView,
     ScrollUp,
     ScrollDown,
@@ -69,6 +71,10 @@ pub enum KeymapResult {
 }
 
 impl ChordState {
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     pub fn handle(&mut self, ev: KeyEvent, km: &Keymap) -> KeymapResult {
         // Normalize the event: ignore Release events on platforms that emit them.
         if !matches!(
@@ -140,27 +146,36 @@ pub fn default_for(profile: Profile) -> Keymap {
 fn emacs() -> Keymap {
     use KeyAction::*;
     let bindings = vec![
+        // Quit
         (Chord(vec![ctrl('x'), ctrl('c')]), Quit),
         (Chord(vec![ch('q')]), Quit),
+        // Session navigation
         (Chord(vec![ctrl('n')]), NextSession),
         (Chord(vec![ctrl('p')]), PrevSession),
         (Chord(vec![key(KeyCode::Down)]), NextSession),
         (Chord(vec![key(KeyCode::Up)]), PrevSession),
-        (Chord(vec![ctrl('c'), ch('i')]), OpenSendInput),
-        (Chord(vec![ctrl('c'), ch('n')]), OpenNewSession),
-        (Chord(vec![ctrl('c'), ch('k')]), OpenKillConfirm),
-        (Chord(vec![ctrl('c'), ch('d')]), OpenDiff),
-        (Chord(vec![ctrl('c'), ctrl('c')]), Interrupt),
-        (Chord(vec![ctrl('c'), ch('r')]), Refresh),
+        // Focus + view (C-x prefix, matching emacs window commands)
+        (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
+        (Chord(vec![key(KeyCode::Tab)]), SwitchFocus),
         (Chord(vec![ctrl('x'), ch('t')]), ToggleView),
+        // Session actions
+        (Chord(vec![ctrl('x'), ctrl('f')]), OpenNewSession),
+        (Chord(vec![ctrl('x'), ch('k')]), OpenKillConfirm),
+        (Chord(vec![ctrl('x'), ch('d')]), OpenDiff),
+        (Chord(vec![ctrl('x'), ch('i')]), OpenSendInput),
+        (Chord(vec![ctrl('x'), ch('r')]), Refresh),
+        // Interrupt the running adapter (emacs comint convention)
+        (Chord(vec![ctrl('c'), ctrl('c')]), Interrupt),
+        // Command palette
         (Chord(vec![alt('x')]), OpenCommandPalette),
-        (Chord(vec![key(KeyCode::Tab)]), TogglePane),
+        // Scroll
         (Chord(vec![ctrl('v')]), ScrollPageDown),
         (Chord(vec![alt('v')]), ScrollPageUp),
         (Chord(vec![ch('g'), ch('g')]), ScrollTop),
         (Chord(vec![shift('G')]), ScrollBottom),
         (Chord(vec![key(KeyCode::PageDown)]), ScrollPageDown),
         (Chord(vec![key(KeyCode::PageUp)]), ScrollPageUp),
+        // Help
         (Chord(vec![ch('?')]), ToggleHelp),
     ];
     Keymap { bindings }
@@ -182,7 +197,12 @@ fn vim() -> Keymap {
         (Chord(vec![ch('r')]), Refresh),
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch(':')]), OpenCommandPalette),
-        (Chord(vec![key(KeyCode::Tab)]), TogglePane),
+        (Chord(vec![key(KeyCode::Tab)]), SwitchFocus),
+        // PTY-mode escape: C-x is the universal prefix here too, so `C-x o`
+        // cycles focus and `C-x C-c` quits even when the PTY is capturing.
+        (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
+        (Chord(vec![ctrl('x'), ctrl('c')]), Quit),
+        (Chord(vec![ctrl('x'), ch('t')]), ToggleView),
         (Chord(vec![ctrl('f')]), ScrollPageDown),
         (Chord(vec![ctrl('b')]), ScrollPageUp),
         (Chord(vec![ch('g'), ch('g')]), ScrollTop),

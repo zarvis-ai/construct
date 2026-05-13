@@ -19,10 +19,14 @@ use std::io::Stdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Which pane currently owns the keyboard. `View` covers both the transcript
+/// and the terminal renderer — when the view shows a PTY-backed session and
+/// View has focus, keystrokes are captured by the PTY (with `C-x` as the
+/// escape prefix back to agentd commands).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Focus {
+pub enum PaneFocus {
     List,
-    Transcript,
+    View,
 }
 
 /// What the right pane is currently showing for the selected session.
@@ -55,7 +59,7 @@ pub struct App {
     pub client: Arc<Client>,
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
-    pub focus: Focus,
+    pub focus: PaneFocus,
     pub transcript: Vec<TimestampedEvent>,
     pub transcript_session: Option<String>,
     pub transcript_scroll: u16,
@@ -74,9 +78,6 @@ pub struct App {
     pub view: ViewMode,
     pub terminals: HashMap<String, vt100::Parser>,
     pub terminal_pane_size: (u16, u16), // (cols, rows) of the right pane.
-    /// True after `C-b` in terminal mode: next key is treated as an agentd
-    /// command instead of a PTY keystroke.
-    pub pending_escape: bool,
 }
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
@@ -91,7 +92,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         client: client.clone(),
         sessions,
         selected: 0,
-        focus: Focus::List,
+        focus: PaneFocus::View,
         transcript: Vec::new(),
         transcript_session: None,
         transcript_scroll: 0,
@@ -109,7 +110,6 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         view: ViewMode::Transcript,
         terminals: HashMap::new(),
         terminal_pane_size: (100, 30),
-        pending_escape: false,
     };
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
@@ -370,10 +370,33 @@ impl App {
             return;
         }
 
-        // Terminal mode: route keystrokes to the PTY (with an escape prefix).
-        if self.view == ViewMode::Terminal && self.in_pty_session() {
-            self.handle_terminal_key(key).await;
-            return;
+        // When the PTY is capturing keystrokes (View focus + terminal mode +
+        // session has a PTY), keys go straight to the child *unless* the user
+        // is starting or continuing a `C-x` chord — those drive the keymap.
+        if self.is_pty_captured() {
+            let is_ctrl_x = matches!(key.code, KeyCode::Char('x'))
+                && key.modifiers.contains(KeyModifiers::CONTROL);
+            // Escape hatch: `C-x C-x` sends a literal C-x byte through to the
+            // PTY (so vim completion, bash's `C-x C-e`, etc. still work).
+            if !self.chord_state.is_empty() && is_ctrl_x {
+                self.chord_state = ChordState::default();
+                self.chord_label.clear();
+                if let Some(id) = self.selected_id() {
+                    let _ = self.client.pty_input(&id, vec![0x18]).await;
+                }
+                return;
+            }
+            if self.chord_state.is_empty() && !is_ctrl_x {
+                if let Some(bytes) = encode_key_to_bytes(key) {
+                    if let Some(id) = self.selected_id() {
+                        if let Err(e) = self.client.pty_input(&id, bytes).await {
+                            self.set_status(format!("pty_input failed: {e}"));
+                        }
+                    }
+                }
+                return;
+            }
+            // fall through to chord dispatch below
         }
 
         let res = self.chord_state.handle(key, &self.keymap);
@@ -381,7 +404,9 @@ impl App {
         match res {
             KeymapResult::Action(a) => self.run_action(a).await,
             KeymapResult::Pending(label) => self.chord_label = label,
-            KeymapResult::Unhandled => {}
+            KeymapResult::Unhandled => {
+                self.chord_label.clear();
+            }
         }
     }
 
@@ -389,59 +414,12 @@ impl App {
         self.selected_session().map(|s| s.has_pty).unwrap_or(false)
     }
 
-    async fn handle_terminal_key(&mut self, key: KeyEvent) {
-        // Escape prefix is `C-b` (tmux-style). After C-b, the next key is
-        // interpreted as an agentd command (single chord, hardcoded set).
-        let is_ctrl_b = matches!(key.code, KeyCode::Char('b'))
-            && key.modifiers.contains(KeyModifiers::CONTROL);
-
-        if self.pending_escape {
-            self.pending_escape = false;
-            self.chord_label.clear();
-            self.run_terminal_escape_chord(key).await;
-            return;
-        }
-        if is_ctrl_b {
-            self.pending_escape = true;
-            self.chord_label = "C-b".to_string();
-            return;
-        }
-        // Plain pass-through: encode and ship as PTY bytes.
-        if let Some(bytes) = encode_key_to_bytes(key) {
-            if let Some(id) = self.selected_id() {
-                if let Err(e) = self.client.pty_input(&id, bytes).await {
-                    self.set_status(format!("pty_input failed: {e}"));
-                }
-            }
-        }
-    }
-
-    async fn run_terminal_escape_chord(&mut self, key: KeyEvent) {
-        use KeyCode::*;
-        match (key.code, key.modifiers) {
-            (Char('t'), m) if !m.contains(KeyModifiers::CONTROL) => {
-                self.view = ViewMode::Transcript;
-                self.set_status("transcript view".into());
-            }
-            (Char('?'), _) => self.help_visible = true,
-            (Char('q'), _) | (Char('c'), KeyModifiers::CONTROL) => {
-                self.should_quit = true;
-            }
-            (Char('k'), _) => self.run_action(KeyAction::OpenKillConfirm).await,
-            (Char('d'), _) => self.run_action(KeyAction::OpenDiff).await,
-            (Char('n'), _) => self.run_action(KeyAction::OpenNewSession).await,
-            (Char('p'), _) | (Up, _) => self.run_action(KeyAction::PrevSession).await,
-            (Char('s'), _) | (Down, _) => self.run_action(KeyAction::NextSession).await,
-            (Char('b'), KeyModifiers::CONTROL) => {
-                // C-b C-b → send a literal C-b byte to the PTY.
-                if let Some(id) = self.selected_id() {
-                    let _ = self.client.pty_input(&id, vec![0x02]).await;
-                }
-            }
-            _ => {
-                // Cancel: unknown escape chord, drop it silently.
-            }
-        }
+    /// True when keystrokes should be forwarded to the session's PTY by
+    /// default (view focused, terminal mode, session has a PTY).
+    fn is_pty_captured(&self) -> bool {
+        self.focus == PaneFocus::View
+            && self.view == ViewMode::Terminal
+            && self.in_pty_session()
     }
 
     async fn run_action(&mut self, action: KeyAction) {
@@ -540,11 +518,16 @@ impl App {
                     intent: MinibufferIntent::CommandPalette,
                 });
             }
-            TogglePane => {
+            SwitchFocus => {
                 self.focus = match self.focus {
-                    Focus::List => Focus::Transcript,
-                    Focus::Transcript => Focus::List,
+                    PaneFocus::List => PaneFocus::View,
+                    PaneFocus::View => PaneFocus::List,
                 };
+                let label = match self.focus {
+                    PaneFocus::List => "focus: list",
+                    PaneFocus::View => "focus: view",
+                };
+                self.set_status(label.into());
             }
             ToggleView => {
                 let has_pty = self.in_pty_session();
