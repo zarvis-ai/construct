@@ -42,7 +42,6 @@ pub enum ViewMode {
 pub enum MinibufferIntent {
     SendInput { session_id: String },
     NewSessionHarness,
-    NewSessionPrompt { harness: String, cwd: String },
     DeleteConfirm { session_id: String },
     CommandPalette,
 }
@@ -673,19 +672,10 @@ impl App {
                 let cwd = std::env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| ".".to_string());
-                self.minibuffer = Some(Minibuffer {
-                    prompt: format!("Prompt for {} in {}: ", harness, cwd),
-                    input: String::new(),
-                    cursor: 0,
-                    intent: MinibufferIntent::NewSessionPrompt { harness, cwd },
-                });
-            }
-            MinibufferIntent::NewSessionPrompt { harness, cwd } => {
-                let prompt = input.trim().to_string();
                 let params = agentd_protocol::CreateSessionParams {
                     harness: harness.clone(),
                     cwd,
-                    prompt: if prompt.is_empty() { None } else { Some(prompt) },
+                    prompt: None,
                     model: None,
                     title: None,
                     mode: None,
@@ -704,6 +694,9 @@ impl App {
                         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
                             self.selected = i;
                             self.refresh_selected_transcript().await;
+                            // Drop focus into the new session's pane so the
+                            // user can start typing immediately.
+                            self.focus = PaneFocus::View;
                         }
                     }
                     Err(e) => self.set_status(format!("create failed: {e}")),
