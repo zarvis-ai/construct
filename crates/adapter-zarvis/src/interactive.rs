@@ -728,7 +728,12 @@ pub async fn run(
     let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
 
     let term = Terminal::new(&emit);
-    term.banner(provider_name, &model, automode);
+    // On resume we skip the full banner — the user already saw it the
+    // first time, and a smaller "(resumed — N prior messages loaded)"
+    // note is printed below once we know the message count.
+    if !persist::is_resume() {
+        term.banner(provider_name, &model, automode);
+    }
     emit.emit(SessionEvent::Status {
         state: SessionState::Running,
         detail: Some(format!("{}:{}  [interactive]", provider_name, model)),
