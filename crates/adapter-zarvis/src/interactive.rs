@@ -356,7 +356,12 @@ impl LineEditor {
         out.extend_from_slice(self.prompt_seq);
         out.extend_from_slice(self.buf.as_bytes());
         let ghost_cells = if let Some(suffix) = self.ghost_suffix() {
-            out.extend_from_slice(b"\x1b[2m");
+            // Use bright-black (90) + dim. Pure DIM (\x1b[2m) was
+            // invisible on themes that render it identical to the
+            // default fg; bright-black is a real color and renders on
+            // every terminal — and the additional dim is a small
+            // bonus on terminals that do support it.
+            out.extend_from_slice(b"\x1b[90;2m");
             out.extend_from_slice(suffix.as_bytes());
             out.extend_from_slice(b"\x1b[0m");
             suffix.chars().count()
@@ -856,6 +861,18 @@ mod tests {
         let mut ed = editor();
         let (_, evs) = ed.feed_bytes(&[0x04]);
         assert!(matches!(evs.as_slice(), [LineEvent::Eof]));
+    }
+
+    #[test]
+    fn redraw_includes_dim_ghost_bytes() {
+        let mut ed = editor();
+        let (out, _) = ed.feed_bytes(b"/");
+        // Should contain a bright-black/dim SGR open + the ghost
+        // suffix + reset.
+        let s = String::from_utf8_lossy(&out);
+        assert!(s.contains("\x1b[90;2m"), "missing ghost SGR: {:?}", s);
+        assert!(s.contains("model"), "missing ghost suffix: {:?}", s);
+        assert!(s.contains("\x1b[0m"), "missing SGR reset: {:?}", s);
     }
 
     #[test]
