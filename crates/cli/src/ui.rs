@@ -167,8 +167,9 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                         row_w.saturating_sub(prefix_w + 1 + harness_w);
                     let raw_name = primary_label(s);
                     let scroll = if is_selected && focused {
+                        // ~6 chars/sec (was 5; +20% per user feedback).
                         Some(
-                            (app.start_instant.elapsed().as_millis() / 200)
+                            (app.start_instant.elapsed().as_millis() / 167)
                                 as usize,
                         )
                     } else {
@@ -824,7 +825,17 @@ fn fit_name(name: &str, width: usize, scroll: Option<usize>) -> String {
             let mut ribbon: Vec<char> = chars.clone();
             ribbon.extend("   ".chars());
             let n = ribbon.len();
-            let start = offset % n;
+            // Hold position 0 for `PAUSE_TICKS` extra cycles so the user
+            // can read the title's start before it begins scrolling.
+            // At ~6 chars/sec, 7 ticks ≈ ~1.2s pause.
+            const PAUSE_TICKS: usize = 7;
+            let cycle = n + PAUSE_TICKS;
+            let phase = offset % cycle;
+            let start = if phase < PAUSE_TICKS {
+                0
+            } else {
+                phase - PAUSE_TICKS
+            };
             let mut visible = String::with_capacity(width);
             for i in 0..width {
                 visible.push(ribbon[(start + i) % n]);
