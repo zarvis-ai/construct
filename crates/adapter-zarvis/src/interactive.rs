@@ -53,8 +53,8 @@ impl<'a> Terminal<'a> {
         let mode_badge = if automode { "  [automode]" } else { "" };
         let banner = format!(
             "\r\n\x1b[1;35mzarvis\x1b[0m  \x1b[2m{provider}:{model}\x1b[0m{mode_badge}\r\n\
-             \x1b[2mtype your prompt and press Enter. C-c interrupts a turn. \
-             `/model <spec>` switches the model. `/quit` or C-d to end.\x1b[0m\r\n",
+             \x1b[2mtype your prompt and press Enter. type `/` for commands, \
+             Tab to complete. C-c interrupts a turn. C-d to end.\x1b[0m\r\n",
         );
         self.write(banner.as_bytes());
     }
@@ -285,7 +285,9 @@ impl<'a> TextSink for PtySink<'a> {
 
 /// Readline-ish line editor — handles printable chars, cursor
 /// navigation (arrows + C-a/C-e/C-b/C-f), history (↑/↓ + C-p/C-n),
-/// killing (C-k/C-u/C-w/Backspace/Delete), Enter, C-c, C-d.
+/// killing (C-k/C-u/C-w/Backspace/Delete), Enter, C-c, C-d, plus a
+/// slash-command popup below the prompt with Tab common-prefix
+/// completion.
 ///
 /// The editor consumes raw PTY bytes through [`feed_bytes`], returning
 /// (a) bytes to write back to the PTY (incremental echoes or full
@@ -303,9 +305,16 @@ struct LineEditor {
     saved: String,
     /// ANSI escape sequence state.
     esc: EscState,
-    /// What we re-emit to redraw the line; produced fresh each frame
+    /// What we re-emit to redraw the prompt; produced fresh each frame
     /// from `(prompt_seq, buf, cursor)`.
     prompt_seq: &'static [u8],
+    /// Visible cell width of `prompt_seq` (SGR escapes don't count).
+    /// Used for absolute-column cursor positioning after the popup.
+    prompt_visible_width: usize,
+    /// Number of popup lines rendered in the last redraw — we erase
+    /// these many lines below the prompt at the start of the next
+    /// redraw so a shrinking popup doesn't leave stale text.
+    last_popup_lines: usize,
 }
 
 #[derive(Default)]
@@ -330,7 +339,7 @@ enum LineEvent {
 }
 
 impl LineEditor {
-    fn new(prompt_seq: &'static [u8]) -> Self {
+    fn new(prompt_seq: &'static [u8], prompt_visible_width: usize) -> Self {
         Self {
             buf: String::new(),
             cursor: 0,
@@ -339,73 +348,109 @@ impl LineEditor {
             saved: String::new(),
             esc: EscState::Idle,
             prompt_seq,
+            prompt_visible_width,
+            last_popup_lines: 0,
         }
     }
 
-    /// Bytes the terminal needs to repaint the current line. Caller is
-    /// responsible for having the cursor sitting on the prompt's row
-    /// before calling (we always start with `\r` + erase-to-end).
-    ///
-    /// When the buffer starts with `/`, the longest matching slash
-    /// command is appended in dim ANSI as a ghost suggestion. The
-    /// suggestion's cells count toward the cursor-back-move so the
-    /// real cursor stays where the user is editing.
-    fn redraw(&self) -> Vec<u8> {
-        let mut out: Vec<u8> = Vec::with_capacity(self.buf.len() + 32);
+    /// Bytes the terminal needs to repaint the current line + the
+    /// slash-command popup below it. Erases any popup rendered by the
+    /// previous call (tracked in `last_popup_lines`) before redrawing.
+    fn redraw(&mut self) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(256);
+        // 1. Erase the previous popup area, if any. Each `\r\n\x1b[K`
+        //    advances to the next line and clears it; we then `\x1b[NA`
+        //    back up to the prompt line.
+        let n_prev = self.last_popup_lines;
+        for _ in 0..n_prev {
+            out.extend_from_slice(b"\r\n\x1b[K");
+        }
+        if n_prev > 0 {
+            let mv = format!("\x1b[{n_prev}A");
+            out.extend_from_slice(mv.as_bytes());
+        }
+        // 2. Repaint the prompt line.
         out.extend_from_slice(b"\r\x1b[K");
         out.extend_from_slice(self.prompt_seq);
         out.extend_from_slice(self.buf.as_bytes());
-        let ghost_cells = if let Some(suffix) = self.ghost_suffix() {
-            // Use bright-black (90) + dim. Pure DIM (\x1b[2m) was
-            // invisible on themes that render it identical to the
-            // default fg; bright-black is a real color and renders on
-            // every terminal — and the additional dim is a small
-            // bonus on terminals that do support it.
-            out.extend_from_slice(b"\x1b[90;2m");
-            out.extend_from_slice(suffix.as_bytes());
+        // 3. Render the slash-command popup below.
+        let matches = self.slash_matches();
+        let n = matches.len();
+        for m in &matches {
+            out.extend_from_slice(b"\r\n\x1b[K");
+            out.extend_from_slice(b"  \x1b[90m");
+            out.extend_from_slice(m.as_bytes());
             out.extend_from_slice(b"\x1b[0m");
-            suffix.chars().count()
-        } else {
-            0
-        };
-        let tail = self.buf.chars().count().saturating_sub(self.cursor);
-        let back = ghost_cells + tail;
-        if back > 0 {
-            let mv = format!("\x1b[{back}D");
+        }
+        // 4. Move the cursor back up to the prompt row and to the
+        //    column the user is editing at (absolute-column via
+        //    `\x1b[<col>G`, 1-based).
+        if n > 0 {
+            let mv = format!("\x1b[{n}A");
             out.extend_from_slice(mv.as_bytes());
         }
+        let target_col = self.prompt_visible_width + self.cursor + 1;
+        let mv = format!("\x1b[{target_col}G");
+        out.extend_from_slice(mv.as_bytes());
+        self.last_popup_lines = n;
         out
     }
 
-    /// Suffix the editor would offer as autocomplete for the current
-    /// buffer, if any. Returns `None` when the buf isn't a slash
-    /// command, when no command starts with it, or when the buf already
-    /// matches a command fully.
-    fn ghost_suffix(&self) -> Option<&'static str> {
-        if !self.buf.starts_with('/') {
-            return None;
+    /// Erase the popup (called before submit so the next prompt isn't
+    /// painted on top of stale popup lines).
+    fn clear_popup(&mut self, out: &mut Vec<u8>) {
+        let n_prev = self.last_popup_lines;
+        for _ in 0..n_prev {
+            out.extend_from_slice(b"\r\n\x1b[K");
         }
-        let buf_len = self.buf.len();
-        for &cmd in SLASH_COMMANDS {
-            if cmd.starts_with(self.buf.as_str()) && cmd.len() > buf_len {
-                return Some(&cmd[buf_len..]);
-            }
+        if n_prev > 0 {
+            let mv = format!("\x1b[{n_prev}A");
+            out.extend_from_slice(mv.as_bytes());
+            // Re-anchor cursor at column = prompt + buf
+            let target_col = self.prompt_visible_width + self.cursor + 1;
+            let mv = format!("\x1b[{target_col}G");
+            out.extend_from_slice(mv.as_bytes());
         }
-        None
+        self.last_popup_lines = 0;
     }
 
-    /// Accept the ghost suggestion (if any), appending a trailing
-    /// space so the user can immediately type the command's argument.
-    /// Returns true when something was accepted.
-    fn accept_ghost(&mut self) -> bool {
-        if let Some(suffix) = self.ghost_suffix() {
-            self.buf.push_str(suffix);
+    /// Slash-commands whose names start with the current buffer.
+    /// Empty when the buf doesn't start with `/`.
+    fn slash_matches(&self) -> Vec<&'static str> {
+        if !self.buf.starts_with('/') {
+            return Vec::new();
+        }
+        SLASH_COMMANDS
+            .iter()
+            .copied()
+            .filter(|c| c.starts_with(self.buf.as_str()))
+            .collect()
+    }
+
+    /// Tab handler: complete the buffer to the matches' common prefix.
+    /// When only one match remains and the buffer already equals it,
+    /// append a trailing space so the user can type the argument.
+    /// Returns true when the buffer changed.
+    fn accept_via_tab(&mut self) -> bool {
+        let matches = self.slash_matches();
+        if matches.is_empty() {
+            return false;
+        }
+        let prefix = common_prefix(&matches);
+        if prefix.chars().count() > self.buf.chars().count() {
+            self.buf = prefix;
+            if matches.len() == 1 && self.buf == matches[0] {
+                self.buf.push(' ');
+            }
+            self.cursor = self.buf.chars().count();
+            return true;
+        }
+        if matches.len() == 1 && self.buf == matches[0] {
             self.buf.push(' ');
             self.cursor = self.buf.chars().count();
-            true
-        } else {
-            false
+            return true;
         }
+        false
     }
 
     fn submit(&mut self) -> LineEvent {
@@ -583,9 +628,10 @@ impl LineEditor {
         match b {
             // Enter
             b'\r' | b'\n' => {
+                // Wipe any open popup first so the caller's next prompt
+                // doesn't paint on top of stale lines.
+                self.clear_popup(out);
                 events.push(self.submit());
-                // Drop the prompt's tail; caller draws its own newline +
-                // re-prompt after handling the Submit event.
                 out.extend_from_slice(b"\r\n");
             }
             // Ctrl-C
@@ -649,9 +695,9 @@ impl LineEditor {
                 out.extend_from_slice(b"\x1b[2J\x1b[H");
                 out.extend_from_slice(&self.redraw());
             }
-            // Tab — accept the slash-command ghost suggestion.
+            // Tab — common-prefix completion against the slash popup.
             0x09 => {
-                if self.accept_ghost() {
+                if self.accept_via_tab() {
                     out.extend_from_slice(&self.redraw());
                 }
             }
@@ -730,6 +776,26 @@ impl LineEditor {
     }
 }
 
+/// Longest common-character prefix across all entries. Returns an
+/// empty string for an empty slice. Operates on chars, so it's
+/// UTF-8-safe.
+fn common_prefix(strs: &[&str]) -> String {
+    let first = match strs.first() {
+        Some(s) => *s,
+        None => return String::new(),
+    };
+    let mut out = String::new();
+    for (i, c) in first.chars().enumerate() {
+        let all_match = strs[1..].iter().all(|s| s.chars().nth(i) == Some(c));
+        if all_match {
+            out.push(c);
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
@@ -742,7 +808,7 @@ mod tests {
     use super::*;
 
     fn editor() -> LineEditor {
-        LineEditor::new(b"> ")
+        LineEditor::new(b"> ", 2)
     }
 
     fn submit_line(ed: &mut LineEditor, bytes: &[u8]) -> Option<String> {
@@ -864,44 +930,60 @@ mod tests {
     }
 
     #[test]
-    fn redraw_includes_dim_ghost_bytes() {
+    fn redraw_renders_popup_below() {
         let mut ed = editor();
         let (out, _) = ed.feed_bytes(b"/");
-        // Should contain a bright-black/dim SGR open + the ghost
-        // suffix + reset.
         let s = String::from_utf8_lossy(&out);
-        assert!(s.contains("\x1b[90;2m"), "missing ghost SGR: {:?}", s);
-        assert!(s.contains("model"), "missing ghost suffix: {:?}", s);
-        assert!(s.contains("\x1b[0m"), "missing SGR reset: {:?}", s);
+        // Popup uses gray SGR for each entry and lists at least `/model`.
+        assert!(s.contains("\x1b[90m"), "missing popup color SGR: {:?}", s);
+        assert!(s.contains("/model"), "missing /model entry: {:?}", s);
+        // Cursor is repositioned with an absolute-column escape.
+        assert!(s.contains("\x1b[") && s.contains("G"), "missing column move: {:?}", s);
     }
 
     #[test]
-    fn slash_ghost_shows_first_match() {
+    fn slash_matches_narrow_as_typed() {
         let mut ed = editor();
         ed.feed_bytes(b"/");
-        assert_eq!(ed.ghost_suffix(), Some("model"));
+        let all = ed.slash_matches();
+        assert!(all.contains(&"/model"));
+        assert!(all.contains(&"/quit"));
+        assert!(all.contains(&"/exit"));
         ed.feed_bytes(b"q");
-        assert_eq!(ed.ghost_suffix(), Some("uit"));
+        assert_eq!(ed.slash_matches(), vec!["/quit"]);
         ed.feed_bytes(b"x");
-        assert_eq!(ed.ghost_suffix(), None);
+        assert!(ed.slash_matches().is_empty());
     }
 
     #[test]
-    fn tab_accepts_ghost_and_appends_space() {
+    fn tab_completes_common_prefix() {
         let mut ed = editor();
         ed.feed_bytes(b"/m");
-        ed.feed_bytes(&[0x09]); // Tab
+        ed.feed_bytes(&[0x09]); // Tab — only /model matches
         assert_eq!(ed.buf, "/model ");
-        assert_eq!(ed.cursor, ed.buf.chars().count());
+        let mut ed = editor();
+        // `/` has 3 matches with no shared chars beyond `/` — Tab is a no-op.
+        ed.feed_bytes(b"/");
+        let buf_before = ed.buf.clone();
+        ed.feed_bytes(&[0x09]);
+        assert_eq!(ed.buf, buf_before);
     }
 
     #[test]
-    fn tab_no_ghost_is_noop() {
+    fn tab_no_match_is_noop() {
         let mut ed = editor();
         ed.feed_bytes(b"hello");
         let buf_before = ed.buf.clone();
         ed.feed_bytes(&[0x09]);
         assert_eq!(ed.buf, buf_before);
+    }
+
+    #[test]
+    fn common_prefix_unit() {
+        assert_eq!(common_prefix(&["/model", "/quit", "/exit"]), "/");
+        assert_eq!(common_prefix(&["/quit", "/exit"]), "/");
+        assert_eq!(common_prefix(&["/model"]), "/model");
+        assert_eq!(common_prefix(&[]), "");
     }
 }
 
@@ -961,7 +1043,8 @@ pub async fn run(
     // match Terminal::prompt's payload sans the leading `\r\n` (we keep
     // those local to Terminal::prompt because the editor uses bare `\r`
     // for redraw and assumes the prompt sits on a fresh row).
-    let mut editor = LineEditor::new(b"\x1b[1;36m\xe2\x9d\xaf \x1b[0m");
+    // The prompt's SGR escapes are invisible; `❯ ` is 2 cells.
+    let mut editor = LineEditor::new(b"\x1b[1;36m\xe2\x9d\xaf \x1b[0m", 2);
     let mut pty_width: usize = params
         .pty_size
         .map(|s| s.cols as usize)
