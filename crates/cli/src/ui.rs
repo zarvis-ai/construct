@@ -70,6 +70,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     apply_focused_scrollback(app);
 
+    // Record the frame's pane geometry so the mouse-click handler can
+    // map terminal coordinates back to a region.
+    app.layout.list_area = Some(cols[0]);
+    app.layout.view_area = Some(detail_area);
+    app.layout.pin_strip_area = pin_strip_area;
+    app.layout.list_row_count = app.list_items().len();
+
     render_sessions(f, cols[0], app);
     render_detail(f, detail_area, app);
     if let Some(strip) = pin_strip_area {
@@ -659,7 +666,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String])
     }
 }
 
-fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
+pub fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
     let n = n.max(1);
     let cols = n.min(4).max(1);
     let rows = (n + cols - 1) / cols;

@@ -157,6 +157,22 @@ pub struct App {
     pub pty_activity: HashMap<String, Instant>,
     /// Monotonic clock anchor; spinner frame index is computed against this.
     pub start_instant: Instant,
+    /// Snapshot of last frame's pane geometry — used by the mouse-click
+    /// handler to map terminal coordinates back to UI regions. Filled
+    /// by `ui::render` each frame; `None` until the first render lands.
+    pub layout: LayoutSnapshot,
+}
+
+/// Last-frame geometry for hit-testing mouse clicks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LayoutSnapshot {
+    pub list_area: Option<ratatui::layout::Rect>,
+    pub view_area: Option<ratatui::layout::Rect>,
+    pub pin_strip_area: Option<ratatui::layout::Rect>,
+    /// Number of rows of the list pane currently in use (so a click
+    /// past the last row is a no-op rather than selecting an
+    /// out-of-range item). Mirrors `app.list_items().len()`.
+    pub list_row_count: usize,
 }
 
 /// Window during which a session counts as "busy" after its last PTY byte.
@@ -215,6 +231,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         view_scrollback: 0,
         pty_activity: HashMap::new(),
         start_instant: Instant::now(),
+        layout: LayoutSnapshot::default(),
     };
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
@@ -812,11 +829,109 @@ impl App {
     }
 
     async fn on_mouse(&mut self, ev: MouseEvent) {
+        use crossterm::event::MouseButton;
         const STEP: i32 = 3;
         match ev.kind {
             MouseEventKind::ScrollUp => self.adjust_scrollback(STEP),
             MouseEventKind::ScrollDown => self.adjust_scrollback(-STEP),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_left_click(ev.column, ev.row).await;
+            }
             _ => {}
+        }
+    }
+
+    /// Hit-test a left-click against the last frame's pane geometry.
+    /// - Inside the list pane: select the row (or toggle group on a
+    ///   header click) and focus the list.
+    /// - Inside the view pane: focus the view (so subsequent keystrokes
+    ///   pass through to the PTY when the session is PTY-backed).
+    /// - Inside the pin strip: select the matching pinned session.
+    async fn handle_left_click(&mut self, col: u16, row: u16) {
+        // Closure-free containment check.
+        fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
+            c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
+        }
+        if let Some(strip) = self.layout.pin_strip_area {
+            if contains(strip, col, row) {
+                self.click_pin_strip(strip, col, row).await;
+                return;
+            }
+        }
+        if let Some(list) = self.layout.list_area {
+            if contains(list, col, row) {
+                self.click_list(list, row).await;
+                return;
+            }
+        }
+        if let Some(view) = self.layout.view_area {
+            if contains(view, col, row) {
+                self.focus = PaneFocus::View;
+                return;
+            }
+        }
+    }
+
+    async fn click_list(&mut self, list: ratatui::layout::Rect, row: u16) {
+        // Top + bottom border are 1 row each; row 0 is the top border.
+        if row <= list.y || row + 1 >= list.y + list.height {
+            return;
+        }
+        let idx = (row - list.y - 1) as usize;
+        let items = self.list_items();
+        if idx >= items.len() {
+            return;
+        }
+        self.focus = PaneFocus::List;
+        match &items[idx] {
+            ListItem::Session { summary, .. } => {
+                self.selection = Selection::Session(summary.id.clone());
+                self.transcript_session = None;
+                self.refresh_selected_transcript().await;
+            }
+            ListItem::GroupHeader { group, .. } => {
+                let id = group.id.clone();
+                let next = !group.collapsed;
+                if self
+                    .selection
+                    .group_id()
+                    .map(|s| s != id.as_str())
+                    .unwrap_or(true)
+                {
+                    self.selection = Selection::Group(id.clone());
+                }
+                if let Err(e) = self.client.set_group_collapsed(&id, next).await {
+                    self.set_status(format!("collapse failed: {e}"));
+                }
+            }
+        }
+    }
+
+    async fn click_pin_strip(&mut self, strip: ratatui::layout::Rect, col: u16, row: u16) {
+        let pinned_ids: Vec<String> = self
+            .list_items()
+            .into_iter()
+            .filter_map(|it| match it {
+                ListItem::Session { summary, .. } if summary.pinned => Some(summary.id),
+                _ => None,
+            })
+            .collect();
+        if pinned_ids.is_empty() {
+            return;
+        }
+        let tiles = crate::ui::pin_tile_layout(strip, pinned_ids.len());
+        for (tile, id) in tiles.iter().zip(pinned_ids.iter()) {
+            if col >= tile.x
+                && col < tile.x + tile.width
+                && row >= tile.y
+                && row < tile.y + tile.height
+            {
+                self.selection = Selection::Session(id.clone());
+                self.transcript_session = None;
+                self.refresh_selected_transcript().await;
+                self.focus = PaneFocus::List;
+                return;
+            }
         }
     }
 
