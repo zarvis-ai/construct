@@ -906,7 +906,12 @@ impl App {
     }
 
     async fn click_list(&mut self, list: ratatui::layout::Rect, row: u16) {
-        // Top + bottom border are 1 row each; row 0 is the top border.
+        // A click anywhere inside the list pane focuses it, even on the
+        // border or empty space past the last item — matching the
+        // intuitive "click the pane to focus it" UX.
+        self.focus = PaneFocus::List;
+        // Top + bottom border are 1 row each; rows outside the inner
+        // content area only handle the focus change above.
         if row <= list.y || row + 1 >= list.y + list.height {
             return;
         }
@@ -915,7 +920,6 @@ impl App {
         if idx >= items.len() {
             return;
         }
-        self.focus = PaneFocus::List;
         match &items[idx] {
             ListItem::Session { summary, .. } => {
                 self.selection = Selection::Session(summary.id.clone());
