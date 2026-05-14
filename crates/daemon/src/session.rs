@@ -357,6 +357,7 @@ impl SessionManager {
             position: -now.timestamp_millis(),
             group_id: None,
             last_pty_at_ms: None,
+            automode: false,
         };
         self.storage.save_summary(&summary)?;
 
@@ -574,7 +575,8 @@ impl SessionManager {
                 | SessionEvent::ToolUse { .. }
                 | SessionEvent::ToolResult { .. }
                 | SessionEvent::Diff { .. }
-                | SessionEvent::Pty { .. } => {}
+                | SessionEvent::Pty { .. }
+                | SessionEvent::ToolApprovalRequest { .. } => {}
             }
             let snapshot = s.clone();
             drop(s);
@@ -1129,6 +1131,80 @@ impl SessionManager {
             .send(BroadcastMsg::State(StateNotificationPayload {
                 session: snapshot,
             }));
+        Ok(())
+    }
+
+    pub async fn set_automode(&self, id: &str, on: bool) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.automode = on;
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        // Forward to the adapter so it picks up the change for the next tool
+        // classification. If the adapter is gone (session ended), skip.
+        if let Some(adapter) = entry.adapter.lock().await.clone() {
+            let params = serde_json::to_value(&agentd_protocol::SessionSetAutomodeParams {
+                session_id: id.to_string(),
+                on,
+            })?;
+            // Best-effort: don't fail the call if the adapter doesn't recognize
+            // the method (e.g. claude/codex, which don't gate tools).
+            let _ = adapter
+                .request(ahp_method::SESSION_SET_AUTOMODE, params)
+                .await;
+        }
+        Ok(())
+    }
+
+    pub async fn tool_decision(
+        &self,
+        id: &str,
+        call_id: String,
+        decision: String,
+    ) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let adapter = entry
+            .adapter
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        // If the user chose "automode" from the prompt, flip the session flag
+        // too so the modeline reflects the new state across clients.
+        if decision == "automode" {
+            let snapshot = {
+                let mut s = entry.summary.write().await;
+                s.automode = true;
+                s.clone()
+            };
+            self.storage.save_summary(&snapshot)?;
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::State(StateNotificationPayload {
+                    session: snapshot,
+                }));
+        }
+        let params = serde_json::to_value(&agentd_protocol::SessionToolDecisionParams {
+            session_id: id.to_string(),
+            call_id,
+            decision,
+        })?;
+        adapter
+            .request(ahp_method::SESSION_TOOL_DECISION, params)
+            .await?;
         Ok(())
     }
 

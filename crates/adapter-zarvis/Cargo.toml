@@ -1,0 +1,29 @@
+[package]
+name = "agentd-adapter-zarvis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Built-in multi-provider agent harness for agentd (talks to OpenAI, Anthropic, Ollama directly)"
+
+[[bin]]
+name = "agentd-adapter-zarvis"
+path = "src/main.rs"
+
+[dependencies]
+agentd-protocol = { workspace = true }
+agentd-client = { workspace = true }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+futures.workspace = true
+bytes.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+eventsource-stream.workspace = true

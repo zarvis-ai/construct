@@ -573,6 +573,16 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             format!("   ⌷ pty: {} bytes (switch to terminal view)", data.len()),
             Style::default().fg(Color::DarkGray),
         )],
+        SessionEvent::ToolApprovalRequest { tool, args_summary, risk, .. } => {
+            let risk_label = match risk {
+                agentd_protocol::ToolRisk::Safe => "safe",
+                agentd_protocol::ToolRisk::Risky => "risky",
+            };
+            vec![Span::styled(
+                format!("   ? approve [{risk_label}] {tool}({})", shorten(args_summary, 160)),
+                Style::default().fg(Color::Yellow),
+            )]
+        }
     }
 }
 
@@ -774,6 +784,7 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::Error { message } => format!("error: {}", shorten(message, 60)),
         SessionEvent::Done { exit_code } => format!("done (exit {exit_code})"),
         SessionEvent::Pty { data } => format!("pty: {} bytes", data.len()),
+        SessionEvent::ToolApprovalRequest { tool, .. } => format!("approve? {tool}"),
     }
 }
 

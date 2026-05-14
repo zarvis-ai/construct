@@ -35,6 +35,8 @@ pub mod ahp_method {
     pub const SESSION_PTY_RESIZE: &str = "session.pty_resize";
     pub const SESSION_INTERRUPT: &str = "session.interrupt";
     pub const SESSION_STOP: &str = "session.stop";
+    pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
+    pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
     pub const SHUTDOWN: &str = "shutdown";
 }
 
@@ -215,6 +217,33 @@ pub enum SessionEvent {
     Pty {
         data: String,
     },
+    /// Adapter is asking the user to approve (or deny) a pending tool call.
+    /// The adapter parks the agent loop until a [`SessionToolDecisionParams`]
+    /// arrives on the inbox referencing the same `call_id`. The `risk` field
+    /// lets the UI render a badge; `args_summary` is pre-formatted by the
+    /// adapter so the UI doesn't have to interpret each tool's schema.
+    ToolApprovalRequest {
+        call_id: String,
+        tool: String,
+        #[serde(default)]
+        args_summary: String,
+        risk: ToolRisk,
+    },
+}
+
+/// Coarse risk classification used by adapters that gate tool calls behind
+/// user approval. Two tiers are intentional; finer-grained policies can be
+/// layered without changing the protocol (the `decision` field on
+/// [`SessionToolDecisionParams`] is an open string).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRisk {
+    /// Read-only / observation. Adapter runs these without prompting even
+    /// when automode is off.
+    Safe,
+    /// Mutates filesystem / sessions / external state. Adapter prompts the
+    /// user when automode is off.
+    Risky,
 }
 
 impl SessionEvent {
@@ -306,6 +335,8 @@ pub mod ipc_method {
     pub const SESSION_DELETE: &str = "session.delete";
     pub const SESSION_SET_PINNED: &str = "session.set_pinned";
     pub const SESSION_SET_TITLE: &str = "session.set_title";
+    pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
+    pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
     pub const SESSION_MOVE: &str = "session.move";
     pub const GROUP_LIST: &str = "group.list";
     pub const GROUP_CREATE: &str = "group.create";
@@ -392,6 +423,12 @@ pub struct SessionSummary {
     /// avoid sending input while the agent is mid-turn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pty_at_ms: Option<i64>,
+    /// When true, the adapter auto-approves tool calls instead of pausing
+    /// for user confirmation. Only meaningful for adapters that gate tool
+    /// calls (zarvis today; future agent harnesses). Toggle via
+    /// `session.set_automode`.
+    #[serde(default)]
+    pub automode: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -419,6 +456,25 @@ pub struct SessionSetTitleParams {
     /// `None` clears any user-set title (display falls back to the hash).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSetAutomodeParams {
+    pub session_id: String,
+    /// `true` = adapter runs all tools without prompting.
+    /// `false` = adapter pauses on Risky tools (default).
+    pub on: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionToolDecisionParams {
+    pub session_id: String,
+    /// Matches the `call_id` in the originating
+    /// [`SessionEvent::ToolApprovalRequest`].
+    pub call_id: String,
+    /// One of `"approve"`, `"deny"`, `"automode"`. Open string so finer
+    /// decisions can be added without a protocol break.
+    pub decision: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

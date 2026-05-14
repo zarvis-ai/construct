@@ -155,6 +155,14 @@ pub enum AdapterInboxMsg {
     Interrupt,
     /// Daemon asks the adapter to wind down cleanly.
     Stop,
+    /// User's decision for a pending tool-approval request emitted by the
+    /// adapter. `decision` is the open string from
+    /// [`crate::SessionToolDecisionParams`] — typically `"approve"`,
+    /// `"deny"`, or `"automode"`.
+    ToolDecision { call_id: String, decision: String },
+    /// User toggled the session's automode flag. The adapter updates its
+    /// in-memory copy so the next classification respects the change.
+    SetAutoMode(bool),
 }
 
 /// Context handed to the user's session handler.
@@ -398,6 +406,55 @@ where
                 }
                 send_ok(serde_json::Value::Null);
                 should_exit = true;
+            }
+            ahp_method::SESSION_TOOL_DECISION => {
+                let p: crate::SessionToolDecisionParams = match req
+                    .params
+                    .clone()
+                    .map(serde_json::from_value)
+                    .transpose()
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        send_err(ErrorObject::invalid_params("missing params"));
+                        continue;
+                    }
+                    Err(e) => {
+                        send_err(ErrorObject::invalid_params(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Some(tx) = &inbox_tx {
+                    let _ = tx
+                        .send(AdapterInboxMsg::ToolDecision {
+                            call_id: p.call_id,
+                            decision: p.decision,
+                        })
+                        .await;
+                }
+                send_ok(serde_json::Value::Null);
+            }
+            ahp_method::SESSION_SET_AUTOMODE => {
+                let p: crate::SessionSetAutomodeParams = match req
+                    .params
+                    .clone()
+                    .map(serde_json::from_value)
+                    .transpose()
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        send_err(ErrorObject::invalid_params("missing params"));
+                        continue;
+                    }
+                    Err(e) => {
+                        send_err(ErrorObject::invalid_params(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Some(tx) = &inbox_tx {
+                    let _ = tx.send(AdapterInboxMsg::SetAutoMode(p.on)).await;
+                }
+                send_ok(serde_json::Value::Null);
             }
             ahp_method::SHUTDOWN => {
                 send_ok(serde_json::Value::Null);

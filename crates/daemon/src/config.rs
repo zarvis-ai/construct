@@ -73,6 +73,11 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         binary: "agentd-adapter-codex",
         description: "OpenAI Codex (wraps the `codex` CLI)",
     },
+    BuiltinAdapter {
+        name: "zarvis",
+        binary: "agentd-adapter-zarvis",
+        description: "Built-in multi-provider agent (OpenAI / Anthropic / Ollama)",
+    },
 ];
 
 impl Config {

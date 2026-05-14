@@ -143,7 +143,9 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::Interrupt) => continue,
                     Some(AdapterInboxMsg::Stop) => break 0,
                     Some(AdapterInboxMsg::PtyInput(_))
-                    | Some(AdapterInboxMsg::PtyResize { .. }) => continue,
+                    | Some(AdapterInboxMsg::PtyResize { .. })
+                    | Some(AdapterInboxMsg::ToolDecision { .. })
+                    | Some(AdapterInboxMsg::SetAutoMode(_)) => continue,
                 }
             }
         };
@@ -258,8 +260,10 @@ async fn drive_turn(
                         pending.push_back(t);
                     }
                     Some(AdapterInboxMsg::PtyInput(_))
-                    | Some(AdapterInboxMsg::PtyResize { .. }) => {
-                        // headless mode ignores PTY traffic
+                    | Some(AdapterInboxMsg::PtyResize { .. })
+                    | Some(AdapterInboxMsg::ToolDecision { .. })
+                    | Some(AdapterInboxMsg::SetAutoMode(_)) => {
+                        // headless codex doesn't gate tools; ignore.
                     }
                 }
             }

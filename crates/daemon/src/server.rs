@@ -7,8 +7,9 @@ use agentd_protocol::{
     ipc_method, ipc_notif, transport, CreateSessionParams, ErrorObject, GroupCreateParams,
     GroupCreateResult, GroupIdParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams,
     Notification, PingResult, Request, Response, SessionIdParams, SessionInputParams,
-    SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetPinnedParams,
-    SessionSetTitleParams, SubscribeParams, TranscriptParams, IPC_VERSION,
+    SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams,
+    SessionSetPinnedParams, SessionSetTitleParams, SessionToolDecisionParams, SubscribeParams,
+    TranscriptParams, IPC_VERSION,
 };
 use anyhow::Result;
 use serde_json::json;
@@ -324,6 +325,23 @@ async fn dispatch(
         m if m == ipc_method::SESSION_SET_TITLE => {
             let p = params!(SessionSetTitleParams);
             match manager.set_title(&p.session_id, p.title).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_SET_AUTOMODE => {
+            let p = params!(SessionSetAutomodeParams);
+            match manager.set_automode(&p.session_id, p.on).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_TOOL_DECISION => {
+            let p = params!(SessionToolDecisionParams);
+            match manager
+                .tool_decision(&p.session_id, p.call_id, p.decision)
+                .await
+            {
                 Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

@@ -6,8 +6,9 @@ use agentd_protocol::{
     GroupIdParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, GroupSummary,
     HarnessInfo, MoveDirection, Notification, PingResult, PtyReplayResult, Request, Response,
     SessionDetail, SessionIdParams, SessionInputParams, SessionMoveParams, SessionPtyInputParams,
-    SessionPtyResizeParams, SessionSetPinnedParams, SessionSetTitleParams, SessionSummary,
-    SubscribeParams, TranscriptParams, TranscriptResult,
+    SessionPtyResizeParams, SessionSetAutomodeParams, SessionSetPinnedParams,
+    SessionSetTitleParams, SessionSummary, SessionToolDecisionParams, SubscribeParams,
+    TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -244,6 +245,36 @@ impl Client {
                 &SessionSetTitleParams {
                     session_id: id.to_string(),
                     title,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn set_automode(&self, id: &str, on: bool) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_SET_AUTOMODE,
+                &SessionSetAutomodeParams {
+                    session_id: id.to_string(),
+                    on,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn tool_decision(
+        &self,
+        id: &str,
+        call_id: impl Into<String>,
+        decision: impl Into<String>,
+    ) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_TOOL_DECISION,
+                &SessionToolDecisionParams {
+                    session_id: id.to_string(),
+                    call_id: call_id.into(),
+                    decision: decision.into(),
                 },
             )
             .await?;
