@@ -84,6 +84,20 @@ pub struct SessionEntry {
     /// title-gen processes; a failed title-gen leaves the title unset
     /// and the session keeps its hash-derived display name.
     title_gen_attempted: AtomicBool,
+    /// PTY-input accumulator used to derive the auto-title prompt for
+    /// adapters that don't echo user input back as `SessionEvent::Message`
+    /// events (shell / claude / codex interactive). Decodes printable
+    /// ASCII through a tiny ESC-sequence state machine; first CR/LF
+    /// closes the buffer and feeds it to title-gen.
+    pty_input_capture: tokio::sync::Mutex<PtyInputCapture>,
+}
+
+#[derive(Default)]
+struct PtyInputCapture {
+    buf: String,
+    /// 0 = not in an escape; 1 = saw ESC; 2 = saw ESC[ (CSI); 3 = saw ESC O (SS3).
+    esc: u8,
+    triggered: bool,
 }
 
 impl SessionEntry {
@@ -191,6 +205,7 @@ impl SessionManager {
                 // restart from re-running title-gen for already-titled
                 // sessions and is harmless for the rest.
                 title_gen_attempted: AtomicBool::new(s.title.is_some()),
+                pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -427,6 +442,7 @@ impl SessionManager {
             }),
             deleted: AtomicBool::new(false),
             title_gen_attempted: AtomicBool::new(summary.title.is_some()),
+            pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
         });
 
         // Record the user's initial prompt as the first transcript event so
@@ -817,6 +833,10 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        // Capture the user's first typed line for auto-title (shell /
+        // claude / codex interactive sessions don't echo a Message event
+        // back to the daemon; this is the only place we see their input).
+        self.feed_pty_input_capture(&entry, &bytes).await;
         let adapter = entry
             .adapter
             .lock()
@@ -828,6 +848,60 @@ impl SessionManager {
         )?;
         adapter.request(ahp_method::SESSION_PTY_INPUT, params).await?;
         Ok(())
+    }
+
+    /// Feed PTY-input bytes through a minimal terminal-input parser
+    /// (printable ASCII + backspace + CR/LF; CSI/SS3 sequences skipped).
+    /// On the first CR/LF, hand the accumulated line to the auto-title
+    /// path. After the first trigger this becomes a no-op for the
+    /// session's lifetime.
+    async fn feed_pty_input_capture(&self, entry: &Arc<SessionEntry>, bytes: &[u8]) {
+        // Cheap early-outs before taking the per-session lock.
+        if entry.title_gen_attempted.load(Ordering::SeqCst) {
+            return;
+        }
+        let mut cap = entry.pty_input_capture.lock().await;
+        if cap.triggered {
+            return;
+        }
+        for &b in bytes {
+            match cap.esc {
+                0 => match b {
+                    b'\r' | b'\n' => {
+                        let s = cap.buf.trim().to_string();
+                        cap.triggered = true;
+                        cap.buf.clear();
+                        drop(cap);
+                        if s.chars().count() >= 2 {
+                            self.maybe_spawn_auto_title(entry.clone(), s);
+                        }
+                        return;
+                    }
+                    0x1b => cap.esc = 1,
+                    0x08 | 0x7f => {
+                        cap.buf.pop();
+                    }
+                    _ if (0x20..0x7f).contains(&b) => cap.buf.push(b as char),
+                    _ => {}
+                },
+                1 => match b {
+                    b'[' => cap.esc = 2,
+                    b'O' => cap.esc = 3,
+                    _ => cap.esc = 0,
+                },
+                2 => {
+                    // CSI: parameter bytes + final byte in `@`..=`~`.
+                    if (0x40..=0x7e).contains(&b) {
+                        cap.esc = 0;
+                    }
+                }
+                3 => {
+                    // SS3: one byte.
+                    cap.esc = 0;
+                }
+                _ => cap.esc = 0,
+            }
+        }
     }
 
     pub async fn pty_resize(&self, id: &str, cols: u16, rows: u16) -> Result<()> {

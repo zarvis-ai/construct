@@ -25,6 +25,7 @@
 //!                     role: MessageRole::User, text: t,
 //!                 }),
 //!                 AdapterInboxMsg::Interrupt | AdapterInboxMsg::Stop => break,
+//!                 _ => {} // ignore PTY traffic, tool decisions, automode toggles
 //!             }
 //!         }
 //!         ctx.emit.emit(SessionEvent::Done { exit_code: 0 });
