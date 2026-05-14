@@ -104,13 +104,13 @@ const PAD_TOP: usize = 1;
 const PAD_BOTTOM: usize = 1;
 const PAD_RIGHT: usize = 2;
 /// First-line marker for the response. `\xe2\x97\x8f` = `●`.
-const RESPONSE_BULLET: &[u8] = b"\xe2\x97\x8f  ";
+const RESPONSE_BULLET: &[u8] = b"\xe2\x97\x8f ";
 /// Continuation indent that aligns the wrapped text under the text
 /// after the bullet. Must visually match the bullet's cell width
-/// (1 dot + 2 spaces = 3 cells).
-const RESPONSE_INDENT: &[u8] = b"   ";
+/// (1 dot + 1 space = 2 cells).
+const RESPONSE_INDENT: &[u8] = b"  ";
 /// Left margin in visible cells (counts toward soft-wrap math).
-const LEFT_MARGIN_CELLS: usize = 3;
+const LEFT_MARGIN_CELLS: usize = 2;
 /// Hard floor on usable width so a tiny pane doesn't crash the wrap
 /// math.
 const MIN_USABLE_WIDTH: usize = 20;
