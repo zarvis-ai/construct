@@ -728,17 +728,22 @@ pub async fn run(
     let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
 
     let term = Terminal::new(&emit);
-    // On resume we skip the full banner — the user already saw it the
-    // first time, and a smaller "(resumed — N prior messages loaded)"
-    // note is printed below once we know the message count.
-    if !persist::is_resume() {
+    let resuming = persist::is_resume();
+    // On resume we emit nothing — banner, note, and prompt all stay off
+    // so the PTY looks exactly as it did before the daemon restart. The
+    // line editor's redraw on the first keystroke will paint the prompt
+    // cleanly. (Pressing Enter on an empty line is also a no-op + fresh
+    // prompt, so the user has an explicit "wake me up" escape hatch.)
+    if !resuming {
         term.banner(provider_name, &model, automode);
     }
     emit.emit(SessionEvent::Status {
         state: SessionState::Running,
         detail: Some(format!("{}:{}  [interactive]", provider_name, model)),
     });
-    term.prompt();
+    if !resuming {
+        term.prompt();
+    }
 
     let tool_ctx = ToolCtx {
         cwd,
@@ -762,9 +767,9 @@ pub async fn run(
     } else {
         Vec::new()
     };
-    if persist::is_resume() && !messages.is_empty() {
-        term.note(&format!("(resumed — {} prior messages loaded)", messages.len()));
-    }
+    // Intentionally silent on resume — the prior PTY state is still
+    // visible to the user; no need for a meta-narration line.
+    let _ = resuming; // referenced above
     let mut pending: VecDeque<String> = VecDeque::new();
     if !persist::is_resume() {
         if let Some(p) = params.prompt.clone() {
