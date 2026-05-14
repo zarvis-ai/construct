@@ -172,57 +172,530 @@ impl<'a> TextSink for PtySink<'a> {
     }
 }
 
-/// Minimal terminal line editor — handles printable ASCII, Backspace,
-/// Enter, Ctrl-C, Ctrl-D. Returns one event per fed byte.
+/// Readline-ish line editor — handles printable chars, cursor
+/// navigation (arrows + C-a/C-e/C-b/C-f), history (↑/↓ + C-p/C-n),
+/// killing (C-k/C-u/C-w/Backspace/Delete), Enter, C-c, C-d.
+///
+/// The editor consumes raw PTY bytes through [`feed_bytes`], returning
+/// (a) bytes to write back to the PTY (incremental echoes or full
+/// line redraws) and (b) any top-level events (Submit / Interrupt /
+/// Eof) the caller should act on.
 struct LineEditor {
     buf: String,
-}
-impl LineEditor {
-    fn new() -> Self {
-        Self { buf: String::new() }
-    }
-    fn feed(&mut self, b: u8) -> LineEvent {
-        match b {
-            // Ctrl-C
-            0x03 => LineEvent::Interrupt,
-            // Ctrl-D — EOF if buffer empty, else nothing.
-            0x04 => {
-                if self.buf.is_empty() {
-                    LineEvent::Eof
-                } else {
-                    LineEvent::None
-                }
-            }
-            // Enter (CR or LF)
-            b'\r' | b'\n' => {
-                let line = std::mem::take(&mut self.buf);
-                LineEvent::Submit(line)
-            }
-            // Backspace / DEL
-            0x08 | 0x7f => {
-                if self.buf.pop().is_some() {
-                    LineEvent::Backspace
-                } else {
-                    LineEvent::None
-                }
-            }
-            // Skip other control codes; let printable bytes through.
-            b if b < 0x20 => LineEvent::None,
-            b => {
-                self.buf.push(b as char);
-                LineEvent::Echo(b)
-            }
-        }
-    }
+    /// Char index of the cursor within `buf` (0 = before first char).
+    cursor: usize,
+    history: Vec<String>,
+    /// `None` = editing current line; `Some(i)` = viewing
+    /// `history[history.len() - 1 - i]` with the editing buffer saved
+    /// in `saved`.
+    hist_pos: Option<usize>,
+    saved: String,
+    /// ANSI escape sequence state.
+    esc: EscState,
+    /// What we re-emit to redraw the line; produced fresh each frame
+    /// from `(prompt_seq, buf, cursor)`.
+    prompt_seq: &'static [u8],
 }
 
+#[derive(Default)]
+enum EscState {
+    #[default]
+    Idle,
+    /// Just saw ESC (0x1b).
+    Esc,
+    /// Saw ESC [ — collecting params until a final byte.
+    Csi {
+        params: String,
+    },
+    /// Saw ESC O — accept exactly one final byte.
+    Ss3,
+}
+
+#[derive(Debug)]
 enum LineEvent {
-    Echo(u8),
-    Backspace,
     Submit(String),
     Interrupt,
     Eof,
-    None,
+}
+
+impl LineEditor {
+    fn new(prompt_seq: &'static [u8]) -> Self {
+        Self {
+            buf: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            hist_pos: None,
+            saved: String::new(),
+            esc: EscState::Idle,
+            prompt_seq,
+        }
+    }
+
+    /// Bytes the terminal needs to repaint the current line. Caller is
+    /// responsible for having the cursor sitting on the prompt's row
+    /// before calling (we always start with `\r` + erase-to-end).
+    fn redraw(&self) -> Vec<u8> {
+        let mut out: Vec<u8> = Vec::with_capacity(self.buf.len() + 32);
+        out.extend_from_slice(b"\r\x1b[K");
+        out.extend_from_slice(self.prompt_seq);
+        out.extend_from_slice(self.buf.as_bytes());
+        // Move cursor back by (chars after cursor) cells, if any.
+        let tail = self.buf.chars().count().saturating_sub(self.cursor);
+        if tail > 0 {
+            let mv = format!("\x1b[{tail}D");
+            out.extend_from_slice(mv.as_bytes());
+        }
+        out
+    }
+
+    fn submit(&mut self) -> LineEvent {
+        let line = std::mem::take(&mut self.buf);
+        self.cursor = 0;
+        self.hist_pos = None;
+        self.saved.clear();
+        if !line.is_empty()
+            && self.history.last().map(|s| s.as_str()) != Some(line.as_str())
+        {
+            self.history.push(line.clone());
+        }
+        LineEvent::Submit(line)
+    }
+
+    fn ascii_at(&self, n: usize) -> Option<char> {
+        self.buf.chars().nth(n)
+    }
+
+    fn move_left(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+        }
+    }
+    fn move_right(&mut self) {
+        if self.cursor < self.buf.chars().count() {
+            self.cursor += 1;
+        }
+    }
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+    fn move_end(&mut self) {
+        self.cursor = self.buf.chars().count();
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let byte_idx = char_index_to_byte(&self.buf, self.cursor);
+        self.buf.insert(byte_idx, c);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let prev_byte = char_index_to_byte(&self.buf, self.cursor - 1);
+        let cur_byte = char_index_to_byte(&self.buf, self.cursor);
+        self.buf.replace_range(prev_byte..cur_byte, "");
+        self.cursor -= 1;
+    }
+    fn delete_forward(&mut self) {
+        let total = self.buf.chars().count();
+        if self.cursor >= total {
+            return;
+        }
+        let cur_byte = char_index_to_byte(&self.buf, self.cursor);
+        let next_byte = char_index_to_byte(&self.buf, self.cursor + 1);
+        self.buf.replace_range(cur_byte..next_byte, "");
+    }
+    fn kill_to_end(&mut self) {
+        let cur_byte = char_index_to_byte(&self.buf, self.cursor);
+        self.buf.truncate(cur_byte);
+    }
+    fn kill_to_home(&mut self) {
+        let cur_byte = char_index_to_byte(&self.buf, self.cursor);
+        self.buf.replace_range(..cur_byte, "");
+        self.cursor = 0;
+    }
+    fn kill_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars: Vec<char> = self.buf.chars().collect();
+        let mut i = self.cursor;
+        // Skip trailing whitespace.
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        // Then skip the word.
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        let start_byte = char_index_to_byte(&self.buf, i);
+        let cur_byte = char_index_to_byte(&self.buf, self.cursor);
+        self.buf.replace_range(start_byte..cur_byte, "");
+        self.cursor = i;
+    }
+
+    fn history_prev(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let new_pos = match self.hist_pos {
+            None => 0,
+            Some(i) if i + 1 < self.history.len() => i + 1,
+            Some(i) => i,
+        };
+        if self.hist_pos.is_none() {
+            self.saved = self.buf.clone();
+        }
+        self.hist_pos = Some(new_pos);
+        self.buf = self.history[self.history.len() - 1 - new_pos].clone();
+        self.cursor = self.buf.chars().count();
+    }
+    fn history_next(&mut self) {
+        let Some(i) = self.hist_pos else { return };
+        if i == 0 {
+            self.hist_pos = None;
+            self.buf = std::mem::take(&mut self.saved);
+        } else {
+            self.hist_pos = Some(i - 1);
+            self.buf = self.history[self.history.len() - i].clone();
+        }
+        self.cursor = self.buf.chars().count();
+    }
+
+    /// Feed a chunk of raw PTY bytes from the user. Returns (bytes to
+    /// write back to the terminal, top-level events).
+    fn feed_bytes(&mut self, input: &[u8]) -> (Vec<u8>, Vec<LineEvent>) {
+        let mut out: Vec<u8> = Vec::new();
+        let mut events: Vec<LineEvent> = Vec::new();
+        for &b in input {
+            self.step_byte(b, &mut out, &mut events);
+        }
+        (out, events)
+    }
+
+    fn step_byte(&mut self, b: u8, out: &mut Vec<u8>, events: &mut Vec<LineEvent>) {
+        // ESC sequence handling first.
+        match &mut self.esc {
+            EscState::Idle => {
+                if b == 0x1b {
+                    self.esc = EscState::Esc;
+                    return;
+                }
+            }
+            EscState::Esc => {
+                match b {
+                    b'[' => {
+                        self.esc = EscState::Csi { params: String::new() };
+                        return;
+                    }
+                    b'O' => {
+                        self.esc = EscState::Ss3;
+                        return;
+                    }
+                    _ => {
+                        // ESC followed by something else — drop both.
+                        self.esc = EscState::Idle;
+                        return;
+                    }
+                }
+            }
+            EscState::Csi { params } => {
+                // Parameter bytes are digits, `;`, or `?`. Final byte is
+                // anything in 0x40..=0x7E.
+                if (b'0'..=b'9').contains(&b) || b == b';' || b == b'?' {
+                    params.push(b as char);
+                    return;
+                }
+                let params = std::mem::take(params);
+                self.esc = EscState::Idle;
+                self.handle_csi_final(b, &params, out, events);
+                return;
+            }
+            EscState::Ss3 => {
+                self.esc = EscState::Idle;
+                self.handle_ss3_final(b, out, events);
+                return;
+            }
+        }
+
+        // Plain (non-ESC) byte.
+        match b {
+            // Enter
+            b'\r' | b'\n' => {
+                events.push(self.submit());
+                // Drop the prompt's tail; caller draws its own newline +
+                // re-prompt after handling the Submit event.
+                out.extend_from_slice(b"\r\n");
+            }
+            // Ctrl-C
+            0x03 => events.push(LineEvent::Interrupt),
+            // Ctrl-D — Eof if empty buf, else forward-delete.
+            0x04 => {
+                if self.buf.is_empty() {
+                    events.push(LineEvent::Eof);
+                } else {
+                    self.delete_forward();
+                    out.extend_from_slice(&self.redraw());
+                }
+            }
+            // Ctrl-A / Home
+            0x01 => {
+                self.move_home();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-E / End
+            0x05 => {
+                self.move_end();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-B
+            0x02 => {
+                self.move_left();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-F
+            0x06 => {
+                self.move_right();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-K (kill to end)
+            0x0b => {
+                self.kill_to_end();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-U (kill to start)
+            0x15 => {
+                self.kill_to_home();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-W (kill word back)
+            0x17 => {
+                self.kill_word_back();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-P (history prev)
+            0x10 => {
+                self.history_prev();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-N (history next)
+            0x0e => {
+                self.history_next();
+                out.extend_from_slice(&self.redraw());
+            }
+            // Ctrl-L — clear screen + redraw.
+            0x0c => {
+                out.extend_from_slice(b"\x1b[2J\x1b[H");
+                out.extend_from_slice(&self.redraw());
+            }
+            // Backspace / DEL
+            0x08 | 0x7f => {
+                if self.cursor > 0 {
+                    self.backspace();
+                    out.extend_from_slice(&self.redraw());
+                }
+            }
+            // Other control bytes: ignore.
+            b if b < 0x20 => {}
+            // Printable ASCII / UTF-8 byte. UTF-8 continuation bytes get
+            // collected by str::from_utf8 elsewhere; here we just treat
+            // any 0x20+ byte as a char insert for simplicity (works for
+            // ASCII; multi-byte UTF-8 sequences from a terminal will
+            // each get inserted as separate chars, which mangles them —
+            // acceptable for v1, fixable by buffering a UTF-8 decoder).
+            b => {
+                let c = b as char;
+                self.insert_char(c);
+                // If cursor is at end, optimize: just echo the char.
+                // Otherwise full redraw to shift the tail.
+                if self.cursor == self.buf.chars().count() {
+                    out.push(b);
+                } else {
+                    out.extend_from_slice(&self.redraw());
+                }
+            }
+        }
+    }
+
+    fn handle_csi_final(
+        &mut self,
+        final_byte: u8,
+        params: &str,
+        out: &mut Vec<u8>,
+        _events: &mut Vec<LineEvent>,
+    ) {
+        match final_byte {
+            b'A' => self.history_prev(),
+            b'B' => self.history_next(),
+            b'C' => self.move_right(),
+            b'D' => self.move_left(),
+            b'H' => self.move_home(),
+            b'F' => self.move_end(),
+            // `\x1b[3~` = Delete; `\x1b[1~` = Home; `\x1b[4~` = End;
+            // `\x1b[7~`/`\x1b[8~` are Linux-console variants.
+            b'~' => match params {
+                "1" | "7" => self.move_home(),
+                "4" | "8" => self.move_end(),
+                "3" => self.delete_forward(),
+                _ => return, // unknown — no redraw
+            },
+            _ => return,
+        }
+        out.extend_from_slice(&self.redraw());
+    }
+
+    fn handle_ss3_final(
+        &mut self,
+        final_byte: u8,
+        out: &mut Vec<u8>,
+        _events: &mut Vec<LineEvent>,
+    ) {
+        match final_byte {
+            b'A' => self.history_prev(),
+            b'B' => self.history_next(),
+            b'C' => self.move_right(),
+            b'D' => self.move_left(),
+            b'H' => self.move_home(),
+            b'F' => self.move_end(),
+            _ => return,
+        }
+        out.extend_from_slice(&self.redraw());
+    }
+}
+
+fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn editor() -> LineEditor {
+        LineEditor::new(b"> ")
+    }
+
+    fn submit_line(ed: &mut LineEditor, bytes: &[u8]) -> Option<String> {
+        let (_, evs) = ed.feed_bytes(bytes);
+        for ev in evs {
+            if let LineEvent::Submit(s) = ev {
+                return Some(s);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn simple_typing_and_enter() {
+        let mut ed = editor();
+        assert_eq!(submit_line(&mut ed, b"hello\r"), Some("hello".into()));
+    }
+
+    #[test]
+    fn left_arrow_then_insert() {
+        // type "ab", left-arrow, insert "X" → "aXb"
+        let mut ed = editor();
+        ed.feed_bytes(b"ab\x1b[D");
+        assert_eq!(ed.cursor, 1);
+        ed.feed_bytes(b"X");
+        assert_eq!(ed.buf, "aXb");
+    }
+
+    #[test]
+    fn ctrl_a_then_e() {
+        let mut ed = editor();
+        ed.feed_bytes(b"hello");
+        assert_eq!(ed.cursor, 5);
+        ed.feed_bytes(&[0x01]); // C-a
+        assert_eq!(ed.cursor, 0);
+        ed.feed_bytes(&[0x05]); // C-e
+        assert_eq!(ed.cursor, 5);
+    }
+
+    #[test]
+    fn ctrl_b_and_f() {
+        let mut ed = editor();
+        ed.feed_bytes(b"hi");
+        ed.feed_bytes(&[0x02]); // C-b
+        assert_eq!(ed.cursor, 1);
+        ed.feed_bytes(&[0x02]);
+        assert_eq!(ed.cursor, 0);
+        ed.feed_bytes(&[0x06]); // C-f
+        assert_eq!(ed.cursor, 1);
+    }
+
+    #[test]
+    fn backspace_and_delete() {
+        let mut ed = editor();
+        ed.feed_bytes(b"hello");
+        ed.feed_bytes(&[0x7f]); // DEL → backspace
+        assert_eq!(ed.buf, "hell");
+        ed.feed_bytes(&[0x01]); // C-a
+        ed.feed_bytes(b"\x1b[3~"); // forward Delete
+        assert_eq!(ed.buf, "ell");
+    }
+
+    #[test]
+    fn kill_to_end_and_home() {
+        let mut ed = editor();
+        ed.feed_bytes(b"hello world");
+        ed.feed_bytes(&[0x01]); // C-a
+        ed.feed_bytes(&[0x06, 0x06, 0x06, 0x06, 0x06]); // forward 5 chars → cursor at " "
+        ed.feed_bytes(&[0x0b]); // C-k
+        assert_eq!(ed.buf, "hello");
+        ed.feed_bytes(&[0x15]); // C-u (kill to home)
+        assert_eq!(ed.buf, "");
+    }
+
+    #[test]
+    fn ctrl_w_kills_last_word() {
+        let mut ed = editor();
+        ed.feed_bytes(b"hello world");
+        ed.feed_bytes(&[0x17]); // C-w
+        assert_eq!(ed.buf, "hello ");
+    }
+
+    #[test]
+    fn history_with_arrows() {
+        let mut ed = editor();
+        submit_line(&mut ed, b"one\r");
+        submit_line(&mut ed, b"two\r");
+        ed.feed_bytes(b"\x1b[A"); // up → "two"
+        assert_eq!(ed.buf, "two");
+        ed.feed_bytes(b"\x1b[A"); // up → "one"
+        assert_eq!(ed.buf, "one");
+        ed.feed_bytes(b"\x1b[B"); // down → "two"
+        assert_eq!(ed.buf, "two");
+        ed.feed_bytes(b"\x1b[B"); // down → saved (empty)
+        assert_eq!(ed.buf, "");
+    }
+
+    #[test]
+    fn history_with_ctrl_p_n() {
+        let mut ed = editor();
+        submit_line(&mut ed, b"alpha\r");
+        submit_line(&mut ed, b"beta\r");
+        ed.feed_bytes(&[0x10]); // C-p
+        assert_eq!(ed.buf, "beta");
+        ed.feed_bytes(&[0x10]);
+        assert_eq!(ed.buf, "alpha");
+        ed.feed_bytes(&[0x0e]); // C-n
+        assert_eq!(ed.buf, "beta");
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_and_ctrl_d_eofs() {
+        let mut ed = editor();
+        let (_, evs) = ed.feed_bytes(&[0x03]);
+        assert!(matches!(evs.as_slice(), [LineEvent::Interrupt]));
+        let mut ed = editor();
+        let (_, evs) = ed.feed_bytes(&[0x04]);
+        assert!(matches!(evs.as_slice(), [LineEvent::Eof]));
+    }
 }
 
 /// Tri-state interrupt signal used during in-flight turns.
@@ -267,7 +740,11 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
     };
 
-    let mut editor = LineEditor::new();
+    // Prompt bytes the line editor will re-emit on every redraw. Must
+    // match Terminal::prompt's payload sans the leading `\r\n` (we keep
+    // those local to Terminal::prompt because the editor uses bare `\r`
+    // for redraw and assumes the prompt sits on a fresh row).
+    let mut editor = LineEditor::new(b"\x1b[1;36m\xe2\x9d\xaf \x1b[0m");
     let mut messages: Vec<Message> = Vec::new();
     let mut pending: VecDeque<String> = VecDeque::new();
     if let Some(p) = params.prompt.clone() {
@@ -426,42 +903,36 @@ async fn read_one_line(
             None => return ReadOutcome::Stop,
             Some(AdapterInboxMsg::Stop) => return ReadOutcome::Stop,
             Some(AdapterInboxMsg::Interrupt) => {
-                // Discard current line, redraw prompt.
                 editor.buf.clear();
-                term.newline();
+                editor.cursor = 0;
+                term.note("(C-c)");
                 term.prompt();
             }
             Some(AdapterInboxMsg::Input(t)) => {
-                // External input from `agent send_input` — treat as if the
-                // user typed it, echo for the transcript.
                 term.print(&t);
                 term.newline();
                 return ReadOutcome::Line(t);
             }
             Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
             Some(AdapterInboxMsg::PtyInput(bytes)) => {
-                for b in bytes {
-                    match editor.feed(b) {
-                        LineEvent::Echo(c) => term.write(&[c]),
-                        LineEvent::Backspace => term.write(b"\x08 \x08"),
-                        LineEvent::Submit(line) => {
-                            term.newline();
-                            return ReadOutcome::Line(line);
-                        }
+                let (out, events) = editor.feed_bytes(&bytes);
+                if !out.is_empty() {
+                    term.write(&out);
+                }
+                for ev in events {
+                    match ev {
+                        LineEvent::Submit(line) => return ReadOutcome::Line(line),
                         LineEvent::Interrupt => {
                             editor.buf.clear();
+                            editor.cursor = 0;
                             term.note("(C-c)");
                             term.prompt();
                         }
                         LineEvent::Eof => return ReadOutcome::Eof,
-                        LineEvent::None => {}
                     }
                 }
             }
-            Some(AdapterInboxMsg::PtyResize { .. }) => {
-                // We don't currently track size for line-wrapping; rely
-                // on the terminal emulator to wrap.
-            }
+            Some(AdapterInboxMsg::PtyResize { .. }) => {}
             Some(AdapterInboxMsg::ToolDecision { .. }) => {}
         }
     }
