@@ -124,6 +124,37 @@ impl Storage {
         Ok(s)
     }
 
+    pub fn start_params_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("start.json")
+    }
+
+    /// Persist the params used to spawn this session, so a daemon restart
+    /// can re-spawn with the same shape (cwd, harness, env, args, …).
+    pub fn save_start_params(
+        &self,
+        id: &str,
+        params: &agentd_protocol::SessionStartParams,
+    ) -> Result<()> {
+        self.ensure_session_dir(id)?;
+        let path = self.start_params_path(id);
+        let tmp = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(params)?;
+        std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+        Ok(())
+    }
+
+    pub fn load_start_params(
+        &self,
+        id: &str,
+    ) -> Result<agentd_protocol::SessionStartParams> {
+        let path = self.start_params_path(id);
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let p: agentd_protocol::SessionStartParams = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse {}", path.display()))?;
+        Ok(p)
+    }
+
     pub fn list_summaries(&self) -> Result<Vec<SessionSummary>> {
         let mut out = Vec::new();
         let root = self.sessions_root();

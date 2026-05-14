@@ -336,6 +336,38 @@ two most-recent.
 - `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `OLLAMA_HOST` — point at
   alternate endpoints (OpenAI-compatible vendors, self-hosted, etc.).
 
+## Session resume across daemon restarts
+
+When the daemon restarts, sessions that were alive at the time of the
+last shutdown are automatically re-spawned. The daemon persists the
+original `SessionStartParams` to disk at create time and sets
+`AGENTD_RESUME=1` + `AGENTD_SESSION_DATA_DIR=<session-dir>` in the
+adapter's env on re-spawn; each adapter decides what "resume" means
+for its harness:
+
+- **shell** — respawns a fresh `$SHELL -il` in the original cwd. The
+  PTY scrollback from the previous incarnation is still in
+  `pty.log` (visible in the terminal pane), but any in-progress
+  command is gone.
+- **claude (interactive)** — mints a fresh UUID at first spawn,
+  passes it as `--session-id <uuid>` to claude, and persists it under
+  `<session-dir>/claude_session_id.txt`. On respawn we pass
+  `--resume <uuid>` so the claude conversation continues.
+- **codex (interactive)** — invokes `codex resume <id>` if we have a
+  captured id (`<session-dir>/codex_session_id.txt`) or
+  `AGENTD_CODEX_RESUME_ID` is set; otherwise falls back to
+  `codex resume --last` (picks the most-recent recorded codex
+  session; correct when you only have one running).
+- **zarvis** — appends each `Message` to
+  `<session-dir>/zarvis.jsonl` as the agent loop runs. On respawn
+  the loop reads the file back into memory before waiting for new
+  input, so the conversation history is intact across daemon
+  restarts.
+
+Sessions whose adapter binary is missing, whose start params can't
+be loaded, or whose harness rejects the respawn are marked `Errored`
+(transcript + scrollback remain readable).
+
 Deferred to later milestones:
 
 - Custom user keymap file (today: choose `AGENTD_KEYMAP=emacs|vim`)

@@ -36,7 +36,7 @@ fn estimate_tokens(messages: &[Message]) -> usize {
     let mut chars = 0usize;
     for m in messages {
         match &m.content {
-            Content::Text(t) => chars += t.len(),
+            Content::Text { text: t } => chars += t.len(),
             Content::AssistantToolCalls { text, calls } => {
                 if let Some(t) = text {
                     chars += t.len();
@@ -108,10 +108,10 @@ mod tests {
     use super::*;
 
     fn user(s: &str) -> Message {
-        Message { role: Role::User, content: Content::Text(s.into()) }
+        Message { role: Role::User, content: Content::Text { text: s.into() } }
     }
     fn asst(s: &str) -> Message {
-        Message { role: Role::Assistant, content: Content::Text(s.into()) }
+        Message { role: Role::Assistant, content: Content::Text { text: s.into() } }
     }
 
     #[test]

@@ -144,13 +144,11 @@ impl SessionManager {
     pub async fn new(storage: Arc<Storage>, config: Arc<Config>) -> Result<Self> {
         let summaries = storage.list_summaries()?;
         let mut sessions = HashMap::new();
-        for mut s in summaries {
-            // Sessions whose adapter was alive when the daemon last died are
-            // by definition orphaned now — mark them errored on restart.
-            if !s.state.is_terminal() {
-                s.state = SessionState::Errored;
-                let _ = storage.save_summary(&s);
-            }
+        for s in summaries {
+            // Preserve the prior state in the entry. `resume_running_sessions`
+            // (called from main after construction) tries to respawn each
+            // non-terminal session and falls back to marking Errored on
+            // failure — see clean_orphaned_after_resume.
             // Recover seq counter from transcript line count.
             let path = storage.transcript_path(&s.id);
             let count = if path.exists() {
@@ -385,6 +383,13 @@ impl SessionManager {
         self.storage.save_summary(&summary)?;
 
         // Send session.start.
+        let mut env_with_meta = params.env.clone();
+        // Hand the adapter a private per-session dir for persisting its own
+        // state (zarvis.jsonl, claude/codex session id files, …).
+        env_with_meta.insert(
+            "AGENTD_SESSION_DATA_DIR".to_string(),
+            self.storage.session_dir(&id).to_string_lossy().to_string(),
+        );
         let start_params = SessionStartParams {
             session_id: id.clone(),
             cwd: summary.cwd.clone(),
@@ -392,9 +397,11 @@ impl SessionManager {
             model: summary.model.clone(),
             mode: params.mode.clone(),
             pty_size: params.pty_size,
-            env: params.env.clone(),
+            env: env_with_meta,
             args: params.args.clone(),
         };
+        // Persist so a daemon restart can re-spawn with the same shape.
+        let _ = self.storage.save_start_params(&id, &start_params);
         // Reflect Pending → Running on start (the adapter may also emit a status).
         summary.state = SessionState::Running;
         self.storage.save_summary(&summary)?;
@@ -447,6 +454,120 @@ impl SessionManager {
         }));
 
         Ok(id)
+    }
+
+    /// Re-spawn the adapter for every persisted session whose state was
+    /// non-terminal at the time of the previous shutdown. Each adapter
+    /// receives `AGENTD_RESUME=1` in its env plus the same start params it
+    /// was originally launched with (cwd, model, prompt, etc.) — the
+    /// adapter decides what "resume" means for its harness. Sessions that
+    /// can't be re-spawned (missing start.json, missing adapter binary,
+    /// spawn failure) are marked Errored.
+    pub async fn resume_running_sessions(self: Arc<Self>) {
+        let ids: Vec<String> = {
+            let guard = self.sessions.read().await;
+            let mut v = Vec::new();
+            for (id, entry) in guard.iter() {
+                let s = entry.summary.read().await;
+                if !s.state.is_terminal() {
+                    v.push(id.clone());
+                }
+            }
+            v
+        };
+        for id in ids {
+            if let Err(e) = self.clone().respawn(&id).await {
+                tracing::warn!(session = %id, error = ?e, "resume failed; marking Errored");
+                if let Some(entry) = self.get_entry(&id).await {
+                    let snapshot = {
+                        let mut s = entry.summary.write().await;
+                        s.state = SessionState::Errored;
+                        s.clone()
+                    };
+                    let _ = self.storage.save_summary(&snapshot);
+                    let _ = self.broadcast.send(BroadcastMsg::State(
+                        StateNotificationPayload { session: snapshot },
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Spawn an adapter for an already-existing session entry (i.e. on
+    /// daemon restart). Reuses the start params persisted at create time
+    /// and signals `AGENTD_RESUME=1` so the adapter can pull its own
+    /// prior state from `AGENTD_SESSION_DATA_DIR`.
+    async fn respawn(self: Arc<Self>, id: &str) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {id}"))?;
+        let mut start_params = self.storage.load_start_params(id)?;
+        start_params
+            .env
+            .insert("AGENTD_RESUME".to_string(), "1".to_string());
+        // Make sure the data-dir env is present even if start.json predates
+        // the meta env injection.
+        start_params.env.insert(
+            "AGENTD_SESSION_DATA_DIR".to_string(),
+            self.storage.session_dir(id).to_string_lossy().to_string(),
+        );
+
+        let harness = {
+            let s = entry.summary.read().await;
+            s.harness.clone()
+        };
+        let adapter_cfg = self
+            .config
+            .adapters
+            .get(&harness)
+            .ok_or_else(|| anyhow!("unknown harness on resume: {harness}"))?
+            .clone();
+        let binary_spec = adapter_cfg.binary.clone().unwrap_or_else(|| harness.clone());
+        let binary = locate_binary(&binary_spec)
+            .ok_or_else(|| anyhow!("adapter binary not found: {binary_spec}"))?;
+        let combined_args = {
+            let mut a = adapter_cfg.args.clone();
+            a.extend(start_params.args.clone());
+            a
+        };
+
+        let (msg_tx, msg_rx) = mpsc::channel::<AdapterMessage>(ADAPTER_DRAIN_CAP);
+        let (adapter, _info) = Adapter::spawn(
+            harness.clone(),
+            binary,
+            combined_args,
+            start_params.env.clone(),
+            msg_tx.clone(),
+        )
+        .await
+        .with_context(|| format!("respawn adapter for {harness}"))?;
+
+        adapter
+            .request(
+                ahp_method::SESSION_START,
+                serde_json::to_value(&start_params)?,
+            )
+            .await
+            .context("adapter session.start (resume) failed")?;
+
+        *entry.adapter.lock().await = Some(adapter.clone());
+
+        // Notify clients that this session is alive again.
+        let snapshot = entry.summary.read().await.clone();
+        let _ = self.broadcast.send(BroadcastMsg::State(
+            StateNotificationPayload { session: snapshot },
+        ));
+
+        // Drain adapter messages just like a fresh create.
+        let manager = self.clone();
+        let entry_for_drain = entry.clone();
+        tokio::spawn(async move {
+            manager.drain_adapter(entry_for_drain, msg_rx).await;
+        });
+
+        tracing::info!(session = %id, %harness, "resumed");
+        Ok(())
     }
 
     async fn drain_adapter(

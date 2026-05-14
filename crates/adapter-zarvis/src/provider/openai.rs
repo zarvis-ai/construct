@@ -55,7 +55,7 @@ fn messages_to_openai(system: &str, messages: &[Message]) -> Vec<Value> {
     }
     for m in messages {
         match &m.content {
-            Content::Text(text) => {
+            Content::Text { text: text } => {
                 out.push(json!({ "role": role_str(m.role), "content": text }));
             }
             Content::AssistantToolCalls { text, calls } => {

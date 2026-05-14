@@ -76,6 +76,31 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let bin = std::env::var("AGENTD_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut args = params.args.clone();
+    // Resume support: on daemon-restart respawn we use codex's
+    // `resume <SESSION_ID>` subcommand instead of starting fresh. We
+    // capture the id from the first turn's transcript (best-effort —
+    // codex prints "session id: <uuid>" in the banner). If we never
+    // captured one, fall back to `resume --last`. Honor the user's
+    // explicit override via `AGENTD_CODEX_RESUME_ID`.
+    let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
+    let sid_file = std::env::var("AGENTD_SESSION_DATA_DIR").ok().map(|d| {
+        std::path::PathBuf::from(d).join("codex_session_id.txt")
+    });
+    if resuming {
+        args.insert(0, "resume".into());
+        let explicit = std::env::var("AGENTD_CODEX_RESUME_ID").ok();
+        let from_file = sid_file.as_ref().and_then(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        if let Some(id) = explicit.or(from_file) {
+            args.insert(1, id);
+        } else {
+            args.insert(1, "--last".into());
+        }
+    }
     if let Some(m) = params.model.as_ref() {
         args.push("-m".into());
         args.push(m.clone());
@@ -86,8 +111,11 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     for a in agentd_protocol::adapter::maybe_inject_codex_mcp_args(&ctx.session_id) {
         args.push(a);
     }
-    if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
-        args.push(prompt.clone());
+    // Skip the initial prompt on resume — codex's resume already has it.
+    if !resuming {
+        if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
+            args.push(prompt.clone());
+        }
     }
     let mut env: Vec<(String, String)> = params
         .env

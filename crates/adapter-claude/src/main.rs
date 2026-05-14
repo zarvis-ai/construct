@@ -91,9 +91,39 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         args.push("--mcp-config".into());
         args.push(cfg.to_string_lossy().to_string());
     }
-    if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
-        // claude treats trailing positional as the initial prompt.
-        args.push(prompt.clone());
+    // Resume support: stash our own UUID under
+    // $AGENTD_SESSION_DATA_DIR/claude_session_id.txt at first spawn (passed
+    // to claude as --session-id), then pass it back as --resume when the
+    // daemon respawns us after a restart. claude's own session-persistence
+    // makes the conversation pick up where it left off.
+    let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
+    let sid_file =
+        std::env::var("AGENTD_SESSION_DATA_DIR").ok().map(|d| {
+            std::path::PathBuf::from(d).join("claude_session_id.txt")
+        });
+    let claude_session_id = match (resuming, sid_file.as_ref()) {
+        (true, Some(p)) if p.exists() => std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    };
+    if let Some(sid) = &claude_session_id {
+        args.push("--resume".into());
+        args.push(sid.clone());
+    } else if let Some(p) = &sid_file {
+        // First spawn (or no prior id): mint our own and pass --session-id.
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let _ = std::fs::write(p, &new_id);
+        args.push("--session-id".into());
+        args.push(new_id);
+    }
+    // Skip the initial prompt on resume — it's already in the claude
+    // conversation we're rejoining.
+    if !resuming {
+        if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
+            args.push(prompt.clone());
+        }
     }
     // Surface the session id to the child's env so agents that aren't using
     // MCP (or the user, via `echo $AGENTD_SESSION_ID`) can still tell.

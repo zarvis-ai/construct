@@ -32,8 +32,13 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/bash".to_string());
 
+        // On daemon-restart resume: ignore the original one-shot prompt
+        // (it already ran in the previous incarnation). Re-spawn a fresh
+        // interactive login shell in the same cwd so the user can keep
+        // working.
+        let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
         let args: Vec<String> = match params.prompt.as_deref() {
-            Some(p) if !p.trim().is_empty() => {
+            Some(p) if !p.trim().is_empty() && !resuming => {
                 vec!["-lc".to_string(), p.to_string()]
             }
             _ => vec!["-il".to_string()],

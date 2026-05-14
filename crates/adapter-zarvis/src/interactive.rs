@@ -10,8 +10,9 @@
 //! The TUI's `vt100`-backed terminal pane parses these bytes the same
 //! way it parses any other PTY-backed adapter's output.
 
-use crate::agent::{ResolvedModel, SYSTEM_PROMPT};
+use crate::agent::{push_msg, ResolvedModel, SYSTEM_PROMPT};
 use crate::context;
+use crate::persist::{self, Persist};
 use crate::provider::{Content, Message, Role, StopReason, TextSink, ToolCall};
 use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
@@ -745,11 +746,26 @@ pub async fn run(
     // those local to Terminal::prompt because the editor uses bare `\r`
     // for redraw and assumes the prompt sits on a fresh row).
     let mut editor = LineEditor::new(b"\x1b[1;36m\xe2\x9d\xaf \x1b[0m");
-    let mut messages: Vec<Message> = Vec::new();
+    let data_dir = persist::session_data_dir_from_env();
+    let mut persist = Persist::open(data_dir.as_deref());
+    let mut messages: Vec<Message> = if persist::is_resume() {
+        if let Some(p) = persist.as_ref().map(|p| p.path().to_path_buf()) {
+            Persist::load(&p).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    if persist::is_resume() && !messages.is_empty() {
+        term.note(&format!("(resumed — {} prior messages loaded)", messages.len()));
+    }
     let mut pending: VecDeque<String> = VecDeque::new();
-    if let Some(p) = params.prompt.clone() {
-        if !p.trim().is_empty() {
-            pending.push_back(p);
+    if !persist::is_resume() {
+        if let Some(p) = params.prompt.clone() {
+            if !p.trim().is_empty() {
+                pending.push_back(p);
+            }
         }
     }
 
@@ -787,9 +803,9 @@ pub async fn run(
             continue;
         }
 
-        messages.push(Message {
+        push_msg!(messages, persist, Message {
             role: Role::User,
-            content: Content::Text(user_text.clone()),
+            content: Content::Text { text: user_text.clone() },
         });
         emit.emit(SessionEvent::Message {
             role: agentd_protocol::MessageRole::User,
@@ -823,15 +839,15 @@ pub async fn run(
 
             if turn.tool_calls.is_empty() {
                 if let Some(text) = turn.text {
-                    messages.push(Message {
+                    push_msg!(messages, persist, Message {
                         role: Role::Assistant,
-                        content: Content::Text(text),
+                        content: Content::Text { text },
                     });
                 }
                 break;
             }
 
-            messages.push(Message {
+            push_msg!(messages, persist, Message {
                 role: Role::Assistant,
                 content: Content::AssistantToolCalls {
                     text: turn.text.clone(),
@@ -852,7 +868,7 @@ pub async fn run(
                 let outcome = match outcome {
                     Ok(o) => o,
                     Err(reason) => {
-                        messages.push(Message {
+                        push_msg!(messages, persist, Message {
                             role: Role::Tool,
                             content: Content::ToolResult {
                                 call_id: call.id.clone(),
@@ -867,7 +883,7 @@ pub async fn run(
                     }
                 };
                 let truncated = truncate_for_model(&outcome.output, TOOL_OUTPUT_BUDGET);
-                messages.push(Message {
+                push_msg!(messages, persist, Message {
                     role: Role::Tool,
                     content: Content::ToolResult {
                         call_id: call.id.clone(),

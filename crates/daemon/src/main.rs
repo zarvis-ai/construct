@@ -83,6 +83,11 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
             .await
             .context("init session manager")?,
     );
+    // Best-effort resume: re-spawn adapters for sessions that were alive at
+    // the previous shutdown. Sessions whose adapter binary is missing or
+    // whose start params can't be loaded get marked Errored. Logs only;
+    // never fatal.
+    manager.clone().resume_running_sessions().await;
 
     let socket_path = socket_override.unwrap_or_else(|| paths.socket());
     server::serve(manager, socket_path).await

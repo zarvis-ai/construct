@@ -8,6 +8,7 @@
 mod agent;
 mod context;
 mod interactive;
+mod persist;
 mod provider;
 mod tools;
 

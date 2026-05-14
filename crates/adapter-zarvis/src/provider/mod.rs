@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod anthropic;
@@ -11,7 +12,8 @@ pub mod ollama;
 pub mod openai;
 pub mod routing;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Role {
     System,
     User,
@@ -22,16 +24,20 @@ pub enum Role {
 /// One message in the rolling conversation we send to the model. Mirrors
 /// the shape that maps cleanly onto OpenAI / Anthropic / Ollama wire
 /// formats — each provider impl translates it to its own JSON.
-#[derive(Debug, Clone)]
+///
+/// Serializable so the agent loop can append each message to
+/// `zarvis.jsonl` and replay on daemon-restart resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: Role,
     pub content: Content,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Content {
     /// Plain text (system / user / assistant).
-    Text(String),
+    Text { text: String },
     /// Assistant turn that's making tool calls. May also include final
     /// pre-tool prose (`text`) that comes before the calls.
     AssistantToolCalls {
@@ -54,7 +60,7 @@ pub struct ToolSpec {
     pub schema: Value,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,

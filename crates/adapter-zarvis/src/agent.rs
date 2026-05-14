@@ -4,6 +4,7 @@
 //! the model signals end-of-turn.
 
 use crate::context;
+use crate::persist::{self, Persist};
 use crate::provider::{
     self, Content, LlmProvider, Message, Role, StopReason, TextSink, ToolCall, ToolSpec,
 };
@@ -46,6 +47,19 @@ Be concise. When you finish a turn, emit a short summary of what you did; the us
 /// model. Full output always goes to the transcript.
 const TOOL_OUTPUT_BUDGET: usize = 8_000;
 
+/// Push a `Message` to the in-memory vec and persist the same message
+/// (best-effort) to `zarvis.jsonl` so a daemon restart can hydrate it.
+macro_rules! push_msg {
+    ($messages:expr, $persist:expr, $msg:expr) => {{
+        let m = $msg;
+        if let Some(p) = $persist.as_mut() {
+            p.append(&m);
+        }
+        $messages.push(m);
+    }};
+}
+pub(crate) use push_msg;
+
 pub async fn run(
     params: SessionStartParams,
     ctx: AdapterContext,
@@ -75,11 +89,27 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
     };
 
-    let mut messages: Vec<Message> = Vec::new();
+    // Per-session message persistence (`zarvis.jsonl`). On resume,
+    // hydrate `messages` from the file before the loop starts.
+    let data_dir = persist::session_data_dir_from_env();
+    let mut persist = Persist::open(data_dir.as_deref());
+    let mut messages: Vec<Message> = if persist::is_resume() {
+        if let Some(p) = persist.as_ref().map(|p| p.path().to_path_buf()) {
+            Persist::load(&p).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     let mut pending: VecDeque<String> = VecDeque::new();
-    if let Some(p) = params.prompt.clone() {
-        if !p.trim().is_empty() {
-            pending.push_back(p);
+    // Skip the initial prompt on resume — it's already in the loaded
+    // messages and re-running it would double-charge the model.
+    if !persist::is_resume() {
+        if let Some(p) = params.prompt.clone() {
+            if !p.trim().is_empty() {
+                pending.push_back(p);
+            }
         }
     }
 
@@ -108,9 +138,9 @@ pub async fn run(
         if user_text.trim().is_empty() {
             continue;
         }
-        messages.push(Message {
+        push_msg!(messages, persist, Message {
             role: Role::User,
-            content: Content::Text(user_text),
+            content: Content::Text { text: user_text },
         });
 
         emit.emit(SessionEvent::Status {
@@ -143,9 +173,9 @@ pub async fn run(
 
             if turn.tool_calls.is_empty() {
                 if let Some(text) = turn.text {
-                    messages.push(Message {
+                    push_msg!(messages, persist, Message {
                         role: Role::Assistant,
-                        content: Content::Text(text),
+                        content: Content::Text { text },
                     });
                 }
                 break;
@@ -153,7 +183,7 @@ pub async fn run(
 
             // Stash the assistant turn that issued the tool calls so
             // the next provider call has the matching `tool_call_id`s.
-            messages.push(Message {
+            push_msg!(messages, persist, Message {
                 role: Role::Assistant,
                 content: Content::AssistantToolCalls {
                     text: turn.text.clone(),
@@ -177,7 +207,7 @@ pub async fn run(
                     Err(reason) => {
                         // Stop / interrupt during approval — synthesize an
                         // error result, abandon the turn.
-                        messages.push(Message {
+                        push_msg!(messages, persist, Message {
                             role: Role::Tool,
                             content: Content::ToolResult {
                                 call_id: call.id.clone(),
@@ -192,7 +222,7 @@ pub async fn run(
                     }
                 };
                 let truncated = truncate_for_model(&outcome.output, TOOL_OUTPUT_BUDGET);
-                messages.push(Message {
+                push_msg!(messages, persist, Message {
                     role: Role::Tool,
                     content: Content::ToolResult {
                         call_id: call.id.clone(),

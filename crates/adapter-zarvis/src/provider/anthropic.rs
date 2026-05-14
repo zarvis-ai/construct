@@ -45,7 +45,7 @@ fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
     for m in messages {
         match (m.role, &m.content) {
             (Role::System, _) => {} // attached as `system` field on the request
-            (_, Content::Text(text)) => {
+            (_, Content::Text { text: text }) => {
                 let role = match m.role {
                     Role::User => "user",
                     Role::Assistant => "assistant",
