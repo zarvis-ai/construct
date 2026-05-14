@@ -81,6 +81,21 @@ pub enum ViewMode {
     Terminal,
 }
 
+/// Which pane (if any) currently takes the entire screen. Zoom mirrors
+/// tmux's `prefix z`: a single key collapses the rest of the layout
+/// onto a single pane and back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ZoomMode {
+    #[default]
+    None,
+    /// Session list fills the screen (minibuffer + modeline still
+    /// visible). `C-x o` from here flips to `View`.
+    List,
+    /// Session view fills the screen. `C-x o` from here flips to
+    /// `List`.
+    View,
+}
+
 #[derive(Debug, Clone)]
 pub enum MinibufferIntent {
     SendInput { session_id: String },
@@ -143,7 +158,7 @@ pub struct App {
     /// Zoom: hide list / pin strip / modeline; the session view fills the
     /// screen except for the minibuffer line at the bottom. Toggled with
     /// `C-x z` (emacs) / `z` (vim), matching tmux's prefix-z.
-    pub zoomed: bool,
+    pub zoom: ZoomMode,
     /// Scrollback offset (in rows) applied to the *focused* session's PTY
     /// parser when rendering. 0 = live view. Increased by mouse-wheel up,
     /// decreased by mouse-wheel down. Reset to 0 on user keystroke into
@@ -228,7 +243,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         view: ViewMode::Transcript,
         terminals: HashMap::new(),
         terminal_pane_size: (100, 30),
-        zoomed: false,
+        zoom: ZoomMode::None,
         view_scrollback: 0,
         pty_activity: HashMap::new(),
         start_instant: Instant::now(),
@@ -1223,10 +1238,25 @@ impl App {
                 });
             }
             SwitchFocus => {
-                self.focus = match self.focus {
-                    PaneFocus::List => PaneFocus::View,
-                    PaneFocus::View => PaneFocus::List,
-                };
+                // In a zoomed layout `C-x o` swaps which pane is
+                // zoomed (and focused). In normal layout it just
+                // swaps focus.
+                match self.zoom {
+                    ZoomMode::List => {
+                        self.zoom = ZoomMode::View;
+                        self.focus = PaneFocus::View;
+                    }
+                    ZoomMode::View => {
+                        self.zoom = ZoomMode::List;
+                        self.focus = PaneFocus::List;
+                    }
+                    ZoomMode::None => {
+                        self.focus = match self.focus {
+                            PaneFocus::List => PaneFocus::View,
+                            PaneFocus::View => PaneFocus::List,
+                        };
+                    }
+                }
                 let label = match self.focus {
                     PaneFocus::List => "focus: list",
                     PaneFocus::View => "focus: view",
@@ -1234,19 +1264,28 @@ impl App {
                 self.set_status(label.into());
             }
             ToggleZoom => {
-                self.zoomed = !self.zoomed;
-                if self.zoomed {
-                    // The list is hidden when zoomed — focus must move to
-                    // the view so PTY capture takes over naturally.
-                    self.focus = PaneFocus::View;
-                }
+                // Zoom the currently-focused pane; if anything is
+                // already zoomed, unzoom back to the split layout.
+                self.zoom = match self.zoom {
+                    ZoomMode::None => match self.focus {
+                        PaneFocus::List => ZoomMode::List,
+                        PaneFocus::View => ZoomMode::View,
+                    },
+                    _ => ZoomMode::None,
+                };
+                // Keep focus in sync with whatever's visible.
+                self.focus = match self.zoom {
+                    ZoomMode::List => PaneFocus::List,
+                    ZoomMode::View => PaneFocus::View,
+                    ZoomMode::None => self.focus,
+                };
                 // The parser is re-sized in render and `pty_resize` propagates
                 // SIGWINCH to the child. We intentionally do NOT send Ctrl-L
                 // here — that would clear the screen in bash, wiping the
                 // user's scrollback. Existing output stays put; new output
                 // continues at the cursor's current row.
                 self.set_status(
-                    if self.zoomed {
+                    if self.zoom != ZoomMode::None {
                         "zoomed — C-x z to unzoom"
                     } else {
                         "zoom off"

@@ -1,6 +1,6 @@
 //! Ratatui rendering for the TUI.
 
-use crate::app::{App, ListItem as AppListItem, PaneFocus, Selection, ViewMode};
+use crate::app::{App, ListItem as AppListItem, PaneFocus, Selection, ViewMode, ZoomMode};
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,9 +11,16 @@ use unicode_width::UnicodeWidthStr;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
-    if app.zoomed {
-        render_zoomed(f, area, app);
-        return;
+    match app.zoom {
+        ZoomMode::View => {
+            render_zoomed_view(f, area, app);
+            return;
+        }
+        ZoomMode::List => {
+            render_zoomed_list(f, area, app);
+            return;
+        }
+        ZoomMode::None => {}
     }
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -109,7 +116,7 @@ fn apply_focused_scrollback(app: &mut App) {
 /// borders — edge-to-edge so the underlying TUI (vim / claude / htop /
 /// whatever is running) gets the most real estate possible. Matches
 /// tmux's `prefix z` zoomed-pane behavior.
-fn render_zoomed(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
@@ -141,6 +148,31 @@ fn render_zoomed(f: &mut Frame, area: Rect, app: &mut App) {
             ViewMode::Transcript => render_transcript(f, main_area, app),
         }
     }
+    render_minibuffer(f, minibuffer_area, app);
+    if app.help_visible {
+        render_help(f, area);
+    }
+}
+
+/// Zoom-list layout: the session list fills the screen above the
+/// minibuffer line. `C-x o` from here flips to the view-zoom layout
+/// for the selected session, matching tmux's pane-cycling feel.
+fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    let main_area = vertical[0];
+    let minibuffer_area = vertical[1];
+
+    // Zoomed-list layout snapshot: only the list + minibuffer exist.
+    app.layout.list_area = Some(main_area);
+    app.layout.view_area = None;
+    app.layout.pin_strip_area = None;
+    app.layout.minibuffer_area = Some(minibuffer_area);
+    app.layout.list_row_count = app.list_items().len();
+
+    render_sessions(f, main_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
         render_help(f, area);
@@ -456,8 +488,10 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &App) {
         // Help hint — when the PTY has the keys, all chords need C-x first.
         let hint = if app.help_visible {
             String::new()
-        } else if app.zoomed {
-            "zoomed — C-x z to unzoom   C-x x palette   ? help".to_string()
+        } else if matches!(app.zoom, ZoomMode::View) {
+            "zoomed: view — C-x o list   C-x z unzoom   C-x x palette".to_string()
+        } else if matches!(app.zoom, ZoomMode::List) {
+            "zoomed: list — C-x o view   C-x z unzoom   C-x x palette".to_string()
         } else if matches!(app.focus, PaneFocus::View)
             && app.view == ViewMode::Terminal
             && app.selected_session().map(|s| s.has_pty).unwrap_or(false)
