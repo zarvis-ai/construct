@@ -56,6 +56,11 @@ pub fn catalog() -> Vec<Value> {
             "`git diff HEAD` for the session's worktree (or its cwd if it's a git repo without an isolated worktree). Empty string if not a git repo.",
             schema_obj(&[("session_id", "string", true)]),
         ),
+        tool(
+            "agentd_get_tasks",
+            "List the session's tool-call task registry: running, backgrounded, and recently-completed entries. Each entry includes call_id, tool, args_summary, state, started_at_ms, optionally backgrounded_at_ms / ended_at_ms / output_preview. Use this to discover what a session is currently working on, including long-running tools that have been auto-promoted to the background.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
         // ----- Write -----
         tool(
             "agentd_create_session",
@@ -227,6 +232,11 @@ pub async fn call(
             let sid = arg_str(&args, "session_id")?;
             serde_json::to_value(client.diff(&sid).await?)?
         }
+        "agentd_get_tasks" => {
+            let sid = arg_str(&args, "session_id")?;
+            let tasks = client.list_tasks(&sid).await?;
+            json!({ "tasks": tasks })
+        }
         // ----- Write -----
         "agentd_create_session" => {
             let harness = arg_str(&args, "harness")?;
@@ -246,6 +256,7 @@ pub async fn call(
                 worktree: args.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
                 env: Default::default(),
                 args: Vec::new(),
+                kind: agentd_protocol::SessionKind::User,
             };
             let sid = client.create(params).await?;
             json!({ "session_id": sid })

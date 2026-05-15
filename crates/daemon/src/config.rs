@@ -33,6 +33,45 @@ pub struct Config {
     pub adapters: BTreeMap<String, AdapterConfig>,
     #[serde(default)]
     pub defaults: Defaults,
+    #[serde(default)]
+    pub orchestrator: OrchestratorConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrchestratorConfig {
+    /// Which harness backs the daemon-created orchestrator session.
+    /// `None` (TOML: `harness = ""` or `enabled = false`) disables
+    /// the orchestrator entirely — clients then fall back to the
+    /// static command palette. Default: `"zarvis"`.
+    #[serde(default)]
+    pub harness: Option<String>,
+    /// Hard kill switch; set to `false` to disable the orchestrator
+    /// even when `harness` is configured. Default: `true`.
+    #[serde(default = "default_orchestrator_enabled")]
+    pub enabled: bool,
+}
+
+fn default_orchestrator_enabled() -> bool {
+    true
+}
+
+impl Default for OrchestratorConfig {
+    fn default() -> Self {
+        Self {
+            harness: Some("zarvis".to_string()),
+            enabled: true,
+        }
+    }
+}
+
+impl OrchestratorConfig {
+    /// The effective harness name when the orchestrator is enabled.
+    pub fn effective_harness(&self) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        self.harness.as_deref().filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

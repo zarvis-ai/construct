@@ -164,6 +164,13 @@ pub enum AdapterInboxMsg {
     /// User toggled the session's automode flag. The adapter updates its
     /// in-memory copy so the next classification respects the change.
     SetAutoMode(bool),
+    /// Client clicked `[kill]` / `[bg]` on a running tool block (or
+    /// invoked the equivalent slash command / IPC method). The
+    /// adapter looks up `call_id` in its in-flight task registry
+    /// and applies the action. `action` is an open string —
+    /// `"kill"` aborts the task, `"background"` moves it to the
+    /// background pool.
+    ToolAction { call_id: String, action: String },
 }
 
 /// Context handed to the user's session handler.
@@ -430,6 +437,33 @@ where
                         .send(AdapterInboxMsg::ToolDecision {
                             call_id: p.call_id,
                             decision: p.decision,
+                        })
+                        .await;
+                }
+                send_ok(serde_json::Value::Null);
+            }
+            ahp_method::SESSION_TOOL_ACTION => {
+                let p: crate::SessionToolActionParams = match req
+                    .params
+                    .clone()
+                    .map(serde_json::from_value)
+                    .transpose()
+                {
+                    Ok(Some(p)) => p,
+                    Ok(None) => {
+                        send_err(ErrorObject::invalid_params("missing params"));
+                        continue;
+                    }
+                    Err(e) => {
+                        send_err(ErrorObject::invalid_params(e.to_string()));
+                        continue;
+                    }
+                };
+                if let Some(tx) = &inbox_tx {
+                    let _ = tx
+                        .send(AdapterInboxMsg::ToolAction {
+                            call_id: p.call_id,
+                            action: p.action,
                         })
                         .await;
                 }

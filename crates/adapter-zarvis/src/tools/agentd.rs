@@ -12,7 +12,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-async fn client(ctx: &ToolCtx) -> Result<Arc<Client>> {
+pub(crate) async fn client(ctx: &ToolCtx) -> Result<Arc<Client>> {
     ctx.client
         .get_or_try_init(|| async {
             let socket = Paths::discover().socket();
@@ -228,6 +228,9 @@ impl Tool for CreateSession {
             worktree: input.get("worktree").and_then(|v| v.as_bool()).unwrap_or(false),
             env: Default::default(),
             args: Vec::new(),
+            // Sessions created via the agentd-control tool are always
+            // user sessions — the orchestrator is daemon-internal only.
+            kind: agentd_protocol::SessionKind::User,
         };
         let c = client(ctx).await?;
         let sid = c.create(params).await?;
@@ -392,3 +395,161 @@ simple_write_tool!(
     },
     "title"
 );
+
+// ---------- Loops ----------
+
+/// Helper: read the calling session's id from the env injected by
+/// the daemon. The agentd-control tools default to "this" session
+/// when the LLM doesn't supply a session_id explicitly.
+fn calling_session_id() -> Option<String> {
+    std::env::var("AGENTD_SESSION_ID").ok()
+}
+
+pub struct LoopCreate;
+#[async_trait]
+impl Tool for LoopCreate {
+    fn name(&self) -> &str { "agentd_loop_create" }
+    fn description(&self) -> &str {
+        "Create a recurring prompt that fires into a session at a regular interval. \
+         `interval_seconds` sets the cadence (clamped to host bounds — default 30s..86400s). \
+         `prompt` is the text that will be injected as if the user typed it. \
+         `expires_in_seconds` optionally caps how long the loop runs. \
+         `session_id` defaults to the calling session."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id":         { "type": "string" },
+                "interval_seconds":   { "type": "integer", "minimum": 1 },
+                "expires_in_seconds": { "type": "integer", "minimum": 1 },
+                "prompt":             { "type": "string" }
+            },
+            "required": ["interval_seconds", "prompt"]
+        })
+    }
+    fn risk(&self) -> ToolRisk { ToolRisk::Risky }
+    fn args_summary(&self, input: &Value) -> String {
+        let secs = input.get("interval_seconds").and_then(|v| v.as_u64()).unwrap_or(0);
+        let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+        let preview: String = prompt.chars().take(40).collect();
+        format!("{secs}s — {preview}")
+    }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let sid = input
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(calling_session_id)
+            .ok_or_else(|| anyhow!("session_id required (and AGENTD_SESSION_ID unset)"))?;
+        let secs = input
+            .get("interval_seconds")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("interval_seconds required"))?;
+        let prompt = need_str(&input, "prompt")?;
+        let expires_in = input.get("expires_in_seconds").and_then(|v| v.as_u64());
+        let expires_at_ms = expires_in.map(|d| {
+            chrono::Utc::now().timestamp_millis() + (d as i64) * 1000
+        });
+        let c = client(ctx).await?;
+        let l = c
+            .loop_create(agentd_protocol::LoopCreateParams {
+                session_id: sid,
+                spec: agentd_protocol::LoopSpec::Interval { seconds: secs },
+                prompt,
+                expires_at_ms,
+            })
+            .await?;
+        Ok(ToolOutcome {
+            ok: true,
+            output: serde_json::to_string(&l)?,
+        })
+    }
+}
+
+pub struct LoopList;
+#[async_trait]
+impl Tool for LoopList {
+    fn name(&self) -> &str { "agentd_loop_list" }
+    fn description(&self) -> &str {
+        "List recurring prompts (loops) attached to a session, or to all sessions when \
+         `session_id` is omitted. Returns metadata + next fire time."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "session_id": { "type": "string" } }
+        })
+    }
+    fn risk(&self) -> ToolRisk { ToolRisk::Safe }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let sid = input.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let c = client(ctx).await?;
+        let loops = c.loop_list(sid.as_deref()).await?;
+        Ok(ToolOutcome { ok: true, output: serde_json::to_string(&loops)? })
+    }
+}
+
+pub struct LoopUpdate;
+#[async_trait]
+impl Tool for LoopUpdate {
+    fn name(&self) -> &str { "agentd_loop_update" }
+    fn description(&self) -> &str {
+        "Update a loop's interval / prompt / expiry. Omitted fields keep their current value."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "loop_id":            { "type": "string" },
+                "interval_seconds":   { "type": "integer", "minimum": 1 },
+                "prompt":             { "type": "string" },
+                "expires_at_ms":      { "type": "integer" }
+            },
+            "required": ["loop_id"]
+        })
+    }
+    fn risk(&self) -> ToolRisk { ToolRisk::Risky }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let loop_id = need_str(&input, "loop_id")?;
+        let spec = input
+            .get("interval_seconds")
+            .and_then(|v| v.as_u64())
+            .map(|s| agentd_protocol::LoopSpec::Interval { seconds: s });
+        let prompt = input.get("prompt").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let expires_at_ms = input.get("expires_at_ms").and_then(|v| v.as_i64());
+        let c = client(ctx).await?;
+        let l = c
+            .loop_update(agentd_protocol::LoopUpdateParams {
+                loop_id,
+                spec,
+                prompt,
+                expires_at_ms,
+            })
+            .await?;
+        Ok(ToolOutcome { ok: true, output: serde_json::to_string(&l)? })
+    }
+}
+
+pub struct LoopRemove;
+#[async_trait]
+impl Tool for LoopRemove {
+    fn name(&self) -> &str { "agentd_loop_remove" }
+    fn description(&self) -> &str {
+        "Remove a recurring prompt by loop_id. Stops future firings."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "loop_id": { "type": "string" } },
+            "required": ["loop_id"]
+        })
+    }
+    fn risk(&self) -> ToolRisk { ToolRisk::Risky }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let loop_id = need_str(&input, "loop_id")?;
+        let c = client(ctx).await?;
+        c.loop_remove(&loop_id).await?;
+        Ok(ToolOutcome { ok: true, output: format!("removed {loop_id}") })
+    }
+}

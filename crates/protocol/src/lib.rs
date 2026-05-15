@@ -36,6 +36,7 @@ pub mod ahp_method {
     pub const SESSION_INTERRUPT: &str = "session.interrupt";
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
+    pub const SESSION_TOOL_ACTION: &str = "session.tool_action";
     pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
     pub const SHUTDOWN: &str = "shutdown";
 }
@@ -237,7 +238,97 @@ pub enum SessionEvent {
         args_summary: String,
         risk: ToolRisk,
     },
+    /// Tool lifecycle: adapter started running a tool. Carries the
+    /// canonical `call_id` (unlike [`ToolUse`] which doesn't) so the
+    /// daemon's per-session task registry can match this against the
+    /// later [`TaskBackgrounded`] / [`TaskEnd`] events. Emitted in
+    /// addition to `ToolUse`, not in place of it — the structured
+    /// transcript and the model's tool-call stream still rely on
+    /// `ToolUse` / `ToolResult`.
+    TaskStart {
+        call_id: String,
+        tool: String,
+        #[serde(default)]
+        args_summary: String,
+    },
+    /// The tool's foreground budget elapsed (auto-bg at
+    /// `AGENTD_TOOL_BG_AFTER_MS`) or the user clicked `[bg]` /
+    /// invoked `session.tool_action { action: "background" }`. The
+    /// adapter detached the join handle into its background pool;
+    /// the agent's conversation got a placeholder result and moved
+    /// on. A [`TaskEnd`] event will follow once the detached task
+    /// actually completes.
+    TaskBackgrounded { call_id: String },
+    /// The tool finished (whichever path it took). `ok` and
+    /// `output_preview` mirror the corresponding `ToolResult` event
+    /// — `output_preview` is truncated for `/tasks` display; the
+    /// full output is in the transcript via `ToolResult`.
+    TaskEnd {
+        call_id: String,
+        ok: bool,
+        #[serde(default)]
+        output_preview: String,
+    },
 }
+
+/// Lifecycle state surfaced by `session.list_tasks`. Derived by the
+/// daemon from `SessionEvent::TaskStart` / `TaskBackgrounded` /
+/// `TaskEnd` flowing from the adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Running,
+    Backgrounded,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub call_id: String,
+    pub tool: String,
+    #[serde(default)]
+    pub args_summary: String,
+    pub state: TaskState,
+    pub started_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backgrounded_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at_ms: Option<i64>,
+    /// Truncated end-state preview (only meaningful for terminal
+    /// states; `None` while still running / backgrounded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_preview: Option<String>,
+    /// `true` for a successful terminal state — distinguishes
+    /// `Completed { ok: true }` from `Completed { ok: false }`.
+    #[serde(default)]
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTasksParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListTasksResult {
+    pub tasks: Vec<TaskInfo>,
+}
+
+/// Conventional tool name that adapters use to forward client-targeted
+/// slash commands. The adapter emits a [`SessionEvent::ToolUse`] with
+/// this name and an `args` object shaped like
+/// `{"command": "<verb>", "args": "<rest>"}` (the `args` field is
+/// omitted when the command was bare); it immediately follows up with
+/// a synthetic [`SessionEvent::ToolResult`] so the transcript stays
+/// balanced. The client TUI / CLI subscribes to `ToolUse` events,
+/// recognizes this tool name, and dispatches its own slash table.
+/// Defining it as a protocol constant (instead of a separate event
+/// variant) keeps the wire format small and lets the LLM-initiated
+/// path use the same tool when we later register it in zarvis's
+/// catalog for natural-language UI actions.
+pub const TUI_DISPATCH_TOOL: &str = "tui";
 
 /// Coarse risk classification used by adapters that gate tool calls behind
 /// user approval. Two tiers are intentional; finer-grained policies can be
@@ -345,6 +436,12 @@ pub mod ipc_method {
     pub const SESSION_SET_TITLE: &str = "session.set_title";
     pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
+    pub const SESSION_TOOL_ACTION: &str = "session.tool_action";
+    pub const SESSION_LIST_TASKS: &str = "session.list_tasks";
+    pub const LOOP_CREATE: &str = "loop.create";
+    pub const LOOP_LIST: &str = "loop.list";
+    pub const LOOP_UPDATE: &str = "loop.update";
+    pub const LOOP_REMOVE: &str = "loop.remove";
     pub const SESSION_MOVE: &str = "session.move";
     pub const GROUP_LIST: &str = "group.list";
     pub const GROUP_CREATE: &str = "group.create";
@@ -376,6 +473,20 @@ pub struct HarnessInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub capabilities: Capabilities,
+}
+
+/// Distinguishes the implicit orchestrator session — created by the
+/// daemon at startup as the user's always-available command surface —
+/// from ordinary user-created sessions. The orchestrator session is
+/// otherwise identical to a user session; clients use this flag to
+/// render it differently (hidden from the session list, surfaced in
+/// the TUI's minibuffer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    User,
+    Orchestrator,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,6 +548,12 @@ pub struct SessionSummary {
     /// `session.set_automode`.
     #[serde(default)]
     pub automode: bool,
+    /// Distinguishes the orchestrator session (daemon-created, hidden
+    /// from the session list) from ordinary user sessions. Persisted
+    /// in `meta.json` so the daemon recognizes the orchestrator
+    /// across restarts.
+    #[serde(default)]
+    pub kind: SessionKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -474,6 +591,22 @@ pub struct SessionSetAutomodeParams {
     pub on: bool,
 }
 
+/// Params for `session.tool_action` — the client asks the adapter
+/// to take an action on a running tool call (the user clicked a
+/// `[kill]` / `[bg]` button, or pressed an override key). The
+/// adapter looks up `call_id` in its running-tasks registry and
+/// either aborts the task (`"kill"`) or moves it to the
+/// background pool (`"background"`); unknown actions are ignored
+/// with a warning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionToolActionParams {
+    pub session_id: String,
+    pub call_id: String,
+    /// One of `"kill"`, `"background"`. Open string so finer
+    /// actions can be added without a protocol break.
+    pub action: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionToolDecisionParams {
     pub session_id: String,
@@ -483,6 +616,71 @@ pub struct SessionToolDecisionParams {
     /// One of `"approve"`, `"deny"`, `"automode"`. Open string so finer
     /// decisions can be added without a protocol break.
     pub decision: String,
+}
+
+/// Schedule for a recurring prompt injection. v1 supports interval
+/// only; the wire format is open so future cron expression support
+/// is additive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoopSpec {
+    /// Fire every `seconds` seconds.
+    Interval { seconds: u64 },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Loop {
+    pub id: String,
+    pub session_id: String,
+    pub spec: LoopSpec,
+    pub prompt: String,
+    pub created_at_ms: i64,
+    pub next_fire_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at_ms: Option<i64>,
+    #[serde(default)]
+    pub fire_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopCreateParams {
+    pub session_id: String,
+    pub spec: LoopSpec,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopListParams {
+    /// `None` = list every session's loops; `Some` = scope to one
+    /// session. The MCP / CLI surface uses the unscoped form; the
+    /// zarvis tool defaults to the calling session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopListResult {
+    pub loops: Vec<Loop>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopUpdateParams {
+    pub loop_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<LoopSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopRemoveParams {
+    pub loop_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +729,12 @@ pub struct CreateSessionParams {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Marks an internal daemon caller as creating the orchestrator
+    /// session. Public IPC clients should leave this as
+    /// `SessionKind::User`; daemon-internal `ensure_orchestrator`
+    /// passes `Orchestrator`.
+    #[serde(default)]
+    pub kind: SessionKind,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

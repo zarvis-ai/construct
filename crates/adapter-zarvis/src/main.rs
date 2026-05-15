@@ -8,8 +8,12 @@
 mod agent;
 mod context;
 mod interactive;
+mod interval_suggest;
+mod observe;
 mod persist;
+mod project_guide;
 mod provider;
+mod tasks;
 mod title_mode;
 mod tools;
 

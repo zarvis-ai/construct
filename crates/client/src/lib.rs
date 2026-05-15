@@ -280,6 +280,85 @@ impl Client {
             .await?;
         Ok(())
     }
+    pub async fn loop_create(
+        &self,
+        params: agentd_protocol::LoopCreateParams,
+    ) -> Result<agentd_protocol::Loop> {
+        self.request(ipc_method::LOOP_CREATE, &params).await
+    }
+    pub async fn loop_list(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Vec<agentd_protocol::Loop>> {
+        let r: agentd_protocol::LoopListResult = self
+            .request(
+                ipc_method::LOOP_LIST,
+                &agentd_protocol::LoopListParams {
+                    session_id: session_id.map(|s| s.to_string()),
+                },
+            )
+            .await?;
+        Ok(r.loops)
+    }
+    pub async fn loop_update(
+        &self,
+        params: agentd_protocol::LoopUpdateParams,
+    ) -> Result<agentd_protocol::Loop> {
+        self.request(ipc_method::LOOP_UPDATE, &params).await
+    }
+    pub async fn loop_remove(&self, loop_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::LOOP_REMOVE,
+                &agentd_protocol::LoopRemoveParams {
+                    loop_id: loop_id.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// List the per-session task registry: running + backgrounded
+    /// + recent terminal entries. Empty for sessions whose adapter
+    /// doesn't emit `TaskStart` lifecycle events (claude / codex /
+    /// shell today).
+    pub async fn list_tasks(
+        &self,
+        id: &str,
+    ) -> Result<Vec<agentd_protocol::TaskInfo>> {
+        let r: agentd_protocol::ListTasksResult = self
+            .request(
+                ipc_method::SESSION_LIST_TASKS,
+                &agentd_protocol::ListTasksParams {
+                    session_id: id.to_string(),
+                },
+            )
+            .await?;
+        Ok(r.tasks)
+    }
+
+    /// Tell the adapter to act on a running tool call — `"kill"` to
+    /// abort, `"background"` to detach and continue. Used by the
+    /// TUI's `[bg]` / `[kill]` button click handlers; future
+    /// orchestrator slash commands will use it too.
+    pub async fn tool_action(
+        &self,
+        id: &str,
+        call_id: impl Into<String>,
+        action: impl Into<String>,
+    ) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_TOOL_ACTION,
+                &agentd_protocol::SessionToolActionParams {
+                    session_id: id.to_string(),
+                    call_id: call_id.into(),
+                    action: action.into(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
     pub async fn move_session(&self, id: &str, direction: MoveDirection) -> Result<()> {
         let _: serde_json::Value = self
             .request(

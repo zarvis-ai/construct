@@ -1,6 +1,10 @@
 //! Ratatui rendering for the TUI.
 
-use crate::app::{App, ListItem as AppListItem, PaneFocus, Selection, ViewMode, ZoomMode};
+use crate::app::{
+    App, HarnessHit, HintZone, ListItem as AppListItem, Minibuffer, MinibufferIntent,
+    PaneFocus, Selection, ViewMode, ZoomMode, SCROLLBACK_MAX,
+};
+use crate::keymap::KeyAction;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -22,21 +26,33 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
         ZoomMode::None => {}
     }
+    let footer_h = compute_minibuffer_height(app, area.height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(footer_h),
         ])
         .split(area);
     let main_area = vertical[0];
     let modeline_area = vertical[1];
     let minibuffer_area = vertical[2];
 
+    // Clamp the user-adjusted list width to leave room for the view
+    // pane on narrow terminals. The drag handler stores the raw width
+    // (so the user's intent is preserved when the terminal grows
+    // again), and we just clamp at render time.
+    let max_list_w = main_area
+        .width
+        .saturating_sub(crate::app::LIST_PANEL_W_VIEW_MIN)
+        .max(crate::app::LIST_PANEL_W_MIN);
+    let list_w = app
+        .list_panel_w
+        .clamp(crate::app::LIST_PANEL_W_MIN, max_list_w);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(40), Constraint::Min(0)])
+        .constraints([Constraint::Length(list_w), Constraint::Min(0)])
         .split(main_area);
     let right_area = cols[1];
 
@@ -70,12 +86,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let inner_cols = detail_area.width.saturating_sub(2);
     let inner_rows = detail_area.height.saturating_sub(2);
     app.terminal_pane_size = (inner_cols, inner_rows);
-    for parser in app.terminals.values_mut() {
-        parser
-            .screen_mut()
-            .set_size(inner_rows.max(1), inner_cols.max(1));
-    }
-    apply_focused_scrollback(app);
+    // No need to pre-size per-session vt100 parsers — the items
+    // model rebuilds a fresh parser at the current pane size on
+    // every render. Scroll offset is applied inside `replay`.
 
     // Record the frame's pane geometry so the mouse-click handler can
     // map terminal coordinates back to a region.
@@ -92,24 +105,328 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     render_modeline(f, modeline_area, app);
     render_minibuffer(f, minibuffer_area, app);
+    render_diamond_tooltip(f, app);
+    render_close_button_tooltip(f, app, &pinned_ids);
+    render_view_close_tooltip(f, app);
+    render_harness_unavailable_tooltip(f, app);
+    render_tasks_popup(f, app);
     if app.help_visible {
         render_help(f, area);
     }
+}
+
+/// Hover hit-test: if the mouse cursor is currently sitting on the
+/// pin-diamond cell of a session row, return that row's info. Returns
+/// `None` on terminals that don't forward motion events (Terminal.app),
+/// since `app.mouse_pos` stays at the last click/scroll position there.
+fn hovered_diamond(app: &App) -> Option<(u16, u16, &SessionSummary)> {
+    let (mx, my) = app.mouse_pos?;
+    let list_area = app.layout.list_area?;
+    if mx <= list_area.x
+        || mx + 1 >= list_area.x + list_area.width
+        || my <= list_area.y
+        || my + 1 >= list_area.y + list_area.height
+    {
+        return None;
+    }
+    let row = (my - list_area.y - 1) as usize;
+    let items = app.list_items();
+    let item = items.into_iter().nth(row)?;
+    let (summary, indented) = match item {
+        AppListItem::Session { summary, indented } => (summary, indented),
+        _ => return None,
+    };
+    let indent: u16 = if indented { 2 } else { 0 };
+    // Hit zone is the 4-cell gutter to the left of the session name:
+    //   [diamond][ ][status-circle][ ]   ← then the name starts
+    // Wider than the bare diamond glyph so it's easier to click —
+    // the visual overlay still anchors on the diamond cell itself.
+    let zone_start = list_area.x + 1 + indent;
+    let zone_end = zone_start + 4; // exclusive
+    if mx < zone_start || mx >= zone_end {
+        return None;
+    }
+    // Walk the live summary list so the caller sees up-to-date `pinned`
+    // state (the materialized item from list_items() is a snapshot).
+    let s = app.sessions.iter().find(|s| s.id == summary.id)?;
+    Some((zone_start, my, s))
+}
+
+/// Top-row close-button geometry for the session view's right edge.
+/// Returns `(x_start, x_end_exclusive, y)`. Same 3-cell shape the pin
+/// strip uses (` x `), one column inset from the right corner.
+pub fn view_close_button_range(view_area: Rect) -> (u16, u16, u16) {
+    let close_w: u16 = 3;
+    let x_start = view_area.x + view_area.width.saturating_sub(close_w + 1);
+    let x_end = view_area.x + view_area.width.saturating_sub(1);
+    (x_start, x_end, view_area.y)
+}
+
+fn hovered_view_close_button(app: &App, view_area: Rect) -> bool {
+    let Some((mx, my)) = app.mouse_pos else {
+        return false;
+    };
+    let (x_start, x_end, y) = view_close_button_range(view_area);
+    my == y && mx >= x_start && mx < x_end
+}
+
+/// Hover hit-test for the per-tile close button in the pin strip.
+/// Returns the cursor's anchor cell (top-right of the `×` glyph) so the
+/// caller can position a tooltip next to it. Stays in lockstep with
+/// `App::click_pin_strip`'s close-button geometry.
+fn hovered_close_button(app: &App, pinned_ids: &[String]) -> Option<(u16, u16)> {
+    let (mx, my) = app.mouse_pos?;
+    let strip = app.layout.pin_strip_area?;
+    if pinned_ids.is_empty() {
+        return None;
+    }
+    let tiles = pin_tile_layout(strip, pinned_ids.len());
+    for tile in &tiles {
+        // Same hit zone as click_pin_strip: top border row, the 3 cells
+        // covering ` × ` just before the right corner.
+        let close_w: u16 = 3;
+        let close_x_start = tile.x + tile.width.saturating_sub(close_w + 1);
+        let close_x_end = tile.x + tile.width.saturating_sub(1);
+        if my == tile.y && mx >= close_x_start && mx < close_x_end {
+            return Some((close_x_start, tile.y));
+        }
+    }
+    None
+}
+
+fn render_close_button_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
+    let Some((cx, cy)) = hovered_close_button(app, pinned_ids) else { return };
+    let label = " Unpin session ";
+    let total = f.area();
+    let inner_w = UnicodeWidthStr::width(label) as u16;
+    let w = inner_w + 2;
+    let h: u16 = 3;
+    // Anchor below the top border, shifted left so the tooltip's right
+    // edge aligns with the close button when there's room; fall back
+    // toward the screen edge otherwise.
+    let mut tx = cx.saturating_sub(w.saturating_sub(3));
+    let mut ty = cy + 1;
+    if tx + w > total.x + total.width {
+        tx = total.x + total.width.saturating_sub(w);
+    }
+    if ty + h > total.y + total.height {
+        ty = total.y + total.height.saturating_sub(h);
+    }
+    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let p = Paragraph::new(label)
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    f.render_widget(Clear, rect);
+    f.render_widget(p, rect);
+}
+
+fn render_view_close_tooltip(f: &mut Frame, app: &App) {
+    let Some(view_area) = app.layout.view_area else { return };
+    if !hovered_view_close_button(app, view_area) {
+        return;
+    }
+    let (cx, _, cy) = view_close_button_range(view_area);
+    let label = " Close session ";
+    let total = f.area();
+    let inner_w = UnicodeWidthStr::width(label) as u16;
+    let w = inner_w + 2;
+    let h: u16 = 3;
+    let mut tx = cx.saturating_sub(w.saturating_sub(3));
+    let mut ty = cy + 1;
+    if tx + w > total.x + total.width {
+        tx = total.x + total.width.saturating_sub(w);
+    }
+    if ty + h > total.y + total.height {
+        ty = total.y + total.height.saturating_sub(h);
+    }
+    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let p = Paragraph::new(label)
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    f.render_widget(Clear, rect);
+    f.render_widget(p, rect);
+}
+
+/// Tooltip that appears when the cursor is hovering an
+/// **unavailable** harness name in the picker — explains why the
+/// click did nothing. Available harnesses don't get one; the
+/// underline + click-submit affordance is self-explanatory.
+fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
+    let Some((mx, my)) = app.mouse_pos else { return };
+    let hits = &app.layout.minibuffer_harness_hits;
+    let hit = hits.iter().find(|h| {
+        h.y == my && mx >= h.x_start && mx < h.x_end && !h.available
+    });
+    let Some(hit) = hit else { return };
+    let label = format!(" {} — not installed ", hit.name);
+    let total = f.area();
+    let inner_w = UnicodeWidthStr::width(label.as_str()) as u16;
+    let w = inner_w + 2;
+    let h: u16 = 3;
+    // Place above the picker row (room there since the minibuffer
+    // is at the bottom of the screen).
+    let mut tx = hit.x_start;
+    if tx + w > total.x + total.width {
+        tx = total.x + total.width.saturating_sub(w);
+    }
+    let ty = hit.y.saturating_sub(h);
+    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let p = Paragraph::new(label)
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    f.render_widget(Clear, rect);
+    f.render_widget(p, rect);
+}
+
+/// Render the new-session harness picker with each name as a
+/// clickable span. Records per-name column ranges in
+/// `app.layout.minibuffer_harness_hits` so the click handler can
+/// submit the picked name without the user having to type it.
+fn render_harness_picker(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    mb: &Minibuffer,
+) {
+    // Show every registered harness plus the synthetic `group` op.
+    // Unavailable harnesses (binary not on PATH) render dimmed and
+    // strike-through; clicking them no-ops + drops a status note;
+    // hover surfaces a "not installed" tooltip.
+    let mut entries: Vec<(String, bool)> = app
+        .harnesses
+        .iter()
+        .map(|h| (h.name.clone(), h.available))
+        .collect();
+    entries.push(("group".to_string(), true));
+
+    let (hovered_x, hovered_y) = app.mouse_pos.unwrap_or((u16::MAX, u16::MAX));
+    let base_available =
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+    let hover_available = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let base_disabled = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::CROSSED_OUT);
+    let hover_disabled = Style::default()
+        .fg(Color::Red)
+        .add_modifier(Modifier::CROSSED_OUT | Modifier::BOLD);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(entries.len() * 2 + 8);
+    let mut col: u16 = area.x;
+
+    let push_raw = |spans: &mut Vec<Span<'static>>, col: &mut u16, s: &str| {
+        *col += UnicodeWidthStr::width(s) as u16;
+        spans.push(Span::raw(s.to_string()));
+    };
+
+    push_raw(&mut spans, &mut col, "New [");
+    for (i, (name, available)) in entries.iter().enumerate() {
+        if i > 0 {
+            push_raw(&mut spans, &mut col, "|");
+        }
+        let w = UnicodeWidthStr::width(name.as_str()) as u16;
+        let x_start = col;
+        let x_end = col + w;
+        let hovered =
+            hovered_y == area.y && hovered_x >= x_start && hovered_x < x_end;
+        let style = match (*available, hovered) {
+            (true, true) => hover_available,
+            (true, false) => base_available,
+            (false, true) => hover_disabled,
+            (false, false) => base_disabled,
+        };
+        spans.push(Span::styled(name.clone(), style));
+        app.layout.minibuffer_harness_hits.push(HarnessHit {
+            name: name.clone(),
+            x_start,
+            x_end,
+            y: area.y,
+            available: *available,
+        });
+        col = x_end;
+    }
+    push_raw(&mut spans, &mut col, "] ");
+    // Hint suffix — kept short so the prompt fits in a typical
+    // terminal width even with several adapters available.
+    push_raw(&mut spans, &mut col, "(Tab completes, click to pick): ");
+    let input_x = col;
+    spans.push(Span::raw(mb.input.clone()));
+    if let Some(err) = &mb.error {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        ));
+    }
+    let para = Paragraph::new(Line::from(spans));
+    f.render_widget(para, area);
+    // Cursor on the input — same shape as the default minibuffer
+    // render uses.
+    let cursor_x = input_x + mb.cursor as u16;
+    f.set_cursor_position(Position { x: cursor_x, y: area.y });
+}
+
+fn render_diamond_tooltip(f: &mut Frame, app: &App) {
+    let Some((dx, dy, summary)) = hovered_diamond(app) else { return };
+
+    // Shadow / highlight diamond on the hover cell. Pinned → dimmed
+    // red (about to remove); unpinned → faint yellow (preview pin).
+    let overlay_style = if summary.pinned {
+        Style::default()
+            .fg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::DIM)
+    };
+    f.buffer_mut().set_string(dx, dy, "⬩", overlay_style);
+
+    let label = if summary.pinned {
+        " Unpin session "
+    } else {
+        " Pin session "
+    };
+    let total = f.area();
+    let inner_w = UnicodeWidthStr::width(label) as u16;
+    let w = inner_w + 2; // borders
+    let h: u16 = 3;
+    // Default: place tooltip just right of the diamond, vertically
+    // centered on the row. Fall back leftward / upward if it would
+    // overflow the screen.
+    let mut tx = dx + 2;
+    let mut ty = dy.saturating_sub(1);
+    if tx + w > total.x + total.width {
+        tx = total.x + total.width.saturating_sub(w);
+    }
+    if ty + h > total.y + total.height {
+        ty = total.y + total.height.saturating_sub(h);
+    }
+    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray));
+    let p = Paragraph::new(label)
+        .block(block)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    f.render_widget(Clear, rect);
+    f.render_widget(p, rect);
 }
 
 fn pin_strip_height(total_h: u16) -> u16 {
     (total_h / 3).clamp(7, 18)
 }
 
-/// Apply the user's scrollback offset to the currently-focused session's
-/// vt100 parser so the rendered view shows older content when the user
-/// has scrolled up with the mouse wheel. vt100 0.16+ clamps internally,
-/// so we just hand it whatever the user dialed in.
-fn apply_focused_scrollback(app: &mut App) {
-    let Some(id) = app.selected_id() else { return; };
-    let Some(parser) = app.terminals.get_mut(&id) else { return; };
-    parser.screen_mut().set_scrollback(app.view_scrollback);
-}
 
 /// Zoom layout: the session view takes the entire screen except for the
 /// minibuffer line at the bottom. No list, no pin strip, no modeline, no
@@ -117,22 +434,17 @@ fn apply_focused_scrollback(app: &mut App) {
 /// whatever is running) gets the most real estate possible. Matches
 /// tmux's `prefix z` zoomed-pane behavior.
 fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
+    let footer_h = compute_minibuffer_height(app, area.height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Min(0), Constraint::Length(footer_h)])
         .split(area);
     let main_area = vertical[0];
     let minibuffer_area = vertical[1];
 
     app.terminal_pane_size = (main_area.width, main_area.height);
-    // Match the parsers to the zoomed area before drawing (see comment in
-    // the normal-layout branch).
-    for parser in app.terminals.values_mut() {
-        parser
-            .screen_mut()
-            .set_size(main_area.height.max(1), main_area.width.max(1));
-    }
-    apply_focused_scrollback(app);
+    // Items model rebuilds parsers per-frame at the current size —
+    // nothing to pre-size here.
     // Zoomed layout snapshot: only the view + minibuffer exist.
     app.layout.list_area = None;
     app.layout.view_area = Some(main_area);
@@ -158,9 +470,10 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
 /// minibuffer line. `C-x o` from here flips to the view-zoom layout
 /// for the selected session, matching tmux's pane-cycling feel.
 fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
+    let footer_h = compute_minibuffer_height(app, area.height);
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .constraints([Constraint::Min(0), Constraint::Length(footer_h)])
         .split(area);
     let main_area = vertical[0];
     let minibuffer_area = vertical[1];
@@ -290,7 +603,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn render_detail(f: &mut Frame, area: Rect, app: &App) {
+fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == PaneFocus::View;
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
@@ -320,10 +633,30 @@ fn render_detail(f: &mut Frame, area: Rect, app: &App) {
         ViewMode::Transcript => "[transcript]",
     };
     let title = format!("{title_inner}{view_label} ");
-    let block = Block::default()
+    // Right-aligned close button on the top border. Hover is
+    // hit-tested against `app.mouse_pos` so the glyph bolds when the
+    // cursor is over it — the click handler in `app.rs` mirrors the
+    // same geometry to dispatch `OpenDeleteConfirm`. Only shown when
+    // a session is actually selected (groups, "no session", and the
+    // diff-overlay branch don't need it).
+    let show_close = summary.is_some();
+    let close_hovered = show_close && hovered_view_close_button(app, area);
+    let close_style = if close_hovered {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let close = Line::from(Span::styled(" x ", close_style))
+        .alignment(ratatui::layout::Alignment::Right);
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(focused))
         .title(title);
+    if show_close {
+        block = block.title(close);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -385,32 +718,48 @@ fn render_group_overview(
     f.render_widget(para, area);
 }
 
-fn render_terminal(f: &mut Frame, area: Rect, app: &App) {
+fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(id) = app.selected_id() else { return; };
-    let Some(parser) = app.terminals.get(&id) else {
-        let hint = Paragraph::new("(no PTY history yet — interact to populate)")
-            .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(hint, area);
-        return;
+    let scroll = app.view_scrollback;
+    let history = match app.histories.get_mut(&id) {
+        Some(h) => h,
+        None => {
+            let hint = Paragraph::new("(no PTY history yet — interact to populate)")
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(hint, area);
+            return;
+        }
     };
-    let screen = parser.screen();
-    let term = tui_term::widget::PseudoTerminal::new(screen);
+    let out = history.replay(area.width, area.height, scroll);
+    let term = tui_term::widget::PseudoTerminal::new(out.parser.screen());
     f.render_widget(term, area);
+    app.block_hits.insert(id, out.blocks);
 }
 
 fn render_transcript(f: &mut Frame, area: Rect, app: &App) {
-    let lines: Vec<Line> = app.transcript.iter().map(format_event).collect();
-    let total = lines.len() as u16;
-    let height = area.height;
+    // Windowed render: format only the events visible in the current
+    // viewport instead of the full transcript. `format_event` is the
+    // hot allocator here, so this keeps long sessions snappy even
+    // when `app.transcript` contains thousands of events.
+    //
+    // Scroll is event-indexed (not wrapped-line-indexed), so wide
+    // messages that wrap may push later rows off the bottom of the
+    // viewport. The user can scroll one event at a time to bring
+    // them in — same model as the pre-windowing code.
+    let total = app.transcript.len();
+    let height = area.height as usize;
     let max_scroll = total.saturating_sub(height);
-    let scroll = if app.transcript_scroll == u16::MAX {
+    let scroll_start = if app.transcript_scroll == u16::MAX {
         max_scroll
     } else {
-        app.transcript_scroll.min(max_scroll)
+        (app.transcript_scroll as usize).min(max_scroll)
     };
-    let para = Paragraph::new(lines)
-        .scroll((scroll, 0))
-        .wrap(Wrap { trim: false });
+    let end = (scroll_start + height).min(total);
+    let lines: Vec<Line> = app.transcript[scroll_start..end]
+        .iter()
+        .map(format_event)
+        .collect();
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -467,8 +816,51 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(para, area);
 }
 
-fn render_minibuffer(f: &mut Frame, area: Rect, app: &App) {
+/// Compute how many rows the minibuffer footer occupies this frame.
+/// The default footer is 1 row (palette / hints / intent prompts).
+/// When the orchestrator panel is focused (its `MinibufferIntent`
+/// active) it expands to a fixed cap so the embedded zarvis REPL has
+/// room to render its banner + chat bubbles, leaving the main view
+/// most of the screen.
+pub fn compute_minibuffer_height(app: &App, total_h: u16) -> u16 {
+    let is_orch = matches!(
+        app.minibuffer.as_ref().map(|m| &m.intent),
+        Some(MinibufferIntent::Orchestrator)
+    );
+    if !is_orch {
+        return 1;
+    }
+    // ~12 rows of panel + 1 row for the top border. The minimum-3
+    // floor leaves room for the modeline + at least one row of the
+    // main view on tiny terminals.
+    let cap: u16 = 13;
+    let max_allowed = total_h.saturating_sub(3).max(2);
+    cap.min(max_allowed)
+}
+
+fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
+    // Hint zones from the previous frame are stale once we re-render.
+    app.layout.minibuffer_hints.clear();
+    app.layout.minibuffer_harness_hits.clear();
+
+    // Orchestrator panel: events above, input row at the bottom.
+    if matches!(
+        app.minibuffer.as_ref().map(|m| &m.intent),
+        Some(MinibufferIntent::Orchestrator)
+    ) {
+        render_orchestrator_panel(f, area, app);
+        return;
+    }
+
     if let Some(mb) = &app.minibuffer {
+        // Harness picker: render `[name1|name2|...|group]` with each
+        // name as its own clickable span, recording column ranges
+        // for the click handler. Hover bolds + underlines.
+        if matches!(mb.intent, MinibufferIntent::NewSessionHarness) {
+            let mb_clone = mb.clone();
+            render_harness_picker(f, area, app, &mb_clone);
+            return;
+        }
         let mut spans = vec![
             Span::raw(mb.prompt.clone()),
             Span::raw(mb.input.clone()),
@@ -484,25 +876,84 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(para, area);
         let x = area.x + mb.prompt.width() as u16 + mb.cursor as u16;
         f.set_cursor_position(Position { x, y: area.y });
-    } else {
-        // Help hint — when the PTY has the keys, all chords need C-x first.
-        let hint = if app.help_visible {
-            String::new()
-        } else if matches!(app.zoom, ZoomMode::View) {
-            "zoomed: view — C-x o list   C-x z unzoom   C-x x palette".to_string()
-        } else if matches!(app.zoom, ZoomMode::List) {
-            "zoomed: list — C-x o view   C-x z unzoom   C-x x palette".to_string()
-        } else if matches!(app.focus, PaneFocus::View)
-            && app.view == ViewMode::Terminal
-            && app.selected_session().map(|s| s.has_pty).unwrap_or(false)
-        {
-            "C-x o focus list   C-x z zoom   C-x x palette   ? help".to_string()
-        } else {
-            "? for help   M-x or C-x x for commands   C-x o other-window".to_string()
-        };
-        let para = Paragraph::new(hint).style(Style::default().fg(Color::DarkGray));
-        f.render_widget(para, area);
+        return;
     }
+    if app.help_visible {
+        let para = Paragraph::new("").style(Style::default().fg(Color::DarkGray));
+        f.render_widget(para, area);
+        return;
+    }
+    // Build the hint as a sequence of (prefix, [(label, action), ...])
+    // — prefix is non-clickable plain text, segments are individually
+    // clickable + hover-highlightable. In the unzoomed layout focus is
+    // a mouse click away, so `C-x o` is dropped — only zoom + palette
+    // are shown. The zoomed layout keeps `C-x o` since the other pane
+    // isn't visible to click.
+    let (prefix, segments): (&str, Vec<(&str, KeyAction)>) = match app.zoom {
+        ZoomMode::View => (
+            "zoomed: view — ",
+            vec![
+                ("C-x x palette", KeyAction::OpenCommandPalette),
+                ("C-x z unzoom", KeyAction::ToggleZoom),
+                ("C-x o list", KeyAction::SwitchFocus),
+            ],
+        ),
+        ZoomMode::List => (
+            "zoomed: list — ",
+            vec![
+                ("C-x x palette", KeyAction::OpenCommandPalette),
+                ("C-x z unzoom", KeyAction::ToggleZoom),
+                ("C-x o view", KeyAction::SwitchFocus),
+            ],
+        ),
+        ZoomMode::None => (
+            "",
+            vec![
+                ("C-x x palette", KeyAction::OpenCommandPalette),
+                ("C-x z zoom", KeyAction::ToggleZoom),
+            ],
+        ),
+    };
+
+    let mouse = app.mouse_pos;
+    let base_style = Style::default().fg(Color::DarkGray);
+    let hover_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2 + 1);
+    let mut col: u16 = area.x;
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_string(), base_style));
+        col += UnicodeWidthStr::width(prefix) as u16;
+    }
+    let sep = "   ";
+    let sep_w = UnicodeWidthStr::width(sep) as u16;
+    for (i, (label, action)) in segments.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(sep.to_string()));
+            col += sep_w;
+        }
+        let w = UnicodeWidthStr::width(*label) as u16;
+        let x_start = col;
+        let x_end = col + w;
+        let hovered = match mouse {
+            Some((mx, my)) => {
+                my == area.y && mx >= x_start && mx < x_end
+            }
+            None => false,
+        };
+        let style = if hovered { hover_style } else { base_style };
+        spans.push(Span::styled(label.to_string(), style));
+        app.layout.minibuffer_hints.push(HintZone {
+            x_start,
+            x_end,
+            y: area.y,
+            action: *action,
+        });
+        col = x_end;
+    }
+    let para = Paragraph::new(Line::from(spans));
+    f.render_widget(para, area);
 }
 
 fn render_help(f: &mut Frame, area: Rect) {
@@ -530,7 +981,8 @@ const HELP_TEXT: &str = "
 emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
 
   focus + view
-    C-x o / Tab     switch focus (list ↔ view)
+    C-x o           switch focus (list ↔ view)
+    RET (on list)   focus the selected session's view
     C-x t           toggle transcript ↔ terminal view
     C-x z           zoom: fill the screen with the session view
     C-n / down      next session
@@ -660,6 +1112,25 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
                 Style::default().fg(Color::Yellow),
             )]
         }
+        // Task-lifecycle events are bookkeeping; the daemon tracks
+        // them in its per-session registry. The transcript already
+        // shows the matching ToolUse / ToolResult, so render these
+        // minimally (or hide entirely).
+        SessionEvent::TaskStart { tool, .. } => vec![Span::styled(
+            format!("   ⏵ task start: {tool}"),
+            Style::default().fg(Color::DarkGray),
+        )],
+        SessionEvent::TaskBackgrounded { .. } => vec![Span::styled(
+            "   ↳ task backgrounded".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )],
+        SessionEvent::TaskEnd { ok, .. } => {
+            let glyph = if *ok { "✓" } else { "✗" };
+            vec![Span::styled(
+                format!("   {glyph} task end"),
+                Style::default().fg(Color::DarkGray),
+            )]
+        }
     }
 }
 
@@ -671,7 +1142,7 @@ fn pane_border_style(focused: bool) -> Style {
     }
 }
 
-fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String]) {
+fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[String]) {
     if pinned_ids.is_empty() || area.height < 3 || area.width < 6 {
         return;
     }
@@ -689,14 +1160,27 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String])
             ),
             None => format!(" ⬩ {} ", short_id(id)),
         };
-        // Right-aligned close button. The trailing space is part of the
-        // visual hot-zone so a click landing on either cell unpins.
-        // Style red so it reads as an action.
-        let close = Line::from(Span::styled(
-            " × ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ))
-        .alignment(ratatui::layout::Alignment::Right);
+        // Right-aligned unpin affordance. Uses a minus glyph (NOT an
+        // ×) — `x` reads as "close/kill", which is reserved for the
+        // session-view close button. Hover bolds the glyph.
+        let unpin_hovered = match app.mouse_pos {
+            Some((mx, my)) => {
+                let close_w: u16 = 3;
+                let x_start = tile_area.x + tile_area.width.saturating_sub(close_w + 1);
+                let x_end = tile_area.x + tile_area.width.saturating_sub(1);
+                my == tile_area.y && mx >= x_start && mx < x_end
+            }
+            None => false,
+        };
+        let unpin_style = if unpin_hovered {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let close = Line::from(Span::styled(" − ", unpin_style))
+            .alignment(ratatui::layout::Alignment::Right);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(pane_border_style(is_selected))
@@ -704,8 +1188,9 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &App, pinned_ids: &[String])
             .title(close);
         let inner = block.inner(*tile_area);
         f.render_widget(block, *tile_area);
-        if let Some(parser) = app.terminals.get(id) {
-            render_pty_tail(f, inner, parser.screen());
+        if let Some(history) = app.histories.get_mut(id) {
+            let out = history.replay(inner.width, inner.height, 0);
+            render_pty_tail(f, inner, out.parser.screen());
         } else {
             // No PTY data yet — show a placeholder.
             let p = Paragraph::new("(no data yet)")
@@ -923,6 +1408,9 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::Done { exit_code } => format!("done (exit {exit_code})"),
         SessionEvent::Pty { data } => format!("pty: {} bytes", data.len()),
         SessionEvent::ToolApprovalRequest { tool, .. } => format!("approve? {tool}"),
+        SessionEvent::TaskStart { tool, call_id, .. } => format!("task-start {tool} {call_id}"),
+        SessionEvent::TaskBackgrounded { call_id } => format!("task-bg {call_id}"),
+        SessionEvent::TaskEnd { call_id, ok, .. } => format!("task-end {call_id} ok={ok}"),
     }
 }
 
@@ -938,4 +1426,137 @@ fn primary_label(s: &agentd_protocol::SessionSummary) -> String {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => short_id(&s.id).to_string(),
     }
+}
+
+/// Render the orchestrator's PTY in the bottom strip. The orchestrator
+/// is a zarvis interactive session; the same items-model history that
+/// renders any other PTY-backed session is replayed onto a fresh
+/// parser sized to the panel's inner area each frame. Tool-block
+/// hit ranges land in `app.block_hits` for click-toggle dispatch.
+fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
+    let Some(id) = app.orchestrator_id.clone() else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Line::from(Span::styled(
+            " orchestrator ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+
+    // Tell the adapter about the orchestrator panel's inner size so
+    // its line editor reflows correctly. Caches the last announced
+    // size on the App so we only fire pty_resize on a real change.
+    let cols = inner.width.max(1);
+    let rows = inner.height.max(1);
+    let last = app.orchestrator_pty_size;
+    if last != Some((cols, rows)) {
+        app.orchestrator_pty_size = Some((cols, rows));
+        let client = app.client.clone();
+        let id_for_resize = id.clone();
+        tokio::spawn(async move {
+            let _ = client.pty_resize(&id_for_resize, cols, rows).await;
+        });
+    }
+
+    let history = app.histories.entry(id.clone()).or_default();
+    // No scrollback offset for the orchestrator panel (the user
+    // hasn't asked for one in this small viewport). Future:
+    // mouse-wheel inside the panel could drive a separate
+    // `orchestrator_scrollback` offset.
+    let out = history.replay(cols, rows, 0);
+    let term = tui_term::widget::PseudoTerminal::new(out.parser.screen());
+    f.render_widget(term, inner);
+    app.block_hits.insert(id, out.blocks);
+}
+
+/// Modal popup listing the selected session's task registry, opened
+/// by `/tasks`. Shows running + backgrounded + recent terminal
+/// states with a one-line summary per task. v1 is read-only at the
+/// keyboard / mouse layer (Esc closes; clicks outside close);
+/// in-block `[kill]` / `[bg]` buttons stay the way to act on a
+/// running task. Future iterations can wire per-row kill buttons
+/// here without changing the data model.
+fn render_tasks_popup(f: &mut Frame, app: &App) {
+    let Some(popup) = app.tasks_popup.as_ref() else { return };
+    let total = f.area();
+    let w = total.width.saturating_sub(8).min(90);
+    let h = total
+        .height
+        .saturating_sub(4)
+        .min((popup.tasks.len() as u16 + 4).max(8));
+    if w < 30 || h < 6 {
+        return;
+    }
+    let x = total.x + (total.width.saturating_sub(w)) / 2;
+    let y = total.y + (total.height.saturating_sub(h)) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+    let title = format!(
+        " tasks — session {} ({} entries) — Esc to close ",
+        short_id(&popup.session_id),
+        popup.tasks.len()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    if popup.tasks.is_empty() {
+        let p = Paragraph::new("(no tasks recorded for this session)")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(p, inner);
+        return;
+    }
+
+    // Render newest-first table; bounded to inner.height rows.
+    let visible = popup
+        .tasks
+        .iter()
+        .rev()
+        .take(inner.height as usize)
+        .enumerate();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut lines: Vec<Line> = Vec::new();
+    for (_idx, t) in visible {
+        let (state_glyph, state_color) = match t.state {
+            agentd_protocol::TaskState::Running => ("◐", Color::Yellow),
+            agentd_protocol::TaskState::Backgrounded => ("↻", Color::Cyan),
+            agentd_protocol::TaskState::Completed => ("✓", Color::Green),
+            agentd_protocol::TaskState::Failed => ("✗", Color::Red),
+            agentd_protocol::TaskState::Cancelled => ("⊘", Color::DarkGray),
+        };
+        let elapsed_ms = t.ended_at_ms.unwrap_or(now_ms) - t.started_at_ms;
+        let elapsed = format!("{:.1}s", (elapsed_ms.max(0)) as f64 / 1000.0);
+        let title_text: String = t
+            .args_summary
+            .chars()
+            .take(40)
+            .collect();
+        let body = format!(
+            " {state_glyph}  {tool:<20}  {args:<40}  {elapsed:>7}",
+            tool = t.tool.chars().take(20).collect::<String>(),
+            args = title_text,
+            elapsed = elapsed,
+        );
+        lines.push(Line::from(vec![
+            Span::styled(body, Style::default().fg(state_color)),
+        ]));
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
 }

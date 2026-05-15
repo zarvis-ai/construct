@@ -8,7 +8,8 @@ use agentd_protocol::{
     GroupCreateResult, GroupIdParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams,
     Notification, PingResult, Request, Response, SessionIdParams, SessionInputParams,
     SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams,
-    SessionSetPinnedParams, SessionSetTitleParams, SessionToolDecisionParams, SubscribeParams,
+    SessionSetPinnedParams, SessionSetTitleParams, SessionToolActionParams,
+    SessionToolDecisionParams, SubscribeParams,
     TranscriptParams, IPC_VERSION,
 };
 use anyhow::Result;
@@ -342,6 +343,63 @@ async fn dispatch(
                 .tool_decision(&p.session_id, p.call_id, p.decision)
                 .await
             {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_TOOL_ACTION => {
+            let p = params!(SessionToolActionParams);
+            match manager
+                .tool_action(&p.session_id, p.call_id, p.action)
+                .await
+            {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::SESSION_LIST_TASKS => {
+            let p = params!(agentd_protocol::ListTasksParams);
+            match manager.list_tasks(&p.session_id).await {
+                Ok(tasks) => Response::ok(
+                    id.clone(),
+                    serde_json::to_value(agentd_protocol::ListTasksResult { tasks })
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::LOOP_CREATE => {
+            let p = params!(agentd_protocol::LoopCreateParams);
+            match manager.loop_create(p).await {
+                Ok(l) => Response::ok(
+                    id.clone(),
+                    serde_json::to_value(&l).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::LOOP_LIST => {
+            let p = params!(agentd_protocol::LoopListParams);
+            let loops = manager.loop_list(p.session_id.as_deref()).await;
+            Response::ok(
+                id.clone(),
+                serde_json::to_value(agentd_protocol::LoopListResult { loops })
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        }
+        m if m == ipc_method::LOOP_UPDATE => {
+            let p = params!(agentd_protocol::LoopUpdateParams);
+            match manager.loop_update(p).await {
+                Ok(l) => Response::ok(
+                    id.clone(),
+                    serde_json::to_value(&l).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::LOOP_REMOVE => {
+            let p = params!(agentd_protocol::LoopRemoveParams);
+            match manager.loop_remove(&p.loop_id).await {
                 Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

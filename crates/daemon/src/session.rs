@@ -90,6 +90,126 @@ pub struct SessionEntry {
     /// ASCII through a tiny ESC-sequence state machine; first CR/LF
     /// closes the buffer and feeds it to title-gen.
     pty_input_capture: tokio::sync::Mutex<PtyInputCapture>,
+    /// Per-session tool-call lifecycle map. Updated from
+    /// `SessionEvent::TaskStart` / `TaskBackgrounded` / `TaskEnd`.
+    /// Surfaced by `session.list_tasks` for the TUI `/tasks` popup
+    /// and the MCP `agentd_get_tasks` tool.
+    pub tasks: tokio::sync::Mutex<TaskRegistry>,
+}
+
+/// Bounded log of recent + in-flight task entries. Held inside
+/// each `SessionEntry`; rebuilt from event replay on rehydrate.
+#[derive(Default)]
+pub struct TaskRegistry {
+    /// Newest-first list. Capped at [`TASK_REGISTRY_CAP`] entries;
+    /// terminal-state oldest are evicted when over.
+    entries: Vec<agentd_protocol::TaskInfo>,
+}
+
+/// How many tasks (running + recent terminal) we keep per session.
+/// Bounded so the registry doesn't grow forever; recent enough that
+/// `/tasks` shows useful history.
+const TASK_REGISTRY_CAP: usize = 50;
+
+impl TaskRegistry {
+    pub fn upsert_start(
+        &mut self,
+        call_id: String,
+        tool: String,
+        args_summary: String,
+        started_at_ms: i64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.call_id == call_id) {
+            // Restart-of-same-call_id is unusual but harmless; treat
+            // as a fresh entry by resetting state.
+            e.tool = tool;
+            e.args_summary = args_summary;
+            e.state = agentd_protocol::TaskState::Running;
+            e.started_at_ms = started_at_ms;
+            e.backgrounded_at_ms = None;
+            e.ended_at_ms = None;
+            e.output_preview = None;
+            e.ok = false;
+            return;
+        }
+        self.entries.push(agentd_protocol::TaskInfo {
+            call_id,
+            tool,
+            args_summary,
+            state: agentd_protocol::TaskState::Running,
+            started_at_ms,
+            backgrounded_at_ms: None,
+            ended_at_ms: None,
+            output_preview: None,
+            ok: false,
+        });
+        self.gc_terminal();
+    }
+
+    pub fn mark_backgrounded(&mut self, call_id: &str, at_ms: i64) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.call_id == call_id) {
+            e.state = agentd_protocol::TaskState::Backgrounded;
+            e.backgrounded_at_ms = Some(at_ms);
+        }
+    }
+
+    pub fn mark_end(
+        &mut self,
+        call_id: &str,
+        ok: bool,
+        output_preview: String,
+        at_ms: i64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.call_id == call_id) {
+            e.state = if ok {
+                agentd_protocol::TaskState::Completed
+            } else {
+                agentd_protocol::TaskState::Failed
+            };
+            e.ended_at_ms = Some(at_ms);
+            e.output_preview = Some(output_preview);
+            e.ok = ok;
+        }
+    }
+
+    pub fn snapshot(&self) -> Vec<agentd_protocol::TaskInfo> {
+        self.entries.clone()
+    }
+
+    fn gc_terminal(&mut self) {
+        if self.entries.len() <= TASK_REGISTRY_CAP {
+            return;
+        }
+        // Evict oldest terminal entries first; keep running / bg.
+        let mut to_remove: Vec<usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| {
+                matches!(
+                    e.state,
+                    agentd_protocol::TaskState::Completed
+                        | agentd_protocol::TaskState::Failed
+                        | agentd_protocol::TaskState::Cancelled
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+        // Oldest first (lower index = older since we push at end).
+        to_remove.sort();
+        while self.entries.len() > TASK_REGISTRY_CAP {
+            match to_remove.first().copied() {
+                Some(i) => {
+                    self.entries.remove(i);
+                    to_remove.remove(0);
+                    for x in to_remove.iter_mut() {
+                        *x = x.saturating_sub(1);
+                    }
+                }
+                None => break, // everything live; nothing to evict
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -103,6 +223,12 @@ struct PtyInputCapture {
 impl SessionEntry {
     pub fn is_deleted(&self) -> bool {
         self.deleted.load(Ordering::SeqCst)
+    }
+    /// Cheap async read of the session's current SessionState —
+    /// used by the loop scheduler to skip firing into a terminal
+    /// session.
+    pub async fn snapshot_state(&self) -> agentd_protocol::SessionState {
+        self.summary.read().await.state
     }
 }
 
@@ -157,6 +283,9 @@ pub struct SessionManager {
     sessions: RwLock<HashMap<String, Arc<SessionEntry>>>,
     groups: RwLock<HashMap<String, Arc<GroupEntry>>>,
     broadcast: broadcast::Sender<BroadcastMsg>,
+    /// Recurring-prompt loops attached to sessions. The scheduler
+    /// task (`crate::loops::run_scheduler`) iterates these.
+    pub(crate) loops: Arc<crate::loops::LoopRegistry>,
 }
 
 impl SessionManager {
@@ -206,6 +335,7 @@ impl SessionManager {
                 // sessions and is harmless for the rest.
                 title_gen_attempted: AtomicBool::new(s.title.is_some()),
                 pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+                tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -226,12 +356,21 @@ impl SessionManager {
         }
 
         let (broadcast, _) = broadcast::channel(BROADCAST_CAP);
+        // Load each session's persisted loops into the in-memory
+        // registry. Missing or unreadable per-session loop files
+        // are logged + skipped.
+        let session_ids: Vec<String> = sessions.keys().cloned().collect();
+        let loops = Arc::new(crate::loops::LoopRegistry::new(
+            storage.data_dir().to_path_buf(),
+        ));
+        loops.hydrate_from_disk(&session_ids).await;
         Ok(Self {
             storage,
             config,
             sessions: RwLock::new(sessions),
             groups: RwLock::new(groups),
             broadcast,
+            loops,
         })
     }
 
@@ -381,6 +520,7 @@ impl SessionManager {
             group_id: None,
             last_pty_at_ms: None,
             automode: false,
+            kind: params.kind,
         };
         self.storage.save_summary(&summary)?;
 
@@ -415,6 +555,17 @@ impl SessionManager {
             "AGENTD_SESSION_DATA_DIR".to_string(),
             self.storage.session_dir(&id).to_string_lossy().to_string(),
         );
+        // Tell the adapter what kind of session this is so it can pick
+        // the right system prompt / behavior. `user` is the default;
+        // `orchestrator` flips zarvis into command-surface mode.
+        env_with_meta.insert(
+            "AGENTD_SESSION_KIND".to_string(),
+            match params.kind {
+                agentd_protocol::SessionKind::User => "user",
+                agentd_protocol::SessionKind::Orchestrator => "orchestrator",
+            }
+            .to_string(),
+        );
         let start_params = SessionStartParams {
             session_id: id.clone(),
             cwd: summary.cwd.clone(),
@@ -443,6 +594,7 @@ impl SessionManager {
             deleted: AtomicBool::new(false),
             title_gen_attempted: AtomicBool::new(summary.title.is_some()),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+            tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
         });
 
         // Record the user's initial prompt as the first transcript event so
@@ -482,6 +634,86 @@ impl SessionManager {
         }));
 
         Ok(id)
+    }
+
+    /// Ensure the daemon-owned orchestrator session exists. Called once
+    /// at startup, after `resume_running_sessions`. Three outcomes:
+    ///
+    /// 1. Orchestrator disabled in config → no-op.
+    /// 2. Orchestrator session already exists (created on a previous
+    ///    run and rehydrated) → no-op; `resume_running_sessions`
+    ///    already brought it back online.
+    /// 3. No orchestrator session yet → create one with the configured
+    ///    harness. Failures (binary missing, capability negotiation,
+    ///    initial prompt rejected) are logged and the daemon proceeds
+    ///    without an orchestrator — clients see palette mode.
+    pub async fn ensure_orchestrator(self: Arc<Self>) {
+        let harness = match self.config.orchestrator.effective_harness() {
+            Some(h) => h.to_string(),
+            None => {
+                tracing::info!("orchestrator disabled in config");
+                return;
+            }
+        };
+        // Already have a *live* one? Persisted summaries with
+        // `kind: Orchestrator` in any non-terminal state are reused.
+        // Terminal orchestrators (Errored / Done — usually from a
+        // previous run when no API key was set) are left in place
+        // for forensics but a fresh one is created so the user gets
+        // a working panel.
+        {
+            let guard = self.sessions.read().await;
+            for entry in guard.values() {
+                let s = entry.summary.read().await;
+                if s.kind == agentd_protocol::SessionKind::Orchestrator
+                    && !s.state.is_terminal()
+                {
+                    tracing::info!(
+                        id = %s.id,
+                        harness = %s.harness,
+                        state = ?s.state,
+                        "orchestrator session already exists"
+                    );
+                    return;
+                }
+            }
+        }
+        // Create fresh. Use the daemon process cwd so the orchestrator's
+        // shell tools resolve relative paths from wherever the user
+        // started agentd. Interactive mode gives the orchestrator a
+        // PTY-backed REPL — the TUI renders it in the minibuffer panel
+        // and gets the line-editor / queue / slash popup polish from
+        // zarvis interactive for free. The initial 80×10 pty_size is
+        // a placeholder; the TUI sends a pty_resize as soon as it
+        // attaches the panel.
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "/".to_string());
+        let params = agentd_protocol::CreateSessionParams {
+            harness: harness.clone(),
+            cwd,
+            prompt: None,
+            model: None,
+            title: Some("orchestrator".to_string()),
+            mode: Some("interactive".to_string()),
+            pty_size: Some(agentd_protocol::PtySize { cols: 80, rows: 10 }),
+            worktree: false,
+            env: Default::default(),
+            args: Vec::new(),
+            kind: agentd_protocol::SessionKind::Orchestrator,
+        };
+        match self.create(params).await {
+            Ok(id) => tracing::info!(
+                id = %id,
+                harness = %harness,
+                "orchestrator session created"
+            ),
+            Err(e) => tracing::warn!(
+                harness = %harness,
+                error = %e,
+                "orchestrator session create failed; clients fall back to palette mode"
+            ),
+        }
     }
 
     /// Re-spawn the adapter for every persisted session whose state was
@@ -753,11 +985,45 @@ impl SessionManager {
                 | SessionEvent::ToolResult { .. }
                 | SessionEvent::Diff { .. }
                 | SessionEvent::Pty { .. }
-                | SessionEvent::ToolApprovalRequest { .. } => {}
+                | SessionEvent::ToolApprovalRequest { .. }
+                | SessionEvent::TaskStart { .. }
+                | SessionEvent::TaskBackgrounded { .. }
+                | SessionEvent::TaskEnd { .. } => {
+                    // Task-lifecycle events are recorded in the
+                    // entry's per-session `tasks` map below — they
+                    // don't move the session's top-level state.
+                }
             }
             let snapshot = s.clone();
             drop(s);
             let _ = self.storage.save_summary(&snapshot);
+        }
+        // Update the per-session task registry from lifecycle events
+        // so `session.list_tasks` has live state to return.
+        match &event {
+            SessionEvent::TaskStart { call_id, tool, args_summary } => {
+                let mut tasks = entry.tasks.lock().await;
+                tasks.upsert_start(
+                    call_id.clone(),
+                    tool.clone(),
+                    args_summary.clone(),
+                    now.timestamp_millis(),
+                );
+            }
+            SessionEvent::TaskBackgrounded { call_id } => {
+                let mut tasks = entry.tasks.lock().await;
+                tasks.mark_backgrounded(call_id, now.timestamp_millis());
+            }
+            SessionEvent::TaskEnd { call_id, ok, output_preview } => {
+                let mut tasks = entry.tasks.lock().await;
+                tasks.mark_end(
+                    call_id,
+                    *ok,
+                    output_preview.clone(),
+                    now.timestamp_millis(),
+                );
+            }
+            _ => {}
         }
 
         // Auto-title hook: trigger on the FIRST User message we record
@@ -1049,6 +1315,11 @@ impl SessionManager {
                 tracing::warn!(%id, error = %e, "remove_worktree failed");
             }
         }
+
+        // Loops are attached to the session — drop them from the
+        // in-memory registry. The on-disk loops.json sits inside
+        // sessions/<id>/ so it goes with the next call.
+        self.loops.drop_session(id).await;
 
         // Drop the on-disk record. Best effort.
         if let Err(e) = self.storage.remove_session(id) {
@@ -1499,6 +1770,99 @@ impl SessionManager {
         })?;
         adapter
             .request(ahp_method::SESSION_TOOL_DECISION, params)
+            .await?;
+        Ok(())
+    }
+
+    /// Snapshot the per-session task registry (running, backgrounded,
+    /// and recent terminal states). Returns an empty list when the
+    /// session has no entry — adapters that don't emit `TaskStart`
+    /// (claude / codex / shell today) simply never populate it.
+    pub async fn loop_create(
+        &self,
+        params: agentd_protocol::LoopCreateParams,
+    ) -> Result<agentd_protocol::Loop> {
+        // Reject on unknown session — the daemon's source of truth
+        // for "is this session real" is sessions map.
+        if self.get_entry(&params.session_id).await.is_none() {
+            return Err(anyhow!("session not found: {}", params.session_id));
+        }
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let next = crate::loops::next_fire_after_ms(&params.spec, now_ms);
+        let l = agentd_protocol::Loop {
+            id: String::new(), // assigned in registry
+            session_id: params.session_id,
+            spec: params.spec,
+            prompt: params.prompt,
+            created_at_ms: now_ms,
+            next_fire_at_ms: next,
+            expires_at_ms: params.expires_at_ms,
+            last_fired_at_ms: None,
+            fire_count: 0,
+        };
+        self.loops.create(l).await
+    }
+
+    pub async fn loop_list(
+        &self,
+        session_id: Option<&str>,
+    ) -> Vec<agentd_protocol::Loop> {
+        self.loops.list(session_id).await
+    }
+
+    pub async fn loop_update(
+        &self,
+        params: agentd_protocol::LoopUpdateParams,
+    ) -> Result<agentd_protocol::Loop> {
+        self.loops
+            .update(&params.loop_id, params.spec, params.prompt, params.expires_at_ms)
+            .await
+    }
+
+    pub async fn loop_remove(&self, loop_id: &str) -> Result<()> {
+        self.loops.remove(loop_id).await
+    }
+
+    pub async fn list_tasks(
+        &self,
+        id: &str,
+    ) -> Result<Vec<agentd_protocol::TaskInfo>> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let g = entry.tasks.lock().await;
+        Ok(g.snapshot())
+    }
+
+    /// Forward a client-initiated tool action (`"kill"` / `"background"`)
+    /// to the adapter. Adapters that don't know the action ignore it
+    /// with a debug log; adapters that don't know the `call_id`
+    /// likewise no-op. No daemon-side state changes — the adapter is
+    /// authoritative for the running-tasks registry.
+    pub async fn tool_action(
+        &self,
+        id: &str,
+        call_id: String,
+        action: String,
+    ) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let adapter = entry
+            .adapter
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let params = serde_json::to_value(&agentd_protocol::SessionToolActionParams {
+            session_id: id.to_string(),
+            call_id,
+            action,
+        })?;
+        adapter
+            .request(ahp_method::SESSION_TOOL_ACTION, params)
             .await?;
         Ok(())
     }

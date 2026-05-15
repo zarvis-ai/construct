@@ -108,6 +108,12 @@ pub enum MinibufferIntent {
     GroupDeleteConfirm { group_id: String },
     GroupRename { group_id: String },
     CommandPalette,
+    /// Persistent orchestrator session input. Unlike other intents
+    /// this one stays open across Enter — the panel re-opens with an
+    /// empty input after each submission. Slash-prefixed input is
+    /// dispatched locally (no LLM cost); non-slash input is sent to
+    /// the orchestrator session via `session.send_input`.
+    Orchestrator,
     /// Approval prompt for a Risky tool call from an agent harness
     /// (currently zarvis). Single-key dispatch: `y`/Enter approve,
     /// `n`/Esc deny, `a` approve + flip automode.
@@ -153,7 +159,23 @@ pub struct App {
     pub connected: bool,
     // Terminal-pane state.
     pub view: ViewMode,
-    pub terminals: HashMap<String, vt100::Parser>,
+    /// Per-session items history. Replaces the old direct
+    /// `vt100::Parser` cache: each session's PTY bytes and tool
+    /// events feed an [`ItemHistory`] that the render path replays
+    /// onto a fresh parser. This enables expand/collapse of tool
+    /// blocks via height mutation rather than vt100 cursor-edit
+    /// gymnastics. Non-zarvis sessions degrade to a single
+    /// `PtyChunk` and render identically to the old pipeline.
+    pub histories: HashMap<String, crate::pty_render::ItemHistory>,
+    /// Per-session cached block hit-test ranges (call_id, row range
+    /// within the rendered pane). Refreshed by the render functions
+    /// after each `replay`. Mouse clicks in the PTY pane consult
+    /// this to toggle the right block.
+    pub block_hits: HashMap<String, Vec<crate::pty_render::BlockHitRect>>,
+    /// Last (cols, rows) we asked the orchestrator's adapter to
+    /// resize to. Tracked so we don't spam `pty_resize` IPC calls
+    /// on every frame.
+    pub orchestrator_pty_size: Option<(u16, u16)>,
     pub terminal_pane_size: (u16, u16), // (cols, rows) of the right pane.
     /// Zoom: hide list / pin strip / modeline; the session view fills the
     /// screen except for the minibuffer line at the bottom. Toggled with
@@ -176,10 +198,65 @@ pub struct App {
     /// handler to map terminal coordinates back to UI regions. Filled
     /// by `ui::render` each frame; `None` until the first render lands.
     pub layout: LayoutSnapshot,
+    /// Most-recently observed mouse cursor position (terminal cell).
+    /// `None` until the first `MouseEventKind::Moved` arrives — and stays
+    /// `None` on terminals that don't forward motion events (e.g. macOS
+    /// Terminal.app, which ignores `\x1b[?1003h` even though crossterm
+    /// requests it).
+    pub mouse_pos: Option<(u16, u16)>,
+    /// ID of the daemon-owned orchestrator session, if one is present
+    /// in the sessions list. The orchestrator runs as a zarvis
+    /// interactive (PTY) session; the TUI renders its PTY in the
+    /// minibuffer panel and routes keystrokes there when the panel is
+    /// focused. `None` falls back to the static palette UX.
+    pub orchestrator_id: Option<String>,
+    /// Width (in terminal cells) of the session-list pane in the
+    /// normal (non-zoomed) layout. Adjustable by dragging the right
+    /// border with the mouse; clamped at render time to
+    /// `[LIST_PANEL_W_MIN, terminal_w - LIST_PANEL_W_VIEW_MIN]`.
+    pub list_panel_w: u16,
+    /// True while the user is mid-drag on the list/view divider.
+    /// Set on `Down(Left)` over the border column, cleared on
+    /// `Up(Left)` or when the mouse drifts outside the layout.
+    pub resizing_list: bool,
+    /// /tasks popup state: `None` = closed, `Some(...)` = open with
+    /// a snapshot of the session's task registry.
+    pub tasks_popup: Option<TasksPopup>,
+}
+
+/// State for the `/tasks` modal popup. v1 is read-only at the UI
+/// layer (Esc closes; clicks outside close); re-typing `/tasks`
+/// refreshes the snapshot.
+#[derive(Debug, Clone)]
+pub struct TasksPopup {
+    pub session_id: String,
+    pub tasks: Vec<agentd_protocol::TaskInfo>,
+}
+
+/// Smallest list-pane width that still leaves room for the session
+/// status glyph + a couple chars of name. Below this drag is clamped.
+pub const LIST_PANEL_W_MIN: u16 = 18;
+/// Smallest right-pane width we'll preserve while dragging — anything
+/// less and the view pane stops being usable.
+pub const LIST_PANEL_W_VIEW_MIN: u16 = 20;
+/// Default list-pane width on first launch.
+pub const LIST_PANEL_W_DEFAULT: u16 = 40;
+
+/// A clickable / hoverable text segment in the minibuffer hint line —
+/// e.g. "C-x z unzoom" or "? help" — that dispatches a KeyAction when
+/// clicked. Geometry is filled by `render_minibuffer` so the click
+/// handler can hit-test against the live last-frame layout.
+#[derive(Debug, Clone, Copy)]
+pub struct HintZone {
+    pub x_start: u16,
+    /// Exclusive end column.
+    pub x_end: u16,
+    pub y: u16,
+    pub action: KeyAction,
 }
 
 /// Last-frame geometry for hit-testing mouse clicks.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LayoutSnapshot {
     pub list_area: Option<ratatui::layout::Rect>,
     pub view_area: Option<ratatui::layout::Rect>,
@@ -189,6 +266,26 @@ pub struct LayoutSnapshot {
     /// past the last row is a no-op rather than selecting an
     /// out-of-range item). Mirrors `app.list_items().len()`.
     pub list_row_count: usize,
+    /// Clickable segments in the minibuffer hint line. Empty when a
+    /// minibuffer prompt (palette / send-input / etc.) is open.
+    pub minibuffer_hints: Vec<HintZone>,
+    /// Clickable harness names in the new-session picker prompt
+    /// (`MinibufferIntent::NewSessionHarness`). Click → submit the
+    /// matching name as if the user typed it and hit Enter.
+    pub minibuffer_harness_hits: Vec<HarnessHit>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessHit {
+    pub name: String,
+    pub x_start: u16,
+    /// Exclusive end column.
+    pub x_end: u16,
+    pub y: u16,
+    /// `false` for harnesses whose adapter binary isn't on PATH —
+    /// rendered dimmed + struck-through, click is a no-op + status
+    /// line note, hover shows a "not installed" tooltip.
+    pub available: bool,
 }
 
 /// Window during which a session counts as "busy" after its last PTY byte.
@@ -212,9 +309,32 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     let sessions = client.list().await.unwrap_or_default();
     let groups = client.list_groups().await.unwrap_or_default();
     let harnesses = client.harnesses().await.unwrap_or_default();
-    let initial_sel = sessions
-        .first()
-        .map(|s| Selection::Session(s.id.clone()))
+    let initial_orch_id = sessions
+        .iter()
+        .find(|s| {
+            s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
+        })
+        .map(|s| s.id.clone());
+    // Restore the previously-selected session if it still exists,
+    // else fall back to the first non-orchestrator session.
+    let persisted = crate::tui_state::load();
+    let initial_sel = persisted
+        .last_selected_session_id
+        .as_ref()
+        .and_then(|id| {
+            sessions
+                .iter()
+                .find(|s| {
+                    s.id == *id && s.kind != agentd_protocol::SessionKind::Orchestrator
+                })
+                .map(|s| Selection::Session(s.id.clone()))
+        })
+        .or_else(|| {
+            sessions
+                .iter()
+                .find(|s| s.kind != agentd_protocol::SessionKind::Orchestrator)
+                .map(|s| Selection::Session(s.id.clone()))
+        })
         .unwrap_or(Selection::None);
 
     let mut app = App {
@@ -222,10 +342,10 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         sessions,
         groups,
         selection: initial_sel,
-        // Start focused on the list so navigation keys (Up/Down, C-n/C-p)
-        // work immediately on first launch. User reaches the view with
-        // `C-x o` or `Tab`.
-        focus: PaneFocus::List,
+        // Default focus is the view — the selected session is usually
+        // what the user wants to interact with first. List navigation
+        // is one `C-x o` / `Tab` away.
+        focus: PaneFocus::View,
         transcript: Vec::new(),
         transcript_session: None,
         transcript_scroll: 0,
@@ -241,13 +361,20 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         should_quit: false,
         connected: true,
         view: ViewMode::Transcript,
-        terminals: HashMap::new(),
+        histories: HashMap::new(),
+        block_hits: HashMap::new(),
+        orchestrator_pty_size: None,
+        tasks_popup: None,
         terminal_pane_size: (100, 30),
         zoom: ZoomMode::None,
         view_scrollback: 0,
         pty_activity: HashMap::new(),
         start_instant: Instant::now(),
         layout: LayoutSnapshot::default(),
+        mouse_pos: None,
+        orchestrator_id: initial_orch_id,
+        list_panel_w: LIST_PANEL_W_DEFAULT,
+        resizing_list: false,
     };
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
@@ -280,6 +407,11 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
     terminal.show_cursor().ok();
+
+    crate::tui_state::save(&crate::tui_state::TuiState {
+        last_selected_session_id: app.selection.session_id().map(|s| s.to_string()),
+    });
+
     result
 }
 
@@ -364,10 +496,14 @@ impl App {
     pub fn list_items(&self) -> Vec<ListItem> {
         let mut out: Vec<ListItem> = Vec::new();
 
+        let orch_id = self.orchestrator_id.as_deref();
         let mut ungrouped: Vec<&SessionSummary> = self
             .sessions
             .iter()
             .filter(|s| s.group_id.is_none())
+            // Hide the orchestrator from the list — it's rendered in
+            // the minibuffer instead.
+            .filter(|s| Some(s.id.as_str()) != orch_id)
             .collect();
         ungrouped.sort_by(|a, b| {
             a.position
@@ -446,7 +582,7 @@ impl App {
         let ids: Vec<String> = self
             .sessions
             .iter()
-            .filter(|s| s.pinned && s.has_pty && !self.terminals.contains_key(&s.id))
+            .filter(|s| s.pinned && s.has_pty && !self.histories.contains_key(&s.id))
             .map(|s| s.id.clone())
             .collect();
         for id in ids {
@@ -455,27 +591,26 @@ impl App {
     }
 
     async fn bootstrap_terminal(&mut self, id: &str) {
-        if self.terminals.contains_key(id) {
+        if self.histories.contains_key(id) {
             return;
         }
-        let (cols, rows) = self.terminal_pane_size;
-        let mut parser =
-            vt100::Parser::new(rows.max(1), cols.max(1), SCROLLBACK_MAX);
+        let mut history = crate::pty_render::ItemHistory::new();
         match self.client.pty_replay(id).await {
             Ok(snap) => {
                 use base64::Engine;
                 if let Ok(bytes) =
                     base64::engine::general_purpose::STANDARD.decode(&snap.data)
                 {
-                    parser.process(&bytes);
+                    history.feed_pty(&bytes);
                 }
             }
             Err(e) => {
                 self.set_status(format!("pty_replay: {e}"));
             }
         }
-        self.terminals.insert(id.to_string(), parser);
+        self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
+        let (cols, rows) = self.terminal_pane_size;
         let _ = self.client.pty_resize(id, cols, rows).await;
     }
 
@@ -565,7 +700,29 @@ impl App {
             Ok(list) => self.groups = list,
             Err(e) => self.set_status(format!("group list failed: {e}")),
         }
+        self.refresh_orchestrator_id();
         self.ensure_selection_valid();
+    }
+
+    /// Re-derive `orchestrator_id` from the current sessions list.
+    /// Called after any list mutation (refresh, state notification,
+    /// session-deleted) so the minibuffer stays bound to the right
+    /// session — and falls back to palette mode if the orchestrator
+    /// goes away.
+    ///
+    /// Prefers a *live* (non-terminal) orchestrator. If only terminal
+    /// orchestrators exist (e.g. a previous run failed to start
+    /// zarvis), we behave as if there's no orchestrator so the user
+    /// gets the palette fallback.
+    fn refresh_orchestrator_id(&mut self) {
+        self.orchestrator_id = self
+            .sessions
+            .iter()
+            .find(|s| {
+                s.kind == agentd_protocol::SessionKind::Orchestrator
+                    && !s.state.is_terminal()
+            })
+            .map(|s| s.id.clone());
     }
 
     /// Move the selection up or down by one row in the materialized list,
@@ -627,23 +784,110 @@ impl App {
                             );
                             // Also fall through so the transcript records it.
                         }
-                        // PTY events: feed into the per-session terminal emulator.
+                        // TUI-dispatch tool calls: any session can emit
+                        // a ToolUse with the conventional `tui` tool
+                        // name to fire a slash-command-style action in
+                        // the client. Args shape:
+                        //   {"command": "<verb>", "args": "<rest>"}
+                        if let SessionEvent::ToolUse { tool, args } = &payload.event {
+                            if tool == agentd_protocol::TUI_DISPATCH_TOOL {
+                                let cmd = args.get("command")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let arg_str = args.get("args")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+                                let full = if arg_str.is_empty() {
+                                    cmd.to_string()
+                                } else {
+                                    format!("{cmd} {arg_str}")
+                                };
+                                if !full.is_empty() {
+                                    self.run_slash_command(&full).await;
+                                }
+                                // Fall through so the transcript still
+                                // records the call for forensics.
+                            }
+                        }
+                        // PTY events: feed into the per-session items history.
                         if let SessionEvent::Pty { .. } = &payload.event {
                             if let Some(bytes) = payload.event.pty_bytes() {
-                                let parser = self
-                                    .terminals
+                                let history = self
+                                    .histories
                                     .entry(payload.session_id.clone())
-                                    .or_insert_with(|| {
-                                        let (cols, rows) = self.terminal_pane_size;
-                                        vt100::Parser::new(rows.max(1), cols.max(1), SCROLLBACK_MAX)
-                                    });
-                                parser.process(&bytes);
+                                    .or_default();
+                                history.feed_pty(&bytes);
                             }
                             // Mark the session as freshly active for the spinner.
                             self.pty_activity
                                 .insert(payload.session_id.clone(), Instant::now());
                             return;
                         }
+                        // Tool events feed the same history so the
+                        // items-model renderer can synthesize block
+                        // visuals from structured content. The
+                        // adapter writes OSC fences around each tool
+                        // block in the PTY stream; the history pairs
+                        // ToolUse events to those fences by FIFO
+                        // arrival order, and matches ToolResults by
+                        // call_id (carried in the `tool` field by
+                        // zarvis convention). Tool events from the
+                        // orchestrator session also land here.
+                        if let SessionEvent::ToolUse { tool, args } = &payload.event {
+                            // The TUI-dispatch tool (`tui`) is a
+                            // slash-command short-circuit, not a real
+                            // tool — skip the items-history feed
+                            // (it's handled by `run_slash_command`).
+                            if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                                let history = self
+                                    .histories
+                                    .entry(payload.session_id.clone())
+                                    .or_default();
+                                history.feed_tool_use(
+                                    tool.clone(),
+                                    summarize_tool_args(args),
+                                );
+                            }
+                        }
+                        // TaskStart is the primary block-creation
+                        // event for the items model — carries an
+                        // explicit call_id so the block can be
+                        // hydrated immediately (no FIFO pairing
+                        // required, no OSC fence needed in the PTY
+                        // stream).
+                        if let SessionEvent::TaskStart {
+                            call_id,
+                            tool,
+                            args_summary,
+                        } = &payload.event
+                        {
+                            let history = self
+                                .histories
+                                .entry(payload.session_id.clone())
+                                .or_default();
+                            history.feed_task_start(
+                                call_id.clone(),
+                                tool.clone(),
+                                args_summary.clone(),
+                            );
+                        }
+                        if let SessionEvent::ToolResult { tool, ok, output } = &payload.event {
+                            let history = self
+                                .histories
+                                .entry(payload.session_id.clone())
+                                .or_default();
+                            history.feed_tool_result(tool, *ok, output.clone());
+                        }
+                        // Orchestrator session events: PTY bytes flow
+                        // through the regular PTY branch above (into
+                        // `terminals[id]`). Non-PTY events (Message,
+                        // ToolUse, ToolResult, ...) just record into
+                        // the transcript like any other session — the
+                        // orchestrator is filtered from the *list*
+                        // view, but its events are still useful for
+                        // CLI / MCP introspection and don't hurt the
+                        // TUI (the panel renders the PTY screen, not
+                        // the structured events).
                         if Some(payload.session_id.as_str())
                             == self.transcript_session.as_deref()
                         {
@@ -675,6 +919,7 @@ impl App {
                             self.sessions.push(payload.session);
                             self.sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
                         }
+                        self.refresh_orchestrator_id();
                         // Newly pinned PTY session: bootstrap so its tile
                         // populates immediately, even when the pin came from
                         // outside this TUI process.
@@ -729,6 +974,16 @@ impl App {
         args_summary: String,
         risk: agentd_protocol::ToolRisk,
     ) {
+        // Orchestrator approvals are rendered inline in zarvis's PTY
+        // (the `? approve [risk] tool(args) — y/n/a` row). The user
+        // responds with a single key inside the orchestrator panel,
+        // not via a separate minibuffer prompt — so skip ours.
+        if self.orchestrator_id.as_deref() == Some(session_id.as_str()) {
+            return;
+        }
+        // Otherwise: any non-orchestrator minibuffer is shorter-lived
+        // and shouldn't be clobbered by an unrelated approval. Skip
+        // when busy.
         if self.minibuffer.is_some() {
             return;
         }
@@ -781,8 +1036,14 @@ impl App {
             self.transcript.clear();
             self.transcript_session = None;
         }
-        self.terminals.remove(id);
+        self.histories.remove(id);
+        self.block_hits.remove(id);
         self.pty_activity.remove(id);
+        // Orchestrator session went away → palette fallback after the
+        // re-derive below. The orchestrator's PTY parser in
+        // `terminals[id]` was already removed by the generic cleanup
+        // above.
+        self.refresh_orchestrator_id();
         self.ensure_selection_valid();
         self.refresh_selected_transcript().await;
     }
@@ -847,14 +1108,56 @@ impl App {
     async fn on_mouse(&mut self, ev: MouseEvent) {
         use crossterm::event::MouseButton;
         const STEP: i32 = 3;
+        // Track every event's cell so hover-aware rendering (diamond
+        // tooltip, etc.) has a current position to render against.
+        self.mouse_pos = Some((ev.column, ev.row));
         match ev.kind {
             MouseEventKind::ScrollUp => self.adjust_scrollback(STEP),
             MouseEventKind::ScrollDown => self.adjust_scrollback(-STEP),
             MouseEventKind::Down(MouseButton::Left) => {
+                // List ↔ view divider: clicking the list pane's right
+                // border starts a resize-drag rather than the usual
+                // click-into-the-list flow. Only meaningful in the
+                // normal split layout (zoomed modes don't show the
+                // border).
+                if self.is_on_list_divider(ev.column, ev.row) {
+                    self.resizing_list = true;
+                    return;
+                }
                 self.handle_left_click(ev.column, ev.row).await;
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.resizing_list {
+                    // Width = column of the new border + 1 (because
+                    // the border sits at width-1).
+                    let want = ev.column.saturating_add(1);
+                    self.list_panel_w = want
+                        .clamp(LIST_PANEL_W_MIN, u16::MAX); // top end clamped at render
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.resizing_list = false;
             }
             _ => {}
         }
+    }
+
+    /// True if `(col, row)` sits on the list pane's right border in
+    /// the current frame's layout — i.e., the column just to the right
+    /// of the list's content, only when we're in the normal split
+    /// layout. Returns false in zoomed layouts (no border to grab).
+    fn is_on_list_divider(&self, col: u16, row: u16) -> bool {
+        if !matches!(self.zoom, ZoomMode::None) {
+            return false;
+        }
+        let Some(list) = self.layout.list_area else {
+            return false;
+        };
+        if list.width == 0 {
+            return false;
+        }
+        let border_x = list.x + list.width - 1;
+        col == border_x && row >= list.y && row < list.y + list.height
     }
 
     /// Hit-test a left-click against the last frame's pane geometry.
@@ -871,6 +1174,40 @@ impl App {
         }
         if let Some(mb_area) = self.layout.minibuffer_area {
             if contains(mb_area, col, row) {
+                // First check the inline-hint zones ("C-x z unzoom" /
+                // "? help" / etc.). They sit on the same row as the
+                // minibuffer area when no prompt is open and dispatch
+                // their bound action directly instead of opening the
+                // palette.
+                for hint in &self.layout.minibuffer_hints {
+                    if row == hint.y
+                        && col >= hint.x_start
+                        && col < hint.x_end
+                    {
+                        let action = hint.action;
+                        self.run_action(action).await;
+                        return;
+                    }
+                }
+                // Orchestrator panel: click on a tool block toggles
+                // its expand state. The orchestrator's render area
+                // is the minibuffer rect minus the 1-row top border.
+                if matches!(
+                    self.minibuffer.as_ref().map(|m| &m.intent),
+                    Some(MinibufferIntent::Orchestrator)
+                ) {
+                    if let Some(orch_id) = self.orchestrator_id.clone() {
+                        let inner = ratatui::layout::Rect {
+                            x: mb_area.x,
+                            y: mb_area.y + 1,
+                            width: mb_area.width,
+                            height: mb_area.height.saturating_sub(1),
+                        };
+                        if self.try_toggle_block_at(&orch_id, inner, col, row).await {
+                            return;
+                        }
+                    }
+                }
                 self.click_minibuffer(mb_area, col).await;
                 return;
             }
@@ -883,26 +1220,182 @@ impl App {
         }
         if let Some(list) = self.layout.list_area {
             if contains(list, col, row) {
-                self.click_list(list, row).await;
+                self.click_list(list, col, row).await;
                 return;
             }
         }
         if let Some(view) = self.layout.view_area {
             if contains(view, col, row) {
+                // Top-row close button: ` x ` 3-cell range at the
+                // right edge of the top border. Click → delete
+                // confirmation prompt for the selected session.
+                let (close_x_start, close_x_end, close_y) =
+                    crate::ui::view_close_button_range(view);
+                if self.selected_session().is_some()
+                    && row == close_y
+                    && col >= close_x_start
+                    && col < close_x_end
+                {
+                    self.run_action(crate::keymap::KeyAction::OpenDeleteConfirm)
+                        .await;
+                    return;
+                }
+                // Inner area: same Rect minus the 1-cell border on
+                // each side. The render path stores hit ranges
+                // relative to the inner area's top — translate
+                // before lookup.
+                let inner = ratatui::layout::Rect {
+                    x: view.x + 1,
+                    y: view.y + 1,
+                    width: view.width.saturating_sub(2),
+                    height: view.height.saturating_sub(2),
+                };
+                if let Some(id) = self.selected_id() {
+                    if self.try_toggle_block_at(&id, inner, col, row).await {
+                        return;
+                    }
+                }
+                self.collapse_orchestrator_panel_on_focus_change();
                 self.focus = PaneFocus::View;
                 return;
             }
         }
     }
 
+    /// Collapse the orchestrator panel (close the
+    /// `MinibufferIntent::Orchestrator` minibuffer) if it's
+    /// currently open. Called from every code path that moves
+    /// focus to a different pane — clicking list / view / pin
+    /// strip, the `SwitchFocus` and `FocusView` actions, the
+    /// session-create completion handler. No-op when the panel
+    /// isn't open or a different intent (palette, send-input,
+    /// rename, etc.) is active.
+    fn collapse_orchestrator_panel_on_focus_change(&mut self) {
+        if matches!(
+            self.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::Orchestrator)
+        ) {
+            self.minibuffer = None;
+        }
+    }
+
+    /// Hit-test (col, row) against the most recent `block_hits` for
+    /// the given session, relative to `inner`. Returns true if the
+    /// click was consumed:
+    ///
+    /// - `[bg]` button row + col range → `client.tool_action(call_id, "background")`.
+    /// - `[kill]` button row + col range → `client.tool_action(call_id, "kill")`.
+    /// - Else inside a block's row range → toggle expand/collapse.
+    /// - Else → false (caller falls through to default focus behavior).
+    async fn try_toggle_block_at(
+        &mut self,
+        session_id: &str,
+        inner: ratatui::layout::Rect,
+        col: u16,
+        row: u16,
+    ) -> bool {
+        if col < inner.x
+            || col >= inner.x + inner.width
+            || row < inner.y
+            || row >= inner.y + inner.height
+        {
+            return false;
+        }
+        let rel_col = col - inner.x;
+        let rel_row = row - inner.y;
+        let hits = match self.block_hits.get(session_id) {
+            Some(h) => h.clone(),
+            None => return false,
+        };
+        for hit in hits {
+            // Button row check. Button cols come from synth_block's
+            // fixed-column layout (buttons FIRST in the status row),
+            // so the recorded ranges are exact regardless of
+            // elapsed-counter width or Unicode glyph width. A click
+            // landing on the status row that DOESN'T hit a button
+            // is consumed (returns true) so it can't silently fall
+            // through to the toggle path.
+            if rel_row == hit.header_row {
+                if let Some((bs, be)) = hit.bg_button {
+                    if rel_col >= bs && rel_col < be {
+                        let session_id_owned = session_id.to_string();
+                        let call_id_owned = hit.call_id.clone();
+                        let short: String =
+                            hit.call_id.chars().take(10).collect();
+                        match self
+                            .client
+                            .tool_action(&session_id_owned, call_id_owned, "background")
+                            .await
+                        {
+                            Ok(()) => self.set_status(format!("→ background {short}")),
+                            Err(e) => self.set_status(format!("background failed: {e}")),
+                        }
+                        return true;
+                    }
+                }
+                if let Some((ks, ke)) = hit.kill_button {
+                    if rel_col >= ks && rel_col < ke {
+                        let session_id_owned = session_id.to_string();
+                        let call_id_owned = hit.call_id.clone();
+                        let short: String =
+                            hit.call_id.chars().take(10).collect();
+                        match self
+                            .client
+                            .tool_action(&session_id_owned, call_id_owned, "kill")
+                            .await
+                        {
+                            Ok(()) => self.set_status(format!("→ kill {short}")),
+                            Err(e) => self.set_status(format!("kill failed: {e}")),
+                        }
+                        return true;
+                    }
+                }
+                if hit.bg_button.is_some() || hit.kill_button.is_some() {
+                    return true;
+                }
+            }
+            // Toggle-on-row-range path (footer click for expand /
+            // collapse). Only fires on COMPLETED blocks where the
+            // footer text exists; the status row was handled above.
+            if rel_row >= hit.row_start && rel_row < hit.row_end {
+                if let Some(history) = self.histories.get_mut(session_id) {
+                    if history.toggle_block(&hit.call_id) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     async fn click_minibuffer(&mut self, mb_area: ratatui::layout::Rect, col: u16) {
         if let Some(mb) = self.minibuffer.as_mut() {
-            // Position the cursor at the clicked column inside the
-            // input. Math: text starts at `area.x + prompt.width()`.
-            // ApproveTool is a single-key intent — no cursor moves are
-            // meaningful, so we skip those.
             if matches!(mb.intent, MinibufferIntent::ApproveTool { .. }) {
                 return;
+            }
+            // Harness picker: clicking an available name submits it
+            // as if the user typed and pressed Enter. Unavailable
+            // names are visually disabled (strikethrough); clicks
+            // on them drop a status note rather than submitting —
+            // the hover tooltip explains why.
+            if matches!(mb.intent, MinibufferIntent::NewSessionHarness) {
+                let hits = self.layout.minibuffer_harness_hits.clone();
+                for hit in hits {
+                    if hit.y == mb_area.y && col >= hit.x_start && col < hit.x_end
+                    {
+                        if !hit.available {
+                            self.set_status(format!(
+                                "{}: adapter binary not installed",
+                                hit.name
+                            ));
+                            return;
+                        }
+                        let intent = mb.intent.clone();
+                        self.minibuffer = None;
+                        self.run_minibuffer_submit(intent, hit.name).await;
+                        return;
+                    }
+                }
             }
             let prompt_w = unicode_width::UnicodeWidthStr::width(mb.prompt.as_str()) as u16;
             let input_start = mb_area.x + prompt_w;
@@ -914,16 +1407,15 @@ impl App {
                 mb.cursor = offset_cells.min(max);
             }
         } else {
-            // No minibuffer open — clicking the prompt area opens the
-            // command palette, matching the `M-x` / `C-x x` chord.
             self.run_action(KeyAction::OpenCommandPalette).await;
         }
     }
 
-    async fn click_list(&mut self, list: ratatui::layout::Rect, row: u16) {
+    async fn click_list(&mut self, list: ratatui::layout::Rect, col: u16, row: u16) {
         // A click anywhere inside the list pane focuses it, even on the
         // border or empty space past the last item — matching the
         // intuitive "click the pane to focus it" UX.
+        self.collapse_orchestrator_panel_on_focus_change();
         self.focus = PaneFocus::List;
         // Top + bottom border are 1 row each; rows outside the inner
         // content area only handle the focus change above.
@@ -934,6 +1426,24 @@ impl App {
         let items = self.list_items();
         if idx >= items.len() {
             return;
+        }
+        // The 4-cell gutter to the left of the session name —
+        //   [diamond][ ][status-circle][ ]
+        // — toggles the pin instead of selecting the row. Wider than
+        // the bare diamond so it's easy to click. Must stay in lockstep
+        // with `hovered_diamond` in ui.rs.
+        if let ListItem::Session { summary, indented } = &items[idx] {
+            let indent = if *indented { 2 } else { 0 };
+            let zone_start = list.x + 1 + indent;
+            let zone_end = zone_start + 4;
+            if col >= zone_start && col < zone_end {
+                let id = summary.id.clone();
+                let next = !summary.pinned;
+                if let Err(e) = self.client.set_pinned(&id, next).await {
+                    self.set_status(format!("set_pinned failed: {e}"));
+                }
+                return;
+            }
         }
         match &items[idx] {
             ListItem::Session { summary, .. } => {
@@ -996,6 +1506,7 @@ impl App {
             self.selection = Selection::Session(id.clone());
             self.transcript_session = None;
             self.refresh_selected_transcript().await;
+            self.collapse_orchestrator_panel_on_focus_change();
             self.focus = PaneFocus::View;
             return;
         }
@@ -1036,8 +1547,25 @@ impl App {
     }
 
     async fn on_key(&mut self, key: KeyEvent) {
-        // Minibuffer captures all input when open.
-        if self.minibuffer.is_some() {
+        // /tasks modal: Esc closes it; everything else falls through
+        // (the popup itself is read-only at the keyboard layer in
+        // v1 — mouse-only row interactions).
+        if self.tasks_popup.is_some() {
+            if matches!(key.code, KeyCode::Esc) {
+                self.tasks_popup = None;
+                return;
+            }
+        }
+        // Minibuffer captures all input when open — with one exception:
+        // the orchestrator intent is just a focus marker for a
+        // PTY-backed panel, so keys go to the orchestrator session's
+        // PTY (with the standard `C-x` chord escape) rather than into
+        // the minibuffer's text input.
+        if let Some(mb) = &self.minibuffer {
+            if matches!(mb.intent, MinibufferIntent::Orchestrator) {
+                self.handle_orchestrator_key(key).await;
+                return;
+            }
             self.handle_minibuffer_key(key).await;
             return;
         }
@@ -1243,18 +1771,27 @@ impl App {
                 }
             }
             OpenCommandPalette => {
-                self.minibuffer = Some(Minibuffer {
-                    prompt: "M-x ".to_string(),
-                    input: String::new(),
-                    cursor: 0,
-                    intent: MinibufferIntent::CommandPalette,
-                    error: None,
-                });
+                self.open_minibuffer_for_command();
+            }
+            FocusView => {
+                // Enter from the list drills into the session view.
+                // In zoomed-list mode, flip the zoom to the view side
+                // so the pane the user is "entering" actually fills
+                // the screen (mirrors SwitchFocus's zoom-aware path).
+                match self.zoom {
+                    ZoomMode::List => {
+                        self.zoom = ZoomMode::View;
+                    }
+                    ZoomMode::View | ZoomMode::None => {}
+                }
+                self.collapse_orchestrator_panel_on_focus_change();
+                self.focus = PaneFocus::View;
             }
             SwitchFocus => {
                 // In a zoomed layout `C-x o` swaps which pane is
                 // zoomed (and focused). In normal layout it just
                 // swaps focus.
+                self.collapse_orchestrator_panel_on_focus_change();
                 match self.zoom {
                     ZoomMode::List => {
                         self.zoom = ZoomMode::View;
@@ -1374,6 +1911,51 @@ impl App {
             }
             ToggleAutomode => {
                 self.toggle_automode().await;
+            }
+        }
+    }
+
+    /// Key handler for the orchestrator panel: same shape as the main
+    /// view's PTY mode (C-x chord escape, `C-x C-x` to forward a
+    /// literal C-x byte). `Esc` closes the panel; the next `C-x x`
+    /// reopens it. All non-chord keys are encoded to PTY bytes and
+    /// forwarded to the orchestrator session.
+    async fn handle_orchestrator_key(&mut self, key: KeyEvent) {
+        let Some(orch_id) = self.orchestrator_id.clone() else {
+            // Orchestrator went away — fall back to palette mode.
+            self.minibuffer = None;
+            return;
+        };
+        let is_ctrl_x = matches!(key.code, KeyCode::Char('x'))
+            && key.modifiers.contains(KeyModifiers::CONTROL);
+        // Escape hatch: `C-x C-x` sends a literal C-x byte through to the
+        // PTY (matching the main-view PTY behavior).
+        if !self.chord_state.is_empty() && is_ctrl_x {
+            self.chord_state = ChordState::default();
+            self.chord_label.clear();
+            let _ = self.client.pty_input(&orch_id, vec![0x18]).await;
+            return;
+        }
+        // Start of a chord or continuation: dispatch through the keymap.
+        if !self.chord_state.is_empty() || is_ctrl_x {
+            let res = self.chord_state.handle(key, &self.keymap);
+            self.chord_label = self.chord_state.label();
+            match res {
+                KeymapResult::Action(a) => self.run_action(a).await,
+                KeymapResult::Pending(label) => self.chord_label = label,
+                KeymapResult::Unhandled => self.chord_label.clear(),
+            }
+            return;
+        }
+        // Esc closes the panel without sending anything to the PTY.
+        if matches!(key.code, KeyCode::Esc) {
+            self.minibuffer = None;
+            return;
+        }
+        // Everything else goes to the orchestrator's PTY.
+        if let Some(bytes) = encode_key_to_bytes(key) {
+            if let Err(e) = self.client.pty_input(&orch_id, bytes).await {
+                self.set_status(format!("orchestrator pty_input: {e}"));
             }
         }
     }
@@ -1570,6 +2152,7 @@ impl App {
                     worktree: false,
                     env: HashMap::new(),
                     args: Vec::new(),
+                    kind: agentd_protocol::SessionKind::User,
                 };
                 match self.client.create(params).await {
                     Ok(id) => {
@@ -1583,15 +2166,10 @@ impl App {
                         // would race the subscription and the banner ends
                         // up rendered twice (once from the ring, once from
                         // the live broadcast that was already in flight).
-                        if !self.terminals.contains_key(&id) {
-                            let (cols, rows) = self.terminal_pane_size;
-                            self.terminals.insert(
+                        if !self.histories.contains_key(&id) {
+                            self.histories.insert(
                                 id.clone(),
-                                vt100::Parser::new(
-                                    rows.max(1),
-                                    cols.max(1),
-                                    SCROLLBACK_MAX,
-                                ),
+                                crate::pty_render::ItemHistory::new(),
                             );
                         }
                         self.selection = Selection::Session(id);
@@ -1685,6 +2263,13 @@ impl App {
                 let cmd = input.trim();
                 self.run_palette_command(cmd).await;
             }
+            MinibufferIntent::Orchestrator => {
+                // Unreachable in PTY-orchestrator mode — the
+                // orchestrator panel's keys are handled in
+                // handle_orchestrator_key and never reach the regular
+                // submit path. Kept as a defensive fallback.
+                let _ = input;
+            }
             MinibufferIntent::ApproveTool { session_id, call_id, .. } => {
                 // Reached only if the special-cased key handler in
                 // handle_minibuffer_key fell through (defensive — should
@@ -1697,6 +2282,16 @@ impl App {
     }
 
     async fn run_palette_command(&mut self, cmd: &str) {
+        // Palette text is the same shape as a slash command without
+        // the leading `/`; share the dispatch.
+        self.run_slash_command(cmd).await;
+    }
+
+    /// Execute a slash-style command (`zoom`, `new`, `quit`, ...) with
+    /// no LLM involvement. Used both by the orchestrator panel (when
+    /// input starts with `/`) and by the static palette (fallback when
+    /// no orchestrator is present).
+    pub async fn run_slash_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         match cmd {
             "" => {}
@@ -1714,6 +2309,9 @@ impl App {
             "diff" => self.run_action(KeyAction::OpenDiff).await,
             "interrupt" => self.run_action(KeyAction::Interrupt).await,
             "help" | "?" => self.help_visible = true,
+            "tasks" => {
+                self.open_tasks_popup().await;
+            }
             "harnesses" => {
                 self.harnesses = self.client.harnesses().await.unwrap_or_default();
                 let names: Vec<String> = self
@@ -1729,6 +2327,73 @@ impl App {
             other => self.set_status(format!("unknown command: {other}")),
         }
     }
+
+    /// Snapshot the selected session's task registry and open the
+    /// `/tasks` modal popup. The popup is read-only on its data
+    /// (no live updates while open); the user closes with Esc and
+    /// re-opens to refresh. Click handlers in the popup itself can
+    /// issue `tool_action(kill)` to terminate running tasks.
+    pub async fn open_tasks_popup(&mut self) {
+        let Some(id) = self.selected_id().or_else(|| self.orchestrator_id.clone())
+        else {
+            self.set_status("no session selected".into());
+            return;
+        };
+        match self.client.list_tasks(&id).await {
+            Ok(tasks) => {
+                self.tasks_popup = Some(TasksPopup {
+                    session_id: id,
+                    tasks,
+                });
+            }
+            Err(e) => self.set_status(format!("list_tasks failed: {e}")),
+        }
+    }
+
+    /// Open the right minibuffer mode for the user's main "command"
+    /// keybind (`M-x` / `C-x x` / click on the prompt). Prefers the
+    /// orchestrator panel when an orchestrator session is available;
+    /// falls back to the static command palette.
+    pub fn open_minibuffer_for_command(&mut self) {
+        if self.orchestrator_id.is_some() {
+            self.minibuffer = Some(Minibuffer {
+                prompt: "> ".to_string(),
+                input: String::new(),
+                cursor: 0,
+                intent: MinibufferIntent::Orchestrator,
+                error: None,
+            });
+        } else {
+            self.minibuffer = Some(Minibuffer {
+                prompt: "M-x ".to_string(),
+                input: String::new(),
+                cursor: 0,
+                intent: MinibufferIntent::CommandPalette,
+                error: None,
+            });
+        }
+    }
+
+}
+
+/// Best-effort one-line summary of a tool call's args JSON for the
+/// PTY tool-block header. Prefers a single salient field
+/// (`command` for shell, `path` for read_file, `query` for search-
+/// style tools, `glob` for globs); otherwise falls back to
+/// truncated JSON. Capped at 80 chars so the header stays single-
+/// line in the typical pane width.
+pub fn summarize_tool_args(args: &serde_json::Value) -> String {
+    if let Some(obj) = args.as_object() {
+        for key in ["command", "path", "query", "glob", "pattern", "cwd"] {
+            if let Some(v) = obj.get(key) {
+                if let Some(s) = v.as_str() {
+                    return s.chars().take(80).collect();
+                }
+            }
+        }
+    }
+    let s = args.to_string();
+    s.chars().take(80).collect()
 }
 
 pub fn short_id(id: &str) -> &str {

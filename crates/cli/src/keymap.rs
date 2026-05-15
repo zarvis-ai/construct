@@ -25,6 +25,10 @@ pub enum KeyAction {
     /// Cycle keyboard focus across the panes (list ↔ view). Bound to `C-x o`
     /// in the emacs profile, matching `other-window`.
     SwitchFocus,
+    /// Move keyboard focus into the selected session's view pane (from
+    /// the list). Acts on Enter from the list — a one-way "drill in"
+    /// counterpart to `SwitchFocus`'s toggle.
+    FocusView,
     ToggleView,
     /// Pin / unpin the currently-selected session so it stays in the pin
     /// strip below the main view. On a group selection: pin or unpin all
@@ -180,9 +184,11 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('p')]), PrevSession),
         (Chord(vec![key(KeyCode::Down)]), NextSession),
         (Chord(vec![key(KeyCode::Up)]), PrevSession),
-        // Focus + view (C-x prefix, matching emacs window commands)
+        // Focus + view (C-x prefix, matching emacs window commands).
+        // Enter from the list "drills in" to the session view; Tab is
+        // intentionally left unbound for future use (e.g. completion).
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
-        (Chord(vec![key(KeyCode::Tab)]), SwitchFocus),
+        (Chord(vec![key(KeyCode::Enter)]), FocusView),
         (Chord(vec![ctrl('x'), ch('t')]), ToggleView),
         (Chord(vec![ctrl('x'), ch('z')]), ToggleZoom),
         // Session actions
@@ -260,7 +266,9 @@ fn vim() -> Keymap {
         (Chord(vec![shift_key(KeyCode::Up)]), MoveSelectedUp),
         (Chord(vec![shift_key(KeyCode::Down)]), MoveSelectedDown),
         (Chord(vec![ch(':')]), OpenCommandPalette),
-        (Chord(vec![key(KeyCode::Tab)]), SwitchFocus),
+        // Enter from the list focuses the selected session's view;
+        // Tab stays unbound for future use.
+        (Chord(vec![key(KeyCode::Enter)]), FocusView),
         // PTY-mode escape: C-x is the universal prefix here too, so `C-x o`
         // cycles focus and `C-x C-c` quits even when the PTY is capturing.
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),

@@ -183,7 +183,8 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_)) => continue,
+                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::ToolAction { .. }) => continue,
                 }
             }
         };
@@ -314,7 +315,8 @@ async fn drive_turn(
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_)) => {
+                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::ToolAction { .. }) => {
                         // headless claude doesn't gate tools; ignore.
                     }
                 }

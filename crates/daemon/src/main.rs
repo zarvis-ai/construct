@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 mod adapter;
 mod config;
+mod loops;
 mod server;
 mod session;
 mod storage;
@@ -88,6 +89,22 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     // whose start params can't be loaded get marked Errored. Logs only;
     // never fatal.
     manager.clone().resume_running_sessions().await;
+    // Best-effort: create the orchestrator session if config enables
+    // one and no orchestrator exists yet. Logged-only on failure (e.g.
+    // chosen harness missing or no API key); clients fall back to the
+    // static palette in that case.
+    manager.clone().ensure_orchestrator().await;
+    // Loop scheduler: wakes every second, fires due loops by
+    // calling `SessionManager::send_input`. Persisted per-session
+    // in `sessions/<id>/loops.json`; daemon restart picks them
+    // back up.
+    {
+        let mgr = manager.clone();
+        let loops = mgr.loops.clone();
+        tokio::spawn(async move {
+            loops::run_scheduler(mgr, loops).await;
+        });
+    }
 
     let socket_path = socket_override.unwrap_or_else(|| paths.socket());
     server::serve(manager, socket_path).await

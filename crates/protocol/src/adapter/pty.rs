@@ -182,7 +182,8 @@ pub async fn run_session(spec: PtySpec, ctx: AdapterContext) -> i32 {
                     }
                     // PTY-mode adapters don't gate tool calls — ignore.
                     Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_)) => {}
+                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::ToolAction { .. }) => {}
                 }
             }
             res = &mut wait_handle => {

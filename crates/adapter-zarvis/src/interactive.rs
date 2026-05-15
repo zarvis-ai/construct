@@ -10,7 +10,7 @@
 //! The TUI's `vt100`-backed terminal pane parses these bytes the same
 //! way it parses any other PTY-backed adapter's output.
 
-use crate::agent::{push_msg, ResolvedModel, SYSTEM_PROMPT};
+use crate::agent::{push_msg, system_prompt_for_env, ResolvedModel};
 use crate::context;
 use crate::persist::{self, Persist};
 use crate::provider::{self, Content, Message, Role, StopReason, TextSink, ToolCall};
@@ -18,7 +18,7 @@ use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::Result;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 
 const TOOL_OUTPUT_BUDGET: usize = 8_000;
@@ -72,6 +72,58 @@ impl<'a> Terminal<'a> {
         let line = format!("  {glyph}  \x1b[2m{one_line}\x1b[0m\r\n");
         self.write(line.as_bytes());
     }
+    /// Open a tool-block region in the PTY stream with a custom OSC
+    /// marker. Ratatui clients use this as a fence: the bytes between
+    /// the open and matching close are zarvis's truncated rendering,
+    /// which the items-model renderer skips in favor of synthesizing
+    /// its own representation from the structured `ToolUse` /
+    /// `ToolResult` events (and which can therefore expand/collapse
+    /// in place). Non-ratatui consumers (CLI tail, browser, MCP raw
+    /// view) see only the inline bytes — the OSC is invisible — so
+    /// their output stays sensible.
+    fn tool_block_open(&self, call_id: &str) {
+        let open = format!("\x1b]7700;open;call={}\x07", call_id);
+        self.write(open.as_bytes());
+    }
+    fn tool_block_close(&self, call_id: &str) {
+        let close = format!("\x1b]7700;close;call={}\x07", call_id);
+        self.write(close.as_bytes());
+    }
+    /// Render a tool's result body (glyph row + truncated preview +
+    /// optional `[+N lines — click to expand]` footer). Caller is
+    /// responsible for wrapping with [`tool_block_open`] /
+    /// [`tool_block_close`] — and typically writing a [`tool_use`]
+    /// header line in between so the entire block is fenced.
+    fn tool_result_body(&self, ok: bool, output: &str) {
+        let glyph = if ok {
+            "\x1b[1;32m✓\x1b[0m"
+        } else {
+            "\x1b[1;31m✗\x1b[0m"
+        };
+        let total_lines = output.lines().count();
+        for (i, line) in output.lines().take(TOOL_BLOCK_MAX_LINES).enumerate() {
+            let trimmed: String = line.chars().take(TOOL_BLOCK_MAX_COLS).collect();
+            if i == 0 {
+                let payload =
+                    format!("  {glyph}  \x1b[2m{trimmed}\x1b[0m\r\n");
+                self.write(payload.as_bytes());
+            } else {
+                let payload = format!("     \x1b[2m{trimmed}\x1b[0m\r\n");
+                self.write(payload.as_bytes());
+            }
+        }
+        if total_lines == 0 {
+            let payload = format!("  {glyph}  \x1b[2m(no output)\x1b[0m\r\n");
+            self.write(payload.as_bytes());
+        }
+        if total_lines > TOOL_BLOCK_MAX_LINES {
+            let remaining = total_lines - TOOL_BLOCK_MAX_LINES;
+            let footer = format!(
+                "     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n"
+            );
+            self.write(footer.as_bytes());
+        }
+    }
     fn approval(&self, tool: &str, args_summary: &str, risk: ToolRisk) {
         let risk_label = match risk {
             ToolRisk::Safe => "safe",
@@ -87,6 +139,33 @@ impl<'a> Terminal<'a> {
         let line = format!("\r\n\x1b[2m{msg}\x1b[0m\r\n");
         self.write(line.as_bytes());
     }
+    /// Inline acknowledgement that a user line was captured while the
+    /// agent was mid-turn — it'll fire on the next AwaitingInput.
+    /// Dim cyan so it reads as "future intent" rather than current
+    /// agent activity. Includes a leading + trailing CRLF so the
+    /// marker doesn't clobber whatever the agent is currently
+    /// writing on its line (there's still some visual artifact on
+    /// terminals with strict cursor tracking, but it's bounded to
+    /// one line of scrollback).
+    fn queued_ack(&self, line: &str) {
+        let trimmed = line.trim();
+        let payload = if trimmed.len() > 80 {
+            let head: String = trimmed.chars().take(77).collect();
+            format!("{head}...")
+        } else {
+            trimmed.to_string()
+        };
+        let marker = format!("\r\n\x1b[2;36m↳ queued: {payload}\x1b[0m\r\n");
+        self.write(marker.as_bytes());
+    }
+    /// Echo a queued line as the user turn that's about to run, with
+    /// the same `❯ ` glyph the live line editor uses. Called from the
+    /// outer loop as it drains the queue between turns.
+    fn echo_user_line(&self, line: &str) {
+        self.write(b"\r\n\x1b[1;36m\xe2\x9d\xaf \x1b[0m");
+        self.write(line.as_bytes());
+        self.write(b"\r\n");
+    }
 }
 
 /// Lines whose start matches one of these labels are dimmed in the PTY
@@ -100,7 +179,25 @@ const DIM_LINE_PREFIXES: &[&str] = &["Summary:"];
 /// multiple commands share a prefix, the first one wins as the ghost.
 /// Keep in lockstep with the `match trimmed { ... }` block that handles
 /// them after submit.
-const SLASH_COMMANDS: &[&str] = &["/model", "/quit", "/exit"];
+/// Commands surfaced by the `/` popup + tab completion. `/model` is
+/// adapter-internal (zarvis switches its own provider). Everything
+/// else is dispatched as a `tui` ToolUse for the TUI's slash table,
+/// except `/loop` which is parsed inline and turned into an
+/// `agentd_loop_create` call. Keep this in lockstep with the
+/// after-submit match block + the TUI's `run_slash_command`.
+const SLASH_COMMANDS: &[&str] = &[
+    "/help",
+    "/loop",
+    "/model",
+    "/new",
+    "/quit",
+    "/exit",
+    "/refresh",
+    "/rename",
+    "/send",
+    "/tasks",
+    "/zoom",
+];
 
 /// Padding around the assistant's streamed response. The response is
 /// rendered as a chat bubble: `❯` marks user input (the line editor's
@@ -121,6 +218,17 @@ const LEFT_MARGIN_CELLS: usize = 2;
 /// Hard floor on usable width so a tiny pane doesn't crash the wrap
 /// math.
 const MIN_USABLE_WIDTH: usize = 20;
+
+/// Max preview lines per tool result rendered in the PTY. Output
+/// beyond this lands behind a `[+N lines — click to expand]` footer
+/// (the full output is still in the transcript and in the model's
+/// context). Tuned to balance "I can see what the tool did" against
+/// "every read_file blowing out the scrollback."
+const TOOL_BLOCK_MAX_LINES: usize = 5;
+/// Per-line truncation inside a tool block, before the wrap math
+/// gets involved. Just a backstop against pathological single-line
+/// outputs from `shell` calls.
+const TOOL_BLOCK_MAX_COLS: usize = 200;
 
 /// Sink for the interactive mode: deltas go directly to the PTY (with
 /// dim-line styling for `Summary:` etc. + top/bottom/left/right padding
@@ -1001,6 +1109,25 @@ mod tests {
         assert_eq!(common_prefix(&["/model"]), "/model");
         assert_eq!(common_prefix(&[]), "");
     }
+
+    /// Submit events fired while the agent is mid-turn still come out
+    /// of `feed_bytes` — the caller (drive_with_input) is responsible
+    /// for pushing them onto the queue. Verify that the editor produces
+    /// the Submit for each Enter in a multi-line chunk, so a fast-typing
+    /// user gets every queued message captured.
+    #[test]
+    fn multiple_submits_in_one_chunk() {
+        let mut ed = editor();
+        let (_, evs) = ed.feed_bytes(b"hello\rworld\r");
+        let submits: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                LineEvent::Submit(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(submits, vec!["hello", "world"]);
+    }
 }
 
 /// Tri-state interrupt signal used during in-flight turns.
@@ -1031,6 +1158,29 @@ pub async fn run(
     let specs = registry.specs();
     let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
 
+    // Per-session task registry: tracks every spawned tool's
+    // supervisor handle so manual `[kill]` / `[bg]` clicks can find
+    // the right call_id, and so auto-bg can hand off cleanly. The
+    // background-completion channel feeds completions back into the
+    // agent loop as `OBSERVATION:` synthetic messages.
+    let tasks = crate::tasks::Tasks::new();
+    let (bg_completion_tx, mut bg_completion_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::tasks::BackgroundCompletion>();
+    let bg_after = crate::tasks::bg_after_duration();
+
+    // Project-guide injection: assemble the full system prompt once
+    // here, then re-use across every provider.complete call. Read
+    // happens at session start (and on resume since we re-enter
+    // this function), not per turn — so edits to AGENTS.md mid-
+    // session aren't picked up until the session is reopened.
+    let system_prompt: String = {
+        let base = crate::agent::system_prompt_for_env();
+        match crate::project_guide::format_section(&cwd) {
+            Some(section) => format!("{base}\n\n{section}"),
+            None => base.to_string(),
+        }
+    };
+
     let term = Terminal::new(&emit);
     let resuming = persist::is_resume();
     // On resume we emit nothing — banner, note, and prompt all stay off
@@ -1049,6 +1199,10 @@ pub async fn run(
         term.prompt();
     }
 
+    // Clone the id before moving it into ToolCtx — the
+    // observation task and slash handlers (e.g. `/loop`) need it.
+    let self_id_for_obs = session_id.clone();
+    let session_id_for_slash = session_id.clone();
     let tool_ctx = ToolCtx {
         cwd,
         session_id,
@@ -1088,14 +1242,43 @@ pub async fn run(
             }
         }
     }
+    // Submissions captured while the agent was mid-turn. Drained at
+    // the top of every outer-loop iteration so the user can keep
+    // composing thoughts while the agent works. Independent of
+    // `pending` (which is the one-shot startup prompt).
+    let mut queue: VecDeque<String> = VecDeque::new();
+
+    // Orchestrator-only: subscribe to other sessions' events so the
+    // agent can react to fleet activity (sessions finishing, errors,
+    // approval requests) without the user polling. Non-orchestrator
+    // sessions get `None` here and skip the obs branch in the inner
+    // select. Rate-limited so a burst of events can't fire a turn
+    // per event.
+    let is_orchestrator =
+        std::env::var("AGENTD_SESSION_KIND").as_deref() == Ok("orchestrator");
+    let mut obs_rx = if is_orchestrator {
+        Some(crate::observe::spawn(self_id_for_obs))
+    } else {
+        None
+    };
+    let mut obs_limiter =
+        crate::observe::RateLimiter::new(5, std::time::Duration::from_secs(60));
 
     'outer: loop {
-        // Wait for a user message, either from pending or by typing.
+        // Wait for a user message — drain order: startup prompt
+        // (`pending`), then anything queued during the previous turn,
+        // then live typing.
         let user_text = if let Some(t) = pending.pop_front() {
             // Echo the pre-supplied prompt as if the user typed it, so
             // the transcript is faithful.
             term.print(&t);
             term.newline();
+            t
+        } else if let Some(t) = queue.pop_front() {
+            // Drain a turn-queued line. Echo with the same `❯ ` glyph
+            // the live editor would use so the scrollback reads
+            // consistently.
+            term.echo_user_line(&t);
             t
         } else {
             emit.emit(SessionEvent::Status {
@@ -1108,14 +1291,68 @@ pub async fn run(
                 &term,
                 &mut automode,
                 &mut pty_width,
-                &messages,
-                provider_name,
-                &model,
-                &emit,
+                obs_rx.as_mut(),
+                &mut bg_completion_rx,
+                &tasks,
             )
             .await
             {
                 ReadOutcome::Line(t) => t,
+                ReadOutcome::Observation(obs) => {
+                    if !obs_limiter.try_consume() {
+                        tracing::info!(
+                            session = %obs.session_id,
+                            "orchestrator observation rate-limited; dropping"
+                        );
+                        continue 'outer;
+                    }
+                    let text = obs.as_synthetic_user_message();
+                    term.note(&text);
+                    text
+                }
+                ReadOutcome::BackgroundCompletion(bc) => {
+                    // Emit the real ToolResult so the transcript +
+                    // any MCP/CLI subscribers see the actual output
+                    // — replaces the synthetic "(running in
+                    // background)" result the LLM was given earlier.
+                    let (ok, output_text) = match &bc.outcome {
+                        Ok(o) => (o.ok, o.output.clone()),
+                        Err(e) => (false, format!("({e})")),
+                    };
+                    emit.emit(SessionEvent::ToolResult {
+                        tool: bc.call_id.clone(),
+                        ok,
+                        output: output_text.clone(),
+                    });
+                    // TaskEnd for the daemon's registry — closes
+                    // out the entry that's been in `Backgrounded`
+                    // state since the auto-bg fired.
+                    let preview: String = output_text.chars().take(200).collect();
+                    emit.emit(SessionEvent::TaskEnd {
+                        call_id: bc.call_id.clone(),
+                        ok,
+                        output_preview: preview,
+                    });
+                    // No inline PTY writes — the items-model
+                    // renderer already has the original block (from
+                    // the earlier TaskStart) and will fill it from
+                    // the ToolResult event we emitted above.
+                    // Synthesize an OBSERVATION: message so the
+                    // agent's next turn knows about the completion.
+                    let short_call: String = bc.call_id.chars().take(10).collect();
+                    let preview: String = output_text.chars().take(160).collect();
+                    let label = if ok { "ok" } else { "failed" };
+                    let text = format!(
+                        "OBSERVATION: background tool {} ({}) finished {} after {:.1}s. Output: {}",
+                        short_call,
+                        bc.tool_name,
+                        label,
+                        bc.duration.as_secs_f64(),
+                        preview
+                    );
+                    term.note(&text);
+                    text
+                }
                 ReadOutcome::Stop => break 'outer,
                 ReadOutcome::Eof => {
                     term.note("(end of session)");
@@ -1124,12 +1361,12 @@ pub async fn run(
             }
         };
 
-        // Slash-command meta inputs: never sent to the model.
+        // Slash-command meta inputs: never sent to the model. `/model`
+        // is adapter-internal (it switches zarvis state); everything
+        // else is delegated to the client via SessionEvent::ClientCommand
+        // so the TUI can dispatch its own slash table without an LLM
+        // roundtrip.
         let trimmed = user_text.trim();
-        if trimmed == "/quit" || trimmed == "/exit" {
-            term.note("(bye)");
-            break;
-        }
         if let Some(rest) = trimmed.strip_prefix("/model") {
             let arg = rest.trim();
             if arg.is_empty() {
@@ -1156,6 +1393,64 @@ pub async fn run(
             term.prompt();
             continue;
         }
+        // `/loop` is special-cased before the generic tui-dispatch
+        // path: it parses the spec inline (asking the LLM for an
+        // interval when the user didn't supply one), then calls
+        // the agentd_loop_create tool synthetically — same path
+        // the LLM would take, just from the adapter side.
+        if let Some(rest) = trimmed.strip_prefix("/loop ").or_else(|| {
+            (trimmed == "/loop").then_some("")
+        }) {
+            handle_slash_loop(
+                rest,
+                &session_id_for_slash,
+                &emit,
+                &term,
+                provider.as_ref(),
+                &model,
+                &tool_ctx,
+            )
+            .await;
+            term.prompt();
+            continue;
+        }
+        if let Some((name, args)) = parse_slash_command(trimmed) {
+            // Encode as a `tui` tool call so it lives in the same
+            // transcript surface as agent tool calls — the client TUI
+            // subscribes to ToolUse, recognizes the conventional
+            // tool name, and dispatches. We follow up with a
+            // synthetic ToolResult immediately so the trace looks
+            // like any other completed tool call.
+            let tool_args = match &args {
+                Some(a) => serde_json::json!({ "command": name, "args": a }),
+                None => serde_json::json!({ "command": name }),
+            };
+            let pretty = match &args {
+                Some(a) => format!("/{name} {a}"),
+                None => format!("/{name}"),
+            };
+            // Use a deterministic-enough id so a future repeat shows
+            // up as a separate call; the LLM never sees these so
+            // collision tolerance is fine.
+            let call_id = format!(
+                "tui-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            emit.emit(SessionEvent::ToolUse {
+                tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
+                args: tool_args,
+            });
+            emit.emit(SessionEvent::ToolResult {
+                tool: call_id,
+                ok: true,
+                output: pretty,
+            });
+            term.prompt();
+            continue;
+        }
         if trimmed.is_empty() {
             term.prompt();
             continue;
@@ -1178,18 +1473,48 @@ pub async fn run(
         loop {
             let _pruned = context::prune(&mut messages, provider_name, &model);
             let mut sink = PtySink::new(&emit, pty_width);
-            let turn = match provider
-                .complete(&model, SYSTEM_PROMPT, &messages, &specs, &mut sink)
-                .await
-            {
-                Ok(t) => {
+            // Wrap the provider call so user typing during the
+            // stream is fed to the editor and pressed-Enter lines
+            // join the pending-input queue instead of vanishing
+            // until the turn ends.
+            let drive = drive_with_input(
+                &mut inbox,
+                &mut editor,
+                &term,
+                &mut queue,
+                &mut automode,
+                tasks.clone(),
+                async {
+                    provider
+                        .complete(
+                            &model,
+                            &system_prompt,
+                            &messages,
+                            &specs,
+                            &mut sink,
+                        )
+                        .await
+                },
+            )
+            .await;
+            let turn = match drive {
+                DriveExit::Done(Ok(t)) => {
                     sink.finalize();
                     t
                 }
-                Err(e) => {
+                DriveExit::Done(Err(e)) => {
                     sink.finalize();
                     term.note(&format!("(provider error: {e})"));
                     emit.emit(SessionEvent::Error { message: format!("{e}") });
+                    break;
+                }
+                DriveExit::Stop | DriveExit::Channel => {
+                    sink.finalize();
+                    break 'outer;
+                }
+                DriveExit::Interrupt => {
+                    sink.finalize();
+                    term.note("(interrupted)");
                     break;
                 }
             };
@@ -1234,33 +1559,134 @@ pub async fn run(
             let mut early_stop = false;
 
             if !safe_idx.is_empty() {
-                let tasks: Vec<_> = safe_idx
+                // Precompute display metadata in the main task so the
+                // parallel children don't re-derive args summaries.
+                let safe_meta: Vec<(usize, provider::ToolCall, String)> = safe_idx
                     .iter()
                     .map(|&i| {
                         let call = turn.tool_calls[i].clone();
-                        let reg = registry.clone();
-                        let emit_c = emit.clone();
-                        let ctx_c = crate::agent::clone_tool_ctx(&tool_ctx);
-                        async move {
-                            (i, run_safe_call_pty(call, &reg, &ctx_c, &emit_c).await)
-                        }
+                        let summary = registry
+                            .get(&call.name)
+                            .map(|t| t.args_summary(&call.input))
+                            .unwrap_or_else(|| {
+                                serde_json::to_string(&call.input)
+                                    .unwrap_or_default()
+                            });
+                        (i, call, summary)
                     })
                     .collect();
-                let join_fut = futures::future::join_all(tasks);
-                let results: Vec<(usize, std::result::Result<ToolOutcome, String>)> =
-                    tokio::select! {
-                        biased;
-                        kind = wait_for_interrupt(&mut inbox) => {
-                            let reason = match kind {
-                                InterruptKind::Stop => { early_stop = true; "stop" }
-                                _ => "interrupt",
-                            };
-                            safe_idx.iter().map(|&i| (i, Err(reason.to_string()))).collect()
+
+                // Drive the tasks concurrently but yield results in
+                // submission order — that's how the user gets `→ a`
+                // immediately followed by `✓ a` even when `a` was the
+                // slowest. `FuturesOrdered` blocks on the head until
+                // ready, so a slow first call stalls visible output;
+                // that's the cost of tight grouping.
+                use futures::stream::{FuturesOrdered, StreamExt};
+                let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
+                for (_, call, summary) in &safe_meta {
+                    let call_clone = call.clone();
+                    let summary_clone = summary.clone();
+                    let reg = registry.clone();
+                    let emit_c = emit.clone();
+                    let ctx_c = crate::agent::clone_tool_ctx(&tool_ctx);
+                    let tasks_c = tasks.clone();
+                    let bg_tx_c = bg_completion_tx.clone();
+                    let bg_after_c = bg_after;
+                    let call_id = call.id.clone();
+                    let tool_name = call.name.clone();
+                    ordered.push_back(async move {
+                        // Each safe call gets its own supervisor —
+                        // auto-bg works in parallel just like the
+                        // risky serial path. SupervisorOutcome maps
+                        // to Result<ToolOutcome, String> for the
+                        // existing render pipeline.
+                        let tool_runner = async move {
+                            run_safe_call_silent(call_clone, &reg, &ctx_c, &emit_c).await
+                        };
+                        let outcome = crate::tasks::supervise(
+                            call_id,
+                            tool_name,
+                            summary_clone,
+                            tasks_c,
+                            bg_tx_c,
+                            bg_after_c,
+                            tool_runner,
+                        )
+                        .await;
+                        match outcome {
+                            crate::tasks::SupervisorOutcome::Done(r) => r,
+                            crate::tasks::SupervisorOutcome::Killed => {
+                                Err("interrupt".into())
+                            }
+                            crate::tasks::SupervisorOutcome::Backgrounded => {
+                                Ok(ToolOutcome {
+                                    ok: true,
+                                    output: crate::tasks::BG_PLACEHOLDER_OUTPUT.to_string(),
+                                })
+                            }
                         }
-                        r = join_fut => r,
-                    };
-                for (i, outcome) in results {
-                    outcomes.insert(i, outcome);
+                    });
+                }
+
+                let render_fut = async {
+                    let mut outcomes_map: HashMap<
+                        usize,
+                        std::result::Result<ToolOutcome, String>,
+                    > = HashMap::new();
+                    let mut meta_iter = safe_meta.iter();
+                    while let Some(outcome) = ordered.next().await {
+                        let (i, call, summary) = match meta_iter.next() {
+                            Some(m) => m,
+                            None => break,
+                        };
+                        // No inline PTY writes for tool blocks — the
+                        // items-model renderer synthesizes them from
+                        // the structured ToolUse / ToolResult /
+                        // TaskStart / TaskEnd events that the
+                        // supervisor already emitted. Leaving the
+                        // PTY stream as pure chat content keeps the
+                        // user's live prompt + typing visible during
+                        // tool waits (those bytes used to be stripped
+                        // by the OSC fence). `summary` and `call`
+                        // bindings stay for the outcomes map below.
+                        let _ = (call, summary);
+                        outcomes_map.insert(*i, outcome);
+                    }
+                    outcomes_map
+                };
+
+                let drive = drive_with_input(
+                    &mut inbox,
+                    &mut editor,
+                    &term,
+                    &mut queue,
+                    &mut automode,
+                    tasks.clone(),
+                    render_fut,
+                )
+                .await;
+                match drive {
+                    DriveExit::Done(map) => {
+                        for (i, outcome) in map {
+                            outcomes.insert(i, outcome);
+                        }
+                    }
+                    DriveExit::Stop | DriveExit::Channel => {
+                        early_stop = true;
+                        for &i in &safe_idx {
+                            outcomes
+                                .entry(i)
+                                .or_insert_with(|| Err("stop".to_string()));
+                        }
+                    }
+                    DriveExit::Interrupt => {
+                        for &i in &safe_idx {
+                            outcomes
+                                .entry(i)
+                                .or_insert_with(|| Err("interrupt".to_string()));
+                        }
+                    }
                 }
             }
 
@@ -1275,6 +1701,11 @@ pub async fn run(
                         &term,
                         &mut inbox,
                         &mut automode,
+                        &mut editor,
+                        &mut queue,
+                        tasks.clone(),
+                        bg_completion_tx.clone(),
+                        bg_after,
                     )
                     .await;
                     let stop_now = matches!(outcome.as_ref(), Err(r) if r == "stop");
@@ -1331,23 +1762,57 @@ pub async fn run(
 
 enum ReadOutcome {
     Line(String),
+    /// Orchestrator-only: an observation from another session arrived
+    /// while we were waiting for user input. The outer loop turns
+    /// this into a pseudo-user message so the agent can react.
+    Observation(crate::observe::Observation),
+    /// A backgrounded tool just finished. The outer loop emits the
+    /// real `ToolResult` event (so the transcript catches up) and
+    /// synthesizes an `OBSERVATION:` user message so the agent's
+    /// next turn knows about the completion.
+    BackgroundCompletion(crate::tasks::BackgroundCompletion),
     Stop,
     Eof,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_one_line(
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
     editor: &mut LineEditor,
     term: &Terminal<'_>,
     automode: &mut bool,
     pty_width: &mut usize,
-    messages: &[Message],
-    provider_name: &str,
-    model: &str,
-    emit: &EventEmitter,
+    mut obs_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<crate::observe::Observation>>,
+    bg_completion_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
+        crate::tasks::BackgroundCompletion,
+    >,
+    tasks: &std::sync::Arc<crate::tasks::Tasks>,
 ) -> ReadOutcome {
     loop {
-        match inbox.recv().await {
+        let inbox_recv = inbox.recv();
+        let obs_recv = async {
+            match obs_rx.as_mut() {
+                Some(rx) => rx.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let bg_recv = bg_completion_rx.recv();
+        let msg = tokio::select! {
+            biased;
+            obs = obs_recv => match obs {
+                Some(o) => return ReadOutcome::Observation(o),
+                None => {
+                    obs_rx = None;
+                    continue;
+                }
+            },
+            done = bg_recv => match done {
+                Some(c) => return ReadOutcome::BackgroundCompletion(c),
+                None => continue, // channel closed; ignore
+            },
+            m = inbox_recv => m,
+        };
+        match msg {
             None => return ReadOutcome::Stop,
             Some(AdapterInboxMsg::Stop) => return ReadOutcome::Stop,
             Some(AdapterInboxMsg::Interrupt) => {
@@ -1383,107 +1848,55 @@ async fn read_one_line(
             Some(AdapterInboxMsg::PtyResize { cols, .. }) => {
                 let new_w = (cols as usize)
                     .max(MIN_USABLE_WIDTH + LEFT_MARGIN_CELLS + PAD_RIGHT);
+                let width_changed = new_w != *pty_width;
                 *pty_width = new_w;
-                // Full re-render: claude/codex reflow on resize via
-                // their own SIGWINCH handler in the child; zarvis owns
-                // the rendering itself, so we redraw the banner + every
-                // message in `messages` at the new width, then repaint
-                // the prompt.
-                redraw_history(
-                    term,
-                    emit,
-                    provider_name,
-                    model,
-                    *automode,
-                    messages,
-                    new_w,
-                );
-                // The redraw cleared the screen; any popup we'd tracked
-                // is gone with it.
-                editor.last_popup_lines = 0;
-                let bytes = editor.redraw();
-                term.write(&bytes);
+                // Subsequent streaming uses the new width. We don't
+                // replay history: the items-model client rebuilds its
+                // vt100 parser at the current width every frame, so
+                // the viewport reflows on its own. Re-emitting the
+                // full conversation here scaled O(history bytes) and
+                // also kept appending duplicate PtyChunks to the
+                // client's store on every resize. Old content keeps
+                // whatever wrap points PtySink already baked in, which
+                // is the same tradeoff most terminal apps accept.
+                if width_changed {
+                    editor.last_popup_lines = 0;
+                    let bytes = editor.redraw();
+                    term.write(&bytes);
+                }
             }
             Some(AdapterInboxMsg::ToolDecision { .. }) => {}
+            Some(AdapterInboxMsg::ToolAction { .. }) => {
+                // Tool actions only matter while a tool is running.
+                // We're waiting for input, so nothing to do.
+            }
         }
     }
 }
 
 /// Clear the PTY and re-emit the entire conversation at the new width.
-/// Skips `Message` events on the re-rendered assistant text (those
-/// already live in the daemon-side transcript). User and tool turns
-/// are re-rendered with the same glyphs the live path uses so the
-/// reflow is visually identical to the original streaming output.
-fn redraw_history(
-    term: &Terminal<'_>,
-    emit: &EventEmitter,
-    provider_name: &str,
-    model: &str,
-    automode: bool,
-    messages: &[Message],
-    width: usize,
-) {
-    // ED 3 clears the on-disk scrollback buffer too (some terminals
-    // support this); ED 2 clears the visible screen; CUP 1;1 homes.
-    term.write(b"\x1b[3J\x1b[2J\x1b[H");
-    term.banner(provider_name, model, automode);
-    for m in messages {
-        match (&m.role, &m.content) {
-            (Role::User, Content::Text { text }) => {
-                // Echo as if the user just typed it: `❯ <text>`.
-                term.write(b"\r\n\x1b[1;36m\xe2\x9d\xaf \x1b[0m");
-                term.write(text.as_bytes());
-                term.write(b"\r\n");
-            }
-            (Role::Assistant, Content::Text { text }) => {
-                let mut sink = PtySink::new_replay(emit, width);
-                sink.delta(text);
-                sink.finalize();
-            }
-            (Role::Assistant, Content::AssistantToolCalls { text, calls }) => {
-                if let Some(t) = text {
-                    if !t.is_empty() {
-                        let mut sink = PtySink::new_replay(emit, width);
-                        sink.delta(t);
-                        sink.finalize();
-                    }
-                }
-                for c in calls {
-                    let args = serde_json::to_string(&c.input).unwrap_or_default();
-                    let summary: String = if args.chars().count() > 120 {
-                        let head: String = args.chars().take(120).collect();
-                        format!("{head}…")
-                    } else {
-                        args
-                    };
-                    term.tool_use(&c.name, &summary);
-                }
-            }
-            (Role::Tool, Content::ToolResult { output, is_error, .. }) => {
-                term.tool_result(!*is_error, output);
-            }
-            _ => {}
-        }
-    }
-}
-
 /// Run one tool with approval gating + interrupt support. Mirrors the
 /// headless version but renders into the PTY and reads y/n/a from
 /// PtyInput when prompting.
+#[allow(clippy::too_many_arguments)]
 async fn run_one_tool(
     call: &ToolCall,
-    registry: &ToolRegistry,
+    registry: &std::sync::Arc<ToolRegistry>,
     tool_ctx: &ToolCtx,
     emit: &EventEmitter,
     term: &Terminal<'_>,
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
     automode: &mut bool,
+    editor: &mut LineEditor,
+    queue: &mut VecDeque<String>,
+    tasks: std::sync::Arc<crate::tasks::Tasks>,
+    bg_completion_tx: crate::tasks::BgCompletionTx,
+    bg_after: std::time::Duration,
 ) -> std::result::Result<ToolOutcome, String> {
     let tool = match registry.get(&call.name) {
         Some(t) => t,
         None => {
-            term.tool_use(&call.name, &serde_json::to_string(&call.input).unwrap_or_default());
-            term.tool_result(false, &format!("unknown tool: {}", call.name));
+            // Items model synthesizes the block from these events.
             emit.emit(SessionEvent::ToolUse {
                 tool: call.name.clone(),
                 args: call.input.clone(),
@@ -1501,10 +1914,22 @@ async fn run_one_tool(
     };
 
     let args_summary = tool.args_summary(&call.input);
-    term.tool_use(&call.name, &args_summary);
+    // No inline PTY writes for the tool's header/body/result —
+    // the items-model renderer synthesizes the whole block from
+    // the structured events emitted below. Leaving the PTY
+    // stream as pure chat content means the user's live prompt
+    // + typing remain visible during the tool's wait (the
+    // previous fence implementation stripped them).
     emit.emit(SessionEvent::ToolUse {
         tool: call.name.clone(),
         args: call.input.clone(),
+    });
+    // Task-lifecycle event for the daemon's per-session task
+    // registry — surfaces in `/tasks` + MCP `agentd_get_tasks`.
+    emit.emit(SessionEvent::TaskStart {
+        call_id: call.id.clone(),
+        tool: call.name.clone(),
+        args_summary: args_summary.clone(),
     });
 
     let needs_approval = !*automode && matches!(tool.risk(), ToolRisk::Risky);
@@ -1528,7 +1953,6 @@ async fn run_one_tool(
                     ok: false,
                     output: msg.clone(),
                 });
-                term.tool_result(false, &msg);
                 return Ok(ToolOutcome { ok: false, output: msg });
             }
             ApprovalOutcome::Approve => term.print("y\r\n"),
@@ -1539,22 +1963,69 @@ async fn run_one_tool(
         }
     }
 
-    let outcome = run_with_interrupt(tool, call.input.clone(), tool_ctx, inbox).await;
+    let supervisor_outcome = run_with_supervisor(
+        call.id.clone(),
+        call.name.clone(),
+        args_summary.clone(),
+        registry.clone(),
+        call.input.clone(),
+        tool_ctx,
+        inbox,
+        editor,
+        term,
+        queue,
+        automode,
+        tasks,
+        bg_completion_tx,
+        bg_after,
+    )
+    .await;
+    let outcome: Result<ToolOutcome, String> = match supervisor_outcome {
+        crate::tasks::SupervisorOutcome::Done(res) => res,
+        crate::tasks::SupervisorOutcome::Killed => Err("interrupt".into()),
+        crate::tasks::SupervisorOutcome::Backgrounded => {
+            // Synthesize a placeholder result so the LLM's
+            // conversation slot is closed; the real result will
+            // land as an OBSERVATION when the background watcher
+            // reports completion.
+            emit.emit(SessionEvent::TaskBackgrounded {
+                call_id: call.id.clone(),
+            });
+            Ok(ToolOutcome {
+                ok: true,
+                output: crate::tasks::BG_PLACEHOLDER_OUTPUT.to_string(),
+            })
+        }
+    };
     match &outcome {
         Ok(o) => {
-            term.tool_result(o.ok, &o.output);
             emit.emit(SessionEvent::ToolResult {
                 tool: call.id.clone(),
                 ok: o.ok,
                 output: o.output.clone(),
             });
+            // Foreground-completed (non-bg) paths fire TaskEnd
+            // here; the backgrounded path fires it later when the
+            // BackgroundCompletion arrives via the agent loop.
+            if o.output != crate::tasks::BG_PLACEHOLDER_OUTPUT {
+                let preview: String = o.output.chars().take(200).collect();
+                emit.emit(SessionEvent::TaskEnd {
+                    call_id: call.id.clone(),
+                    ok: o.ok,
+                    output_preview: preview,
+                });
+            }
         }
         Err(reason) => {
-            term.tool_result(false, &format!("({reason})"));
             emit.emit(SessionEvent::ToolResult {
                 tool: call.id.clone(),
                 ok: false,
                 output: format!("({reason})"),
+            });
+            emit.emit(SessionEvent::TaskEnd {
+                call_id: call.id.clone(),
+                ok: false,
+                output_preview: format!("({reason})"),
             });
         }
     }
@@ -1620,41 +2091,43 @@ async fn wait_for_approval(
 /// PTY-rendering counterpart of `agent::run_safe_call`: emits the same
 /// `ToolUse` / `ToolResult` events AND the colored inline blocks that
 /// interactive mode draws into the PTY.
-async fn run_safe_call_pty(
+/// Run a Safe tool call and emit only the structured `ToolUse` /
+/// `ToolResult` events — no PTY writes. Used by the parallel-safe
+/// block so each task's PTY rendering can be deferred to a
+/// sequential pass in original call order. The user sees
+/// `→ name` immediately followed by the `✓ result` block for the
+/// same call, never interleaved with another in-flight tool.
+async fn run_safe_call_silent(
     call: provider::ToolCall,
     registry: &ToolRegistry,
     ctx: &ToolCtx,
     emit: &EventEmitter,
 ) -> std::result::Result<ToolOutcome, String> {
-    let term = Terminal::new(emit);
     let tool = match registry.get(&call.name) {
         Some(t) => t,
         None => {
-            term.tool_use(
-                &call.name,
-                &serde_json::to_string(&call.input).unwrap_or_default(),
-            );
-            term.tool_result(false, &format!("unknown tool: {}", call.name));
             emit.emit(SessionEvent::ToolUse {
                 tool: call.name.clone(),
                 args: call.input.clone(),
             });
+            let msg = format!("unknown tool: {}", call.name);
             emit.emit(SessionEvent::ToolResult {
                 tool: call.id.clone(),
                 ok: false,
-                output: format!("unknown tool: {}", call.name),
+                output: msg.clone(),
             });
-            return Ok(ToolOutcome {
-                ok: false,
-                output: format!("unknown tool: {}", call.name),
-            });
+            return Ok(ToolOutcome { ok: false, output: msg });
         }
     };
-    let args_summary = tool.args_summary(&call.input);
-    term.tool_use(&call.name, &args_summary);
     emit.emit(SessionEvent::ToolUse {
         tool: call.name.clone(),
         args: call.input.clone(),
+    });
+    let args_summary_for_event = tool.args_summary(&call.input);
+    emit.emit(SessionEvent::TaskStart {
+        call_id: call.id.clone(),
+        tool: call.name.clone(),
+        args_summary: args_summary_for_event.clone(),
     });
     let outcome = tool
         .run(call.input.clone(), ctx)
@@ -1662,77 +2135,521 @@ async fn run_safe_call_pty(
         .map_err(|e| format!("tool error: {e}"));
     match &outcome {
         Ok(o) => {
-            term.tool_result(o.ok, &o.output);
             emit.emit(SessionEvent::ToolResult {
                 tool: call.id.clone(),
                 ok: o.ok,
                 output: o.output.clone(),
             });
+            // The supervisor may auto-bg this call later — only fire
+            // TaskEnd for genuinely-foreground completions. The
+            // outer agent loop handles TaskEnd for the bg path via
+            // BackgroundCompletion.
+            let preview: String = o.output.chars().take(200).collect();
+            emit.emit(SessionEvent::TaskEnd {
+                call_id: call.id.clone(),
+                ok: o.ok,
+                output_preview: preview,
+            });
         }
         Err(reason) => {
-            term.tool_result(false, &format!("({reason})"));
             emit.emit(SessionEvent::ToolResult {
                 tool: call.id.clone(),
                 ok: false,
                 output: format!("({reason})"),
+            });
+            emit.emit(SessionEvent::TaskEnd {
+                call_id: call.id.clone(),
+                ok: false,
+                output_preview: format!("({reason})"),
             });
         }
     }
     outcome
 }
 
-async fn run_with_interrupt(
-    tool: &dyn crate::tools::Tool,
+
+/// Run a tool through the per-session supervisor. The supervisor
+/// spawns the actual `tool.run` on its own task, races the join
+/// handle against the auto-bg timer + control-channel signals, and
+/// returns a [`SupervisorOutcome`] this caller maps back to a
+/// `Result<ToolOutcome, String>` for the agent loop.
+///
+/// While the tool runs, this caller still drains the inbox via
+/// `drive_with_input` so user typing queues + Ctrl-C / explicit
+/// `ToolAction` messages flow through. The supervisor's control
+/// channel is what actually drives kill/background; this function
+/// just relays inbox events into it.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_supervisor(
+    call_id: String,
+    tool_name: String,
+    args_summary: String,
+    registry: std::sync::Arc<ToolRegistry>,
     input: serde_json::Value,
     ctx: &ToolCtx,
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
-) -> std::result::Result<ToolOutcome, String> {
+    editor: &mut LineEditor,
+    term: &Terminal<'_>,
+    queue: &mut VecDeque<String>,
+    automode: &mut bool,
+    tasks: std::sync::Arc<crate::tasks::Tasks>,
+    bg_completion_tx: crate::tasks::BgCompletionTx,
+    bg_after: std::time::Duration,
+) -> crate::tasks::SupervisorOutcome {
     let cwd = ctx.cwd.clone();
     let session_id = ctx.session_id.clone();
-    let client_cell = std::sync::Mutex::new(ctx.client.get().cloned());
-    let tool_fut = async {
+    let client_seed = ctx.client.get().cloned();
+    let tool_name_for_runner = tool_name.clone();
+    let tool_runner = async move {
         let local_ctx = ToolCtx {
             cwd,
             session_id,
             client: tokio::sync::OnceCell::new(),
         };
-        if let Some(c) = client_cell.lock().unwrap().clone() {
+        if let Some(c) = client_seed {
             let _ = local_ctx.client.set(c);
         }
-        tool.run(input, &local_ctx).await
-    };
-    tokio::select! {
-        biased;
-        kind = wait_for_interrupt(inbox) => {
-            match kind {
-                InterruptKind::Stop => Err("stop".into()),
-                _ => Err("interrupt".into()),
+        let tool = match registry.get(&tool_name_for_runner) {
+            Some(t) => t,
+            None => {
+                return Err(format!("tool went away: {tool_name_for_runner}"));
             }
+        };
+        tool.run(input, &local_ctx)
+            .await
+            .map_err(|e| format!("tool error: {e}"))
+    };
+
+    // Race the supervisor (which owns the spawned tool task) against
+    // the inbox drain so user typing during a long tool run still
+    // queues. Inbox `ToolAction` events get forwarded to the
+    // supervisor's control channel; everything else flows through
+    // the editor / queue / automode handlers like before.
+    let tasks_for_drive = tasks.clone();
+    let inner = crate::tasks::supervise(
+        call_id.clone(),
+        tool_name.clone(),
+        args_summary.clone(),
+        tasks.clone(),
+        bg_completion_tx,
+        bg_after,
+        tool_runner,
+    );
+    let drive = drive_with_input_relaying(
+        inbox,
+        editor,
+        term,
+        queue,
+        automode,
+        tasks_for_drive,
+        &call_id,
+        inner,
+    )
+    .await;
+    match drive {
+        DriveExit::Done(outcome) => outcome,
+        DriveExit::Stop | DriveExit::Channel => crate::tasks::SupervisorOutcome::Killed,
+        DriveExit::Interrupt => {
+            // Reach into the supervisor's control channel to
+            // request a kill. (The supervisor future was dropped by
+            // drive_with_input on interrupt, but if it's still
+            // around because of a race we want to be sure.)
+            let _ = crate::tasks::forward_control(
+                &tasks,
+                &call_id,
+                crate::tasks::ToolControl::Kill,
+            )
+            .await;
+            crate::tasks::SupervisorOutcome::Killed
         }
-        res = tool_fut => res.map_err(|e| format!("tool error: {e}")),
     }
 }
 
-enum InterruptKind {
-    Stop,
-    Interrupt,
-    Channel,
-}
-
-async fn wait_for_interrupt(
+/// Variant of `drive_with_input` that *also* relays
+/// `AdapterInboxMsg::ToolAction` events to a specific call_id's
+/// supervisor via its control channel. Used by
+/// `run_with_supervisor` so kill/bg buttons on the live tool block
+/// actually take effect. Other inbox handling is identical to the
+/// regular `drive_with_input`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_with_input_relaying<F>(
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
-) -> InterruptKind {
+    editor: &mut LineEditor,
+    term: &Terminal<'_>,
+    queue: &mut VecDeque<String>,
+    automode: &mut bool,
+    tasks: std::sync::Arc<crate::tasks::Tasks>,
+    this_call_id: &str,
+    fut: F,
+) -> DriveExit<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(fut);
     loop {
-        match inbox.recv().await {
-            None => return InterruptKind::Channel,
-            Some(AdapterInboxMsg::Stop) => return InterruptKind::Stop,
-            Some(AdapterInboxMsg::Interrupt) => return InterruptKind::Interrupt,
-            Some(AdapterInboxMsg::PtyInput(bytes)) => {
-                if bytes.contains(&0x03) {
-                    return InterruptKind::Interrupt;
+        tokio::select! {
+            biased;
+            res = &mut fut => return DriveExit::Done(res),
+            msg = inbox.recv() => {
+                match msg {
+                    None => return DriveExit::Channel,
+                    Some(AdapterInboxMsg::Stop) => return DriveExit::Stop,
+                    Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
+                    Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+                    Some(AdapterInboxMsg::Input(t)) => {
+                        enqueue_line(term, queue, t);
+                    }
+                    Some(AdapterInboxMsg::PtyInput(bytes)) => {
+                        if bytes.contains(&0x03) {
+                            return DriveExit::Interrupt;
+                        }
+                        // Relay live keystrokes to the PTY so the user
+                        // sees what they're typing even while a tool
+                        // is running. Editor output is the ANSI bytes
+                        // that paint the visible prompt + cursor.
+                        let (out, events) = editor.feed_bytes(&bytes);
+                        if !out.is_empty() {
+                            term.write(&out);
+                        }
+                        for ev in events {
+                            match ev {
+                                LineEvent::Submit(line) => {
+                                    enqueue_line(term, queue, line);
+                                }
+                                LineEvent::Interrupt => return DriveExit::Interrupt,
+                                LineEvent::Eof => {}
+                            }
+                        }
+                    }
+                    Some(AdapterInboxMsg::PtyResize { .. }) => {}
+                    Some(AdapterInboxMsg::ToolDecision { .. }) => {}
+                    Some(AdapterInboxMsg::ToolAction { call_id, action }) => {
+                        // Forward to whichever supervisor matches —
+                        // not strictly limited to this_call_id, since
+                        // parallel-safe tools each have their own.
+                        let control = match action.as_str() {
+                            "kill" => Some(crate::tasks::ToolControl::Kill),
+                            "background" => Some(crate::tasks::ToolControl::Background),
+                            _ => None,
+                        };
+                        if let Some(c) = control {
+                            let _ = crate::tasks::forward_control(&tasks, &call_id, c)
+                                .await;
+                        }
+                        let _ = this_call_id; // suppress unused-var lint
+                    }
                 }
             }
-            Some(_) => {}
         }
     }
 }
+
+
+/// Parse a `^/word( args)?$` line into `(name, args)`. Returns `None`
+/// for anything that doesn't look like a client slash command — empty
+/// input, lines that don't start with `/`, or `/` followed by a
+/// non-word character (so things like `/2` or `/!` flow through to the
+/// LLM as natural-language). The name comes out lowercased so the TUI
+/// dispatch table doesn't have to be case-aware.
+/// Inline parser for the `/loop` slash spec — same shape as the
+/// daemon-side `loops::parse_slash_spec` (duplicated to avoid a
+/// daemon ↔ adapter coupling for this small helper). Recognized
+/// tokens: `every? <num><unit>`, optional `for <num><unit>` tail.
+fn parse_slash_loop_spec(
+    input: &str,
+    now_ms: i64,
+) -> Option<(agentd_protocol::LoopSpec, Option<i64>, String)> {
+    let mut tokens = input.split_whitespace().peekable();
+    if matches!(tokens.peek().copied(), Some("every")) {
+        tokens.next();
+    }
+    let first = tokens.peek().copied()?;
+    let secs = parse_duration_secs(first)?;
+    tokens.next();
+    let mut expires_at_ms: Option<i64> = None;
+    if matches!(tokens.peek().copied(), Some("for")) {
+        tokens.next();
+        if let Some(t) = tokens.peek().copied() {
+            if let Some(d) = parse_duration_secs(t) {
+                tokens.next();
+                expires_at_ms = Some(now_ms + (d as i64) * 1000);
+            }
+        }
+    }
+    let rest: Vec<&str> = tokens.collect();
+    let prompt = rest.join(" ");
+    Some((
+        agentd_protocol::LoopSpec::Interval { seconds: secs },
+        expires_at_ms,
+        prompt,
+    ))
+}
+
+fn parse_duration_secs(tok: &str) -> Option<u64> {
+    let split_at = tok.find(|c: char| !c.is_ascii_digit())?;
+    if split_at == 0 {
+        return None;
+    }
+    let (num_s, unit_s) = tok.split_at(split_at);
+    let num: u64 = num_s.parse().ok()?;
+    let mult: u64 = match unit_s.to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600,
+        "d" | "day" | "days" => 86400,
+        _ => return None,
+    };
+    num.checked_mul(mult)
+}
+
+/// Handle a `/loop ...` slash command. Parses any explicit
+/// interval / `for <duration>` tokens; for prompts with no
+/// interval, asks the model to suggest one. Calls the
+/// `agentd_loop_create` tool path via the IPC client so the loop
+/// is persisted by the daemon's scheduler.
+async fn handle_slash_loop(
+    rest: &str,
+    session_id: &str,
+    emit: &EventEmitter,
+    term: &Terminal<'_>,
+    provider: &dyn crate::provider::LlmProvider,
+    model: &str,
+    tool_ctx: &ToolCtx,
+) {
+    use agentd_protocol::{LoopCreateParams, LoopSpec};
+    let rest = rest.trim();
+    if rest.is_empty() {
+        term.note("(usage: /loop [interval] [for <duration>] <prompt>)");
+        return;
+    }
+    let now_ms = chrono::Utc::now().timestamp_millis();
+
+    // Try the inline parser first. On miss, ask the LLM for an
+    // interval seeded by the user's prompt.
+    let (spec, expires_at_ms, prompt, suggested) = match parse_slash_loop_spec(rest, now_ms) {
+        Some((s, e, p)) => (s, e, p, false),
+        None => {
+            term.note("(no interval given — asking the model to pick one…)");
+            let secs = match crate::interval_suggest::suggest(provider, model, rest).await {
+                Ok(s) => s,
+                Err(e) => {
+                    term.note(&format!("(interval suggest failed: {e})"));
+                    return;
+                }
+            };
+            (
+                LoopSpec::Interval { seconds: secs },
+                None,
+                rest.to_string(),
+                true,
+            )
+        }
+    };
+
+    // Clamp + persist via the daemon. The daemon enforces the
+    // same bounds, but clamping here lets us include "(clamped)"
+    // in the user-visible note.
+    let LoopSpec::Interval { seconds } = spec;
+    let (clamped, was_clamped) = clamp_interval_for_slash(seconds);
+    let spec = LoopSpec::Interval { seconds: clamped };
+
+    if prompt.trim().is_empty() {
+        term.note("(no prompt — usage: /loop [interval] <prompt>)");
+        return;
+    }
+
+    let client = match crate::tools::agentd::client(tool_ctx).await {
+        Ok(c) => c,
+        Err(e) => {
+            term.note(&format!("(daemon connect failed: {e})"));
+            return;
+        }
+    };
+    let loop_obj = match client
+        .loop_create(LoopCreateParams {
+            session_id: session_id.to_string(),
+            spec,
+            prompt: prompt.clone(),
+            expires_at_ms,
+        })
+        .await
+    {
+        Ok(l) => l,
+        Err(e) => {
+            term.note(&format!("(loop create failed: {e})"));
+            return;
+        }
+    };
+
+    // Emit the equivalent ToolUse + ToolResult so the transcript
+    // shows the action — matches the path the LLM would take if
+    // it called `agentd_loop_create` directly.
+    let call_id = format!("slash-loop-{}", loop_obj.id);
+    let args = serde_json::json!({
+        "session_id": loop_obj.session_id,
+        "interval_seconds": clamped,
+        "prompt": loop_obj.prompt,
+    });
+    emit.emit(SessionEvent::ToolUse {
+        tool: "agentd_loop_create".to_string(),
+        args,
+    });
+    emit.emit(SessionEvent::ToolResult {
+        tool: call_id,
+        ok: true,
+        output: serde_json::to_string(&loop_obj).unwrap_or_default(),
+    });
+
+    let note = format!(
+        "(loop {} every {}s — \"{}\"{}{})",
+        loop_obj.id.chars().take(10).collect::<String>(),
+        clamped,
+        prompt.chars().take(60).collect::<String>(),
+        if suggested { " — interval suggested" } else { "" },
+        if was_clamped { " — clamped to bounds" } else { "" },
+    );
+    term.note(&note);
+}
+
+/// Read the bounds the daemon's loop module uses for clamping.
+/// Duplicated from `daemon::loops::clamp_interval` because the
+/// adapter doesn't share that module — but the env-var keys
+/// match so a deployment-time override applies to both sides.
+fn clamp_interval_for_slash(secs: u64) -> (u64, bool) {
+    let min = std::env::var("AGENTD_LOOP_MIN_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30u64);
+    let max = std::env::var("AGENTD_LOOP_MAX_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24 * 3600u64);
+    if secs < min {
+        (min, true)
+    } else if secs > max {
+        (max, true)
+    } else {
+        (secs, false)
+    }
+}
+
+fn parse_slash_command(line: &str) -> Option<(String, Option<String>)> {
+    let rest = line.strip_prefix('/')?;
+    let (name, args) = match rest.find(char::is_whitespace) {
+        Some(i) => (&rest[..i], rest[i..].trim()),
+        None => (rest, ""),
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+        return None;
+    }
+    let args = if args.is_empty() { None } else { Some(args.to_string()) };
+    Some((name.to_lowercase(), args))
+}
+
+/// Push a user-typed (or programmatically-sent) line onto the
+/// pending-input queue and write an inline `↳ queued: ...` ack to the
+/// PTY. Trimmed-empty lines are dropped silently — they'd just produce
+/// a blank turn at the next AwaitingInput.
+fn enqueue_line(term: &Terminal<'_>, queue: &mut VecDeque<String>, line: String) {
+    if line.trim().is_empty() {
+        return;
+    }
+    term.queued_ack(&line);
+    queue.push_back(line);
+}
+
+/// Outcome of [`drive_with_input`]: either the wrapped future completed,
+/// or the inbox produced a control event that should unwind the agent's
+/// current turn.
+enum DriveExit<T> {
+    Done(T),
+    Stop,
+    Channel,
+    Interrupt,
+}
+
+/// Run `fut` concurrently with an inbox-drain task so the user can keep
+/// typing — and queue submissions — while the agent is mid-turn.
+///
+/// Returns [`DriveExit::Done`] when `fut` completes first, or one of the
+/// control variants when an inbox message demands the turn unwind
+/// (Stop / channel closed / Ctrl-C / `Interrupt` inbox message).
+///
+/// PTY bytes are fed to `editor` *silently* — the editor's redraw output
+/// is discarded so it can't clobber whatever the streaming agent is
+/// writing to the same PTY. Submit events (and any programmatic
+/// `AdapterInboxMsg::Input` arriving during the turn) are pushed onto
+/// `queue` with an inline `↳ queued: ...` marker for visual feedback.
+async fn drive_with_input<F>(
+    inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
+    editor: &mut LineEditor,
+    term: &Terminal<'_>,
+    queue: &mut VecDeque<String>,
+    automode: &mut bool,
+    tasks: std::sync::Arc<crate::tasks::Tasks>,
+    fut: F,
+) -> DriveExit<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut fut => return DriveExit::Done(res),
+            msg = inbox.recv() => {
+                match msg {
+                    None => return DriveExit::Channel,
+                    Some(AdapterInboxMsg::Stop) => return DriveExit::Stop,
+                    Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
+                    Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+                    Some(AdapterInboxMsg::Input(t)) => {
+                        enqueue_line(term, queue, t);
+                    }
+                    Some(AdapterInboxMsg::PtyInput(bytes)) => {
+                        if bytes.contains(&0x03) {
+                            return DriveExit::Interrupt;
+                        }
+                        // Relay editor output so live keystrokes are
+                        // visible during tool waits. The PTY pane is
+                        // pure chat content now — tool blocks render
+                        // as separate items — so user typing can't
+                        // clash with tool output.
+                        let (out, events) = editor.feed_bytes(&bytes);
+                        if !out.is_empty() {
+                            term.write(&out);
+                        }
+                        for ev in events {
+                            match ev {
+                                LineEvent::Submit(line) => {
+                                    enqueue_line(term, queue, line);
+                                }
+                                LineEvent::Interrupt => {
+                                    return DriveExit::Interrupt;
+                                }
+                                LineEvent::Eof => {}
+                            }
+                        }
+                    }
+                    Some(AdapterInboxMsg::PtyResize { .. }) => {}
+                    Some(AdapterInboxMsg::ToolDecision { .. }) => {}
+                    Some(AdapterInboxMsg::ToolAction { call_id, action }) => {
+                        // Forward to whichever supervisor matches.
+                        // No-op if call_id doesn't exist (already
+                        // completed, never existed, parallel race).
+                        let control = match action.as_str() {
+                            "kill" => Some(crate::tasks::ToolControl::Kill),
+                            "background" => Some(crate::tasks::ToolControl::Background),
+                            _ => None,
+                        };
+                        if let Some(c) = control {
+                            let _ = crate::tasks::forward_control(&tasks, &call_id, c)
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+

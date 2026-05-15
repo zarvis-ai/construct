@@ -71,6 +71,10 @@ impl Paths {
     pub fn session_dir(&self, id: &str) -> PathBuf {
         self.sessions_root().join(id)
     }
+
+    pub fn tui_state_file(&self) -> PathBuf {
+        self.state_dir.join("tui-state.json")
+    }
 }
 
 fn home_dir() -> PathBuf {

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 mod app;
 mod keymap;
+mod pty_render;
+mod tui_state;
 mod ui;
 
 use agentd_client::Client;
@@ -183,6 +185,7 @@ async fn main() -> Result<()> {
                     worktree,
                     env: Default::default(),
                     args: Vec::new(),
+                    kind: agentd_protocol::SessionKind::User,
                 })
                 .await?;
             println!("{id}");
