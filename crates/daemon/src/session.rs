@@ -988,10 +988,11 @@ impl SessionManager {
                 | SessionEvent::ToolApprovalRequest { .. }
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
-                | SessionEvent::TaskEnd { .. } => {
-                    // Task-lifecycle events are recorded in the
-                    // entry's per-session `tasks` map below — they
-                    // don't move the session's top-level state.
+                | SessionEvent::TaskEnd { .. }
+                | SessionEvent::EditorState { .. } => {
+                    // Task-lifecycle and editor-state events are
+                    // recorded by other handlers — they don't move
+                    // the session's top-level state.
                 }
             }
             let snapshot = s.clone();

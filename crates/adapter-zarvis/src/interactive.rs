@@ -147,25 +147,83 @@ impl<'a> Terminal<'a> {
     /// writing on its line (there's still some visual artifact on
     /// terminals with strict cursor tracking, but it's bounded to
     /// one line of scrollback).
-    fn queued_ack(&self, line: &str) {
+    /// Recolor the `❯ ` prefix of the row immediately above the cursor
+    /// to "queued" white. Called after the user submits during a tool
+    /// run so the now-lifted line reads as pending in the queue. Uses
+    /// DECSC/DECRC (`ESC 7` / `ESC 8`) — the SCO `\x1b[s` / `\x1b[u`
+    /// pair isn't honored by every parser.
+    fn retro_color_queued_above(&self) {
+        // ESC 7 save, up 1, col 0, white ❯+space, ESC 8 restore.
+        self.write(b"\x1b7\x1b[1A\r\x1b[1;37m\xe2\x9d\xaf \x1b[0m\x1b8");
+    }
+    /// Walk `rows` lines upward from cursor, recoloring each `❯ ` to
+    /// gray (the "consumed / historical" color). Used when the agent
+    /// dequeues the queue at the start of its next turn.
+    fn retro_color_consumed(&self, rows: usize) {
+        if rows == 0 {
+            return;
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(8 + rows * 16);
+        out.extend_from_slice(b"\x1b7");
+        for _ in 0..rows {
+            out.extend_from_slice(b"\x1b[1A\r\x1b[90m\xe2\x9d\xaf \x1b[0m");
+        }
+        out.extend_from_slice(b"\x1b8");
+        self.write(&out);
+    }
+    /// Wipe `rows` rendered queued lines plus the active editor line
+    /// below them. After this call the cursor is at column 0 of the
+    /// topmost erased row, ready for the editor's redraw to repaint
+    /// the active prompt with recalled content.
+    fn erase_queue_and_active(&self, rows: usize) {
+        if rows == 0 {
+            self.write(b"\r\x1b[2K");
+            return;
+        }
+        let cmd = format!("\x1b[{rows}A\r\x1b[J");
+        self.write(cmd.as_bytes());
+    }
+    /// Wipe the active editor row (so an agent-text stream below doesn't
+    /// land beside an orphan `❯`) and back up onto the line above so
+    /// the stream's leading `\r\n` lands on the just-cleared row.
+    fn erase_active_for_stream(&self) {
+        self.write(b"\r\x1b[2K\x1b[1A");
+    }
+    /// Echo a consumed line into the chat scrollback as a gray `❯`
+    /// prompt — used at queue-dequeue to record "what the agent is
+    /// answering right now" in the chat history (the editor pane sees
+    /// the line vanish from `queued` at the same moment).
+    fn echo_consumed_line(&self, line: &str) {
         let trimmed = line.trim();
-        let payload = if trimmed.len() > 80 {
-            let head: String = trimmed.chars().take(77).collect();
+        let payload = if trimmed.chars().count() > 240 {
+            let head: String = trimmed.chars().take(237).collect();
             format!("{head}...")
         } else {
             trimmed.to_string()
         };
-        let marker = format!("\r\n\x1b[2;36m↳ queued: {payload}\x1b[0m\r\n");
-        self.write(marker.as_bytes());
+        // Two leading `\r\n`s leave a blank row above the echo so the
+        // previous agent paragraph (or any other chat content) gets
+        // visual separation before the user's submission.
+        let bytes = format!("\r\n\r\n\x1b[90m❯ \x1b[0m{payload}\r\n");
+        self.write(bytes.as_bytes());
     }
-    /// Echo a queued line as the user turn that's about to run, with
-    /// the same `❯ ` glyph the live line editor uses. Called from the
-    /// outer loop as it drains the queue between turns.
-    fn echo_user_line(&self, line: &str) {
-        self.write(b"\r\n\x1b[1;36m\xe2\x9d\xaf \x1b[0m");
-        self.write(line.as_bytes());
-        self.write(b"\r\n");
-    }
+}
+
+/// Emit a `SessionEvent::EditorState` snapshot reflecting the editor
+/// buf, cursor, and pending queue. Called at every state change so the
+/// TUI's input pane stays in sync. Each queued entry is sent as a
+/// single string (newlines preserved); the TUI renders the first line
+/// with the `❯` glyph and continuation lines with a matching indent.
+fn emit_editor_state(
+    emit: &EventEmitter,
+    editor: &LineEditor,
+    queue: &VecDeque<String>,
+) {
+    emit.emit(SessionEvent::EditorState {
+        queued: queue.iter().cloned().collect(),
+        buf: editor.buf.clone(),
+        cursor: editor.cursor,
+    });
 }
 
 /// Lines whose start matches one of these labels are dimmed in the PTY
@@ -202,10 +260,12 @@ const SLASH_COMMANDS: &[&str] = &[
 /// Padding around the assistant's streamed response. The response is
 /// rendered as a chat bubble: `❯` marks user input (the line editor's
 /// prompt), `●` marks the response's first line, continuation lines
-/// indent under the text-after-the-dot. Top/bottom are blank lines;
-/// right is implemented as soft-wrap at `width - PAD_RIGHT`.
+/// indent under the text-after-the-dot. Top is a blank line; bottom
+/// padding is zero because the TUI's editor pane already supplies the
+/// visual separator above the active `❯`. Right is implemented as
+/// soft-wrap at `width - PAD_RIGHT`.
 const PAD_TOP: usize = 1;
-const PAD_BOTTOM: usize = 1;
+const PAD_BOTTOM: usize = 0;
 const PAD_RIGHT: usize = 2;
 /// First-line marker for the response. `\xe2\x97\x8f` = `●`.
 const RESPONSE_BULLET: &[u8] = b"\xe2\x97\x8f ";
@@ -439,6 +499,13 @@ struct LineEditor {
     /// these many lines below the prompt at the start of the next
     /// redraw so a shrinking popup doesn't leave stale text.
     last_popup_lines: usize,
+    /// "Queued recall": pending-input the user enqueued while the
+    /// agent was busy, exposed to up-arrow so they can pull the
+    /// whole batch back into the editor and edit it as one prompt
+    /// before it executes. `None` when the queue is empty. Set by
+    /// `enqueue_line` (caller-managed) and cleared on dequeue or
+    /// after a recall.
+    queued_recall: Option<String>,
 }
 
 #[derive(Default)]
@@ -460,6 +527,11 @@ enum LineEvent {
     Submit(String),
     Interrupt,
     Eof,
+    /// Up-arrow recalled the pending input queue into the editor.
+    /// The outer loop should drain its queue (its content is now
+    /// in `editor.buf` for editing) so the recalled text doesn't
+    /// double-execute.
+    DequeueRecall,
 }
 
 impl LineEditor {
@@ -474,7 +546,15 @@ impl LineEditor {
             prompt_seq,
             prompt_visible_width,
             last_popup_lines: 0,
+            queued_recall: None,
         }
+    }
+
+    /// Caller-managed mirror of the input queue's current combined
+    /// form. Set to `Some(joined)` when something is queued; cleared
+    /// on dequeue or recall. Up-arrow hits this first.
+    fn set_queued_recall(&mut self, recall: Option<String>) {
+        self.queued_recall = recall;
     }
 
     /// Bytes the terminal needs to repaint the current line + the
@@ -664,7 +744,18 @@ impl LineEditor {
         self.cursor = i;
     }
 
-    fn history_prev(&mut self) {
+    fn history_prev(&mut self, events: &mut Vec<LineEvent>) {
+        // First up-arrow when there's pending-input recall pulls
+        // the queued batch back into the editor. The outer loop
+        // hears `DequeueRecall` and drains its queue accordingly.
+        if let Some(recall) = self.queued_recall.take() {
+            self.saved = self.buf.clone();
+            self.hist_pos = None;
+            self.buf = recall;
+            self.cursor = self.buf.chars().count();
+            events.push(LineEvent::DequeueRecall);
+            return;
+        }
         if self.history.is_empty() {
             return;
         }
@@ -806,7 +897,7 @@ impl LineEditor {
             }
             // Ctrl-P (history prev)
             0x10 => {
-                self.history_prev();
+                self.history_prev(events);
                 out.extend_from_slice(&self.redraw());
             }
             // Ctrl-N (history next)
@@ -859,10 +950,10 @@ impl LineEditor {
         final_byte: u8,
         params: &str,
         out: &mut Vec<u8>,
-        _events: &mut Vec<LineEvent>,
+        events: &mut Vec<LineEvent>,
     ) {
         match final_byte {
-            b'A' => self.history_prev(),
+            b'A' => self.history_prev(events),
             b'B' => self.history_next(),
             b'C' => self.move_right(),
             b'D' => self.move_left(),
@@ -885,10 +976,10 @@ impl LineEditor {
         &mut self,
         final_byte: u8,
         out: &mut Vec<u8>,
-        _events: &mut Vec<LineEvent>,
+        events: &mut Vec<LineEvent>,
     ) {
         match final_byte {
-            b'A' => self.history_prev(),
+            b'A' => self.history_prev(events),
             b'B' => self.history_next(),
             b'C' => self.move_right(),
             b'D' => self.move_left(),
@@ -1195,9 +1286,9 @@ pub async fn run(
         state: SessionState::Running,
         detail: Some(format!("{}:{}  [interactive]", provider_name, model)),
     });
-    if !resuming {
-        term.prompt();
-    }
+    // The active `❯` lives in the TUI's fixed editor pane, fed by
+    // `SessionEvent::EditorState`; no inline prompt write needed.
+    let _ = resuming;
 
     // Clone the id before moving it into ToolCtx — the
     // observation task and slash handlers (e.g. `/loop`) need it.
@@ -1247,6 +1338,12 @@ pub async fn run(
     // composing thoughts while the agent works. Independent of
     // `pending` (which is the one-shot startup prompt).
     let mut queue: VecDeque<String> = VecDeque::new();
+    // Vestigial — the new model uses `SessionEvent::EditorState` for
+    // the bottom input pane, no PTY-side row tracking required.
+    let mut queued_rows: usize = 0;
+    // Initial editor state so the TUI's bottom pane has something to
+    // paint before the first drive call (idle waiting for user input).
+    emit_editor_state(&emit, &editor, &queue);
 
     // Orchestrator-only: subscribe to other sessions' events so the
     // agent can react to fleet activity (sessions finishing, errors,
@@ -1269,16 +1366,19 @@ pub async fn run(
         // (`pending`), then anything queued during the previous turn,
         // then live typing.
         let user_text = if let Some(t) = pending.pop_front() {
-            // Echo the pre-supplied prompt as if the user typed it, so
-            // the transcript is faithful.
-            term.print(&t);
-            term.newline();
+            // Echo the pre-supplied prompt as if the user just sent it.
+            term.echo_consumed_line(&t);
+            emit_editor_state(&emit, &editor, &queue);
             t
         } else if let Some(t) = queue.pop_front() {
-            // Drain a turn-queued line. Echo with the same `❯ ` glyph
-            // the live editor would use so the scrollback reads
-            // consistently.
-            term.echo_user_line(&t);
+            // Echo the combined consumed text into the chat as a gray
+            // `❯` history line so the user has a record of what the
+            // agent is now answering. The editor pane updates to
+            // empty queued + empty buf via `emit_editor_state`.
+            editor.set_queued_recall(None);
+            term.echo_consumed_line(&t);
+            queued_rows = 0;
+            emit_editor_state(&emit, &editor, &queue);
             t
         } else {
             emit.emit(SessionEvent::Status {
@@ -1390,7 +1490,7 @@ pub async fn run(
                     }
                 }
             }
-            term.prompt();
+            emit_editor_state(&emit, &editor, &queue);
             continue;
         }
         // `/loop` is special-cased before the generic tui-dispatch
@@ -1411,7 +1511,7 @@ pub async fn run(
                 &tool_ctx,
             )
             .await;
-            term.prompt();
+            emit_editor_state(&emit, &editor, &queue);
             continue;
         }
         if let Some((name, args)) = parse_slash_command(trimmed) {
@@ -1448,11 +1548,11 @@ pub async fn run(
                 ok: true,
                 output: pretty,
             });
-            term.prompt();
+            emit_editor_state(&emit, &editor, &queue);
             continue;
         }
         if trimmed.is_empty() {
-            term.prompt();
+            emit_editor_state(&emit, &editor, &queue);
             continue;
         }
 
@@ -1476,13 +1576,15 @@ pub async fn run(
             // Wrap the provider call so user typing during the
             // stream is fed to the editor and pressed-Enter lines
             // join the pending-input queue instead of vanishing
-            // until the turn ends.
-            let drive = drive_with_input(
+            // until the turn ends. Silent variant — the agent is
+            // writing to the same PTY, so we can't echo keystrokes
+            // without garbling the stream.
+            let drive = drive_with_input_silent(
                 &mut inbox,
                 &mut editor,
-                &term,
                 &mut queue,
                 &mut automode,
+                &emit,
                 tasks.clone(),
                 async {
                     provider
@@ -1661,6 +1763,7 @@ pub async fn run(
                     &mut editor,
                     &term,
                     &mut queue,
+                    &mut queued_rows,
                     &mut automode,
                     tasks.clone(),
                     render_fut,
@@ -1703,6 +1806,7 @@ pub async fn run(
                         &mut automode,
                         &mut editor,
                         &mut queue,
+                        &mut queued_rows,
                         tasks.clone(),
                         bg_completion_tx.clone(),
                         bg_after,
@@ -1755,7 +1859,8 @@ pub async fn run(
             }
         }
 
-        term.prompt();
+        // Reset the editor pane to empty after the turn ends.
+        emit_editor_state(&emit, &editor, &queue);
     }
     Ok(())
 }
@@ -1819,31 +1924,39 @@ async fn read_one_line(
                 editor.buf.clear();
                 editor.cursor = 0;
                 term.note("(C-c)");
-                term.prompt();
+                emit_editor_state(term.emit, editor, &VecDeque::new());
             }
             Some(AdapterInboxMsg::Input(t)) => {
-                term.print(&t);
-                term.newline();
+                term.echo_consumed_line(&t);
                 return ReadOutcome::Line(t);
             }
             Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
             Some(AdapterInboxMsg::PtyInput(bytes)) => {
-                let (out, events) = editor.feed_bytes(&bytes);
-                if !out.is_empty() {
-                    term.write(&out);
-                }
+                // PTY bytes only update editor state; nothing is
+                // painted inline in chat. The TUI's bottom pane shows
+                // the live editor via `EditorState` events.
+                let (_discarded, events) = editor.feed_bytes(&bytes);
                 for ev in events {
                     match ev {
-                        LineEvent::Submit(line) => return ReadOutcome::Line(line),
+                        LineEvent::Submit(line) => {
+                            term.echo_consumed_line(&line);
+                            emit_editor_state(term.emit, editor, &VecDeque::new());
+                            return ReadOutcome::Line(line);
+                        }
                         LineEvent::Interrupt => {
                             editor.buf.clear();
                             editor.cursor = 0;
                             term.note("(C-c)");
-                            term.prompt();
                         }
                         LineEvent::Eof => return ReadOutcome::Eof,
+                        LineEvent::DequeueRecall => {
+                            // No queue to drain while idle — the
+                            // editor just pulled saved content into
+                            // `buf` and we'll see the Submit next.
+                        }
                     }
                 }
+                emit_editor_state(term.emit, editor, &VecDeque::new());
             }
             Some(AdapterInboxMsg::PtyResize { cols, .. }) => {
                 let new_w = (cols as usize)
@@ -1889,6 +2002,7 @@ async fn run_one_tool(
     automode: &mut bool,
     editor: &mut LineEditor,
     queue: &mut VecDeque<String>,
+    queued_rows: &mut usize,
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     bg_completion_tx: crate::tasks::BgCompletionTx,
     bg_after: std::time::Duration,
@@ -1974,6 +2088,7 @@ async fn run_one_tool(
         editor,
         term,
         queue,
+        queued_rows,
         automode,
         tasks,
         bg_completion_tx,
@@ -2191,6 +2306,7 @@ async fn run_with_supervisor(
     editor: &mut LineEditor,
     term: &Terminal<'_>,
     queue: &mut VecDeque<String>,
+    queued_rows: &mut usize,
     automode: &mut bool,
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     bg_completion_tx: crate::tasks::BgCompletionTx,
@@ -2240,6 +2356,7 @@ async fn run_with_supervisor(
         editor,
         term,
         queue,
+        queued_rows,
         automode,
         tasks_for_drive,
         &call_id,
@@ -2277,6 +2394,7 @@ async fn drive_with_input_relaying<F>(
     editor: &mut LineEditor,
     term: &Terminal<'_>,
     queue: &mut VecDeque<String>,
+    queued_rows: &mut usize,
     automode: &mut bool,
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     this_call_id: &str,
@@ -2285,6 +2403,11 @@ async fn drive_with_input_relaying<F>(
 where
     F: std::future::Future,
 {
+    // Editor state lives in the TUI's fixed bottom pane now, fed by
+    // `EditorState` events. No PTY-side prompt painting here — the
+    // PTY scrollback is reserved for chat + tool blocks.
+    let _ = queued_rows; // retained for source-compat with callers
+    emit_editor_state(term.emit, editor, queue);
     tokio::pin!(fut);
     loop {
         tokio::select! {
@@ -2297,29 +2420,30 @@ where
                     Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
                     Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
                     Some(AdapterInboxMsg::Input(t)) => {
-                        enqueue_line(term, queue, t);
+                        enqueue_line(queue, editor, t);
+                        emit_editor_state(term.emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyInput(bytes)) => {
                         if bytes.contains(&0x03) {
                             return DriveExit::Interrupt;
                         }
-                        // Relay live keystrokes to the PTY so the user
-                        // sees what they're typing even while a tool
-                        // is running. Editor output is the ANSI bytes
-                        // that paint the visible prompt + cursor.
-                        let (out, events) = editor.feed_bytes(&bytes);
-                        if !out.is_empty() {
-                            term.write(&out);
-                        }
+                        let (_discarded, events) = editor.feed_bytes(&bytes);
                         for ev in events {
                             match ev {
                                 LineEvent::Submit(line) => {
-                                    enqueue_line(term, queue, line);
+                                    enqueue_line(queue, editor, line);
                                 }
                                 LineEvent::Interrupt => return DriveExit::Interrupt,
                                 LineEvent::Eof => {}
+                                LineEvent::DequeueRecall => {
+                                    // Editor's buf has the recalled
+                                    // combined text; drop the queue
+                                    // so it doesn't double-run.
+                                    queue.clear();
+                                }
                             }
                         }
+                        emit_editor_state(term.emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyResize { .. }) => {}
                     Some(AdapterInboxMsg::ToolDecision { .. }) => {}
@@ -2547,15 +2671,30 @@ fn parse_slash_command(line: &str) -> Option<(String, Option<String>)> {
 }
 
 /// Push a user-typed (or programmatically-sent) line onto the
-/// pending-input queue and write an inline `↳ queued: ...` ack to the
-/// PTY. Trimmed-empty lines are dropped silently — they'd just produce
-/// a blank turn at the next AwaitingInput.
-fn enqueue_line(term: &Terminal<'_>, queue: &mut VecDeque<String>, line: String) {
+/// pending-input queue. Trimmed-empty lines are dropped silently —
+/// they'd just produce a blank turn at the next AwaitingInput.
+///
+/// Successive enqueues coalesce into a single queue entry joined by
+/// newlines so that the LLM receives one well-structured user message
+/// with the original line breaks intact, and up-arrow can pull the
+/// whole batch back into the editor as a single multi-line prompt.
+fn enqueue_line(
+    queue: &mut VecDeque<String>,
+    editor: &mut LineEditor,
+    line: String,
+) {
     if line.trim().is_empty() {
         return;
     }
-    term.queued_ack(&line);
-    queue.push_back(line);
+    if let Some(existing) = queue.back_mut() {
+        existing.push('\n');
+        existing.push_str(&line);
+        let combined = existing.clone();
+        editor.set_queued_recall(Some(combined));
+    } else {
+        queue.push_back(line.clone());
+        editor.set_queued_recall(Some(line));
+    }
 }
 
 /// Outcome of [`drive_with_input`]: either the wrapped future completed,
@@ -2580,11 +2719,13 @@ enum DriveExit<T> {
 /// writing to the same PTY. Submit events (and any programmatic
 /// `AdapterInboxMsg::Input` arriving during the turn) are pushed onto
 /// `queue` with an inline `↳ queued: ...` marker for visual feedback.
+#[allow(clippy::too_many_arguments)]
 async fn drive_with_input<F>(
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
     editor: &mut LineEditor,
     term: &Terminal<'_>,
     queue: &mut VecDeque<String>,
+    queued_rows: &mut usize,
     automode: &mut bool,
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     fut: F,
@@ -2592,6 +2733,10 @@ async fn drive_with_input<F>(
 where
     F: std::future::Future,
 {
+    // Editor lives in the TUI's fixed bottom pane; emit state changes
+    // as `EditorState` events instead of painting the PTY scrollback.
+    let _ = queued_rows; // retained for source-compat with callers
+    emit_editor_state(term.emit, editor, queue);
     tokio::pin!(fut);
     loop {
         tokio::select! {
@@ -2604,32 +2749,29 @@ where
                     Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
                     Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
                     Some(AdapterInboxMsg::Input(t)) => {
-                        enqueue_line(term, queue, t);
+                        enqueue_line(queue, editor, t);
+                        emit_editor_state(term.emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyInput(bytes)) => {
                         if bytes.contains(&0x03) {
                             return DriveExit::Interrupt;
                         }
-                        // Relay editor output so live keystrokes are
-                        // visible during tool waits. The PTY pane is
-                        // pure chat content now — tool blocks render
-                        // as separate items — so user typing can't
-                        // clash with tool output.
-                        let (out, events) = editor.feed_bytes(&bytes);
-                        if !out.is_empty() {
-                            term.write(&out);
-                        }
+                        let (_discarded, events) = editor.feed_bytes(&bytes);
                         for ev in events {
                             match ev {
                                 LineEvent::Submit(line) => {
-                                    enqueue_line(term, queue, line);
+                                    enqueue_line(queue, editor, line);
                                 }
                                 LineEvent::Interrupt => {
                                     return DriveExit::Interrupt;
                                 }
                                 LineEvent::Eof => {}
+                                LineEvent::DequeueRecall => {
+                                    queue.clear();
+                                }
                             }
                         }
+                        emit_editor_state(term.emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyResize { .. }) => {}
                     Some(AdapterInboxMsg::ToolDecision { .. }) => {}
@@ -2646,6 +2788,77 @@ where
                             let _ = crate::tasks::forward_control(&tasks, &call_id, c)
                                 .await;
                         }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Variant of [`drive_with_input`] that keeps the user's typing
+/// invisible to the PTY. Used while the agent is streaming its
+/// response — relaying editor bytes to the same PTY would interleave
+/// with the agent's writes and clobber both. Submissions still flow
+/// into `queue` (and the editor's `queued_recall`), so the work the
+/// user composes during streaming is preserved for the next turn or
+/// for an up-arrow recall once a tool drive takes over.
+#[allow(clippy::too_many_arguments)]
+async fn drive_with_input_silent<F>(
+    inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
+    editor: &mut LineEditor,
+    queue: &mut VecDeque<String>,
+    automode: &mut bool,
+    emit: &EventEmitter,
+    _tasks: std::sync::Arc<crate::tasks::Tasks>,
+    fut: F,
+) -> DriveExit<F::Output>
+where
+    F: std::future::Future,
+{
+    // The agent owns the PTY for the duration of this future; the
+    // TUI's fixed editor pane is what users see, fed by
+    // `EditorState` events.
+    emit_editor_state(emit, editor, queue);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut fut => return DriveExit::Done(res),
+            msg = inbox.recv() => {
+                match msg {
+                    None => return DriveExit::Channel,
+                    Some(AdapterInboxMsg::Stop) => return DriveExit::Stop,
+                    Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
+                    Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+                    Some(AdapterInboxMsg::Input(t)) => {
+                        enqueue_line(queue, editor, t);
+                        emit_editor_state(emit, editor, queue);
+                    }
+                    Some(AdapterInboxMsg::PtyInput(bytes)) => {
+                        if bytes.contains(&0x03) {
+                            return DriveExit::Interrupt;
+                        }
+                        let (_discarded, events) = editor.feed_bytes(&bytes);
+                        for ev in events {
+                            match ev {
+                                LineEvent::Submit(line) => {
+                                    enqueue_line(queue, editor, line);
+                                }
+                                LineEvent::Interrupt => {
+                                    return DriveExit::Interrupt;
+                                }
+                                LineEvent::Eof => {}
+                                LineEvent::DequeueRecall => {
+                                    queue.clear();
+                                }
+                            }
+                        }
+                        emit_editor_state(emit, editor, queue);
+                    }
+                    Some(AdapterInboxMsg::PtyResize { .. }) => {}
+                    Some(AdapterInboxMsg::ToolDecision { .. }) => {}
+                    Some(AdapterInboxMsg::ToolAction { .. }) => {
+                        // No active tool while the agent is streaming.
                     }
                 }
             }

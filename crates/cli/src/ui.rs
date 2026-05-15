@@ -721,19 +721,165 @@ fn render_group_overview(
 fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(id) = app.selected_id() else { return; };
     let scroll = app.view_scrollback;
+    // Only adapters that publish `SessionEvent::EditorState` (currently
+    // zarvis interactive) get the fixed editor pane at the bottom.
+    // claude / codex / shell render their own input prompt inside the
+    // PTY, so a second editor pane would just look like a duplicate.
+    let editor_state = app.editor_states.get(&id).cloned();
+    let (chat_area, editor_area) = if let Some(es) = &editor_state {
+        // Each queued entry may itself be multi-line — sum the line
+        // counts so a 3-line queued thought reserves 3 rows.
+        let queued_lines: usize = es
+            .queued
+            .iter()
+            .map(|s| s.split('\n').count().max(1))
+            .sum();
+        let buf_lines = es.buf.lines().count().max(1);
+        let raw_rows = queued_lines + 1 + buf_lines;
+        let editor_rows: u16 = (raw_rows as u16).min(area.height.saturating_sub(1));
+        let chat_height = area.height.saturating_sub(editor_rows);
+        (
+            Rect { x: area.x, y: area.y, width: area.width, height: chat_height },
+            Some(Rect {
+                x: area.x,
+                y: area.y + chat_height,
+                width: area.width,
+                height: editor_rows,
+            }),
+        )
+    } else {
+        (area, None)
+    };
     let history = match app.histories.get_mut(&id) {
         Some(h) => h,
         None => {
             let hint = Paragraph::new("(no PTY history yet — interact to populate)")
                 .style(Style::default().fg(Color::DarkGray));
-            f.render_widget(hint, area);
+            f.render_widget(hint, chat_area);
+            if let (Some(area), Some(es)) = (editor_area, editor_state.as_ref()) {
+                render_editor_pane(f, area, es, true);
+            }
             return;
         }
     };
-    let out = history.replay(area.width, area.height, scroll);
-    let term = tui_term::widget::PseudoTerminal::new(out.parser.screen());
-    f.render_widget(term, area);
+    let out = history.replay(chat_area.width, chat_area.height, scroll);
+    // Hide the chat pane's cursor block if we have our own editor pane
+    // — otherwise the chat's vt100 cursor would render as a stray
+    // block. For non-editor-pane sessions (claude / codex / shell)
+    // keep the cursor visible so users see where their typing lands.
+    let term = if editor_area.is_some() {
+        let no_cursor = tui_term::widget::Cursor::default().visibility(false);
+        tui_term::widget::PseudoTerminal::new(out.parser.screen()).cursor(no_cursor)
+    } else {
+        tui_term::widget::PseudoTerminal::new(out.parser.screen())
+    };
+    f.render_widget(term, chat_area);
     app.block_hits.insert(id, out.blocks);
+    if let (Some(area), Some(es)) = (editor_area, editor_state.as_ref()) {
+        render_editor_pane(f, area, es, true);
+    }
+}
+
+/// Paint the fixed bottom input pane:
+/// - zero or more queued lines (gray `❯`), then
+/// - one blank spacer row, then
+/// - the active editor — one row per `\n`-separated buf line, cyan `❯`
+///   on the first row, two-space indent on continuation rows.
+/// Cursor is placed on the active line/col that corresponds to `state.cursor`.
+fn render_editor_pane(
+    f: &mut Frame,
+    area: Rect,
+    state: &crate::app::EditorState,
+    set_cursor: bool,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let queued_style = Style::default().fg(Color::DarkGray);
+    let queued_glyph_style = queued_style.add_modifier(Modifier::BOLD);
+    let active_glyph_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let prompt_w: u16 = 2;
+
+    let total_rows = area.height as usize;
+    let mut y = area.y;
+    let mut remaining = total_rows;
+
+    // Queued entries — one `❯` per entry; continuation lines align
+    // under the prompt's text column with a two-space indent.
+    'queued: for entry in &state.queued {
+        let mut first = true;
+        for line in entry.split('\n') {
+            if remaining <= 1 {
+                break 'queued;
+            }
+            let row = Rect { x: area.x, y, width: area.width, height: 1 };
+            let spans = if first {
+                first = false;
+                vec![
+                    Span::styled("❯ ", queued_glyph_style),
+                    Span::styled(line.to_string(), queued_style),
+                ]
+            } else {
+                vec![
+                    Span::raw("  "),
+                    Span::styled(line.to_string(), queued_style),
+                ]
+            };
+            f.render_widget(Paragraph::new(Line::from(spans)), row);
+            y = y.saturating_add(1);
+            remaining -= 1;
+        }
+    }
+
+    // Spacer row above the active prompt — visual breathing room.
+    if remaining > 1 {
+        y = y.saturating_add(1);
+        remaining -= 1;
+    }
+
+    // Active editor — possibly multi-line.
+    let buf_lines: Vec<&str> = if state.buf.is_empty() {
+        vec![""]
+    } else {
+        state.buf.split('\n').collect()
+    };
+    let mut cursor_pos: Option<(u16, u16)> = None;
+    let mut char_seen = 0usize;
+    for (i, line) in buf_lines.iter().enumerate().take(remaining) {
+        let row = Rect { x: area.x, y, width: area.width, height: 1 };
+        let para = if i == 0 {
+            Paragraph::new(Line::from(vec![
+                Span::styled("❯ ", active_glyph_style),
+                Span::raw(line.to_string()),
+            ]))
+        } else {
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "), // align with prompt width
+                Span::raw(line.to_string()),
+            ]))
+        };
+        f.render_widget(para, row);
+        let line_chars = line.chars().count();
+        if cursor_pos.is_none()
+            && state.cursor >= char_seen
+            && state.cursor <= char_seen + line_chars
+        {
+            let col = (state.cursor - char_seen) as u16;
+            let x = area
+                .x
+                .saturating_add(prompt_w)
+                .saturating_add(col)
+                .min(area.x + area.width.saturating_sub(1));
+            cursor_pos = Some((x, y));
+        }
+        char_seen += line_chars + 1; // +1 for the `\n`
+        y = y.saturating_add(1);
+    }
+    if set_cursor {
+        if let Some(pos) = cursor_pos {
+            f.set_cursor_position(pos);
+        }
+    }
 }
 
 fn render_transcript(f: &mut Frame, area: Rect, app: &App) {
@@ -1131,6 +1277,11 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
                 Style::default().fg(Color::DarkGray),
             )]
         }
+        SessionEvent::EditorState { .. } => {
+            // Editor state is rendered by the input pane, not the
+            // chat transcript.
+            vec![]
+        }
     }
 }
 
@@ -1411,6 +1562,9 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::TaskStart { tool, call_id, .. } => format!("task-start {tool} {call_id}"),
         SessionEvent::TaskBackgrounded { call_id } => format!("task-bg {call_id}"),
         SessionEvent::TaskEnd { call_id, ok, .. } => format!("task-end {call_id} ok={ok}"),
+        SessionEvent::EditorState { queued, buf, cursor } => {
+            format!("editor: q={} buf={}b cur={}", queued.len(), buf.len(), cursor)
+        }
     }
 }
 
@@ -1453,19 +1607,13 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Clear, area);
     f.render_widget(block, area);
 
-    // Tell the adapter about the orchestrator panel's inner size so
-    // its line editor reflows correctly. Caches the last announced
-    // size on the App so we only fire pty_resize on a real change.
+    // Publish the orchestrator panel's inner size; `run_loop` debounces
+    // and fires the actual `pty_resize` once the value settles. Stops
+    // drag-resize from spraying one IPC per frame.
     let cols = inner.width.max(1);
     let rows = inner.height.max(1);
-    let last = app.orchestrator_pty_size;
-    if last != Some((cols, rows)) {
-        app.orchestrator_pty_size = Some((cols, rows));
-        let client = app.client.clone();
-        let id_for_resize = id.clone();
-        tokio::spawn(async move {
-            let _ = client.pty_resize(&id_for_resize, cols, rows).await;
-        });
+    if app.orchestrator_desired_size != Some((cols, rows)) {
+        app.orchestrator_desired_size = Some((cols, rows));
     }
 
     let history = app.histories.entry(id.clone()).or_default();
@@ -1474,7 +1622,10 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     // mouse-wheel inside the panel could drive a separate
     // `orchestrator_scrollback` offset.
     let out = history.replay(cols, rows, 0);
-    let term = tui_term::widget::PseudoTerminal::new(out.parser.screen());
+    // Same as the main view: hide the parser's cursor block so the
+    // only visible cursor is the editor's.
+    let no_cursor = tui_term::widget::Cursor::default().visibility(false);
+    let term = tui_term::widget::PseudoTerminal::new(out.parser.screen()).cursor(no_cursor);
     f.render_widget(term, inner);
     app.block_hits.insert(id, out.blocks);
 }

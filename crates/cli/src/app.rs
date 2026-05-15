@@ -172,10 +172,11 @@ pub struct App {
     /// after each `replay`. Mouse clicks in the PTY pane consult
     /// this to toggle the right block.
     pub block_hits: HashMap<String, Vec<crate::pty_render::BlockHitRect>>,
-    /// Last (cols, rows) we asked the orchestrator's adapter to
-    /// resize to. Tracked so we don't spam `pty_resize` IPC calls
-    /// on every frame.
-    pub orchestrator_pty_size: Option<(u16, u16)>,
+    /// The orchestrator panel's most recent inner (cols, rows) as
+    /// computed during render. Written by `ui::render`, consumed by
+    /// `run_loop`'s debounce — once the value stays stable for
+    /// `RESIZE_DEBOUNCE_MS`, a single `pty_resize` IPC fires.
+    pub orchestrator_desired_size: Option<(u16, u16)>,
     pub terminal_pane_size: (u16, u16), // (cols, rows) of the right pane.
     /// Zoom: hide list / pin strip / modeline; the session view fills the
     /// screen except for the minibuffer line at the bottom. Toggled with
@@ -222,6 +223,19 @@ pub struct App {
     /// /tasks popup state: `None` = closed, `Some(...)` = open with
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
+    /// Per-session input editor state, fed by `SessionEvent::EditorState`
+    /// from the adapter (currently zarvis interactive). Drives the
+    /// fixed bottom input pane.
+    pub editor_states: HashMap<String, EditorState>,
+}
+
+/// Adapter-owned input editor state, mirrored from
+/// `SessionEvent::EditorState` and rendered as a fixed bottom pane.
+#[derive(Debug, Clone, Default)]
+pub struct EditorState {
+    pub queued: Vec<String>,
+    pub buf: String,
+    pub cursor: usize,
 }
 
 /// State for the `/tasks` modal popup. v1 is read-only at the UI
@@ -363,7 +377,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         view: ViewMode::Transcript,
         histories: HashMap::new(),
         block_hits: HashMap::new(),
-        orchestrator_pty_size: None,
+        orchestrator_desired_size: None,
         tasks_popup: None,
         terminal_pane_size: (100, 30),
         zoom: ZoomMode::None,
@@ -375,6 +389,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         orchestrator_id: initial_orch_id,
         list_panel_w: LIST_PANEL_W_DEFAULT,
         resizing_list: false,
+        editor_states: HashMap::new(),
     };
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
@@ -428,15 +443,55 @@ async fn run_loop(
     // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
 
+    // Debounce window for resize events. Terminal-app drags and
+    // list/view divider drags both flood `terminal_pane_size` (and
+    // the orchestrator panel's size) with many close-spaced values;
+    // firing `pty_resize` per frame creates IPC churn and asks every
+    // child PTY to reflow repeatedly. Sitting on the size until it
+    // stays stable for this window collapses the storm into one IPC.
+    let resize_debounce = Duration::from_millis(100);
     let mut last_size_sent: (u16, u16) = (0, 0);
+    let mut pending_size: Option<((u16, u16), Instant)> = None;
+    let mut last_orch_sent: (u16, u16) = (0, 0);
+    let mut pending_orch: Option<((u16, u16), Instant)> = None;
     while !app.should_quit {
         terminal.draw(|f| ui::render(f, app))?;
-        // If the right pane changed size, push pty_resize for the current
-        // PTY session (if any). Skip the very first frame (0,0).
+        // Right pane (main session) resize — debounced fire.
         let cur = app.terminal_pane_size;
         if cur != last_size_sent && cur.0 > 0 && cur.1 > 0 {
-            app.notify_pane_size(cur.0, cur.1).await;
-            last_size_sent = cur;
+            match pending_size {
+                Some((p, _)) if p == cur => {}
+                _ => pending_size = Some((cur, Instant::now())),
+            }
+        } else {
+            pending_size = None;
+        }
+        if let Some((size, at)) = pending_size {
+            if at.elapsed() >= resize_debounce {
+                app.notify_pane_size(size.0, size.1).await;
+                last_size_sent = size;
+                pending_size = None;
+            }
+        }
+        // Orchestrator panel resize — same debounce, separate target.
+        if let Some(orch_size) = app.orchestrator_desired_size {
+            if orch_size != last_orch_sent && orch_size.0 > 0 && orch_size.1 > 0 {
+                match pending_orch {
+                    Some((p, _)) if p == orch_size => {}
+                    _ => pending_orch = Some((orch_size, Instant::now())),
+                }
+            } else {
+                pending_orch = None;
+            }
+        }
+        if let Some((size, at)) = pending_orch {
+            if at.elapsed() >= resize_debounce {
+                if let Some(orch_id) = app.orchestrator_id.clone() {
+                    let _ = app.client.pty_resize(&orch_id, size.0, size.1).await;
+                }
+                last_orch_sent = size;
+                pending_orch = None;
+            }
         }
         tokio::select! {
             ev = input_stream.next() => {
@@ -877,6 +932,23 @@ impl App {
                                 .entry(payload.session_id.clone())
                                 .or_default();
                             history.feed_tool_result(tool, *ok, output.clone());
+                        }
+                        // Adapter editor state — drives the fixed
+                        // bottom input pane.
+                        if let SessionEvent::EditorState {
+                            queued,
+                            buf,
+                            cursor,
+                        } = &payload.event
+                        {
+                            self.editor_states.insert(
+                                payload.session_id.clone(),
+                                EditorState {
+                                    queued: queued.clone(),
+                                    buf: buf.clone(),
+                                    cursor: *cursor,
+                                },
+                            );
                         }
                         // Orchestrator session events: PTY bytes flow
                         // through the regular PTY branch above (into

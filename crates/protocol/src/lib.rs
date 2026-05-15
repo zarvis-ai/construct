@@ -269,6 +269,28 @@ pub enum SessionEvent {
         #[serde(default)]
         output_preview: String,
     },
+    /// State of an adapter's input editor, rendered by the TUI in a
+    /// fixed pane below the chat scrollback. Emitted by the adapter
+    /// (currently zarvis interactive) whenever the editor buffer,
+    /// cursor, or pending-input queue changes. Lets the client paint
+    /// a true bottom-anchored prompt that doesn't compete with the
+    /// agent's stream for PTY rows.
+    EditorState {
+        /// Pending user submissions waiting for the agent — each
+        /// shown as a "queued" row above the active prompt. The
+        /// adapter coalesces consecutive submissions but exposes the
+        /// per-submission strings so the TUI can render one line per
+        /// pending entry if it likes.
+        #[serde(default)]
+        queued: Vec<String>,
+        /// Current text in the editor buffer.
+        #[serde(default)]
+        buf: String,
+        /// Character index of the cursor within `buf` (0 = before
+        /// first char).
+        #[serde(default)]
+        cursor: usize,
+    },
 }
 
 /// Lifecycle state surfaced by `session.list_tasks`. Derived by the
