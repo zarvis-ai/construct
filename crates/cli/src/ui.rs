@@ -769,9 +769,9 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     // keep the cursor visible so users see where their typing lands.
     let term = if editor_area.is_some() {
         let no_cursor = tui_term::widget::Cursor::default().visibility(false);
-        tui_term::widget::PseudoTerminal::new(out.parser.screen()).cursor(no_cursor)
+        tui_term::widget::PseudoTerminal::new(out.screen).cursor(no_cursor)
     } else {
-        tui_term::widget::PseudoTerminal::new(out.parser.screen())
+        tui_term::widget::PseudoTerminal::new(out.screen)
     };
     f.render_widget(term, chat_area);
     app.block_hits.insert(id, out.blocks);
@@ -1341,7 +1341,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         f.render_widget(block, *tile_area);
         if let Some(history) = app.histories.get_mut(id) {
             let out = history.replay(inner.width, inner.height, 0);
-            render_pty_tail(f, inner, out.parser.screen());
+            render_pty_tail(f, inner, out.screen);
         } else {
             // No PTY data yet — show a placeholder.
             let p = Paragraph::new("(no data yet)")

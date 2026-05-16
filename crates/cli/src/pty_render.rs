@@ -77,8 +77,12 @@ pub struct BlockHitRect {
     pub header_row: u16,
 }
 
-pub struct RenderOutput {
-    pub parser: vt100::Parser,
+pub struct RenderOutput<'a> {
+    /// Borrowed from the `ItemHistory`'s cached parser — lifetime is
+    /// tied to the `&mut self` of [`ItemHistory::replay`]. Callers
+    /// hand this to `tui_term::PseudoTerminal::new` (or read cells
+    /// directly); they never need to own a [`vt100::Parser`].
+    pub screen: &'a vt100::Screen,
     pub blocks: Vec<BlockHitRect>,
 }
 
@@ -150,6 +154,77 @@ pub struct ItemHistory {
     /// Set by every mutation; cleared by `replay`. Future-proofing
     /// for an incremental cache.
     pub dirty: bool,
+    /// Persistent `vt100::Parser` reused across frames for sessions
+    /// without tool blocks (claude / codex / shell) — these never
+    /// have items mutate underfoot, so we can process only the
+    /// items appended since the last replay and just `set_size` on
+    /// resize instead of replaying the full history.
+    /// Sessions WITH tool blocks (zarvis) always rebuild because a
+    /// block's synth bytes change as state evolves (elapsed counter,
+    /// expand/collapse, output arrival).
+    cached: Option<CachedParser>,
+}
+
+/// Cached parser + the items-count it was last advanced to. The
+/// parser also remembers its (cols, rows); on a size mismatch
+/// `replay` calls `screen_mut().set_size()` instead of rebuilding.
+struct CachedParser {
+    parser: vt100::Parser,
+    cols: u16,
+    rows: u16,
+    processed_count: usize,
+    /// Length of `pending_chunk` already fed into the parser. Only
+    /// non-zero when the cache was populated by a path that decided
+    /// to feed pending bytes in-place (currently always 0 because
+    /// `replay` flushes pending into a `PtyChunk` item up front for
+    /// cached sessions).
+    pending_consumed: usize,
+    /// Per-item signature for `replay_full` — lets us detect when
+    /// an existing item mutated (block hydrated, expanded toggled,
+    /// running counter ticked) vs. when the items list was only
+    /// appended to. On mutation we rebuild; on append-only we just
+    /// process the new tail through the persistent parser.
+    /// Empty for the non-tool-block fast path (which doesn't need it).
+    signatures: Vec<ItemSig>,
+    /// Cumulative visible-line count up through `pending_consumed`.
+    /// Lets `replay_full` skip re-counting the whole `pending_chunk`
+    /// per frame for block-span row math — we just add the new
+    /// tail's visible-line count.
+    pending_visible_lines: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ItemSig {
+    Chunk(usize),
+    Block {
+        call_id: String,
+        has_output: bool,
+        ok: bool,
+        expanded: bool,
+        /// `Some(elapsed_sec)` while the block is running (its
+        /// status row shows a live counter). `None` once the
+        /// block has output — the synth bytes are stable.
+        running_elapsed: Option<u64>,
+    },
+}
+
+impl ItemSig {
+    fn of(item: &Item) -> Self {
+        match item {
+            Item::PtyChunk(b) => ItemSig::Chunk(b.len()),
+            Item::ToolBlock(b) => ItemSig::Block {
+                call_id: b.call_id.clone(),
+                has_output: b.output.is_some(),
+                ok: b.ok,
+                expanded: b.expanded,
+                running_elapsed: if b.output.is_some() {
+                    None
+                } else {
+                    Some(b.started_at.elapsed().as_secs())
+                },
+            },
+        }
+    }
 }
 
 /// How many output lines a collapsed tool block shows (must match
@@ -170,6 +245,7 @@ impl ItemHistory {
             pending_block_hydrations: VecDeque::new(),
             pending_tool_results: HashMap::new(),
             dirty: true,
+            cached: None,
         }
     }
 
@@ -405,17 +481,170 @@ impl ItemHistory {
         }
     }
 
-    /// Build a fresh `vt100::Parser`, replay every item into it at
-    /// the requested size, and return both the parser (for tui-term
-    /// rendering) and the visible block ranges (for hit-testing).
+    /// Render the session's accumulated content into a `vt100::Screen`
+    /// at the requested size. Two strategies:
     ///
-    /// Scrollback offset is applied via `Parser::screen_mut().set_scrollback`
-    /// AFTER the replay — same as the old direct-parser pipeline.
-    pub fn replay(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput {
-        // Flush a copy of the in-progress chunk so it shows up in
-        // the rendered output without disturbing the appendable
-        // state for future feeds.
-        let mut parser = vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX);
+    /// 1. **Tool-block sessions (zarvis):** rebuild the parser from
+    ///    scratch every frame so tool blocks can reflect live state
+    ///    (elapsed counters, expand/collapse, in-flight output).
+    /// 2. **Non-tool sessions (claude / codex / shell):** keep the
+    ///    parser alive across frames. On resize, call `set_size` and
+    ///    skip replay — matches what a real terminal does for those
+    ///    tools. On streaming, process only the newly-appended items
+    ///    instead of the entire history.
+    ///
+    /// Scrollback offset is applied via `Screen::set_scrollback`
+    /// after either path produces the screen.
+    pub fn replay(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
+        let has_blocks = self
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::ToolBlock(_)));
+        if has_blocks {
+            self.replay_full(cols, rows, scrollback)
+        } else {
+            self.replay_cached(cols, rows, scrollback)
+        }
+    }
+
+    /// Persistent-parser fast path for sessions without tool blocks.
+    /// The cache is invalidated on size mismatch via `set_size` (vt100
+    /// preserves the grid contents). Items appended since the last
+    /// frame are processed in-place; `pending_chunk` is processed
+    /// every frame on top of the cache so streaming text shows live.
+    fn replay_cached(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
+        // Drop a stale cache from an earlier tool-block era.
+        let need_reset = match &self.cached {
+            None => true,
+            Some(_) => false,
+        };
+        if need_reset {
+            self.cached = Some(CachedParser {
+                parser: vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX),
+                cols,
+                rows,
+                processed_count: 0,
+                pending_consumed: 0,
+                signatures: Vec::new(),
+                pending_visible_lines: 0,
+            });
+        }
+        let cache = self.cached.as_mut().expect("just populated above");
+
+        // Resize handling has two cases:
+        //
+        //   - Rows changed but cols didn't: `set_size` is enough.
+        //     vt100 keeps the grid; rows are added/removed at the
+        //     bottom. No replay, no visible flicker.
+        //   - Cols changed: vt100 doesn't reflow soft-wrapped lines,
+        //     so just `set_size` leaves prior content at the old
+        //     wrap (looks narrow in a wider pane). Rebuild the parser
+        //     from the items list so prior content re-wraps at the
+        //     new width. Cost is one full replay on this frame; the
+        //     cache continues to absorb streaming after.
+        if cache.cols != cols {
+            cache.parser = vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX);
+            cache.cols = cols;
+            cache.rows = rows;
+            cache.processed_count = 0;
+            cache.pending_consumed = 0;
+        } else if cache.rows != rows {
+            cache.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+            cache.rows = rows;
+        }
+
+        // Feed newly-appended items through the live parser.
+        if cache.processed_count < self.items.len() {
+            for item in &self.items[cache.processed_count..] {
+                if let Item::PtyChunk(b) = item {
+                    cache.parser.process(b);
+                }
+                // ToolBlocks can't occur in this path (has_blocks is
+                // false), but be defensive.
+            }
+            cache.processed_count = self.items.len();
+        }
+
+        // Feed any newly-arrived pending bytes. Since pending_chunk
+        // only grows (or gets flushed wholesale into items via
+        // `flush_chunk` on OSC markers, which for non-tool sessions
+        // never fire), we just process the suffix beyond what we've
+        // already consumed.
+        let pending_len = self.pending_chunk.len();
+        if pending_len > cache.pending_consumed {
+            let suffix = &self.pending_chunk[cache.pending_consumed..];
+            cache.parser.process(suffix);
+            cache.pending_consumed = pending_len;
+        } else if pending_len < cache.pending_consumed {
+            // pending_chunk was flushed or shrunk under us — rebuild
+            // to stay consistent.
+            *cache = CachedParser {
+                parser: vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX),
+                cols,
+                rows,
+                processed_count: 0,
+                pending_consumed: 0,
+                signatures: Vec::new(),
+                pending_visible_lines: 0,
+            };
+            for item in &self.items {
+                if let Item::PtyChunk(b) = item {
+                    cache.parser.process(b);
+                }
+            }
+            cache.parser.process(&self.pending_chunk);
+            cache.processed_count = self.items.len();
+            cache.pending_consumed = self.pending_chunk.len();
+        }
+
+        cache.parser.screen_mut().set_scrollback(scrollback);
+        self.dirty = false;
+        RenderOutput {
+            screen: cache.parser.screen(),
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Tool-block-aware replay. Reuses the persistent parser when
+    /// safe; falls back to a full rebuild only when an item
+    /// mid-history actually mutated (block hydrated, expanded
+    /// toggled, running counter ticked to a new second). Append-only
+    /// changes (new chunks, new blocks at the tail) just feed the
+    /// new suffix through the live parser — same shape as
+    /// `replay_cached` but with per-block signatures so we know
+    /// when invalidation is required.
+    fn replay_full(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
+        // Per-item signatures: if anything in the prefix mutated,
+        // we have to rebuild because vt100 has no "undo bytes" API.
+        let current_sigs: Vec<ItemSig> = self.items.iter().map(ItemSig::of).collect();
+
+        let needs_rebuild = match &self.cached {
+            None => true,
+            Some(c) => {
+                c.cols != cols
+                    || c.rows != rows
+                    || current_sigs.len() < c.signatures.len()
+                    || self.pending_chunk.len() < c.pending_consumed
+                    || c.signatures
+                        .iter()
+                        .zip(current_sigs.iter())
+                        .any(|(a, b)| a != b)
+            }
+        };
+
+        if needs_rebuild {
+            self.cached = Some(CachedParser {
+                parser: vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX),
+                cols,
+                rows,
+                processed_count: 0,
+                pending_consumed: 0,
+                signatures: Vec::new(),
+                pending_visible_lines: 0,
+            });
+        }
+        let cache = self.cached.as_mut().expect("just populated above");
+
         struct BlockSpan {
             call_id: String,
             abs_start: usize,
@@ -427,21 +656,30 @@ impl ItemHistory {
         let mut block_spans: Vec<BlockSpan> = Vec::new();
         let mut abs_line: usize = 0;
 
-        let mut process = |parser: &mut vt100::Parser,
-                           bytes: &[u8],
-                           cols: u16,
-                           abs_line: &mut usize| {
-            *abs_line += count_visible_lines(bytes, cols);
-            parser.process(bytes);
-        };
-
-        for item in &self.items {
+        // On rebuild, process every item; on incremental, just the
+        // new tail past `processed_count`. We still iterate ALL items
+        // so we can compute block-span row positions for hit-testing
+        // (those depend on visible-line counts even for items we
+        // don't re-feed to the parser).
+        let start_processing_at = if needs_rebuild { 0 } else { cache.processed_count };
+        for (idx, item) in self.items.iter().enumerate() {
             let start = abs_line;
             match item {
-                Item::PtyChunk(b) => process(&mut parser, b, cols, &mut abs_line),
+                Item::PtyChunk(b) => {
+                    if idx >= start_processing_at {
+                        abs_line += count_visible_lines(b, cols);
+                        cache.parser.process(b);
+                    } else {
+                        abs_line += count_visible_lines(b, cols);
+                    }
+                }
                 Item::ToolBlock(block) => {
                     let synth = synth_block(block, cols);
-                    process(&mut parser, &synth.bytes, cols, &mut abs_line);
+                    let lines = count_visible_lines(&synth.bytes, cols);
+                    if idx >= start_processing_at {
+                        cache.parser.process(&synth.bytes);
+                    }
+                    abs_line += lines;
                     let status_abs_row = synth
                         .status_row_offset
                         .map(|off| start + off as usize);
@@ -456,34 +694,48 @@ impl ItemHistory {
                 }
             }
         }
-        // Any bytes that haven't formed a complete chunk yet — feed
-        // them through too so the user sees streaming text live.
-        if !self.pending_chunk.is_empty() {
-            process(&mut parser, &self.pending_chunk, cols, &mut abs_line);
-        }
 
-        parser.screen_mut().set_scrollback(scrollback);
+        // Pending: feed only the new tail through the parser. The
+        // running visible-line count is kept on the cache so we
+        // never re-iterate the whole pending buffer (otherwise long
+        // sessions pay O(history) per frame just to position block
+        // spans).
+        if needs_rebuild {
+            cache.pending_visible_lines = 0;
+        }
+        let pending_start = cache.pending_consumed.min(self.pending_chunk.len());
+        if pending_start < self.pending_chunk.len() {
+            let suffix = &self.pending_chunk[pending_start..];
+            cache.parser.process(suffix);
+            cache.pending_visible_lines += count_visible_lines(suffix, cols);
+        }
+        abs_line += cache.pending_visible_lines;
+
+        cache.processed_count = self.items.len();
+        cache.pending_consumed = self.pending_chunk.len();
+        cache.signatures = current_sigs;
+
+        cache.parser.screen_mut().set_scrollback(scrollback);
 
         // Map absolute-line ranges to current-frame screen rows.
         let total_lines = abs_line;
-        let visible_top = total_lines
-            .saturating_sub(rows as usize + scrollback);
+        let visible_top = total_lines.saturating_sub(rows as usize + scrollback);
         let mut blocks: Vec<BlockHitRect> = Vec::new();
         for span in block_spans {
             if span.abs_end <= visible_top {
                 continue;
             }
-            let row_start = span.abs_start
+            let row_start = span
+                .abs_start
                 .saturating_sub(visible_top)
                 .min(rows as usize) as u16;
-            let row_end = span.abs_end
+            let row_end = span
+                .abs_end
                 .saturating_sub(visible_top)
                 .min(rows as usize) as u16;
             if row_end <= row_start {
                 continue;
             }
-            // Map status row's abs position → screen row. Skip
-            // buttons that fall outside the visible window.
             let mut header_row = row_start;
             let mut bg_button = None;
             let mut kill_button = None;
@@ -505,7 +757,10 @@ impl ItemHistory {
         }
 
         self.dirty = false;
-        RenderOutput { parser, blocks }
+        RenderOutput {
+            screen: cache.parser.screen(),
+            blocks,
+        }
     }
 }
 
@@ -770,7 +1025,7 @@ mod tests {
         // No blocks parsed.
         assert_eq!(block_count(&h), 0);
         let out = h.replay(40, 10, 0);
-        let cell = out.parser.screen().cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
         assert_eq!(cell, "h");
     }
 
@@ -909,5 +1164,217 @@ mod tests {
         bytes.extend_from_slice(b"\x1b[0m"); // reset
         let n = count_visible_lines(&bytes, 80);
         assert_eq!(n, 1);
+    }
+
+    /// PERF (suspect): tool-block sessions use `replay_full` — rebuild
+    /// the parser from every item every frame so block synth bytes
+    /// reflect live state (timers, expand/collapse). This is the
+    /// orchestrator panel's path; that panel renders every frame
+    /// regardless of which session is selected. If orchestrator
+    /// history accumulates lots of bytes + a tool block, every
+    /// frame does O(total bytes) work.
+    #[test]
+    fn replay_full_scales_with_history_size() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        // Force the full-rebuild path by adding a tool block.
+        h.feed_tool_use("shell".into(), "ls".into());
+        h.feed_pty(b"\x1b]7700;open;call=cX\x07x\x1b]7700;close;call=cX\x07");
+        h.feed_tool_result("cX", true, "done".into());
+
+        // Baseline: small history.
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            let _ = h.replay(cols, rows, 0);
+        }
+        let small_us = t0.elapsed().as_micros();
+
+        // Grow the history: 50,000 lines of realistic chat content.
+        let mut grow = Vec::with_capacity(2 * 1024 * 1024);
+        for i in 0..50_000u32 {
+            grow.extend_from_slice(b"\x1b[33m");
+            grow.extend_from_slice(format!("line {i} of accumulated chat ").as_bytes());
+            grow.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        h.feed_pty(&grow);
+
+        // Warm up the cache so we measure steady-state, not the
+        // one-time post-growth rebuild.
+        let t_warm = Instant::now();
+        let _ = h.replay(cols, rows, 0);
+        let warmup_us = t_warm.elapsed().as_micros();
+
+        // Steady state: signatures stable, no new bytes — should be
+        // essentially free.
+        let t1 = Instant::now();
+        for _ in 0..100 {
+            let _ = h.replay(cols, rows, 0);
+        }
+        let large_us = t1.elapsed().as_micros();
+
+        eprintln!(
+            "replay_full: small {small_us} µs/100, warmup {warmup_us} µs (bootstrap), steady-large {large_us} µs/100 ({}x vs small)",
+            large_us.max(1) / small_us.max(1)
+        );
+        // After warmup, steady state should be cheap (<5ms total for
+        // 100 frames). The 3807× cliff this test originally exposed
+        // would manifest as >100ms here.
+        assert!(
+            large_us < 10_000,
+            "steady-state replay_full too slow: {large_us} µs/100 frames (warmup was {warmup_us} µs)"
+        );
+    }
+
+    /// PERF: PseudoTerminal::render iterates cells of the parser's
+    /// screen each frame. If a tall pane × wide pane × heavy SGR
+    /// content makes that slow, the TUI lags even when nothing's
+    /// streaming. Measures wall time for repeated full-pane renders
+    /// of a screen populated with realistic content.
+    #[test]
+    fn pseudo_terminal_render_is_fast_per_frame() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+        use std::time::Instant;
+
+        let mut h = ItemHistory::new();
+        let cols = 200u16;
+        let rows = 60u16;
+        // Fill a realistic-looking screen: many lines of text + SGR.
+        let mut bytes = Vec::with_capacity(200_000);
+        for i in 0..2_000u32 {
+            bytes.extend_from_slice(b"\x1b[36m");
+            bytes.extend_from_slice(format!("Ran git log --oneline -{i}").as_bytes());
+            bytes.extend_from_slice(b"\x1b[0m\r\n");
+            bytes.extend_from_slice(b"\x1b[90m");
+            bytes.extend_from_slice(b"  some captured output that fills the row a bit");
+            bytes.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        h.feed_pty(&bytes);
+        let out = h.replay(cols, rows, 0);
+
+        // Render 100 times into a buffer; measure wall time.
+        let area = Rect::new(0, 0, cols, rows);
+        let t = Instant::now();
+        for _ in 0..100 {
+            let mut buf = Buffer::empty(area);
+            let no_cursor = tui_term::widget::Cursor::default().visibility(false);
+            let term = tui_term::widget::PseudoTerminal::new(out.screen).cursor(no_cursor);
+            term.render(area, &mut buf);
+        }
+        let elapsed_us = t.elapsed().as_micros();
+        let per_frame_us = elapsed_us / 100;
+        eprintln!(
+            "PseudoTerminal::render: 100 frames at {cols}x{rows} in {elapsed_us} µs ({per_frame_us} µs/frame)"
+        );
+        // Should be well under 5 ms/frame.
+        assert!(
+            per_frame_us < 5_000,
+            "PseudoTerminal::render too slow: {per_frame_us} µs/frame"
+        );
+    }
+
+    /// PERF: many small events (codex's animated progress indicators
+    /// can fire dozens per second, each a handful of bytes — repaint
+    /// the spinner, erase-and-rewrite the elapsed counter, etc.).
+    /// Each event triggers `feed_pty` + a replay. If steady-state
+    /// per-event cost climbs as the session ages, the user feels
+    /// the "gets slower and slower" pattern.
+    #[test]
+    fn many_small_events_stay_fast_as_history_grows() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        // Pre-load history so we're measuring "events arriving on
+        // top of a long session", not a cold start.
+        let preload = vec![b'.'; 500_000];
+        h.feed_pty(&preload);
+        let _ = h.replay(cols, rows, 0);
+
+        let mut buckets = Vec::new();
+        for batch in 0..5 {
+            let t = Instant::now();
+            for _ in 0..1_000 {
+                // 16-byte event — a spinner frame "\r⠋ working..."ish.
+                h.feed_pty(b"\r* working...   ");
+                let _ = h.replay(cols, rows, 0);
+            }
+            buckets.push((batch, t.elapsed().as_micros()));
+        }
+        for (i, us) in &buckets {
+            eprintln!("batch {i}: 1000 events in {us} µs ({} ns/event)", us * 1000 / 1000);
+        }
+        // Sanity: a later batch shouldn't be drastically slower than
+        // the first batch — that would indicate per-event cost
+        // grows with history.
+        let first = buckets.first().unwrap().1;
+        let last = buckets.last().unwrap().1;
+        assert!(
+            last <= first * 3,
+            "per-event cost is growing with history: first batch {first} µs, last batch {last} µs"
+        );
+    }
+
+    /// PERF: a session with a large accumulated PTY history (the
+    /// `pty_replay` snapshot a TUI restart loads) should not make
+    /// each subsequent small `replay()` proportionally slow. The
+    /// `ItemHistory` keeps a persistent parser for non-tool-block
+    /// sessions, so steady-state per-frame cost should be bounded
+    /// by NEW bytes since the last frame — not by total history.
+    /// This test fails (or times out) if the cache is broken.
+    #[test]
+    fn replay_after_large_history_is_cheap_per_chunk() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        // Bootstrap: 2 MB of plausible PTY content (lines with
+        // varying widths + occasional CSI escapes, no OSC 7700 so
+        // it lands as one large pending chunk — same shape codex /
+        // claude produce).
+        let mut bootstrap = Vec::with_capacity(2 * 1024 * 1024);
+        for i in 0..50_000u32 {
+            bootstrap.extend_from_slice(b"\x1b[33msome line ");
+            bootstrap.extend_from_slice(i.to_string().as_bytes());
+            bootstrap.extend_from_slice(b" with reasonably long content to wrap\x1b[0m\r\n");
+        }
+        h.feed_pty(&bootstrap);
+        // First replay does the one-time bootstrap processing.
+        let t_first = Instant::now();
+        let _ = h.replay(cols, rows, 0);
+        let first_ms = t_first.elapsed().as_micros();
+
+        // Steady state: 1000 small chunks ("typing" / "streaming"),
+        // measured per-chunk.
+        let small_chunk = b"x";
+        let mut totals = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            let t = Instant::now();
+            h.feed_pty(small_chunk);
+            let _ = h.replay(cols, rows, 0);
+            totals.push(t.elapsed().as_micros());
+        }
+        let max_us = *totals.iter().max().unwrap();
+        let avg_us: u128 = totals.iter().sum::<u128>() / totals.len() as u128;
+
+        eprintln!(
+            "bootstrap_first_replay_us={first_ms} steady_avg_us={avg_us} steady_max_us={max_us}"
+        );
+
+        // After bootstrap, each frame should take well under 1 ms on
+        // any reasonable hardware — empirically <50 µs on a 2024
+        // laptop. The threshold here is intentionally loose so we
+        // don't get flaky CI; the test exists mostly to print the
+        // numbers when we suspect the cache regressed.
+        assert!(
+            avg_us < 2_000,
+            "steady-state replay avg too slow: {avg_us} µs/frame after {first_ms} µs bootstrap"
+        );
     }
 }

@@ -462,22 +462,33 @@ async fn run_loop(
     let mut pending_size: Option<((u16, u16), Instant)> = None;
     let mut last_orch_sent: (u16, u16) = (0, 0);
     let mut pending_orch: Option<((u16, u16), Instant)> = None;
+    // Track the most recent session we've sent a resize for. Switching
+    // sessions counts as a resize-event-of-interest even when the
+    // dimensions are unchanged — claude/codex draw their UI to the
+    // PTY size they last received and don't refresh past content
+    // without a SIGWINCH, so the focused session needs a fresh resize
+    // every time it gains focus.
+    let mut last_session_sent: Option<String> = None;
     while !app.should_quit {
         terminal.draw(|f| ui::render(f, app))?;
-        // Right pane (main session) resize — debounced fire.
+        // Right pane (main session) resize — debounced fire. Also
+        // refires if the *selected* session changed since last sent.
         let cur = app.terminal_pane_size;
-        if cur != last_size_sent && cur.0 > 0 && cur.1 > 0 {
+        let cur_session = app.selected_id();
+        let session_changed = cur_session != last_session_sent;
+        if cur.0 > 0 && cur.1 > 0 && (cur != last_size_sent || session_changed) {
             match pending_size {
-                Some((p, _)) if p == cur => {}
+                Some((p, _)) if p == cur && !session_changed => {}
                 _ => pending_size = Some((cur, Instant::now())),
             }
         } else {
             pending_size = None;
         }
         if let Some((size, at)) = pending_size {
-            if at.elapsed() >= resize_debounce {
+            if at.elapsed() >= resize_debounce || session_changed {
                 app.notify_pane_size(size.0, size.1).await;
                 last_size_sent = size;
+                last_session_sent = cur_session;
                 pending_size = None;
             }
         }
@@ -521,7 +532,6 @@ async fn run_loop(
                 }
             }
             _ = tick.tick() => {
-                // Clear expired status, redraw.
                 if let Some((_, at)) = &app.status {
                     if at.elapsed() > Duration::from_secs(5) {
                         app.status = None;
@@ -642,12 +652,23 @@ impl App {
     /// freshly pinned (so the pin strip never shows a blank tile for a
     /// session that has had output).
     pub async fn ensure_pinned_parsers(&mut self) {
-        let ids: Vec<String> = self
+        let mut ids: Vec<String> = self
             .sessions
             .iter()
             .filter(|s| s.pinned && s.has_pty && !self.histories.contains_key(&s.id))
             .map(|s| s.id.clone())
             .collect();
+        // The orchestrator session is always rendered (in the
+        // minibuffer panel) but never appears in `list_items` and
+        // isn't pinnable — so bootstrap its history alongside the
+        // pinned ones so the panel has the daemon's `pty_log`
+        // backfill on TUI launch instead of starting empty until
+        // the next event.
+        if let Some(orch_id) = self.orchestrator_id.clone() {
+            if !self.histories.contains_key(&orch_id) {
+                ids.push(orch_id);
+            }
+        }
         for id in ids {
             self.bootstrap_terminal(&id).await;
         }
