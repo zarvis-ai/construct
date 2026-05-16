@@ -1,8 +1,8 @@
 //! TUI app state and event loop.
 
-use agentd_client::Client;
 use crate::keymap::{self, ChordState, KeyAction, Keymap, KeymapResult, Profile};
 use crate::ui;
+use agentd_client::Client;
 use agentd_protocol::{
     EventNotificationPayload, GroupSummary, HarnessInfo, SessionEvent, SessionSummary,
     StateNotificationPayload, TimestampedEvent,
@@ -13,13 +13,16 @@ use crossterm::event::{
     KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Stdout;
+use std::io::{Stdout, Write};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,8 +38,14 @@ pub const SCROLLBACK_MAX: usize = 5_000;
 /// list; key dispatch and selection are typed.
 #[derive(Debug, Clone)]
 pub enum ListItem {
-    Session { summary: SessionSummary, indented: bool },
-    GroupHeader { group: GroupSummary, member_count: usize },
+    Session {
+        summary: SessionSummary,
+        indented: bool,
+    },
+    GroupHeader {
+        group: GroupSummary,
+        member_count: usize,
+    },
 }
 
 impl ListItem {
@@ -60,10 +69,18 @@ pub enum Selection {
 
 impl Selection {
     pub fn session_id(&self) -> Option<&str> {
-        if let Self::Session(id) = self { Some(id) } else { None }
+        if let Self::Session(id) = self {
+            Some(id)
+        } else {
+            None
+        }
     }
     pub fn group_id(&self) -> Option<&str> {
-        if let Self::Group(id) = self { Some(id) } else { None }
+        if let Self::Group(id) = self {
+            Some(id)
+        } else {
+            None
+        }
     }
 }
 
@@ -99,15 +116,25 @@ pub enum ZoomMode {
 
 #[derive(Debug, Clone)]
 pub enum MinibufferIntent {
-    SendInput { session_id: String },
+    SendInput {
+        session_id: String,
+    },
     NewSessionHarness,
     /// Second stage of the new-session wizard when the user typed `group`:
     /// asks for the group's name.
     NewGroupName,
-    DeleteConfirm { session_id: String },
-    Rename { session_id: String },
-    GroupDeleteConfirm { group_id: String },
-    GroupRename { group_id: String },
+    DeleteConfirm {
+        session_id: String,
+    },
+    Rename {
+        session_id: String,
+    },
+    GroupDeleteConfirm {
+        group_id: String,
+    },
+    GroupRename {
+        group_id: String,
+    },
     CommandPalette,
     /// Persistent orchestrator session input. Unlike other intents
     /// this one stays open across Enter — the panel re-opens with an
@@ -136,6 +163,26 @@ pub struct Minibuffer {
     /// Inline status appended after the input. Examples: "no such harness",
     /// "matches: claude, codex". Cleared by the next text edit.
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ScreenPoint {
+    pub col: u16,
+    pub row: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct TextSelection {
+    pub anchor: ScreenPoint,
+    pub head: ScreenPoint,
+    pub dragged: bool,
+    pub bounds: Option<ratatui::layout::Rect>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TextSelectionRange {
+    pub start: ScreenPoint,
+    pub end: ScreenPoint,
 }
 
 pub struct App {
@@ -206,6 +253,10 @@ pub struct App {
     /// Terminal.app, which ignores `\x1b[?1003h` even though crossterm
     /// requests it).
     pub mouse_pos: Option<(u16, u16)>,
+    /// Whether terminal mouse capture is enabled. When false, agentd
+    /// stops receiving mouse events so the user's terminal can perform
+    /// native drag selection/copy.
+    pub mouse_capture_enabled: bool,
     /// ID of the daemon-owned orchestrator session, if one is present
     /// in the sessions list. The orchestrator runs as a zarvis
     /// interactive (PTY) session; the TUI renders its PTY in the
@@ -251,6 +302,17 @@ pub struct App {
     /// from the adapter (currently zarvis interactive). Drives the
     /// fixed bottom input pane.
     pub editor_states: HashMap<String, EditorState>,
+    /// Last rendered frame, one string per terminal row. Mouse drag
+    /// selection copies out of this snapshot, so it works across the
+    /// whole TUI without every widget implementing text export.
+    pub frame_text: Vec<String>,
+    /// In-app text selection driven by left-drag while mouse capture is on.
+    pub text_selection: Option<TextSelection>,
+    /// Copied selection text. After mouse release we re-find this text in
+    /// the latest rendered frame so the highlight follows content shifts.
+    pub selected_text: Option<String>,
+    pub selected_text_bounds: Option<ratatui::layout::Rect>,
+    pub selected_text_range: Option<TextSelectionRange>,
 }
 
 /// Adapter-owned input editor state, mirrored from
@@ -342,6 +404,67 @@ pub struct HarnessHit {
     pub available: bool,
 }
 
+fn selection_bounds_for_layout(
+    layout: &LayoutSnapshot,
+    pinned_count: usize,
+    is_orchestrator_panel: bool,
+    col: u16,
+    row: u16,
+) -> Option<ratatui::layout::Rect> {
+    fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
+        c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
+    }
+    fn inner(r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+        ratatui::layout::Rect {
+            x: r.x.saturating_add(1),
+            y: r.y.saturating_add(1),
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2),
+        }
+    }
+
+    if let Some(list) = layout.list_area {
+        let list_inner = inner(list);
+        if contains(list_inner, col, row) {
+            return Some(list_inner);
+        }
+    }
+
+    if let Some(view) = layout.view_area {
+        let view_inner = inner(view);
+        if contains(view_inner, col, row) {
+            return Some(view_inner);
+        }
+    }
+
+    if let Some(strip) = layout.pin_strip_area {
+        for tile in crate::ui::pin_tile_layout(strip, pinned_count) {
+            let tile_inner = inner(tile);
+            if contains(tile_inner, col, row) {
+                return Some(tile_inner);
+            }
+        }
+    }
+
+    if let Some(minibuffer) = layout.minibuffer_area {
+        let minibuffer_content = if is_orchestrator_panel {
+            ratatui::layout::Rect {
+                x: minibuffer.x,
+                y: minibuffer.y.saturating_add(1),
+                width: minibuffer.width,
+                height: minibuffer.height.saturating_sub(1),
+            }
+        } else {
+            minibuffer
+        };
+        if contains(minibuffer_content, col, row) {
+            return Some(minibuffer_content);
+        }
+    }
+
+    None
+}
+
 /// Window during which a session counts as "busy" after its last PTY byte.
 /// Claude/codex TUIs emit a frame every ~80ms while thinking, so 600ms
 /// covers a missed frame without falsely flapping to idle.
@@ -352,8 +475,7 @@ pub const SPINNER_FRAME_MS: u128 = 120;
 /// Pulsing-star spinner: a 4-glyph sparkle whose size "breathes" via a
 /// palindromic frame schedule (small → big → small). Single cell wide so
 /// it slots into the same column as the static state glyph.
-pub const SPINNER_FRAMES: [&str; 8] =
-    ["✦", "✧", "✶", "✷", "✸", "✷", "✶", "✧"];
+pub const SPINNER_FRAMES: [&str; 8] = ["✦", "✧", "✶", "✷", "✸", "✷", "✶", "✧"];
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
     let profile = Profile::from_env();
@@ -365,9 +487,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     let harnesses = client.harnesses().await.unwrap_or_default();
     let initial_orch_id = sessions
         .iter()
-        .find(|s| {
-            s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
-        })
+        .find(|s| s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal())
         .map(|s| s.id.clone());
     // Restore the previously-selected session if it still exists,
     // else fall back to the first non-orchestrator session.
@@ -383,9 +503,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         .and_then(|id| {
             sessions
                 .iter()
-                .find(|s| {
-                    s.id == *id && s.kind != agentd_protocol::SessionKind::Orchestrator
-                })
+                .find(|s| s.id == *id && s.kind != agentd_protocol::SessionKind::Orchestrator)
                 .map(|s| Selection::Session(s.id.clone()))
         })
         .or_else(|| {
@@ -431,6 +549,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         start_instant: Instant::now(),
         layout: LayoutSnapshot::default(),
         mouse_pos: None,
+        mouse_capture_enabled: true,
         orchestrator_id: initial_orch_id,
         list_panel_w: persisted.list_panel_w.unwrap_or(LIST_PANEL_W_DEFAULT),
         resizing_list: None,
@@ -438,6 +557,11 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         resizing_pin_strip: None,
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
+        frame_text: Vec::new(),
+        text_selection: None,
+        selected_text: None,
+        selected_text_bounds: None,
+        selected_text_range: None,
     };
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
@@ -468,7 +592,11 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
 
     // Teardown — best effort.
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
     terminal.show_cursor().ok();
 
     crate::tui_state::save(&crate::tui_state::TuiState {
@@ -482,10 +610,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     result
 }
 
-async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
-) -> Result<()> {
+async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     let mut input_stream = EventStream::new();
     let mut notifications = app
         .client
@@ -653,7 +778,10 @@ impl App {
                 .then_with(|| b.created_at.cmp(&a.created_at))
         });
         for s in ungrouped {
-            out.push(ListItem::Session { summary: s.clone(), indented: false });
+            out.push(ListItem::Session {
+                summary: s.clone(),
+                indented: false,
+            });
         }
 
         let mut groups: Vec<&GroupSummary> = self.groups.iter().collect();
@@ -671,7 +799,10 @@ impl App {
             });
             if !g.collapsed {
                 for s in members {
-                    out.push(ListItem::Session { summary: s.clone(), indented: true });
+                    out.push(ListItem::Session {
+                        summary: s.clone(),
+                        indented: true,
+                    });
                 }
             }
         }
@@ -751,9 +882,7 @@ impl App {
         match self.client.pty_replay(id).await {
             Ok(snap) => {
                 use base64::Engine;
-                if let Ok(bytes) =
-                    base64::engine::general_purpose::STANDARD.decode(&snap.data)
-                {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&snap.data) {
                     history.feed_pty(&bytes);
                 }
             }
@@ -784,22 +913,11 @@ impl App {
                             // real tool block — skip it here just
                             // like the live notification handler.
                             if tool != agentd_protocol::TUI_DISPATCH_TOOL {
-                                history.feed_tool_use(
-                                    tool.clone(),
-                                    summarize_tool_args(args),
-                                );
+                                history.feed_tool_use(tool.clone(), summarize_tool_args(args));
                             }
                         }
-                        agentd_protocol::SessionEvent::ToolResult {
-                            tool,
-                            ok,
-                            output,
-                        } => {
-                            history.feed_tool_result(
-                                tool,
-                                *ok,
-                                output.clone(),
-                            );
+                        agentd_protocol::SessionEvent::ToolResult { tool, ok, output } => {
+                            history.feed_tool_result(tool, *ok, output.clone());
                         }
                         _ => {}
                     }
@@ -856,13 +974,11 @@ impl App {
                         self.set_status(format!("set_pinned {}: {}", short_id(&s.id), e));
                     }
                 }
-                self.set_status(
-                    if want {
-                        format!("pinned {} member(s)", members.len())
-                    } else {
-                        format!("unpinned {} member(s)", members.len())
-                    },
-                );
+                self.set_status(if want {
+                    format!("pinned {} member(s)", members.len())
+                } else {
+                    format!("unpinned {} member(s)", members.len())
+                });
             }
             Selection::None => {
                 self.set_status("nothing selected".into());
@@ -920,8 +1036,7 @@ impl App {
             .sessions
             .iter()
             .find(|s| {
-                s.kind == agentd_protocol::SessionKind::Orchestrator
-                    && !s.state.is_terminal()
+                s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
             })
             .map(|s| s.id.clone());
     }
@@ -992,12 +1107,10 @@ impl App {
                         //   {"command": "<verb>", "args": "<rest>"}
                         if let SessionEvent::ToolUse { tool, args } = &payload.event {
                             if tool == agentd_protocol::TUI_DISPATCH_TOOL {
-                                let cmd = args.get("command")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let arg_str = args.get("args")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let cmd =
+                                    args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                                let arg_str =
+                                    args.get("args").and_then(|v| v.as_str()).unwrap_or("");
                                 let full = if arg_str.is_empty() {
                                     cmd.to_string()
                                 } else {
@@ -1044,10 +1157,7 @@ impl App {
                                     .histories
                                     .entry(payload.session_id.clone())
                                     .or_default();
-                                history.feed_tool_use(
-                                    tool.clone(),
-                                    summarize_tool_args(args),
-                                );
+                                history.feed_tool_use(tool.clone(), summarize_tool_args(args));
                             }
                         }
                         // TaskStart is the primary block-creation
@@ -1106,9 +1216,7 @@ impl App {
                         // CLI / MCP introspection and don't hurt the
                         // TUI (the panel renders the PTY screen, not
                         // the structured events).
-                        if Some(payload.session_id.as_str())
-                            == self.transcript_session.as_deref()
-                        {
+                        if Some(payload.session_id.as_str()) == self.transcript_session.as_deref() {
                             self.transcript.push(TimestampedEvent {
                                 seq: payload.seq,
                                 at: payload.at,
@@ -1135,7 +1243,8 @@ impl App {
                             self.sessions[i] = payload.session;
                         } else {
                             self.sessions.push(payload.session);
-                            self.sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                            self.sessions
+                                .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                         }
                         self.refresh_orchestrator_id();
                         // Newly pinned PTY session: bootstrap so its tile
@@ -1149,9 +1258,8 @@ impl App {
             }
             m if m == agentd_protocol::ipc_notif::DELETED => {
                 if let Some(p) = n.params {
-                    if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::DeletedNotificationPayload,
-                    >(p)
+                    if let Ok(payload) =
+                        serde_json::from_value::<agentd_protocol::DeletedNotificationPayload>(p)
                     {
                         self.on_session_deleted(&payload.session_id).await;
                     }
@@ -1159,9 +1267,8 @@ impl App {
             }
             m if m == agentd_protocol::ipc_notif::GROUP_STATE => {
                 if let Some(p) = n.params {
-                    if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::GroupStateNotificationPayload,
-                    >(p)
+                    if let Ok(payload) =
+                        serde_json::from_value::<agentd_protocol::GroupStateNotificationPayload>(p)
                     {
                         self.on_group_state(payload.group).await;
                     }
@@ -1238,10 +1345,7 @@ impl App {
         let id = s.id.clone();
         let next = !s.automode;
         match self.client.set_automode(&id, next).await {
-            Ok(()) => self.set_status(format!(
-                "automode {}",
-                if next { "ON" } else { "off" }
-            )),
+            Ok(()) => self.set_status(format!("automode {}", if next { "ON" } else { "off" })),
             Err(e) => self.set_status(format!("set_automode failed: {e}")),
         }
     }
@@ -1290,9 +1394,8 @@ impl App {
     /// Current spinner frame, ticking on wall-time so all sessions animate
     /// in phase.
     pub fn spinner_frame(&self) -> &'static str {
-        let idx =
-            (self.start_instant.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
-                % SPINNER_FRAMES.len();
+        let idx = (self.start_instant.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
+            % SPINNER_FRAMES.len();
         SPINNER_FRAMES[idx]
     }
 
@@ -1324,6 +1427,9 @@ impl App {
     }
 
     async fn on_mouse(&mut self, ev: MouseEvent) {
+        if !self.mouse_capture_enabled {
+            return;
+        }
         use crossterm::event::MouseButton;
         const STEP: i32 = 3;
         // Track every event's cell so hover-aware rendering (diamond
@@ -1349,15 +1455,25 @@ impl App {
                 // strip's top border, the same row) starts a
                 // vertical resize-drag for the pin strip.
                 if self.is_on_pin_strip_divider(ev.column, ev.row) {
-                    let cur_h = self
-                        .layout
-                        .pin_strip_area
-                        .map(|s| s.height)
-                        .unwrap_or(0);
+                    let cur_h = self.layout.pin_strip_area.map(|s| s.height).unwrap_or(0);
                     self.resizing_pin_strip = Some((ev.row, cur_h));
                     return;
                 }
-                self.handle_left_click(ev.column, ev.row).await;
+                self.selected_text = None;
+                self.selected_text_bounds = None;
+                self.selected_text_range = None;
+                self.text_selection = Some(TextSelection {
+                    anchor: ScreenPoint {
+                        col: ev.column,
+                        row: ev.row,
+                    },
+                    head: ScreenPoint {
+                        col: ev.column,
+                        row: ev.row,
+                    },
+                    dragged: false,
+                    bounds: self.selection_bounds_at(ev.column, ev.row),
+                });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 if let Some((anchor_col, anchor_w)) = self.resizing_list {
@@ -1366,15 +1482,12 @@ impl App {
                     // points: list's right border (col = w−1) and
                     // view/pin's left border (col = w) — the delta
                     // is what matters, not the absolute column.
-                    let delta =
-                        ev.column as i32 - anchor_col as i32;
+                    let delta = ev.column as i32 - anchor_col as i32;
                     let want = (anchor_w as i32 + delta)
                         .max(LIST_PANEL_W_MIN as i32)
                         .min(u16::MAX as i32) as u16;
                     self.list_panel_w = want;
-                } else if let Some((anchor_row, anchor_h)) =
-                    self.resizing_pin_strip
-                {
+                } else if let Some((anchor_row, anchor_h)) = self.resizing_pin_strip {
                     // Dragging the divider DOWN (row grows) shrinks
                     // the pin strip; dragging UP grows it. Negate
                     // the row delta to match cursor direction.
@@ -1383,14 +1496,133 @@ impl App {
                         .max(PIN_STRIP_H_MIN as i32)
                         .min(PIN_STRIP_H_MAX as i32) as u16;
                     self.pin_strip_h = Some(want);
+                } else if let Some(sel) = self.text_selection.as_mut() {
+                    sel.head = ScreenPoint {
+                        col: ev.column,
+                        row: ev.row,
+                    };
+                    sel.dragged =
+                        sel.dragged || sel.anchor.col != ev.column || sel.anchor.row != ev.row;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                let was_resizing =
+                    self.resizing_list.is_some() || self.resizing_pin_strip.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
+                if was_resizing {
+                    self.text_selection = None;
+                    return;
+                }
+                if let Some(mut sel) = self.text_selection.clone() {
+                    sel.head = ScreenPoint {
+                        col: ev.column,
+                        row: ev.row,
+                    };
+                    if sel.dragged {
+                        let text = self.selected_frame_text(&sel);
+                        match copy_to_clipboard(&text) {
+                            Ok(()) => {
+                                let n = text.chars().count();
+                                self.selected_text = (!text.is_empty()).then_some(text);
+                                self.selected_text_bounds = sel.bounds;
+                                self.selected_text_range = self.selected_frame_range(&sel);
+                                self.text_selection = None;
+                                self.set_status(format!("copied {n} chars"));
+                            }
+                            Err(e) => self.set_status(format!("copy failed: {e}")),
+                        }
+                        return;
+                    }
+                }
+                self.text_selection = None;
+                self.handle_left_click(ev.column, ev.row).await;
             }
             _ => {}
         }
+    }
+
+    fn selected_frame_text(&self, sel: &TextSelection) -> String {
+        let Some(range) = self.selected_frame_range(sel) else {
+            return String::new();
+        };
+        let bounds = sel.bounds;
+        let bound_left = bounds.map(|b| b.left()).unwrap_or(0);
+        let bound_right = bounds.map(|b| b.right().saturating_sub(1));
+        let mut lines = Vec::new();
+        for row in range.start.row..=range.end.row {
+            let Some(line) = self.frame_text.get(row as usize) else {
+                continue;
+            };
+            let start_col = if row == range.start.row {
+                range.start.col
+            } else {
+                bound_left
+            };
+            let end_col = if row == range.end.row {
+                range.end.col
+            } else {
+                bound_right.unwrap_or_else(|| line.chars().count().saturating_sub(1) as u16)
+            };
+            lines.push(slice_line(line, start_col, end_col).trim_end().to_string());
+        }
+        lines.join("\n").trim_end().to_string()
+    }
+
+    fn selected_frame_range(&self, sel: &TextSelection) -> Option<TextSelectionRange> {
+        let (start, end) = normalized_points(sel.anchor, sel.head);
+        let bounds = sel.bounds;
+        let row_start = bounds.map(|b| b.top()).unwrap_or(0).max(start.row);
+        let row_end = bounds
+            .map(|b| b.bottom().saturating_sub(1))
+            .unwrap_or(u16::MAX)
+            .min(end.row);
+        if row_start > row_end {
+            return None;
+        }
+        let bound_left = bounds.map(|b| b.left()).unwrap_or(0);
+        let bound_right = bounds.map(|b| b.right().saturating_sub(1));
+        let start_col = if row_start == start.row {
+            start.col
+        } else {
+            bound_left
+        }
+        .max(bound_left);
+        let end_col = if row_end == end.row {
+            end.col
+        } else {
+            bound_right.unwrap_or(u16::MAX)
+        }
+        .min(bound_right.unwrap_or(u16::MAX));
+        Some(TextSelectionRange {
+            start: ScreenPoint {
+                col: start_col,
+                row: row_start,
+            },
+            end: ScreenPoint {
+                col: end_col,
+                row: row_end,
+            },
+        })
+    }
+
+    fn selection_bounds_at(&self, col: u16, row: u16) -> Option<ratatui::layout::Rect> {
+        let pinned_count = self
+            .list_items()
+            .into_iter()
+            .filter(|it| matches!(it, ListItem::Session { summary, .. } if summary.pinned))
+            .count();
+        let is_orchestrator_panel = matches!(
+            self.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::Orchestrator)
+        );
+        selection_bounds_for_layout(
+            &self.layout,
+            pinned_count,
+            is_orchestrator_panel,
+            col,
+            row,
+        )
     }
 
     /// True if `(col, row)` sits on the main view's bottom border
@@ -1475,10 +1707,7 @@ impl App {
                 // their bound action directly instead of opening the
                 // palette.
                 for hint in &self.layout.minibuffer_hints {
-                    if row == hint.y
-                        && col >= hint.x_start
-                        && col < hint.x_end
-                    {
+                    if row == hint.y && col >= hint.x_start && col < hint.x_end {
                         let action = hint.action;
                         self.run_action(action).await;
                         return;
@@ -1625,8 +1854,7 @@ impl App {
                     if rel_col >= bs && rel_col < be {
                         let session_id_owned = session_id.to_string();
                         let call_id_owned = hit.call_id.clone();
-                        let short: String =
-                            hit.call_id.chars().take(10).collect();
+                        let short: String = hit.call_id.chars().take(10).collect();
                         match self
                             .client
                             .tool_action(&session_id_owned, call_id_owned, "background")
@@ -1642,8 +1870,7 @@ impl App {
                     if rel_col >= ks && rel_col < ke {
                         let session_id_owned = session_id.to_string();
                         let call_id_owned = hit.call_id.clone();
-                        let short: String =
-                            hit.call_id.chars().take(10).collect();
+                        let short: String = hit.call_id.chars().take(10).collect();
                         match self
                             .client
                             .tool_action(&session_id_owned, call_id_owned, "kill")
@@ -1686,13 +1913,9 @@ impl App {
             if matches!(mb.intent, MinibufferIntent::NewSessionHarness) {
                 let hits = self.layout.minibuffer_harness_hits.clone();
                 for hit in hits {
-                    if hit.y == mb_area.y && col >= hit.x_start && col < hit.x_end
-                    {
+                    if hit.y == mb_area.y && col >= hit.x_start && col < hit.x_end {
                         if !hit.available {
-                            self.set_status(format!(
-                                "{}: adapter binary not installed",
-                                hit.name
-                            ));
+                            self.set_status(format!("{}: adapter binary not installed", hit.name));
                             return;
                         }
                         let intent = mb.intent.clone();
@@ -1733,18 +1956,14 @@ impl App {
         // Title bar buttons: `+` (left, new session) and `−`
         // (right, collapse). Both live on the top border row.
         if row == list.y {
-            if let Some((xs, xe, y)) =
-                crate::ui::list_plus_button_range(list)
-            {
+            if let Some((xs, xe, y)) = crate::ui::list_plus_button_range(list) {
                 if row == y && col >= xs && col < xe {
                     self.run_action(crate::keymap::KeyAction::OpenNewSession)
                         .await;
                     return;
                 }
             }
-            if let Some((xs, xe, y)) =
-                crate::ui::list_collapse_button_range(list)
-            {
+            if let Some((xs, xe, y)) = crate::ui::list_collapse_button_range(list) {
                 if row == y && col >= xs && col < xe {
                     self.list_collapsed = true;
                     // Drop focus so the collapse takes effect this
@@ -1886,6 +2105,10 @@ impl App {
     }
 
     async fn on_key(&mut self, key: KeyEvent) {
+        self.text_selection = None;
+        self.selected_text = None;
+        self.selected_text_bounds = None;
+        self.selected_text_range = None;
         // /tasks modal: Esc closes it; everything else falls through
         // (the popup itself is read-only at the keyboard layer in
         // v1 — mouse-only row interactions).
@@ -2251,6 +2474,31 @@ impl App {
             ToggleAutomode => {
                 self.toggle_automode().await;
             }
+            ToggleMouseCapture => {
+                self.toggle_mouse_capture();
+            }
+        }
+    }
+
+    fn toggle_mouse_capture(&mut self) {
+        self.mouse_capture_enabled = !self.mouse_capture_enabled;
+        self.mouse_pos = None;
+        let result = if self.mouse_capture_enabled {
+            execute!(std::io::stdout(), EnableMouseCapture)
+        } else {
+            execute!(std::io::stdout(), DisableMouseCapture)
+        };
+        match result {
+            Ok(()) if self.mouse_capture_enabled => {
+                self.set_status("mouse capture on".into());
+            }
+            Ok(()) => {
+                self.set_status("mouse capture off — drag to select text".into());
+            }
+            Err(e) => {
+                self.mouse_capture_enabled = !self.mouse_capture_enabled;
+                self.set_status(format!("mouse toggle failed: {e}"));
+            }
         }
     }
 
@@ -2265,8 +2513,8 @@ impl App {
             self.minibuffer = None;
             return;
         };
-        let is_ctrl_x = matches!(key.code, KeyCode::Char('x'))
-            && key.modifiers.contains(KeyModifiers::CONTROL);
+        let is_ctrl_x =
+            matches!(key.code, KeyCode::Char('x')) && key.modifiers.contains(KeyModifiers::CONTROL);
         // Escape hatch: `C-x C-x` sends a literal C-x byte through to the
         // PTY (matching the main-view PTY behavior).
         if !self.chord_state.is_empty() && is_ctrl_x {
@@ -2335,8 +2583,11 @@ impl App {
                 _ => None,
             };
             if let Some(d) = decision {
-                if let Some(MinibufferIntent::ApproveTool { session_id, call_id, .. }) =
-                    self.minibuffer.as_ref().map(|m| m.intent.clone())
+                if let Some(MinibufferIntent::ApproveTool {
+                    session_id,
+                    call_id,
+                    ..
+                }) = self.minibuffer.as_ref().map(|m| m.intent.clone())
                 {
                     self.minibuffer = None;
                     match self.client.tool_decision(&session_id, call_id, d).await {
@@ -2348,7 +2599,9 @@ impl App {
             return;
         }
 
-        let Some(mb) = self.minibuffer.as_mut() else { return; };
+        let Some(mb) = self.minibuffer.as_mut() else {
+            return;
+        };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -2375,9 +2628,7 @@ impl App {
                         return;
                     }
                     if !available_harnesses.iter().any(|h| h == &trimmed) {
-                        mb.error = Some(format!(
-                            "unknown: {trimmed} (Tab to complete)"
-                        ));
+                        mb.error = Some(format!("unknown: {trimmed} (Tab to complete)"));
                         return;
                     }
                 }
@@ -2519,10 +2770,8 @@ impl App {
                         // up rendered twice (once from the ring, once from
                         // the live broadcast that was already in flight).
                         if !self.histories.contains_key(&id) {
-                            self.histories.insert(
-                                id.clone(),
-                                crate::pty_render::ItemHistory::new(),
-                            );
+                            self.histories
+                                .insert(id.clone(), crate::pty_render::ItemHistory::new());
                         }
                         self.selection = Selection::Session(id);
                         self.refresh_selected_transcript().await;
@@ -2550,9 +2799,7 @@ impl App {
                 }
                 match self.client.rename_group(&group_id, &trimmed).await {
                     Ok(()) => {
-                        if let Some(g) =
-                            self.groups.iter_mut().find(|g| g.id == group_id)
-                        {
+                        if let Some(g) = self.groups.iter_mut().find(|g| g.id == group_id) {
                             g.name = trimmed.clone();
                         }
                         self.set_status(format!("renamed group → {trimmed}"));
@@ -2585,17 +2832,13 @@ impl App {
                 match self.client.set_title(&session_id, new_title.clone()).await {
                     Ok(()) => {
                         // Optimistically reflect locally.
-                        if let Some(i) =
-                            self.sessions.iter().position(|s| s.id == session_id)
-                        {
+                        if let Some(i) = self.sessions.iter().position(|s| s.id == session_id) {
                             self.sessions[i].title = new_title.clone();
                         }
-                        self.set_status(
-                            match &new_title {
-                                Some(t) => format!("renamed → {t}"),
-                                None => "title cleared".into(),
-                            },
-                        );
+                        self.set_status(match &new_title {
+                            Some(t) => format!("renamed → {t}"),
+                            None => "title cleared".into(),
+                        });
                     }
                     Err(e) => self.set_status(format!("rename failed: {e}")),
                 }
@@ -2622,11 +2865,19 @@ impl App {
                 // submit path. Kept as a defensive fallback.
                 let _ = input;
             }
-            MinibufferIntent::ApproveTool { session_id, call_id, .. } => {
+            MinibufferIntent::ApproveTool {
+                session_id,
+                call_id,
+                ..
+            } => {
                 // Reached only if the special-cased key handler in
                 // handle_minibuffer_key fell through (defensive — should
                 // not happen in practice). Treat any submit as approve.
-                if let Err(e) = self.client.tool_decision(&session_id, call_id, "approve").await {
+                if let Err(e) = self
+                    .client
+                    .tool_decision(&session_id, call_id, "approve")
+                    .await
+                {
                     self.set_status(format!("tool_decision failed: {e}"));
                 }
             }
@@ -2660,6 +2911,9 @@ impl App {
             "zoom" | "fullscreen" => self.run_action(KeyAction::ToggleZoom).await,
             "diff" => self.run_action(KeyAction::OpenDiff).await,
             "interrupt" => self.run_action(KeyAction::Interrupt).await,
+            "mouse" | "select" | "selection" => {
+                self.run_action(KeyAction::ToggleMouseCapture).await
+            }
             "help" | "?" => self.help_visible = true,
             "tasks" => {
                 self.open_tasks_popup().await;
@@ -2686,8 +2940,7 @@ impl App {
     /// re-opens to refresh. Click handlers in the popup itself can
     /// issue `tool_action(kill)` to terminate running tasks.
     pub async fn open_tasks_popup(&mut self) {
-        let Some(id) = self.selected_id().or_else(|| self.orchestrator_id.clone())
-        else {
+        let Some(id) = self.selected_id().or_else(|| self.orchestrator_id.clone()) else {
             self.set_status("no session selected".into());
             return;
         };
@@ -2725,7 +2978,6 @@ impl App {
             });
         }
     }
-
 }
 
 /// Best-effort one-line summary of a tool call's args JSON for the
@@ -2753,8 +3005,132 @@ pub fn short_id(id: &str) -> &str {
     &id[..n]
 }
 
+fn normalized_points(a: ScreenPoint, b: ScreenPoint) -> (ScreenPoint, ScreenPoint) {
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn slice_line(line: &str, start_col: u16, end_col: u16) -> String {
+    if end_col < start_col {
+        return String::new();
+    }
+    line.chars()
+        .skip(start_col as usize)
+        .take((end_col - start_col + 1) as usize)
+        .collect()
+}
+
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    if copy_with_pbcopy(text).is_ok() {
+        return Ok(());
+    }
+    copy_with_osc52(text)
+}
+
+fn copy_with_pbcopy(text: &str) -> Result<()> {
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!("pbcopy exited with {status}")
+    }
+}
+
+fn copy_with_osc52(text: &str) -> Result<()> {
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    stdout.flush()?;
+    Ok(())
+}
+
 fn byte_pos(s: &str, char_idx: usize) -> usize {
-    s.char_indices().nth(char_idx).map(|(b, _)| b).unwrap_or(s.len())
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(b, _)| b)
+        .unwrap_or(s.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    fn test_layout() -> LayoutSnapshot {
+        LayoutSnapshot {
+            list_area: Some(Rect::new(0, 0, 20, 10)),
+            view_area: Some(Rect::new(20, 0, 80, 20)),
+            pin_strip_area: Some(Rect::new(20, 20, 80, 8)),
+            minibuffer_area: Some(Rect::new(0, 29, 100, 4)),
+            list_row_count: 0,
+            minibuffer_hints: Vec::new(),
+            minibuffer_harness_hits: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn selection_bounds_use_list_inner_area() {
+        let bounds = selection_bounds_for_layout(&test_layout(), 0, false, 1, 1);
+
+        assert_eq!(bounds, Some(Rect::new(1, 1, 18, 8)));
+        assert_eq!(
+            selection_bounds_for_layout(&test_layout(), 0, false, 0, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_bounds_use_view_inner_area() {
+        let bounds = selection_bounds_for_layout(&test_layout(), 0, false, 21, 1);
+
+        assert_eq!(bounds, Some(Rect::new(21, 1, 78, 18)));
+        assert_eq!(
+            selection_bounds_for_layout(&test_layout(), 0, false, 20, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_bounds_use_pinned_tile_inner_area() {
+        let bounds = selection_bounds_for_layout(&test_layout(), 2, false, 21, 21);
+
+        assert_eq!(bounds, Some(Rect::new(21, 21, 38, 6)));
+        assert_eq!(
+            selection_bounds_for_layout(&test_layout(), 2, false, 20, 21),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_bounds_use_minibuffer_line_for_god_area() {
+        let bounds = selection_bounds_for_layout(&test_layout(), 0, false, 0, 29);
+
+        assert_eq!(bounds, Some(Rect::new(0, 29, 100, 4)));
+    }
+
+    #[test]
+    fn selection_bounds_exclude_orchestrator_panel_top_border() {
+        assert_eq!(
+            selection_bounds_for_layout(&test_layout(), 0, true, 0, 29),
+            None
+        );
+        assert_eq!(
+            selection_bounds_for_layout(&test_layout(), 0, true, 0, 30),
+            Some(Rect::new(0, 30, 100, 3))
+        );
+    }
 }
 
 fn delete_back_char(mb: &mut Minibuffer) {
@@ -2821,8 +3197,7 @@ fn kill_word_forward(mb: &mut Minibuffer) {
 /// the candidates when the result is ambiguous.
 fn apply_harness_completion(mb: &mut Minibuffer, options: &[String]) {
     let current = mb.input.clone();
-    let matches: Vec<&String> =
-        options.iter().filter(|o| o.starts_with(&current)).collect();
+    let matches: Vec<&String> = options.iter().filter(|o| o.starts_with(&current)).collect();
     if matches.is_empty() {
         mb.error = if options.is_empty() {
             Some("(no harnesses available)".to_string())
@@ -2848,7 +3223,9 @@ fn apply_harness_completion(mb: &mut Minibuffer, options: &[String]) {
 
 fn longest_common_prefix(strs: &[&String]) -> String {
     let mut out = String::new();
-    let Some(first) = strs.first() else { return out };
+    let Some(first) = strs.first() else {
+        return out;
+    };
     'outer: for (i, c) in first.chars().enumerate() {
         for s in &strs[1..] {
             if s.chars().nth(i) != Some(c) {
