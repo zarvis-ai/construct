@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Test
+        # Three pty_render perf-budget tests assert hardware-dependent
+        # timings tuned for local dev (Apple Silicon). On the shared
+        # 2-core GitHub runner they exceed budget even with no code
+        # changes, so they're skipped in CI. Run them locally with
+        # `cargo test` to catch real regressions.
+        run: |
+          cargo test --workspace --locked -- \
+            --skip pty_render::tests::codex_initial_render_after_restart_is_bounded \
+            --skip pty_render::tests::many_pinned_sessions_resize_within_budget \
+            --skip pty_render::tests::pseudo_terminal_render_is_fast_per_frame
