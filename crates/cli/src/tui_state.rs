@@ -23,6 +23,8 @@ pub struct TuiState {
     #[serde(default)]
     pub pin_strip_h: Option<u16>,
     #[serde(default)]
+    pub orchestrator_panel_h: Option<u16>,
+    #[serde(default)]
     pub list_collapsed: bool,
 }
 

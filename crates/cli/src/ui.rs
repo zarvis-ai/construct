@@ -1409,12 +1409,23 @@ pub fn compute_minibuffer_height(app: &App, total_h: u16) -> u16 {
     if !is_orch {
         return 1;
     }
-    // ~12 rows of panel + 1 row for the top border. The minimum-3
-    // floor leaves room for the modeline + at least one row of the
-    // main view on tiny terminals.
-    let cap: u16 = 13;
-    let max_allowed = total_h.saturating_sub(3).max(2);
-    cap.min(max_allowed)
+    minibuffer_panel_height(app.orchestrator_panel_h, total_h)
+}
+
+fn minibuffer_panel_height(preferred: Option<u16>, total_h: u16) -> u16 {
+    // ~12 rows of panel + 1 row for the top border by default. The minimum
+    // floor leaves room for the modeline + at least one row of the main view
+    // on tiny terminals.
+    let preferred = preferred
+        .unwrap_or(crate::app::MINIBUFFER_PANEL_H_DEFAULT)
+        .clamp(
+            crate::app::MINIBUFFER_PANEL_H_MIN,
+            crate::app::MINIBUFFER_PANEL_H_MAX,
+        );
+    let max_allowed = total_h
+        .saturating_sub(3)
+        .max(crate::app::MINIBUFFER_PANEL_H_MIN);
+    preferred.min(max_allowed)
 }
 
 fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
@@ -2362,5 +2373,19 @@ mod tests {
         let ranges = find_text_ranges(&frame, "target", None, Some(original));
 
         assert_eq!(ranges, vec![(2, 5, 10)]);
+    }
+
+    #[test]
+    fn minibuffer_panel_height_uses_preference_and_clamps() {
+        assert_eq!(
+            minibuffer_panel_height(None, 40),
+            crate::app::MINIBUFFER_PANEL_H_DEFAULT
+        );
+        assert_eq!(minibuffer_panel_height(Some(20), 40), 20);
+        assert_eq!(
+            minibuffer_panel_height(Some(1), 40),
+            crate::app::MINIBUFFER_PANEL_H_MIN
+        );
+        assert_eq!(minibuffer_panel_height(Some(80), 20), 17);
     }
 }

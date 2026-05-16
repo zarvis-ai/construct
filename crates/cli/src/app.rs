@@ -33,6 +33,9 @@ use std::time::{Duration, Instant};
 /// Max scrollback rows kept by each [`vt100::Parser`]. Mouse-wheel can scroll
 /// up to this many lines into history.
 pub const SCROLLBACK_MAX: usize = 5_000;
+pub const MINIBUFFER_PANEL_H_DEFAULT: u16 = 13;
+pub const MINIBUFFER_PANEL_H_MIN: u16 = 3;
+pub const MINIBUFFER_PANEL_H_MAX: u16 = 80;
 
 /// A row in the rendered list view. Sessions and group headers share the
 /// list; key dispatch and selection are typed.
@@ -240,6 +243,12 @@ pub struct App {
     /// history does not leave the main session view scrolled when the panel
     /// closes.
     pub orchestrator_scrollback: usize,
+    /// User-preferred height for the daemon-owned orchestrator panel rendered
+    /// in the minibuffer. Clamped by terminal height at render time.
+    pub orchestrator_panel_h: Option<u16>,
+    /// `Some((anchor_row, anchor_height))` while the user drags the
+    /// orchestrator panel's top border.
+    pub resizing_orchestrator_panel: Option<(u16, u16)>,
     /// Per-session "last PTY byte" timestamp, updated locally from incoming
     /// Pty events. Used to drive the "session looks busy" spinner via a
     /// short quiescence window. Daemon's `SessionSummary.last_pty_at_ms`
@@ -551,6 +560,8 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         zoom: initial_zoom,
         view_scrollback: 0,
         orchestrator_scrollback: 0,
+        orchestrator_panel_h: persisted.orchestrator_panel_h,
+        resizing_orchestrator_panel: None,
         pty_activity: HashMap::new(),
         start_instant: Instant::now(),
         layout: LayoutSnapshot::default(),
@@ -610,6 +621,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         zoom: app.zoom,
         list_panel_w: Some(app.list_panel_w),
         pin_strip_h: app.pin_strip_h,
+        orchestrator_panel_h: app.orchestrator_panel_h,
         list_collapsed: app.list_collapsed,
     });
 
@@ -1476,6 +1488,16 @@ impl App {
                     self.resizing_pin_strip = Some((ev.row, cur_h));
                     return;
                 }
+                // God/minibuffer panel: the top border is the panel's title
+                // area and acts as a vertical resize handle.
+                if self.is_on_orchestrator_panel_divider(ev.column, ev.row) {
+                    let cur_h = self.layout.minibuffer_area.map(|a| a.height).unwrap_or(
+                        self.orchestrator_panel_h
+                            .unwrap_or(MINIBUFFER_PANEL_H_DEFAULT),
+                    );
+                    self.resizing_orchestrator_panel = Some((ev.row, cur_h));
+                    return;
+                }
                 self.selected_text = None;
                 self.selected_text_bounds = None;
                 self.selected_text_range = None;
@@ -1513,6 +1535,15 @@ impl App {
                         .max(PIN_STRIP_H_MIN as i32)
                         .min(PIN_STRIP_H_MAX as i32) as u16;
                     self.pin_strip_h = Some(want);
+                } else if let Some((anchor_row, anchor_h)) = self.resizing_orchestrator_panel {
+                    // Dragging the top border UP grows the panel; dragging it
+                    // DOWN shrinks it. The render path still clamps to the
+                    // available terminal height.
+                    let delta = anchor_row as i32 - ev.row as i32;
+                    let want = (anchor_h as i32 + delta)
+                        .max(MINIBUFFER_PANEL_H_MIN as i32)
+                        .min(MINIBUFFER_PANEL_H_MAX as i32) as u16;
+                    self.orchestrator_panel_h = Some(want);
                 } else if let Some(sel) = self.text_selection.as_mut() {
                     sel.head = ScreenPoint {
                         col: ev.column,
@@ -1524,9 +1555,12 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let was_resizing =
-                    self.resizing_list.is_some() || self.resizing_pin_strip.is_some();
+                    self.resizing_list.is_some()
+                        || self.resizing_pin_strip.is_some()
+                        || self.resizing_orchestrator_panel.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
+                self.resizing_orchestrator_panel = None;
                 if was_resizing {
                     self.text_selection = None;
                     return;
@@ -1659,6 +1693,19 @@ impl App {
             None => return false,
         };
         row == view_bottom && col >= strip.x && col < strip.x + strip.width
+    }
+
+    /// True if `(col, row)` sits on the orchestrator/god panel's top border.
+    /// That border is the visible horizontal title line when god is focused
+    /// and is used as a vertical resize handle.
+    fn is_on_orchestrator_panel_divider(&self, col: u16, row: u16) -> bool {
+        if !self.is_orchestrator_panel_open() {
+            return false;
+        }
+        let Some(area) = self.layout.minibuffer_area else {
+            return false;
+        };
+        area.height > 1 && row == area.y && col >= area.x && col < area.x + area.width
     }
 
     /// True if `(col, row)` sits on the list ↔ right-pane divider.
