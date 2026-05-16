@@ -761,6 +761,54 @@ impl App {
                 self.set_status(format!("pty_replay: {e}"));
             }
         }
+        // Rehydrate ToolBlocks. `feed_pty` parses the OSC fences in
+        // pty.log and creates empty `ToolBlock` items, but the
+        // structured `tool` / `args` / `output` fields live in
+        // transcript events — which the live path routes via
+        // `feed_tool_use` / `feed_tool_result` but the daemon does
+        // NOT re-broadcast on subscribe. So after a daemon restart
+        // the blocks would render as `→ ?` with no body and the
+        // dim-styled args + footer the user sees during a live
+        // session disappear. Replay the transcript here in the
+        // SAME ORDER `feed_pty` saw the fences (FIFO) so
+        // pending-hydration pairing in `ItemHistory` reattaches
+        // tools to their blocks; `feed_tool_result` matches by
+        // call_id and just fills `output` on the existing block.
+        match self.client.transcript(id, 0, None).await {
+            Ok(t) => {
+                for ev in &t.events {
+                    match &ev.event {
+                        agentd_protocol::SessionEvent::ToolUse { tool, args } => {
+                            // The TUI-dispatch tool (`tui`) is a
+                            // slash-command short-circuit, not a
+                            // real tool block — skip it here just
+                            // like the live notification handler.
+                            if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                                history.feed_tool_use(
+                                    tool.clone(),
+                                    summarize_tool_args(args),
+                                );
+                            }
+                        }
+                        agentd_protocol::SessionEvent::ToolResult {
+                            tool,
+                            ok,
+                            output,
+                        } => {
+                            history.feed_tool_result(
+                                tool,
+                                *ok,
+                                output.clone(),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                self.set_status(format!("rehydrate transcript: {e}"));
+            }
+        }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
         let (cols, rows) = self.terminal_pane_size;

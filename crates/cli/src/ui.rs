@@ -1736,6 +1736,14 @@ fn vt100_cell_style(cell: &vt100::Cell) -> Style {
     if cell.bold() {
         mods.insert(Modifier::BOLD);
     }
+    // `\x1b[2m` (dim/faint) — without this the pin tile renders
+    // styled-dim text (e.g. zarvis's `[+N lines — click to expand]`
+    // markers and tool args) at full intensity, while the main view
+    // shows them correctly because `tui_term::PseudoTerminal`
+    // translates the attribute itself.
+    if cell.dim() {
+        mods.insert(Modifier::DIM);
+    }
     if cell.italic() {
         mods.insert(Modifier::ITALIC);
     }
@@ -2037,4 +2045,47 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// User-reported regression: zarvis emits `\x1b[2m` (DIM/faint)
+    /// for markers like `[+N lines — click to expand]` and tool
+    /// args. The main session view renders that as dim/gray because
+    /// `tui_term::PseudoTerminal` translates the attribute itself,
+    /// but the pin tile uses `render_pty_tail` which copies cells
+    /// through `vt100_cell_style`. If `vt100_cell_style` doesn't
+    /// emit `Modifier::DIM`, the pin tile shows the same content at
+    /// full intensity — visually inconsistent with the main view.
+    ///
+    /// This test feeds dim bytes through a vt100 parser, looks up
+    /// the resulting cell, runs it through `vt100_cell_style`, and
+    /// asserts the DIM modifier is set. It also asserts that a
+    /// neighboring non-dim cell does NOT have DIM, so we catch a
+    /// future bug where we accidentally set DIM unconditionally.
+    #[test]
+    fn vt100_cell_style_preserves_dim_attribute() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        // "X" in default style, then "Y" in DIM style.
+        parser.process(b"X\x1b[2mY\x1b[0m");
+        let screen = parser.screen();
+
+        let plain = screen.cell(0, 0).expect("plain cell");
+        let dimmed = screen.cell(0, 1).expect("dim cell");
+
+        let plain_style = super::vt100_cell_style(plain);
+        let dimmed_style = super::vt100_cell_style(dimmed);
+
+        assert!(
+            !plain_style.add_modifier.contains(Modifier::DIM),
+            "non-dim cell should not have DIM modifier"
+        );
+        assert!(
+            dimmed_style.add_modifier.contains(Modifier::DIM),
+            "dim cell must carry DIM modifier — without it the pin \
+             tile renders zarvis's gray markers at full intensity"
+        );
+    }
 }

@@ -1540,6 +1540,113 @@ mod tests {
         h.feed_pty(b"\xe2\x97\x8f done.\r\n");
     }
 
+    /// Daemon-restart restore path for a zarvis session.
+    ///
+    /// `bootstrap_terminal` reads pty.log via `pty_replay` and
+    /// feeds the bytes to a fresh `ItemHistory`. The OSC fences
+    /// inside the bytes create `ToolBlock` items, but the
+    /// structured `tool` / `args` / `output` data lives in
+    /// transcript events — which the daemon does NOT re-broadcast
+    /// on subscribe. So without an explicit transcript replay step,
+    /// each block reconstructed from the fences would render as
+    /// `→ ?` with no body (the dim-styled args + `[+N lines]`
+    /// footer the user sees live would disappear).
+    ///
+    /// The fix is in `bootstrap_terminal` (`app.rs`): after
+    /// `pty_replay` it also fetches the transcript and routes
+    /// `ToolUse` / `ToolResult` events through
+    /// `feed_tool_use` / `feed_tool_result`, which (via the
+    /// FIFO `pending_block_hydrations` queue and the call_id match
+    /// in `feed_tool_result`) reattach the structured data to the
+    /// blocks created by `feed_pty`.
+    ///
+    /// This test verifies that path end-to-end at the items-model
+    /// layer: feed pty bytes first (matching how `bootstrap_terminal`
+    /// does it), THEN replay transcript-style events, and check the
+    /// reconstructed `ToolBlock` carries the same `tool` /
+    /// `args_summary` / `output` it would have had if it'd been
+    /// built live.
+    #[test]
+    fn zarvis_restart_restore_rehydrates_tool_block_details() {
+        // Pre-restart: build the full live byte stream the adapter
+        // would have produced, mirroring `interactive.rs`'s actual
+        // sequence: tool_block_open → tool_use header → tool_result_body
+        // → tool_block_close.
+        let mut live_bytes: Vec<u8> = Vec::new();
+        live_bytes.extend_from_slice(b"\xe2\x9d\xaf list the cwd\r\n");
+        // OSC open for call "c1"
+        live_bytes.extend_from_slice(b"\x1b]7700;open;call=c1\x07");
+        // tool_use header (dim args)
+        live_bytes.extend_from_slice(
+            b"\r\n\x1b[1;33m\xe2\x86\x92 shell\x1b[0m\x1b[2m(ls)\x1b[0m\r\n",
+        );
+        // tool_result_body (dim content + the `[+N lines]` footer)
+        live_bytes.extend_from_slice(
+            b"  \x1b[1;32m\xe2\x9c\x93\x1b[0m  \x1b[2mfile_a\x1b[0m\r\n",
+        );
+        live_bytes.extend_from_slice(
+            b"     \x1b[2mfile_b\x1b[0m\r\n",
+        );
+        live_bytes.extend_from_slice(
+            b"     \x1b[2;36m[+5 lines \xe2\x80\x94 click to expand]\x1b[0m\r\n",
+        );
+        live_bytes.extend_from_slice(b"\x1b]7700;close;call=c1\x07");
+        live_bytes.extend_from_slice(b"\xe2\x97\x8f done.\r\n");
+
+        // Restore path: feed pty bytes first (mirrors
+        // `bootstrap_terminal`'s `feed_pty`), THEN replay the
+        // structured transcript events as the bootstrap fix does
+        // via `feed_tool_use` / `feed_tool_result`. The
+        // `pending_block_hydrations` FIFO inside `ItemHistory`
+        // attaches each ToolUse to the next pending block (by
+        // arrival order); `feed_tool_result` matches by call_id.
+        let mut h = ItemHistory::new();
+        h.feed_pty(&live_bytes);
+        // Transcript replay: one ToolUse + one ToolResult for "c1".
+        h.feed_tool_use("shell".into(), "ls".into());
+        let full_output: String = (0..8)
+            .map(|i| format!("file_{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.feed_tool_result("c1", true, full_output.clone());
+
+        let has_tool_block = h.items.iter().any(|i| {
+            matches!(i, Item::ToolBlock(_))
+        });
+        assert!(
+            has_tool_block,
+            "post-restore feed should reconstruct the ToolBlock from OSC fences"
+        );
+        let block = h
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::ToolBlock(b) => Some(b.clone()),
+                _ => None,
+            })
+            .expect("a tool block exists");
+        // The fix: structured fields are now populated, so
+        // `synth_block` will re-emit the dim-styled args + output
+        // + `[+N lines]` footer just like it does for a live
+        // session.
+        assert_eq!(
+            block.tool.as_deref(),
+            Some("shell"),
+            "ToolBlock.tool should be filled by transcript replay"
+        );
+        assert_eq!(
+            block.args_summary.as_deref(),
+            Some("ls"),
+            "ToolBlock.args_summary should be filled by transcript replay"
+        );
+        assert_eq!(
+            block.output.as_deref(),
+            Some(full_output.as_str()),
+            "ToolBlock.output should be filled by transcript replay"
+        );
+        assert_eq!(block.ok, true);
+    }
+
     #[test]
     fn zarvis_renders_after_bootstrap() {
         let mut h = ItemHistory::new();
