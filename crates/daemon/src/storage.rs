@@ -260,6 +260,19 @@ impl Storage {
         Ok(TranscriptResult { events, total })
     }
 
+    pub fn truncate_transcript(&self, id: &str) -> Result<()> {
+        let path = self.transcript_path(id);
+        if !path.exists() {
+            return Ok(());
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .with_context(|| format!("truncate {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }

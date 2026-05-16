@@ -217,6 +217,10 @@ pub enum SessionEvent {
     Error {
         message: String,
     },
+    /// Adapter requests that the daemon clear this session's persisted
+    /// transcript and PTY replay history. Used by interactive adapters for
+    /// slash commands such as `/reset`.
+    Reset,
     Done {
         #[serde(default)]
         exit_code: i32,

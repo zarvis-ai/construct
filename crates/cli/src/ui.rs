@@ -1688,6 +1688,10 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             format!("   ! {message}"),
             Style::default().fg(Color::Red),
         )],
+        SessionEvent::Reset => vec![Span::styled(
+            "   ↺ session reset".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )],
         SessionEvent::Done { exit_code } => vec![Span::styled(
             format!("   ▢ done (exit {exit_code})"),
             Style::default().fg(Color::Green),
@@ -2075,6 +2079,7 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::Cost { usd, .. } => format!("cost ${:.4}", usd),
         SessionEvent::Diff { .. } => "diff".to_string(),
         SessionEvent::Error { message } => format!("error: {}", shorten(message, 60)),
+        SessionEvent::Reset => "reset".to_string(),
         SessionEvent::Done { exit_code } => format!("done (exit {exit_code})"),
         SessionEvent::Pty { data } => format!("pty: {} bytes", data.len()),
         SessionEvent::ToolApprovalRequest { tool, .. } => format!("approve? {tool}"),
