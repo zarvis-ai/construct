@@ -126,6 +126,30 @@ enum OscState {
 /// with tool calls held as expand/collapse-aware blocks rather
 /// than baked into the PTY stream.
 pub struct ItemHistory {
+    /// Shadow parser used exclusively to back mouse scrollback.
+    ///
+    /// The main parser (`cached.parser` in the cached path,
+    /// rebuilt-per-frame in the full path) renders the *live*
+    /// viewport faithfully — including alt-screen mode and
+    /// whatever in-place redraws the child does. Neither path
+    /// fills vt100's scrollback buffer for those harnesses, so
+    /// mouse-wheel scroll-up has nothing to show.
+    ///
+    /// The shadow parser sees a *filtered* version of the PTY
+    /// stream: alt-screen toggle escapes (`\x1b[?1049/1047/47
+    /// h/l`) and bytes between an enter and exit are skipped, so
+    /// the shadow stays in normal-screen mode and accumulates
+    /// natural `\r\n`-scrolled content from before/after the
+    /// alt-screen window. When the caller passes `scrollback > 0`
+    /// to `replay`, we render from the shadow's screen instead
+    /// of the main parser.
+    shadow_parser: vt100::Parser,
+    shadow_in_alt_screen: bool,
+    /// Last cols/rows the shadow was sized to, so we only call
+    /// `set_size` when the dims actually changed (matches the
+    /// main-parser caching idiom).
+    shadow_cols: u16,
+    shadow_rows: u16,
     items: Vec<Item>,
     /// Bytes accumulating into the in-progress non-block chunk.
     pending_chunk: Vec<u8>,
@@ -236,7 +260,16 @@ pub const TOOL_BLOCK_MAX_COLS: usize = 200;
 
 impl ItemHistory {
     pub fn new() -> Self {
+        // Shadow parser: start at 80x24, gets resized at render
+        // time. Same scrollback cap as the main parser via
+        // `super::app::SCROLLBACK_MAX`.
+        let shadow_parser =
+            vt100::Parser::new(24, 80, super::app::SCROLLBACK_MAX);
         Self {
+            shadow_parser,
+            shadow_in_alt_screen: false,
+            shadow_cols: 80,
+            shadow_rows: 24,
             items: Vec::new(),
             pending_chunk: Vec::new(),
             osc: OscState::Normal,
@@ -260,7 +293,71 @@ impl ItemHistory {
         for &b in bytes {
             self.feed_byte(b);
         }
+        // Mirror the bytes (with alt-screen filtering) into the
+        // shadow parser used by mouse-wheel scrollback. See the
+        // doc comment on `shadow_parser`.
+        self.shadow_feed(bytes);
         self.dirty = true;
+    }
+
+    /// Route bytes to the shadow parser, skipping (a) the
+    /// alt-screen toggle escape sequences themselves and (b)
+    /// every byte that arrives while alt-screen is active. The
+    /// goal is to keep the shadow in normal-screen mode so its
+    /// natural `\r\n` accumulation can populate vt100's
+    /// scrollback for the user-visible mouse-scroll-up path.
+    fn shadow_feed(&mut self, bytes: &[u8]) {
+        // (pattern, target state) — DEC private-mode toggles for
+        // alt-screen across the three xterm variants. 1049 is the
+        // modern "save+enter+restore" combo, 1047 is "enter and
+        // keep save state from 1048", 47 is the original. We match
+        // them all so we cover claude / any TUI child that picks
+        // any of these.
+        const TOGGLES: &[(&[u8], bool)] = &[
+            (b"\x1b[?1049h", true),
+            (b"\x1b[?1049l", false),
+            (b"\x1b[?1047h", true),
+            (b"\x1b[?1047l", false),
+            (b"\x1b[?47h", true),
+            (b"\x1b[?47l", false),
+        ];
+        let mut i = 0;
+        while i < bytes.len() {
+            // Probe for any toggle prefix at the current position.
+            let mut matched: Option<(usize, bool)> = None;
+            for (pat, target) in TOGGLES {
+                if bytes[i..].starts_with(pat) {
+                    matched = Some((pat.len(), *target));
+                    break;
+                }
+            }
+            if let Some((len, new_state)) = matched {
+                // Drop the toggle bytes themselves AND flip state.
+                // The shadow never enters alt-screen mode itself.
+                self.shadow_in_alt_screen = new_state;
+                i += len;
+                continue;
+            }
+            if !self.shadow_in_alt_screen {
+                self.shadow_parser.process(&bytes[i..i + 1]);
+            }
+            i += 1;
+        }
+    }
+
+    /// Resize-and-render helper for the shadow path. Set its
+    /// viewport dims to match what the caller wants and apply the
+    /// scrollback offset. Cheap: just `set_size` (preserves grid +
+    /// scrollback) and `set_scrollback`.
+    fn render_shadow(&mut self, cols: u16, rows: u16, scrollback: usize) {
+        if self.shadow_cols != cols || self.shadow_rows != rows {
+            self.shadow_parser
+                .screen_mut()
+                .set_size(rows.max(1), cols.max(1));
+            self.shadow_cols = cols;
+            self.shadow_rows = rows;
+        }
+        self.shadow_parser.screen_mut().set_scrollback(scrollback);
     }
 
     fn feed_byte(&mut self, b: u8) {
@@ -496,6 +593,23 @@ impl ItemHistory {
     /// Scrollback offset is applied via `Screen::set_scrollback`
     /// after either path produces the screen.
     pub fn replay(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
+        // Mouse-wheel scrollback: divert to the shadow parser
+        // when the caller is asking for older content. The shadow
+        // sees the same byte stream as main, with alt-screen
+        // toggles + content filtered out, so it stays in normal-
+        // screen mode and `set_scrollback` actually exposes
+        // history (alt-screen has no scrollback by design;
+        // codex's natural `\r\n` chat content still flows
+        // through). At scroll=0 we fall back to the live main
+        // parser so block hit-test geometry, animated tool block
+        // counters, etc. stay correct.
+        if scrollback > 0 {
+            self.render_shadow(cols, rows, scrollback);
+            return RenderOutput {
+                screen: self.shadow_parser.screen(),
+                blocks: Vec::new(),
+            };
+        }
         let has_blocks = self
             .items
             .iter()
@@ -2571,6 +2685,218 @@ mod tests {
              intermediate frames (the user-visible replay cascade); \
              got {transient_frames}. If this assertion fails because \
              the cascade is gone, invert it: the bug is fixed."
+        );
+    }
+
+    // ============================================================
+    // Mouse-scrollback regression
+    //
+    // User report: scrolling up in a codex or claude session view
+    // doesn't show older history. Scrolling is wired through
+    // `App::adjust_scrollback` → `view_scrollback` → passed as the
+    // 3rd arg to `ItemHistory::replay`, which forwards to
+    // `vt100::Screen::set_scrollback`. For that to actually show
+    // older lines, the parser's scrollback buffer must contain
+    // them — and vt100 only fills scrollback when content
+    // *naturally* scrolls off the top of the viewport (newline at
+    // bottom row pushes the top row into scrollback).
+    //
+    // Two harness patterns break this:
+    //
+    // 1. **Alt-screen** (claude): `\x1b[?1049h` switches to a
+    //    separate buffer that has no scrollback by design — same
+    //    as a real terminal running vim/htop/less. Scrolling up
+    //    in the TUI does nothing because there's literally nothing
+    //    in the alt-screen's scrollback.
+    //
+    // 2. **In-place redraw** (codex): when the child clears and
+    //    re-paints its viewport with `\x1b[2J\x1b[H` (or
+    //    `\x1b[H\x1b[J`) instead of letting content scroll off
+    //    naturally, the cleared rows do NOT enter scrollback. The
+    //    viewport advances but the buffer doesn't grow. Codex's
+    //    chat output in real life mixes both patterns (some
+    //    streaming `\r\n` content + occasional viewport
+    //    redraws); the redraw passes erase whatever was visible
+    //    before they ran.
+    //
+    // These tests document both failure modes. A real fix would
+    // either (a) snapshot pre-redraw viewport rows into scrollback
+    // before `\x1b[2J` clears them, (b) keep an items-model
+    // companion buffer of every `PtyChunk` so scrollback isn't
+    // dependent on what vt100 retained, or (c) for alt-screen,
+    // surface the underlying main-screen scrollback when the user
+    // scrolls.
+    // ============================================================
+
+    /// Helper: count rows in a screen that have ANY non-blank
+    /// content. Used as a "does this look like a populated
+    /// viewport" check.
+    fn screen_populated_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> usize {
+        (0..rows)
+            .filter(|&r| {
+                (0..cols).any(|c| {
+                    screen
+                        .cell(r, c)
+                        .map(|cell| !cell.contents().is_empty() && cell.contents() != " ")
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+
+    /// Concat every populated row's content for comparison. Two
+    /// scrollback positions should produce different concat'd
+    /// strings if scrollback is doing anything.
+    fn screen_text(screen: &vt100::Screen, rows: u16, cols: u16) -> String {
+        let mut out = String::new();
+        for r in 0..rows {
+            for c in 0..cols {
+                if let Some(cell) = screen.cell(r, c) {
+                    out.push_str(&cell.contents());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Sanity baseline: shell-style output (pure `\r\n` lines) DOES
+    /// populate scrollback, so a scrolled-back render shows older
+    /// rows than a live render. This is the contract that codex
+    /// and claude break.
+    #[test]
+    fn shell_scrollback_shows_history() {
+        let mut h = ItemHistory::new();
+        for i in 0..200u32 {
+            h.feed_pty(format!("shell line {i:04}\r\n").as_bytes());
+        }
+        let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        let scrolled = screen_text(h.replay(80, 24, 50).screen, 24, 80);
+        assert_ne!(
+            live, scrolled,
+            "shell scrollback should expose older rows; if these match, \
+             vt100 isn't accumulating history"
+        );
+        // The scrolled-back view should reach further back than the
+        // live view — concretely, it shows lines ≤ 150 while live
+        // shows lines 176-199.
+        assert!(
+            scrolled.contains("shell line 0150") || scrolled.contains("shell line 0100"),
+            "scrolled view should show older line numbers, got rows:\n{scrolled}"
+        );
+        assert!(
+            live.contains("shell line 0199"),
+            "live view should show the most recent line, got rows:\n{live}"
+        );
+    }
+
+    /// claude (alt-screen) — with the shadow parser fix, the
+    /// shadow stays in normal-screen mode and accumulates the
+    /// pre-alt-screen content. Scrolling up exposes whatever was
+    /// on the main screen *before* claude grabbed it.
+    #[test]
+    fn claude_scrollback_shows_pre_alt_screen_history() {
+        let mut h = ItemHistory::new();
+        // Simulate a shell session that ran before launching
+        // claude — these lines should be reachable via the
+        // mouse-scroll-up shadow buffer.
+        for i in 0..50u32 {
+            h.feed_pty(format!("shell line before claude {i:04}\r\n").as_bytes());
+        }
+        // Now claude enters alt-screen and renders its TUI.
+        claude_feed_alt_screen(&mut h);
+        for i in 0..200u32 {
+            h.feed_pty(format!("\x1b[Halt line {i:04}\r\n").as_bytes());
+        }
+        let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        let scrolled = screen_text(h.replay(80, 24, 30).screen, 24, 80);
+        assert_ne!(
+            live, scrolled,
+            "shadow parser should expose pre-alt-screen content; \
+             live shows claude's alt-screen view, scrolled shows shell history"
+        );
+        assert!(
+            scrolled.contains("shell line before claude"),
+            "scrolled-back view should show shell content from before \
+             claude entered alt-screen, got:\n{scrolled}"
+        );
+        // Live view still shows claude's alt-screen content.
+        assert!(
+            live.contains("claude") || live.contains("alt line"),
+            "live view should still render claude's alt-screen output"
+        );
+    }
+
+    /// vt100 keeps `\x1b[2J`-cleared content in scrollback (the
+    /// `J` clears the visible viewport but does NOT truncate the
+    /// back-buffer). Documents the contract for the redraw shape
+    /// that codex's resize path uses; this case alone wouldn't
+    /// break the user's mouse-scroll experience.
+    #[test]
+    fn vt100_retains_pre_clear_lines_in_scrollback() {
+        let mut h = ItemHistory::new();
+        for i in 0..100u32 {
+            h.feed_pty(format!("pre {i:04}\r\n").as_bytes());
+        }
+        h.feed_pty(b"\x1b[2J\x1b[H");
+        for i in 0..5u32 {
+            h.feed_pty(format!("post {i:04}\r\n").as_bytes());
+        }
+        let scrolled = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        let scrolled_back = screen_text(h.replay(80, 24, 100).screen, 24, 80);
+        assert_ne!(scrolled, scrolled_back);
+        assert!(scrolled_back.contains("pre"),
+            "scrollback should still expose pre-clear lines");
+    }
+
+    /// codex-style normal-screen chat — natural `\r\n` lines flow
+    /// through both main and shadow parser. The shadow's
+    /// scrollback exposes older chat content when the user scrolls.
+    /// (The pure TUI-redraw case where the child *never* emits
+    /// `\r\n` still won't populate scrollback, but real codex chat
+    /// is line-based.)
+    #[test]
+    fn codex_scrollback_shows_chat_history() {
+        let mut h = ItemHistory::new();
+        for i in 0..200u32 {
+            h.feed_pty(
+                format!("\x1b[36muser\x1b[0m: chat msg {i:04}\r\n").as_bytes(),
+            );
+        }
+        let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        let scrolled = screen_text(h.replay(80, 24, 80).screen, 24, 80);
+        assert_ne!(live, scrolled, "scrollback should expose older chat lines");
+        // At scroll=80 with 24-row viewport over 200 messages,
+        // the viewport sits around msgs 96..=119. Anchor the
+        // assertion on something inside that window.
+        assert!(
+            scrolled.contains("chat msg 0100"),
+            "scrolled view should expose older messages around msg 0100, got:\n{scrolled}"
+        );
+    }
+
+    /// Edge case the shadow fix doesn't help: a true TUI-style
+    /// child that NEVER emits `\r\n` — every frame is pure cursor-
+    /// positioning + erase-line. Neither the main parser nor the
+    /// shadow accumulates scrollback (the shadow is fed the exact
+    /// same in-place redraw bytes the main one is). Documented so
+    /// the contract is explicit: scrollback shows the user what
+    /// "scrolled past", and nothing scrolled past in this case.
+    #[test]
+    fn pure_tui_redraw_still_has_empty_scrollback() {
+        let mut h = ItemHistory::new();
+        for turn in 0..50u32 {
+            h.feed_pty(b"\x1b[H");
+            for row in 0..10u32 {
+                h.feed_pty(format!("\x1b[{};1H\x1b[K", row + 1).as_bytes());
+                h.feed_pty(format!("turn {turn:03} row {row:02}").as_bytes());
+            }
+        }
+        let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        let scrolled = screen_text(h.replay(80, 24, 100).screen, 24, 80);
+        assert_eq!(
+            live, scrolled,
+            "with no natural newlines, scrollback has nothing to expose"
         );
     }
 }
