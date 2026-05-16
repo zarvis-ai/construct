@@ -25,6 +25,10 @@ const ADAPTER_DRAIN_CAP: usize = 256;
 /// Per-session PTY history kept in memory for late-attach replay.
 const PTY_RING_CAP: usize = 256 * 1024;
 
+fn should_resume_on_startup(state: SessionState) -> bool {
+    !matches!(state, SessionState::Done)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionEdge {
     Top,
@@ -295,8 +299,7 @@ impl SessionManager {
         for s in summaries {
             // Preserve the prior state in the entry. `resume_running_sessions`
             // (called from main after construction) tries to respawn each
-            // non-terminal session and falls back to marking Errored on
-            // failure — see clean_orphaned_after_resume.
+            // resumable session and falls back to marking Errored on failure.
             // Recover seq counter from transcript line count.
             let path = storage.transcript_path(&s.id);
             let count = if path.exists() {
@@ -717,8 +720,11 @@ impl SessionManager {
         }
     }
 
-    /// Re-spawn the adapter for every persisted session whose state was
-    /// non-terminal at the time of the previous shutdown. Each adapter
+    /// Re-spawn the adapter for every persisted session whose state is
+    /// resumable at daemon startup. `Done` sessions stay closed; `Errored`
+    /// sessions are retried because an error can mean the previous adapter or
+    /// machine died rather than the underlying agent conversation ending.
+    /// Each adapter
     /// receives `AGENTD_RESUME=1` in its env plus the same start params it
     /// was originally launched with (cwd, model, prompt, etc.) — the
     /// adapter decides what "resume" means for its harness. Sessions that
@@ -730,7 +736,7 @@ impl SessionManager {
             let mut v = Vec::new();
             for (id, entry) in guard.iter() {
                 let s = entry.summary.read().await;
-                if !s.state.is_terminal() {
+                if should_resume_on_startup(s.state) {
                     v.push(id.clone());
                 }
             }
@@ -842,8 +848,17 @@ impl SessionManager {
 
         *entry.adapter.lock().await = Some(adapter.clone());
 
-        // Notify clients that this session is alive again.
-        let snapshot = entry.summary.read().await.clone();
+        // Notify clients that this session is alive again. A resumed
+        // `Errored` session must stop looking terminal immediately so startup
+        // code (notably orchestrator creation) does not treat it as dead while
+        // waiting for the adapter's first Status event.
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.state = SessionState::Running;
+            s.pending_input = false;
+            s.clone()
+        };
+        let _ = self.storage.save_summary(&snapshot);
         let _ = self.broadcast.send(BroadcastMsg::State(
             StateNotificationPayload { session: snapshot },
         ));
@@ -1987,4 +2002,19 @@ async fn generate_auto_title(
         session: snapshot,
     }));
     tracing::info!(session = %entry.id, %title, "auto-title applied");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_resume_retries_errored_sessions() {
+        assert!(should_resume_on_startup(SessionState::Pending));
+        assert!(should_resume_on_startup(SessionState::Running));
+        assert!(should_resume_on_startup(SessionState::AwaitingInput));
+        assert!(should_resume_on_startup(SessionState::Paused));
+        assert!(should_resume_on_startup(SessionState::Errored));
+        assert!(!should_resume_on_startup(SessionState::Done));
+    }
 }
