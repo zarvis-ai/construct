@@ -2174,7 +2174,11 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let history = app.histories.entry(id.clone()).or_default();
-    let out = history.replay(chat_area.width, chat_area.height, 0);
+    let out = history.replay(
+        chat_area.width,
+        chat_area.height,
+        app.orchestrator_scrollback,
+    );
     let term = if editor_area.is_some() {
         let no_cursor = tui_term::widget::Cursor::default().visibility(false);
         tui_term::widget::PseudoTerminal::new(out.screen).cursor(no_cursor)

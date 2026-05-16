@@ -235,6 +235,11 @@ pub struct App {
     /// decreased by mouse-wheel down. Reset to 0 on user keystroke into
     /// the PTY or on session change.
     pub view_scrollback: usize,
+    /// Scrollback offset for the daemon-owned orchestrator panel rendered in
+    /// the minibuffer. Kept separate from `view_scrollback` so reading god
+    /// history does not leave the main session view scrolled when the panel
+    /// closes.
+    pub orchestrator_scrollback: usize,
     /// Per-session "last PTY byte" timestamp, updated locally from incoming
     /// Pty events. Used to drive the "session looks busy" spinner via a
     /// short quiescence window. Daemon's `SessionSummary.last_pty_at_ms`
@@ -545,6 +550,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         terminal_pane_size: (100, 30),
         zoom: initial_zoom,
         view_scrollback: 0,
+        orchestrator_scrollback: 0,
         pty_activity: HashMap::new(),
         start_instant: Instant::now(),
         layout: LayoutSnapshot::default(),
@@ -1447,8 +1453,8 @@ impl App {
         // tooltip, etc.) has a current position to render against.
         self.mouse_pos = Some((ev.column, ev.row));
         match ev.kind {
-            MouseEventKind::ScrollUp => self.adjust_scrollback(STEP),
-            MouseEventKind::ScrollDown => self.adjust_scrollback(-STEP),
+            MouseEventKind::ScrollUp => self.adjust_mouse_scrollback(ev.column, ev.row, STEP),
+            MouseEventKind::ScrollDown => self.adjust_mouse_scrollback(ev.column, ev.row, -STEP),
             MouseEventKind::Down(MouseButton::Left) => {
                 // List ↔ view divider: clicking the list pane's
                 // right border (col = list_width - 1), the view's
@@ -2086,12 +2092,45 @@ impl App {
     /// view is on a PTY-backed session in terminal mode. vt100 clamps the
     /// offset to its actual buffer size internally on `set_scrollback`.
     fn adjust_scrollback(&mut self, delta: i32) {
+        if self.is_orchestrator_panel_open() {
+            self.orchestrator_scrollback = adjusted_scrollback(self.orchestrator_scrollback, delta);
+            return;
+        }
         if self.view != ViewMode::Terminal || !self.in_pty_session() {
             return;
         }
-        let cur = self.view_scrollback as i32;
-        let next = (cur + delta).max(0).min(SCROLLBACK_MAX as i32);
-        self.view_scrollback = next as usize;
+        self.view_scrollback = adjusted_scrollback(self.view_scrollback, delta);
+    }
+
+    fn adjust_mouse_scrollback(&mut self, col: u16, row: u16, delta: i32) {
+        if self.is_orchestrator_panel_open() {
+            if let Some(area) = self.layout.minibuffer_area {
+                if col >= area.x
+                    && col < area.x + area.width
+                    && row >= area.y
+                    && row < area.y + area.height
+                {
+                    self.orchestrator_scrollback =
+                        adjusted_scrollback(self.orchestrator_scrollback, delta);
+                    return;
+                }
+            }
+        }
+        if self.view == ViewMode::Terminal && self.in_pty_session() {
+            self.view_scrollback = adjusted_scrollback(self.view_scrollback, delta);
+        }
+    }
+
+    fn is_orchestrator_panel_open(&self) -> bool {
+        matches!(
+            self.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::Orchestrator)
+        )
+    }
+
+    fn can_scroll_pty_history(&self) -> bool {
+        self.is_orchestrator_panel_open()
+            || (self.view == ViewMode::Terminal && self.in_pty_session())
     }
 
     /// Tell every relevant PTY child about the new pane geometry. The actual
@@ -2452,32 +2491,56 @@ impl App {
                 }
             }
             ScrollUp => {
-                if self.transcript_scroll != u16::MAX {
+                if self.can_scroll_pty_history() {
+                    self.adjust_scrollback(1);
+                } else if self.transcript_scroll != u16::MAX {
                     self.transcript_scroll = self.transcript_scroll.saturating_sub(1);
                 }
             }
             ScrollDown => {
-                if self.transcript_scroll != u16::MAX {
+                if self.can_scroll_pty_history() {
+                    self.adjust_scrollback(-1);
+                } else if self.transcript_scroll != u16::MAX {
                     self.transcript_scroll = self.transcript_scroll.saturating_add(1);
                 }
             }
             ScrollPageUp => {
-                if self.transcript_scroll == u16::MAX {
+                if self.can_scroll_pty_history() {
+                    self.adjust_scrollback(10);
+                } else if self.transcript_scroll == u16::MAX {
                     self.transcript_scroll = 0;
                 } else {
                     self.transcript_scroll = self.transcript_scroll.saturating_sub(10);
                 }
             }
             ScrollPageDown => {
-                if self.transcript_scroll != u16::MAX {
+                if self.can_scroll_pty_history() {
+                    self.adjust_scrollback(-10);
+                } else if self.transcript_scroll != u16::MAX {
                     self.transcript_scroll = self.transcript_scroll.saturating_add(10);
                 }
             }
             ScrollTop => {
-                self.transcript_scroll = 0;
+                if self.can_scroll_pty_history() {
+                    if self.is_orchestrator_panel_open() {
+                        self.orchestrator_scrollback = SCROLLBACK_MAX;
+                    } else {
+                        self.view_scrollback = SCROLLBACK_MAX;
+                    }
+                } else {
+                    self.transcript_scroll = 0;
+                }
             }
             ScrollBottom => {
-                self.transcript_scroll = u16::MAX;
+                if self.can_scroll_pty_history() {
+                    if self.is_orchestrator_panel_open() {
+                        self.orchestrator_scrollback = 0;
+                    } else {
+                        self.view_scrollback = 0;
+                    }
+                } else {
+                    self.transcript_scroll = u16::MAX;
+                }
             }
             ToggleHelp => {
                 self.help_visible = !self.help_visible;
@@ -2552,6 +2615,9 @@ impl App {
         }
         // Everything else goes to the orchestrator's PTY.
         if let Some(bytes) = encode_key_to_bytes(key) {
+            // Typing into god snaps back to live output, matching the main
+            // PTY pane's behavior.
+            self.orchestrator_scrollback = 0;
             if let Err(e) = self.client.pty_input(&orch_id, bytes).await {
                 self.set_status(format!("orchestrator pty_input: {e}"));
             }
@@ -2972,6 +3038,7 @@ impl App {
     /// falls back to the static command palette.
     pub fn open_minibuffer_for_command(&mut self) {
         if self.orchestrator_id.is_some() {
+            self.orchestrator_scrollback = 0;
             self.minibuffer = Some(Minibuffer {
                 prompt: "> ".to_string(),
                 input: String::new(),
@@ -3142,6 +3209,19 @@ mod tests {
             Some(Rect::new(0, 30, 100, 3))
         );
     }
+
+    #[test]
+    fn adjusted_scrollback_clamps_to_live_and_max() {
+        assert_eq!(adjusted_scrollback(0, -10), 0);
+        assert_eq!(adjusted_scrollback(5, -3), 2);
+        assert_eq!(adjusted_scrollback(5, 3), 8);
+        assert_eq!(adjusted_scrollback(SCROLLBACK_MAX - 1, 10), SCROLLBACK_MAX);
+    }
+}
+
+fn adjusted_scrollback(current: usize, delta: i32) -> usize {
+    let next = current as i32 + delta;
+    next.max(0).min(SCROLLBACK_MAX as i32) as usize
 }
 
 fn delete_back_char(mb: &mut Minibuffer) {
