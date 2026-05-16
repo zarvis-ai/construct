@@ -54,6 +54,9 @@ pub enum KeyAction {
     /// calls (zarvis) stop prompting for approvals when on. Bound to
     /// `C-x A` (emacs) / `A` (vim).
     ToggleAutomode,
+    /// Toggle terminal mouse capture. When disabled, native terminal
+    /// selection works; agentd mouse interactions are suspended.
+    ToggleMouseCapture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +233,8 @@ fn emacs() -> Keymap {
         (Chord(vec![key(KeyCode::PageUp)]), ScrollPageUp),
         // Toggle automode on the selected session (zarvis / future agents).
         (Chord(vec![ctrl('x'), shift('A')]), ToggleAutomode),
+        // Give the terminal mouse back for native text selection/copy.
+        (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
         // Help
         (Chord(vec![ch('?')]), ToggleHelp),
     ];
@@ -279,6 +284,7 @@ fn vim() -> Keymap {
         (Chord(vec![ch('g'), ch('g')]), ScrollTop),
         (Chord(vec![shift('G')]), ScrollBottom),
         (Chord(vec![shift('A')]), ToggleAutomode),
+        (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
         (Chord(vec![ch('?')]), ToggleHelp),
     ];
     Keymap { bindings }

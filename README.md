@@ -122,6 +122,8 @@ default — `C-x` is the escape prefix back to agentd commands.
 | `C-x C-p` / `C-x C-n` | reorder: move selected session up / down in the list (Meta-free; works in every terminal) |
 | `Shift-↑` / `Shift-↓` | same, in terminals that forward Shift with arrows (iTerm2, WezTerm, Alacritty, Kitty — **not** macOS Terminal.app default) |
 | `C-x A` | toggle automode on selected agent session (zarvis approval gate) |
+| mouse drag | select visible TUI text and copy it to the terminal clipboard |
+| `C-x m` | toggle mouse capture off/on for native terminal selection fallback |
 
 **In PTY-captured mode** (view focused on a PTY session), all keys pass
 through to the child *except* `C-x`, which starts a chord. So everything in

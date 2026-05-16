@@ -1,8 +1,8 @@
 //! Ratatui rendering for the TUI.
 
 use crate::app::{
-    App, HarnessHit, HintZone, ListItem as AppListItem, Minibuffer, MinibufferIntent,
-    PaneFocus, Selection, ViewMode, ZoomMode, SCROLLBACK_MAX,
+    App, HarnessHit, HintZone, ListItem as AppListItem, Minibuffer, MinibufferIntent, PaneFocus,
+    ScreenPoint, Selection, TextSelectionRange, ViewMode, ZoomMode,
 };
 use crate::keymap::KeyAction;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
@@ -18,10 +18,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     match app.zoom {
         ZoomMode::View => {
             render_zoomed_view(f, area, app);
+            finish_frame(f, app);
             return;
         }
         ZoomMode::List => {
             render_zoomed_list(f, area, app);
+            finish_frame(f, app);
             return;
         }
         ZoomMode::None => {}
@@ -47,8 +49,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // at the minimal `LIST_PANEL_W_COLLAPSED` (3 cells) instead — a
     // small strip with an expand affordance. Focus on the list
     // temporarily expands so the user can interact with it.
-    let effective_collapsed =
-        app.list_collapsed && app.focus != PaneFocus::List;
+    let effective_collapsed = app.list_collapsed && app.focus != PaneFocus::List;
     let list_w = if effective_collapsed {
         crate::app::LIST_PANEL_W_COLLAPSED
     } else {
@@ -82,7 +83,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
         // Honor the user's persisted preference when present; clamp
         // against the right pane so we never starve the main view on
         // a small terminal regardless of what was saved.
-        let upper = right_area.height.saturating_sub(10).max(crate::app::PIN_STRIP_H_MIN);
+        let upper = right_area
+            .height
+            .saturating_sub(10)
+            .max(crate::app::PIN_STRIP_H_MIN);
         let strip_h = app
             .pin_strip_h
             .map(|h| h.clamp(crate::app::PIN_STRIP_H_MIN, upper))
@@ -140,6 +144,176 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_tasks_popup(f, app);
     if app.help_visible {
         render_help(f, area);
+    }
+    finish_frame(f, app);
+}
+
+fn finish_frame(f: &mut Frame, app: &mut App) {
+    capture_frame_text(f, app);
+    render_text_selection(f, app);
+}
+
+fn capture_frame_text(f: &mut Frame, app: &mut App) {
+    let area = *f.buffer_mut().area();
+    let mut rows = Vec::with_capacity(area.height as usize);
+    for y in area.top()..area.bottom() {
+        let mut line = String::new();
+        for x in area.left()..area.right() {
+            let symbol = f
+                .buffer_mut()
+                .cell(Position { x, y })
+                .map(|c| c.symbol())
+                .unwrap_or(" ");
+            if symbol.is_empty() {
+                line.push(' ');
+            } else {
+                line.push_str(symbol);
+            }
+        }
+        rows.push(line);
+    }
+    app.frame_text = rows;
+}
+
+fn render_text_selection(f: &mut Frame, app: &App) {
+    let area = *f.buffer_mut().area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let style = Style::default().bg(Color::Blue).fg(Color::White);
+    if let Some(sel) = &app.text_selection {
+        if sel.dragged {
+            let (start, end) = normalized_points(sel.anchor, sel.head);
+            render_selection_rect(f, sel.bounds.unwrap_or(area), start, end, style);
+        }
+        return;
+    }
+    if let Some(text) = &app.selected_text {
+        for (row, start_col, end_col) in find_text_ranges(
+            &app.frame_text,
+            text,
+            app.selected_text_bounds,
+            app.selected_text_range,
+        ) {
+            let start = ScreenPoint {
+                col: start_col,
+                row,
+            };
+            let end = ScreenPoint { col: end_col, row };
+            render_selection_rect(
+                f,
+                app.selected_text_bounds.unwrap_or(area),
+                start,
+                end,
+                style,
+            );
+        }
+    }
+}
+
+fn render_selection_rect(
+    f: &mut Frame,
+    area: Rect,
+    start: ScreenPoint,
+    end: ScreenPoint,
+    style: Style,
+) {
+    let max_x = area.right().saturating_sub(1);
+    for row in start.row..=end.row {
+        if row < area.top() || row >= area.bottom() {
+            continue;
+        }
+        let x_start = if row == start.row {
+            start.col
+        } else {
+            area.left()
+        }
+        .clamp(area.left(), max_x);
+        let x_end = if row == end.row { end.col } else { max_x }.clamp(area.left(), max_x);
+        if x_end < x_start {
+            continue;
+        }
+        for x in x_start..=x_end {
+            if let Some(cell) = f.buffer_mut().cell_mut(Position { x, y: row }) {
+                cell.set_style(style);
+            }
+        }
+    }
+}
+
+fn find_text_ranges(
+    frame_text: &[String],
+    selected: &str,
+    bounds: Option<Rect>,
+    original: Option<TextSelectionRange>,
+) -> Vec<(u16, u16, u16)> {
+    let selected_lines: Vec<&str> = selected.lines().collect();
+    if selected_lines.is_empty() {
+        return Vec::new();
+    }
+    let first_row = bounds.map(|b| b.top() as usize).unwrap_or(0);
+    let end_row = bounds
+        .map(|b| b.bottom() as usize)
+        .unwrap_or(frame_text.len())
+        .min(frame_text.len());
+    let left_col = bounds.map(|b| b.left() as usize).unwrap_or(0);
+    let right_col = bounds.map(|b| b.right() as usize);
+    let mut matches = Vec::new();
+    'row: for row in first_row..end_row {
+        if row + selected_lines.len() > end_row {
+            break;
+        }
+        let mut ranges = Vec::with_capacity(selected_lines.len());
+        for (offset, wanted) in selected_lines.iter().enumerate() {
+            if wanted.is_empty() {
+                ranges.push(((row + offset) as u16, left_col as u16, left_col as u16));
+                continue;
+            }
+            let line = &frame_text[row + offset];
+            let line_cols = line.chars().count();
+            let search_left = left_col.min(line_cols);
+            let search_right = right_col.unwrap_or(line_cols).min(line_cols);
+            if search_left >= search_right {
+                continue 'row;
+            };
+            let prefix_bytes = byte_index_for_col(line, search_left);
+            let suffix_bytes = byte_index_for_col(line, search_right);
+            let haystack = &line[prefix_bytes..suffix_bytes];
+            let Some(byte_col) = haystack.find(wanted) else {
+                continue 'row;
+            };
+            let start_col = search_left + haystack[..byte_col].chars().count();
+            let end_col = start_col + wanted.chars().count().saturating_sub(1);
+            ranges.push(((row + offset) as u16, start_col as u16, end_col as u16));
+        }
+        matches.push(ranges);
+    }
+    let Some(original) = original else {
+        return matches.into_iter().next().unwrap_or_default();
+    };
+    matches
+        .into_iter()
+        .min_by_key(|ranges| {
+            ranges.first().map_or(u32::MAX, |(row, col, _)| {
+                original.start.row.abs_diff(*row) as u32 * 1024
+                    + original.start.col.abs_diff(*col) as u32
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn byte_index_for_col(line: &str, col: usize) -> usize {
+    line.char_indices()
+        .nth(col)
+        .map(|(i, _)| i)
+        .unwrap_or(line.len())
+}
+
+fn normalized_points(a: ScreenPoint, b: ScreenPoint) -> (ScreenPoint, ScreenPoint) {
+    if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
     }
 }
 
@@ -220,7 +394,9 @@ pub fn is_on_view_uncollapse_handle(app: &super::app::App, col: u16, row: u16) -
     if !(app.list_collapsed && app.focus != crate::app::PaneFocus::List) {
         return false;
     }
-    let Some(view) = app.layout.view_area else { return false; };
+    let Some(view) = app.layout.view_area else {
+        return false;
+    };
     col == view.x && row >= view.y && row < view.y + view.height
 }
 
@@ -244,7 +420,12 @@ fn render_button_tooltip(f: &mut Frame, label: &str, anchor_x: u16, anchor_y: u1
     if ty + h > total.y + total.height {
         ty = total.y + total.height.saturating_sub(h);
     }
-    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let rect = Rect {
+        x: tx,
+        y: ty,
+        width: w,
+        height: h,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -256,8 +437,12 @@ fn render_button_tooltip(f: &mut Frame, label: &str, anchor_x: u16, anchor_y: u1
 }
 
 fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
-    let Some(list) = app.layout.list_area else { return };
-    let Some((mx, my)) = app.mouse_pos else { return };
+    let Some(list) = app.layout.list_area else {
+        return;
+    };
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
     // Only when expanded — collapsed list has no `+` / `−`.
     if app.list_collapsed && app.focus != PaneFocus::List {
         return;
@@ -279,8 +464,12 @@ fn render_view_uncollapse_tooltip(f: &mut Frame, app: &App) {
     if !(app.list_collapsed && app.focus != PaneFocus::List) {
         return;
     }
-    let Some(view) = app.layout.view_area else { return };
-    let Some((mx, my)) = app.mouse_pos else { return };
+    let Some(view) = app.layout.view_area else {
+        return;
+    };
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
     if mx == view.x && my >= view.y && my < view.y + view.height {
         let (gx, gy) = view_uncollapse_glyph_pos(view);
         render_button_tooltip(f, " Expand list ", gx, gy);
@@ -347,13 +536,13 @@ fn hovered_pin_diamond<'a>(
 }
 
 fn render_pin_diamond_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
-    let Some((dx, dy, _summary)) = hovered_pin_diamond(app, pinned_ids) else { return };
+    let Some((dx, dy, _summary)) = hovered_pin_diamond(app, pinned_ids) else {
+        return;
+    };
 
     // Overlay the diamond cell in red+bold — same "about to unpin"
     // affordance the list-view diamond uses for pinned rows.
-    let overlay_style = Style::default()
-        .fg(Color::Red)
-        .add_modifier(Modifier::BOLD);
+    let overlay_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     f.buffer_mut().set_string(dx, dy, "⬩", overlay_style);
 
     let label = " Unpin session ";
@@ -372,7 +561,12 @@ fn render_pin_diamond_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
     if ty + h > total.y + total.height {
         ty = total.y + total.height.saturating_sub(h);
     }
-    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let rect = Rect {
+        x: tx,
+        y: ty,
+        width: w,
+        height: h,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -384,7 +578,9 @@ fn render_pin_diamond_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
 }
 
 fn render_view_close_tooltip(f: &mut Frame, app: &App) {
-    let Some(view_area) = app.layout.view_area else { return };
+    let Some(view_area) = app.layout.view_area else {
+        return;
+    };
     if !hovered_view_close_button(app, view_area) {
         return;
     }
@@ -402,7 +598,12 @@ fn render_view_close_tooltip(f: &mut Frame, app: &App) {
     if ty + h > total.y + total.height {
         ty = total.y + total.height.saturating_sub(h);
     }
-    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let rect = Rect {
+        x: tx,
+        y: ty,
+        width: w,
+        height: h,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -418,11 +619,13 @@ fn render_view_close_tooltip(f: &mut Frame, app: &App) {
 /// click did nothing. Available harnesses don't get one; the
 /// underline + click-submit affordance is self-explanatory.
 fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
-    let Some((mx, my)) = app.mouse_pos else { return };
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
     let hits = &app.layout.minibuffer_harness_hits;
-    let hit = hits.iter().find(|h| {
-        h.y == my && mx >= h.x_start && mx < h.x_end && !h.available
-    });
+    let hit = hits
+        .iter()
+        .find(|h| h.y == my && mx >= h.x_start && mx < h.x_end && !h.available);
     let Some(hit) = hit else { return };
     let label = format!(" {} — not installed ", hit.name);
     let total = f.area();
@@ -436,7 +639,12 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
         tx = total.x + total.width.saturating_sub(w);
     }
     let ty = hit.y.saturating_sub(h);
-    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let rect = Rect {
+        x: tx,
+        y: ty,
+        width: w,
+        height: h,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -451,12 +659,7 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
 /// clickable span. Records per-name column ranges in
 /// `app.layout.minibuffer_harness_hits` so the click handler can
 /// submit the picked name without the user having to type it.
-fn render_harness_picker(
-    f: &mut Frame,
-    area: Rect,
-    app: &mut App,
-    mb: &Minibuffer,
-) {
+fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuffer) {
     // Show every registered harness plus the synthetic `group` op.
     // Unavailable harnesses (binary not on PATH) render dimmed and
     // strike-through; clicking them no-ops + drops a status note;
@@ -469,8 +672,9 @@ fn render_harness_picker(
     entries.push(("group".to_string(), true));
 
     let (hovered_x, hovered_y) = app.mouse_pos.unwrap_or((u16::MAX, u16::MAX));
-    let base_available =
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+    let base_available = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
     let hover_available = Style::default()
         .fg(Color::White)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
@@ -497,8 +701,7 @@ fn render_harness_picker(
         let w = UnicodeWidthStr::width(name.as_str()) as u16;
         let x_start = col;
         let x_end = col + w;
-        let hovered =
-            hovered_y == area.y && hovered_x >= x_start && hovered_x < x_end;
+        let hovered = hovered_y == area.y && hovered_x >= x_start && hovered_x < x_end;
         let style = match (*available, hovered) {
             (true, true) => hover_available,
             (true, false) => base_available,
@@ -523,28 +726,28 @@ fn render_harness_picker(
     spans.push(Span::raw(mb.input.clone()));
     if let Some(err) = &mb.error {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
-        ));
+        spans.push(Span::styled(err.clone(), Style::default().fg(Color::Red)));
     }
     let para = Paragraph::new(Line::from(spans));
     f.render_widget(para, area);
     // Cursor on the input — same shape as the default minibuffer
     // render uses.
     let cursor_x = input_x + mb.cursor as u16;
-    f.set_cursor_position(Position { x: cursor_x, y: area.y });
+    f.set_cursor_position(Position {
+        x: cursor_x,
+        y: area.y,
+    });
 }
 
 fn render_diamond_tooltip(f: &mut Frame, app: &App) {
-    let Some((dx, dy, summary)) = hovered_diamond(app) else { return };
+    let Some((dx, dy, summary)) = hovered_diamond(app) else {
+        return;
+    };
 
     // Shadow / highlight diamond on the hover cell. Pinned → dimmed
     // red (about to remove); unpinned → faint yellow (preview pin).
     let overlay_style = if summary.pinned {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
         Style::default()
             .fg(Color::Yellow)
@@ -572,7 +775,12 @@ fn render_diamond_tooltip(f: &mut Frame, app: &App) {
     if ty + h > total.y + total.height {
         ty = total.y + total.height.saturating_sub(h);
     }
-    let rect = Rect { x: tx, y: ty, width: w, height: h };
+    let rect = Rect {
+        x: tx,
+        y: ty,
+        width: w,
+        height: h,
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
@@ -586,7 +794,6 @@ fn render_diamond_tooltip(f: &mut Frame, app: &App) {
 fn pin_strip_height(total_h: u16) -> u16 {
     (total_h / 3).clamp(7, 18)
 }
-
 
 /// Zoom layout: the session view takes the entire screen except for the
 /// minibuffer line at the bottom. No list, no pin strip, no modeline, no
@@ -656,8 +863,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == PaneFocus::List;
     // Collapsed render path: a thin column with a `>` expand glyph
     // on the top border. Anywhere inside the pane click-expands.
-    let effective_collapsed =
-        app.list_collapsed && !focused;
+    let effective_collapsed = app.list_collapsed && !focused;
     if effective_collapsed {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -696,8 +902,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Style::default().fg(Color::Gray)
     };
-    let collapse_line = Line::from(Span::styled(" − ", minus_style))
-        .alignment(ratatui::layout::Alignment::Right);
+    let collapse_line =
+        Line::from(Span::styled(" − ", minus_style)).alignment(ratatui::layout::Alignment::Right);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(focused))
@@ -717,7 +923,10 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                 selected_idx = Some(i);
             }
             match item {
-                AppListItem::Session { summary: s, indented } => {
+                AppListItem::Session {
+                    summary: s,
+                    indented,
+                } => {
                     let pin_glyph = if s.pinned { "⬩" } else { " " };
                     let indent_prefix = if *indented { "  " } else { "" };
                     // Fixed-width left side: indent + pin (1) + " glyph " (3).
@@ -726,51 +935,37 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                     let harness_w = harness.chars().count();
                     // Always leave at least one cell of gap between the name
                     // and the right-aligned harness.
-                    let name_avail =
-                        row_w.saturating_sub(prefix_w + 1 + harness_w);
+                    let name_avail = row_w.saturating_sub(prefix_w + 1 + harness_w);
                     let raw_name = primary_label(s);
                     let scroll = if is_selected && focused {
                         // ~6 chars/sec (was 5; +20% per user feedback).
-                        Some(
-                            (app.start_instant.elapsed().as_millis() / 167)
-                                as usize,
-                        )
+                        Some((app.start_instant.elapsed().as_millis() / 167) as usize)
                     } else {
                         None
                     };
                     let name_display = fit_name(&raw_name, name_avail, scroll);
                     let name_display_w = name_display.chars().count();
-                    let gap = row_w
-                        .saturating_sub(prefix_w + name_display_w + harness_w);
+                    let gap = row_w.saturating_sub(prefix_w + name_display_w + harness_w);
                     let gap_str: String = " ".repeat(gap);
                     ListItem::new(Line::from(vec![
                         Span::raw(indent_prefix.to_string()),
-                        Span::styled(
-                            pin_glyph.to_string(),
-                            Style::default().fg(Color::Yellow),
-                        ),
+                        Span::styled(pin_glyph.to_string(), Style::default().fg(Color::Yellow)),
                         Span::styled(
                             format!(" {} ", session_status_glyph(app, s)),
                             state_style(s.state),
                         ),
-                        Span::styled(
-                            name_display,
-                            Style::default().fg(Color::White),
-                        ),
+                        Span::styled(name_display, Style::default().fg(Color::White)),
                         Span::raw(gap_str),
-                        Span::styled(
-                            harness.to_string(),
-                            Style::default().fg(Color::Cyan),
-                        ),
+                        Span::styled(harness.to_string(), Style::default().fg(Color::Cyan)),
                     ]))
                 }
-                AppListItem::GroupHeader { group, member_count } => {
+                AppListItem::GroupHeader {
+                    group,
+                    member_count,
+                } => {
                     let glyph = if group.collapsed { "▶" } else { "▼" };
                     ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!("{glyph} "),
-                            Style::default().fg(Color::Magenta),
-                        ),
+                        Span::styled(format!("{glyph} "), Style::default().fg(Color::Magenta)),
                         Span::styled(
                             group.name.clone(),
                             Style::default()
@@ -794,9 +989,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
             .fg(Color::White)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White)
+        Style::default().bg(Color::DarkGray).fg(Color::White)
     };
     let mut state = ListState::default();
     state.select(if matches!(app.selection, Selection::None) {
@@ -804,7 +997,9 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     } else {
         selected_idx
     });
-    let list = List::new(items).block(block).highlight_style(highlight_style);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style);
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -877,8 +1072,8 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(Color::White)
     };
-    let close = Line::from(Span::styled(" x ", close_style))
-        .alignment(ratatui::layout::Alignment::Right);
+    let close =
+        Line::from(Span::styled(" x ", close_style)).alignment(ratatui::layout::Alignment::Right);
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(pane_border_style(focused))
@@ -919,14 +1114,12 @@ fn render_group_overview(
         .filter(|s| s.group_id.as_deref() == Some(group.id.as_str()))
         .collect();
     let mut lines: Vec<Line> = Vec::with_capacity(members.len() + 3);
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("Group: {}", group.name),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        format!("Group: {}", group.name),
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )]));
     lines.push(Line::from(format!(
         "  {} member(s){}",
         members.len(),
@@ -956,7 +1149,9 @@ fn render_group_overview(
 }
 
 fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
-    let Some(id) = app.selected_id() else { return; };
+    let Some(id) = app.selected_id() else {
+        return;
+    };
     let scroll = app.view_scrollback;
     // Only adapters that publish `SessionEvent::EditorState` (currently
     // zarvis interactive) get the fixed editor pane at the bottom.
@@ -966,17 +1161,18 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let (chat_area, editor_area) = if let Some(es) = &editor_state {
         // Each queued entry may itself be multi-line — sum the line
         // counts so a 3-line queued thought reserves 3 rows.
-        let queued_lines: usize = es
-            .queued
-            .iter()
-            .map(|s| s.split('\n').count().max(1))
-            .sum();
+        let queued_lines: usize = es.queued.iter().map(|s| s.split('\n').count().max(1)).sum();
         let buf_lines = es.buf.lines().count().max(1);
         let raw_rows = queued_lines + 1 + buf_lines;
         let editor_rows: u16 = (raw_rows as u16).min(area.height.saturating_sub(1));
         let chat_height = area.height.saturating_sub(editor_rows);
         (
-            Rect { x: area.x, y: area.y, width: area.width, height: chat_height },
+            Rect {
+                x: area.x,
+                y: area.y,
+                width: area.width,
+                height: chat_height,
+            },
             Some(Rect {
                 x: area.x,
                 y: area.y + chat_height,
@@ -1034,7 +1230,9 @@ fn render_editor_pane(
     }
     let queued_style = Style::default().fg(Color::DarkGray);
     let queued_glyph_style = queued_style.add_modifier(Modifier::BOLD);
-    let active_glyph_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let active_glyph_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let prompt_w: u16 = 2;
 
     let total_rows = area.height as usize;
@@ -1049,7 +1247,12 @@ fn render_editor_pane(
             if remaining <= 1 {
                 break 'queued;
             }
-            let row = Rect { x: area.x, y, width: area.width, height: 1 };
+            let row = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
             let spans = if first {
                 first = false;
                 vec![
@@ -1083,7 +1286,12 @@ fn render_editor_pane(
     let mut cursor_pos: Option<(u16, u16)> = None;
     let mut char_seen = 0usize;
     for (i, line) in buf_lines.iter().enumerate().take(remaining) {
-        let row = Rect { x: area.x, y, width: area.width, height: 1 };
+        let row = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
         let para = if i == 0 {
             Paragraph::new(Line::from(vec![
                 Span::styled("❯ ", active_glyph_style),
@@ -1180,17 +1388,10 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!("({})  ", app.chord_label)
         },
-        status = app
-            .status
-            .as_ref()
-            .map(|(m, _)| m.as_str())
-            .unwrap_or(""),
+        status = app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or(""),
     );
-    let para = Paragraph::new(modeline).style(
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(Color::White),
-    );
+    let para =
+        Paragraph::new(modeline).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(para, area);
 }
 
@@ -1239,16 +1440,10 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             render_harness_picker(f, area, app, &mb_clone);
             return;
         }
-        let mut spans = vec![
-            Span::raw(mb.prompt.clone()),
-            Span::raw(mb.input.clone()),
-        ];
+        let mut spans = vec![Span::raw(mb.prompt.clone()), Span::raw(mb.input.clone())];
         if let Some(err) = &mb.error {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                err.clone(),
-                Style::default().fg(Color::Red),
-            ));
+            spans.push(Span::styled(err.clone(), Style::default().fg(Color::Red)));
         }
         let para = Paragraph::new(Line::from(spans));
         f.render_widget(para, area);
@@ -1315,9 +1510,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         let x_start = col;
         let x_end = col + w;
         let hovered = match mouse {
-            Some((mx, my)) => {
-                my == area.y && mx >= x_start && mx < x_end
-            }
+            Some((mx, my)) => my == area.y && mx >= x_start && mx < x_end,
             None => false,
         };
         let style = if hovered { hover_style } else { base_style };
@@ -1346,11 +1539,16 @@ fn render_help(f: &mut Frame, area: Rect) {
     let target_w = 92u16;
     let width = target_w.min(area.width.saturating_sub(2 * MARGIN + 4));
     // Content height = lines + 2 borders + 2 vertical padding.
-    let height = (HELP_TEXT.lines().count() as u16 + 4)
-        .min(area.height.saturating_sub(2 * MARGIN + 2));
+    let height =
+        (HELP_TEXT.lines().count() as u16 + 4).min(area.height.saturating_sub(2 * MARGIN + 2));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let popup = Rect { x, y, width, height };
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     // Outer rect = popup grown by `MARGIN` cells on each side. We
     // Clear *this* so the gap between the popup's border and any
     // background content paints blank — without that, foreground
@@ -1403,6 +1601,10 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
     C-x C-n         move selected session down
     Shift-up/down   same, in terminals that pass Shift to arrows
                     (iTerm2/WezTerm/Alacritty yes; macOS Terminal.app no)
+
+  mouse
+    drag text       select visible TUI text and copy to terminal clipboard
+    C-x m           toggle mouse capture off/on for native selection fallback
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
@@ -1481,10 +1683,7 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             format!("   $ ${:.4} (in={} out={})", usd, tokens_in, tokens_out),
             Style::default().fg(Color::DarkGray),
         )],
-        SessionEvent::Diff { patch } => vec![Span::raw(format!(
-            "   Δ {}",
-            shorten(patch, 200)
-        ))],
+        SessionEvent::Diff { patch } => vec![Span::raw(format!("   Δ {}", shorten(patch, 200)))],
         SessionEvent::Error { message } => vec![Span::styled(
             format!("   ! {message}"),
             Style::default().fg(Color::Red),
@@ -1497,13 +1696,21 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             format!("   ⌷ pty: {} bytes (switch to terminal view)", data.len()),
             Style::default().fg(Color::DarkGray),
         )],
-        SessionEvent::ToolApprovalRequest { tool, args_summary, risk, .. } => {
+        SessionEvent::ToolApprovalRequest {
+            tool,
+            args_summary,
+            risk,
+            ..
+        } => {
             let risk_label = match risk {
                 agentd_protocol::ToolRisk::Safe => "safe",
                 agentd_protocol::ToolRisk::Risky => "risky",
             };
             vec![Span::styled(
-                format!("   ? approve [{risk_label}] {tool}({})", shorten(args_summary, 160)),
+                format!(
+                    "   ? approve [{risk_label}] {tool}({})",
+                    shorten(args_summary, 160)
+                ),
                 Style::default().fg(Color::Yellow),
             )]
         }
@@ -1647,8 +1854,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
             render_pty_tail(f, inner, out.screen);
         } else {
             // No PTY data yet — show a placeholder.
-            let p = Paragraph::new("(no data yet)")
-                .style(Style::default().fg(Color::DarkGray));
+            let p = Paragraph::new("(no data yet)").style(Style::default().fg(Color::DarkGray));
             f.render_widget(p, inner);
         }
     }
@@ -1658,8 +1864,9 @@ pub fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
     let n = n.max(1);
     let cols = n.min(4).max(1);
     let rows = (n + cols - 1) / cols;
-    let row_constraints: Vec<Constraint> =
-        (0..rows).map(|_| Constraint::Ratio(1, rows as u32)).collect();
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Ratio(1, rows as u32))
+        .collect();
     let row_areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
@@ -1788,7 +1995,9 @@ fn state_style(state: SessionState) -> Style {
 
 fn role_style(role: MessageRole) -> Style {
     match role {
-        MessageRole::User => Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        MessageRole::User => Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
         MessageRole::Assistant => Style::default().fg(Color::LightGreen),
         MessageRole::System => Style::default().fg(Color::DarkGray),
         MessageRole::Tool => Style::default().fg(Color::Yellow),
@@ -1872,8 +2081,17 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::TaskStart { tool, call_id, .. } => format!("task-start {tool} {call_id}"),
         SessionEvent::TaskBackgrounded { call_id } => format!("task-bg {call_id}"),
         SessionEvent::TaskEnd { call_id, ok, .. } => format!("task-end {call_id} ok={ok}"),
-        SessionEvent::EditorState { queued, buf, cursor } => {
-            format!("editor: q={} buf={}b cur={}", queued.len(), buf.len(), cursor)
+        SessionEvent::EditorState {
+            queued,
+            buf,
+            cursor,
+        } => {
+            format!(
+                "editor: q={} buf={}b cur={}",
+                queued.len(),
+                buf.len(),
+                cursor
+            )
         }
     }
 }
@@ -1927,17 +2145,18 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     // and the editor was invisible (zarvis stopped painting it).
     let editor_state = app.editor_states.get(&id).cloned();
     let (chat_area, editor_area) = if let Some(es) = &editor_state {
-        let queued_lines: usize = es
-            .queued
-            .iter()
-            .map(|s| s.split('\n').count().max(1))
-            .sum();
+        let queued_lines: usize = es.queued.iter().map(|s| s.split('\n').count().max(1)).sum();
         let buf_lines = es.buf.lines().count().max(1);
         let raw_rows = queued_lines + 1 + buf_lines;
         let editor_rows: u16 = (raw_rows as u16).min(inner.height.saturating_sub(1));
         let chat_height = inner.height.saturating_sub(editor_rows);
         (
-            Rect { x: inner.x, y: inner.y, width: inner.width, height: chat_height },
+            Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: chat_height,
+            },
             Some(Rect {
                 x: inner.x,
                 y: inner.y + chat_height,
@@ -1972,7 +2191,9 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
 /// running task. Future iterations can wire per-row kill buttons
 /// here without changing the data model.
 fn render_tasks_popup(f: &mut Frame, app: &App) {
-    let Some(popup) = app.tasks_popup.as_ref() else { return };
+    let Some(popup) = app.tasks_popup.as_ref() else {
+        return;
+    };
     let total = f.area();
     let w = total.width.saturating_sub(8).min(90);
     let h = total
@@ -1984,7 +2205,12 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
     }
     let x = total.x + (total.width.saturating_sub(w)) / 2;
     let y = total.y + (total.height.saturating_sub(h)) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     let title = format!(
         " tasks — session {} ({} entries) — Esc to close ",
         short_id(&popup.session_id),
@@ -1995,7 +2221,9 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(Span::styled(
             title,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
@@ -2027,20 +2255,17 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
         };
         let elapsed_ms = t.ended_at_ms.unwrap_or(now_ms) - t.started_at_ms;
         let elapsed = format!("{:.1}s", (elapsed_ms.max(0)) as f64 / 1000.0);
-        let title_text: String = t
-            .args_summary
-            .chars()
-            .take(40)
-            .collect();
+        let title_text: String = t.args_summary.chars().take(40).collect();
         let body = format!(
             " {state_glyph}  {tool:<20}  {args:<40}  {elapsed:>7}",
             tool = t.tool.chars().take(20).collect::<String>(),
             args = title_text,
             elapsed = elapsed,
         );
-        lines.push(Line::from(vec![
-            Span::styled(body, Style::default().fg(state_color)),
-        ]));
+        lines.push(Line::from(vec![Span::styled(
+            body,
+            Style::default().fg(state_color),
+        )]));
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
@@ -2086,5 +2311,47 @@ mod tests {
             "dim cell must carry DIM modifier — without it the pin \
              tile renders zarvis's gray markers at full intensity"
         );
+    }
+
+    #[test]
+    fn find_text_ranges_respects_selection_bounds() {
+        let frame = vec![
+            "outside match".to_string(),
+            "  inside match  ".to_string(),
+            "outside match".to_string(),
+        ];
+
+        let ranges = find_text_ranges(
+            &frame,
+            "inside",
+            Some(Rect::new(2, 1, 12, 1)),
+            None,
+        );
+
+        assert_eq!(ranges, vec![(1, 2, 7)]);
+        assert!(find_text_ranges(
+            &frame,
+            "outside",
+            Some(Rect::new(2, 1, 12, 1)),
+            None,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn find_text_ranges_prefers_duplicate_nearest_original_range() {
+        let frame = vec![
+            "same target".to_string(),
+            "filler".to_string(),
+            "same target".to_string(),
+        ];
+        let original = TextSelectionRange {
+            start: ScreenPoint { col: 5, row: 2 },
+            end: ScreenPoint { col: 10, row: 2 },
+        };
+
+        let ranges = find_text_ranges(&frame, "target", None, Some(original));
+
+        assert_eq!(ranges, vec![(2, 5, 10)]);
     }
 }
