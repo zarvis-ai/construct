@@ -1377,4 +1377,313 @@ mod tests {
             "steady-state replay avg too slow: {avg_us} µs/frame after {first_ms} µs bootstrap"
         );
     }
+
+    // ============================================================
+    // Per-harness regression suite
+    //
+    // Each agentd-supported harness writes to the PTY in a different
+    // shape (shell = plain stdout, claude = alt-screen TUI, zarvis =
+    // chat + tool blocks, orchestrator = chat + EditorState, codex =
+    // normal-screen TUI with accumulated history). Bugs that show up
+    // in one frequently don't show up in another — these tests pin
+    // each pattern's expected behavior so a future change can't
+    // silently regress one harness while the other three still look
+    // fine in manual testing.
+    //
+    // Scenarios per harness:
+    //   * "after bootstrap" — TUI restart path: a single big
+    //     `feed_pty` (the `pty_replay` snapshot from the daemon)
+    //     followed by `replay`. Asserts the screen reflects the
+    //     content, no panic, no garbage.
+    //   * "after resize" — pane dims change between `replay` calls.
+    //     Asserts the screen still reflects the content correctly.
+    //   * "typing perf" — many small events arriving on top of a
+    //     populated history; per-event cost stays bounded.
+    //   * "resize perf" — cost of resizing an already-populated
+    //     session. Currently passes for sessions whose accumulated
+    //     `pending_chunk` is small (shell / zarvis / orchestrator /
+    //     claude-via-alt-screen) and FAILS for codex (which
+    //     accumulates a lot of normal-screen content).
+    // ============================================================
+
+    use std::time::Instant;
+
+    /// Heuristic for "did this `replay` re-feed the whole history?".
+    /// Returns the wall time the call took. If a rebuild fired it
+    /// scales with history size (10s of ms at MB scale); incremental
+    /// `set_size`-only calls return in single-digit µs.
+    fn time_replay(h: &mut ItemHistory, cols: u16, rows: u16) -> u128 {
+        let t = Instant::now();
+        let _ = h.replay(cols, rows, 0);
+        t.elapsed().as_micros()
+    }
+
+    // ----- shell (`bash`-style: plain stdout, small history) -----
+
+    fn shell_feed_minimal(h: &mut ItemHistory) {
+        // Tiny shell session: prompt + a couple of commands.
+        h.feed_pty(b"$ ls\r\nfile_a  file_b  file_c\r\n$ pwd\r\n/home/user\r\n$ ");
+    }
+
+    #[test]
+    fn shell_renders_after_bootstrap() {
+        let mut h = ItemHistory::new();
+        shell_feed_minimal(&mut h);
+        let out = h.replay(80, 24, 0);
+        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        assert_eq!(cell, "$", "shell prompt should be on row 0 col 0");
+    }
+
+    #[test]
+    fn shell_renders_after_resize() {
+        let mut h = ItemHistory::new();
+        shell_feed_minimal(&mut h);
+        let _ = h.replay(80, 24, 0);
+        let out = h.replay(120, 30, 0);
+        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        assert_eq!(cell, "$", "content survives shell session resize");
+    }
+
+    #[test]
+    fn shell_typing_is_fast() {
+        let mut h = ItemHistory::new();
+        shell_feed_minimal(&mut h);
+        let _ = h.replay(80, 24, 0);
+        let t = Instant::now();
+        for _ in 0..200 {
+            h.feed_pty(b"x");
+            let _ = h.replay(80, 24, 0);
+        }
+        let us = t.elapsed().as_micros();
+        assert!(us < 50_000, "200 typing events at shell-scale: {us} µs");
+    }
+
+    // ----- claude (alt-screen TUI) -----
+
+    fn claude_feed_alt_screen(h: &mut ItemHistory) {
+        // Enter alt screen, draw a few status lines, leave the
+        // cursor at a known position. Real claude does much more,
+        // but the *shape* (alt-screen + small bounded content) is
+        // what matters for our parser.
+        h.feed_pty(b"\x1b[?1049h"); // enter alt screen
+        h.feed_pty(b"\x1b[H");      // cursor home
+        h.feed_pty(b"claude\r\n");
+        h.feed_pty(b"> hello\r\n");
+        h.feed_pty(b"\x1b[2;1H");   // status row
+    }
+
+    #[test]
+    fn claude_renders_after_bootstrap() {
+        let mut h = ItemHistory::new();
+        claude_feed_alt_screen(&mut h);
+        let out = h.replay(80, 24, 0);
+        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        assert_eq!(cell, "c", "claude banner present in alt-screen buffer");
+    }
+
+    #[test]
+    fn claude_renders_after_resize() {
+        let mut h = ItemHistory::new();
+        claude_feed_alt_screen(&mut h);
+        let _ = h.replay(80, 24, 0);
+        let out = h.replay(120, 30, 0);
+        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        assert_eq!(cell, "c", "claude content survives resize");
+    }
+
+    /// claude's alt-screen content is bounded by the viewport, so
+    /// resizing should not be expensive even if the session has
+    /// existed for a while.
+    #[test]
+    fn claude_resize_is_cheap() {
+        let mut h = ItemHistory::new();
+        claude_feed_alt_screen(&mut h);
+        // Simulate some passage of time / additional small redraws.
+        for i in 0..200 {
+            h.feed_pty(b"\x1b[H");
+            h.feed_pty(format!("line {i}\r\n").as_bytes());
+        }
+        let _ = h.replay(80, 24, 0);
+        let t = Instant::now();
+        let _ = h.replay(120, 30, 0);
+        let us = t.elapsed().as_micros();
+        assert!(us < 5_000, "claude resize too slow: {us} µs (expected <5ms)");
+    }
+
+    // ----- zarvis (chat text + occasional tool blocks) -----
+
+    fn zarvis_feed_chat(h: &mut ItemHistory) {
+        // A few chat exchanges. zarvis bytes look much like a plain
+        // CLI for the chat portion — the special bits are
+        // tool-block events (TaskStart/feed_tool_use), not OSC
+        // markers anymore. Use OSC here to exercise the tool-block
+        // path so this hits `replay_full`.
+        h.feed_pty(b"\xe2\x9d\xaf hi\r\n");
+        h.feed_pty(b"\xe2\x97\x8f hello -- what can I do?\r\n");
+        h.feed_tool_use("shell".into(), "ls".into());
+        h.feed_pty(b"\x1b]7700;open;call=z1\x07x\x1b]7700;close;call=z1\x07");
+        h.feed_tool_result("z1", true, "file_a\nfile_b".into());
+        h.feed_pty(b"\xe2\x97\x8f done.\r\n");
+    }
+
+    #[test]
+    fn zarvis_renders_after_bootstrap() {
+        let mut h = ItemHistory::new();
+        zarvis_feed_chat(&mut h);
+        let out = h.replay(80, 24, 0);
+        // Don't assert exact cells (tool-block synth shifts rows);
+        // just confirm we have a block recorded.
+        assert!(!out.blocks.is_empty(), "zarvis tool block should be hit-testable");
+    }
+
+    #[test]
+    fn zarvis_renders_after_resize() {
+        let mut h = ItemHistory::new();
+        zarvis_feed_chat(&mut h);
+        let _ = h.replay(80, 24, 0);
+        let out = h.replay(120, 30, 0);
+        assert!(!out.blocks.is_empty(), "zarvis blocks survive resize");
+    }
+
+    #[test]
+    fn zarvis_resize_steady_state_is_cheap() {
+        let mut h = ItemHistory::new();
+        zarvis_feed_chat(&mut h);
+        // Warm the cache at the post-bootstrap state.
+        let _ = h.replay(80, 24, 0);
+        let _ = h.replay(80, 24, 0);
+        // Resize (cols change). Since this session has tool blocks
+        // it goes through `replay_full`, which uses signature-based
+        // incremental — but cols change does invalidate at the
+        // moment. Document the current bound rather than asserting
+        // it's free.
+        let t = Instant::now();
+        let _ = h.replay(120, 30, 0);
+        let us = t.elapsed().as_micros();
+        assert!(us < 5_000, "zarvis resize too slow: {us} µs");
+    }
+
+    // ----- orchestrator / minibuffer (zarvis-like content, no
+    // tool blocks in the common case) -----
+
+    fn orchestrator_feed(h: &mut ItemHistory) {
+        // Orchestrator chat + a single observation echo. No tool
+        // blocks (those are rare in orchestrator). Treated as a
+        // shell-like history through `replay_cached`.
+        for _ in 0..50 {
+            h.feed_pty(b"orchestrator observation log entry...\r\n");
+        }
+        h.feed_pty(b"> ");
+    }
+
+    #[test]
+    fn orchestrator_renders_after_bootstrap() {
+        let mut h = ItemHistory::new();
+        orchestrator_feed(&mut h);
+        let out = h.replay(60, 6, 0);
+        let cell = out.screen.cell(5, 0).map(|c| c.contents()).unwrap_or_default();
+        assert!(!cell.is_empty(), "orchestrator panel last row populated");
+    }
+
+    #[test]
+    fn orchestrator_resize_is_cheap() {
+        let mut h = ItemHistory::new();
+        orchestrator_feed(&mut h);
+        let _ = h.replay(60, 6, 0);
+        let t = Instant::now();
+        let _ = h.replay(80, 8, 0);
+        let us = t.elapsed().as_micros();
+        assert!(us < 5_000, "orchestrator panel resize too slow: {us} µs");
+    }
+
+    // ----- codex (normal-screen, accumulated history) -----
+
+    fn codex_feed_long_session(h: &mut ItemHistory) {
+        // Codex doesn't use alt-screen by default; its bytes stack
+        // up in the main scrollback. After a real session of any
+        // length the `pending_chunk` is megabytes of conversation +
+        // tool output. Simulate that scale here.
+        let mut buf = Vec::with_capacity(1_500_000);
+        for i in 0..30_000u32 {
+            buf.extend_from_slice(b"\x1b[36muser\x1b[0m: hi from line ");
+            buf.extend_from_slice(i.to_string().as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            buf.extend_from_slice(b"\x1b[32massistant\x1b[0m: doing the thing\r\n");
+        }
+        h.feed_pty(&buf);
+    }
+
+    /// Count how many of the visible screen rows have ANY non-blank
+    /// cell. Useful as a "history is on screen" check that doesn't
+    /// depend on the exact cursor position.
+    fn populated_rows(screen: &vt100::Screen, rows: u16, cols: u16) -> usize {
+        (0..rows)
+            .filter(|&r| {
+                (0..cols).any(|c| {
+                    screen
+                        .cell(r, c)
+                        .map(|cell| !cell.contents().is_empty() && cell.contents() != " ")
+                        .unwrap_or(false)
+                })
+            })
+            .count()
+    }
+
+    #[test]
+    fn codex_renders_after_bootstrap() {
+        let mut h = ItemHistory::new();
+        codex_feed_long_session(&mut h);
+        let out = h.replay(80, 24, 0);
+        let n = populated_rows(out.screen, 24, 80);
+        assert!(
+            n >= 20,
+            "expected most rows to show codex history, got {n}/24 populated"
+        );
+    }
+
+    #[test]
+    fn codex_renders_after_resize() {
+        let mut h = ItemHistory::new();
+        codex_feed_long_session(&mut h);
+        let _ = h.replay(80, 24, 0);
+        let out = h.replay(120, 30, 0);
+        let n = populated_rows(out.screen, 30, 120);
+        assert!(
+            n >= 20,
+            "history should still be on screen after resize, got {n}/30 populated"
+        );
+    }
+
+    /// FAILING test — documents the codex resize regression.
+    ///
+    /// After a long codex-style session is loaded and the cache is
+    /// warm, resizing the pane should be O(viewport), not
+    /// O(history). The current `replay_cached` rebuilds the parser
+    /// on every cols-change → it re-feeds the entire `pending_chunk`
+    /// through vt100. This wall-time test fails (~20 ms for ~1.5 MB
+    /// history on a 2024 laptop). The "replay history" visual you
+    /// see on real sessions is the cumulative cost of that rebuild
+    /// PLUS ratatui re-painting every cell of the dim-changed pane
+    /// PLUS codex's own SIGWINCH redraw bytes flowing through.
+    ///
+    /// A passing version of this test is the success criterion for
+    /// the fix.
+    #[test]
+    fn codex_resize_does_not_replay_history() {
+        let mut h = ItemHistory::new();
+        codex_feed_long_session(&mut h);
+        let _ = h.replay(80, 24, 0); // warm
+
+        // Baseline: resize *without* growing history. Should be cheap
+        // — just vt100 reshape + a tiny render.
+        let resize_us = time_replay(&mut h, 120, 30);
+        eprintln!("codex resize wall time at ~1.5MB history: {resize_us} µs");
+        assert!(
+            resize_us < 5_000,
+            "codex resize is {resize_us} µs — should be O(viewport) (<5ms), not O(history). \
+             This failing assertion documents the bug: every cols-change rebuilds the parser \
+             from the full pending_chunk, which manifests visually as the \"history replay\" \
+             flash the user reports."
+        );
+    }
 }
