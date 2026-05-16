@@ -116,6 +116,10 @@ pub struct TaskRegistry {
 const TASK_REGISTRY_CAP: usize = 50;
 
 impl TaskRegistry {
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
     pub fn upsert_start(
         &mut self,
         call_id: String,
@@ -922,6 +926,40 @@ impl SessionManager {
         if entry.is_deleted() {
             return;
         }
+        if matches!(event, SessionEvent::Reset) {
+            if let Err(e) = self.storage.truncate_transcript(&entry.id) {
+                tracing::warn!(session = %entry.id, error = ?e, "truncate_transcript on reset failed");
+            }
+            if let Err(e) = self.storage.truncate_pty_log(&entry.id) {
+                tracing::warn!(session = %entry.id, error = ?e, "truncate_pty_log on reset failed");
+            }
+            entry.transcript_count.store(0, Ordering::Relaxed);
+            entry.pty.lock().await.ring.clear();
+            entry.tasks.lock().await.clear();
+            let now = Utc::now();
+            let snapshot = {
+                let mut s = entry.summary.write().await;
+                s.last_event_at = Some(now);
+                s.event_count = 0;
+                s.last_pty_at_ms = None;
+                s.state = SessionState::AwaitingInput;
+                s.pending_input = true;
+                s.clone()
+            };
+            let _ = self.storage.save_summary(&snapshot);
+            let _ = self.broadcast.send(BroadcastMsg::State(
+                StateNotificationPayload { session: snapshot },
+            ));
+            let _ = self.broadcast.send(BroadcastMsg::Event(
+                EventNotificationPayload {
+                    session_id: entry.id.clone(),
+                    at: now,
+                    event,
+                    seq: 0,
+                },
+            ));
+            return;
+        }
         // PTY events take a fast path: they go to the in-memory ring +
         // append to the on-disk pty.log + a live broadcast, but they don't
         // bloat the structured transcript.
@@ -996,7 +1034,8 @@ impl SessionManager {
                     s.state = SessionState::Errored;
                     s.pending_input = false;
                 }
-                SessionEvent::Message { .. }
+                SessionEvent::Reset
+                | SessionEvent::Message { .. }
                 | SessionEvent::ToolUse { .. }
                 | SessionEvent::ToolResult { .. }
                 | SessionEvent::Diff { .. }

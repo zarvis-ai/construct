@@ -1100,6 +1100,17 @@ impl App {
                             );
                             // Also fall through so the transcript records it.
                         }
+                        if matches!(payload.event, SessionEvent::Reset) {
+                            self.histories.remove(&payload.session_id);
+                            self.block_hits.remove(&payload.session_id);
+                            self.editor_states.remove(&payload.session_id);
+                            self.pty_activity.remove(&payload.session_id);
+                            if Some(payload.session_id.as_str()) == self.transcript_session.as_deref() {
+                                self.transcript.clear();
+                                self.transcript_scroll = u16::MAX;
+                            }
+                            return;
+                        }
                         // TUI-dispatch tool calls: any session can emit
                         // a ToolUse with the conventional `tui` tool
                         // name to fire a slash-command-style action in

@@ -63,6 +63,24 @@ impl Persist {
         let _ = file.flush();
     }
 
+    /// Clear persisted conversation context and reopen the append handle.
+    pub fn reset(&mut self) {
+        self.file = None;
+        match OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+        {
+            Ok(file) => self.file = Some(file),
+            Err(e) => tracing::warn!(
+                path = %self.path.display(),
+                error = ?e,
+                "zarvis persist: reset failed"
+            ),
+        }
+    }
+
     /// Read every message from the file. Skips malformed lines (logged
     /// at warn) so a single corrupt entry doesn't abandon the rest.
     pub fn load(path: &Path) -> Result<Vec<Message>> {
@@ -97,4 +115,43 @@ pub fn session_data_dir_from_env() -> Option<PathBuf> {
 /// True if the daemon signaled this is a resumed session.
 pub fn is_resume() -> bool {
     std::env::var("AGENTD_RESUME").as_deref() == Ok("1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{Content, Message, Role};
+
+    #[test]
+    fn reset_truncates_persisted_messages_and_keeps_appending() {
+        let dir = std::env::temp_dir().join(format!(
+            "agentd-zarvis-persist-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut persist = Persist::open(Some(&dir)).unwrap();
+        persist.append(&Message {
+            role: Role::User,
+            content: Content::Text { text: "old".into() },
+        });
+        assert_eq!(Persist::load(persist.path()).unwrap().len(), 1);
+
+        persist.reset();
+        assert!(Persist::load(persist.path()).unwrap().is_empty());
+
+        persist.append(&Message {
+            role: Role::User,
+            content: Content::Text { text: "new".into() },
+        });
+        let loaded = Persist::load(persist.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(
+            &loaded[0].content,
+            Content::Text { text } if text == "new"
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

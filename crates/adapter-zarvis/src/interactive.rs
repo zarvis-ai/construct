@@ -249,6 +249,7 @@ const SLASH_COMMANDS: &[&str] = &[
     "/model",
     "/new",
     "/quit",
+    "/reset",
     "/exit",
     "/refresh",
     "/rename",
@@ -668,6 +669,13 @@ impl LineEditor {
             self.history.push(line.clone());
         }
         LineEvent::Submit(line)
+    }
+
+    fn reset_history(&mut self) {
+        self.history.clear();
+        self.hist_pos = None;
+        self.saved.clear();
+        self.queued_recall = None;
     }
 
     fn ascii_at(&self, n: usize) -> Option<char> {
@@ -1164,6 +1172,7 @@ mod tests {
         assert!(all.contains(&"/model"));
         assert!(all.contains(&"/quit"));
         assert!(all.contains(&"/exit"));
+        assert!(all.contains(&"/reset"));
         ed.feed_bytes(b"q");
         assert_eq!(ed.slash_matches(), vec!["/quit"]);
         ed.feed_bytes(b"x");
@@ -1511,6 +1520,21 @@ pub async fn run(
                 &tool_ctx,
             )
             .await;
+            emit_editor_state(&emit, &editor, &queue);
+            continue;
+        }
+        if trimmed == "/reset" {
+            messages.clear();
+            if let Some(p) = persist.as_mut() {
+                p.reset();
+            }
+            pending.clear();
+            queue.clear();
+            editor.reset_history();
+            queued_rows = 0;
+            emit.emit(SessionEvent::Reset);
+            term.banner(provider_name, &model, automode);
+            term.note("(session reset)");
             emit_editor_state(&emit, &editor, &queue);
             continue;
         }
@@ -2865,4 +2889,3 @@ where
         }
     }
 }
-
