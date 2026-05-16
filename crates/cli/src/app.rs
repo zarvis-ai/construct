@@ -524,7 +524,32 @@ async fn run_loop(
             }
             notif = notifications.recv() => {
                 match notif {
-                    Some(n) => app.on_notification(n).await,
+                    Some(n) => {
+                        app.on_notification(n).await;
+                        // Drain any additional pending notifications
+                        // before looping back to the per-iteration
+                        // `terminal.draw`. A burst of PtyChunks
+                        // (codex's SIGWINCH redraw fragments across
+                        // PTY reads, so a single redraw arrives as
+                        // 4-10+ events) would otherwise produce one
+                        // render per chunk — the user sees that as
+                        // a "history replay" cascade animating
+                        // frame-by-frame. Coalescing the burst into
+                        // a single render renders only the final
+                        // settled state. Capped to keep input + tick
+                        // arms responsive under sustained load.
+                        const MAX_DRAIN: usize = 256;
+                        let mut drained = 0;
+                        while drained < MAX_DRAIN {
+                            match notifications.try_recv() {
+                                Ok(n) => {
+                                    app.on_notification(n).await;
+                                    drained += 1;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    }
                     None => {
                         app.connected = false;
                         app.set_status("daemon disconnected".to_string());

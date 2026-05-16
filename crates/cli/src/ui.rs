@@ -1340,7 +1340,25 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         let inner = block.inner(*tile_area);
         f.render_widget(block, *tile_area);
         if let Some(history) = app.histories.get_mut(id) {
-            let out = history.replay(inner.width, inner.height, 0);
+            // Render at the *main view's* virtual size, not the
+            // pin tile's narrow size. Each `ItemHistory` is shared
+            // between the main view and the pin tile, and `replay`
+            // resizes the cached vt100 parser to the requested
+            // dims. Asking the pin tile (e.g. 30×6) and then the
+            // main view (e.g. 120×30) on alternating frames
+            // thrashes the parser: every resize re-feeds the
+            // pending chunk through a freshly-sized grid, content
+            // reflows at the wrong width, and the main view
+            // appears clipped at the pin width.
+            //
+            // Always replay at main-view dims so the parser stays
+            // stable; `render_pty_tail` crops to `inner` for
+            // display (top-left of the rendered screen, anchored
+            // to the cursor row).
+            let (main_cols, main_rows) = app.terminal_pane_size;
+            let cols = main_cols.max(inner.width).max(1);
+            let rows = main_rows.max(inner.height).max(1);
+            let out = history.replay(cols, rows, 0);
             render_pty_tail(f, inner, out.screen);
         } else {
             // No PTY data yet — show a placeholder.

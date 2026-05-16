@@ -118,7 +118,7 @@ pub struct SessionStartParams {
     pub args: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PtySize {
     pub cols: u16,
     pub rows: u16,

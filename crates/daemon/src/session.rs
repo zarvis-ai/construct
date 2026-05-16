@@ -1206,7 +1206,22 @@ impl SessionManager {
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
         let size = PtySize { cols, rows };
-        entry.pty.lock().await.size = Some(size);
+        // Dedup: if the adapter's PTY is already at this size, skip
+        // the SIGWINCH. A no-op resize on a normal-screen TUI like
+        // codex still causes the child to redraw its viewport (which
+        // for codex means re-emitting its full transcript), so every
+        // spurious resize looks like a "history replay" to the user.
+        // Sources of spurious resizes: TUI bootstrap calling
+        // `pty_resize` with the same dims it already sent, and
+        // multiple SIGWINCH'd frames during a terminal-window drag
+        // that all land on the same final size.
+        {
+            let mut pty = entry.pty.lock().await;
+            if pty.size == Some(size) {
+                return Ok(());
+            }
+            pty.size = Some(size);
+        }
         // Cache the size so the next daemon respawn can re-spawn the
         // adapter's PTY at the right dimensions from the start.
         if let Err(e) = self.storage.save_pty_size(id, size) {
