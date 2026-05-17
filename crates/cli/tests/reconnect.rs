@@ -108,7 +108,10 @@ async fn test_reconnect_flow() {
 
         // Spawn second server
         let path2 = sock.clone();
-        let srv2 = tokio::spawn(async move { run_one_shot_server(path2).await });
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let srv2 = tokio::spawn(async move { run_one_shot_server(path2, tx2).await });
+        // wait for bind signal
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx2).await.expect("server2 bind timeout");
 
         // Second client connect+subscribe
         let client2 = Client::connect(&sock).await.unwrap();
