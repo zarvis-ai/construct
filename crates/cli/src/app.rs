@@ -2768,41 +2768,38 @@ pub async fn try_connect_and_subscribe(
     Some((client, notifications))
 }
 
-    async fn reconnect(
-        &mut self,
-        socket: &Path,
-    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<agentd_protocol::Notification>> {
-        let (client, notifications) = match try_connect_and_subscribe(socket).await {
-            Some((c, rx)) => (c, rx),
-            None => return None,
-        };
+pub async fn reconnect_app(app: &mut App, socket: &Path) -> Option<tokio::sync::mpsc::UnboundedReceiver<agentd_protocol::Notification>> {
+    let (client, notifications) = match try_connect_and_subscribe(socket).await {
+        Some((c, rx)) => (c, rx),
+        None => return None,
+    };
 
-        self.client = client;
-        self.connected = true;
-        self.set_status("daemon reconnected".to_string());
+    app.client = client;
+    app.connected = true;
+    app.set_status("daemon reconnected".to_string());
 
-        match self.client.list().await {
-            Ok(list) => self.sessions = list,
-            Err(e) => self.set_status(format!("list after reconnect failed: {e}")),
-        }
-        match self.client.list_groups().await {
-            Ok(list) => self.groups = list,
-            Err(e) => self.set_status(format!("group list after reconnect failed: {e}")),
-        }
-        match self.client.harnesses().await {
-            Ok(list) => self.harnesses = list,
-            Err(e) => self.set_status(format!("harnesses after reconnect failed: {e}")),
-        }
-        self.refresh_orchestrator_id();
-        self.ensure_selection_valid();
-        // Force fresh transcript/PTY snapshots from the new daemon. The old
-        // local histories remain visible until replay succeeds, so the user
-        // does not lose context during the reconnect window.
-        self.transcript_session = None;
-        self.refresh_selected_transcript().await;
-        self.ensure_pinned_parsers().await;
-        Some(notifications)
+    match app.client.list().await {
+        Ok(list) => app.sessions = list,
+        Err(e) => app.set_status(format!("list after reconnect failed: {e}")),
     }
+    match app.client.list_groups().await {
+        Ok(list) => app.groups = list,
+        Err(e) => app.set_status(format!("group list after reconnect failed: {e}")),
+    }
+    match app.client.harnesses().await {
+        Ok(list) => app.harnesses = list,
+        Err(e) => app.set_status(format!("harnesses after reconnect failed: {e}")),
+    }
+    app.refresh_orchestrator_id();
+    app.ensure_selection_valid();
+    // Force fresh transcript/PTY snapshots from the new daemon. The old
+    // local histories remain visible until replay succeeds, so the user
+    // does not lose context during the reconnect window.
+    app.transcript_session = None;
+    app.refresh_selected_transcript().await;
+    app.ensure_pinned_parsers().await;
+    Some(notifications)
+}
 
     /// Key handler for the orchestrator panel: same shape as the main
     /// view's PTY mode (C-x chord escape, `C-x C-x` to forward a
