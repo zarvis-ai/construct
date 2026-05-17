@@ -65,6 +65,16 @@ impl Tool for Shell {
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| ctx.cwd.clone());
 
+        if !cwd.is_dir() {
+            return Ok(ToolOutcome {
+                ok: false,
+                output: format!(
+                    "shell: cwd '{}' does not exist or is not a directory (session worktree may have been removed)\n",
+                    cwd.display()
+                ),
+            });
+        }
+
         let mut child = Command::new("bash")
             .args(["-lc", cmd])
             .current_dir(&cwd)
