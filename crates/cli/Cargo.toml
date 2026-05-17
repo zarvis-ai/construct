@@ -13,6 +13,7 @@ name = "agent"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3"
 agentd-protocol = { workspace = true }
 agentd-client = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
