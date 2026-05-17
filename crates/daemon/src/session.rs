@@ -537,11 +537,34 @@ impl SessionManager {
             a.extend(params.args.clone());
             a
         };
+
+        // Build the full env (user-provided + daemon meta) BEFORE spawn so
+        // the adapter process inherits AGENTD_SESSION_DATA_DIR /
+        // AGENTD_SESSION_KIND — not just the session.start params.env. The
+        // codex adapter (and claude) reads these via std::env::var, so
+        // leaving them only in session.start meant their first-spawn
+        // bookkeeping (originator-tagged rollout capture, session-id
+        // minting) silently no-op'd; respawn already merged them in time,
+        // so the bug only surfaced on initial create.
+        let mut env_with_meta = params.env.clone();
+        env_with_meta.insert(
+            "AGENTD_SESSION_DATA_DIR".to_string(),
+            self.storage.session_dir(&id).to_string_lossy().to_string(),
+        );
+        env_with_meta.insert(
+            "AGENTD_SESSION_KIND".to_string(),
+            match params.kind {
+                agentd_protocol::SessionKind::User => "user",
+                agentd_protocol::SessionKind::Orchestrator => "orchestrator",
+            }
+            .to_string(),
+        );
+
         let (adapter, info) = Adapter::spawn(
             params.harness.clone(),
             binary,
             combined_args,
-            params.env.clone(),
+            env_with_meta.clone(),
             msg_tx.clone(),
         )
         .await
@@ -553,26 +576,6 @@ impl SessionManager {
         }
         summary.has_pty = info.capabilities.supports_pty;
         self.storage.save_summary(&summary)?;
-
-        // Send session.start.
-        let mut env_with_meta = params.env.clone();
-        // Hand the adapter a private per-session dir for persisting its own
-        // state (zarvis.jsonl, claude/codex session id files, …).
-        env_with_meta.insert(
-            "AGENTD_SESSION_DATA_DIR".to_string(),
-            self.storage.session_dir(&id).to_string_lossy().to_string(),
-        );
-        // Tell the adapter what kind of session this is so it can pick
-        // the right system prompt / behavior. `user` is the default;
-        // `orchestrator` flips zarvis into command-surface mode.
-        env_with_meta.insert(
-            "AGENTD_SESSION_KIND".to_string(),
-            match params.kind {
-                agentd_protocol::SessionKind::User => "user",
-                agentd_protocol::SessionKind::Orchestrator => "orchestrator",
-            }
-            .to_string(),
-        );
         let start_params = SessionStartParams {
             session_id: id.clone(),
             cwd: summary.cwd.clone(),
