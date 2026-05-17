@@ -2994,6 +2994,57 @@ mod tests {
         assert_eq!((h.shadow_cols, h.shadow_rows), (1, 1));
     }
 
+    /// Symptom-level regression for the unzoomed-codex scroll bug.
+    ///
+    /// User-visible: scrolling back in an unzoomed codex view
+    /// showed incoherent / wrapped scrollback (lines split across
+    /// rows, missing recent content). Root cause: the shadow
+    /// parser was seeded at the vt100 default 80×24 and was only
+    /// resized when the user first scrolled — so every byte that
+    /// arrived before that point (the entire session, in the live
+    /// path) was wrapped/clamped at 80 cols. After the user
+    /// finally scrolled, `set_size` resized the shadow but vt100
+    /// does NOT reflow existing scrollback; the lines stayed
+    /// wrapped at 80 cols and the rendered output was broken.
+    ///
+    /// This test pins the symptom: feed 100 chat lines that fit
+    /// in 120 cols but wrap at 80, then scroll back. The full,
+    /// unwrapped chat line must appear on a single screen row.
+    /// Pre-fix this fails (lines are split across two rows
+    /// because the shadow processed them at 80×24).
+    #[test]
+    fn codex_unzoomed_scrollback_shows_unwrapped_lines() {
+        let cols: u16 = 120;
+        let rows: u16 = 30;
+
+        let mut h = ItemHistory::new();
+        // Live render loop runs a frame before bytes arrive — the
+        // first `replay` is what establishes the shadow's
+        // geometry for the live path. We simulate that here.
+        let _ = h.replay(cols, rows, 0);
+
+        // Pad each chat line to a width that exceeds the default
+        // shadow's 80 cols but fits comfortably in 120 cols. A
+        // single-row, single-line assertion only succeeds if the
+        // shadow saw these bytes at 120-col width.
+        let pad: String = "x".repeat(95);
+        for i in 0..100u32 {
+            h.feed_pty(format!("chat-line-{i:03} {pad}\r\n").as_bytes());
+        }
+
+        let scrolled = screen_text(h.replay(cols, rows, 30).screen, rows, cols);
+        // The full padded line for msg 0050 should appear on one
+        // screen row — i.e., contiguous in `scrolled` with no
+        // intervening `\n`. screen_text inserts `\n` between rows,
+        // so any `\n` inside the searched substring would indicate
+        // the line got wrapped during shadow processing.
+        let needle = format!("chat-line-050 {pad}");
+        assert!(
+            scrolled.contains(&needle),
+            "scrolled shadow view should contain the unwrapped chat line; got:\n{scrolled}"
+        );
+    }
+
     /// Edge case the shadow fix doesn't help: a true TUI-style
     /// child that NEVER emits `\r\n` — every frame is pure cursor-
     /// positioning + erase-line. Neither the main parser nor the
