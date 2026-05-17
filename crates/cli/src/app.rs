@@ -945,6 +945,20 @@ impl App {
         let mut history = crate::pty_render::ItemHistory::new();
         match self.client.pty_replay(id).await {
             Ok(snap) => {
+                // Size the shadow parser to match the PTY the
+                // daemon last knew about (falls back to the
+                // current pane size) BEFORE feeding rehydrated
+                // bytes. Codex / claude / any normal-screen TUI
+                // emits cursor positioning that depends on
+                // terminal dims — replaying those bytes against
+                // the shadow's default 80×24 leaves scrollback
+                // showing clamped, incoherent fragments.
+                let (cols, rows) = snap
+                    .size
+                    .as_ref()
+                    .map(|s| (s.cols, s.rows))
+                    .unwrap_or(self.terminal_pane_size);
+                history.set_pty_size(cols, rows);
                 use base64::Engine;
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&snap.data) {
                     history.feed_pty(&bytes);
