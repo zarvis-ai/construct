@@ -73,7 +73,7 @@ impl Default for Theme {
             user: Color::Rgb(225, 255, 230),
             assistant: Color::Rgb(145, 255, 165),
             system: Color::Rgb(60, 140, 76),
-            tool: Color::Rgb(255, 222, 105),
+            tool: Color::Rgb(125, 255, 115),
             matrix_dim: Color::Rgb(18, 92, 42),
             matrix_line: Color::Rgb(30, 105, 54),
             matrix_close: Color::Rgb(150, 255, 170),
@@ -287,5 +287,10 @@ mod tests {
         assert_eq!(theme.accent, Color::Cyan);
         assert_eq!(theme.matrix_dim, Color::Indexed(34));
         assert_eq!(theme.danger, Theme::default().danger);
+    }
+
+    #[test]
+    fn default_matrix_theme_uses_green_for_tools() {
+        assert_eq!(Theme::default().tool, Theme::default().success);
     }
 }

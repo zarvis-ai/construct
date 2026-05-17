@@ -1042,7 +1042,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     let tool = block.tool.as_deref().unwrap_or("?");
     let args = block.args_summary.as_deref().unwrap_or("");
     let header = format!(
-        "\x1b[1;33m→ {tool}\x1b[0m\x1b[2m({args})\x1b[0m\r\n"
+        "\x1b[1;32m→ {tool}\x1b[0m\x1b[2m({args})\x1b[0m\r\n"
     );
     out.extend_from_slice(header.as_bytes());
     // After the leading `\r\n` + header, we've emitted 2 rows.
@@ -1733,7 +1733,7 @@ mod tests {
         live_bytes.extend_from_slice(b"\x1b]7700;open;call=c1\x07");
         // tool_use header (dim args)
         live_bytes.extend_from_slice(
-            b"\r\n\x1b[1;33m\xe2\x86\x92 shell\x1b[0m\x1b[2m(ls)\x1b[0m\r\n",
+            b"\r\n\x1b[1;32m\xe2\x86\x92 shell\x1b[0m\x1b[2m(ls)\x1b[0m\r\n",
         );
         // tool_result_body (dim content + the `[+N lines]` footer)
         live_bytes.extend_from_slice(

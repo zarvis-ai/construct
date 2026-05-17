@@ -61,7 +61,7 @@ impl<'a> Terminal<'a> {
     }
     fn tool_use(&self, name: &str, args_summary: &str) {
         let line = format!(
-            "\r\n\x1b[1;33m→ {name}\x1b[0m\x1b[2m({args_summary})\x1b[0m\r\n"
+            "\r\n\x1b[1;32m→ {name}\x1b[0m\x1b[2m({args_summary})\x1b[0m\r\n"
         );
         self.write(line.as_bytes());
     }
