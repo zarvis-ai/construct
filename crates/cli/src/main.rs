@@ -278,5 +278,5 @@ async fn connect(socket: &std::path::Path) -> Result<std::sync::Arc<Client>> {
 
 async fn run_tui(socket: PathBuf) -> Result<()> {
     let client = connect(&socket).await?;
-    app::run(socket, client).await
+    app::run(client).await
 }
