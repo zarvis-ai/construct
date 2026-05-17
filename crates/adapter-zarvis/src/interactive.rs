@@ -2066,24 +2066,17 @@ async fn read_one_line(
                 emit_editor_state(term.emit, editor, &VecDeque::new());
             }
             Some(AdapterInboxMsg::PtyResize { cols, .. }) => {
-                let new_w = (cols as usize)
+                // Track the new width so subsequent streaming uses it.
+                // Do NOT paint the editor through the PTY: the active
+                // `❯` lives in the TUI's bottom editor pane (fed by
+                // `EditorState`), so writing `editor.redraw()` here
+                // would leave a stray cyan `❯` in chat scrollback that
+                // duplicates the editor pane's prompt. The items-model
+                // client rebuilds its vt100 parser at the current
+                // width every frame, so the viewport reflows on its
+                // own without us re-emitting history.
+                *pty_width = (cols as usize)
                     .max(MIN_USABLE_WIDTH + LEFT_MARGIN_CELLS + PAD_RIGHT);
-                let width_changed = new_w != *pty_width;
-                *pty_width = new_w;
-                // Subsequent streaming uses the new width. We don't
-                // replay history: the items-model client rebuilds its
-                // vt100 parser at the current width every frame, so
-                // the viewport reflows on its own. Re-emitting the
-                // full conversation here scaled O(history bytes) and
-                // also kept appending duplicate PtyChunks to the
-                // client's store on every resize. Old content keeps
-                // whatever wrap points PtySink already baked in, which
-                // is the same tradeoff most terminal apps accept.
-                if width_changed {
-                    editor.last_popup_lines = 0;
-                    let bytes = editor.redraw();
-                    term.write(&bytes);
-                }
             }
             Some(AdapterInboxMsg::ToolDecision { .. }) => {}
             Some(AdapterInboxMsg::ToolAction { .. }) => {
