@@ -286,6 +286,30 @@ impl ItemHistory {
         self.items.is_empty() && self.pending_chunk.is_empty()
     }
 
+    /// Resize the shadow parser to match the PTY child's geometry.
+    /// Call this before `feed_pty` whenever the caller knows the
+    /// child's current size — bootstrap replay from `pty_replay`,
+    /// every render frame, and any other path that knows the size.
+    ///
+    /// vt100's `set_size` doesn't reflow existing content, so the
+    /// payoff is for *future* bytes: codex (and any normal-screen
+    /// TUI) emits CSI cursor-positioning + scroll-region escapes
+    /// that depend on terminal dimensions. If the shadow stays at
+    /// the default 80×24 while the real PTY is 140×30, every
+    /// out-of-range cursor position gets clamped and codex's UI
+    /// state in the shadow drifts from what the user actually saw
+    /// — scrollback then shows incoherent fragments instead of the
+    /// real chat history.
+    pub fn set_pty_size(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        if self.shadow_cols != cols || self.shadow_rows != rows {
+            self.shadow_parser.screen_mut().set_size(rows, cols);
+            self.shadow_cols = cols;
+            self.shadow_rows = rows;
+        }
+    }
+
     /// Feed a raw PTY byte chunk. Parses inline OSC `7700` markers
     /// out, drops the bytes between paired markers, and accumulates
     /// the rest into `Item::PtyChunk` entries.
@@ -350,13 +374,7 @@ impl ItemHistory {
     /// scrollback offset. Cheap: just `set_size` (preserves grid +
     /// scrollback) and `set_scrollback`.
     fn render_shadow(&mut self, cols: u16, rows: u16, scrollback: usize) {
-        if self.shadow_cols != cols || self.shadow_rows != rows {
-            self.shadow_parser
-                .screen_mut()
-                .set_size(rows.max(1), cols.max(1));
-            self.shadow_cols = cols;
-            self.shadow_rows = rows;
-        }
+        self.set_pty_size(cols, rows);
         self.shadow_parser.screen_mut().set_scrollback(scrollback);
     }
 
@@ -593,6 +611,16 @@ impl ItemHistory {
     /// Scrollback offset is applied via `Screen::set_scrollback`
     /// after either path produces the screen.
     pub fn replay(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
+        // Keep the shadow's geometry in sync with the PTY's known
+        // size every frame (not just when scrollback > 0). Codex
+        // and other normal-screen TUIs emit CSI cursor-positioning
+        // + scroll-region escapes that depend on terminal dims; if
+        // the shadow stays at 80×24 default while bytes arrive
+        // shaped for the real pane size, positions get clamped and
+        // the shadow's screen / scrollback drifts from what the
+        // user actually saw. This is a no-op when dims match.
+        self.set_pty_size(cols, rows);
+
         // Mouse-wheel scrollback: divert to the shadow parser
         // when the caller is asking for older content. The shadow
         // sees the same byte stream as main, with alt-screen
@@ -2915,6 +2943,105 @@ mod tests {
         assert!(
             scrolled.contains("chat msg 0100"),
             "scrolled view should expose older messages around msg 0100, got:\n{scrolled}"
+        );
+    }
+
+    /// Real codex sessions emit cursor positioning (`\x1b[r;cH`)
+    /// and DECSTBM scroll regions sized for the *actual* PTY —
+    /// frequently with row counts > 24 and col counts > 80. If the
+    /// shadow parser is left at the default 80×24 while bytes
+    /// arrive shaped for a 140×30 pane, every out-of-range cursor
+    /// position gets clamped and codex's UI state in the shadow
+    /// becomes incoherent. The user's symptom was: scroll back in
+    /// an unzoomed codex view jumps past recent content because
+    /// the shadow doesn't reflect what codex actually rendered.
+    ///
+    /// The fix has two halves, both pinned here:
+    ///   1. `replay(cols, rows, _)` resizes the shadow to match
+    ///      the pane on every frame — not just scrollback>0.
+    ///   2. `set_pty_size(cols, rows)` is a public hook so the
+    ///      bootstrap path (which feeds rehydrated bytes BEFORE
+    ///      the first render) can pre-size the shadow.
+    #[test]
+    fn replay_keeps_shadow_in_sync_with_pty_dims() {
+        let mut h = ItemHistory::new();
+        // Default before any replay: vt100 chose the seed values
+        // (80×24), which is wrong for almost every real pane.
+        assert_eq!((h.shadow_cols, h.shadow_rows), (80, 24));
+
+        let _ = h.replay(140, 30, 0); // scrollback==0 must still resize
+        assert_eq!(
+            (h.shadow_cols, h.shadow_rows),
+            (140, 30),
+            "replay at scrollback=0 must size the shadow to the pane"
+        );
+
+        let _ = h.replay(100, 40, 5); // scrollback>0 path also resizes
+        assert_eq!((h.shadow_cols, h.shadow_rows), (100, 40));
+    }
+
+    #[test]
+    fn set_pty_size_resizes_shadow_before_feed() {
+        // Simulates `bootstrap_terminal`: caller knows the PTY
+        // dims, sizes the shadow, THEN feeds the rehydrated bytes
+        // so codex's cursor-positioning is interpreted correctly.
+        let mut h = ItemHistory::new();
+        h.set_pty_size(140, 30);
+        assert_eq!((h.shadow_cols, h.shadow_rows), (140, 30));
+
+        // Defensive clamps for absurd inputs.
+        h.set_pty_size(0, 0);
+        assert_eq!((h.shadow_cols, h.shadow_rows), (1, 1));
+    }
+
+    /// Symptom-level regression for the unzoomed-codex scroll bug.
+    ///
+    /// User-visible: scrolling back in an unzoomed codex view
+    /// showed incoherent / wrapped scrollback (lines split across
+    /// rows, missing recent content). Root cause: the shadow
+    /// parser was seeded at the vt100 default 80×24 and was only
+    /// resized when the user first scrolled — so every byte that
+    /// arrived before that point (the entire session, in the live
+    /// path) was wrapped/clamped at 80 cols. After the user
+    /// finally scrolled, `set_size` resized the shadow but vt100
+    /// does NOT reflow existing scrollback; the lines stayed
+    /// wrapped at 80 cols and the rendered output was broken.
+    ///
+    /// This test pins the symptom: feed 100 chat lines that fit
+    /// in 120 cols but wrap at 80, then scroll back. The full,
+    /// unwrapped chat line must appear on a single screen row.
+    /// Pre-fix this fails (lines are split across two rows
+    /// because the shadow processed them at 80×24).
+    #[test]
+    fn codex_unzoomed_scrollback_shows_unwrapped_lines() {
+        let cols: u16 = 120;
+        let rows: u16 = 30;
+
+        let mut h = ItemHistory::new();
+        // Live render loop runs a frame before bytes arrive — the
+        // first `replay` is what establishes the shadow's
+        // geometry for the live path. We simulate that here.
+        let _ = h.replay(cols, rows, 0);
+
+        // Pad each chat line to a width that exceeds the default
+        // shadow's 80 cols but fits comfortably in 120 cols. A
+        // single-row, single-line assertion only succeeds if the
+        // shadow saw these bytes at 120-col width.
+        let pad: String = "x".repeat(95);
+        for i in 0..100u32 {
+            h.feed_pty(format!("chat-line-{i:03} {pad}\r\n").as_bytes());
+        }
+
+        let scrolled = screen_text(h.replay(cols, rows, 30).screen, rows, cols);
+        // The full padded line for msg 0050 should appear on one
+        // screen row — i.e., contiguous in `scrolled` with no
+        // intervening `\n`. screen_text inserts `\n` between rows,
+        // so any `\n` inside the searched substring would indicate
+        // the line got wrapped during shadow processing.
+        let needle = format!("chat-line-050 {pad}");
+        assert!(
+            scrolled.contains(&needle),
+            "scrolled shadow view should contain the unwrapped chat line; got:\n{scrolled}"
         );
     }
 
