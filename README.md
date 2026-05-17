@@ -88,51 +88,6 @@ scripts/smoke.sh
 
 `agentd paths` prints the resolved layout.
 
-## TUI keys (emacs default)
-
-The right pane has two views — **transcript** (structured event log) and
-**terminal** (live PTY emulator powered by `vt100`+`tui-term`). Sessions whose
-adapter has `supports_pty=true` (shell always, claude/codex in interactive
-mode) open in terminal view.
-
-Two focusable panes (matching standard emacs window semantics): the **list**
-on the left and the **view** on the right. When the view is focused *and* it's
-in terminal mode for a PTY-backed session, keystrokes go to the child by
-default — `C-x` is the escape prefix back to agentd commands.
-
-| Key | Action |
-|---|---|
-| `C-x o` / `Tab` | switch focus (list ↔ view) — `other-window` |
-| `C-x t` | toggle transcript ↔ terminal view |
-| `C-x z` | zoom: fill the screen with the session view (matches tmux `prefix z`) |
-| `C-n` / `↓` | next session |
-| `C-p` / `↑` | prev session |
-| `C-x C-f` | new session (wizard) |
-| `C-x i` | send input to selected session |
-| `C-x k` | delete selected session (confirms; kills if running, drops transcript + worktree) |
-| `C-x d` | show diff |
-| `C-x r` | rename selected session (sets the user-facing title; submit empty to clear back to the hash) |
-| `C-c C-c` | interrupt |
-| `M-x` / `C-x x` | command palette (the `C-x x` alias is Meta-free, useful on macOS Terminal.app without "Use Option as Meta") |
-| `C-v` / `M-v` | scroll page down / up |
-| `g g` / `G` | scroll top / bottom |
-| `?` | toggle help |
-| `C-x C-c` / `q` | quit |
-| `Space` / `C-x p` | toggle pin on selected session (live tail tile in the pin strip below the main view) |
-| `C-x C-p` / `C-x C-n` | reorder: move selected session up / down in the list (Meta-free; works in every terminal) |
-| `Shift-↑` / `Shift-↓` | same, in terminals that forward Shift with arrows (iTerm2, WezTerm, Alacritty, Kitty — **not** macOS Terminal.app default) |
-| `C-x A` | toggle automode on selected agent session (zarvis approval gate) |
-| mouse drag | select visible TUI text and copy it to the terminal clipboard |
-| `C-x m` | toggle mouse capture off/on for native terminal selection fallback |
-
-**In PTY-captured mode** (view focused on a PTY session), all keys pass
-through to the child *except* `C-x`, which starts a chord. So everything in
-the table above that begins with `C-x` works without changing focus —
-`C-x o` to jump to the list, `C-x C-f` to start a new session, `C-x C-c` to
-quit, etc. Other commands like `M-x` need focus on the list first.
-
-Set `AGENTD_KEYMAP=vim` for the vim profile.
-
 ## Adapter protocol (AHP)
 
 The daemon spawns one adapter process per session and speaks JSON-RPC 2.0 over the adapter's stdin/stdout, one message per line.
