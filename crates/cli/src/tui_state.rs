@@ -26,6 +26,8 @@ pub struct TuiState {
     pub orchestrator_panel_h: Option<u16>,
     #[serde(default)]
     pub list_collapsed: bool,
+    #[serde(default)]
+    pub matrix_rain_hidden: bool,
 }
 
 fn state_path() -> PathBuf {
