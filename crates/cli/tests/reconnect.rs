@@ -59,6 +59,10 @@ async fn test_reconnect_flow() {
 
     // now drop server by awaiting the server task
     server.await.unwrap();
+    // remove the socket file so we can bind a new listener at the same path
+    let _ = std::fs::remove_file(&sock);
+    // small pause to let the OS reclaim the address
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Now test reconnect by starting a new server on same socket
     let listener2 = UnixListener::bind(&sock).unwrap();
