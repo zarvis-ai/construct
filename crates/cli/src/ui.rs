@@ -125,6 +125,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.list_area = Some(cols[0]);
     app.layout.view_area = Some(detail_area);
     app.layout.pin_strip_area = pin_strip_area;
+    app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
     app.layout.list_row_count = app.list_items().len();
 
@@ -391,25 +392,14 @@ pub fn list_collapse_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
     Some((x_start, x_end, list_area.y))
 }
 
-/// Hit zone for the Matrix-rain panel close button. `occupied_rows`
-/// is the materialized session/group row count inside the list pane.
-pub fn matrix_rain_close_button_range(
-    list_area: Rect,
-    occupied_rows: usize,
-) -> Option<(u16, u16, u16)> {
-    let inner_w = list_area.width.saturating_sub(2);
-    let inner_h = list_area.height.saturating_sub(2);
-    if inner_w < 8 || inner_h < 4 {
+/// Hit zone for the Matrix-rain panel close button.
+pub fn matrix_rain_close_button_range(rain_area: Rect) -> Option<(u16, u16, u16)> {
+    if rain_area.width < 8 || rain_area.height < 4 {
         return None;
     }
-    let used = (occupied_rows as u16).min(inner_h);
-    if inner_h.saturating_sub(used) < 4 {
-        return None;
-    }
-    let y = list_area.y + 1 + used;
-    let x_start = list_area.x + list_area.width.saturating_sub(4);
-    let x_end = list_area.x + list_area.width.saturating_sub(1);
-    Some((x_start, x_end, y))
+    let x_start = rain_area.x + rain_area.width.saturating_sub(4);
+    let x_end = rain_area.x + rain_area.width.saturating_sub(1);
+    Some((x_start, x_end, rain_area.y))
 }
 
 /// Cell where the `›` uncollapse glyph is painted on the main
@@ -493,9 +483,11 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
         }
     }
     if !app.matrix_rain_hidden {
-        if let Some((xs, xe, y)) = matrix_rain_close_button_range(list, app.layout.list_row_count) {
-            if my == y && mx >= xs && mx < xe {
-                render_button_tooltip(f, &app.theme, " Hide rain ", xs, y);
+        if let Some(rain) = app.layout.matrix_rain_area {
+            if let Some((xs, xe, y)) = matrix_rain_close_button_range(rain) {
+                if my == y && mx >= xs && mx < xe {
+                    render_button_tooltip(f, &app.theme, " Hide rain ", xs, y);
+                }
             }
         }
     }
@@ -843,6 +835,15 @@ fn pin_strip_height(total_h: u16) -> u16 {
     (total_h / 3).clamp(7, 18)
 }
 
+pub fn matrix_rain_panel_height(preferred: Option<u16>, available_h: u16) -> u16 {
+    if available_h < crate::app::MATRIX_RAIN_H_MIN {
+        return available_h;
+    }
+    preferred
+        .unwrap_or(crate::app::MATRIX_RAIN_H_DEFAULT)
+        .clamp(crate::app::MATRIX_RAIN_H_MIN, available_h)
+}
+
 /// Zoom layout: the session view takes the entire screen except for the
 /// minibuffer line at the bottom. No list, no pin strip, no modeline, no
 /// borders — edge-to-edge so the underlying TUI (vim / claude / htop /
@@ -864,6 +865,7 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_area = None;
     app.layout.view_area = Some(main_area);
     app.layout.pin_strip_area = None;
+    app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
 
     if let Some(diff) = &app.last_diff {
@@ -897,6 +899,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_area = Some(main_area);
     app.layout.view_area = None;
     app.layout.pin_strip_area = None;
+    app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
     app.layout.list_row_count = app.list_items().len();
 
@@ -907,7 +910,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
+fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == PaneFocus::List;
     // Collapsed render path: a thin column with a `>` expand glyph
     // on the top border. Anywhere inside the pane click-expands.
@@ -1050,7 +1053,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     render_matrix_rain(f, inner, app, app_items.len());
 }
 
-fn render_matrix_rain(f: &mut Frame, area: Rect, app: &App, occupied_rows: usize) {
+fn render_matrix_rain(f: &mut Frame, area: Rect, app: &mut App, occupied_rows: usize) {
+    app.layout.matrix_rain_area = None;
     if app.matrix_rain_hidden {
         return;
     }
@@ -1058,15 +1062,18 @@ fn render_matrix_rain(f: &mut Frame, area: Rect, app: &App, occupied_rows: usize
         return;
     }
     let used = (occupied_rows as u16).min(area.height);
+    let available = area.height.saturating_sub(used);
+    let panel_h = matrix_rain_panel_height(app.matrix_rain_h, available);
     let rain_area = Rect {
         x: area.x,
-        y: area.y + used,
+        y: area.y + area.height.saturating_sub(panel_h),
         width: area.width,
-        height: area.height.saturating_sub(used),
+        height: panel_h,
     };
     if rain_area.width < 8 || rain_area.height < 4 {
         return;
     }
+    app.layout.matrix_rain_area = Some(rain_area);
     render_matrix_rain_header(f, rain_area, &app.theme);
     let rain_area = Rect {
         x: rain_area.x,
@@ -3062,6 +3069,18 @@ mod tests {
             let head = ((passed_at / tick_ms) + offset) % cycle as u64;
             assert_eq!(head, target_rel_y as u64);
         }
+    }
+
+    #[test]
+    fn matrix_rain_panel_height_defaults_and_clamps() {
+        assert_eq!(
+            matrix_rain_panel_height(None, 30),
+            crate::app::MATRIX_RAIN_H_DEFAULT
+        );
+        assert_eq!(matrix_rain_panel_height(None, 8), 8);
+        assert_eq!(matrix_rain_panel_height(Some(2), 30), crate::app::MATRIX_RAIN_H_MIN);
+        assert_eq!(matrix_rain_panel_height(Some(50), 30), 30);
+        assert_eq!(matrix_rain_panel_height(Some(8), 3), 3);
     }
 
     #[test]
