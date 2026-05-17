@@ -339,6 +339,7 @@ pub struct EditorState {
     pub queued: Vec<String>,
     pub buf: String,
     pub cursor: usize,
+    pub completions: Vec<String>,
 }
 
 fn agent_status_history_line(status: &agentd_protocol::AgentStatus) -> Option<Vec<u8>> {
@@ -1256,6 +1257,7 @@ impl App {
                             queued,
                             buf,
                             cursor,
+                            completions,
                         } = &payload.event
                         {
                             self.editor_states.insert(
@@ -1264,6 +1266,7 @@ impl App {
                                     queued: queued.clone(),
                                     buf: buf.clone(),
                                     cursor: *cursor,
+                                    completions: completions.clone(),
                                 },
                             );
                         }

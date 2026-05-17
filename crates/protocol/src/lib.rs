@@ -310,6 +310,11 @@ pub enum SessionEvent {
         /// first char).
         #[serde(default)]
         cursor: usize,
+        /// Completion suggestions for the current editor buffer.
+        /// Rendered above the fixed prompt by clients so completions
+        /// stay out of PTY scrollback.
+        #[serde(default)]
+        completions: Vec<String>,
     },
 }
 

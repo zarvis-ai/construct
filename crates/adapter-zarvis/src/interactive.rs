@@ -265,6 +265,11 @@ fn emit_editor_state(
         queued: queue.iter().cloned().collect(),
         buf: editor.buf.clone(),
         cursor: editor.cursor,
+        completions: editor
+            .slash_matches()
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     });
 }
 

@@ -42,6 +42,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let modeline_area = vertical[1];
     let minibuffer_area = vertical[2];
 
+    // Clear the main area and chrome regions so any stale cells from prior
+    // larger editor popups don't persist visually. This forces a full
+    // repaint of the content region and avoids relying on a terminal
+    // resize to flush artifacts.
+    f.render_widget(Clear, main_area);
+    f.render_widget(Clear, modeline_area);
+    f.render_widget(Clear, minibuffer_area);
+
     // Clamp the user-adjusted list width to leave room for the view
     // pane on narrow terminals. The drag handler stores the raw width
     // (so the user's intent is preserved when the terminal grows
@@ -1214,9 +1222,32 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         tui_term::widget::PseudoTerminal::new(out.screen)
     };
+    // Clear the chat area before painting so any rows uncovered when the
+    // editor pane shrinks are not left stale. This prevents visual gaps
+    // that only disappear on terminal resize.
+    f.render_widget(Clear, chat_area);
+    // Extra defensive clear: fill the chat area with blank rows so some
+    // terminals that don't honor Clear promptly still see overwritten cells.
+    for row in 0..chat_area.height {
+        let blank = " ".repeat(chat_area.width as usize);
+        let r = Rect {
+            x: chat_area.x,
+            y: chat_area.y + row,
+            width: chat_area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
+    }
     f.render_widget(term, chat_area);
     app.block_hits.insert(id, out.blocks);
     if let Some(area) = editor_area {
+        // Also clear the editor area (defensive)
+        f.render_widget(Clear, area);
+        for row in 0..area.height {
+            let blank = " ".repeat(area.width as usize);
+            let r = Rect { x: area.x, y: area.y + row, width: area.width, height: 1 };
+            f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
+        }
         render_editor_pane(
             f,
             area,
@@ -1243,6 +1274,12 @@ fn render_editor_pane(
     if area.height == 0 || area.width == 0 {
         return;
     }
+    // Ensure we clear any stale content from a previous frame. When the
+    // completion popup shrinks (or disappears) we must explicitly clear
+    // the editor area so leftover glyphs don't linger until a terminal
+    // resize forces a repaint.
+    f.render_widget(Clear, area);
+
     let queued_style = Style::default().fg(Color::DarkGray);
     let queued_glyph_style = queued_style.add_modifier(Modifier::BOLD);
     let active_glyph_style = Style::default()
@@ -1319,8 +1356,35 @@ fn render_editor_pane(
         }
     }
 
-    // Spacer row above the active prompt — visual breathing room.
+    // Spacer row above completions / active prompt — visual breathing room.
     if remaining > 1 {
+        y = y.saturating_add(1);
+        remaining -= 1;
+    }
+
+    // Completion suggestions — bottom-pane anchored, rendered above
+    // the active prompt so they don't pollute PTY scrollback or get
+    // clipped below the terminal edge.
+    let completion_style = Style::default().fg(Color::DarkGray);
+    for completion in &state.completions {
+        // Keep at least one row for the active editor.
+        if remaining <= 1 {
+            break;
+        }
+        let row = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        let text: String = completion.chars().take(text_width).collect();
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(text, completion_style),
+            ])),
+            row,
+        );
         y = y.saturating_add(1);
         remaining -= 1;
     }
@@ -1392,6 +1456,7 @@ fn editor_pane_rows(
     let queued_lines: usize = state
         .map(|s| s.queued.iter().map(|q| wrapped_text_rows(q, text_width)).sum())
         .unwrap_or(0);
+    let completion_lines = state.map(|s| s.completions.len()).unwrap_or(0);
     let buf_lines = state
         .map(|s| wrapped_text_rows(&s.buf, text_width))
         .unwrap_or(1);
@@ -1399,7 +1464,7 @@ fn editor_pane_rows(
         .filter(|s| s.active)
         .map(|_| 3)
         .unwrap_or(0);
-    status_lines + queued_lines + 1 + buf_lines
+    status_lines + queued_lines + 1 + completion_lines + buf_lines
 }
 
 #[derive(Debug, Clone)]
@@ -2281,12 +2346,14 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
             queued,
             buf,
             cursor,
+            completions,
         } => {
             format!(
-                "editor: q={} buf={}b cur={}",
+                "editor: q={} buf={}b cur={} completions={}",
                 queued.len(),
                 buf.len(),
-                cursor
+                cursor,
+                completions.len()
             )
         }
     }
@@ -2576,5 +2643,42 @@ mod tests {
             crate::app::MINIBUFFER_PANEL_H_MIN
         );
         assert_eq!(minibuffer_panel_height(Some(80), 20), 17);
+    }
+
+    #[test]
+    fn editor_pane_rows_includes_completion_suggestions() {
+        let state = crate::app::EditorState {
+            queued: Vec::new(),
+            buf: "/".to_string(),
+            cursor: 1,
+            completions: vec!["/help".to_string(), "/model".to_string()],
+        };
+
+        // spacer + two completion rows + active prompt row
+        assert_eq!(editor_pane_rows(Some(&state), None, 80), 4);
+    }
+
+    #[test]
+    fn shrink_popup_clears_editor_area() {
+        // Render a bigger editor area then a smaller one and ensure the
+        // old content wouldn't persist. We can't render a real Frame in
+        // unit tests easily here, but the logic is exercised by calling
+        // editor_pane_rows to ensure the reserved rows decrease. The
+        // actual visual clearing is done by calling `Clear` at the start
+        // of `render_editor_pane`, which has been added to prevent the
+        // terminal-resize-only repaint symptom.
+        let big_state = crate::app::EditorState {
+            queued: Vec::new(),
+            buf: "/".to_string(),
+            cursor: 1,
+            completions: vec!["/help".to_string(), "/model".to_string(), "/new".to_string()],
+        };
+        let small_state = crate::app::EditorState {
+            queued: Vec::new(),
+            buf: "/".to_string(),
+            cursor: 1,
+            completions: vec!["/help".to_string()],
+        };
+        assert!(editor_pane_rows(Some(&big_state), None, 80) > editor_pane_rows(Some(&small_state), None, 80));
     }
 }

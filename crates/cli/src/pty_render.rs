@@ -647,18 +647,17 @@ impl ItemHistory {
 
         // Resize handling has two cases:
         //
-        //   - Rows changed but cols didn't: `set_size` is enough.
-        //     vt100 keeps the grid; rows are added/removed at the
-        //     bottom. No replay, no visible flicker. We deliberately
-        //     do NOT emit a state-reset escape sequence here —
-        //     `\x1b[r` (DECSTBM) and similar all have cursor-position
-        //     side effects (DECSTBM moves the cursor to home), which
-        //     would cause the next streamed bytes to overwrite row 0
-        //     instead of continuing after the prior content. The
-        //     zarvis editor pane grows as the user types, shrinking
+        //   - Rows shrink but cols don't: `set_size` is enough.
+        //     vt100 keeps the grid without replay and, importantly,
+        //     avoids cursor-relocating reset escapes. The zarvis
+        //     editor pane grows as the user types, shrinking
         //     `chat_area.height` and tripping this path on nearly
-        //     every keystroke — a stale-state reset there is a
-        //     visible bug.
+        //     every keystroke.
+        //   - Rows grow but cols don't: rebuild. `set_size` appends
+        //     blank rows at the bottom instead of pulling newly
+        //     exposed lines from scrollback. That made content hidden
+        //     under the zarvis completion popup stay blank until a real
+        //     terminal resize forced a replay.
         //   - Cols changed: vt100 doesn't reflow soft-wrapped lines,
         //     so just `set_size` leaves prior content at the old
         //     wrap (looks narrow in a wider pane). Rebuild the parser
@@ -676,6 +675,20 @@ impl ItemHistory {
             cache.rows = rows;
             cache.processed_count = 0;
             cache.pending_consumed = 0;
+        } else if rows > cache.rows {
+            cache.parser =
+                vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX);
+            cache.rows = rows;
+            cache.processed_count = 0;
+            cache.pending_consumed = 0;
+            for item in &self.items {
+                if let Item::PtyChunk(b) = item {
+                    cache.parser.process(b);
+                }
+            }
+            cache.parser.process(&self.pending_chunk);
+            cache.processed_count = self.items.len();
+            cache.pending_consumed = self.pending_chunk.len();
         } else if cache.rows != rows {
             cache.parser.screen_mut().set_size(rows.max(1), cols.max(1));
             cache.rows = rows;
@@ -1823,6 +1836,36 @@ mod tests {
             "post-resize streaming byte landed at row 0 \
              (cursor-reset side effect from the resize escape \
              sequence): row 0 = {row0:?}"
+        );
+    }
+
+    /// Regression: when the zarvis completion popup disappears, the
+    /// fixed editor pane shrinks and `chat_area.height` grows. A bare
+    /// vt100 row-only `set_size` keeps the old grid and appends blank
+    /// rows at the bottom, so content hidden by the popup does not
+    /// reappear until a real terminal resize. Growing rows must replay
+    /// from history so the newly exposed rows are populated.
+    #[test]
+    fn replay_cached_rows_grow_repopulates_newly_exposed_rows() {
+        let mut h = ItemHistory::new();
+        for i in 0..30 {
+            h.feed_pty(format!("history line {i:02}\r\n").as_bytes());
+        }
+        const MARKER: &str = "BOTTOM_MARKER";
+        h.feed_pty(MARKER.as_bytes());
+
+        // Completion popup visible: chat area is shorter.
+        let _ = h.replay(80, 5, 0);
+
+        // Completion popup hidden: chat area grows. The bottom row
+        // should be repopulated by replaying history, not left blank.
+        let out = h.replay(80, 10, 0);
+        let bottom: String = (0..80)
+            .filter_map(|c| out.screen.cell(9, c).map(|x| x.contents()))
+            .collect();
+        assert!(
+            bottom.contains(MARKER),
+            "newly exposed bottom row was not repopulated after row grow: {bottom:?}"
         );
     }
 
