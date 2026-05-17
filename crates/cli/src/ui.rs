@@ -1620,6 +1620,7 @@ fn render_editor_pane(
     let active_glyph_style = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
+    let active_text_style = Style::default().fg(theme.text);
     let prompt_w: u16 = 2;
     let empty_state = crate::app::EditorState::default();
     let state = state.unwrap_or(&empty_state);
@@ -1750,12 +1751,12 @@ fn render_editor_pane(
                 first_visual = false;
                 Paragraph::new(Line::from(vec![
                     Span::styled("❯ ", active_glyph_style),
-                    Span::raw(visual.text.clone()),
+                    Span::styled(visual.text.clone(), active_text_style),
                 ]))
             } else {
                 Paragraph::new(Line::from(vec![
                     Span::raw("  "), // align with prompt width
-                    Span::raw(visual.text.clone()),
+                    Span::styled(visual.text.clone(), active_text_style),
                 ]))
             };
             f.render_widget(para, row);
@@ -1780,10 +1781,25 @@ fn render_editor_pane(
         char_seen += logical_chars + 1; // +1 for the `\n`
     }
     if set_cursor {
-        if let Some(pos) = cursor_pos {
-            f.set_cursor_position(pos);
+        if let Some((x, y)) = cursor_pos {
+            render_editor_cursor(f, Position { x, y }, theme);
         }
     }
+}
+
+fn render_editor_cursor(f: &mut Frame, pos: Position, theme: &Theme) {
+    let Some(cell) = f.buffer_mut().cell_mut(pos) else {
+        return;
+    };
+    if cell.symbol().is_empty() {
+        cell.set_symbol(" ");
+    }
+    cell.set_style(
+        Style::default()
+            .fg(theme.highlight_fg)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
 }
 
 fn editor_pane_rows(
@@ -3106,6 +3122,72 @@ mod tests {
 
         // spacer + two completion rows + active prompt row
         assert_eq!(editor_pane_rows(Some(&state), None, 80), 4);
+    }
+
+    #[test]
+    fn editor_pane_themes_active_prompt_text() {
+        let state = crate::app::EditorState {
+            queued: Vec::new(),
+            buf: "hello".to_string(),
+            cursor: 5,
+            completions: Vec::new(),
+        };
+        let theme = Theme::default();
+        let backend = ratatui::backend::TestBackend::new(20, 3);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| {
+                render_editor_pane(
+                    f,
+                    Rect::new(0, 0, 20, 3),
+                    Some(&state),
+                    None,
+                    &theme,
+                    false,
+                );
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let glyph_cell = buffer.cell((0, 1)).expect("glyph cell");
+        let text_cell = buffer.cell((2, 1)).expect("text cell");
+
+        assert_eq!(glyph_cell.style().fg, Some(theme.accent));
+        assert_eq!(text_cell.style().fg, Some(theme.text));
+    }
+
+    #[test]
+    fn editor_pane_renders_themed_prompt_cursor() {
+        let state = crate::app::EditorState {
+            queued: Vec::new(),
+            buf: "hello".to_string(),
+            cursor: 5,
+            completions: Vec::new(),
+        };
+        let theme = Theme::default();
+        let backend = ratatui::backend::TestBackend::new(20, 3);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| {
+                render_editor_pane(
+                    f,
+                    Rect::new(0, 0, 20, 3),
+                    Some(&state),
+                    None,
+                    &theme,
+                    true,
+                );
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        let cursor_cell = buffer.cell((7, 1)).expect("cursor cell");
+
+        assert_eq!(cursor_cell.style().fg, Some(theme.highlight_fg));
+        assert_eq!(cursor_cell.style().bg, Some(theme.accent));
+        assert!(cursor_cell.style().add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
