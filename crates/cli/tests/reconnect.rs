@@ -5,6 +5,8 @@ use serde_json::Value;
 use agentd_client::Client;
 use agentd_protocol::ipc_method;
 
+use std::path::Path;
+
 // A minimal mock daemon: accept one client, handle subscribe + list calls,
 // then send a fake notification and keep the socket open.
 
