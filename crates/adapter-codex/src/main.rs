@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -77,20 +77,20 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let bin = std::env::var("AGENTD_CODEX_BIN").unwrap_or_else(|_| "codex".into());
     let mut args = params.args.clone();
-    // Resume support: codex does not let the client assign a session id,
-    // so we capture the one codex picked by snooping its on-disk sessions
-    // dir on first spawn (see `spawn_session_id_watcher`) and writing it
-    // to `<session-dir>/codex_session_id.txt`. On daemon-restart respawn
-    // we read that file and run `codex resume <uuid>` so we attach to the
-    // same codex conversation. The explicit override
+    // Resume support: codex doesn't let the client assign a session id, so
+    // we tag each spawn with a unique `originator` (via codex's internal
+    // env override) and watch its rollouts dir for one bearing that tag.
+    // When we see it, we persist codex's UUID to
+    // `<session-dir>/codex_session_id.txt`; on daemon-restart respawn we
+    // pass it back as `codex resume <uuid>`. The explicit override
     // `AGENTD_CODEX_RESUME_ID` still wins if set.
     //
-    // We deliberately do NOT fall back to `codex resume --last` when no
-    // id was captured: `--last` resolves globally across every codex
-    // session on the machine, so two agentd codex sessions both falling
-    // through here will both attach to the same upstream codex and from
-    // that moment paint identical PTY content. Starting a fresh codex
-    // loses one session's conversation but never conflates two of them.
+    // We deliberately do NOT fall back to `codex resume --last` when no id
+    // was captured: `--last` resolves globally across every codex session
+    // on the machine, so two agentd codex sessions both falling through
+    // would attach to the same upstream codex and from that moment paint
+    // identical PTY content. Starting a fresh codex loses one session's
+    // conversation but never conflates two of them.
     let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
     let sid_file = std::env::var("AGENTD_SESSION_DATA_DIR").ok().map(|d| {
         std::path::PathBuf::from(d).join("codex_session_id.txt")
@@ -140,18 +140,30 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
+    // Tag this codex's rollout with a unique originator we can grep for.
+    // Codex stamps `payload.originator` in the rollout's session_meta line
+    // from this internal env var (found by string-grep on the binary; not
+    // a public flag but stable across recent codex releases). Without the
+    // tag we'd have to guess which of several concurrent codex rollouts
+    // in the same cwd belongs to which agentd session.
+    let originator_tag = format!("agentd:{}", ctx.session_id);
+    env.push((
+        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".into(),
+        originator_tag.clone(),
+    ));
     // If we're starting (or fresh-respawning) a codex without a captured
-    // id, kick off a best-effort watcher that snoops `~/.codex/sessions/`
-    // for the new rollout file codex is about to create. As soon as it
-    // appears, we extract the UUID and write it to
-    // `<session-dir>/codex_session_id.txt` so the next daemon restart
-    // can `codex resume <uuid>` instead of conflating with another
-    // session via `--last`.
+    // id, kick off a watcher that scans codex's rollouts for one tagged
+    // with our originator. As soon as it appears, we extract the UUID and
+    // write it to `<session-dir>/codex_session_id.txt` so the next daemon
+    // restart can `codex resume <uuid>`. The watcher polls for the
+    // session's full lifetime — codex sometimes flushes its rollout file
+    // many minutes after spawn (it's lazy until the first turn completes)
+    // so a short timeout would just miss it.
     if !resuming_existing {
         if let Some(sid_path) = sid_file.clone() {
             spawn_session_id_watcher(
                 sid_path,
-                PathBuf::from(&params.cwd),
+                originator_tag,
                 params.env.clone(),
                 ctx.emit.clone(),
             );
@@ -169,19 +181,19 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let _ = run_pty(spec, ctx).await;
 }
 
-/// Watch codex's sessions directory for the new rollout file that this
-/// spawn is about to create, then persist its UUID to
+/// Watch codex's sessions directory for the rollout file tagged with our
+/// originator marker, then persist its UUID to
 /// `<session-dir>/codex_session_id.txt` so a future daemon restart can
 /// resume the same upstream codex conversation by id.
 ///
-/// Best-effort: silently times out after 30s of polling. If the watcher
-/// can't find codex's data root (no `$CODEX_HOME` and no `$HOME`), it
-/// also silently exits — we just lose cross-restart resume for this
-/// session, which is strictly better than conflating it with someone
-/// else's via `--last`.
+/// Polls for the entire session lifetime (the spawn dies when the
+/// adapter process exits). No timeout because codex flushes its rollout
+/// lazily — sometimes within a second, sometimes only after the first
+/// turn completes minutes later. To keep the work cheap, files that
+/// don't bear our originator are remembered and not re-read.
 fn spawn_session_id_watcher(
     sid_file: PathBuf,
-    expected_cwd: PathBuf,
+    expected_originator: String,
     session_env: HashMap<String, String>,
     emit: EventEmitter,
 ) {
@@ -200,62 +212,55 @@ fn spawn_session_id_watcher(
         );
         return;
     };
-    let snapshot = list_rollout_names(&sessions_root);
     tokio::spawn(async move {
-        let started = Instant::now();
-        let deadline = Duration::from_secs(30);
-        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        // Files we've already inspected and determined are not ours —
+        // skip them on later ticks so a deep `~/.codex/sessions/` tree
+        // stays cheap to poll.
+        let mut not_ours: HashSet<String> = HashSet::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // First tick fires immediately; that's fine — codex usually
-        // writes its rollout within ~hundreds of ms.
         loop {
             tick.tick().await;
-            if started.elapsed() >= deadline {
-                emit.log(
-                    "codex: session-id capture timed out; resume across daemon restart \
-                     will not work for this session",
-                );
+            for (name, path) in list_rollouts(&sessions_root) {
+                if not_ours.contains(&name) {
+                    continue;
+                }
+                let Some(meta) = read_session_meta(&path) else {
+                    // File exists but session_meta isn't readable yet.
+                    // Don't blacklist — codex may still be writing.
+                    continue;
+                };
+                if meta.originator.as_deref() != Some(expected_originator.as_str()) {
+                    not_ours.insert(name);
+                    continue;
+                }
+                let uuid = match meta
+                    .id
+                    .clone()
+                    .or_else(|| uuid_from_rollout_name(&name))
+                {
+                    Some(u) => u,
+                    None => {
+                        emit.log(format!(
+                            "codex: rollout {name} matched originator but had no id; skipping"
+                        ));
+                        not_ours.insert(name);
+                        continue;
+                    }
+                };
+                if let Err(e) = std::fs::write(&sid_file, &uuid) {
+                    emit.log(format!(
+                        "codex: failed to write {}: {e}",
+                        sid_file.display()
+                    ));
+                    return;
+                }
+                emit.log(format!(
+                    "codex: captured session id {uuid} (from {})",
+                    path.display()
+                ));
                 return;
             }
-            let now = list_rollouts(&sessions_root);
-            // Candidates: rollouts that weren't there at spawn time.
-            let mut candidates: Vec<(String, PathBuf)> = now
-                .into_iter()
-                .filter(|(name, _)| !snapshot.contains(name))
-                .collect();
-            if candidates.is_empty() {
-                continue;
-            }
-            // Disambiguate by cwd. Newest first so if two rollouts match
-            // we prefer the most recent one (codex names files by
-            // timestamp, so lexically-later is newer).
-            candidates.sort_by(|a, b| b.0.cmp(&a.0));
-            let expected = expected_cwd.as_path();
-            let pick = candidates
-                .iter()
-                .find(|(_, path)| rollout_cwd_matches(path, expected))
-                .or_else(|| candidates.first());
-            let Some((name, path)) = pick else {
-                continue;
-            };
-            let Some(uuid) = uuid_from_rollout_name(name) else {
-                emit.log(format!(
-                    "codex: new rollout {name} has unrecognized filename — skipping capture"
-                ));
-                continue;
-            };
-            if let Err(e) = std::fs::write(&sid_file, &uuid) {
-                emit.log(format!(
-                    "codex: failed to write {}: {e}",
-                    sid_file.display()
-                ));
-                return;
-            }
-            emit.log(format!(
-                "codex: captured session id {uuid} (from {})",
-                path.display()
-            ));
-            return;
         }
     });
 }
@@ -305,8 +310,28 @@ fn list_rollouts(root: &Path) -> Vec<(String, PathBuf)> {
     out
 }
 
-fn list_rollout_names(root: &Path) -> HashSet<String> {
-    list_rollouts(root).into_iter().map(|(n, _)| n).collect()
+/// Subset of fields we care about from codex's `session_meta` JSONL line.
+#[derive(Default)]
+struct SessionMeta {
+    id: Option<String>,
+    originator: Option<String>,
+}
+
+/// Read the rollout's first JSONL line and pull `payload.id` and
+/// `payload.originator`. Returns `None` if the file is empty / mid-write
+/// / not parseable — caller should re-check on a later tick.
+fn read_session_meta(path: &Path) -> Option<SessionMeta> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let first = text.lines().next()?;
+    let v: Value = serde_json::from_str(first).ok()?;
+    let payload = v.get("payload")?;
+    Some(SessionMeta {
+        id: payload.get("id").and_then(|s| s.as_str()).map(String::from),
+        originator: payload
+            .get("originator")
+            .and_then(|s| s.as_str())
+            .map(String::from),
+    })
 }
 
 /// Extract the trailing UUID from a `rollout-<ts>-<uuid>.jsonl` filename.
@@ -329,27 +354,6 @@ fn uuid_from_rollout_name(name: &str) -> Option<String> {
         }
     }
     Some(uuid.to_string())
-}
-
-/// Read the rollout's first JSONL line and check that
-/// `payload.cwd == expected`. Returns `false` on any read/parse error
-/// — we'd rather skip a candidate than misattribute it.
-fn rollout_cwd_matches(path: &Path, expected: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let first = match text.lines().next() {
-        Some(l) => l,
-        None => return false,
-    };
-    let Ok(v) = serde_json::from_str::<Value>(first) else {
-        return false;
-    };
-    let cwd = v
-        .get("payload")
-        .and_then(|p| p.get("cwd"))
-        .and_then(|c| c.as_str());
-    cwd.map(|c| Path::new(c) == expected).unwrap_or(false)
 }
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
@@ -684,33 +688,42 @@ mod tests {
     }
 
     #[test]
-    fn rollout_cwd_matches_picks_only_matching_session() {
+    fn read_session_meta_extracts_id_and_originator() {
         let tmp = std::env::temp_dir().join(format!(
-            "agentd-codex-rollout-test-{}",
+            "agentd-codex-meta-test-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
+
         let mine = tmp.join("rollout-mine.jsonl");
-        let theirs = tmp.join("rollout-theirs.jsonl");
         std::fs::write(
             &mine,
-            r#"{"timestamp":"x","type":"session_meta","payload":{"id":"u","cwd":"/work/me"}}
-"#,
+            "{\"timestamp\":\"x\",\"type\":\"session_meta\",\"payload\":\
+             {\"id\":\"019e32aa-014a-7ff0-9a3f-7ae773961a37\",\
+             \"cwd\":\"/work/me\",\"originator\":\"agentd:sess-abc\"}}\n",
         )
         .unwrap();
+        let meta = read_session_meta(&mine).unwrap();
+        assert_eq!(meta.id.as_deref(), Some("019e32aa-014a-7ff0-9a3f-7ae773961a37"));
+        assert_eq!(meta.originator.as_deref(), Some("agentd:sess-abc"));
+
+        // Default codex originator stays distinct.
+        let other = tmp.join("rollout-other.jsonl");
         std::fs::write(
-            &theirs,
-            r#"{"timestamp":"x","type":"session_meta","payload":{"id":"u","cwd":"/work/them"}}
-"#,
+            &other,
+            "{\"type\":\"session_meta\",\"payload\":\
+             {\"id\":\"u\",\"originator\":\"codex-tui\"}}\n",
         )
         .unwrap();
-        assert!(rollout_cwd_matches(&mine, Path::new("/work/me")));
-        assert!(!rollout_cwd_matches(&theirs, Path::new("/work/me")));
-        // Empty / malformed files don't match anything.
+        let meta = read_session_meta(&other).unwrap();
+        assert_eq!(meta.originator.as_deref(), Some("codex-tui"));
+
+        // Empty / mid-write file: caller will re-check later.
         let blank = tmp.join("rollout-blank.jsonl");
         std::fs::write(&blank, "").unwrap();
-        assert!(!rollout_cwd_matches(&blank, Path::new("/work/me")));
+        assert!(read_session_meta(&blank).is_none());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

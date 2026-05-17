@@ -329,17 +329,22 @@ for its harness:
   `<session-dir>/claude_session_id.txt`. On respawn we pass
   `--resume <uuid>` so the claude conversation continues.
 - **codex (interactive)** — codex doesn't let the client assign a
-  session id, so on first spawn the adapter snoops codex's sessions
-  dir (`$CODEX_HOME/sessions` or `~/.codex/sessions`) to capture the
-  UUID codex chose, then writes it to
+  session id, so we tag the spawn with a unique `originator` via
+  codex's internal env override
+  (`CODEX_INTERNAL_ORIGINATOR_OVERRIDE=agentd:<session-id>`) and watch
+  the codex sessions dir (`$CODEX_HOME/sessions` or
+  `~/.codex/sessions`) for the rollout that bears that tag. When we
+  find it, we read codex's UUID from `payload.id` and write it to
   `<session-dir>/codex_session_id.txt`. On respawn we run
   `codex resume <uuid>` to reattach. `AGENTD_CODEX_RESUME_ID`
-  overrides the captured id. If no id was captured (the capture
-  window timed out, or the file is missing), the respawn starts a
-  *fresh* codex rather than `codex resume --last` — `--last`
-  resolves globally across every codex session on the machine, so
-  using it as a fallback conflates multiple agentd codex sessions
-  into the same upstream conversation.
+  overrides the captured id. The watcher polls for the session's full
+  lifetime — codex flushes its rollout lazily (sometimes only after
+  the first turn completes), so a short timeout would just miss it.
+  If no id has been captured yet when the daemon restarts, the
+  respawn starts a *fresh* codex rather than `codex resume --last`
+  — `--last` resolves globally across every codex session on the
+  machine, so using it as a fallback conflates multiple agentd codex
+  sessions into the same upstream conversation.
 - **zarvis** — appends each `Message` to
   `<session-dir>/zarvis.jsonl` as the agent loop runs. On respawn
   the loop reads the file back into memory before waiting for new
