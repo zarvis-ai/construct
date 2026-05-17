@@ -1026,6 +1026,10 @@ fn char_index_to_byte(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
+fn pty_input_requests_interrupt(bytes: &[u8]) -> bool {
+    bytes.contains(&0x03) || bytes == [0x1b]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1154,53 @@ mod tests {
         let mut ed = editor();
         let (_, evs) = ed.feed_bytes(&[0x04]);
         assert!(matches!(evs.as_slice(), [LineEvent::Eof]));
+    }
+
+    #[test]
+    fn pty_interrupt_detection_preserves_escape_sequences() {
+        assert!(pty_input_requests_interrupt(&[0x03]));
+        assert!(pty_input_requests_interrupt(&[0x1b]));
+        assert!(!pty_input_requests_interrupt(b"\x1b[A"));
+        assert!(!pty_input_requests_interrupt(b"\x1b[1;5D"));
+        assert!(!pty_input_requests_interrupt(b"abc"));
+    }
+
+    #[tokio::test]
+    async fn kill_supervisor_task_aborts_running_tool() {
+        struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropNotify {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let tasks = crate::tasks::Tasks::new();
+        let (completion_tx, _completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+
+        let supervisor = tokio::spawn(crate::tasks::supervise(
+            "c1".into(),
+            "slow".into(),
+            "".into(),
+            tasks.clone(),
+            completion_tx,
+            std::time::Duration::from_secs(60),
+            async move {
+                let _guard = DropNotify(Some(dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<std::result::Result<ToolOutcome, String>>().await
+            },
+        ));
+
+        started_rx.await.expect("tool runner should start");
+        let outcome = kill_supervisor_task(&tasks, "c1", supervisor).await;
+        assert!(matches!(outcome, crate::tasks::SupervisorOutcome::Killed));
+        dropped_rx.await.expect("tool runner should be aborted");
+        assert!(tasks.running.lock().await.is_empty());
     }
 
     #[test]
@@ -1702,15 +1753,13 @@ pub async fn run(
                     })
                     .collect();
 
-                // Drive the tasks concurrently but yield results in
-                // submission order — that's how the user gets `→ a`
-                // immediately followed by `✓ a` even when `a` was the
-                // slowest. `FuturesOrdered` blocks on the head until
-                // ready, so a slow first call stalls visible output;
-                // that's the cost of tight grouping.
-                use futures::stream::{FuturesOrdered, StreamExt};
-                let mut ordered: FuturesOrdered<_> = FuturesOrdered::new();
-                for (_, call, summary) in &safe_meta {
+                // Spawn each supervisor outside the input-driver
+                // future. If the user interrupts, dropping the driver
+                // must not drop the supervisor and detach the tool.
+                let (safe_tx, mut safe_rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut safe_supervisors = Vec::new();
+                for (i, call, summary) in &safe_meta {
+                    let safe_index = *i;
                     let call_clone = call.clone();
                     let summary_clone = summary.clone();
                     let reg = registry.clone();
@@ -1721,7 +1770,9 @@ pub async fn run(
                     let bg_after_c = bg_after;
                     let call_id = call.id.clone();
                     let tool_name = call.name.clone();
-                    ordered.push_back(async move {
+                    let call_id_for_handle = call_id.clone();
+                    let tx = safe_tx.clone();
+                    let handle = tokio::spawn(async move {
                         // Each safe call gets its own supervisor —
                         // auto-bg works in parallel just like the
                         // risky serial path. SupervisorOutcome maps
@@ -1740,30 +1791,20 @@ pub async fn run(
                             tool_runner,
                         )
                         .await;
-                        match outcome {
-                            crate::tasks::SupervisorOutcome::Done(r) => r,
-                            crate::tasks::SupervisorOutcome::Killed => {
-                                Err("interrupt".into())
-                            }
-                            crate::tasks::SupervisorOutcome::Backgrounded => {
-                                Ok(ToolOutcome {
-                                    ok: true,
-                                    output: crate::tasks::BG_PLACEHOLDER_OUTPUT.to_string(),
-                                })
-                            }
-                        }
+                        let _ = tx.send((safe_index, outcome));
                     });
+                    safe_supervisors.push((safe_index, call_id_for_handle, handle));
                 }
+                drop(safe_tx);
 
                 let render_fut = async {
                     let mut outcomes_map: HashMap<
                         usize,
                         std::result::Result<ToolOutcome, String>,
                     > = HashMap::new();
-                    let mut meta_iter = safe_meta.iter();
-                    while let Some(outcome) = ordered.next().await {
-                        let (i, call, summary) = match meta_iter.next() {
-                            Some(m) => m,
+                    while outcomes_map.len() < safe_meta.len() {
+                        let (i, outcome) = match safe_rx.recv().await {
+                            Some(item) => item,
                             None => break,
                         };
                         // No inline PTY writes for tool blocks — the
@@ -1774,10 +1815,8 @@ pub async fn run(
                         // PTY stream as pure chat content keeps the
                         // user's live prompt + typing visible during
                         // tool waits (those bytes used to be stripped
-                        // by the OSC fence). `summary` and `call`
-                        // bindings stay for the outcomes map below.
-                        let _ = (call, summary);
-                        outcomes_map.insert(*i, outcome);
+                        // by the OSC fence).
+                        outcomes_map.insert(i, outcome_from_supervisor(outcome));
                     }
                     outcomes_map
                 };
@@ -1801,14 +1840,14 @@ pub async fn run(
                     }
                     DriveExit::Stop | DriveExit::Channel => {
                         early_stop = true;
-                        for &i in &safe_idx {
-                            outcomes
-                                .entry(i)
-                                .or_insert_with(|| Err("stop".to_string()));
+                        for (i, call_id, handle) in safe_supervisors {
+                            kill_joined_task(&tasks, &call_id, handle).await;
+                            outcomes.entry(i).or_insert_with(|| Err("stop".to_string()));
                         }
                     }
                     DriveExit::Interrupt => {
-                        for &i in &safe_idx {
+                        for (i, call_id, handle) in safe_supervisors {
+                            kill_joined_task(&tasks, &call_id, handle).await;
                             outcomes
                                 .entry(i)
                                 .or_insert_with(|| Err("interrupt".to_string()));
@@ -2366,7 +2405,7 @@ async fn run_with_supervisor(
     // supervisor's control channel; everything else flows through
     // the editor / queue / automode handlers like before.
     let tasks_for_drive = tasks.clone();
-    let inner = crate::tasks::supervise(
+    let mut supervisor = tokio::spawn(crate::tasks::supervise(
         call_id.clone(),
         tool_name.clone(),
         args_summary.clone(),
@@ -2374,7 +2413,7 @@ async fn run_with_supervisor(
         bg_completion_tx,
         bg_after,
         tool_runner,
-    );
+    ));
     let drive = drive_with_input_relaying(
         inbox,
         editor,
@@ -2384,26 +2423,68 @@ async fn run_with_supervisor(
         automode,
         tasks_for_drive,
         &call_id,
-        inner,
+        async { (&mut supervisor).await },
     )
     .await;
     match drive {
-        DriveExit::Done(outcome) => outcome,
-        DriveExit::Stop | DriveExit::Channel => crate::tasks::SupervisorOutcome::Killed,
-        DriveExit::Interrupt => {
-            // Reach into the supervisor's control channel to
-            // request a kill. (The supervisor future was dropped by
-            // drive_with_input on interrupt, but if it's still
-            // around because of a race we want to be sure.)
-            let _ = crate::tasks::forward_control(
-                &tasks,
-                &call_id,
-                crate::tasks::ToolControl::Kill,
-            )
-            .await;
-            crate::tasks::SupervisorOutcome::Killed
+        DriveExit::Done(outcome) => join_supervisor_outcome(outcome),
+        DriveExit::Stop | DriveExit::Channel => {
+            kill_supervisor_task(&tasks, &call_id, supervisor).await
         }
+        DriveExit::Interrupt => kill_supervisor_task(&tasks, &call_id, supervisor).await,
     }
+}
+
+fn outcome_from_supervisor(
+    outcome: crate::tasks::SupervisorOutcome,
+) -> std::result::Result<ToolOutcome, String> {
+    match outcome {
+        crate::tasks::SupervisorOutcome::Done(r) => r,
+        crate::tasks::SupervisorOutcome::Killed => Err("interrupt".into()),
+        crate::tasks::SupervisorOutcome::Backgrounded => Ok(ToolOutcome {
+            ok: true,
+            output: crate::tasks::BG_PLACEHOLDER_OUTPUT.to_string(),
+        }),
+    }
+}
+
+fn join_supervisor_outcome(
+    outcome: std::result::Result<
+        crate::tasks::SupervisorOutcome,
+        tokio::task::JoinError,
+    >,
+) -> crate::tasks::SupervisorOutcome {
+    match outcome {
+        Ok(outcome) => outcome,
+        Err(e) if e.is_cancelled() => crate::tasks::SupervisorOutcome::Killed,
+        Err(e) => crate::tasks::SupervisorOutcome::Done(Err(format!("join error: {e}"))),
+    }
+}
+
+async fn kill_supervisor_task(
+    tasks: &crate::tasks::Tasks,
+    call_id: &str,
+    handle: tokio::task::JoinHandle<crate::tasks::SupervisorOutcome>,
+) -> crate::tasks::SupervisorOutcome {
+    let signaled =
+        crate::tasks::forward_control(tasks, call_id, crate::tasks::ToolControl::Kill).await;
+    if !signaled && !handle.is_finished() {
+        handle.abort();
+    }
+    join_supervisor_outcome(handle.await)
+}
+
+async fn kill_joined_task<T>(
+    tasks: &crate::tasks::Tasks,
+    call_id: &str,
+    handle: tokio::task::JoinHandle<T>,
+) {
+    let signaled =
+        crate::tasks::forward_control(tasks, call_id, crate::tasks::ToolControl::Kill).await;
+    if !signaled && !handle.is_finished() {
+        handle.abort();
+    }
+    let _ = handle.await;
 }
 
 /// Variant of `drive_with_input` that *also* relays
@@ -2448,7 +2529,7 @@ where
                         emit_editor_state(term.emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyInput(bytes)) => {
-                        if bytes.contains(&0x03) {
+                        if pty_input_requests_interrupt(&bytes) {
                             return DriveExit::Interrupt;
                         }
                         let (_discarded, events) = editor.feed_bytes(&bytes);
@@ -2777,7 +2858,7 @@ where
                         emit_editor_state(term.emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyInput(bytes)) => {
-                        if bytes.contains(&0x03) {
+                        if pty_input_requests_interrupt(&bytes) {
                             return DriveExit::Interrupt;
                         }
                         let (_discarded, events) = editor.feed_bytes(&bytes);
@@ -2859,7 +2940,7 @@ where
                         emit_editor_state(emit, editor, queue);
                     }
                     Some(AdapterInboxMsg::PtyInput(bytes)) => {
-                        if bytes.contains(&0x03) {
+                        if pty_input_requests_interrupt(&bytes) {
                             return DriveExit::Interrupt;
                         }
                         let (_discarded, events) = editor.feed_bytes(&bytes);
