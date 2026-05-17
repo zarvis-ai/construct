@@ -16,7 +16,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use serde::{Deserialize, Serialize};
@@ -748,7 +748,48 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         tokio::select! {
             ev = input_stream.next() => {
                 match ev {
-                    Some(Ok(ev)) => app.on_term_event(ev).await,
+                    Some(Ok(ev)) => {
+                        app.on_term_event(ev).await;
+                        // Coalesce consecutive left-button drag events
+                        // before the next render. Mouse drags (resize
+                        // dividers, text selection) fire one event per
+                        // pixel of cursor movement — many per frame on
+                        // a fast mouse — and each event is a tiny state
+                        // mutation. Without this, every event triggers
+                        // a full TUI re-render, which on a session with
+                        // a large PTY history pegs CPU and makes the
+                        // drag feel laggy. Same shape as the
+                        // notification-drain below: apply all pending
+                        // drag updates, render once.
+                        const MAX_DRAG_DRAIN: usize = 64;
+                        let mut drained = 0;
+                        while drained < MAX_DRAG_DRAIN {
+                            match input_stream.next().now_or_never() {
+                                Some(Some(Ok(CtEvent::Mouse(m))))
+                                    if matches!(
+                                        m.kind,
+                                        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                                    ) =>
+                                {
+                                    app.on_term_event(CtEvent::Mouse(m)).await;
+                                    drained += 1;
+                                }
+                                Some(Some(Ok(other_ev))) => {
+                                    // Non-drag event surfaced — handle
+                                    // it (so we don't drop input) and
+                                    // stop draining so it can render.
+                                    app.on_term_event(other_ev).await;
+                                    break;
+                                }
+                                Some(Some(Err(e))) => {
+                                    app.set_status(format!("input error: {e}"));
+                                    break;
+                                }
+                                // Stream ended OR no event ready.
+                                Some(None) | None => break,
+                            }
+                        }
+                    }
                     Some(Err(e)) => {
                         app.set_status(format!("input error: {e}"));
                     }
