@@ -1,7 +1,6 @@
-use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::net::UnixListener;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split};
 use serde_json::Value;
 use agentd_client::Client;
 use agentd_protocol::ipc_method;
@@ -19,8 +18,9 @@ async fn test_reconnect_flow() {
 
     // Spawn server task
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut reader = BufReader::new(stream.clone());
+        let (stream, _) = listener.accept().await.unwrap();
+        let (r, mut w) = split(stream);
+        let mut reader = BufReader::new(r);
         let mut line = String::new();
         // read one request
         reader.read_line(&mut line).await.unwrap();
@@ -31,20 +31,20 @@ async fn test_reconnect_flow() {
         if method == ipc_method::SUBSCRIBE_EVENTS {
             let resp = serde_json::json!({"jsonrpc":"2.0","id": id, "result": null});
             let s = resp.to_string() + "\n";
-            stream.write_all(s.as_bytes()).await.unwrap();
+            w.write_all(s.as_bytes()).await.unwrap();
             // send a notification after a short delay
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let notif = serde_json::json!({"jsonrpc":"2.0","method":"session/event","params": {"session_id":"s1","event":{"type":"status","state":"running"}}});
             let ns = notif.to_string() + "\n";
-            stream.write_all(ns.as_bytes()).await.unwrap();
+            w.write_all(ns.as_bytes()).await.unwrap();
         } else if method == ipc_method::SESSION_LIST {
             let resp = serde_json::json!({"jsonrpc":"2.0","id": id, "result": []});
             let s = resp.to_string() + "\n";
-            stream.write_all(s.as_bytes()).await.unwrap();
+            w.write_all(s.as_bytes()).await.unwrap();
         } else {
             let resp = serde_json::json!({"jsonrpc":"2.0","id": id, "result": null});
             let s = resp.to_string() + "\n";
-            stream.write_all(s.as_bytes()).await.unwrap();
+            w.write_all(s.as_bytes()).await.unwrap();
         }
         // keep open a bit
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -61,8 +61,9 @@ async fn test_reconnect_flow() {
     // Now test reconnect by starting a new server on same socket
     let listener2 = UnixListener::bind(&sock).unwrap();
     let server2 = tokio::spawn(async move {
-        let (mut stream, _) = listener2.accept().await.unwrap();
-        let mut reader = BufReader::new(stream.clone());
+        let (stream, _) = listener2.accept().await.unwrap();
+        let (r, mut w) = split(stream);
+        let mut reader = BufReader::new(r);
         let mut line = String::new();
         // read a few requests and reply with basic results
         for _ in 0..5 {
@@ -79,12 +80,12 @@ async fn test_reconnect_flow() {
                 _ => serde_json::json!({"jsonrpc":"2.0","id": id, "result": null}),
             };
             let s = resp.to_string() + "\n";
-            stream.write_all(s.as_bytes()).await.unwrap();
+            w.write_all(s.as_bytes()).await.unwrap();
         }
         // send a notification so client has something to receive
         let notif = serde_json::json!({"jsonrpc":"2.0","method":"session/event","params": {"session_id":"s1","event":{"type":"status","state":"running"}}});
         let ns = notif.to_string() + "\n";
-        stream.write_all(ns.as_bytes()).await.unwrap();
+        w.write_all(ns.as_bytes()).await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     });
 
