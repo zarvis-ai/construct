@@ -1116,9 +1116,22 @@ fn render_matrix_rain(f: &mut Frame, area: Rect, app: &App, occupied_rows: usize
         }
     }
 
-    if let Some(flash) = app.matrix_rain.active_flash(now) {
-        if let Some(progress) = flash.progress(now) {
-            render_matrix_flash(f, rain_area, &app.theme, flash.text, flash.tone, progress);
+    for reveal in app.matrix_rain.active_reveals(now) {
+        if reveal.progress(now).is_some() {
+            let reveal_start_elapsed_ms = reveal
+                .started
+                .checked_duration_since(app.start_instant)
+                .map(|duration| duration.as_millis() as u64)
+                .unwrap_or(0);
+            render_matrix_reveal(
+                f,
+                rain_area,
+                &app.theme,
+                reveal,
+                elapsed,
+                reveal_start_elapsed_ms,
+                cycle,
+            );
         }
     }
 }
@@ -1189,50 +1202,108 @@ fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
     }
 }
 
-fn render_matrix_flash(
+fn render_matrix_reveal(
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
-    text: &str,
-    tone: crate::matrix_rain::FlashTone,
-    progress: f32,
+    reveal: &crate::matrix_rain::RevealWord,
+    elapsed_ms: u64,
+    reveal_start_elapsed_ms: u64,
+    cycle: u16,
 ) {
     if area.width < 4 || area.height == 0 {
         return;
     }
-    let text_w = text.chars().count() as u16;
+    let chars: Vec<char> = reveal.text.chars().collect();
+    let text_w = chars.len() as u16;
     if text_w == 0 || text_w + 2 > area.width {
         return;
     }
-    let pulse = (1.0 - (progress * 2.0 - 1.0).abs()).clamp(0.0, 1.0);
-    let row_seed = hash64(text.bytes().fold(0u64, |acc, b| acc ^ b as u64));
-    let y = area.y
-        + ((area.height / 3) + (row_seed as u16 % area.height.max(1) / 3))
-            .min(area.height.saturating_sub(1));
-    let x = area.x + (area.width.saturating_sub(text_w) / 2);
-    let color = flash_color(theme, tone, pulse);
-    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let glow = Style::default().fg(theme.matrix_glow);
-    if x > area.x {
-        f.buffer_mut().set_string(x - 1, y, ">", glow);
+    let target_x = area.x
+        + ((area.width.saturating_sub(text_w) as f32) * reveal.x)
+            .round()
+            .clamp(0.0, area.width.saturating_sub(text_w) as f32) as u16;
+    let target_y = area.y
+        + ((area.height.saturating_sub(1) as f32) * reveal.y)
+            .round()
+            .clamp(0.0, area.height.saturating_sub(1) as f32) as u16;
+
+    let target_rel_y = target_y.saturating_sub(area.y);
+    let mut pins = Vec::with_capacity(chars.len());
+    let mut all_pinned_at = reveal_start_elapsed_ms;
+    for i in 0..chars.len() {
+        let col = target_x.saturating_sub(area.x) + i as u16;
+        let pinned_at =
+            rain_pass_elapsed_ms(area.width, col, target_rel_y, cycle, reveal_start_elapsed_ms);
+        all_pinned_at = all_pinned_at.max(pinned_at);
+        pins.push(pinned_at);
     }
-    if x + text_w < area.x + area.width {
-        f.buffer_mut().set_string(x + text_w, y, "<", glow);
-    }
-    for (i, ch) in text.chars().enumerate() {
+
+    let complete_hold_ms = 400;
+    let fade_ms = 200;
+    let fade_start = all_pinned_at + complete_hold_ms;
+    let fade_end = fade_start + fade_ms;
+    let fade_level = if elapsed_ms < fade_start {
+        1.0
+    } else {
+        let elapsed_fade = elapsed_ms.saturating_sub(fade_start);
+        (1.0 - elapsed_fade as f32 / fade_ms.max(1) as f32).clamp(0.0, 1.0)
+    };
+
+    for (i, ch) in chars.into_iter().enumerate() {
+        let pinned_at = pins[i];
+        if elapsed_ms < pinned_at {
+            continue;
+        }
+        if elapsed_ms >= fade_end {
+            continue;
+        }
+        let since_pin_ms = elapsed_ms.saturating_sub(pinned_at);
+        let brightness = if elapsed_ms < fade_start {
+            if since_pin_ms < 220 {
+                1.0
+            } else {
+                0.76
+            }
+        } else {
+            (0.12 + fade_level * 0.64).clamp(0.0, 1.0)
+        };
+        let style = matrix_reveal_style(theme, brightness, elapsed_ms < fade_start);
+        let x = target_x + i as u16;
         f.buffer_mut()
-            .set_string(x + i as u16, y, ch.to_string(), style);
+            .set_string(x, target_y, ch.to_string(), style);
     }
 }
 
-fn flash_color(theme: &Theme, tone: crate::matrix_rain::FlashTone, pulse: f32) -> Color {
-    let base = match tone {
-        crate::matrix_rain::FlashTone::Work => theme.matrix_flash_work,
-        crate::matrix_rain::FlashTone::Good => theme.matrix_flash_good,
-        crate::matrix_rain::FlashTone::Warn => theme.matrix_flash_warn,
-        crate::matrix_rain::FlashTone::Bad => theme.matrix_flash_bad,
-    };
-    blend_color(base, theme.text, pulse.clamp(0.0, 1.0) * 0.28)
+fn matrix_reveal_style(theme: &Theme, brightness: f32, bold: bool) -> Style {
+    let brightness = brightness.clamp(0.0, 1.0);
+    let color = blend_color(theme.matrix_dim, theme.text, brightness);
+    let style = Style::default().fg(color);
+    if bold || brightness > 0.72 {
+        style.add_modifier(Modifier::BOLD)
+    } else if brightness < 0.35 {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    }
+}
+
+fn rain_pass_elapsed_ms(
+    width: u16,
+    col: u16,
+    target_rel_y: u16,
+    cycle: u16,
+    start_elapsed_ms: u64,
+) -> u64 {
+    let seed = hash64(col as u64 ^ ((width as u64) << 24));
+    let speed = 2 + (seed % 7);
+    let tick_ms = 58 + speed * 19;
+    let offset = (seed >> 8) % cycle.max(1) as u64;
+    let cycle = cycle.max(1) as u64;
+    let start_step = start_elapsed_ms / tick_ms;
+    let target_step = (target_rel_y as u64 + cycle - offset) % cycle;
+    let delta = (target_step + cycle - (start_step % cycle)) % cycle;
+    (start_step + delta) * tick_ms
 }
 
 fn blend_color(a: Color, b: Color, t: f32) -> Color {
@@ -2954,6 +3025,27 @@ mod tests {
             Some(super::green_for_luma(&theme, 102)),
             "ANSI dark gray should become the corresponding Matrix green"
         );
+    }
+
+    #[test]
+    fn rain_pass_elapsed_ms_waits_for_natural_column_pass() {
+        let width = 24;
+        let cycle = 13;
+        let target_rel_y = 4;
+
+        for col in 0..width {
+            let passed_at = rain_pass_elapsed_ms(width, col, target_rel_y, cycle, 1_000);
+
+            let seed = hash64(col as u64 ^ ((width as u64) << 24));
+            let tick_ms = 58 + (2 + (seed % 7)) * 19;
+            assert!(
+                passed_at >= 1_000 || passed_at + tick_ms > 1_000,
+                "the pass should either be upcoming or still be the current head position"
+            );
+            let offset = (seed >> 8) % cycle as u64;
+            let head = ((passed_at / tick_ms) + offset) % cycle as u64;
+            assert_eq!(head, target_rel_y as u64);
+        }
     }
 
     #[test]
