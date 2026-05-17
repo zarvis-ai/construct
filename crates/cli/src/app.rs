@@ -2747,19 +2747,33 @@ impl App {
         }
     }
 
+}
+
+/// Try to connect to `socket`, subscribe to events, and return the client
+/// plus the notifications receiver on success.
+pub async fn try_connect_and_subscribe(
+    socket: &Path,
+) -> Option<(std::sync::Arc<Client>, tokio::sync::mpsc::UnboundedReceiver<agentd_protocol::Notification>)> {
+    let client = match Client::connect(socket).await {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    if client.subscribe(None).await.is_err() {
+        return None;
+    }
+    let notifications = match client.take_notifications().await {
+        Some(rx) => rx,
+        None => return None,
+    };
+    Some((client, notifications))
+}
+
     async fn reconnect(
         &mut self,
         socket: &Path,
     ) -> Option<tokio::sync::mpsc::UnboundedReceiver<agentd_protocol::Notification>> {
-        let client = match Client::connect(socket).await {
-            Ok(client) => client,
-            Err(_) => return None,
-        };
-        if client.subscribe(None).await.is_err() {
-            return None;
-        }
-        let notifications = match client.take_notifications().await {
-            Some(rx) => rx,
+        let (client, notifications) = match try_connect_and_subscribe(socket).await {
+            Some((c, rx)) => (c, rx),
             None => return None,
         };
 
