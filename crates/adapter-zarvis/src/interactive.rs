@@ -308,6 +308,15 @@ const LEFT_MARGIN_CELLS: usize = 2;
 /// math.
 const MIN_USABLE_WIDTH: usize = 20;
 
+/// Update `pty_width` for a new terminal column count. Pure on purpose:
+/// it takes no `Terminal` / emitter, so the resize handler structurally
+/// cannot paint to PTY. The active `❯` lives in the TUI's bottom editor
+/// pane (fed by `EditorState`); painting `editor.redraw()` here would
+/// leave a stray cyan `❯` in chat scrollback duplicating the prompt.
+fn apply_pty_resize(cols: u16, pty_width: &mut usize) {
+    *pty_width = (cols as usize).max(MIN_USABLE_WIDTH + LEFT_MARGIN_CELLS + PAD_RIGHT);
+}
+
 /// Max preview lines per tool result rendered in the PTY. Output
 /// beyond this lands behind a `[+N lines — click to expand]` footer
 /// (the full output is still in the transcript and in the model's
@@ -1070,6 +1079,25 @@ mod tests {
 
     fn editor() -> LineEditor {
         LineEditor::new(b"> ", 2)
+    }
+
+    #[test]
+    fn apply_pty_resize_updates_width_for_normal_columns() {
+        let mut width = 80;
+        apply_pty_resize(120, &mut width);
+        assert_eq!(width, 120);
+        apply_pty_resize(40, &mut width);
+        assert_eq!(width, 40);
+    }
+
+    #[test]
+    fn apply_pty_resize_clamps_below_minimum() {
+        let min = MIN_USABLE_WIDTH + LEFT_MARGIN_CELLS + PAD_RIGHT;
+        let mut width = 80;
+        apply_pty_resize(5, &mut width);
+        assert_eq!(width, min, "tiny pane should clamp up to wrap-math floor");
+        apply_pty_resize(0, &mut width);
+        assert_eq!(width, min, "zero-column resize should also clamp");
     }
 
     fn submit_line(ed: &mut LineEditor, bytes: &[u8]) -> Option<String> {
@@ -2066,24 +2094,7 @@ async fn read_one_line(
                 emit_editor_state(term.emit, editor, &VecDeque::new());
             }
             Some(AdapterInboxMsg::PtyResize { cols, .. }) => {
-                let new_w = (cols as usize)
-                    .max(MIN_USABLE_WIDTH + LEFT_MARGIN_CELLS + PAD_RIGHT);
-                let width_changed = new_w != *pty_width;
-                *pty_width = new_w;
-                // Subsequent streaming uses the new width. We don't
-                // replay history: the items-model client rebuilds its
-                // vt100 parser at the current width every frame, so
-                // the viewport reflows on its own. Re-emitting the
-                // full conversation here scaled O(history bytes) and
-                // also kept appending duplicate PtyChunks to the
-                // client's store on every resize. Old content keeps
-                // whatever wrap points PtySink already baked in, which
-                // is the same tradeoff most terminal apps accept.
-                if width_changed {
-                    editor.last_popup_lines = 0;
-                    let bytes = editor.redraw();
-                    term.write(&bytes);
-                }
+                apply_pty_resize(cols, pty_width);
             }
             Some(AdapterInboxMsg::ToolDecision { .. }) => {}
             Some(AdapterInboxMsg::ToolAction { .. }) => {
