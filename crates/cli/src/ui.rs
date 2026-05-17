@@ -5,6 +5,7 @@ use crate::app::{
     ScreenPoint, Selection, TextSelectionRange, ViewMode, ZoomMode,
 };
 use crate::keymap::KeyAction;
+use crate::theme::Theme;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -152,7 +153,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_harness_unavailable_tooltip(f, app);
     render_tasks_popup(f, app);
     if app.help_visible {
-        render_help(f, area);
+        render_help(f, area, &app.theme);
     }
     finish_frame(f, app);
 }
@@ -189,7 +190,9 @@ fn render_text_selection(f: &mut Frame, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let style = Style::default().bg(Color::Blue).fg(Color::White);
+    let style = Style::default()
+        .bg(app.theme.highlight_bg)
+        .fg(app.theme.highlight_fg);
     if let Some(sel) = &app.text_selection {
         if sel.dragged {
             let (start, end) = normalized_points(sel.anchor, sel.head);
@@ -437,7 +440,7 @@ pub fn is_on_view_uncollapse_handle(app: &super::app::App, col: u16, row: u16) -
 /// overflow the screen edges. Mirrors the layout used by
 /// `render_diamond_tooltip` / `render_view_close_tooltip` so all
 /// tooltips look uniform.
-fn render_button_tooltip(f: &mut Frame, label: &str, anchor_x: u16, anchor_y: u16) {
+fn render_button_tooltip(f: &mut Frame, theme: &Theme, label: &str, anchor_x: u16, anchor_y: u16) {
     let total = f.area();
     let inner_w = UnicodeWidthStr::width(label) as u16;
     let w = inner_w + 2;
@@ -458,10 +461,10 @@ fn render_button_tooltip(f: &mut Frame, label: &str, anchor_x: u16, anchor_y: u1
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(theme.border));
     let p = Paragraph::new(label)
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(Style::default().fg(theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
 }
@@ -479,22 +482,20 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
     }
     if let Some((xs, xe, y)) = list_plus_button_range(list) {
         if my == y && mx >= xs && mx < xe {
-            render_button_tooltip(f, " New session ", xs, y);
+            render_button_tooltip(f, &app.theme, " New session ", xs, y);
             return;
         }
     }
     if let Some((xs, xe, y)) = list_collapse_button_range(list) {
         if my == y && mx >= xs && mx < xe {
-            render_button_tooltip(f, " Collapse list ", xs, y);
+            render_button_tooltip(f, &app.theme, " Collapse list ", xs, y);
             return;
         }
     }
     if !app.matrix_rain_hidden {
-        if let Some((xs, xe, y)) =
-            matrix_rain_close_button_range(list, app.layout.list_row_count)
-        {
+        if let Some((xs, xe, y)) = matrix_rain_close_button_range(list, app.layout.list_row_count) {
             if my == y && mx >= xs && mx < xe {
-                render_button_tooltip(f, " Hide rain ", xs, y);
+                render_button_tooltip(f, &app.theme, " Hide rain ", xs, y);
             }
         }
     }
@@ -512,14 +513,14 @@ fn render_view_uncollapse_tooltip(f: &mut Frame, app: &App) {
     };
     if mx == view.x && my >= view.y && my < view.y + view.height {
         let (gx, gy) = view_uncollapse_glyph_pos(view);
-        render_button_tooltip(f, " Expand list ", gx, gy);
+        render_button_tooltip(f, &app.theme, " Expand list ", gx, gy);
     }
 }
 
-fn render_view_uncollapse_glyph(f: &mut Frame, _app: &App, view_area: Rect) {
+fn render_view_uncollapse_glyph(f: &mut Frame, app: &App, view_area: Rect) {
     let (gx, gy) = view_uncollapse_glyph_pos(view_area);
     let style = Style::default()
-        .fg(Color::White)
+        .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
     f.buffer_mut().set_string(gx, gy, "›", style);
 }
@@ -582,7 +583,9 @@ fn render_pin_diamond_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
 
     // Overlay the diamond cell in red+bold — same "about to unpin"
     // affordance the list-view diamond uses for pinned rows.
-    let overlay_style = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let overlay_style = Style::default()
+        .fg(app.theme.danger)
+        .add_modifier(Modifier::BOLD);
     f.buffer_mut().set_string(dx, dy, "⬩", overlay_style);
 
     let label = " Unpin session ";
@@ -609,10 +612,10 @@ fn render_pin_diamond_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let p = Paragraph::new(label)
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(Style::default().fg(app.theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
 }
@@ -646,10 +649,10 @@ fn render_view_close_tooltip(f: &mut Frame, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let p = Paragraph::new(label)
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(Style::default().fg(app.theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
 }
@@ -687,10 +690,10 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let p = Paragraph::new(label)
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(Style::default().fg(app.theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
 }
@@ -713,16 +716,16 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
 
     let (hovered_x, hovered_y) = app.mouse_pos.unwrap_or((u16::MAX, u16::MAX));
     let base_available = Style::default()
-        .fg(Color::Cyan)
+        .fg(app.theme.info)
         .add_modifier(Modifier::UNDERLINED);
     let hover_available = Style::default()
-        .fg(Color::White)
+        .fg(app.theme.text)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let base_disabled = Style::default()
-        .fg(Color::DarkGray)
+        .fg(app.theme.dim)
         .add_modifier(Modifier::CROSSED_OUT);
     let hover_disabled = Style::default()
-        .fg(Color::Red)
+        .fg(app.theme.danger)
         .add_modifier(Modifier::CROSSED_OUT | Modifier::BOLD);
 
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(entries.len() * 2 + 8);
@@ -766,7 +769,10 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
     spans.push(Span::raw(mb.input.clone()));
     if let Some(err) = &mb.error {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(err.clone(), Style::default().fg(Color::Red)));
+        spans.push(Span::styled(
+            err.clone(),
+            Style::default().fg(app.theme.danger),
+        ));
     }
     let para = Paragraph::new(Line::from(spans));
     f.render_widget(para, area);
@@ -787,10 +793,12 @@ fn render_diamond_tooltip(f: &mut Frame, app: &App) {
     // Shadow / highlight diamond on the hover cell. Pinned → dimmed
     // red (about to remove); unpinned → faint yellow (preview pin).
     let overlay_style = if summary.pinned {
-        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.danger)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(Color::Yellow)
+            .fg(app.theme.warning)
             .add_modifier(Modifier::DIM)
     };
     f.buffer_mut().set_string(dx, dy, "⬩", overlay_style);
@@ -823,10 +831,10 @@ fn render_diamond_tooltip(f: &mut Frame, app: &App) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let p = Paragraph::new(label)
         .block(block)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
+        .style(Style::default().fg(app.theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
 }
@@ -869,7 +877,7 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     }
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        render_help(f, area);
+        render_help(f, area, &app.theme);
     }
 }
 
@@ -895,7 +903,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     render_sessions(f, main_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        render_help(f, area);
+        render_help(f, area, &app.theme);
     }
 }
 
@@ -907,11 +915,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     if effective_collapsed {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(pane_border_style(focused))
+            .border_style(pane_border_style(&app.theme, focused))
             .title(Line::from(Span::styled(
                 "›",
                 Style::default()
-                    .fg(Color::White)
+                    .fg(app.theme.accent)
                     .add_modifier(Modifier::BOLD),
             )));
         f.render_widget(block, area);
@@ -922,7 +930,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     // click handler in `App::click_list` consults
     // `list_title_button_hit` for the geometry.
     let plus_style = Style::default()
-        .fg(Color::White)
+        .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
     let title_line = Line::from(vec![
         Span::raw(" "),
@@ -937,16 +945,16 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
     };
     let minus_style = if minus_hovered {
         Style::default()
-            .fg(Color::White)
+            .fg(app.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(app.theme.muted)
     };
     let collapse_line =
         Line::from(Span::styled(" − ", minus_style)).alignment(ratatui::layout::Alignment::Right);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(pane_border_style(focused))
+        .border_style(pane_border_style(&app.theme, focused))
         .title(title_line)
         .title(collapse_line);
     let inner = block.inner(area);
@@ -990,14 +998,14 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                     let gap_str: String = " ".repeat(gap);
                     ListItem::new(Line::from(vec![
                         Span::raw(indent_prefix.to_string()),
-                        Span::styled(pin_glyph.to_string(), Style::default().fg(Color::Yellow)),
+                        Span::styled(pin_glyph.to_string(), Style::default().fg(app.theme.accent)),
                         Span::styled(
                             format!(" {} ", session_status_glyph(app, s)),
-                            state_style(s.state),
+                            state_style(&app.theme, s.state),
                         ),
-                        Span::styled(name_display, Style::default().fg(Color::White)),
+                        Span::styled(name_display, Style::default().fg(app.theme.text)),
                         Span::raw(gap_str),
-                        Span::styled(harness.to_string(), Style::default().fg(Color::Cyan)),
+                        Span::styled(harness.to_string(), harness_style(&app.theme)),
                     ]))
                 }
                 AppListItem::GroupHeader {
@@ -1006,17 +1014,12 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
                 } => {
                     let glyph = if group.collapsed { "▶" } else { "▼" };
                     ListItem::new(Line::from(vec![
-                        Span::styled(format!("{glyph} "), Style::default().fg(Color::Magenta)),
-                        Span::styled(
-                            group.name.clone(),
-                            Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD),
-                        ),
+                        Span::styled(format!("{glyph} "), Style::default().fg(app.theme.group)),
+                        Span::styled(group.name.clone(), group_name_style(&app.theme)),
                         Span::raw("  "),
                         Span::styled(
                             format!("({member_count})"),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(app.theme.dim),
                         ),
                     ]))
                 }
@@ -1026,11 +1029,13 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &App) {
 
     let highlight_style = if focused {
         Style::default()
-            .bg(Color::Blue)
-            .fg(Color::White)
+            .bg(app.theme.highlight_bg)
+            .fg(app.theme.highlight_fg)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(Color::DarkGray).fg(Color::White)
+        Style::default()
+            .bg(app.theme.inactive_highlight_bg)
+            .fg(app.theme.text)
     };
     let mut state = ListState::default();
     state.select(if matches!(app.selection, Selection::None) {
@@ -1062,7 +1067,7 @@ fn render_matrix_rain(f: &mut Frame, area: Rect, app: &App, occupied_rows: usize
     if rain_area.width < 8 || rain_area.height < 4 {
         return;
     }
-    render_matrix_rain_header(f, rain_area);
+    render_matrix_rain_header(f, rain_area, &app.theme);
     let rain_area = Rect {
         x: rain_area.x,
         y: rain_area.y + 1,
@@ -1091,11 +1096,11 @@ fn render_matrix_rain(f: &mut Frame, area: Rect, app: &App, occupied_rows: usize
             let mut style = None;
             if dist >= 0 && dist < tail as i16 {
                 let shade = 1.0 - (dist as f32 / tail.max(1) as f32);
-                style = Some(rain_style(shade, activity));
+                style = Some(rain_style(&app.theme, shade, activity));
             } else {
                 let sparkle = hash64(seed ^ row as u64 ^ (elapsed / 260));
                 if sparkle % 100 < faint_threshold {
-                    style = Some(Style::default().fg(Color::Rgb(18, 92, 42)));
+                    style = Some(Style::default().fg(app.theme.matrix_dim));
                 }
             }
             if let Some(style) = style {
@@ -1113,15 +1118,15 @@ fn render_matrix_rain(f: &mut Frame, area: Rect, app: &App, occupied_rows: usize
 
     if let Some(flash) = app.matrix_rain.active_flash(now) {
         if let Some(progress) = flash.progress(now) {
-            render_matrix_flash(f, rain_area, flash.text, flash.tone, progress);
+            render_matrix_flash(f, rain_area, &app.theme, flash.text, flash.tone, progress);
         }
     }
 }
 
-fn render_matrix_rain_header(f: &mut Frame, area: Rect) {
-    let line_style = Style::default().fg(Color::Rgb(30, 105, 54));
+fn render_matrix_rain_header(f: &mut Frame, area: Rect, theme: &Theme) {
+    let line_style = Style::default().fg(theme.matrix_line);
     let close_style = Style::default()
-        .fg(Color::Rgb(150, 255, 170))
+        .fg(theme.matrix_close)
         .add_modifier(Modifier::BOLD);
     for x in area.x..area.x + area.width {
         f.buffer_mut().set_string(x, area.y, "─", line_style);
@@ -1169,13 +1174,14 @@ fn fleet_activity(app: &App, now: Instant) -> f32 {
     (0.16 + (score / user_sessions.len().max(1) as f32) * 0.42).clamp(0.12, 0.82)
 }
 
-fn rain_style(shade: f32, activity: f32) -> Style {
+fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
     let shade = shade.clamp(0.0, 1.0);
     let boost = activity.clamp(0.0, 1.0);
-    let g = (84.0 + shade * 150.0 + boost * 20.0).min(255.0) as u8;
-    let r = (10.0 + shade * 80.0) as u8;
-    let b = (28.0 + shade * 78.0) as u8;
-    let style = Style::default().fg(Color::Rgb(r, g, b));
+    let style = Style::default().fg(blend_color(
+        theme.matrix_dim,
+        theme.accent,
+        (shade * 0.86 + boost * 0.14).clamp(0.0, 1.0),
+    ));
     if shade > 0.72 {
         style.add_modifier(Modifier::BOLD)
     } else {
@@ -1186,6 +1192,7 @@ fn rain_style(shade: f32, activity: f32) -> Style {
 fn render_matrix_flash(
     f: &mut Frame,
     area: Rect,
+    theme: &Theme,
     text: &str,
     tone: crate::matrix_rain::FlashTone,
     progress: f32,
@@ -1203,9 +1210,9 @@ fn render_matrix_flash(
         + ((area.height / 3) + (row_seed as u16 % area.height.max(1) / 3))
             .min(area.height.saturating_sub(1));
     let x = area.x + (area.width.saturating_sub(text_w) / 2);
-    let color = flash_color(tone, pulse);
+    let color = flash_color(theme, tone, pulse);
     let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
-    let glow = Style::default().fg(Color::Rgb(52, 132, 78));
+    let glow = Style::default().fg(theme.matrix_glow);
     if x > area.x {
         f.buffer_mut().set_string(x - 1, y, ">", glow);
     }
@@ -1218,13 +1225,51 @@ fn render_matrix_flash(
     }
 }
 
-fn flash_color(tone: crate::matrix_rain::FlashTone, pulse: f32) -> Color {
-    let lift = (pulse * 70.0) as u8;
-    match tone {
-        crate::matrix_rain::FlashTone::Work => Color::Rgb(165, 255, 190),
-        crate::matrix_rain::FlashTone::Good => Color::Rgb(150, 255, 120),
-        crate::matrix_rain::FlashTone::Warn => Color::Rgb(255, 210, 90 + lift / 3),
-        crate::matrix_rain::FlashTone::Bad => Color::Rgb(255, 95 + lift, 90),
+fn flash_color(theme: &Theme, tone: crate::matrix_rain::FlashTone, pulse: f32) -> Color {
+    let base = match tone {
+        crate::matrix_rain::FlashTone::Work => theme.matrix_flash_work,
+        crate::matrix_rain::FlashTone::Good => theme.matrix_flash_good,
+        crate::matrix_rain::FlashTone::Warn => theme.matrix_flash_warn,
+        crate::matrix_rain::FlashTone::Bad => theme.matrix_flash_bad,
+    };
+    blend_color(base, theme.text, pulse.clamp(0.0, 1.0) * 0.28)
+}
+
+fn blend_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    match (color_rgb(a), color_rgb(b)) {
+        (Some((ar, ag, ab)), Some((br, bg, bb))) => {
+            Color::Rgb(lerp_u8(ar, br, t), lerp_u8(ag, bg, t), lerp_u8(ab, bb, t))
+        }
+        _ if t >= 0.5 => b,
+        _ => a,
+    }
+}
+
+fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+fn color_rgb(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Black => Some((0, 0, 0)),
+        Color::Red => Some((205, 49, 49)),
+        Color::Green => Some((13, 188, 121)),
+        Color::Yellow => Some((229, 229, 16)),
+        Color::Blue => Some((36, 114, 200)),
+        Color::Magenta => Some((188, 63, 188)),
+        Color::Cyan => Some((17, 168, 205)),
+        Color::Gray => Some((229, 229, 229)),
+        Color::DarkGray => Some((102, 102, 102)),
+        Color::LightRed => Some((241, 76, 76)),
+        Color::LightGreen => Some((35, 209, 139)),
+        Color::LightYellow => Some((245, 245, 67)),
+        Color::LightBlue => Some((59, 142, 234)),
+        Color::LightMagenta => Some((214, 112, 214)),
+        Color::LightCyan => Some((41, 184, 219)),
+        Color::White => Some((255, 255, 255)),
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
     }
 }
 
@@ -1240,7 +1285,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(pane_border_style(focused))
+            .border_style(pane_border_style(&app.theme, focused))
             .title(" diff (ESC clears; press d to refresh) ");
         let para = Paragraph::new(diff.clone())
             .block(block)
@@ -1285,7 +1330,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let harness_right = summary.map(|s| {
         Line::from(Span::styled(
             format!(" {} ", s.harness),
-            pane_border_style(focused),
+            pane_border_style(&app.theme, focused),
         ))
         .alignment(ratatui::layout::Alignment::Right)
     });
@@ -1299,16 +1344,16 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let close_hovered = show_close && hovered_view_close_button(app, area);
     let close_style = if close_hovered {
         Style::default()
-            .fg(Color::White)
+            .fg(app.theme.text)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::White)
+        Style::default().fg(app.theme.matrix_close)
     };
     let close =
         Line::from(Span::styled(" x ", close_style)).alignment(ratatui::layout::Alignment::Right);
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(pane_border_style(focused))
+        .border_style(pane_border_style(&app.theme, focused))
         .title(title);
     // Order matters: ratatui stacks right-aligned titles left-to-right
     // in the order they're added. Add the harness FIRST so it sits
@@ -1348,9 +1393,7 @@ fn render_group_overview(
     let mut lines: Vec<Line> = Vec::with_capacity(members.len() + 3);
     lines.push(Line::from(vec![Span::styled(
         format!("Group: {}", group.name),
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
+        group_name_style(&app.theme),
     )]));
     lines.push(Line::from(format!(
         "  {} member(s){}",
@@ -1361,18 +1404,18 @@ fn render_group_overview(
     if members.is_empty() {
         lines.push(Line::from(Span::styled(
             "  (empty — move sessions into this group)",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(app.theme.dim),
         )));
     } else {
         for s in &members {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("  {} ", session_status_glyph(app, s)),
-                    state_style(s.state),
+                    state_style(&app.theme, s.state),
                 ),
-                Span::raw(primary_label(s)),
+                Span::styled(primary_label(s), Style::default().fg(app.theme.text)),
                 Span::raw("  "),
-                Span::styled(s.harness.clone(), Style::default().fg(Color::Cyan)),
+                Span::styled(s.harness.clone(), harness_style(&app.theme)),
             ]));
         }
     }
@@ -1392,11 +1435,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let editor_state = app.editor_states.get(&id).cloned();
     let agent_status = app.agent_statuses.get(&id).cloned();
     let (chat_area, editor_area) = if editor_state.is_some() || agent_status.is_some() {
-        let raw_rows = editor_pane_rows(
-            editor_state.as_ref(),
-            agent_status.as_ref(),
-            area.width,
-        );
+        let raw_rows = editor_pane_rows(editor_state.as_ref(), agent_status.as_ref(), area.width);
         let editor_rows: u16 = (raw_rows as u16).min(area.height.saturating_sub(1));
         let chat_height = area.height.saturating_sub(editor_rows);
         (
@@ -1420,7 +1459,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         Some(h) => h,
         None => {
             let hint = Paragraph::new("(no PTY history yet — interact to populate)")
-                .style(Style::default().fg(Color::DarkGray));
+                .style(Style::default().fg(app.theme.dim));
             f.render_widget(hint, chat_area);
             if let Some(area) = editor_area {
                 render_editor_pane(
@@ -1428,6 +1467,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
                     area,
                     editor_state.as_ref(),
                     agent_status.as_ref(),
+                    &app.theme,
                     true,
                 );
             }
@@ -1439,12 +1479,6 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     // — otherwise the chat's vt100 cursor would render as a stray
     // block. For non-editor-pane sessions (claude / codex / shell)
     // keep the cursor visible so users see where their typing lands.
-    let term = if editor_area.is_some() {
-        let no_cursor = tui_term::widget::Cursor::default().visibility(false);
-        tui_term::widget::PseudoTerminal::new(out.screen).cursor(no_cursor)
-    } else {
-        tui_term::widget::PseudoTerminal::new(out.screen)
-    };
     // Clear the chat area before painting so any rows uncovered when the
     // editor pane shrinks are not left stale. This prevents visual gaps
     // that only disappear on terminal resize.
@@ -1461,14 +1495,19 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         };
         f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
     }
-    f.render_widget(term, chat_area);
+    render_pty_screen(f, chat_area, out.screen, &app.theme, editor_area.is_none());
     app.block_hits.insert(id, out.blocks);
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)
         f.render_widget(Clear, area);
         for row in 0..area.height {
             let blank = " ".repeat(area.width as usize);
-            let r = Rect { x: area.x, y: area.y + row, width: area.width, height: 1 };
+            let r = Rect {
+                x: area.x,
+                y: area.y + row,
+                width: area.width,
+                height: 1,
+            };
             f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
         }
         render_editor_pane(
@@ -1476,6 +1515,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
             area,
             editor_state.as_ref(),
             agent_status.as_ref(),
+            &app.theme,
             true,
         );
     }
@@ -1492,6 +1532,7 @@ fn render_editor_pane(
     area: Rect,
     state: Option<&crate::app::EditorState>,
     agent_status: Option<&agentd_protocol::AgentStatus>,
+    theme: &Theme,
     set_cursor: bool,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -1503,10 +1544,10 @@ fn render_editor_pane(
     // resize forces a repaint.
     f.render_widget(Clear, area);
 
-    let queued_style = Style::default().fg(Color::DarkGray);
+    let queued_style = Style::default().fg(theme.dim);
     let queued_glyph_style = queued_style.add_modifier(Modifier::BOLD);
     let active_glyph_style = Style::default()
-        .fg(Color::Cyan)
+        .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
     let prompt_w: u16 = 2;
     let empty_state = crate::app::EditorState::default();
@@ -1528,11 +1569,15 @@ fn render_editor_pane(
                 width: area.width,
                 height: 1,
             };
-            let label = format!("* {}.. {}", status.status, format_elapsed(status.started_at_ms));
+            let label = format!(
+                "* {}.. {}",
+                status.status,
+                format_elapsed(status.started_at_ms)
+            );
             f.render_widget(
                 Paragraph::new(Line::from(vec![Span::styled(
                     label,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.dim),
                 )])),
                 row,
             );
@@ -1588,7 +1633,7 @@ fn render_editor_pane(
     // Completion suggestions — bottom-pane anchored, rendered above
     // the active prompt so they don't pollute PTY scrollback or get
     // clipped below the terminal edge.
-    let completion_style = Style::default().fg(Color::DarkGray);
+    let completion_style = Style::default().fg(theme.dim);
     for completion in &state.completions {
         // Keep at least one row for the active editor.
         if remaining <= 1 {
@@ -1649,8 +1694,8 @@ fn render_editor_pane(
                 && (state.cursor < abs_end
                     || (visual.end == logical_chars && state.cursor <= abs_end));
             if cursor_pos.is_none() && contains_cursor {
-                let col = width_between_chars(logical, visual.start, state.cursor - char_seen)
-                    as u16;
+                let col =
+                    width_between_chars(logical, visual.start, state.cursor - char_seen) as u16;
                 let x = area
                     .x
                     .saturating_add(prompt_w)
@@ -1677,16 +1722,18 @@ fn editor_pane_rows(
 ) -> usize {
     let text_width = width.saturating_sub(2).max(1) as usize;
     let queued_lines: usize = state
-        .map(|s| s.queued.iter().map(|q| wrapped_text_rows(q, text_width)).sum())
+        .map(|s| {
+            s.queued
+                .iter()
+                .map(|q| wrapped_text_rows(q, text_width))
+                .sum()
+        })
         .unwrap_or(0);
     let completion_lines = state.map(|s| s.completions.len()).unwrap_or(0);
     let buf_lines = state
         .map(|s| wrapped_text_rows(&s.buf, text_width))
         .unwrap_or(1);
-    let status_lines = agent_status
-        .filter(|s| s.active)
-        .map(|_| 3)
-        .unwrap_or(0);
+    let status_lines = agent_status.filter(|s| s.active).map(|_| 3).unwrap_or(0);
     status_lines + queued_lines + 1 + completion_lines + buf_lines
 }
 
@@ -1795,7 +1842,7 @@ fn render_transcript(f: &mut Frame, area: Rect, app: &App) {
     let end = (scroll_start + height).min(total);
     let lines: Vec<Line> = app.transcript[scroll_start..end]
         .iter()
-        .map(format_event)
+        .map(|ev| format_event(&app.theme, ev))
         .collect();
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, area);
@@ -1837,8 +1884,11 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
         },
         status = app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or(""),
     );
-    let para =
-        Paragraph::new(modeline).style(Style::default().bg(Color::DarkGray).fg(Color::White));
+    let para = Paragraph::new(modeline).style(
+        Style::default()
+            .bg(app.theme.modeline_bg)
+            .fg(app.theme.modeline_fg),
+    );
     f.render_widget(para, area);
 }
 
@@ -1901,7 +1951,10 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         let mut spans = vec![Span::raw(mb.prompt.clone()), Span::raw(mb.input.clone())];
         if let Some(err) = &mb.error {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(err.clone(), Style::default().fg(Color::Red)));
+            spans.push(Span::styled(
+                err.clone(),
+                Style::default().fg(app.theme.danger),
+            ));
         }
         let para = Paragraph::new(Line::from(spans));
         f.render_widget(para, area);
@@ -1910,7 +1963,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     if app.help_visible {
-        let para = Paragraph::new("").style(Style::default().fg(Color::DarkGray));
+        let para = Paragraph::new("").style(Style::default().fg(app.theme.dim));
         f.render_widget(para, area);
         return;
     }
@@ -1947,9 +2000,9 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let mouse = app.mouse_pos;
-    let base_style = Style::default().fg(Color::DarkGray);
+    let base_style = Style::default().fg(app.theme.dim);
     let hover_style = Style::default()
-        .fg(Color::White)
+        .fg(app.theme.text)
         .add_modifier(Modifier::BOLD);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(segments.len() * 2 + 1);
     let mut col: u16 = area.x;
@@ -1985,7 +2038,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
-fn render_help(f: &mut Frame, area: Rect) {
+fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
     // Target a comfortable reading width — long enough to keep each
     // command line on one row without wrapping, capped so it doesn't
     // span an ultra-wide terminal edge-to-edge. The outer rect adds
@@ -2020,10 +2073,12 @@ fn render_help(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, outer);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.border_focused))
         .padding(ratatui::widgets::Padding::new(2, 2, 1, 1))
         .title(" help (any key to close) ");
     let para = Paragraph::new(HELP_TEXT)
         .block(block)
+        .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: false });
     f.render_widget(para, popup);
 }
@@ -2077,17 +2132,17 @@ child. `C-x` is the escape prefix — start any `C-x …` chord above to run
 an agentd command without changing focus.
 ";
 
-fn format_event(ev: &TimestampedEvent) -> Line<'static> {
+fn format_event(theme: &Theme, ev: &TimestampedEvent) -> Line<'static> {
     let ts = ev.at.format("%H:%M:%S").to_string();
     let mut spans = vec![Span::styled(
         format!("[{ts}] "),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(theme.dim),
     )];
-    spans.extend(format_event_body(&ev.event));
+    spans.extend(format_event_body(theme, &ev.event));
     Line::from(spans)
 }
 
-fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
+fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
     match ev {
         SessionEvent::Message { role, text } => {
             let role_label = match role {
@@ -2097,22 +2152,22 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
                 MessageRole::Tool => "tool",
             };
             vec![
-                Span::styled(format!("{role_label:>7}: "), role_style(*role)),
+                Span::styled(format!("{role_label:>7}: "), role_style(theme, *role)),
                 Span::raw(text.clone()),
             ]
         }
         SessionEvent::ToolUse { tool, args } => {
             let args_s = serde_json::to_string(args).unwrap_or_default();
             vec![
-                Span::styled("   tool: ", Style::default().fg(Color::Yellow)),
+                Span::styled("   tool: ", Style::default().fg(theme.tool)),
                 Span::raw(format!("{tool}({})", shorten(&args_s, 120))),
             ]
         }
         SessionEvent::ToolResult { tool, ok, output } => {
             let (mark, color) = if *ok {
-                (" ✓ ", Color::Green)
+                (" ✓ ", theme.success)
             } else {
-                (" ✗ ", Color::Red)
+                (" ✗ ", theme.danger)
             };
             vec![
                 Span::styled(format!("   {}", mark), Style::default().fg(color)),
@@ -2123,14 +2178,14 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             let p = prompt.clone().unwrap_or_default();
             vec![Span::styled(
                 format!("   ◐ awaiting input: {p}"),
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(theme.warning),
             )]
         }
         SessionEvent::Status { state, detail } => {
             let d = detail.clone().unwrap_or_default();
             vec![Span::styled(
                 format!("   ⟳ {} {}", state.label(), d),
-                Style::default().fg(Color::Blue),
+                Style::default().fg(theme.info),
             )]
         }
         SessionEvent::AgentStatus(status) => {
@@ -2141,7 +2196,7 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
                         status.status,
                         format_elapsed(status.started_at_ms)
                     ),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.dim),
                 )]
             } else {
                 vec![]
@@ -2153,24 +2208,24 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
             tokens_out,
         } => vec![Span::styled(
             format!("   $ ${:.4} (in={} out={})", usd, tokens_in, tokens_out),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )],
         SessionEvent::Diff { patch } => vec![Span::raw(format!("   Δ {}", shorten(patch, 200)))],
         SessionEvent::Error { message } => vec![Span::styled(
             format!("   ! {message}"),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme.danger),
         )],
         SessionEvent::Reset => vec![Span::styled(
             "   ↺ session reset".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )],
         SessionEvent::Done { exit_code } => vec![Span::styled(
             format!("   ▢ done (exit {exit_code})"),
-            Style::default().fg(Color::Green),
+            Style::default().fg(theme.success),
         )],
         SessionEvent::Pty { data } => vec![Span::styled(
             format!("   ⌷ pty: {} bytes (switch to terminal view)", data.len()),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )],
         SessionEvent::ToolApprovalRequest {
             tool,
@@ -2187,7 +2242,7 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
                     "   ? approve [{risk_label}] {tool}({})",
                     shorten(args_summary, 160)
                 ),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(theme.warning),
             )]
         }
         // Task-lifecycle events are bookkeeping; the daemon tracks
@@ -2196,17 +2251,17 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
         // minimally (or hide entirely).
         SessionEvent::TaskStart { tool, .. } => vec![Span::styled(
             format!("   ⏵ task start: {tool}"),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )],
         SessionEvent::TaskBackgrounded { .. } => vec![Span::styled(
             "   ↳ task backgrounded".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme.dim),
         )],
         SessionEvent::TaskEnd { ok, .. } => {
             let glyph = if *ok { "✓" } else { "✗" };
             vec![Span::styled(
                 format!("   {glyph} task end"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.dim),
             )]
         }
         SessionEvent::EditorState { .. } => {
@@ -2217,12 +2272,20 @@ fn format_event_body(ev: &SessionEvent) -> Vec<Span<'static>> {
     }
 }
 
-fn pane_border_style(focused: bool) -> Style {
+fn pane_border_style(theme: &Theme, focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Yellow)
+        Style::default().fg(theme.border_focused)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.border)
     }
+}
+
+fn group_name_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.group).add_modifier(Modifier::BOLD)
+}
+
+fn harness_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.harness).add_modifier(Modifier::BOLD)
 }
 
 /// Clip `s` to at most `max` display columns, appending `…` when the
@@ -2294,13 +2357,13 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         let harness_right = summary.map(|s| {
             Line::from(Span::styled(
                 format!(" {} ", s.harness),
-                pane_border_style(is_selected),
+                pane_border_style(&app.theme, is_selected),
             ))
             .alignment(ratatui::layout::Alignment::Right)
         });
         let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_style(pane_border_style(is_selected))
+            .border_style(pane_border_style(&app.theme, is_selected))
             .title(title);
         if let Some(h) = harness_right {
             block = block.title(h);
@@ -2327,10 +2390,10 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
             let cols = main_cols.max(inner.width).max(1);
             let rows = main_rows.max(inner.height).max(1);
             let out = history.replay(cols, rows, 0);
-            render_pty_tail(f, inner, out.screen);
+            render_pty_tail(f, inner, out.screen, &app.theme);
         } else {
             // No PTY data yet — show a placeholder.
-            let p = Paragraph::new("(no data yet)").style(Style::default().fg(Color::DarkGray));
+            let p = Paragraph::new("(no data yet)").style(Style::default().fg(app.theme.dim));
             f.render_widget(p, inner);
         }
     }
@@ -2373,7 +2436,51 @@ pub fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
 /// attributes. The window is anchored at the bottom of the source screen so
 /// harness status/input bars (zarvis, codex, claude all park them in the
 /// last few rows) stay visible on pinned tiles. Used by the pin strip.
-fn render_pty_tail(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
+fn render_pty_screen(
+    f: &mut Frame,
+    area: Rect,
+    screen: &vt100::Screen,
+    theme: &Theme,
+    show_cursor: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    let visible_h = area.height;
+    let visible_w = area.width;
+    let buf = f.buffer_mut();
+    for row in 0..visible_h {
+        for col in 0..visible_w {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            let x = area.x + col;
+            let y = area.y + row;
+            if let Some(buf_cell) = buf.cell_mut(Position { x, y }) {
+                paint_vt100_cell(buf_cell, cell, theme);
+            }
+        }
+    }
+    if show_cursor && !screen.hide_cursor() {
+        let (row, col) = screen.cursor_position();
+        let row = row.saturating_add(u16::try_from(screen.scrollback()).unwrap_or(u16::MAX));
+        if row < area.height && col < area.width {
+            let x = area.x + col;
+            let y = area.y + row;
+            if let Some(buf_cell) = f.buffer_mut().cell_mut(Position { x, y }) {
+                if screen.cell(row, col).map(|c| c.has_contents()).unwrap_or(false) {
+                    buf_cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                } else {
+                    buf_cell.set_symbol("█");
+                    buf_cell.set_style(Style::default().fg(theme.muted));
+                }
+            }
+        }
+    }
+}
+
+fn render_pty_tail(f: &mut Frame, area: Rect, screen: &vt100::Screen, theme: &Theme) {
     let (rows, cols) = screen.size();
     if rows == 0 || cols == 0 || area.width == 0 || area.height == 0 {
         return;
@@ -2394,23 +2501,25 @@ fn render_pty_tail(f: &mut Frame, area: Rect, screen: &vt100::Screen) {
             let x = area.x + c;
             let y = area.y + r;
             if let Some(buf_cell) = buf.cell_mut(Position { x, y }) {
-                let contents = cell.contents();
-                if contents.is_empty() {
-                    buf_cell.set_char(' ');
-                } else {
-                    buf_cell.set_symbol(&contents);
-                }
-                buf_cell.set_style(vt100_cell_style(cell));
+                paint_vt100_cell(buf_cell, cell, theme);
             }
         }
     }
 }
 
-fn vt100_cell_style(cell: &vt100::Cell) -> Style {
-    let mut s = Style::default();
-    if let Some(c) = vt100_color(cell.fgcolor()) {
-        s = s.fg(c);
+fn paint_vt100_cell(buf_cell: &mut ratatui::buffer::Cell, cell: &vt100::Cell, theme: &Theme) {
+    let contents = cell.contents();
+    if contents.is_empty() {
+        buf_cell.set_char(' ');
+    } else {
+        buf_cell.set_symbol(contents);
     }
+    buf_cell.set_style(vt100_cell_style(cell, theme));
+}
+
+fn vt100_cell_style(cell: &vt100::Cell, theme: &Theme) -> Style {
+    let mut s = Style::default();
+    s = s.fg(themed_vt100_fg(cell.fgcolor(), theme));
     if let Some(c) = vt100_color(cell.bgcolor()) {
         s = s.bg(c);
     }
@@ -2438,6 +2547,32 @@ fn vt100_cell_style(cell: &vt100::Cell) -> Style {
     s.add_modifier(mods)
 }
 
+fn themed_vt100_fg(c: vt100::Color, theme: &Theme) -> Color {
+    match c {
+        vt100::Color::Default => theme.text,
+        vt100::Color::Idx(i) => indexed_grayscale_luma(i)
+            .map(|luma| green_for_luma(theme, luma))
+            .unwrap_or(Color::Indexed(i)),
+        vt100::Color::Rgb(r, g, b) if r == g && g == b => green_for_luma(theme, r),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn indexed_grayscale_luma(i: u8) -> Option<u8> {
+    match i {
+        0 => Some(0),
+        7 => Some(229),
+        8 => Some(102),
+        15 => Some(255),
+        232..=255 => Some(8u8.saturating_add((i - 232).saturating_mul(10))),
+        _ => None,
+    }
+}
+
+fn green_for_luma(theme: &Theme, luma: u8) -> Color {
+    blend_color(theme.matrix_dim, theme.text, f32::from(luma) / 255.0)
+}
+
 fn vt100_color(c: vt100::Color) -> Option<Color> {
     match c {
         vt100::Color::Default => None,
@@ -2458,25 +2593,23 @@ fn session_status_glyph(app: &App, s: &SessionSummary) -> &'static str {
     }
 }
 
-fn state_style(state: SessionState) -> Style {
+fn state_style(theme: &Theme, state: SessionState) -> Style {
     match state {
-        SessionState::Pending => Style::default().fg(Color::Gray),
-        SessionState::Running => Style::default().fg(Color::Green),
-        SessionState::AwaitingInput => Style::default().fg(Color::Green),
-        SessionState::Paused => Style::default().fg(Color::Yellow),
-        SessionState::Done => Style::default().fg(Color::Cyan),
-        SessionState::Errored => Style::default().fg(Color::Red),
+        SessionState::Pending => Style::default().fg(theme.muted),
+        SessionState::Running => Style::default().fg(theme.success),
+        SessionState::AwaitingInput => Style::default().fg(theme.success),
+        SessionState::Paused => Style::default().fg(theme.warning),
+        SessionState::Done => Style::default().fg(theme.info),
+        SessionState::Errored => Style::default().fg(theme.danger),
     }
 }
 
-fn role_style(role: MessageRole) -> Style {
+fn role_style(theme: &Theme, role: MessageRole) -> Style {
     match role {
-        MessageRole::User => Style::default()
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD),
-        MessageRole::Assistant => Style::default().fg(Color::LightGreen),
-        MessageRole::System => Style::default().fg(Color::DarkGray),
-        MessageRole::Tool => Style::default().fg(Color::Yellow),
+        MessageRole::User => Style::default().fg(theme.user).add_modifier(Modifier::BOLD),
+        MessageRole::Assistant => Style::default().fg(theme.assistant),
+        MessageRole::System => Style::default().fg(theme.system),
+        MessageRole::Tool => Style::default().fg(theme.tool),
     }
 }
 
@@ -2610,7 +2743,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let block = Block::default()
         .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(Style::default().fg(app.theme.border));
     let inner = block.inner(area);
     f.render_widget(Clear, area);
     f.render_widget(block, area);
@@ -2632,11 +2765,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let editor_state = app.editor_states.get(&id).cloned();
     let agent_status = app.agent_statuses.get(&id).cloned();
     let (chat_area, editor_area) = if editor_state.is_some() || agent_status.is_some() {
-        let raw_rows = editor_pane_rows(
-            editor_state.as_ref(),
-            agent_status.as_ref(),
-            inner.width,
-        );
+        let raw_rows = editor_pane_rows(editor_state.as_ref(), agent_status.as_ref(), inner.width);
         let editor_rows: u16 = (raw_rows as u16).min(inner.height.saturating_sub(1));
         let chat_height = inner.height.saturating_sub(editor_rows);
         (
@@ -2663,13 +2792,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
         chat_area.height,
         app.orchestrator_scrollback,
     );
-    let term = if editor_area.is_some() {
-        let no_cursor = tui_term::widget::Cursor::default().visibility(false);
-        tui_term::widget::PseudoTerminal::new(out.screen).cursor(no_cursor)
-    } else {
-        tui_term::widget::PseudoTerminal::new(out.screen)
-    };
-    f.render_widget(term, chat_area);
+    render_pty_screen(f, chat_area, out.screen, &app.theme, editor_area.is_none());
     app.block_hits.insert(id, out.blocks);
     if let Some(area) = editor_area {
         render_editor_pane(
@@ -2677,6 +2800,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
             area,
             editor_state.as_ref(),
             agent_status.as_ref(),
+            &app.theme,
             true,
         );
     }
@@ -2717,11 +2841,11 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(app.theme.border_focused))
         .title(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(app.theme.info)
                 .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(rect);
@@ -2730,7 +2854,7 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
 
     if popup.tasks.is_empty() {
         let p = Paragraph::new("(no tasks recorded for this session)")
-            .style(Style::default().fg(Color::DarkGray));
+            .style(Style::default().fg(app.theme.dim));
         f.render_widget(p, inner);
         return;
     }
@@ -2746,11 +2870,11 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
     let mut lines: Vec<Line> = Vec::new();
     for (_idx, t) in visible {
         let (state_glyph, state_color) = match t.state {
-            agentd_protocol::TaskState::Running => ("◐", Color::Yellow),
-            agentd_protocol::TaskState::Backgrounded => ("↻", Color::Cyan),
-            agentd_protocol::TaskState::Completed => ("✓", Color::Green),
-            agentd_protocol::TaskState::Failed => ("✗", Color::Red),
-            agentd_protocol::TaskState::Cancelled => ("⊘", Color::DarkGray),
+            agentd_protocol::TaskState::Running => ("◐", app.theme.warning),
+            agentd_protocol::TaskState::Backgrounded => ("↻", app.theme.info),
+            agentd_protocol::TaskState::Completed => ("✓", app.theme.success),
+            agentd_protocol::TaskState::Failed => ("✗", app.theme.danger),
+            agentd_protocol::TaskState::Cancelled => ("⊘", app.theme.dim),
         };
         let elapsed_ms = t.ended_at_ms.unwrap_or(now_ms) - t.started_at_ms;
         let elapsed = format!("{:.1}s", (elapsed_ms.max(0)) as f64 / 1000.0);
@@ -2798,8 +2922,9 @@ mod tests {
         let plain = screen.cell(0, 0).expect("plain cell");
         let dimmed = screen.cell(0, 1).expect("dim cell");
 
-        let plain_style = super::vt100_cell_style(plain);
-        let dimmed_style = super::vt100_cell_style(dimmed);
+        let theme = Theme::default();
+        let plain_style = super::vt100_cell_style(plain, &theme);
+        let dimmed_style = super::vt100_cell_style(dimmed, &theme);
 
         assert!(
             !plain_style.add_modifier.contains(Modifier::DIM),
@@ -2813,6 +2938,25 @@ mod tests {
     }
 
     #[test]
+    fn vt100_cell_style_maps_grayscale_foreground_to_theme_green() {
+        let mut parser = vt100::Parser::new(2, 20, 0);
+        parser.process(b"\x1b[97mW\x1b[90mD\x1b[0m");
+        let screen = parser.screen();
+        let theme = Theme::default();
+
+        let white = super::vt100_cell_style(screen.cell(0, 0).expect("white cell"), &theme);
+        let dark_gray = super::vt100_cell_style(screen.cell(0, 1).expect("dark gray cell"), &theme);
+
+        assert_eq!(white.fg, Some(theme.text));
+        assert_ne!(dark_gray.fg, Some(Color::DarkGray));
+        assert_eq!(
+            dark_gray.fg,
+            Some(super::green_for_luma(&theme, 102)),
+            "ANSI dark gray should become the corresponding Matrix green"
+        );
+    }
+
+    #[test]
     fn find_text_ranges_respects_selection_bounds() {
         let frame = vec![
             "outside match".to_string(),
@@ -2820,21 +2964,12 @@ mod tests {
             "outside match".to_string(),
         ];
 
-        let ranges = find_text_ranges(
-            &frame,
-            "inside",
-            Some(Rect::new(2, 1, 12, 1)),
-            None,
-        );
+        let ranges = find_text_ranges(&frame, "inside", Some(Rect::new(2, 1, 12, 1)), None);
 
         assert_eq!(ranges, vec![(1, 2, 7)]);
-        assert!(find_text_ranges(
-            &frame,
-            "outside",
-            Some(Rect::new(2, 1, 12, 1)),
-            None,
-        )
-        .is_empty());
+        assert!(
+            find_text_ranges(&frame, "outside", Some(Rect::new(2, 1, 12, 1)), None,).is_empty()
+        );
     }
 
     #[test]
@@ -2894,7 +3029,11 @@ mod tests {
             queued: Vec::new(),
             buf: "/".to_string(),
             cursor: 1,
-            completions: vec!["/help".to_string(), "/model".to_string(), "/new".to_string()],
+            completions: vec![
+                "/help".to_string(),
+                "/model".to_string(),
+                "/new".to_string(),
+            ],
         };
         let small_state = crate::app::EditorState {
             queued: Vec::new(),
@@ -2902,6 +3041,9 @@ mod tests {
             cursor: 1,
             completions: vec!["/help".to_string()],
         };
-        assert!(editor_pane_rows(Some(&big_state), None, 80) > editor_pane_rows(Some(&small_state), None, 80));
+        assert!(
+            editor_pane_rows(Some(&big_state), None, 80)
+                > editor_pane_rows(Some(&small_state), None, 80)
+        );
     }
 }

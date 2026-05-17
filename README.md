@@ -88,6 +88,24 @@ scripts/smoke.sh
 
 `agentd paths` prints the resolved layout.
 
+## TUI Theme
+
+The TUI uses a built-in Matrix theme by default. Override any color slot in
+`$AGENTD_CONFIG_DIR/theme.toml` (default `~/.config/agentd/theme.toml`):
+
+```toml
+[colors]
+text = "#b8ffcc"
+accent = "#39ff88"
+border_focused = "#4bff82"
+harness = "#96ffaa"
+danger = "red"
+matrix_dim = "indexed:34"
+```
+
+Colors accept `#rrggbb`, `indexed:N`, or ANSI names such as `green`, `cyan`,
+`dark_gray`, and `light_yellow`. Omitted slots keep the Matrix default.
+
 ## Adapter protocol (AHP)
 
 The daemon spawns one adapter process per session and speaks JSON-RPC 2.0 over the adapter's stdin/stdout, one message per line.

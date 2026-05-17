@@ -199,6 +199,7 @@ pub struct App {
     pub transcript_scroll: u16,
     pub minibuffer: Option<Minibuffer>,
     pub harnesses: Vec<HarnessInfo>,
+    pub theme: crate::theme::Theme,
     pub help_visible: bool,
     pub profile: Profile,
     pub keymap: Keymap,
@@ -535,6 +536,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     let sessions = client.list().await.unwrap_or_default();
     let groups = client.list_groups().await.unwrap_or_default();
     let harnesses = client.harnesses().await.unwrap_or_default();
+    let (theme, theme_warning) = crate::theme::Theme::load_or_default();
     let initial_orch_id = sessions
         .iter()
         .find(|s| s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal())
@@ -578,6 +580,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         transcript_scroll: 0,
         minibuffer: None,
         harnesses,
+        theme,
         help_visible: false,
         profile,
         keymap,
@@ -619,6 +622,9 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         selected_text_bounds: None,
         selected_text_range: None,
     };
+    if let Some(warning) = theme_warning {
+        app.status = Some((warning, Instant::now()));
+    }
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
         app.view = ViewMode::Terminal;
