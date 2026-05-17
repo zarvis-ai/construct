@@ -303,6 +303,13 @@ pub struct App {
     /// mid-drag on the view/pin-strip horizontal divider — mirrors
     /// the `resizing_list` model but for the vertical axis.
     pub resizing_pin_strip: Option<(u16, u16)>,
+    /// User-preferred Matrix-rain panel height in cells. `None` =
+    /// default to about 200px worth of terminal rows, clamped to the empty
+    /// space below the list items.
+    pub matrix_rain_h: Option<u16>,
+    /// `Some((anchor_row, anchor_height))` while the user drags the
+    /// Matrix-rain title bar to resize the panel.
+    pub resizing_matrix_rain: Option<(u16, u16)>,
     /// User has collapsed the session list pane via the `−` button
     /// on its title bar. Effective only when the list pane doesn't
     /// have focus — when focus is on the list (e.g. via `C-x o`),
@@ -409,6 +416,12 @@ pub const LIST_PANEL_W_COLLAPSED: u16 = 0;
 pub const PIN_STRIP_H_MIN: u16 = 3;
 pub const PIN_STRIP_H_MAX: u16 = 40;
 
+/// Matrix-rain panel height in terminal rows. The product request was
+/// "about 200px"; terminal UIs do not know pixel height, so the default is
+/// a compact 12-row panel and render-time clamping shrinks it on short panes.
+pub const MATRIX_RAIN_H_MIN: u16 = 4;
+pub const MATRIX_RAIN_H_DEFAULT: u16 = 12;
+
 /// A clickable / hoverable text segment in the minibuffer hint line —
 /// e.g. "C-x z unzoom" or "? help" — that dispatches a KeyAction when
 /// clicked. Geometry is filled by `render_minibuffer` so the click
@@ -428,6 +441,7 @@ pub struct LayoutSnapshot {
     pub list_area: Option<ratatui::layout::Rect>,
     pub view_area: Option<ratatui::layout::Rect>,
     pub pin_strip_area: Option<ratatui::layout::Rect>,
+    pub matrix_rain_area: Option<ratatui::layout::Rect>,
     pub minibuffer_area: Option<ratatui::layout::Rect>,
     /// Number of rows of the list pane currently in use (so a click
     /// past the last row is a no-op rather than selecting an
@@ -611,6 +625,8 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         resizing_list: None,
         pin_strip_h: persisted.pin_strip_h,
         resizing_pin_strip: None,
+        matrix_rain_h: persisted.matrix_rain_h,
+        resizing_matrix_rain: None,
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
@@ -667,6 +683,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         list_panel_w: Some(app.list_panel_w),
         pin_strip_h: app.pin_strip_h,
         orchestrator_panel_h: app.orchestrator_panel_h,
+        matrix_rain_h: app.matrix_rain_h,
         list_collapsed: app.list_collapsed,
         matrix_rain_hidden: app.matrix_rain_hidden,
     });
@@ -1578,6 +1595,18 @@ impl App {
                     self.resizing_orchestrator_panel = Some((ev.row, cur_h));
                     return;
                 }
+                // Matrix-rain panel: the title bar doubles as a height
+                // handle. The panel is bottom-anchored, so dragging the top
+                // edge upward grows it and dragging downward shrinks it.
+                if self.is_on_matrix_rain_title_bar(ev.column, ev.row) {
+                    let cur_h = self
+                        .layout
+                        .matrix_rain_area
+                        .map(|a| a.height)
+                        .unwrap_or(MATRIX_RAIN_H_DEFAULT);
+                    self.resizing_matrix_rain = Some((ev.row, cur_h));
+                    return;
+                }
                 self.selected_text = None;
                 self.selected_text_bounds = None;
                 self.selected_text_range = None;
@@ -1624,6 +1653,14 @@ impl App {
                         .max(MINIBUFFER_PANEL_H_MIN as i32)
                         .min(MINIBUFFER_PANEL_H_MAX as i32) as u16;
                     self.orchestrator_panel_h = Some(want);
+                } else if let Some((anchor_row, anchor_h)) = self.resizing_matrix_rain {
+                    let delta = anchor_row as i32 - ev.row as i32;
+                    let raw = (anchor_h as i32 + delta).max(MATRIX_RAIN_H_MIN as i32) as u16;
+                    let available = self.matrix_rain_available_height().unwrap_or(raw);
+                    self.matrix_rain_h = Some(crate::ui::matrix_rain_panel_height(
+                        Some(raw),
+                        available,
+                    ));
                 } else if let Some(sel) = self.text_selection.as_mut() {
                     sel.head = ScreenPoint {
                         col: ev.column,
@@ -1637,10 +1674,12 @@ impl App {
                 let was_resizing =
                     self.resizing_list.is_some()
                         || self.resizing_pin_strip.is_some()
-                        || self.resizing_orchestrator_panel.is_some();
+                        || self.resizing_orchestrator_panel.is_some()
+                        || self.resizing_matrix_rain.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
                 self.resizing_orchestrator_panel = None;
+                self.resizing_matrix_rain = None;
                 if was_resizing {
                     self.text_selection = None;
                     return;
@@ -1786,6 +1825,31 @@ impl App {
             return false;
         };
         area.height > 1 && row == area.y && col >= area.x && col < area.x + area.width
+    }
+
+    fn is_on_matrix_rain_title_bar(&self, col: u16, row: u16) -> bool {
+        if self.matrix_rain_hidden {
+            return false;
+        }
+        let Some(rain) = self.layout.matrix_rain_area else {
+            return false;
+        };
+        if row != rain.y || col < rain.x || col >= rain.x + rain.width {
+            return false;
+        }
+        if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
+            if row == y && col >= xs && col < xe {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn matrix_rain_available_height(&self) -> Option<u16> {
+        let list = self.layout.list_area?;
+        let inner_h = list.height.saturating_sub(2);
+        let used = (self.layout.list_row_count as u16).min(inner_h);
+        Some(inner_h.saturating_sub(used))
     }
 
     /// True if `(col, row)` sits on the list ↔ right-pane divider.
@@ -2119,13 +2183,13 @@ impl App {
             }
         }
         if !self.matrix_rain_hidden {
-            if let Some((xs, xe, y)) =
-                crate::ui::matrix_rain_close_button_range(list, self.list_items().len())
-            {
-                if row == y && col >= xs && col < xe {
-                    self.matrix_rain_hidden = true;
-                    self.set_status("matrix rain hidden — M-x rain to show".into());
-                    return;
+            if let Some(rain) = self.layout.matrix_rain_area {
+                if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
+                    if row == y && col >= xs && col < xe {
+                        self.matrix_rain_hidden = true;
+                        self.set_status("matrix rain hidden — M-x rain to show".into());
+                        return;
+                    }
                 }
             }
         }
@@ -3301,6 +3365,7 @@ mod tests {
             list_area: Some(Rect::new(0, 0, 20, 10)),
             view_area: Some(Rect::new(20, 0, 80, 20)),
             pin_strip_area: Some(Rect::new(20, 20, 80, 8)),
+            matrix_rain_area: None,
             minibuffer_area: Some(Rect::new(0, 29, 100, 4)),
             list_row_count: 0,
             minibuffer_hints: Vec::new(),

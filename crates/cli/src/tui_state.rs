@@ -25,6 +25,8 @@ pub struct TuiState {
     #[serde(default)]
     pub orchestrator_panel_h: Option<u16>,
     #[serde(default)]
+    pub matrix_rain_h: Option<u16>,
+    #[serde(default)]
     pub list_collapsed: bool,
     #[serde(default)]
     pub matrix_rain_hidden: bool,
