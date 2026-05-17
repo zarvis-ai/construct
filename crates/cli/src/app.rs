@@ -1039,29 +1039,26 @@ impl App {
         // pending-hydration pairing in `ItemHistory` reattaches
         // tools to their blocks; `feed_tool_result` matches by
         // call_id and just fills `output` on the existing block.
+        let mut replayed_editor_state: Option<EditorState> = None;
+        let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
         match self.client.transcript(id, 0, None).await {
             Ok(t) => {
-                for ev in &t.events {
-                    match &ev.event {
-                        agentd_protocol::SessionEvent::ToolUse { tool, args } => {
-                            // The TUI-dispatch tool (`tui`) is a
-                            // slash-command short-circuit, not a
-                            // real tool block — skip it here just
-                            // like the live notification handler.
-                            if tool != agentd_protocol::TUI_DISPATCH_TOOL {
-                                history.feed_tool_use(tool.clone(), summarize_tool_args(args));
-                            }
-                        }
-                        agentd_protocol::SessionEvent::ToolResult { tool, ok, output } => {
-                            history.feed_tool_result(tool, *ok, output.clone());
-                        }
-                        _ => {}
-                    }
-                }
+                apply_transcript_to_local_state(
+                    &t.events,
+                    &mut history,
+                    &mut replayed_editor_state,
+                    &mut replayed_agent_status,
+                );
             }
             Err(e) => {
                 self.set_status(format!("rehydrate transcript: {e}"));
             }
+        }
+        if let Some(state) = replayed_editor_state {
+            self.editor_states.insert(id.to_string(), state);
+        }
+        if let Some(status) = replayed_agent_status {
+            self.agent_statuses.insert(id.to_string(), status);
         }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
@@ -3319,6 +3316,72 @@ impl App {
 /// style tools, `glob` for globs); otherwise falls back to
 /// truncated JSON. Capped at 80 chars so the header stays single-
 /// line in the typical pane width.
+/// Replay a session's transcript into the local-state snapshots
+/// `bootstrap_terminal` rebuilds on subscribe / pin / TUI restart.
+///
+/// The daemon stores every adapter event in the transcript ring,
+/// but its `event.subscribe` notification stream only fires from
+/// the moment of subscribe forward. Anything that happened before
+/// — a tool block's arguments, a tool result's output, the
+/// current editor buffer, the agent's running status — is missed
+/// unless we re-derive it from the persisted transcript.
+///
+/// Pure function over the events slice plus mutable references to
+/// the local-state cells so it stays trivially unit-testable.
+pub fn apply_transcript_to_local_state(
+    events: &[TimestampedEvent],
+    history: &mut crate::pty_render::ItemHistory,
+    editor_state: &mut Option<EditorState>,
+    agent_status: &mut Option<agentd_protocol::AgentStatus>,
+) {
+    for ev in events {
+        match &ev.event {
+            SessionEvent::ToolUse { tool, args } => {
+                // The TUI-dispatch tool (`tui`) is a slash-command
+                // short-circuit, not a real tool block — skip it
+                // just like the live notification handler does.
+                if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                    history.feed_tool_use(tool.clone(), summarize_tool_args(args));
+                }
+            }
+            SessionEvent::ToolResult { tool, ok, output } => {
+                history.feed_tool_result(tool, *ok, output.clone());
+            }
+            // Each new EditorState supersedes the prior one — the
+            // adapter emits one on every buffer / cursor / queue /
+            // completions change, so the last event in the
+            // transcript is the live state at subscribe time. Without
+            // this, the TUI shows no editor pane after reconnect
+            // until the user types, and the bottom rows of the chat
+            // overflow into where the prompt should sit.
+            SessionEvent::EditorState {
+                queued,
+                buf,
+                cursor,
+                completions,
+            } => {
+                *editor_state = Some(EditorState {
+                    queued: queued.clone(),
+                    buf: buf.clone(),
+                    cursor: *cursor,
+                    completions: completions.clone(),
+                });
+            }
+            // Mirror the live notification handler: `active=true`
+            // sets the running status; `active=false` clears it so
+            // the chat doesn't keep showing a stale spinner.
+            SessionEvent::AgentStatus(status) => {
+                *agent_status = if status.active {
+                    Some(status.clone())
+                } else {
+                    None
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn summarize_tool_args(args: &serde_json::Value) -> String {
     if let Some(obj) = args.as_object() {
         for key in ["command", "path", "query", "glob", "pattern", "cwd"] {
@@ -3464,6 +3527,84 @@ mod tests {
             selection_bounds_for_layout(&test_layout(), 0, true, 0, 30),
             Some(Rect::new(0, 30, 100, 3))
         );
+    }
+
+    /// Symptom-level repro for the zarvis-prompt-overlap bug.
+    ///
+    /// User report (against `tui reconnect`, harness=zarvis): after
+    /// the TUI reconnects or otherwise rebootstraps a session, the
+    /// last turn's output extends all the way to the bottom row,
+    /// overwriting the position where the `❯ ` prompt should sit.
+    /// Typing anything (which triggers a fresh `EditorState` event
+    /// from the adapter) shrinks the chat area by ~3 rows and the
+    /// prompt finally appears.
+    ///
+    /// Root cause: `bootstrap_terminal` replays the transcript but
+    /// only feeds `ToolUse` / `ToolResult` back into the local
+    /// state. `EditorState` events are dropped, so `editor_states`
+    /// stays empty and `render_terminal` doesn't reserve the
+    /// bottom editor pane. Replaying the latest `EditorState` (and
+    /// `AgentStatus`) from the transcript fixes it.
+    #[test]
+    fn apply_transcript_replays_latest_editor_state_for_bootstrap() {
+        use agentd_protocol::SessionEvent;
+        use chrono::TimeZone;
+
+        fn ev(seq: u64, e: SessionEvent) -> TimestampedEvent {
+            TimestampedEvent {
+                seq,
+                at: chrono::Utc.timestamp_opt(0, 0).unwrap(),
+                event: e,
+            }
+        }
+
+        let events = vec![
+            ev(
+                1,
+                SessionEvent::EditorState {
+                    queued: Vec::new(),
+                    buf: "stale".into(),
+                    cursor: 5,
+                    completions: Vec::new(),
+                },
+            ),
+            ev(
+                2,
+                SessionEvent::ToolUse {
+                    tool: "shell".into(),
+                    args: serde_json::json!({"command": "ls"}),
+                },
+            ),
+            // The most recent EditorState — this is what the TUI
+            // must surface on reconnect so the prompt is visible
+            // before the user touches the keyboard.
+            ev(
+                3,
+                SessionEvent::EditorState {
+                    queued: vec!["queued msg".into()],
+                    buf: "latest".into(),
+                    cursor: 6,
+                    completions: vec!["/help".into()],
+                },
+            ),
+        ];
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor_state: Option<EditorState> = None;
+        let mut agent_status: Option<agentd_protocol::AgentStatus> = None;
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor_state,
+            &mut agent_status,
+        );
+
+        let state = editor_state
+            .expect("bootstrap must replay the most recent EditorState so the prompt is visible");
+        assert_eq!(state.buf, "latest");
+        assert_eq!(state.cursor, 6);
+        assert_eq!(state.queued, vec!["queued msg".to_string()]);
+        assert_eq!(state.completions, vec!["/help".to_string()]);
     }
 
     #[test]
