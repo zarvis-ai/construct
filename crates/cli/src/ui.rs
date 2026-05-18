@@ -1497,6 +1497,16 @@ fn transition_amount(started_at: Instant) -> Option<f32> {
     Some(1.0 - (elapsed as f32 / crate::app::SESSION_TRANSITION_MS as f32))
 }
 
+fn glitch_style(theme: &Theme, row: u16) -> Style {
+    let color = match row % 4 {
+        0 => theme.matrix_flash_work,
+        1 => theme.matrix_flash_good,
+        2 => theme.accent,
+        _ => theme.matrix_glow,
+    };
+    Style::default().fg(color)
+}
+
 fn render_glitch_overlay(f: &mut Frame, area: Rect, theme: &Theme, seed: u64, amount: f32) {
     if area.width == 0 || area.height == 0 || amount <= 0.0 {
         return;
@@ -1524,13 +1534,7 @@ fn render_glitch_overlay(f: &mut Frame, area: Rect, theme: &Theme, seed: u64, am
                 text.push(' ');
             }
         }
-        let style = if row % 3 == 0 {
-            Style::default().fg(theme.accent_alt)
-        } else if row % 5 == 0 {
-            Style::default().fg(theme.warning)
-        } else {
-            Style::default().fg(theme.accent)
-        };
+        let style = glitch_style(theme, row);
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(text, style))),
             Rect {
@@ -1543,18 +1547,19 @@ fn render_glitch_overlay(f: &mut Frame, area: Rect, theme: &Theme, seed: u64, am
     }
 }
 
-fn render_main_transition(f: &mut Frame, area: Rect, app: &App, session_id: &str) {
-    let Some(t) = app
-        .session_transition
-        .as_ref()
-        .filter(|t| t.session_id == session_id)
-    else {
+fn render_main_transition(f: &mut Frame, area: Rect, app: &App) {
+    let Some(t) = app.session_transition.as_ref() else {
         return;
     };
     let Some(amount) = transition_amount(t.started_at) else {
         return;
     };
-    render_glitch_overlay(f, area, &app.theme, hash_str(session_id), amount);
+    let seed = match &app.selection {
+        Selection::Session(id) => hash_str(id),
+        Selection::Group(id) => hash_str(id) ^ 0x67726f7570,
+        Selection::None => 0x5e5510,
+    };
+    render_glitch_overlay(f, area, &app.theme, seed, amount);
 }
 
 fn render_pin_transition(f: &mut Frame, area: Rect, app: &App, session_id: &str) {
@@ -1660,16 +1665,14 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
 
     if let Some(g) = app.selected_group() {
         render_group_overview(f, inner, app, g);
+        render_main_transition(f, inner, app);
         return;
     }
-    let selected_id = app.selected_id();
     match app.view {
         ViewMode::Terminal => render_terminal(f, inner, app),
         ViewMode::Transcript => render_transcript(f, inner, app),
     }
-    if let Some(id) = selected_id {
-        render_main_transition(f, inner, app, &id);
-    }
+    render_main_transition(f, inner, app);
 }
 
 fn render_group_overview(

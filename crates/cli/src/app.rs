@@ -360,7 +360,6 @@ pub struct App {
 
 #[derive(Debug, Clone)]
 pub struct SessionTransition {
-    pub session_id: String,
     pub started_at: Instant,
 }
 
@@ -894,9 +893,8 @@ impl App {
         self.status = Some((msg, Instant::now()));
     }
 
-    pub fn start_session_transition(&mut self, session_id: impl Into<String>) {
+    pub fn start_session_transition(&mut self) {
         self.session_transition = Some(SessionTransition {
-            session_id: session_id.into(),
             started_at: Instant::now(),
         });
     }
@@ -908,10 +906,21 @@ impl App {
 
     pub fn select_session(&mut self, id: String) {
         if self.selection.session_id() != Some(id.as_str()) {
-            self.start_session_transition(id.clone());
+            self.start_session_transition();
         }
         self.selection = Selection::Session(id);
         self.transcript_session = None;
+    }
+
+    pub fn select_group(&mut self, id: String) {
+        if self.selection.group_id() != Some(id.as_str()) {
+            self.start_session_transition();
+        }
+        self.selection = Selection::Group(id);
+        self.transcript.clear();
+        self.transcript_session = None;
+        self.transcript_scroll = u16::MAX;
+        self.view_scrollback = 0;
     }
 
     pub fn prune_finished_transitions(&mut self) {
@@ -1029,6 +1038,9 @@ impl App {
             self.bootstrap_terminal(&id).await;
         } else {
             self.view = ViewMode::Transcript;
+        }
+        if self.selection.session_id() == Some(id.as_str()) {
+            self.start_session_transition();
         }
     }
 
@@ -1253,9 +1265,7 @@ impl App {
         let next = ((cur as i32 + delta).rem_euclid(n)) as usize;
         match &items[next] {
             ListItem::Session { summary, .. } => self.select_session(summary.id.clone()),
-            ListItem::GroupHeader { group, .. } => {
-                self.selection = Selection::Group(group.id.clone())
-            }
+            ListItem::GroupHeader { group, .. } => self.select_group(group.id.clone()),
         }
         self.refresh_selected_transcript().await;
     }
@@ -2340,7 +2350,7 @@ impl App {
                     .map(|s| s != id.as_str())
                     .unwrap_or(true)
                 {
-                    self.selection = Selection::Group(id.clone());
+                    self.select_group(id.clone());
                 }
                 if let Err(e) = self.client.set_group_collapsed(&id, next).await {
                     self.set_status(format!("collapse failed: {e}"));
@@ -3202,7 +3212,7 @@ impl App {
                     Ok(id) => {
                         self.set_status(format!("created group '{trimmed}'"));
                         self.refresh_sessions().await; // also refreshes groups
-                        self.selection = Selection::Group(id);
+                        self.select_group(id);
                     }
                     Err(e) => self.set_status(format!("group create failed: {e}")),
                 }
