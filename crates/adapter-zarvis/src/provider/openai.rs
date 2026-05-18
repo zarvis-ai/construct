@@ -23,8 +23,8 @@ pub struct OpenAi {
 
 impl OpenAi {
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .map_err(|_| anyhow!("OPENAI_API_KEY not set"))?;
+        let api_key =
+            std::env::var("OPENAI_API_KEY").map_err(|_| anyhow!("OPENAI_API_KEY not set"))?;
         let base_url = std::env::var("OPENAI_BASE_URL")
             .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
             .trim_end_matches('/')
@@ -93,6 +93,10 @@ fn messages_to_openai(system: &str, messages: &[Message]) -> Vec<Value> {
                     "tool_call_id": call_id,
                     "content": output,
                 }));
+            }
+            Content::Summary { text, .. } => {
+                let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
+                out.push(json!({ "role": "user", "content": body }));
             }
         }
     }
@@ -192,7 +196,11 @@ impl LlmProvider for OpenAi {
                     .and_then(|n| n.as_u64())
                     .unwrap_or(usage.output_tokens);
             }
-            let choice = match chunk.get("choices").and_then(|c| c.as_array()).and_then(|a| a.first()) {
+            let choice = match chunk
+                .get("choices")
+                .and_then(|c| c.as_array())
+                .and_then(|a| a.first())
+            {
                 Some(c) => c,
                 None => continue,
             };

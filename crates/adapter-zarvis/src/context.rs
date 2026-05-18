@@ -52,10 +52,15 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
                 }
                 for c in calls {
                     chars += c.name.len();
-                    chars += serde_json::to_string(&c.input).map(|s| s.len()).unwrap_or(0);
+                    chars += serde_json::to_string(&c.input)
+                        .map(|s| s.len())
+                        .unwrap_or(0);
                 }
             }
             Content::ToolResult { output, .. } => chars += output.len(),
+            Content::Summary { text, .. } => {
+                chars += text.len() + crate::provider::SUMMARY_WIRE_PREFIX.len();
+            }
         }
     }
     (chars as f64 / 3.5) as usize
@@ -125,10 +130,16 @@ mod tests {
     use super::*;
 
     fn user(s: &str) -> Message {
-        Message { role: Role::User, content: Content::Text { text: s.into() } }
+        Message {
+            role: Role::User,
+            content: Content::Text { text: s.into() },
+        }
     }
     fn asst(s: &str) -> Message {
-        Message { role: Role::Assistant, content: Content::Text { text: s.into() } }
+        Message {
+            role: Role::Assistant,
+            content: Content::Text { text: s.into() },
+        }
     }
 
     #[test]

@@ -1378,8 +1378,13 @@ fn render_matrix_reveal(
     let mut all_pinned_at = reveal_start_elapsed_ms;
     for i in 0..chars.len() {
         let col = target_x.saturating_sub(area.x) + i as u16;
-        let pinned_at =
-            rain_pass_elapsed_ms(area.width, col, target_rel_y, cycle, reveal_start_elapsed_ms);
+        let pinned_at = rain_pass_elapsed_ms(
+            area.width,
+            col,
+            target_rel_y,
+            cycle,
+            reveal_start_elapsed_ms,
+        );
         all_pinned_at = all_pinned_at.max(pinned_at);
         pins.push(pinned_at);
     }
@@ -2603,6 +2608,22 @@ fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
             // chat transcript.
             vec![]
         }
+        SessionEvent::ContextCompacted {
+            kept_turns,
+            dropped_turns,
+            tokens_before,
+            tokens_after,
+            summary_preview,
+        } => vec![Span::styled(
+            format!(
+                "   ◧ compacted {} turns (~{}→{} tok): {}",
+                dropped_turns,
+                tokens_before,
+                tokens_after,
+                shorten(summary_preview, 120)
+            ),
+            Style::default().fg(theme.dim),
+        )],
     }
 }
 
@@ -2615,11 +2636,15 @@ fn pane_border_style(theme: &Theme, focused: bool) -> Style {
 }
 
 fn group_name_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.group).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(theme.group)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn harness_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.harness).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(theme.harness)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Clip `s` to at most `max` display columns, appending `…` when the
@@ -2805,7 +2830,11 @@ fn render_pty_screen(
             let x = area.x + col;
             let y = area.y + row;
             if let Some(buf_cell) = f.buffer_mut().cell_mut(Position { x, y }) {
-                if screen.cell(row, col).map(|c| c.has_contents()).unwrap_or(false) {
+                if screen
+                    .cell(row, col)
+                    .map(|c| c.has_contents())
+                    .unwrap_or(false)
+                {
                     buf_cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
                 } else {
                     buf_cell.set_symbol("█");
@@ -3048,6 +3077,15 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
                 completions.len()
             )
         }
+        SessionEvent::ContextCompacted {
+            dropped_turns,
+            tokens_before,
+            tokens_after,
+            ..
+        } => format!(
+            "compact: {} turns ~{}→{} tok",
+            dropped_turns, tokens_before, tokens_after
+        ),
     }
 }
 
@@ -3320,7 +3358,10 @@ mod tests {
             crate::app::MATRIX_RAIN_H_DEFAULT
         );
         assert_eq!(matrix_rain_panel_height(None, 8), 8);
-        assert_eq!(matrix_rain_panel_height(Some(2), 30), crate::app::MATRIX_RAIN_H_MIN);
+        assert_eq!(
+            matrix_rain_panel_height(Some(2), 30),
+            crate::app::MATRIX_RAIN_H_MIN
+        );
         assert_eq!(matrix_rain_panel_height(Some(50), 30), 30);
         assert_eq!(matrix_rain_panel_height(Some(8), 3), 3);
     }
@@ -3358,8 +3399,7 @@ mod tests {
         let crossing = epoch + Duration::from_millis(2500);
         let seed = 42;
         assert_eq!(
-            foreground_rain_frame(crossing, epoch, seed, threshold, 2, 20)
-                .map(|frame| frame.head),
+            foreground_rain_frame(crossing, epoch, seed, threshold, 2, 20).map(|frame| frame.head),
             Some(0)
         );
         assert_eq!(
@@ -3457,14 +3497,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_editor_pane(
-                    f,
-                    Rect::new(0, 0, 20, 3),
-                    Some(&state),
-                    None,
-                    &theme,
-                    false,
-                );
+                render_editor_pane(f, Rect::new(0, 0, 20, 3), Some(&state), None, &theme, false);
             })
             .expect("draw");
 
@@ -3490,14 +3523,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_editor_pane(
-                    f,
-                    Rect::new(0, 0, 20, 3),
-                    Some(&state),
-                    None,
-                    &theme,
-                    true,
-                );
+                render_editor_pane(f, Rect::new(0, 0, 20, 3), Some(&state), None, &theme, true);
             })
             .expect("draw");
 

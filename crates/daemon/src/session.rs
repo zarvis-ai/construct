@@ -167,13 +167,7 @@ impl TaskRegistry {
         }
     }
 
-    pub fn mark_end(
-        &mut self,
-        call_id: &str,
-        ok: bool,
-        output_preview: String,
-        at_ms: i64,
-    ) {
+    pub fn mark_end(&mut self, call_id: &str, ok: bool, output_preview: String, at_ms: i64) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.call_id == call_id) {
             e.state = if ok {
                 agentd_protocol::TaskState::Completed
@@ -256,8 +250,7 @@ impl PtyState {
     fn push(&mut self, bytes: &[u8]) {
         if bytes.len() >= PTY_RING_CAP {
             self.ring.clear();
-            self.ring
-                .extend(&bytes[bytes.len() - PTY_RING_CAP..]);
+            self.ring.extend(&bytes[bytes.len() - PTY_RING_CAP..]);
             return;
         }
         while self.ring.len() + bytes.len() > PTY_RING_CAP {
@@ -491,8 +484,7 @@ impl SessionManager {
         let now = Utc::now();
 
         // Worktree setup (best effort).
-        let want_worktree =
-            params.worktree || self.config.defaults.worktree.unwrap_or(false);
+        let want_worktree = params.worktree || self.config.defaults.worktree.unwrap_or(false);
         let cwd_path = PathBuf::from(&params.cwd);
         let worktree_path = if want_worktree && worktree::is_git_repo(&cwd_path).await {
             let dest = self.storage.worktree_path(&id);
@@ -507,9 +499,7 @@ impl SessionManager {
         } else {
             None
         };
-        let effective_cwd = worktree_path
-            .clone()
-            .unwrap_or_else(|| cwd_path.clone());
+        let effective_cwd = worktree_path.clone().unwrap_or_else(|| cwd_path.clone());
 
         let mut summary = SessionSummary {
             id: id.clone(),
@@ -521,7 +511,9 @@ impl SessionManager {
             last_event_at: None,
             cost_usd: None,
             model: params.model.clone(),
-            worktree: worktree_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            worktree: worktree_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
             pending_input: false,
             last_prompt: params.prompt.clone(),
             event_count: 0,
@@ -635,7 +627,10 @@ impl SessionManager {
             .await
             .context("adapter session.start failed")?;
 
-        self.sessions.write().await.insert(id.clone(), entry.clone());
+        self.sessions
+            .write()
+            .await
+            .insert(id.clone(), entry.clone());
 
         // Spawn drain task for adapter messages.
         let manager = self.clone();
@@ -645,9 +640,11 @@ impl SessionManager {
         });
 
         // Broadcast initial state.
-        let _ = self.broadcast.send(BroadcastMsg::State(StateNotificationPayload {
-            session: summary,
-        }));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: summary,
+            }));
 
         Ok(id)
     }
@@ -681,9 +678,7 @@ impl SessionManager {
             let guard = self.sessions.read().await;
             for entry in guard.values() {
                 let s = entry.summary.read().await;
-                if s.kind == agentd_protocol::SessionKind::Orchestrator
-                    && !s.state.is_terminal()
-                {
+                if s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal() {
                     tracing::info!(
                         id = %s.id,
                         harness = %s.harness,
@@ -765,9 +760,11 @@ impl SessionManager {
                         s.clone()
                     };
                     let _ = self.storage.save_summary(&snapshot);
-                    let _ = self.broadcast.send(BroadcastMsg::State(
-                        StateNotificationPayload { session: snapshot },
-                    ));
+                    let _ = self
+                        .broadcast
+                        .send(BroadcastMsg::State(StateNotificationPayload {
+                            session: snapshot,
+                        }));
                 }
             }
         }
@@ -809,7 +806,10 @@ impl SessionManager {
             .get(&harness)
             .ok_or_else(|| anyhow!("unknown harness on resume: {harness}"))?
             .clone();
-        let binary_spec = adapter_cfg.binary.clone().unwrap_or_else(|| harness.clone());
+        let binary_spec = adapter_cfg
+            .binary
+            .clone()
+            .unwrap_or_else(|| harness.clone());
         let binary = locate_binary(&binary_spec)
             .ok_or_else(|| anyhow!("adapter binary not found: {binary_spec}"))?;
         let combined_args = {
@@ -872,9 +872,11 @@ impl SessionManager {
             s.clone()
         };
         let _ = self.storage.save_summary(&snapshot);
-        let _ = self.broadcast.send(BroadcastMsg::State(
-            StateNotificationPayload { session: snapshot },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
 
         // Drain adapter messages just like a fresh create.
         let manager = self.clone();
@@ -951,7 +953,10 @@ impl SessionManager {
                 AdapterMessage::Event(env) => {
                     self.handle_event(&entry, env.event).await;
                 }
-                AdapterMessage::Log { session_id: _, line } => {
+                AdapterMessage::Log {
+                    session_id: _,
+                    line,
+                } => {
                     tracing::info!(session = %entry.id, "adapter: {line}");
                 }
                 AdapterMessage::Closed { exit_code } => {
@@ -974,9 +979,11 @@ impl SessionManager {
                     drop(summary);
                     let _ = self.storage.save_summary(&snapshot);
                     *entry.adapter.lock().await = None;
-                    let _ = self.broadcast.send(BroadcastMsg::State(
-                        StateNotificationPayload { session: snapshot },
-                    ));
+                    let _ = self
+                        .broadcast
+                        .send(BroadcastMsg::State(StateNotificationPayload {
+                            session: snapshot,
+                        }));
                     break;
                 }
             }
@@ -1010,17 +1017,19 @@ impl SessionManager {
                 s.clone()
             };
             let _ = self.storage.save_summary(&snapshot);
-            let _ = self.broadcast.send(BroadcastMsg::State(
-                StateNotificationPayload { session: snapshot },
-            ));
-            let _ = self.broadcast.send(BroadcastMsg::Event(
-                EventNotificationPayload {
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::State(StateNotificationPayload {
+                    session: snapshot,
+                }));
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::Event(EventNotificationPayload {
                     session_id: entry.id.clone(),
                     at: now,
                     event,
                     seq: 0,
-                },
-            ));
+                }));
             return;
         }
         // AgentStatus is ephemeral live UI state. The CLI may render
@@ -1124,10 +1133,11 @@ impl SessionManager {
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
                 | SessionEvent::TaskEnd { .. }
+                | SessionEvent::ContextCompacted { .. }
                 | SessionEvent::EditorState { .. } => {
-                    // Task-lifecycle and editor-state events are
-                    // recorded by other handlers — they don't move
-                    // the session's top-level state.
+                    // Task-lifecycle, editor-state, and compaction
+                    // events are recorded by other handlers — they
+                    // don't move the session's top-level state.
                 }
             }
             let snapshot = s.clone();
@@ -1137,7 +1147,11 @@ impl SessionManager {
         // Update the per-session task registry from lifecycle events
         // so `session.list_tasks` has live state to return.
         match &event {
-            SessionEvent::TaskStart { call_id, tool, args_summary } => {
+            SessionEvent::TaskStart {
+                call_id,
+                tool,
+                args_summary,
+            } => {
                 let mut tasks = entry.tasks.lock().await;
                 tasks.upsert_start(
                     call_id.clone(),
@@ -1150,14 +1164,13 @@ impl SessionManager {
                 let mut tasks = entry.tasks.lock().await;
                 tasks.mark_backgrounded(call_id, now.timestamp_millis());
             }
-            SessionEvent::TaskEnd { call_id, ok, output_preview } => {
+            SessionEvent::TaskEnd {
+                call_id,
+                ok,
+                output_preview,
+            } => {
                 let mut tasks = entry.tasks.lock().await;
-                tasks.mark_end(
-                    call_id,
-                    *ok,
-                    output_preview.clone(),
-                    now.timestamp_millis(),
-                );
+                tasks.mark_end(call_id, *ok, output_preview.clone(), now.timestamp_millis());
             }
             _ => {}
         }
@@ -1176,18 +1189,22 @@ impl SessionManager {
             self.maybe_spawn_auto_title(entry.clone(), text.clone());
         }
 
-        let _ = self.broadcast.send(BroadcastMsg::Event(EventNotificationPayload {
-            session_id: entry.id.clone(),
-            at: now,
-            event,
-            seq,
-        }));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::Event(EventNotificationPayload {
+                session_id: entry.id.clone(),
+                at: now,
+                event,
+                seq,
+            }));
 
         // Also push a state snapshot so list views update without explicit refresh.
         let summary = entry.summary().await;
-        let _ = self.broadcast.send(BroadcastMsg::State(StateNotificationPayload {
-            session: summary,
-        }));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: summary,
+            }));
     }
 
     pub async fn send_input(&self, id: &str, text: String) -> Result<()> {
@@ -1273,10 +1290,12 @@ impl SessionManager {
             .await
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(
-            &agentd_protocol::SessionPtyInputParams::from_bytes(id, &bytes),
-        )?;
-        adapter.request(ahp_method::SESSION_PTY_INPUT, params).await?;
+        let params = serde_json::to_value(&agentd_protocol::SessionPtyInputParams::from_bytes(
+            id, &bytes,
+        ))?;
+        adapter
+            .request(ahp_method::SESSION_PTY_INPUT, params)
+            .await?;
         Ok(())
     }
 
@@ -1405,7 +1424,9 @@ impl SessionManager {
         let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
             session_id: id.to_string(),
         })?;
-        adapter.request(ahp_method::SESSION_INTERRUPT, params).await?;
+        adapter
+            .request(ahp_method::SESSION_INTERRUPT, params)
+            .await?;
         Ok(())
     }
 
@@ -1533,9 +1554,16 @@ impl SessionManager {
                 }
                 // At top of region — try to exit into the previous region.
                 let prev = region_above(me.group_id.as_deref(), &all_groups);
-                let Some(prev_region) = prev else { return Ok(()); };
-                self.move_session_into_region(&me.id, &prev_region, RegionEdge::Bottom, &all_sessions)
-                    .await
+                let Some(prev_region) = prev else {
+                    return Ok(());
+                };
+                self.move_session_into_region(
+                    &me.id,
+                    &prev_region,
+                    RegionEdge::Bottom,
+                    &all_sessions,
+                )
+                .await
             }
             MoveDirection::Down => {
                 if pos_in_region + 1 < region.len() {
@@ -1544,7 +1572,9 @@ impl SessionManager {
                 }
                 // At bottom of region — try to enter the next region.
                 let next = region_below(me.group_id.as_deref(), &all_groups);
-                let Some(next_region) = next else { return Ok(()); };
+                let Some(next_region) = next else {
+                    return Ok(());
+                };
                 self.move_session_into_region(&me.id, &next_region, RegionEdge::Top, &all_sessions)
                     .await
             }
@@ -1574,12 +1604,16 @@ impl SessionManager {
         };
         self.storage.save_summary(&snap_a)?;
         self.storage.save_summary(&snap_b)?;
-        let _ = self.broadcast.send(BroadcastMsg::State(
-            StateNotificationPayload { session: snap_a },
-        ));
-        let _ = self.broadcast.send(BroadcastMsg::State(
-            StateNotificationPayload { session: snap_b },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snap_a,
+            }));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snap_b,
+            }));
         Ok(())
     }
 
@@ -1638,9 +1672,11 @@ impl SessionManager {
             s.clone()
         };
         self.storage.save_summary(&snapshot)?;
-        let _ = self.broadcast.send(BroadcastMsg::State(
-            StateNotificationPayload { session: snapshot },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
         Ok(())
     }
 
@@ -1677,9 +1713,11 @@ impl SessionManager {
                 summary: RwLock::new(summary.clone()),
             }),
         );
-        let _ = self.broadcast.send(BroadcastMsg::GroupState(
-            GroupStateNotificationPayload { group: summary },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
+                group: summary,
+            }));
         Ok(id)
     }
 
@@ -1701,9 +1739,11 @@ impl SessionManager {
             s.clone()
         };
         self.storage.save_group(&snapshot)?;
-        let _ = self.broadcast.send(BroadcastMsg::GroupState(
-            GroupStateNotificationPayload { group: snapshot },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
+                group: snapshot,
+            }));
         Ok(())
     }
 
@@ -1721,9 +1761,11 @@ impl SessionManager {
             s.clone()
         };
         self.storage.save_group(&snapshot)?;
-        let _ = self.broadcast.send(BroadcastMsg::GroupState(
-            GroupStateNotificationPayload { group: snapshot },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
+                group: snapshot,
+            }));
         Ok(())
     }
 
@@ -1779,9 +1821,11 @@ impl SessionManager {
                     s.clone()
                 };
                 let _ = self.storage.save_summary(&snapshot);
-                let _ = self.broadcast.send(BroadcastMsg::State(
-                    StateNotificationPayload { session: snapshot },
-                ));
+                let _ = self
+                    .broadcast
+                    .send(BroadcastMsg::State(StateNotificationPayload {
+                        session: snapshot,
+                    }));
             }
         }
         let _ = self.storage.remove_group(id);
@@ -1845,12 +1889,16 @@ impl SessionManager {
         };
         self.storage.save_group(&snap_a)?;
         self.storage.save_group(&snap_b)?;
-        let _ = self.broadcast.send(BroadcastMsg::GroupState(
-            GroupStateNotificationPayload { group: snap_a },
-        ));
-        let _ = self.broadcast.send(BroadcastMsg::GroupState(
-            GroupStateNotificationPayload { group: snap_b },
-        ));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
+                group: snap_a,
+            }));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
+                group: snap_b,
+            }));
         Ok(())
     }
 
@@ -1928,12 +1976,7 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn tool_decision(
-        &self,
-        id: &str,
-        call_id: String,
-        decision: String,
-    ) -> Result<()> {
+    pub async fn tool_decision(&self, id: &str, call_id: String, decision: String) -> Result<()> {
         let entry = self
             .get_entry(id)
             .await
@@ -1999,10 +2042,7 @@ impl SessionManager {
         self.loops.create(l).await
     }
 
-    pub async fn loop_list(
-        &self,
-        session_id: Option<&str>,
-    ) -> Vec<agentd_protocol::Loop> {
+    pub async fn loop_list(&self, session_id: Option<&str>) -> Vec<agentd_protocol::Loop> {
         self.loops.list(session_id).await
     }
 
@@ -2011,7 +2051,12 @@ impl SessionManager {
         params: agentd_protocol::LoopUpdateParams,
     ) -> Result<agentd_protocol::Loop> {
         self.loops
-            .update(&params.loop_id, params.spec, params.prompt, params.expires_at_ms)
+            .update(
+                &params.loop_id,
+                params.spec,
+                params.prompt,
+                params.expires_at_ms,
+            )
             .await
     }
 
@@ -2019,10 +2064,7 @@ impl SessionManager {
         self.loops.remove(loop_id).await
     }
 
-    pub async fn list_tasks(
-        &self,
-        id: &str,
-    ) -> Result<Vec<agentd_protocol::TaskInfo>> {
+    pub async fn list_tasks(&self, id: &str) -> Result<Vec<agentd_protocol::TaskInfo>> {
         let entry = self
             .get_entry(id)
             .await
@@ -2036,12 +2078,7 @@ impl SessionManager {
     /// with a debug log; adapters that don't know the `call_id`
     /// likewise no-op. No daemon-side state changes — the adapter is
     /// authoritative for the running-tasks registry.
-    pub async fn tool_action(
-        &self,
-        id: &str,
-        call_id: String,
-        action: String,
-    ) -> Result<()> {
+    pub async fn tool_action(&self, id: &str, call_id: String, action: String) -> Result<()> {
         let entry = self
             .get_entry(id)
             .await
@@ -2134,7 +2171,11 @@ async fn generate_auto_title(
     let snapshot = {
         let mut s = entry.summary.write().await;
         // Don't clobber a title the user set after we kicked this off.
-        if s.title.as_ref().map(|t| !t.trim().is_empty()).unwrap_or(false) {
+        if s.title
+            .as_ref()
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false)
+        {
             return;
         }
         s.title = Some(title.clone());
@@ -2208,10 +2249,16 @@ mod tests {
     #[test]
     fn force_redraw_runs_for_pty_adapters_with_cached_size() {
         let caps = pty_caps();
-        let size = Some(PtySize { cols: 160, rows: 50 });
+        let size = Some(PtySize {
+            cols: 160,
+            rows: 50,
+        });
         assert_eq!(
             force_redraw_size_on_resume(&caps, size),
-            Some(PtySize { cols: 160, rows: 50 })
+            Some(PtySize {
+                cols: 160,
+                rows: 50
+            })
         );
     }
 
@@ -2225,7 +2272,10 @@ mod tests {
     fn force_redraw_skipped_for_silent_resume_adapters() {
         let mut caps = pty_caps();
         caps.supports_silent_resume = true;
-        let size = Some(PtySize { cols: 160, rows: 50 });
+        let size = Some(PtySize {
+            cols: 160,
+            rows: 50,
+        });
         assert_eq!(force_redraw_size_on_resume(&caps, size), None);
     }
 
@@ -2247,7 +2297,10 @@ mod tests {
             supports_silent_resume: false,
             ..Default::default()
         };
-        let size = Some(PtySize { cols: 160, rows: 50 });
+        let size = Some(PtySize {
+            cols: 160,
+            rows: 50,
+        });
         assert_eq!(force_redraw_size_on_resume(&caps, size), None);
     }
 

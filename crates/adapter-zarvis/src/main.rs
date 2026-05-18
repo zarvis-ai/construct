@@ -6,6 +6,7 @@
 //! design.
 
 mod agent;
+mod compact;
 mod context;
 mod interactive;
 mod interval_suggest;

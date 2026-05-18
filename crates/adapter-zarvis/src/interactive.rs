@@ -60,16 +60,24 @@ impl<'a> Terminal<'a> {
         self.write(banner.as_bytes());
     }
     fn tool_use(&self, name: &str, args_summary: &str) {
-        let line = format!(
-            "\r\n\x1b[1;32m→ {name}\x1b[0m\x1b[2m({args_summary})\x1b[0m\r\n"
-        );
+        let line = format!("\r\n\x1b[1;32m→ {name}\x1b[0m\x1b[2m({args_summary})\x1b[0m\r\n");
         self.write(line.as_bytes());
     }
     fn tool_result(&self, ok: bool, output: &str) {
-        let glyph = if ok { "\x1b[1;32m✓\x1b[0m" } else { "\x1b[1;31m✗\x1b[0m" };
+        let glyph = if ok {
+            "\x1b[1;32m✓\x1b[0m"
+        } else {
+            "\x1b[1;31m✗\x1b[0m"
+        };
         // Print a short single-line preview of the result; full content
         // is in the transcript (we also emit ToolResult).
-        let one_line: String = output.lines().next().unwrap_or("").chars().take(160).collect();
+        let one_line: String = output
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(160)
+            .collect();
         let line = format!("  {glyph}  \x1b[2m{one_line}\x1b[0m\r\n");
         self.write(line.as_bytes());
     }
@@ -105,8 +113,7 @@ impl<'a> Terminal<'a> {
         for (i, line) in output.lines().take(TOOL_BLOCK_MAX_LINES).enumerate() {
             let trimmed: String = line.chars().take(TOOL_BLOCK_MAX_COLS).collect();
             if i == 0 {
-                let payload =
-                    format!("  {glyph}  \x1b[2m{trimmed}\x1b[0m\r\n");
+                let payload = format!("  {glyph}  \x1b[2m{trimmed}\x1b[0m\r\n");
                 self.write(payload.as_bytes());
             } else {
                 let payload = format!("     \x1b[2m{trimmed}\x1b[0m\r\n");
@@ -119,9 +126,8 @@ impl<'a> Terminal<'a> {
         }
         if total_lines > TOOL_BLOCK_MAX_LINES {
             let remaining = total_lines - TOOL_BLOCK_MAX_LINES;
-            let footer = format!(
-                "     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n"
-            );
+            let footer =
+                format!("     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n");
             self.write(footer.as_bytes());
         }
     }
@@ -231,11 +237,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn emit_agent_status(
-    emit: &EventEmitter,
-    started_at_ms: i64,
-    status: &str,
-) {
+fn emit_agent_status(emit: &EventEmitter, started_at_ms: i64, status: &str) {
     emit.emit(SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
         active: true,
         started_at_ms,
@@ -256,11 +258,7 @@ fn finish_agent_status(emit: &EventEmitter, started_at_ms: i64, status: &str) {
 /// TUI's input pane stays in sync. Each queued entry is sent as a
 /// single string (newlines preserved); the TUI renders the first line
 /// with the `❯` glyph and continuation lines with a matching indent.
-fn emit_editor_state(
-    emit: &EventEmitter,
-    editor: &LineEditor,
-    queue: &VecDeque<String>,
-) {
+fn emit_editor_state(emit: &EventEmitter, editor: &LineEditor, queue: &VecDeque<String>) {
     emit.emit(SessionEvent::EditorState {
         queued: queue.iter().cloned().collect(),
         buf: editor.buf.clone(),
@@ -291,19 +289,8 @@ const DIM_LINE_PREFIXES: &[&str] = &["Summary:"];
 /// `agentd_loop_create` call. Keep this in lockstep with the
 /// after-submit match block + the TUI's `run_slash_command`.
 const SLASH_COMMANDS: &[&str] = &[
-    "/border",
-    "/help",
-    "/loop",
-    "/model",
-    "/new",
-    "/quit",
-    "/reset",
-    "/exit",
-    "/refresh",
-    "/rename",
-    "/send",
-    "/tasks",
-    "/zoom",
+    "/border", "/compact", "/help", "/loop", "/model", "/new", "/quit", "/reset", "/exit",
+    "/refresh", "/rename", "/send", "/tasks", "/zoom",
 ];
 
 /// Padding around the assistant's streamed response. The response is
@@ -582,9 +569,7 @@ enum EscState {
     /// Just saw ESC (0x1b).
     Esc,
     /// Saw ESC [ — collecting params until a final byte.
-    Csi {
-        params: String,
-    },
+    Csi { params: String },
     /// Saw ESC O — accept exactly one final byte.
     Ss3,
 }
@@ -734,9 +719,7 @@ impl LineEditor {
         self.cursor = 0;
         self.hist_pos = None;
         self.saved.clear();
-        if !line.is_empty()
-            && self.history.last().map(|s| s.as_str()) != Some(line.as_str())
-        {
+        if !line.is_empty() && self.history.last().map(|s| s.as_str()) != Some(line.as_str()) {
             self.history.push(line.clone());
         }
         LineEvent::Submit(line)
@@ -802,9 +785,7 @@ impl LineEditor {
     }
 
     fn editor_text_width(&self) -> usize {
-        self.width
-            .saturating_sub(self.prompt_visible_width)
-            .max(1)
+        self.width.saturating_sub(self.prompt_visible_width).max(1)
     }
 
     fn backspace(&mut self) {
@@ -916,7 +897,9 @@ impl LineEditor {
             EscState::Esc => {
                 match b {
                     b'[' => {
-                        self.esc = EscState::Csi { params: String::new() };
+                        self.esc = EscState::Csi {
+                            params: String::new(),
+                        };
                         return;
                     }
                     b'O' => {
@@ -1100,12 +1083,7 @@ impl LineEditor {
         out.extend_from_slice(&self.redraw());
     }
 
-    fn handle_ss3_final(
-        &mut self,
-        final_byte: u8,
-        out: &mut Vec<u8>,
-        events: &mut Vec<LineEvent>,
-    ) {
+    fn handle_ss3_final(&mut self, final_byte: u8, out: &mut Vec<u8>, events: &mut Vec<LineEvent>) {
         match final_byte {
             b'A' => {
                 if !self.move_vertical(true) {
@@ -1181,10 +1159,7 @@ fn visual_editor_rows(chars: &[char], width: usize) -> Vec<VisualEditorRow> {
 
         let ch_width = UnicodeWidthChar::width(*ch).unwrap_or(0);
         if idx > start && col + ch_width > width {
-            rows.push(VisualEditorRow {
-                start,
-                end: idx,
-            });
+            rows.push(VisualEditorRow { start, end: idx });
             start = idx;
             col = 0;
         }
@@ -1523,7 +1498,11 @@ mod tests {
         assert!(s.contains("\x1b[90m"), "missing popup color SGR: {:?}", s);
         assert!(s.contains("/model"), "missing /model entry: {:?}", s);
         // Cursor is repositioned with an absolute-column escape.
-        assert!(s.contains("\x1b[") && s.contains("G"), "missing column move: {:?}", s);
+        assert!(
+            s.contains("\x1b[") && s.contains("G"),
+            "missing column move: {:?}",
+            s
+        );
     }
 
     #[test]
@@ -1616,7 +1595,11 @@ pub async fn run(
     ctx: AdapterContext,
     spec: ResolvedModel,
 ) -> Result<()> {
-    let AdapterContext { session_id, emit, mut inbox } = ctx;
+    let AdapterContext {
+        session_id,
+        emit,
+        mut inbox,
+    } = ctx;
     let mut provider_name = spec.provider_name();
     let mut model = spec.model.clone();
     let mut provider = spec.provider;
@@ -1734,15 +1717,13 @@ pub async fn run(
     // sessions get `None` here and skip the obs branch in the inner
     // select. Rate-limited so a burst of events can't fire a turn
     // per event.
-    let is_orchestrator =
-        std::env::var("AGENTD_SESSION_KIND").as_deref() == Ok("orchestrator");
+    let is_orchestrator = std::env::var("AGENTD_SESSION_KIND").as_deref() == Ok("orchestrator");
     let mut obs_rx = if is_orchestrator {
         Some(crate::observe::spawn(self_id_for_obs))
     } else {
         None
     };
-    let mut obs_limiter =
-        crate::observe::RateLimiter::new(5, std::time::Duration::from_secs(60));
+    let mut obs_limiter = crate::observe::RateLimiter::new(5, std::time::Duration::from_secs(60));
 
     'outer: loop {
         // Wait for a user message — drain order: startup prompt
@@ -1891,9 +1872,10 @@ pub async fn run(
         // interval when the user didn't supply one), then calls
         // the agentd_loop_create tool synthetically — same path
         // the LLM would take, just from the adapter side.
-        if let Some(rest) = trimmed.strip_prefix("/loop ").or_else(|| {
-            (trimmed == "/loop").then_some("")
-        }) {
+        if let Some(rest) = trimmed
+            .strip_prefix("/loop ")
+            .or_else(|| (trimmed == "/loop").then_some(""))
+        {
             handle_slash_loop(
                 rest,
                 &session_id_for_slash,
@@ -1919,6 +1901,55 @@ pub async fn run(
             emit.emit(SessionEvent::Reset);
             term.banner(provider_name, &model, automode);
             term.note("(session reset)");
+            emit_editor_state(&emit, &editor, &queue);
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("/compact").map(|s| s.trim()) {
+            // Parse optional N — how many recent turn pairs to keep
+            // verbatim. Default = compact::DEFAULT_KEEP_PAIRS.
+            let keep_pairs = if rest.is_empty() {
+                crate::compact::DEFAULT_KEEP_PAIRS
+            } else {
+                match rest.parse::<usize>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => {
+                        term.note("(usage: /compact [N]  — N is recent turn pairs to keep)");
+                        emit_editor_state(&emit, &editor, &queue);
+                        continue;
+                    }
+                }
+            };
+            term.note(&format!(
+                "(compacting — keeping last {keep_pairs} turn pairs…)"
+            ));
+            match crate::compact::compact(&mut messages, keep_pairs, provider.as_ref(), &model)
+                .await
+            {
+                Ok(Some(outcome)) => {
+                    if let Some(p) = persist.as_mut() {
+                        if let Err(e) = p.rewrite(&messages) {
+                            tracing::warn!(error = ?e, "compact: persist rewrite failed");
+                        }
+                    }
+                    emit.emit(SessionEvent::ContextCompacted {
+                        kept_turns: outcome.kept_turn_pairs,
+                        dropped_turns: outcome.dropped_turn_pairs,
+                        tokens_before: outcome.tokens_before,
+                        tokens_after: outcome.tokens_after,
+                        summary_preview: outcome.summary_preview.clone(),
+                    });
+                    term.note(&format!(
+                        "(compacted {} turns; ~{}→{} tokens)",
+                        outcome.dropped_turn_pairs, outcome.tokens_before, outcome.tokens_after,
+                    ));
+                }
+                Ok(None) => {
+                    term.note("(nothing to compact — not enough history)");
+                }
+                Err(e) => {
+                    term.note(&format!("(compact failed: {e})"));
+                }
+            }
             emit_editor_state(&emit, &editor, &queue);
             continue;
         }
@@ -1964,10 +1995,16 @@ pub async fn run(
             continue;
         }
 
-        push_msg!(messages, persist, Message {
-            role: Role::User,
-            content: Content::Text { text: user_text.clone() },
-        });
+        push_msg!(
+            messages,
+            persist,
+            Message {
+                role: Role::User,
+                content: Content::Text {
+                    text: user_text.clone()
+                },
+            }
+        );
         emit.emit(SessionEvent::Message {
             role: agentd_protocol::MessageRole::User,
             text: user_text,
@@ -1993,18 +2030,56 @@ pub async fn run(
             let hardcoded_cap = context::context_window_tokens(provider_name, &model);
             let learned = limits.get(provider_name, &model);
             let est = context::estimate_tokens(&messages) as u64;
-            let is_probe = learned.is_some()
-                && limits.should_probe(provider_name, &model, est, now_ms);
+            let is_probe =
+                learned.is_some() && limits.should_probe(provider_name, &model, est, now_ms);
             let effective_cap = match learned {
                 Some(lim) => lim,
                 None => hardcoded_cap as u64,
             };
             let budget = if is_probe {
-                ((effective_cap as f64)
-                    * crate::model_limits::PROBE_OVERFLOW_RATIO) as usize
+                ((effective_cap as f64) * crate::model_limits::PROBE_OVERFLOW_RATIO) as usize
             } else {
                 ((effective_cap as f64) * context::UTILIZATION) as usize
             };
+            // Auto-compact pass before the destructive rolling prune.
+            // We try this first so historical context survives as a
+            // summary instead of vanishing. On any failure (provider
+            // error, no cut point), we fall straight through to the
+            // existing prune-by-removal path — never block a turn on
+            // compaction.
+            if crate::compact::auto_compact_enabled() {
+                match crate::compact::maybe_auto_compact(
+                    &mut messages,
+                    effective_cap,
+                    provider.as_ref(),
+                    &model,
+                )
+                .await
+                {
+                    Ok(Some(outcome)) => {
+                        if let Some(p) = persist.as_mut() {
+                            if let Err(e) = p.rewrite(&messages) {
+                                tracing::warn!(error = ?e, "auto-compact: persist rewrite failed");
+                            }
+                        }
+                        emit.emit(SessionEvent::ContextCompacted {
+                            kept_turns: outcome.kept_turn_pairs,
+                            dropped_turns: outcome.dropped_turn_pairs,
+                            tokens_before: outcome.tokens_before,
+                            tokens_after: outcome.tokens_after,
+                            summary_preview: outcome.summary_preview.clone(),
+                        });
+                        term.note(&format!(
+                            "(auto-compacted {} turns; ~{}→{} tokens)",
+                            outcome.dropped_turn_pairs, outcome.tokens_before, outcome.tokens_after,
+                        ));
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "auto-compact failed; falling back to prune");
+                    }
+                }
+            }
             let _pruned = context::prune_to_budget(&mut messages, budget);
             let mut sink = PtySink::new(&emit, pty_width, turn_started_at_ms);
             // Wrap the provider call so user typing during the
@@ -2022,13 +2097,7 @@ pub async fn run(
                 tasks.clone(),
                 async {
                     provider
-                        .complete(
-                            &model,
-                            &system_prompt,
-                            &messages,
-                            &specs,
-                            &mut sink,
-                        )
+                        .complete(&model, &system_prompt, &messages, &specs, &mut sink)
                         .await
                 },
             )
@@ -2045,9 +2114,7 @@ pub async fn run(
                     // typed sentinel out of the wrapped `anyhow`;
                     // `parse_overflow` in `provider/mod.rs` is what
                     // makes providers emit it.
-                    if let Some(ov) =
-                        e.downcast_ref::<crate::provider::ContextOverflow>()
-                    {
+                    if let Some(ov) = e.downcast_ref::<crate::provider::ContextOverflow>() {
                         let new_limit = limits.record_overflow(
                             provider_name,
                             &model,
@@ -2055,10 +2122,8 @@ pub async fn run(
                             effective_cap,
                             now_ms,
                         );
-                        let retry_budget =
-                            ((new_limit as f64) * context::UTILIZATION) as usize;
-                        let _pruned =
-                            context::prune_to_budget(&mut messages, retry_budget);
+                        let retry_budget = ((new_limit as f64) * context::UTILIZATION) as usize;
+                        let _pruned = context::prune_to_budget(&mut messages, retry_budget);
                         term.note(&format!(
                             "(context overflow — relearned cap as {} tokens, retrying)",
                             new_limit
@@ -2080,13 +2145,7 @@ pub async fn run(
                             tasks.clone(),
                             async {
                                 provider
-                                    .complete(
-                                        &model,
-                                        &system_prompt,
-                                        &messages,
-                                        &specs,
-                                        &mut sink2,
-                                    )
+                                    .complete(&model, &system_prompt, &messages, &specs, &mut sink2)
                                     .await
                             },
                         )
@@ -2099,23 +2158,15 @@ pub async fn run(
                             DriveExit::Done(Err(e2)) => {
                                 sink2.finalize();
                                 final_status = "Errored";
-                                term.note(&format!(
-                                    "(still over budget after retry: {e2})"
-                                ));
+                                term.note(&format!("(still over budget after retry: {e2})"));
                                 emit.emit(SessionEvent::Error {
-                                    message: format!(
-                                        "still over budget after retry: {e2}"
-                                    ),
+                                    message: format!("still over budget after retry: {e2}"),
                                 });
                                 break;
                             }
                             DriveExit::Stop | DriveExit::Channel => {
                                 sink2.finalize();
-                                finish_agent_status(
-                                    &emit,
-                                    turn_started_at_ms,
-                                    "Stopped",
-                                );
+                                finish_agent_status(&emit, turn_started_at_ms, "Stopped");
                                 break 'outer;
                             }
                             DriveExit::Interrupt => {
@@ -2164,27 +2215,38 @@ pub async fn run(
 
             if turn.tool_calls.is_empty() {
                 if let Some(text) = turn.text {
-                    push_msg!(messages, persist, Message {
-                        role: Role::Assistant,
-                        content: Content::Text { text },
-                    });
+                    push_msg!(
+                        messages,
+                        persist,
+                        Message {
+                            role: Role::Assistant,
+                            content: Content::Text { text },
+                        }
+                    );
                 }
                 break;
             }
 
-            push_msg!(messages, persist, Message {
-                role: Role::Assistant,
-                content: Content::AssistantToolCalls {
-                    text: turn.text.clone(),
-                    calls: turn.tool_calls.clone(),
-                },
-            });
+            push_msg!(
+                messages,
+                persist,
+                Message {
+                    role: Role::Assistant,
+                    content: Content::AssistantToolCalls {
+                        text: turn.text.clone(),
+                        calls: turn.tool_calls.clone(),
+                    },
+                }
+            );
             // Partition by risk: Safe in parallel, Risky serial through
             // the approval gate. See agent::run for the matching logic.
             let mut safe_idx: Vec<usize> = Vec::new();
             let mut risky_idx: Vec<usize> = Vec::new();
             for (i, c) in turn.tool_calls.iter().enumerate() {
-                let r = registry.get(&c.name).map(|t| t.risk()).unwrap_or(ToolRisk::Risky);
+                let r = registry
+                    .get(&c.name)
+                    .map(|t| t.risk())
+                    .unwrap_or(ToolRisk::Risky);
                 if matches!(r, ToolRisk::Safe) {
                     safe_idx.push(i);
                 } else {
@@ -2192,8 +2254,10 @@ pub async fn run(
                 }
             }
 
-            let mut outcomes: std::collections::BTreeMap<usize, std::result::Result<ToolOutcome, String>> =
-                std::collections::BTreeMap::new();
+            let mut outcomes: std::collections::BTreeMap<
+                usize,
+                std::result::Result<ToolOutcome, String>,
+            > = std::collections::BTreeMap::new();
             let mut early_stop = false;
 
             if !safe_idx.is_empty() {
@@ -2208,8 +2272,7 @@ pub async fn run(
                             .get(&call.name)
                             .map(|t| t.args_summary(&call.input))
                             .unwrap_or_else(|| {
-                                serde_json::to_string(&call.input)
-                                    .unwrap_or_default()
+                                serde_json::to_string(&call.input).unwrap_or_default()
                             });
                         (i, call, summary)
                     })
@@ -2260,10 +2323,8 @@ pub async fn run(
                 drop(safe_tx);
 
                 let render_fut = async {
-                    let mut outcomes_map: HashMap<
-                        usize,
-                        std::result::Result<ToolOutcome, String>,
-                    > = HashMap::new();
+                    let mut outcomes_map: HashMap<usize, std::result::Result<ToolOutcome, String>> =
+                        HashMap::new();
                     while outcomes_map.len() < safe_meta.len() {
                         let (i, outcome) = match safe_rx.recv().await {
                             Some(item) => item,
@@ -2356,24 +2417,32 @@ pub async fn run(
                 match outcome {
                     Ok(o) => {
                         let truncated = truncate_for_model(&o.output, TOOL_OUTPUT_BUDGET);
-                        push_msg!(messages, persist, Message {
-                            role: Role::Tool,
-                            content: Content::ToolResult {
-                                call_id: call.id.clone(),
-                                output: truncated,
-                                is_error: !o.ok,
-                            },
-                        });
+                        push_msg!(
+                            messages,
+                            persist,
+                            Message {
+                                role: Role::Tool,
+                                content: Content::ToolResult {
+                                    call_id: call.id.clone(),
+                                    output: truncated,
+                                    is_error: !o.ok,
+                                },
+                            }
+                        );
                     }
                     Err(reason) => {
-                        push_msg!(messages, persist, Message {
-                            role: Role::Tool,
-                            content: Content::ToolResult {
-                                call_id: call.id.clone(),
-                                output: format!("(turn aborted: {reason})"),
-                                is_error: true,
-                            },
-                        });
+                        push_msg!(
+                            messages,
+                            persist,
+                            Message {
+                                role: Role::Tool,
+                                content: Content::ToolResult {
+                                    call_id: call.id.clone(),
+                                    output: format!("(turn aborted: {reason})"),
+                                    is_error: true,
+                                },
+                            }
+                        );
                     }
                 }
             }
@@ -2416,9 +2485,7 @@ async fn read_one_line(
     automode: &mut bool,
     pty_width: &mut usize,
     mut obs_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<crate::observe::Observation>>,
-    bg_completion_rx: &mut tokio::sync::mpsc::UnboundedReceiver<
-        crate::tasks::BackgroundCompletion,
-    >,
+    bg_completion_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tasks::BackgroundCompletion>,
     tasks: &std::sync::Arc<crate::tasks::Tasks>,
 ) -> ReadOutcome {
     loop {
@@ -2579,7 +2646,10 @@ async fn run_one_tool(
                     ok: false,
                     output: msg.clone(),
                 });
-                return Ok(ToolOutcome { ok: false, output: msg });
+                return Ok(ToolOutcome {
+                    ok: false,
+                    output: msg,
+                });
             }
             ApprovalOutcome::Approve => term.print("y\r\n"),
             ApprovalOutcome::Automode => {
@@ -2683,9 +2753,10 @@ async fn wait_for_approval(
                     return ApprovalOutcome::Automode;
                 }
             }
-            Some(AdapterInboxMsg::ToolDecision { call_id: cid, decision })
-                if cid == call_id =>
-            {
+            Some(AdapterInboxMsg::ToolDecision {
+                call_id: cid,
+                decision,
+            }) if cid == call_id => {
                 return match decision.as_str() {
                     "approve" => ApprovalOutcome::Approve,
                     "automode" => {
@@ -2743,7 +2814,10 @@ async fn run_safe_call_silent(
                 ok: false,
                 output: msg.clone(),
             });
-            return Ok(ToolOutcome { ok: false, output: msg });
+            return Ok(ToolOutcome {
+                ok: false,
+                output: msg,
+            });
         }
     };
     emit.emit(SessionEvent::ToolUse {
@@ -2793,7 +2867,6 @@ async fn run_safe_call_silent(
     }
     outcome
 }
-
 
 /// Run a tool through the per-session supervisor. The supervisor
 /// spawns the actual `tool.run` on its own task, races the join
@@ -2898,10 +2971,7 @@ fn outcome_from_supervisor(
 }
 
 fn join_supervisor_outcome(
-    outcome: std::result::Result<
-        crate::tasks::SupervisorOutcome,
-        tokio::task::JoinError,
-    >,
+    outcome: std::result::Result<crate::tasks::SupervisorOutcome, tokio::task::JoinError>,
 ) -> crate::tasks::SupervisorOutcome {
     match outcome {
         Ok(outcome) => outcome,
@@ -3021,7 +3091,6 @@ where
         }
     }
 }
-
 
 /// Parse a `^/word( args)?$` line into `(name, args)`. Returns `None`
 /// for anything that doesn't look like a client slash command — empty
@@ -3183,8 +3252,16 @@ async fn handle_slash_loop(
         loop_obj.id.chars().take(10).collect::<String>(),
         clamped,
         prompt.chars().take(60).collect::<String>(),
-        if suggested { " — interval suggested" } else { "" },
-        if was_clamped { " — clamped to bounds" } else { "" },
+        if suggested {
+            " — interval suggested"
+        } else {
+            ""
+        },
+        if was_clamped {
+            " — clamped to bounds"
+        } else {
+            ""
+        },
     );
     term.note(&note);
 }
@@ -3217,10 +3294,18 @@ fn parse_slash_command(line: &str) -> Option<(String, Option<String>)> {
         Some(i) => (&rest[..i], rest[i..].trim()),
         None => (rest, ""),
     };
-    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
         return None;
     }
-    let args = if args.is_empty() { None } else { Some(args.to_string()) };
+    let args = if args.is_empty() {
+        None
+    } else {
+        Some(args.to_string())
+    };
     Some((name.to_lowercase(), args))
 }
 
@@ -3232,11 +3317,7 @@ fn parse_slash_command(line: &str) -> Option<(String, Option<String>)> {
 /// newlines so that the LLM receives one well-structured user message
 /// with the original line breaks intact, and up-arrow can pull the
 /// whole batch back into the editor as a single multi-line prompt.
-fn enqueue_line(
-    queue: &mut VecDeque<String>,
-    editor: &mut LineEditor,
-    line: String,
-) {
+fn enqueue_line(queue: &mut VecDeque<String>, editor: &mut LineEditor, line: String) {
     if line.trim().is_empty() {
         return;
     }

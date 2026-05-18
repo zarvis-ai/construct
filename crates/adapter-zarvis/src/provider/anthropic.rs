@@ -22,8 +22,8 @@ pub struct Anthropic {
 
 impl Anthropic {
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
-            .map_err(|_| anyhow!("ANTHROPIC_API_KEY not set"))?;
+        let api_key =
+            std::env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow!("ANTHROPIC_API_KEY not set"))?;
         let base_url = std::env::var("ANTHROPIC_BASE_URL")
             .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string())
             .trim_end_matches('/')
@@ -71,7 +71,14 @@ fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
                 }
                 out.push(json!({ "role": "assistant", "content": blocks }));
             }
-            (_, Content::ToolResult { call_id, output, is_error }) => {
+            (
+                _,
+                Content::ToolResult {
+                    call_id,
+                    output,
+                    is_error,
+                },
+            ) => {
                 let block = json!({
                     "type": "tool_result",
                     "tool_use_id": call_id,
@@ -79,6 +86,10 @@ fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
                     "is_error": *is_error,
                 });
                 out.push(json!({ "role": "user", "content": [block] }));
+            }
+            (_, Content::Summary { text, .. }) => {
+                let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
+                out.push(json!({ "role": "user", "content": body }));
             }
         }
     }
@@ -175,10 +186,8 @@ impl LlmProvider for Anthropic {
             match ty {
                 "message_start" => {
                     if let Some(u) = v.pointer("/message/usage") {
-                        usage.input_tokens = u
-                            .get("input_tokens")
-                            .and_then(|n| n.as_u64())
-                            .unwrap_or(0);
+                        usage.input_tokens =
+                            u.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
                     }
                 }
                 "content_block_start" => {
@@ -190,8 +199,11 @@ impl LlmProvider for Anthropic {
                     let bty = block.get("type").and_then(|s| s.as_str()).unwrap_or("");
                     if bty == "tool_use" {
                         blocks[idx].kind = BlockKind::ToolUse;
-                        blocks[idx].id =
-                            block.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        blocks[idx].id = block
+                            .get("id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
                         blocks[idx].name = block
                             .get("name")
                             .and_then(|s| s.as_str())

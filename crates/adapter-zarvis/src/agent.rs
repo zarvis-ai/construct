@@ -161,7 +161,11 @@ pub async fn run(
     ctx: AdapterContext,
     spec: ResolvedModel,
 ) -> Result<()> {
-    let AdapterContext { session_id, emit, mut inbox } = ctx;
+    let AdapterContext {
+        session_id,
+        emit,
+        mut inbox,
+    } = ctx;
     let cwd = PathBuf::from(&params.cwd);
     let registry = Arc::new(ToolRegistry::with_defaults());
     let specs = registry.specs();
@@ -249,10 +253,14 @@ pub async fn run(
         if user_text.trim().is_empty() {
             continue;
         }
-        push_msg!(messages, persist, Message {
-            role: Role::User,
-            content: Content::Text { text: user_text },
-        });
+        push_msg!(
+            messages,
+            persist,
+            Message {
+                role: Role::User,
+                content: Content::Text { text: user_text },
+            }
+        );
 
         emit.emit(SessionEvent::Status {
             state: SessionState::Running,
@@ -275,18 +283,50 @@ pub async fn run(
             let hardcoded_cap = context::context_window_tokens(provider_name, &model);
             let learned = limits.get(provider_name, &model);
             let est = context::estimate_tokens(&messages) as u64;
-            let is_probe = learned.is_some()
-                && limits.should_probe(provider_name, &model, est, now_ms);
+            let is_probe =
+                learned.is_some() && limits.should_probe(provider_name, &model, est, now_ms);
             let effective_cap = match learned {
                 Some(lim) => lim,
                 None => hardcoded_cap as u64,
             };
             let budget = if is_probe {
-                ((effective_cap as f64)
-                    * crate::model_limits::PROBE_OVERFLOW_RATIO) as usize
+                ((effective_cap as f64) * crate::model_limits::PROBE_OVERFLOW_RATIO) as usize
             } else {
                 ((effective_cap as f64) * context::UTILIZATION) as usize
             };
+            // Auto-compact pass before the destructive prune. Headless
+            // sessions don't get a `/compact` UI, so this is the only
+            // way summaries get generated outside of an interactive
+            // session. Failures fall through to plain prune.
+            if crate::compact::auto_compact_enabled() {
+                match crate::compact::maybe_auto_compact(
+                    &mut messages,
+                    effective_cap,
+                    provider.as_ref(),
+                    &model,
+                )
+                .await
+                {
+                    Ok(Some(outcome)) => {
+                        if let Some(p) = persist.as_mut() {
+                            if let Err(e) = p.rewrite(&messages) {
+                                tracing::warn!(error = ?e, "auto-compact: persist rewrite failed");
+                            }
+                        }
+                        emit.emit(SessionEvent::ContextCompacted {
+                            kept_turns: outcome.kept_turn_pairs,
+                            dropped_turns: outcome.dropped_turn_pairs,
+                            tokens_before: outcome.tokens_before,
+                            tokens_after: outcome.tokens_after,
+                            summary_preview: outcome.summary_preview,
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "auto-compact failed; falling back to prune");
+                    }
+                }
+            }
             let _pruned = context::prune_to_budget(&mut messages, budget);
 
             let mut sink = MessageSink { emit: &emit };
@@ -301,9 +341,7 @@ pub async fn run(
                     // sentinel in `anyhow::Error`; we downcast to
                     // pull out the extracted limit number (when
                     // the API reported one).
-                    if let Some(ov) =
-                        e.downcast_ref::<crate::provider::ContextOverflow>()
-                    {
+                    if let Some(ov) = e.downcast_ref::<crate::provider::ContextOverflow>() {
                         let new_limit = limits.record_overflow(
                             provider_name,
                             &model,
@@ -311,10 +349,8 @@ pub async fn run(
                             effective_cap,
                             now_ms,
                         );
-                        let retry_budget =
-                            ((new_limit as f64) * context::UTILIZATION) as usize;
-                        let _pruned =
-                            context::prune_to_budget(&mut messages, retry_budget);
+                        let retry_budget = ((new_limit as f64) * context::UTILIZATION) as usize;
+                        let _pruned = context::prune_to_budget(&mut messages, retry_budget);
                         emit.emit(SessionEvent::Status {
                             state: SessionState::Running,
                             detail: Some(format!(
@@ -324,27 +360,21 @@ pub async fn run(
                         });
                         let mut sink = MessageSink { emit: &emit };
                         match provider
-                            .complete(
-                                &model,
-                                &system_prompt,
-                                &messages,
-                                &specs,
-                                &mut sink,
-                            )
+                            .complete(&model, &system_prompt, &messages, &specs, &mut sink)
                             .await
                         {
                             Ok(t) => t,
                             Err(e2) => {
                                 emit.emit(SessionEvent::Error {
-                                    message: format!(
-                                        "still over budget after retry: {e2}"
-                                    ),
+                                    message: format!("still over budget after retry: {e2}"),
                                 });
                                 break;
                             }
                         }
                     } else {
-                        emit.emit(SessionEvent::Error { message: format!("{e}") });
+                        emit.emit(SessionEvent::Error {
+                            message: format!("{e}"),
+                        });
                         break;
                     }
                 }
@@ -370,23 +400,31 @@ pub async fn run(
 
             if turn.tool_calls.is_empty() {
                 if let Some(text) = turn.text {
-                    push_msg!(messages, persist, Message {
-                        role: Role::Assistant,
-                        content: Content::Text { text },
-                    });
+                    push_msg!(
+                        messages,
+                        persist,
+                        Message {
+                            role: Role::Assistant,
+                            content: Content::Text { text },
+                        }
+                    );
                 }
                 break;
             }
 
             // Stash the assistant turn that issued the tool calls so
             // the next provider call has the matching `tool_call_id`s.
-            push_msg!(messages, persist, Message {
-                role: Role::Assistant,
-                content: Content::AssistantToolCalls {
-                    text: turn.text.clone(),
-                    calls: turn.tool_calls.clone(),
-                },
-            });
+            push_msg!(
+                messages,
+                persist,
+                Message {
+                    role: Role::Assistant,
+                    content: Content::AssistantToolCalls {
+                        text: turn.text.clone(),
+                        calls: turn.tool_calls.clone(),
+                    },
+                }
+            );
 
             // Partition into Safe (fan out in parallel) and Risky
             // (serialize through the approval gate). Results are merged
@@ -396,7 +434,10 @@ pub async fn run(
             let mut safe_idx: Vec<usize> = Vec::new();
             let mut risky_idx: Vec<usize> = Vec::new();
             for (i, c) in turn.tool_calls.iter().enumerate() {
-                let r = registry.get(&c.name).map(|t| t.risk()).unwrap_or(ToolRisk::Risky);
+                let r = registry
+                    .get(&c.name)
+                    .map(|t| t.risk())
+                    .unwrap_or(ToolRisk::Risky);
                 if matches!(r, ToolRisk::Safe) {
                     safe_idx.push(i);
                 } else {
@@ -404,8 +445,10 @@ pub async fn run(
                 }
             }
 
-            let mut outcomes: std::collections::BTreeMap<usize, std::result::Result<ToolOutcome, String>> =
-                std::collections::BTreeMap::new();
+            let mut outcomes: std::collections::BTreeMap<
+                usize,
+                std::result::Result<ToolOutcome, String>,
+            > = std::collections::BTreeMap::new();
             let mut early_stop = false;
 
             if !safe_idx.is_empty() {
@@ -423,23 +466,22 @@ pub async fn run(
                     })
                     .collect();
                 let join_fut = futures::future::join_all(tasks);
-                let results: Vec<(usize, std::result::Result<ToolOutcome, String>)> =
-                    tokio::select! {
-                        biased;
-                        kind = wait_for_interrupt_or_stop(&mut inbox) => {
-                            // Drop the batch (cancels all in-flight Safe tasks)
-                            // and synthesize a uniform "interrupted" outcome.
-                            let reason = match kind {
-                                InterruptKind::Stop => {
-                                    early_stop = true;
-                                    "stop"
-                                }
-                                _ => "interrupt",
-                            };
-                            safe_idx.iter().map(|&i| (i, Err(reason.to_string()))).collect()
-                        }
-                        r = join_fut => r,
-                    };
+                let results: Vec<(usize, std::result::Result<ToolOutcome, String>)> = tokio::select! {
+                    biased;
+                    kind = wait_for_interrupt_or_stop(&mut inbox) => {
+                        // Drop the batch (cancels all in-flight Safe tasks)
+                        // and synthesize a uniform "interrupted" outcome.
+                        let reason = match kind {
+                            InterruptKind::Stop => {
+                                early_stop = true;
+                                "stop"
+                            }
+                            _ => "interrupt",
+                        };
+                        safe_idx.iter().map(|&i| (i, Err(reason.to_string()))).collect()
+                    }
+                    r = join_fut => r,
+                };
                 for (i, outcome) in results {
                     outcomes.insert(i, outcome);
                 }
@@ -448,15 +490,9 @@ pub async fn run(
             if !early_stop {
                 for &i in &risky_idx {
                     let call = &turn.tool_calls[i];
-                    let outcome = run_one_tool(
-                        call,
-                        &registry,
-                        &tool_ctx,
-                        &emit,
-                        &mut inbox,
-                        &mut automode,
-                    )
-                    .await;
+                    let outcome =
+                        run_one_tool(call, &registry, &tool_ctx, &emit, &mut inbox, &mut automode)
+                            .await;
                     let stop_now = matches!(outcome.as_ref(), Err(r) if r == "stop");
                     outcomes.insert(i, outcome);
                     if stop_now {
@@ -481,24 +517,32 @@ pub async fn run(
                 match outcome {
                     Ok(o) => {
                         let truncated = truncate_for_model(&o.output, TOOL_OUTPUT_BUDGET);
-                        push_msg!(messages, persist, Message {
-                            role: Role::Tool,
-                            content: Content::ToolResult {
-                                call_id: call.id.clone(),
-                                output: truncated,
-                                is_error: !o.ok,
-                            },
-                        });
+                        push_msg!(
+                            messages,
+                            persist,
+                            Message {
+                                role: Role::Tool,
+                                content: Content::ToolResult {
+                                    call_id: call.id.clone(),
+                                    output: truncated,
+                                    is_error: !o.ok,
+                                },
+                            }
+                        );
                     }
                     Err(reason) => {
-                        push_msg!(messages, persist, Message {
-                            role: Role::Tool,
-                            content: Content::ToolResult {
-                                call_id: call.id.clone(),
-                                output: format!("(turn aborted: {reason})"),
-                                is_error: true,
-                            },
-                        });
+                        push_msg!(
+                            messages,
+                            persist,
+                            Message {
+                                role: Role::Tool,
+                                content: Content::ToolResult {
+                                    call_id: call.id.clone(),
+                                    output: format!("(turn aborted: {reason})"),
+                                    is_error: true,
+                                },
+                            }
+                        );
                     }
                 }
             }
@@ -570,9 +614,7 @@ async fn run_one_tool(
                         break;
                     }
                 }
-                Some(AdapterInboxMsg::ToolDecision { call_id, decision })
-                    if call_id == call.id =>
-                {
+                Some(AdapterInboxMsg::ToolDecision { call_id, decision }) if call_id == call.id => {
                     match decision.as_str() {
                         "approve" => break,
                         "automode" => {
@@ -588,7 +630,10 @@ async fn run_one_tool(
                                 ok: false,
                                 output: msg.clone(),
                             });
-                            return Ok(ToolOutcome { ok: false, output: msg });
+                            return Ok(ToolOutcome {
+                                ok: false,
+                                output: msg,
+                            });
                         }
                     }
                 }
