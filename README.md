@@ -345,6 +345,16 @@ for its harness:
   — `--last` resolves globally across every codex session on the
   machine, so using it as a fallback conflates multiple agentd codex
   sessions into the same upstream conversation.
+
+  Known limitation: using codex's own `/resume` slash command
+  inside an agentd-managed codex session won't survive a daemon
+  restart. Codex appends the resumed conversation to the original
+  rollout file and leaves its `originator` unchanged, so our
+  originator-tagged watcher can't detect the switch and we keep
+  pointing at the *first* UUID we captured. On daemon restart you'll
+  reattach to the original conversation, not the one you `/resume`d
+  to. Create a separate agentd session instead if you want to work
+  on a different codex conversation.
 - **zarvis** — appends each `Message` to
   `<session-dir>/zarvis.jsonl` as the agent loop runs. On respawn
   the loop reads the file back into memory before waiting for new
