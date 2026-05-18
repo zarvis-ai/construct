@@ -328,11 +328,33 @@ for its harness:
   passes it as `--session-id <uuid>` to claude, and persists it under
   `<session-dir>/claude_session_id.txt`. On respawn we pass
   `--resume <uuid>` so the claude conversation continues.
-- **codex (interactive)** — invokes `codex resume <id>` if we have a
-  captured id (`<session-dir>/codex_session_id.txt`) or
-  `AGENTD_CODEX_RESUME_ID` is set; otherwise falls back to
-  `codex resume --last` (picks the most-recent recorded codex
-  session; correct when you only have one running).
+- **codex (interactive)** — codex doesn't let the client assign a
+  session id, so we tag the spawn with a unique `originator` via
+  codex's internal env override
+  (`CODEX_INTERNAL_ORIGINATOR_OVERRIDE=agentd:<session-id>`) and watch
+  the codex sessions dir (`$CODEX_HOME/sessions` or
+  `~/.codex/sessions`) for the rollout that bears that tag. When we
+  find it, we read codex's UUID from `payload.id` and write it to
+  `<session-dir>/codex_session_id.txt`. On respawn we run
+  `codex resume <uuid>` to reattach. `AGENTD_CODEX_RESUME_ID`
+  overrides the captured id. The watcher polls for the session's full
+  lifetime — codex flushes its rollout lazily (sometimes only after
+  the first turn completes), so a short timeout would just miss it.
+  If no id has been captured yet when the daemon restarts, the
+  respawn starts a *fresh* codex rather than `codex resume --last`
+  — `--last` resolves globally across every codex session on the
+  machine, so using it as a fallback conflates multiple agentd codex
+  sessions into the same upstream conversation.
+
+  Known limitation: using codex's own `/resume` slash command
+  inside an agentd-managed codex session won't survive a daemon
+  restart. Codex appends the resumed conversation to the original
+  rollout file and leaves its `originator` unchanged, so our
+  originator-tagged watcher can't detect the switch and we keep
+  pointing at the *first* UUID we captured. On daemon restart you'll
+  reattach to the original conversation, not the one you `/resume`d
+  to. Create a separate agentd session instead if you want to work
+  on a different codex conversation.
 - **zarvis** — appends each `Message` to
   `<session-dir>/zarvis.jsonl` as the agent loop runs. On respawn
   the loop reads the file back into memory before waiting for new
