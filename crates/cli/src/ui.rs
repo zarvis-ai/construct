@@ -2339,7 +2339,7 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
-                    palette commands: new send delete rename diff borders
+                    palette commands: new send delete rename diff border
                                       zoom interrupt refresh harnesses help
     ?               toggle this help
     C-x C-c / q     quit

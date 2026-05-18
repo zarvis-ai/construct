@@ -3252,7 +3252,7 @@ impl App {
                     if self.matrix_rain_hidden { "hidden" } else { "shown" }
                 ));
             }
-            "borders" | "border" | "pane-borders" => {
+            "border" => {
                 self.hide_pane_side_borders = !self.hide_pane_side_borders;
                 self.set_status(format!(
                     "pane side borders {}",

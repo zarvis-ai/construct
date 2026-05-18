@@ -291,6 +291,7 @@ const DIM_LINE_PREFIXES: &[&str] = &["Summary:"];
 /// `agentd_loop_create` call. Keep this in lockstep with the
 /// after-submit match block + the TUI's `run_slash_command`.
 const SLASH_COMMANDS: &[&str] = &[
+    "/border",
     "/help",
     "/loop",
     "/model",
@@ -1534,6 +1535,11 @@ mod tests {
         assert!(all.contains(&"/quit"));
         assert!(all.contains(&"/exit"));
         assert!(all.contains(&"/reset"));
+        assert!(all.contains(&"/border"));
+        ed.feed_bytes(b"bor");
+        assert_eq!(ed.slash_matches(), vec!["/border"]);
+        let mut ed = editor();
+        ed.feed_bytes(b"/");
         ed.feed_bytes(b"q");
         assert_eq!(ed.slash_matches(), vec!["/quit"]);
         ed.feed_bytes(b"x");
