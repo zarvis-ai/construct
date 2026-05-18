@@ -795,44 +795,59 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             ev = input_stream.next() => {
                 match ev {
                     Some(Ok(ev)) => {
+                        // Only enter the drag-coalesce drain when the
+                        // event we just handled was itself a left-drag.
+                        // Polling `input_stream.next().now_or_never()`
+                        // poisons crossterm's `EventStream` wake task
+                        // with a noop waker — subsequent real events
+                        // call `.wake()` on the noop and never notify
+                        // the main `select!`, so input sits in the
+                        // buffer until something else (typically the
+                        // 120 ms `tick`) wakes the loop. Gating on
+                        // "was the last event a drag" keeps typing
+                        // off that code path entirely; a sustained
+                        // drag still coalesces because every drag
+                        // event re-enters the drain.
+                        let was_drag = matches!(
+                            &ev,
+                            CtEvent::Mouse(m)
+                                if matches!(
+                                    m.kind,
+                                    MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+                                )
+                        );
                         app.on_term_event(ev).await;
-                        // Coalesce consecutive left-button drag events
-                        // before the next render. Mouse drags (resize
-                        // dividers, text selection) fire one event per
-                        // pixel of cursor movement — many per frame on
-                        // a fast mouse — and each event is a tiny state
-                        // mutation. Without this, every event triggers
-                        // a full TUI re-render, which on a session with
-                        // a large PTY history pegs CPU and makes the
-                        // drag feel laggy. Same shape as the
-                        // notification-drain below: apply all pending
-                        // drag updates, render once.
-                        const MAX_DRAG_DRAIN: usize = 64;
-                        let mut drained = 0;
-                        while drained < MAX_DRAG_DRAIN {
-                            match input_stream.next().now_or_never() {
-                                Some(Some(Ok(CtEvent::Mouse(m))))
-                                    if matches!(
-                                        m.kind,
-                                        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-                                    ) =>
-                                {
-                                    app.on_term_event(CtEvent::Mouse(m)).await;
-                                    drained += 1;
+                        if was_drag {
+                            const MAX_DRAG_DRAIN: usize = 64;
+                            let mut drained = 0;
+                            while drained < MAX_DRAG_DRAIN {
+                                match input_stream.next().now_or_never() {
+                                    Some(Some(Ok(CtEvent::Mouse(m))))
+                                        if matches!(
+                                            m.kind,
+                                            MouseEventKind::Drag(
+                                                crossterm::event::MouseButton::Left
+                                            )
+                                        ) =>
+                                    {
+                                        app.on_term_event(CtEvent::Mouse(m)).await;
+                                        drained += 1;
+                                    }
+                                    Some(Some(Ok(other_ev))) => {
+                                        // Non-drag event surfaced —
+                                        // handle it (so we don't drop
+                                        // input) and stop draining so
+                                        // it can render.
+                                        app.on_term_event(other_ev).await;
+                                        break;
+                                    }
+                                    Some(Some(Err(e))) => {
+                                        app.set_status(format!("input error: {e}"));
+                                        break;
+                                    }
+                                    // Stream ended OR no event ready.
+                                    Some(None) | None => break,
                                 }
-                                Some(Some(Ok(other_ev))) => {
-                                    // Non-drag event surfaced — handle
-                                    // it (so we don't drop input) and
-                                    // stop draining so it can render.
-                                    app.on_term_event(other_ev).await;
-                                    break;
-                                }
-                                Some(Some(Err(e))) => {
-                                    app.set_status(format!("input error: {e}"));
-                                    break;
-                                }
-                                // Stream ended OR no event ready.
-                                Some(None) | None => break,
                             }
                         }
                     }
