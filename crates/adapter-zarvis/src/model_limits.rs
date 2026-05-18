@@ -248,4 +248,53 @@ mod tests {
         s.record_call("openai", "gpt-5", 450_000, true, 400_000, 2_000);
         assert_eq!(s.get("openai", "gpt-5"), Some((450_000.0 * 1.05) as u64));
     }
+
+    /// Round-trip via the same JSON shape the daemon stores on disk.
+    /// Catches accidental serde-rename or required-field churn that
+    /// would silently break learned limits across daemon restarts.
+    #[test]
+    fn serde_round_trip_preserves_learned_limit() {
+        let mut s = ModelLimits::default();
+        s.record_overflow("openai", "gpt-5.5", Some(272_000), 400_000, 1_700_000_000_000);
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: ModelLimits =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.get("openai", "gpt-5.5"), Some(272_000));
+        let e = restored
+            .entries
+            .get("openai:gpt-5.5")
+            .expect("entry present");
+        assert_eq!(e.learned_input_tokens, 272_000);
+        assert_eq!(e.last_probed_at_ms, 1_700_000_000_000);
+        assert_eq!(e.key, "openai:gpt-5.5");
+    }
+
+    /// Forward-compat: extra/unknown fields in the on-disk JSON must
+    /// not break the load. `entries` is the only required field; the
+    /// rest of `ModelEntry` is `#[serde(default)]`.
+    #[test]
+    fn load_tolerates_unknown_fields_and_missing_optionals() {
+        let json = r#"{
+            "entries": {
+                "openai:gpt-5": {
+                    "learned_input_tokens": 350000,
+                    "future_field": "ignored"
+                }
+            },
+            "future_top_level_field": 42
+        }"#;
+        let s: ModelLimits = serde_json::from_str(json).expect("forward-compat");
+        assert_eq!(s.get("openai", "gpt-5"), Some(350_000));
+    }
+
+    /// Corrupt / empty file path: `load()` must NOT panic. Used by
+    /// agent.rs and interactive.rs at session start; failure there
+    /// would block every zarvis session from running.
+    #[test]
+    fn from_garbage_falls_back_to_default() {
+        let s: ModelLimits = serde_json::from_str("not json").unwrap_or_default();
+        assert!(s.entries.is_empty());
+        let s: ModelLimits = serde_json::from_str("").unwrap_or_default();
+        assert!(s.entries.is_empty());
+    }
 }

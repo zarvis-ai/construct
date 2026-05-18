@@ -135,45 +135,83 @@ impl std::error::Error for ContextOverflow {}
 /// an overflow error; the extracted value is `Some(n)` if the body
 /// stated a token limit explicitly, `None` if it was overflow-shaped
 /// but didn't name a number.
+///
+/// Recognition uses two passes:
+///
+///   1. **Phrase-shaped:** known wordings from OpenAI / Anthropic /
+///      Ollama overflow errors. Cheap to add new variants as vendors
+///      change copy.
+///   2. **Structural fallback:** the body says "tokens" *and* contains
+///      a number that looks like a token count (in
+///      `[MIN_TOKEN_COUNT, MAX_TOKEN_COUNT]`). Catches future error
+///      formats that we haven't seen yet without us having to ship a
+///      release every time a vendor edits a string.
+///
+/// The structural pass is gated on "tokens" because we don't want
+/// every HTTP 400 with a big number in it (rate-limit windows, file
+/// sizes, etc.) to trigger the overflow path.
 pub fn parse_overflow(body: &str) -> Option<Option<u64>> {
+    const MIN_TOKEN_COUNT: u64 = 1_000;
+    const MAX_TOKEN_COUNT: u64 = 5_000_000;
     let lower = body.to_ascii_lowercase();
-    let overflow_shaped = lower.contains("maximum context length")
+    // 1) Known phrases. Update this list when a vendor changes their
+    //    error wording — additions are safe (no false positives) since
+    //    any phrase reaching this list is one we've actually observed.
+    let phrase_match = lower.contains("maximum context length")
         || lower.contains("context length")
+        || lower.contains("context window")
         || lower.contains("prompt is too long")
         || lower.contains("input is too long")
-        || lower.contains("context window")
-        || lower.contains("too many tokens");
-    if !overflow_shaped {
+        || lower.contains("too many tokens")
+        // 2026 OpenAI: "Input tokens exceed the configured limit of N
+        // tokens. Your messages resulted in M tokens." (Newer wording
+        // that doesn't mention "context length" — this user's report.)
+        || lower.contains("input tokens exceed")
+        || lower.contains("configured limit");
+    // 2) Structural fallback: "tokens" + a number in plausible range.
+    //    Brittle phrase matching is the historical failure mode; this
+    //    gate trips even when vendors invent new copy.
+    let nums = extract_numbers_in_range(body, MIN_TOKEN_COUNT, MAX_TOKEN_COUNT);
+    let structural_match = lower.contains("tokens") && !nums.is_empty();
+    if !phrase_match && !structural_match {
         return None;
     }
-    // OpenAI: "This model's maximum context length is 200000 tokens.
-    // However, you requested ... tokens".
-    // Extract the FIRST token-count number; the "however you
-    // requested N" comes after, and it'd be confusing to learn
-    // *that* as the cap.
-    let mut nums = Vec::new();
+    // Pick the FIRST number in plausible range. OpenAI's older format
+    // reads "maximum context length is 200000 tokens. However, you
+    // requested 380000 tokens" — the FIRST number is the cap, the
+    // second is current usage. The newer "configured limit of 272000
+    // tokens. Your messages resulted in 273174 tokens" follows the
+    // same order. Anthropic / Ollama vary; the fallback ratio at the
+    // agent layer corrects either way.
+    Some(nums.into_iter().next())
+}
+
+/// Scan `s` for non-overlapping decimal integer runs and return the
+/// ones that fit in `[min_val, max_val]`. Order is preserved (first
+/// occurrence first).
+fn extract_numbers_in_range(s: &str, min_val: u64, max_val: u64) -> Vec<u64> {
+    let mut out = Vec::new();
     let mut cur = String::new();
-    for ch in body.chars() {
+    for ch in s.chars() {
         if ch.is_ascii_digit() {
             cur.push(ch);
-        } else {
-            if !cur.is_empty() {
-                if let Ok(n) = cur.parse::<u64>() {
-                    nums.push(n);
+        } else if !cur.is_empty() {
+            if let Ok(n) = cur.parse::<u64>() {
+                if n >= min_val && n <= max_val {
+                    out.push(n);
                 }
-                cur.clear();
             }
+            cur.clear();
         }
     }
     if !cur.is_empty() {
         if let Ok(n) = cur.parse::<u64>() {
-            nums.push(n);
+            if n >= min_val && n <= max_val {
+                out.push(n);
+            }
         }
     }
-    // Reasonable token-count range: >= 1K, <= 5M. Filters out HTTP
-    // status codes, error codes, line numbers, etc.
-    let extracted = nums.into_iter().find(|n| *n >= 1_000 && *n <= 5_000_000);
-    Some(extracted)
+    out
 }
 
 #[cfg(test)]
@@ -213,6 +251,64 @@ mod overflow_tests {
     fn unrelated_400_is_not_overflow() {
         let body = r#"{"error":{"message":"invalid api key","code":"invalid_api_key"}}"#;
         assert_eq!(parse_overflow(body), None);
+    }
+
+    /// Regression for the user-reported failure: OpenAI's 2026 wording
+    /// reads "Input tokens exceed the configured limit of N tokens.
+    /// Your messages resulted in M tokens." The old phrase list didn't
+    /// recognize either "input tokens exceed" or "configured limit",
+    /// so the agent loop fell through to a raw error and broke. The
+    /// learn-and-retry path needs this to fire.
+    #[test]
+    fn openai_2026_configured_limit_phrase() {
+        let body = r#"{"error":{"message":"Input tokens exceed the configured limit of 272000 tokens. Your messages resulted in 273174 tokens. Please reduce the length of the messages.","type":"invalid_request_error","param":"messages","code":"context_length_exceeded"}}"#;
+        let r = parse_overflow(body);
+        assert_eq!(r, Some(Some(272_000)));
+    }
+
+    /// Structural fallback: if a vendor invents a new wording we
+    /// haven't catalogued, presence of "tokens" + a token-shaped
+    /// number should still trigger the overflow path. Keeps us from
+    /// silently breaking every time a provider edits their copy.
+    #[test]
+    fn structural_fallback_catches_unknown_wording() {
+        let body = r#"{"error":{"message":"Your call exhausted the allowed 200000 tokens for this conversation. Trim and retry."}}"#;
+        let r = parse_overflow(body);
+        assert_eq!(r, Some(Some(200_000)));
+    }
+
+    /// Structural fallback must NOT trip on errors that happen to
+    /// contain a large number but aren't about tokens (rate-limit
+    /// windows, file sizes, etc.). The word "tokens" is the gate.
+    #[test]
+    fn structural_does_not_overmatch_unrelated_big_numbers() {
+        // Rate-limit error with a 300000-millisecond window.
+        let body = r#"{"error":{"message":"Rate limit exceeded. Try again in 300000 ms."}}"#;
+        assert_eq!(parse_overflow(body), None);
+        // 4M-byte payload size error.
+        let body = r#"{"error":{"message":"Request body too large: 4500000 bytes exceeds 4194304 bytes."}}"#;
+        assert_eq!(parse_overflow(body), None);
+    }
+
+    /// Numbers below 1K are likely status codes / counts, not token
+    /// counts. Above 5M would be implausible.
+    #[test]
+    fn structural_ignores_implausible_token_counts() {
+        let body = r#"{"error":{"message":"too many tokens: 500"}}"#;
+        // 500 is below MIN_TOKEN_COUNT; recognized as overflow-shaped
+        // by phrase but no extractable number.
+        assert_eq!(parse_overflow(body), Some(None));
+        let body = r#"{"error":{"message":"too many tokens: 10000000"}}"#;
+        // 10M > MAX_TOKEN_COUNT; same outcome.
+        assert_eq!(parse_overflow(body), Some(None));
+    }
+
+    /// Phrase-shaped overflow with no number → caller should fall
+    /// back to FALLBACK_OVERFLOW_RATIO at the agent layer.
+    #[test]
+    fn phrase_match_without_number_returns_some_none() {
+        let body = r#"{"error":{"message":"prompt is too long"}}"#;
+        assert_eq!(parse_overflow(body), Some(None));
     }
 }
 

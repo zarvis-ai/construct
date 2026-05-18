@@ -1624,6 +1624,12 @@ pub async fn run(
     let registry = std::sync::Arc::new(ToolRegistry::with_defaults());
     let specs = registry.specs();
     let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
+    // Per-model learned input-token limits. Shared with `agent.rs`
+    // via `state_dir/zarvis-model-limits.json`, so a context-overflow
+    // learned in one session benefits every later session on the same
+    // machine. We hold one instance for the lifetime of this run and
+    // mutate through `record_overflow` / `record_call`.
+    let mut limits = crate::model_limits::ModelLimits::load();
 
     // Per-session task registry: tracks every spawned tool's
     // supervisor handle so manual `[kill]` / `[bg]` clicks can find
@@ -1976,7 +1982,30 @@ pub async fn run(
 
         // Inner step loop — feed tool results back until end-of-turn.
         loop {
-            let _pruned = context::prune(&mut messages, provider_name, &model);
+            // Budget mirrors `agent::run` (headless): use the
+            // *learned* per-model cap when we have one, else fall back
+            // to the hardcoded table. Probe occasionally (criteria in
+            // `model_limits::should_probe`) to detect a model quietly
+            // raising its limit. Without this, interactive sessions
+            // were pruning against the hardcoded cap and hitting the
+            // real (often lower) cap with no recovery.
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let hardcoded_cap = context::context_window_tokens(provider_name, &model);
+            let learned = limits.get(provider_name, &model);
+            let est = context::estimate_tokens(&messages) as u64;
+            let is_probe = learned.is_some()
+                && limits.should_probe(provider_name, &model, est, now_ms);
+            let effective_cap = match learned {
+                Some(lim) => lim,
+                None => hardcoded_cap as u64,
+            };
+            let budget = if is_probe {
+                ((effective_cap as f64)
+                    * crate::model_limits::PROBE_OVERFLOW_RATIO) as usize
+            } else {
+                ((effective_cap as f64) * context::UTILIZATION) as usize
+            };
+            let _pruned = context::prune_to_budget(&mut messages, budget);
             let mut sink = PtySink::new(&emit, pty_width, turn_started_at_ms);
             // Wrap the provider call so user typing during the
             // stream is fed to the editor and pressed-Enter lines
@@ -2011,10 +2040,99 @@ pub async fn run(
                 }
                 DriveExit::Done(Err(e)) => {
                     sink.finalize();
-                    final_status = "Errored";
-                    term.note(&format!("(provider error: {e})"));
-                    emit.emit(SessionEvent::Error { message: format!("{e}") });
-                    break;
+                    // Context overflow → learn the real cap and retry
+                    // once. Mirrors `agent.rs`. We downcast the
+                    // typed sentinel out of the wrapped `anyhow`;
+                    // `parse_overflow` in `provider/mod.rs` is what
+                    // makes providers emit it.
+                    if let Some(ov) =
+                        e.downcast_ref::<crate::provider::ContextOverflow>()
+                    {
+                        let new_limit = limits.record_overflow(
+                            provider_name,
+                            &model,
+                            ov.extracted,
+                            effective_cap,
+                            now_ms,
+                        );
+                        let retry_budget =
+                            ((new_limit as f64) * context::UTILIZATION) as usize;
+                        let _pruned =
+                            context::prune_to_budget(&mut messages, retry_budget);
+                        term.note(&format!(
+                            "(context overflow — relearned cap as {} tokens, retrying)",
+                            new_limit
+                        ));
+                        emit.emit(SessionEvent::Status {
+                            state: SessionState::Running,
+                            detail: Some(format!(
+                                "context overflow — relearning ({} tokens) and retrying",
+                                new_limit
+                            )),
+                        });
+                        let mut sink2 = PtySink::new(&emit, pty_width, turn_started_at_ms);
+                        let drive2 = drive_with_input_silent(
+                            &mut inbox,
+                            &mut editor,
+                            &mut queue,
+                            &mut automode,
+                            &emit,
+                            tasks.clone(),
+                            async {
+                                provider
+                                    .complete(
+                                        &model,
+                                        &system_prompt,
+                                        &messages,
+                                        &specs,
+                                        &mut sink2,
+                                    )
+                                    .await
+                            },
+                        )
+                        .await;
+                        match drive2 {
+                            DriveExit::Done(Ok(t)) => {
+                                sink2.finalize();
+                                t
+                            }
+                            DriveExit::Done(Err(e2)) => {
+                                sink2.finalize();
+                                final_status = "Errored";
+                                term.note(&format!(
+                                    "(still over budget after retry: {e2})"
+                                ));
+                                emit.emit(SessionEvent::Error {
+                                    message: format!(
+                                        "still over budget after retry: {e2}"
+                                    ),
+                                });
+                                break;
+                            }
+                            DriveExit::Stop | DriveExit::Channel => {
+                                sink2.finalize();
+                                finish_agent_status(
+                                    &emit,
+                                    turn_started_at_ms,
+                                    "Stopped",
+                                );
+                                break 'outer;
+                            }
+                            DriveExit::Interrupt => {
+                                sink2.finalize();
+                                final_status = "Interrupted";
+                                term.note("(interrupted)");
+                                break;
+                            }
+                        }
+                    } else {
+                        final_status = "Errored";
+                        term.note(&format!("(provider error: {e})"));
+                        emit.emit(SessionEvent::Error {
+                            message: format!("{e}"),
+                        });
+                        break;
+                    }
                 }
                 DriveExit::Stop | DriveExit::Channel => {
                     sink.finalize();
@@ -2028,6 +2146,16 @@ pub async fn run(
                     break;
                 }
             };
+            // Record the call so probe state advances (and the learned
+            // limit grows on a probe that pushed past the prior cap).
+            limits.record_call(
+                provider_name,
+                &model,
+                turn.usage.input_tokens,
+                is_probe,
+                hardcoded_cap as u64,
+                now_ms,
+            );
             emit.emit(SessionEvent::Cost {
                 usd: turn.usage.usd,
                 tokens_in: turn.usage.input_tokens,
