@@ -347,6 +347,9 @@ pub struct App {
     pub matrix_rain_intensity: f32,
     pub matrix_rain_intensity_updated_at: Instant,
     pub matrix_rain_foreground_epoch: Instant,
+    /// Matrix-rain drop cycle keys that already spawned. Intensity decay stops
+    /// future cycles from entering this set; existing drops finish their fall.
+    pub matrix_rain_active_drops: HashMap<u64, u16>,
     /// User-hidden Matrix-rain panel. Toggle with `/rain`; close with the
     /// panel's `x` button.
     pub matrix_rain_hidden: bool,
@@ -664,6 +667,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         matrix_rain_intensity: 0.0,
         matrix_rain_intensity_updated_at: now,
         matrix_rain_foreground_epoch: now,
+        matrix_rain_active_drops: HashMap::new(),
         matrix_rain_hidden: persisted.matrix_rain_hidden,
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
