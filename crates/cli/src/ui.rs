@@ -171,6 +171,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
     app.layout.list_row_count = app.list_items().len();
+    app.layout.list_items_area = None;
+    app.layout.list_scroll_offset = 0;
 
     if list_w > 0 {
         render_sessions(f, cols[0], app);
@@ -910,6 +912,8 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.pin_strip_area = None;
     app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
+    app.layout.list_items_area = None;
+    app.layout.list_scroll_offset = 0;
 
     if let Some(diff) = &app.last_diff {
         let para = Paragraph::new(diff.clone()).wrap(Wrap { trim: false });
@@ -945,6 +949,8 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
     app.layout.list_row_count = app.list_items().len();
+    app.layout.list_items_area = None;
+    app.layout.list_scroll_offset = 0;
 
     render_sessions(f, main_area, app);
     render_minibuffer(f, minibuffer_area, app);
@@ -1090,31 +1096,78 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         selected_idx
     });
-    let list = List::new(items)
-        .block(block)
-        .highlight_style(highlight_style);
-    f.render_stateful_widget(list, area, &mut state);
+    // Split the bordered pane's inner area into a top "list items"
+    // region and a bottom "matrix rain" region so the rain panel
+    // stays anchored at the bottom even when the session list grows
+    // beyond the visible height. Rendering the block separately (so
+    // the List widget is given the items rect, not the full pane)
+    // is what makes ratatui scroll the list — when items > height,
+    // the offset auto-advances to keep the selection in view.
+    let (list_items_area, matrix_area) =
+        split_list_pane(inner, app.matrix_rain_hidden, app.matrix_rain_h);
+    f.render_widget(block, area);
+    let list = List::new(items).highlight_style(highlight_style);
+    f.render_stateful_widget(list, list_items_area, &mut state);
+    app.layout.list_items_area = Some(list_items_area);
+    app.layout.list_scroll_offset = state.offset();
     clear_pane_side_borders(f, area, app);
-    render_matrix_rain(f, inner, app, app_items.len());
+    render_matrix_rain(f, matrix_area, app);
 }
 
-fn render_matrix_rain(f: &mut Frame, area: Rect, app: &mut App, occupied_rows: usize) {
+/// Split the list pane's inner area (the rect inside the borders)
+/// into a top region for session rows and a bottom region for the
+/// matrix-rain panel.
+///
+/// The matrix panel is "sticky": it always claims its preferred
+/// height at the bottom whenever there is room. The list shrinks to
+/// the remaining rows and scrolls when items overflow. Below
+/// `SESSION_LIST_H_MIN + MATRIX_RAIN_H_MIN` of total inner height
+/// (or when the user hid the rain), the list takes the entire pane
+/// and the rain area is reported as zero-height — i.e., the rain
+/// effectively goes "out of view" when the terminal is too short.
+fn split_list_pane(
+    inner: Rect,
+    matrix_rain_hidden: bool,
+    matrix_rain_preferred_h: Option<u16>,
+) -> (Rect, Rect) {
+    let empty_matrix = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(inner.height),
+        width: inner.width,
+        height: 0,
+    };
+    if matrix_rain_hidden {
+        return (inner, empty_matrix);
+    }
+    let max_matrix_h = inner.height.saturating_sub(crate::app::SESSION_LIST_H_MIN);
+    if max_matrix_h < crate::app::MATRIX_RAIN_H_MIN {
+        return (inner, empty_matrix);
+    }
+    let matrix_h = matrix_rain_panel_height(matrix_rain_preferred_h, max_matrix_h);
+    if matrix_h == 0 {
+        return (inner, empty_matrix);
+    }
+    let list_h = inner.height.saturating_sub(matrix_h);
+    let list = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: list_h,
+    };
+    let matrix = Rect {
+        x: inner.x,
+        y: inner.y.saturating_add(list_h),
+        width: inner.width,
+        height: matrix_h,
+    };
+    (list, matrix)
+}
+
+fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     app.layout.matrix_rain_area = None;
     if app.matrix_rain_hidden {
         return;
     }
-    if area.width < 8 || area.height < 3 {
-        return;
-    }
-    let used = (occupied_rows as u16).min(area.height);
-    let available = area.height.saturating_sub(used);
-    let panel_h = matrix_rain_panel_height(app.matrix_rain_h, available);
-    let rain_area = Rect {
-        x: area.x,
-        y: area.y + area.height.saturating_sub(panel_h),
-        width: area.width,
-        height: panel_h,
-    };
     if rain_area.width < 8 || rain_area.height < 4 {
         return;
     }
@@ -3311,6 +3364,52 @@ mod tests {
             let head = ((passed_at / tick_ms) + offset) % cycle as u64;
             assert_eq!(head, target_rel_y as u64);
         }
+    }
+
+    #[test]
+    fn split_list_pane_reserves_matrix_height_so_list_scrolls_when_items_overflow() {
+        // Tall pane: items would overflow but matrix should still be
+        // anchored at the default 12 rows at the bottom, and the list
+        // gets the remainder (which is what makes ratatui's List
+        // widget scroll to keep the selection in view).
+        let inner = Rect::new(0, 0, 20, 20);
+        let (list, matrix) = split_list_pane(inner, false, None);
+        assert_eq!(matrix.height, crate::app::MATRIX_RAIN_H_DEFAULT);
+        assert_eq!(list.height, 20 - crate::app::MATRIX_RAIN_H_DEFAULT);
+        assert_eq!(matrix.y, list.y + list.height);
+        assert_eq!(list.x, inner.x);
+        assert_eq!(matrix.x, inner.x);
+    }
+
+    #[test]
+    fn split_list_pane_falls_back_to_full_list_when_height_too_short() {
+        // SESSION_LIST_H_MIN (3) + MATRIX_RAIN_H_MIN (4) = 7. With
+        // only 6 rows of inner space we can't honor both, so list
+        // takes everything and matrix is reported as a zero-height
+        // rect anchored past the bottom.
+        let inner = Rect::new(0, 0, 20, 6);
+        let (list, matrix) = split_list_pane(inner, false, None);
+        assert_eq!(list, inner);
+        assert_eq!(matrix.height, 0);
+    }
+
+    #[test]
+    fn split_list_pane_keeps_min_list_height_when_pane_is_tight() {
+        // SESSION_LIST_H_MIN=3 + MATRIX_RAIN_H_MIN=4 = 7 inner rows.
+        // The list takes exactly its minimum, matrix takes the rest.
+        let inner = Rect::new(0, 0, 20, 7);
+        let (list, matrix) = split_list_pane(inner, false, None);
+        assert_eq!(list.height, crate::app::SESSION_LIST_H_MIN);
+        assert_eq!(matrix.height, crate::app::MATRIX_RAIN_H_MIN);
+        assert_eq!(matrix.y, list.y + list.height);
+    }
+
+    #[test]
+    fn split_list_pane_skips_matrix_when_hidden() {
+        let inner = Rect::new(0, 0, 20, 30);
+        let (list, matrix) = split_list_pane(inner, true, None);
+        assert_eq!(list, inner);
+        assert_eq!(matrix.height, 0);
     }
 
     #[test]

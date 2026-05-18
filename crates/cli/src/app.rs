@@ -450,6 +450,12 @@ pub const PIN_STRIP_H_MAX: u16 = 40;
 pub const MATRIX_RAIN_H_MIN: u16 = 4;
 pub const MATRIX_RAIN_H_DEFAULT: u16 = 12;
 
+/// Minimum number of session-list rows the layout keeps visible when
+/// the matrix-rain panel is shown. Below this the list takes the
+/// entire pane and the matrix is hidden — preserving the ability to
+/// see and select sessions in a very short terminal.
+pub const SESSION_LIST_H_MIN: u16 = 3;
+
 /// A clickable / hoverable text segment in the minibuffer hint line —
 /// e.g. "C-x z unzoom" or "? help" — that dispatches a KeyAction when
 /// clicked. Geometry is filled by `render_minibuffer` so the click
@@ -475,6 +481,17 @@ pub struct LayoutSnapshot {
     /// past the last row is a no-op rather than selecting an
     /// out-of-range item). Mirrors `app.list_items().len()`.
     pub list_row_count: usize,
+    /// Sub-rect of the list pane where session rows are actually
+    /// drawn — the inner area minus the bottom matrix-rain panel
+    /// (when shown). Click hit-testing for rows uses this so clicks
+    /// inside the matrix panel don't mis-fire as row selections, and
+    /// it also bounds the visible window when the list scrolls.
+    pub list_items_area: Option<ratatui::layout::Rect>,
+    /// Scroll offset of the session list (number of items scrolled
+    /// off the top). Captured from `ListState::offset()` after the
+    /// last render so click-to-row mapping stays correct when the
+    /// list overflows its visible area.
+    pub list_scroll_offset: usize,
     /// Clickable segments in the minibuffer hint line. Empty when a
     /// minibuffer prompt (palette / send-input / etc.) is open.
     pub minibuffer_hints: Vec<HintZone>,
@@ -1982,8 +1999,10 @@ impl App {
     fn matrix_rain_available_height(&self) -> Option<u16> {
         let list = self.layout.list_area?;
         let inner_h = list.height.saturating_sub(2);
-        let used = (self.layout.list_row_count as u16).min(inner_h);
-        Some(inner_h.saturating_sub(used))
+        // The matrix panel is sticky and may shrink the visible item
+        // window, but it's clamped so the list always keeps at least
+        // SESSION_LIST_H_MIN rows when both are shown.
+        Some(inner_h.saturating_sub(SESSION_LIST_H_MIN))
     }
 
     /// True if `(col, row)` sits on the list ↔ right-pane divider.
@@ -2332,7 +2351,21 @@ impl App {
         if row <= list.y || row + 1 >= list.y + list.height {
             return;
         }
-        let idx = (row - list.y - 1) as usize;
+        // Clicks inside the (sticky) matrix-rain panel at the bottom
+        // of the list pane focus the list but do NOT count as a row
+        // click — without this guard, clicks past the last visible
+        // item would map to phantom indices when items overflow.
+        let items_area = self.layout.list_items_area.unwrap_or(ratatui::layout::Rect {
+            x: list.x,
+            y: list.y.saturating_add(1),
+            width: list.width,
+            height: list.height.saturating_sub(2),
+        });
+        if row < items_area.y || row >= items_area.y + items_area.height {
+            return;
+        }
+        let visible_row = (row - items_area.y) as usize;
+        let idx = visible_row + self.layout.list_scroll_offset;
         let items = self.list_items();
         if idx >= items.len() {
             return;
@@ -3699,6 +3732,8 @@ mod tests {
             matrix_rain_area: None,
             minibuffer_area: Some(Rect::new(0, 29, 100, 4)),
             list_row_count: 0,
+            list_items_area: None,
+            list_scroll_offset: 0,
             minibuffer_hints: Vec::new(),
             minibuffer_harness_hits: Vec::new(),
         }
