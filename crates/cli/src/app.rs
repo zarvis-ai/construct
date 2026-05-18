@@ -2682,7 +2682,7 @@ impl App {
                         .unwrap_or_default();
                     self.minibuffer = Some(Minibuffer {
                         prompt: format!(
-                            "Delete group '{}' (members will be orphaned)? (y/N): ",
+                            "Delete group '{}'? (y = orphan members / type 'all' to delete sessions too / N = cancel): ",
                             name
                         ),
                         input: String::new(),
@@ -3261,13 +3261,24 @@ impl App {
                 }
             }
             MinibufferIntent::GroupDeleteConfirm { group_id } => {
-                let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
-                if !yes {
-                    self.set_status("group delete cancelled".to_string());
-                    return;
-                }
-                match self.client.delete_group(&group_id).await {
-                    Ok(()) => self.set_status("group deleted".into()),
+                let choice = parse_group_delete_choice(&input);
+                let delete_members = match choice {
+                    GroupDeleteChoice::Cancel => {
+                        self.set_status("group delete cancelled".to_string());
+                        return;
+                    }
+                    GroupDeleteChoice::OrphanMembers => false,
+                    GroupDeleteChoice::DeleteMembers => true,
+                };
+                match self.client.delete_group(&group_id, delete_members).await {
+                    Ok(()) => {
+                        let msg = if delete_members {
+                            "group + all sessions deleted"
+                        } else {
+                            "group deleted (members orphaned)"
+                        };
+                        self.set_status(msg.into());
+                    }
                     Err(e) => self.set_status(format!("group delete failed: {e}")),
                 }
             }
@@ -4087,5 +4098,92 @@ mod drain_gate_tests {
         assert!(!should_drain_after(&CtEvent::Paste(String::from("hi"))));
         assert!(!should_drain_after(&CtEvent::FocusGained));
         assert!(!should_drain_after(&CtEvent::FocusLost));
+    }
+}
+
+/// Three-way choice in the group-delete confirmation minibuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupDeleteChoice {
+    /// User pressed Enter on an empty line, or typed anything that
+    /// isn't a recognized "yes" variant. Treat as cancel — the
+    /// destructive default is always "no".
+    Cancel,
+    /// `y` / `yes` — drop the group, keep the sessions (their
+    /// `group_id` clears to `None`).
+    OrphanMembers,
+    /// `all` — drop the group AND every member session. Requires
+    /// typing the full word; a single-letter `a` is rejected so a
+    /// stray keystroke can't trigger a cascade delete.
+    DeleteMembers,
+}
+
+pub fn parse_group_delete_choice(input: &str) -> GroupDeleteChoice {
+    match input.trim().to_lowercase().as_str() {
+        "y" | "yes" => GroupDeleteChoice::OrphanMembers,
+        // Intentionally NO single-letter alias here — the destructive
+        // cascade should never be a typo away from "y".
+        "all" => GroupDeleteChoice::DeleteMembers,
+        _ => GroupDeleteChoice::Cancel,
+    }
+}
+
+#[cfg(test)]
+mod group_delete_prompt_tests {
+    use super::{parse_group_delete_choice, GroupDeleteChoice};
+
+    /// `y` / `yes` (any case, with whitespace) → orphan members
+    /// (original pre-cascade behavior).
+    #[test]
+    fn yes_orphans_members() {
+        for s in ["y", "Y", "yes", "YES", "  y  ", " Yes "] {
+            assert_eq!(
+                parse_group_delete_choice(s),
+                GroupDeleteChoice::OrphanMembers,
+                "input {s:?} should orphan",
+            );
+        }
+    }
+
+    /// Only the full word `all` (case-insensitive, whitespace ok)
+    /// triggers cascade-delete. Requiring the full word means the
+    /// destructive option is never one stray keystroke away from a
+    /// confirm.
+    #[test]
+    fn all_deletes_members() {
+        for s in ["all", "ALL", "  all  ", " All "] {
+            assert_eq!(
+                parse_group_delete_choice(s),
+                GroupDeleteChoice::DeleteMembers,
+                "input {s:?} should delete members",
+            );
+        }
+    }
+
+    /// Regression: a single `a` must NOT be a shortcut for cascade.
+    /// Same for `al` or any prefix. The user has to type the full
+    /// word.
+    #[test]
+    fn single_letter_a_does_not_delete_members() {
+        for s in ["a", "A", "  a  ", "al", "AL"] {
+            assert_eq!(
+                parse_group_delete_choice(s),
+                GroupDeleteChoice::Cancel,
+                "input {s:?} must not delete members — full word required",
+            );
+        }
+    }
+
+    /// The destructive default is always cancel. Empty input,
+    /// explicit `n`/`no`, garbage, or anything ambiguous routes to
+    /// Cancel so a stray keystroke never wipes sessions.
+    #[test]
+    fn anything_else_cancels() {
+        for s in ["", " ", "n", "N", "no", "NO", "maybe", "1", "yep", "delete"] {
+            assert_eq!(
+                parse_group_delete_choice(s),
+                GroupDeleteChoice::Cancel,
+                "input {s:?} should cancel",
+            );
+        }
     }
 }

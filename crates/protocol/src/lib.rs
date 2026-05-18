@@ -907,6 +907,20 @@ pub struct GroupIdParams {
     pub group_id: String,
 }
 
+/// Parameters for `group.delete`. `delete_members` defaults to false
+/// so a client that sends the older `GroupIdParams` shape (just
+/// `{"group_id": "…"}`) still deserializes cleanly with the original
+/// "orphan members" semantics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupDeleteParams {
+    pub group_id: String,
+    /// When true, cascade-delete every member session before removing
+    /// the group. When false (default), members are orphaned —
+    /// `group_id` on their summary clears to `None` and they survive.
+    #[serde(default)]
+    pub delete_members: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupRenameParams {
     pub group_id: String,

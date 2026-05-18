@@ -3,7 +3,7 @@
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, transport, CreateSessionParams, DiffResult, ErrorObject, GroupCreateParams,
-    GroupIdParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, GroupSummary,
+    GroupDeleteParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, GroupSummary,
     HarnessInfo, MoveDirection, Notification, PingResult, PtyReplayResult, Request, Response,
     SessionDetail, SessionIdParams, SessionInputParams, SessionMoveParams, SessionPtyInputParams,
     SessionPtyResizeParams, SessionSetAutomodeParams, SessionSetPinnedParams,
@@ -425,11 +425,19 @@ impl Client {
             .await?;
         Ok(())
     }
-    pub async fn delete_group(&self, id: &str) -> Result<()> {
+    /// Delete a group. When `delete_members` is true the daemon
+    /// cascade-deletes every member session (kills its adapter, removes
+    /// its on-disk dir, tears down any worktree) before removing the
+    /// group itself. When false (the previous behavior) members are
+    /// orphaned: their `group_id` clears but the sessions survive.
+    pub async fn delete_group(&self, id: &str, delete_members: bool) -> Result<()> {
         let _: serde_json::Value = self
             .request(
                 ipc_method::GROUP_DELETE,
-                &GroupIdParams { group_id: id.to_string() },
+                &GroupDeleteParams {
+                    group_id: id.to_string(),
+                    delete_members,
+                },
             )
             .await?;
         Ok(())

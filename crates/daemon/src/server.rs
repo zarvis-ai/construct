@@ -5,11 +5,11 @@ use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, ipc_notif, transport, CreateSessionParams, ErrorObject, GroupCreateParams,
-    GroupCreateResult, GroupIdParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams,
-    Notification, PingResult, Request, Response, SessionIdParams, SessionInputParams,
-    SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams,
-    SessionSetGroupParams, SessionSetPinnedParams, SessionSetTitleParams, SessionToolActionParams,
-    SessionToolDecisionParams, SubscribeParams,
+    GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
+    GroupSetCollapsedParams, Notification, PingResult, Request, Response, SessionIdParams,
+    SessionInputParams, SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams,
+    SessionSetAutomodeParams, SessionSetGroupParams, SessionSetPinnedParams,
+    SessionSetTitleParams, SessionToolActionParams, SessionToolDecisionParams, SubscribeParams,
     TranscriptParams, IPC_VERSION,
 };
 use anyhow::Result;
@@ -444,8 +444,12 @@ async fn dispatch(
             }
         }
         m if m == ipc_method::GROUP_DELETE => {
-            let p = params!(GroupIdParams);
-            match manager.delete_group(&p.group_id).await {
+            // Accept the new `GroupDeleteParams` shape (with optional
+            // `delete_members`); older clients sending the bare
+            // `{"group_id": "…"}` payload deserialize too because
+            // `delete_members` is `#[serde(default)]`.
+            let p = params!(GroupDeleteParams);
+            match manager.delete_group(&p.group_id, p.delete_members).await {
                 Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

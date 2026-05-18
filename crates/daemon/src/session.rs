@@ -1727,35 +1727,62 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Delete a group. Member sessions are orphaned (group_id set to None);
-    /// they survive the group deletion.
-    pub async fn delete_group(&self, id: &str) -> Result<()> {
+    /// Delete a group. When `delete_members` is false (default), member
+    /// sessions are orphaned: their `group_id` clears to `None` and they
+    /// survive. When true, every member session is fully deleted first
+    /// (adapter killed, on-disk session dir removed, worktree torn down)
+    /// before the group itself is removed.
+    pub async fn delete_group(&self, id: &str, delete_members: bool) -> Result<()> {
+        // Collect member ids BEFORE we drop the group entry so we don't
+        // race with a concurrent set_session_group that might re-parent
+        // them under a different group while we're working.
+        let member_ids: Vec<String> = {
+            let sessions = self.sessions.read().await;
+            let mut ids = Vec::new();
+            for (sid, entry) in sessions.iter() {
+                let s = entry.summary.read().await;
+                if s.group_id.as_deref() == Some(id) {
+                    ids.push(sid.clone());
+                }
+            }
+            ids
+        };
+
         let entry = self.groups.write().await.remove(id);
         if entry.is_none() {
             return Err(anyhow!("group not found: {}", id));
         }
-        // Orphan members: scan sessions, anything with this group_id becomes None.
-        let session_ids: Vec<String> = self.sessions.read().await.keys().cloned().collect();
-        for sid in session_ids {
-            let Some(s_entry) = self.sessions.read().await.get(&sid).cloned() else {
-                continue;
-            };
-            let needs_update = {
-                let s = s_entry.summary.read().await;
-                s.group_id.as_deref() == Some(id)
-            };
-            if !needs_update {
-                continue;
+
+        if delete_members {
+            // Cascade-delete: tear down each member session. Errors are
+            // logged but don't abort the cascade — a single broken
+            // session shouldn't strand the rest in a now-missing group.
+            for sid in &member_ids {
+                if let Err(e) = self.delete(sid).await {
+                    tracing::warn!(
+                        group = %id,
+                        session = %sid,
+                        error = %e,
+                        "group cascade-delete: member delete failed",
+                    );
+                }
             }
-            let snapshot = {
-                let mut s = s_entry.summary.write().await;
-                s.group_id = None;
-                s.clone()
-            };
-            let _ = self.storage.save_summary(&snapshot);
-            let _ = self.broadcast.send(BroadcastMsg::State(
-                StateNotificationPayload { session: snapshot },
-            ));
+        } else {
+            // Orphan members: clear their group_id and rebroadcast.
+            for sid in &member_ids {
+                let Some(s_entry) = self.sessions.read().await.get(sid).cloned() else {
+                    continue;
+                };
+                let snapshot = {
+                    let mut s = s_entry.summary.write().await;
+                    s.group_id = None;
+                    s.clone()
+                };
+                let _ = self.storage.save_summary(&snapshot);
+                let _ = self.broadcast.send(BroadcastMsg::State(
+                    StateNotificationPayload { session: snapshot },
+                ));
+            }
         }
         let _ = self.storage.remove_group(id);
         let _ = self.broadcast.send(BroadcastMsg::GroupDeleted(
