@@ -1608,9 +1608,8 @@ impl App {
                     self.resizing_list = Some((ev.column, self.list_panel_w));
                     return;
                 }
-                // View ↔ pin-strip horizontal divider: clicking the
-                // view's bottom border (or equivalently the pin
-                // strip's top border, the same row) starts a
+                // View ↔ pin-strip horizontal divider: with bottom borders
+                // hidden, the first row of pinned-session title bars starts a
                 // vertical resize-drag for the pin strip.
                 if self.is_on_pin_strip_divider(ev.column, ev.row) {
                     let cur_h = self.layout.pin_strip_area.map(|s| s.height).unwrap_or(0);
@@ -1827,11 +1826,9 @@ impl App {
         )
     }
 
-    /// True if `(col, row)` sits on the main view's bottom border
-    /// row — the divider directly above the pin strip. The view's
-    /// bottom border is at `pin_strip.y − 1` (one row above the
-    /// strip's top border / title row). Only meaningful when there
-    /// IS a pin strip and we're in the normal split layout.
+    /// True if `(col, row)` sits on the first row of pinned-session
+    /// title bars. This is the visible vertical resize handle now
+    /// that the main view's bottom border is an empty gap.
     fn is_on_pin_strip_divider(&self, col: u16, row: u16) -> bool {
         if !matches!(self.zoom, ZoomMode::None) {
             return false;
@@ -1839,11 +1836,29 @@ impl App {
         let Some(strip) = self.layout.pin_strip_area else {
             return false;
         };
-        let view_bottom = match strip.y.checked_sub(1) {
-            Some(r) => r,
-            None => return false,
+        let pinned_count = self
+            .list_items()
+            .into_iter()
+            .filter(|it| matches!(it, ListItem::Session { summary, .. } if summary.pinned))
+            .count();
+        if pinned_count == 0 {
+            return false;
+        }
+        let tiles = crate::ui::pin_tile_layout(strip, pinned_count);
+        let Some(top_row) = tiles.iter().map(|tile| tile.y).min() else {
+            return false;
         };
-        row == view_bottom && col >= strip.x && col < strip.x + strip.width
+        if row != top_row {
+            return false;
+        }
+        tiles
+            .iter()
+            .filter(|tile| tile.y == top_row)
+            .any(|tile| {
+                let in_title = col >= tile.x && col < tile.x + tile.width;
+                let in_unpin = col >= tile.x + 1 && col < tile.x + 5;
+                in_title && !in_unpin
+            })
     }
 
     /// True if `(col, row)` sits on the orchestrator/god panel's top border.
@@ -2268,12 +2283,12 @@ impl App {
                 continue;
             }
             // Diamond zone: 4 cells on the top border, starting
-            // at the tile's left edge — covers `[ ][⬩][ ][status]` in the
-            // title ` ⬩ <status> <label> <harness> `. Same gesture
+            // after the leading title dash — covers `[ ][⬩][ ][status]` in the
+            // title `- ⬩ <status> <label> <harness>`. Same gesture
             // as clicking the list-view diamond. Must stay in
             // lockstep with `pin_tile_diamond_zone` in ui.rs.
-            let diamond_zone_start = tile.x;
-            let diamond_zone_end = tile.x + 4;
+            let diamond_zone_start = tile.x + 1;
+            let diamond_zone_end = tile.x + 5;
             if row == tile.y && col >= diamond_zone_start && col < diamond_zone_end {
                 if let Err(e) = self.client.set_pinned(id, false).await {
                     self.set_status(format!("unpin failed: {e}"));
