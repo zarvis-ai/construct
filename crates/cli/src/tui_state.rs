@@ -30,6 +30,8 @@ pub struct TuiState {
     pub list_collapsed: bool,
     #[serde(default)]
     pub matrix_rain_hidden: bool,
+    #[serde(default)]
+    pub hide_pane_side_borders: bool,
 }
 
 fn state_path() -> PathBuf {

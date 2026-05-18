@@ -12,28 +12,47 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
-const TITLE_BORDER: &str = "─";
+const MATRIX_RAIN_RAMP_UP_SECS: f32 = 5.0;
+const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
 
-/// Content area for panes that render only a top border while preserving the
-/// old one-row bottom gap as empty space between adjacent regions.
-pub fn top_border_content_area(area: Rect) -> Rect {
-    Rect {
-        x: area.x,
-        y: area.y.saturating_add(1),
-        width: area.width,
-        height: area.height.saturating_sub(2),
+fn clear_pane_side_borders(f: &mut Frame, area: Rect, app: &App) {
+    if !app.hide_pane_side_borders || area.width == 0 || area.height <= 1 {
+        return;
     }
-}
-
-/// The list pane keeps its two rightmost columns clear as the visual divider and
-/// drag handle. Its left edge is regular usable content.
-pub fn list_content_area(area: Rect) -> Rect {
-    let mut inner = top_border_content_area(area);
-    inner.width = inner.width.saturating_sub(2);
-    inner
+    let side_y = area.y.saturating_add(1);
+    let side_h = area.height.saturating_sub(1);
+    f.render_widget(
+        Clear,
+        Rect {
+            x: area.x,
+            y: side_y,
+            width: 1,
+            height: side_h,
+        },
+    );
+    if area.width > 1 {
+        f.render_widget(
+            Clear,
+            Rect {
+                x: area.x + area.width - 1,
+                y: side_y,
+                width: 1,
+                height: side_h,
+            },
+        );
+    }
+    f.render_widget(
+        Clear,
+        Rect {
+            x: area.x,
+            y: area.y + area.height - 1,
+            width: area.width,
+            height: 1,
+        },
+    );
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -134,9 +153,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // before drawing so the current frame's parser screen geometry matches
     // the area we're rendering into (otherwise zoom-in shows blank rows at
     // the bottom and zoom-out clips content).
-    let detail_inner = top_border_content_area(detail_area);
-    let inner_cols = detail_inner.width;
-    let inner_rows = detail_inner.height;
+    let inner_cols = detail_area.width.saturating_sub(2);
+    let inner_rows = detail_area.height.saturating_sub(2);
     app.terminal_pane_size = (inner_cols, inner_rows);
     // No need to pre-size per-session vt100 parsers — the items
     // model rebuilds a fresh parser at the current pane size on
@@ -359,11 +377,14 @@ fn normalized_points(a: ScreenPoint, b: ScreenPoint) -> (ScreenPoint, ScreenPoin
 fn hovered_diamond(app: &App) -> Option<(u16, u16, &SessionSummary)> {
     let (mx, my) = app.mouse_pos?;
     let list_area = app.layout.list_area?;
-    let inner = list_content_area(list_area);
-    if mx < inner.x || mx >= inner.x + inner.width || my < inner.y || my >= inner.y + inner.height {
+    if mx <= list_area.x
+        || mx + 1 >= list_area.x + list_area.width
+        || my <= list_area.y
+        || my + 1 >= list_area.y + list_area.height
+    {
         return None;
     }
-    let row = (my - inner.y) as usize;
+    let row = (my - list_area.y - 1) as usize;
     let items = app.list_items();
     let item = items.into_iter().nth(row)?;
     let (summary, indented) = match item {
@@ -375,7 +396,7 @@ fn hovered_diamond(app: &App) -> Option<(u16, u16, &SessionSummary)> {
     //   [diamond][ ][status-circle][ ]   ← then the name starts
     // Wider than the bare diamond glyph so it's easier to click —
     // the visual overlay still anchors on the diamond cell itself.
-    let zone_start = inner.x + indent;
+    let zone_start = list_area.x + 1 + indent;
     let zone_end = zone_start + 4; // exclusive
     if mx < zone_start || mx >= zone_end {
         return None;
@@ -388,7 +409,7 @@ fn hovered_diamond(app: &App) -> Option<(u16, u16, &SessionSummary)> {
 
 /// Hit zone for the `+` button on the session-list pane's title
 /// (`" + sessions "`). Returns `(x_start, x_end_exclusive, y)`.
-/// Anchored after the leading title border. Cells `list.x + 1`
+/// Anchored after the top-left border corner — cells `list.x + 1`
 /// and `list.x + 2` cover `[ ][+]` for a forgiving click target.
 pub fn list_plus_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
     if list_area.width < 4 {
@@ -399,12 +420,13 @@ pub fn list_plus_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
 
 /// Hit zone for the right-aligned `−` button that collapses the
 /// session list. Returns `(x_start, x_end_exclusive, y)`. Sits one
-/// cell inset from the right edge so the divider column stays clear.
+/// cell inset from the right corner so the corner glyph stays
+/// visible.
 pub fn list_collapse_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
-    if list_area.width < 7 {
+    if list_area.width < 5 {
         return None;
     }
-    let close_w: u16 = 5;
+    let close_w: u16 = 3;
     let x_start = list_area.x + list_area.width.saturating_sub(close_w + 1);
     let x_end = list_area.x + list_area.width.saturating_sub(1);
     Some((x_start, x_end, list_area.y))
@@ -428,7 +450,9 @@ pub fn view_uncollapse_glyph_pos(view_area: Rect) -> (u16, u16) {
     (view_area.x, view_area.y)
 }
 
-/// True when `(col, row)` lies on the collapsed-list expand glyph.
+/// True when `(col, row)` lies on the main view's left border AND
+/// the list is collapsed — the entire left border column acts as
+/// the uncollapse hit zone, so clicks are forgiving.
 pub fn is_on_view_uncollapse_handle(app: &super::app::App, col: u16, row: u16) -> bool {
     if !(app.list_collapsed && app.focus != crate::app::PaneFocus::List) {
         return false;
@@ -436,8 +460,7 @@ pub fn is_on_view_uncollapse_handle(app: &super::app::App, col: u16, row: u16) -
     let Some(view) = app.layout.view_area else {
         return false;
     };
-    let (gx, gy) = view_uncollapse_glyph_pos(view);
-    col == gx && row == gy
+    col == view.x && row >= view.y && row < view.y + view.height
 }
 
 /// Float a small one-line tooltip with `label` (padded with single
@@ -520,7 +543,7 @@ fn render_view_uncollapse_tooltip(f: &mut Frame, app: &App) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
-    if is_on_view_uncollapse_handle(app, mx, my) {
+    if mx == view.x && my >= view.y && my < view.y + view.height {
         let (gx, gy) = view_uncollapse_glyph_pos(view);
         render_button_tooltip(f, &app.theme, " Expand list ", gx, gy);
     }
@@ -535,12 +558,12 @@ fn render_view_uncollapse_glyph(f: &mut Frame, app: &App, view_area: Rect) {
 }
 
 /// Top-row close-button geometry for the session view's right edge.
-/// Returns `(x_start, x_end_exclusive, y)`. Same 4-cell shape the pin
-/// strip uses (` x `), one column inset from the right edge.
+/// Returns `(x_start, x_end_exclusive, y)`. Same 3-cell shape the pin
+/// strip uses (` x `), one column inset from the right corner.
 pub fn view_close_button_range(view_area: Rect) -> (u16, u16, u16) {
-    let close_w: u16 = 4;
-    let x_start = view_area.x + view_area.width.saturating_sub(close_w);
-    let x_end = view_area.x + view_area.width;
+    let close_w: u16 = 3;
+    let x_start = view_area.x + view_area.width.saturating_sub(close_w + 1);
+    let x_end = view_area.x + view_area.width.saturating_sub(1);
     (x_start, x_end, view_area.y)
 }
 
@@ -553,8 +576,8 @@ fn hovered_view_close_button(app: &App, view_area: Rect) -> bool {
 }
 
 /// Hit zone for the pin-tile unpin diamond: 4 cells on the top
-/// border, starting after the leading title border. Title shape is
-/// `─ ⬩ <status> <label> <harness>`, so cells `tile.x + 1 .. tile.x + 5`
+/// border, starting after the corner. Title shape is ` ⬩ <status>
+/// <label> <harness> `, so cells `tile.x + 1 ..= tile.x + 4`
 /// (inclusive) cover `[ ][⬩][ ][status]` — the same 4-cell zone
 /// idiom as the list-view diamond. Returns `(diamond_x,
 /// tile_top_y)` so the tooltip can anchor on the diamond cell.
@@ -575,7 +598,8 @@ fn hovered_pin_diamond<'a>(
     for (tile, id) in tiles.iter().zip(pinned_ids.iter()) {
         let (zone_start, zone_end) = pin_tile_diamond_zone(*tile);
         if my == tile.y && mx >= zone_start && mx < zone_end {
-            // Diamond glyph itself sits at offset +2 in the title.
+            // Diamond glyph itself sits at offset +1 in the title
+            // (after the leading space).
             let diamond_x = tile.x + 2;
             let summary = app.sessions.iter().find(|s| &s.id == id)?;
             return Some((diamond_x, tile.y, summary));
@@ -933,15 +957,16 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     let effective_collapsed = app.list_collapsed && !focused;
     if effective_collapsed {
         let block = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::ALL)
             .border_style(pane_border_style(&app.theme, focused))
             .title(Line::from(Span::styled(
-                "─›─",
+                "›",
                 Style::default()
                     .fg(app.theme.accent)
                     .add_modifier(Modifier::BOLD),
             )));
         f.render_widget(block, area);
+        clear_pane_side_borders(f, area, app);
         return;
     }
     // Expanded render path: title is ` + sessions ` with a
@@ -952,9 +977,9 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
         .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
     let title_line = Line::from(vec![
-        Span::raw("─ "),
+        Span::raw(" "),
         Span::styled("+", plus_style),
-        Span::raw(" sessions ─"),
+        Span::raw(" sessions "),
     ]);
     let minus_hovered = match app.mouse_pos {
         Some((mx, my)) => list_collapse_button_range(area)
@@ -969,18 +994,17 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(app.theme.muted)
     };
-    let collapse_line = Line::from(Span::styled("─ − ─ ", minus_style))
-        .alignment(ratatui::layout::Alignment::Right);
+    let collapse_line =
+        Line::from(Span::styled(" − ", minus_style)).alignment(ratatui::layout::Alignment::Right);
     let block = Block::default()
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
         .border_style(pane_border_style(&app.theme, focused))
         .title(title_line)
         .title(collapse_line);
-    let inner = list_content_area(area);
+    let inner = block.inner(area);
 
-    // Total cells available inside the pane body. The rightmost column stays
-    // clear as the list/view divider and drag handle.
-    let row_w = inner.width as usize;
+    // Total cells available inside the bordered pane.
+    let row_w = (area.width as usize).saturating_sub(2);
     let app_items = app.list_items();
     let mut selected_idx: Option<usize> = None;
     let items: Vec<ListItem> = app_items
@@ -1063,9 +1087,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         selected_idx
     });
-    let list = List::new(items).highlight_style(highlight_style);
-    f.render_widget(block, area);
-    f.render_stateful_widget(list, inner, &mut state);
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(highlight_style);
+    f.render_stateful_widget(list, area, &mut state);
+    clear_pane_side_borders(f, area, app);
     render_matrix_rain(f, inner, app, app_items.len());
 }
 
@@ -1102,26 +1128,33 @@ fn render_matrix_rain(f: &mut Frame, area: Rect, app: &mut App, occupied_rows: u
     }
 
     let now = Instant::now();
-    let activity = fleet_activity(app, now);
+    let activity = update_matrix_rain_intensity(app, now);
     let elapsed = app.start_instant.elapsed().as_millis() as u64;
-    let tail = (4.0 + activity * 8.0).round() as u16;
+    let tail = (3.0 + activity * 9.0).round() as u16;
     let cycle = rain_area.height + tail + 1;
     let charset = b"01:|/\\{}[]<>+$#@*=-zrvshcodxgit";
 
     for col in 0..rain_area.width {
         let seed = hash64(col as u64 ^ ((rain_area.width as u64) << 24));
         let speed = 2 + (seed % 7);
-        let offset = (seed >> 8) % cycle as u64;
-        let head = (((elapsed / (58 + speed * 19)) + offset) % cycle as u64) as i16;
-        let faint_threshold = (3.0 + activity * 11.0).round() as u64;
+        let threshold = foreground_column_threshold(seed);
+        let head = foreground_rain_head(
+            now,
+            app.matrix_rain_foreground_epoch,
+            threshold,
+            activity,
+            speed,
+            cycle,
+        );
         for row in 0..rain_area.height {
-            let dist = head - row as i16;
+            let dist = head.unwrap_or(-1) - row as i16;
             let mut style = None;
-            if dist >= 0 && dist < tail as i16 {
+            if head.is_some() && dist >= 0 && dist < tail as i16 {
                 let shade = 1.0 - (dist as f32 / tail.max(1) as f32);
                 style = Some(rain_style(&app.theme, shade, activity));
             } else {
                 let sparkle = hash64(seed ^ row as u64 ^ (elapsed / 260));
+                let faint_threshold = (2.0 + activity * 3.0).round() as u64;
                 if sparkle % 100 < faint_threshold {
                     style = Some(Style::default().fg(app.theme.matrix_dim));
                 }
@@ -1171,24 +1204,90 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, theme: &Theme) {
     f.buffer_mut().set_string(x, area.y, " x ", close_style);
 }
 
-fn fleet_activity(app: &App, now: Instant) -> f32 {
+fn update_matrix_rain_intensity(app: &mut App, now: Instant) -> f32 {
+    let target = fleet_activity_target(app, now);
+    let elapsed = now
+        .checked_duration_since(app.matrix_rain_intensity_updated_at)
+        .unwrap_or(Duration::ZERO);
+    let prev = app.matrix_rain_intensity;
+    app.matrix_rain_intensity =
+        eased_matrix_rain_intensity(app.matrix_rain_intensity, target, elapsed);
+    if app.matrix_rain_intensity > prev {
+        let offset = Duration::from_secs_f32(app.matrix_rain_intensity * MATRIX_RAIN_RAMP_UP_SECS);
+        app.matrix_rain_foreground_epoch = now.checked_sub(offset).unwrap_or(now);
+    }
+    app.matrix_rain_intensity_updated_at = now;
+    app.matrix_rain_intensity
+}
+
+fn eased_matrix_rain_intensity(current: f32, target: f32, elapsed: Duration) -> f32 {
+    let current = current.clamp(0.0, 1.0);
+    let target = target.clamp(0.0, 1.0);
+    if (current - target).abs() <= f32::EPSILON {
+        return target;
+    }
+    let ramp = if target > current {
+        MATRIX_RAIN_RAMP_UP_SECS
+    } else {
+        MATRIX_RAIN_DECAY_SECS
+    };
+    let step = elapsed.as_secs_f32() / ramp;
+    if target > current {
+        (current + step).min(target)
+    } else {
+        (current - step).max(target)
+    }
+}
+
+fn foreground_column_threshold(seed: u64) -> f32 {
+    unit_f32(hash64(seed ^ 0x9a4b_2f1d_87c6_e503))
+}
+
+fn foreground_rain_head(
+    now: Instant,
+    foreground_epoch: Instant,
+    threshold: f32,
+    activity: f32,
+    speed: u64,
+    cycle: u16,
+) -> Option<i16> {
+    if activity < threshold {
+        return None;
+    }
+    let crossing = foreground_epoch.checked_add(Duration::from_secs_f32(
+        threshold * MATRIX_RAIN_RAMP_UP_SECS,
+    ))?;
+    let age = now.checked_duration_since(crossing)?;
+    let cell_ms = 58 + speed * 19;
+    Some(((age.as_millis() as u64 / cell_ms) % cycle.max(1) as u64) as i16)
+}
+
+fn fleet_activity_target(app: &App, now: Instant) -> f32 {
     let user_sessions: Vec<&SessionSummary> = app
         .sessions
         .iter()
         .filter(|s| s.kind != agentd_protocol::SessionKind::Orchestrator)
         .collect();
     if user_sessions.is_empty() {
-        return 0.18;
+        return 0.0;
     }
     let mut score = 0.0f32;
+    let mut peak = 0.0f32;
     for s in &user_sessions {
-        score += match s.state {
+        let mut session_score: f32 = match s.state {
             SessionState::Running => 1.0,
-            SessionState::AwaitingInput => 0.45,
-            SessionState::Paused | SessionState::Pending => 0.25,
-            SessionState::Done => 0.08,
-            SessionState::Errored => 0.65,
+            SessionState::Pending => 0.55,
+            SessionState::Paused | SessionState::AwaitingInput | SessionState::Done => 0.0,
+            SessionState::Errored => 0.25,
         };
+        if app
+            .agent_statuses
+            .get(&s.id)
+            .map(|status| status.active)
+            .unwrap_or(false)
+        {
+            session_score = session_score.max(1.0);
+        }
         if app
             .pty_activity
             .get(&s.id)
@@ -1196,18 +1295,21 @@ fn fleet_activity(app: &App, now: Instant) -> f32 {
             .map(|d| d.as_millis() < 900)
             .unwrap_or(false)
         {
-            score += 0.55;
+            session_score = session_score.max(1.0);
         } else if let Some(last) = s.last_pty_at_ms {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(last);
             if now_ms.saturating_sub(last) < 1_200 {
-                score += 0.35;
+                session_score = session_score.max(0.7);
             }
         }
+        peak = peak.max(session_score);
+        score += session_score;
     }
-    (0.16 + (score / user_sessions.len().max(1) as f32) * 0.42).clamp(0.12, 0.82)
+    let average = score / user_sessions.len().max(1) as f32;
+    (peak * 0.7 + average * 0.3).clamp(0.0, 1.0)
 }
 
 fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
@@ -1374,47 +1476,52 @@ fn hash64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
+fn unit_f32(seed: u64) -> f32 {
+    ((seed >> 11) as f64 / ((1u64 << 53) as f64)) as f32
+}
+
 fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == PaneFocus::View;
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::ALL)
             .border_style(pane_border_style(&app.theme, focused))
-            .title("─ diff (ESC clears; press d to refresh) ─");
-        let inner = top_border_content_area(area);
-        let para = Paragraph::new(diff.clone()).wrap(Wrap { trim: false });
-        f.render_widget(block, area);
-        f.render_widget(para, inner);
+            .title(" diff (ESC clears; press d to refresh) ");
+        let para = Paragraph::new(diff.clone())
+            .block(block)
+            .wrap(Wrap { trim: false });
+        f.render_widget(para, area);
+        clear_pane_side_borders(f, area, app);
         return;
     }
     let summary = app.selected_session();
     let group = app.selected_group();
     // Width budgets for fitting the title onto the top border.
-    // Layout: `─ <glyph> <label> ─ … ─ <harness> ─  x ─`.
+    // Layout: `<corner> <glyph> <label>  …  <harness>  x <corner>`.
     let total = area.width as usize;
-    let close_w: usize = if summary.is_some() { 4 } else { 0 };
+    let close_w: usize = if summary.is_some() { 3 } else { 0 };
     let harness_w: usize = summary
-        .map(|s| 4 + UnicodeWidthStr::width(s.harness.as_str()))
+        .map(|s| 2 + UnicodeWidthStr::width(s.harness.as_str()))
         .unwrap_or(0);
-    // Label budget = total − right-side blocks − fixed title scaffolding
-    // (`- <glyph> <label> -` is 5 cells plus glyph width and label).
+    // Label budget = total − 2 corners − right-side blocks − fixed
+    // title scaffolding (` <glyph> <label> ` is 3 spaces + glyph
+    // width + label).
     let glyph_w = summary
         .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
         .unwrap_or(0);
     let label_budget = total
+        .saturating_sub(2)
         .saturating_sub(harness_w)
         .saturating_sub(close_w)
-        .saturating_sub(5 + glyph_w);
+        .saturating_sub(3 + glyph_w);
     let title = match (summary, group) {
         (Some(s), _) => format!(
-            "{} {} {} {}",
-            TITLE_BORDER,
+            " {} {} ",
             session_status_glyph(app, s),
             truncate_to_width(&primary_label(s), label_budget),
-            TITLE_BORDER,
         ),
-        (None, Some(g)) => format!("{TITLE_BORDER} group: {} {TITLE_BORDER}", g.name),
-        (None, None) => format!("{TITLE_BORDER} no session {TITLE_BORDER}"),
+        (None, Some(g)) => format!(" group: {} ", g.name),
+        (None, None) => " no session ".to_string(),
     };
     // Harness name right-aligned on the top border so it visually
     // detaches from the session-name title. Sits just left of the
@@ -1423,7 +1530,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // title bar's frame, not as a separately-styled badge.
     let harness_right = summary.map(|s| {
         Line::from(Span::styled(
-            format!("{TITLE_BORDER} {} {TITLE_BORDER}", s.harness),
+            format!(" {} ", s.harness),
             pane_border_style(&app.theme, focused),
         ))
         .alignment(ratatui::layout::Alignment::Right)
@@ -1444,9 +1551,9 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         Style::default().fg(app.theme.matrix_close)
     };
     let close =
-        Line::from(Span::styled(" x ─", close_style)).alignment(ratatui::layout::Alignment::Right);
+        Line::from(Span::styled(" x ", close_style)).alignment(ratatui::layout::Alignment::Right);
     let mut block = Block::default()
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
         .border_style(pane_border_style(&app.theme, focused))
         .title(title);
     // Order matters: ratatui stacks right-aligned titles left-to-right
@@ -1460,8 +1567,9 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     if show_close {
         block = block.title(close);
     }
-    let inner = top_border_content_area(area);
+    let inner = block.inner(area);
     f.render_widget(block, area);
+    clear_pane_side_borders(f, area, app);
 
     if let Some(g) = app.selected_group() {
         render_group_overview(f, inner, app, g);
@@ -2231,7 +2339,7 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
-                    palette commands: new send delete rename diff
+                    palette commands: new send delete rename diff borders
                                       zoom interrupt refresh harnesses help
     ?               toggle this help
     C-x C-c / q     quit
@@ -2444,42 +2552,43 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         // fit both.
         let total_pin = tile_area.width as usize;
         let harness_w = summary
-            .map(|s| 4 + UnicodeWidthStr::width(s.harness.as_str()))
+            .map(|s| 2 + UnicodeWidthStr::width(s.harness.as_str()))
             .unwrap_or(0);
         let glyph_w = summary
             .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
             .unwrap_or(0);
-        // Title shape `- ⬩ <glyph> <label> -` = 7 cells of scaffolding
-        // (dash+space + diamond + space + glyph + space + label + space+dash).
+        // Title shape ` ⬩ <glyph> <label> ` = 5 cells of scaffolding
+        // (1 leading + diamond + 1 + glyph + 1 + label + 1 trailing
+        // = label + 4 + diamond + glyph; diamond is 1 cell).
         let pin_label_budget = total_pin
+            .saturating_sub(2) // corners
             .saturating_sub(harness_w)
-            .saturating_sub(7 + glyph_w);
+            .saturating_sub(5 + glyph_w);
         let title = match summary {
             Some(s) => format!(
-                "{} ⬩ {} {} {}",
-                TITLE_BORDER,
+                " ⬩ {} {} ",
                 session_status_glyph(app, s),
                 truncate_to_width(&primary_label(s), pin_label_budget),
-                TITLE_BORDER,
             ),
-            None => format!("{TITLE_BORDER} ⬩ {} {TITLE_BORDER}", short_id(id)),
+            None => format!(" ⬩ {} ", short_id(id)),
         };
         let harness_right = summary.map(|s| {
             Line::from(Span::styled(
-                format!("{TITLE_BORDER} {} {TITLE_BORDER}", s.harness),
+                format!(" {} ", s.harness),
                 pane_border_style(&app.theme, is_selected),
             ))
             .alignment(ratatui::layout::Alignment::Right)
         });
         let mut block = Block::default()
-            .borders(Borders::TOP)
+            .borders(Borders::ALL)
             .border_style(pane_border_style(&app.theme, is_selected))
             .title(title);
         if let Some(h) = harness_right {
             block = block.title(h);
         }
-        let inner = top_border_content_area(*tile_area);
+        let inner = block.inner(*tile_area);
         f.render_widget(block, *tile_area);
+        clear_pane_side_borders(f, *tile_area, app);
         if let Some(history) = app.histories.get_mut(id) {
             // Render at the *main view's* virtual size, not the
             // pin tile's narrow size. Each `ItemHistory` is shared
@@ -2513,40 +2622,33 @@ pub fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
     let n = n.max(1);
     let cols = n.min(4).max(1);
     let rows = (n + cols - 1) / cols;
-    let row_constraints = spaced_constraints(rows, 1);
+    let row_constraints: Vec<Constraint> = (0..rows)
+        .map(|_| Constraint::Ratio(1, rows as u32))
+        .collect();
     let row_areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(row_constraints)
         .split(area);
     let mut tiles: Vec<Rect> = Vec::with_capacity(n);
-    for (r_idx, row_area) in row_areas.iter().step_by(2).enumerate() {
+    for (r_idx, row_area) in row_areas.iter().enumerate() {
         let placed = r_idx * cols;
         let remaining = n.saturating_sub(placed);
         if remaining == 0 {
             break;
         }
         let cols_here = remaining.min(cols).max(1);
-        let col_constraints = spaced_constraints(cols_here, 2);
+        let col_constraints: Vec<Constraint> = (0..cols_here)
+            .map(|_| Constraint::Ratio(1, cols_here as u32))
+            .collect();
         let col_areas = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(col_constraints)
             .split(*row_area);
-        for col_area in col_areas.iter().step_by(2) {
+        for col_area in col_areas.iter() {
             tiles.push(*col_area);
         }
     }
     tiles
-}
-
-fn spaced_constraints(n: usize, gap: u16) -> Vec<Constraint> {
-    let mut constraints = Vec::with_capacity(n.saturating_mul(2));
-    for idx in 0..n {
-        if idx > 0 {
-            constraints.push(Constraint::Length(gap));
-        }
-        constraints.push(Constraint::Ratio(1, n as u32));
-    }
-    constraints
 }
 
 /// Render a slice of a vt100 screen into `area`, preserving colors and
@@ -3107,22 +3209,34 @@ mod tests {
     }
 
     #[test]
-    fn pin_tile_layout_skips_gap_cells() {
-        let tiles = pin_tile_layout(Rect::new(10, 20, 80, 16), 6);
-
-        assert_eq!(tiles.len(), 6);
-        assert!(
-            tiles.iter().all(|tile| tile.width > 1 && tile.height > 1),
-            "gap rectangles must not be returned as pinned session tiles"
+    fn matrix_rain_intensity_ramps_up_faster_than_down() {
+        assert_eq!(
+            eased_matrix_rain_intensity(0.0, 1.0, Duration::from_secs(5)),
+            1.0
         );
-        for pair in tiles.windows(2) {
-            let a = pair[0];
-            let b = pair[1];
-            if a.y == b.y {
-                assert_eq!(b.x, a.x + a.width + 2);
-            }
-        }
-        assert_eq!(tiles[4].y, tiles[0].y + tiles[0].height + 1);
+        assert_eq!(
+            eased_matrix_rain_intensity(1.0, 0.0, Duration::from_secs(5)),
+            0.75
+        );
+        assert_eq!(
+            eased_matrix_rain_intensity(1.0, 0.0, Duration::from_secs(20)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn foreground_rain_head_starts_at_top_after_activation() {
+        let epoch = Instant::now();
+        let threshold = 0.5;
+        let crossing = epoch + Duration::from_millis(2500);
+        assert_eq!(
+            foreground_rain_head(crossing, epoch, threshold, threshold, 2, 20),
+            Some(0)
+        );
+        assert_eq!(
+            foreground_rain_head(crossing, epoch, threshold, threshold - 0.01, 2, 20),
+            None
+        );
     }
 
     #[test]

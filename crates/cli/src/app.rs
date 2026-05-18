@@ -329,9 +329,17 @@ pub struct App {
     pub agent_statuses: HashMap<String, agentd_protocol::AgentStatus>,
     /// Ambient Matrix-rain panel state for empty rows in the session list.
     pub matrix_rain: crate::matrix_rain::MatrixRain,
+    /// Smoothed 0..1 foreground intensity for Matrix rain. The render path
+    /// eases this toward current fleet activity so rain ramps up and decays
+    /// instead of snapping between idle and active states.
+    pub matrix_rain_intensity: f32,
+    pub matrix_rain_intensity_updated_at: Instant,
+    pub matrix_rain_foreground_epoch: Instant,
     /// User-hidden Matrix-rain panel. Toggle with `/rain`; close with the
     /// panel's `x` button.
     pub matrix_rain_hidden: bool,
+    /// Hide left, right, and bottom border lines for list/view/pin panes.
+    pub hide_pane_side_borders: bool,
     /// Last rendered frame, one string per terminal row. Mouse drag
     /// selection copies out of this snapshot, so it works across the
     /// whole TUI without every widget implementing text export.
@@ -479,15 +487,24 @@ fn selection_bounds_for_layout(
     fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
         c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
     }
+    fn inner(r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+        ratatui::layout::Rect {
+            x: r.x.saturating_add(1),
+            y: r.y.saturating_add(1),
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2),
+        }
+    }
+
     if let Some(list) = layout.list_area {
-        let list_inner = crate::ui::list_content_area(list);
+        let list_inner = inner(list);
         if contains(list_inner, col, row) {
             return Some(list_inner);
         }
     }
 
     if let Some(view) = layout.view_area {
-        let view_inner = crate::ui::top_border_content_area(view);
+        let view_inner = inner(view);
         if contains(view_inner, col, row) {
             return Some(view_inner);
         }
@@ -495,7 +512,7 @@ fn selection_bounds_for_layout(
 
     if let Some(strip) = layout.pin_strip_area {
         for tile in crate::ui::pin_tile_layout(strip, pinned_count) {
-            let tile_inner = crate::ui::top_border_content_area(tile);
+            let tile_inner = inner(tile);
             if contains(tile_inner, col, row) {
                 return Some(tile_inner);
             }
@@ -571,6 +588,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         })
         .unwrap_or(Selection::None);
 
+    let now = Instant::now();
     let mut app = App {
         client: client.clone(),
         sessions,
@@ -607,7 +625,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         orchestrator_panel_h: persisted.orchestrator_panel_h,
         resizing_orchestrator_panel: None,
         pty_activity: HashMap::new(),
-        start_instant: Instant::now(),
+        start_instant: now,
         layout: LayoutSnapshot::default(),
         mouse_pos: None,
         mouse_capture_enabled: true,
@@ -622,7 +640,11 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
         matrix_rain: crate::matrix_rain::MatrixRain::default(),
+        matrix_rain_intensity: 0.0,
+        matrix_rain_intensity_updated_at: now,
+        matrix_rain_foreground_epoch: now,
         matrix_rain_hidden: persisted.matrix_rain_hidden,
+        hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
         text_selection: None,
         selected_text: None,
@@ -677,6 +699,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         matrix_rain_h: app.matrix_rain_h,
         list_collapsed: app.list_collapsed,
         matrix_rain_hidden: app.matrix_rain_hidden,
+        hide_pane_side_borders: app.hide_pane_side_borders,
     });
 
     result
@@ -1030,29 +1053,26 @@ impl App {
         // pending-hydration pairing in `ItemHistory` reattaches
         // tools to their blocks; `feed_tool_result` matches by
         // call_id and just fills `output` on the existing block.
+        let mut replayed_editor_state: Option<EditorState> = None;
+        let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
         match self.client.transcript(id, 0, None).await {
             Ok(t) => {
-                for ev in &t.events {
-                    match &ev.event {
-                        agentd_protocol::SessionEvent::ToolUse { tool, args } => {
-                            // The TUI-dispatch tool (`tui`) is a
-                            // slash-command short-circuit, not a
-                            // real tool block — skip it here just
-                            // like the live notification handler.
-                            if tool != agentd_protocol::TUI_DISPATCH_TOOL {
-                                history.feed_tool_use(tool.clone(), summarize_tool_args(args));
-                            }
-                        }
-                        agentd_protocol::SessionEvent::ToolResult { tool, ok, output } => {
-                            history.feed_tool_result(tool, *ok, output.clone());
-                        }
-                        _ => {}
-                    }
-                }
+                apply_transcript_to_local_state(
+                    &t.events,
+                    &mut history,
+                    &mut replayed_editor_state,
+                    &mut replayed_agent_status,
+                );
             }
             Err(e) => {
                 self.set_status(format!("rehydrate transcript: {e}"));
             }
+        }
+        if let Some(state) = replayed_editor_state {
+            self.editor_states.insert(id.to_string(), state);
+        }
+        if let Some(status) = replayed_agent_status {
+            self.agent_statuses.insert(id.to_string(), status);
         }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
@@ -1608,8 +1628,9 @@ impl App {
                     self.resizing_list = Some((ev.column, self.list_panel_w));
                     return;
                 }
-                // View ↔ pin-strip horizontal divider: with bottom borders
-                // hidden, the first row of pinned-session title bars starts a
+                // View ↔ pin-strip horizontal divider: clicking the
+                // view's bottom border (or equivalently the pin
+                // strip's top border, the same row) starts a
                 // vertical resize-drag for the pin strip.
                 if self.is_on_pin_strip_divider(ev.column, ev.row) {
                     let cur_h = self.layout.pin_strip_area.map(|s| s.height).unwrap_or(0);
@@ -1826,9 +1847,11 @@ impl App {
         )
     }
 
-    /// True if `(col, row)` sits on the first row of pinned-session
-    /// title bars. This is the visible vertical resize handle now
-    /// that the main view's bottom border is an empty gap.
+    /// True if `(col, row)` sits on the main view's bottom border
+    /// row — the divider directly above the pin strip. The view's
+    /// bottom border is at `pin_strip.y − 1` (one row above the
+    /// strip's top border / title row). Only meaningful when there
+    /// IS a pin strip and we're in the normal split layout.
     fn is_on_pin_strip_divider(&self, col: u16, row: u16) -> bool {
         if !matches!(self.zoom, ZoomMode::None) {
             return false;
@@ -1836,29 +1859,11 @@ impl App {
         let Some(strip) = self.layout.pin_strip_area else {
             return false;
         };
-        let pinned_count = self
-            .list_items()
-            .into_iter()
-            .filter(|it| matches!(it, ListItem::Session { summary, .. } if summary.pinned))
-            .count();
-        if pinned_count == 0 {
-            return false;
-        }
-        let tiles = crate::ui::pin_tile_layout(strip, pinned_count);
-        let Some(top_row) = tiles.iter().map(|tile| tile.y).min() else {
-            return false;
+        let view_bottom = match strip.y.checked_sub(1) {
+            Some(r) => r,
+            None => return false,
         };
-        if row != top_row {
-            return false;
-        }
-        tiles
-            .iter()
-            .filter(|tile| tile.y == top_row)
-            .any(|tile| {
-                let in_title = col >= tile.x && col < tile.x + tile.width;
-                let in_unpin = col >= tile.x + 1 && col < tile.x + 5;
-                in_title && !in_unpin
-            })
+        row == view_bottom && col >= strip.x && col < strip.x + strip.width
     }
 
     /// True if `(col, row)` sits on the orchestrator/god panel's top border.
@@ -1894,14 +1899,22 @@ impl App {
 
     fn matrix_rain_available_height(&self) -> Option<u16> {
         let list = self.layout.list_area?;
-        let inner_h = crate::ui::list_content_area(list).height;
+        let inner_h = list.height.saturating_sub(2);
         let used = (self.layout.list_row_count as u16).min(inner_h);
         Some(inner_h.saturating_sub(used))
     }
 
-    /// True if `(col, row)` sits on the list/right-pane divider.
-    /// The grab zone is the list pane's two rightmost clear columns; the
-    /// right pane's left edge is regular usable content.
+    /// True if `(col, row)` sits on the list ↔ right-pane divider.
+    /// The grab zone covers three cells side-by-side:
+    ///   * `list.x + list.width − 1` — list's right border
+    ///   * `view_area.x` — main session view's left border
+    ///   * `pin_strip.x` — first pin tile's left border (when any
+    ///     sessions are pinned)
+    /// The two "left border" cells are at the same column as each
+    /// other (view and pin strip stack vertically), but at row-
+    /// disjoint y ranges, so each contributes to one half of the
+    /// vertical span. Returns false in zoomed layouts (no borders
+    /// to grab there).
     fn is_on_list_divider(&self, col: u16, row: u16) -> bool {
         if !matches!(self.zoom, ZoomMode::None) {
             return false;
@@ -1912,11 +1925,26 @@ impl App {
         if list.width == 0 {
             return false;
         }
-        let divider_start = list.x + list.width.saturating_sub(2);
-        col >= divider_start
-            && col < list.x + list.width
-            && row >= list.y
-            && row < list.y + list.height
+        let list_right_x = list.x + list.width - 1;
+        // List's right border — the original grab handle.
+        if col == list_right_x && row >= list.y && row < list.y + list.height {
+            return true;
+        }
+        // Main view's left border (immediately right of list's
+        // right border).
+        if let Some(view) = self.layout.view_area {
+            if col == view.x && row >= view.y && row < view.y + view.height {
+                return true;
+            }
+        }
+        // First pin tile's left border. The strip's x is the same
+        // column as view.x; we just need the strip's y range.
+        if let Some(strip) = self.layout.pin_strip_area {
+            if col == strip.x && row >= strip.y && row < strip.y + strip.height {
+                return true;
+            }
+        }
+        false
     }
 
     /// Hit-test a left-click against the last frame's pane geometry.
@@ -1982,8 +2010,11 @@ impl App {
         }
         if let Some(view) = self.layout.view_area {
             if contains(view, col, row) {
-                // Uncollapse handle: when the list is collapsed, the
-                // top-left glyph acts as the "show list" button.
+                // Uncollapse handle: when the list is collapsed,
+                // the view's left border column acts as the
+                // "show list" button. Tested before other view
+                // click handlers so a click on column `view.x`
+                // never falls through to a content click.
                 if crate::ui::is_on_view_uncollapse_handle(self, col, row) {
                     self.list_collapsed = false;
                     self.focus = PaneFocus::List;
@@ -2003,9 +2034,16 @@ impl App {
                         .await;
                     return;
                 }
-                // Inner area: top border plus a bottom gap. The render path
-                // stores hit ranges relative to this area.
-                let inner = crate::ui::top_border_content_area(view);
+                // Inner area: same Rect minus the 1-cell border on
+                // each side. The render path stores hit ranges
+                // relative to the inner area's top — translate
+                // before lookup.
+                let inner = ratatui::layout::Rect {
+                    x: view.x + 1,
+                    y: view.y + 1,
+                    width: view.width.saturating_sub(2),
+                    height: view.height.saturating_sub(2),
+                };
                 if let Some(id) = self.selected_id() {
                     if self.try_toggle_block_at(&id, inner, col, row).await {
                         return;
@@ -2207,17 +2245,12 @@ impl App {
                 }
             }
         }
-        // Top border and bottom gap are 1 row each; rows outside the
+        // Top + bottom border are 1 row each; rows outside the inner
         // content area only handle the focus change above.
-        let inner = crate::ui::list_content_area(list);
-        if col < inner.x
-            || col >= inner.x + inner.width
-            || row < inner.y
-            || row >= inner.y + inner.height
-        {
+        if row <= list.y || row + 1 >= list.y + list.height {
             return;
         }
-        let idx = (row - inner.y) as usize;
+        let idx = (row - list.y - 1) as usize;
         let items = self.list_items();
         if idx >= items.len() {
             return;
@@ -2229,7 +2262,7 @@ impl App {
         // with `hovered_diamond` in ui.rs.
         if let ListItem::Session { summary, indented } = &items[idx] {
             let indent = if *indented { 2 } else { 0 };
-            let zone_start = inner.x + indent;
+            let zone_start = list.x + 1 + indent;
             let zone_end = zone_start + 4;
             if col >= zone_start && col < zone_end {
                 let id = summary.id.clone();
@@ -2286,8 +2319,8 @@ impl App {
                 continue;
             }
             // Diamond zone: 4 cells on the top border, starting
-            // after the leading title border — covers `[ ][⬩][ ][status]` in the
-            // title `─ ⬩ <status> <label> <harness>`. Same gesture
+            // after the corner — covers `[ ][⬩][ ][status]` in the
+            // title ` ⬩ <status> <label> <harness> `. Same gesture
             // as clicking the list-view diamond. Must stay in
             // lockstep with `pin_tile_diamond_zone` in ui.rs.
             let diamond_zone_start = tile.x + 1;
@@ -3219,6 +3252,17 @@ impl App {
                     if self.matrix_rain_hidden { "hidden" } else { "shown" }
                 ));
             }
+            "borders" | "border" | "pane-borders" => {
+                self.hide_pane_side_borders = !self.hide_pane_side_borders;
+                self.set_status(format!(
+                    "pane side borders {}",
+                    if self.hide_pane_side_borders {
+                        "hidden"
+                    } else {
+                        "shown"
+                    }
+                ));
+            }
             "diff" => self.run_action(KeyAction::OpenDiff).await,
             "interrupt" => self.run_action(KeyAction::Interrupt).await,
             "mouse" | "select" | "selection" => {
@@ -3297,6 +3341,72 @@ impl App {
 /// style tools, `glob` for globs); otherwise falls back to
 /// truncated JSON. Capped at 80 chars so the header stays single-
 /// line in the typical pane width.
+/// Replay a session's transcript into the local-state snapshots
+/// `bootstrap_terminal` rebuilds on subscribe / pin / TUI restart.
+///
+/// The daemon stores every adapter event in the transcript ring,
+/// but its `event.subscribe` notification stream only fires from
+/// the moment of subscribe forward. Anything that happened before
+/// — a tool block's arguments, a tool result's output, the
+/// current editor buffer, the agent's running status — is missed
+/// unless we re-derive it from the persisted transcript.
+///
+/// Pure function over the events slice plus mutable references to
+/// the local-state cells so it stays trivially unit-testable.
+pub fn apply_transcript_to_local_state(
+    events: &[TimestampedEvent],
+    history: &mut crate::pty_render::ItemHistory,
+    editor_state: &mut Option<EditorState>,
+    agent_status: &mut Option<agentd_protocol::AgentStatus>,
+) {
+    for ev in events {
+        match &ev.event {
+            SessionEvent::ToolUse { tool, args } => {
+                // The TUI-dispatch tool (`tui`) is a slash-command
+                // short-circuit, not a real tool block — skip it
+                // just like the live notification handler does.
+                if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                    history.feed_tool_use(tool.clone(), summarize_tool_args(args));
+                }
+            }
+            SessionEvent::ToolResult { tool, ok, output } => {
+                history.feed_tool_result(tool, *ok, output.clone());
+            }
+            // Each new EditorState supersedes the prior one — the
+            // adapter emits one on every buffer / cursor / queue /
+            // completions change, so the last event in the
+            // transcript is the live state at subscribe time. Without
+            // this, the TUI shows no editor pane after reconnect
+            // until the user types, and the bottom rows of the chat
+            // overflow into where the prompt should sit.
+            SessionEvent::EditorState {
+                queued,
+                buf,
+                cursor,
+                completions,
+            } => {
+                *editor_state = Some(EditorState {
+                    queued: queued.clone(),
+                    buf: buf.clone(),
+                    cursor: *cursor,
+                    completions: completions.clone(),
+                });
+            }
+            // Mirror the live notification handler: `active=true`
+            // sets the running status; `active=false` clears it so
+            // the chat doesn't keep showing a stale spinner.
+            SessionEvent::AgentStatus(status) => {
+                *agent_status = if status.active {
+                    Some(status.clone())
+                } else {
+                    None
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn summarize_tool_args(args: &serde_json::Value) -> String {
     if let Some(obj) = args.as_object() {
         for key in ["command", "path", "query", "glob", "pattern", "cwd"] {
@@ -3442,6 +3552,84 @@ mod tests {
             selection_bounds_for_layout(&test_layout(), 0, true, 0, 30),
             Some(Rect::new(0, 30, 100, 3))
         );
+    }
+
+    /// Symptom-level repro for the zarvis-prompt-overlap bug.
+    ///
+    /// User report (against `tui reconnect`, harness=zarvis): after
+    /// the TUI reconnects or otherwise rebootstraps a session, the
+    /// last turn's output extends all the way to the bottom row,
+    /// overwriting the position where the `❯ ` prompt should sit.
+    /// Typing anything (which triggers a fresh `EditorState` event
+    /// from the adapter) shrinks the chat area by ~3 rows and the
+    /// prompt finally appears.
+    ///
+    /// Root cause: `bootstrap_terminal` replays the transcript but
+    /// only feeds `ToolUse` / `ToolResult` back into the local
+    /// state. `EditorState` events are dropped, so `editor_states`
+    /// stays empty and `render_terminal` doesn't reserve the
+    /// bottom editor pane. Replaying the latest `EditorState` (and
+    /// `AgentStatus`) from the transcript fixes it.
+    #[test]
+    fn apply_transcript_replays_latest_editor_state_for_bootstrap() {
+        use agentd_protocol::SessionEvent;
+        use chrono::TimeZone;
+
+        fn ev(seq: u64, e: SessionEvent) -> TimestampedEvent {
+            TimestampedEvent {
+                seq,
+                at: chrono::Utc.timestamp_opt(0, 0).unwrap(),
+                event: e,
+            }
+        }
+
+        let events = vec![
+            ev(
+                1,
+                SessionEvent::EditorState {
+                    queued: Vec::new(),
+                    buf: "stale".into(),
+                    cursor: 5,
+                    completions: Vec::new(),
+                },
+            ),
+            ev(
+                2,
+                SessionEvent::ToolUse {
+                    tool: "shell".into(),
+                    args: serde_json::json!({"command": "ls"}),
+                },
+            ),
+            // The most recent EditorState — this is what the TUI
+            // must surface on reconnect so the prompt is visible
+            // before the user touches the keyboard.
+            ev(
+                3,
+                SessionEvent::EditorState {
+                    queued: vec!["queued msg".into()],
+                    buf: "latest".into(),
+                    cursor: 6,
+                    completions: vec!["/help".into()],
+                },
+            ),
+        ];
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor_state: Option<EditorState> = None;
+        let mut agent_status: Option<agentd_protocol::AgentStatus> = None;
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor_state,
+            &mut agent_status,
+        );
+
+        let state = editor_state
+            .expect("bootstrap must replay the most recent EditorState so the prompt is visible");
+        assert_eq!(state.buf, "latest");
+        assert_eq!(state.cursor, 6);
+        assert_eq!(state.queued, vec!["queued msg".to_string()]);
+        assert_eq!(state.completions, vec!["/help".to_string()]);
     }
 
     #[test]
