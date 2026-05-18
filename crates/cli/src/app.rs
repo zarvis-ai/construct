@@ -129,6 +129,13 @@ pub enum MinibufferIntent {
     DeleteConfirm {
         session_id: String,
     },
+    /// Confirmation prompt for restarting a terminated (`Done` /
+    /// `Errored`) session. Single-key dispatch: `y`/Enter respawns
+    /// the adapter (with `AGENTD_RESUME=1` so persistent harnesses
+    /// reload state); anything else cancels.
+    RestartConfirm {
+        session_id: String,
+    },
     Rename {
         session_id: String,
     },
@@ -2709,6 +2716,28 @@ impl App {
                 self.open_minibuffer_for_command();
             }
             FocusView => {
+                // Enter on a *terminated* session opens a restart
+                // confirmation instead of drilling in. Typing into
+                // the prompt of a Done/Errored session is a no-op
+                // anyway (adapter exited; PTY writes go nowhere), so
+                // surface a path back to a live adapter while we're
+                // here. Live sessions keep the original drill-in.
+                if matches!(self.focus, PaneFocus::List) {
+                    if let Some(s) = self.selected_session() {
+                        if s.state.is_terminal() {
+                            let session_id = s.id.clone();
+                            let short = short_id(&session_id).to_string();
+                            self.minibuffer = Some(Minibuffer {
+                                prompt: format!("Restart session {short}? (y/N): "),
+                                input: String::new(),
+                                cursor: 0,
+                                intent: MinibufferIntent::RestartConfirm { session_id },
+                                error: None,
+                            });
+                            return;
+                        }
+                    }
+                }
                 // Enter from the list drills into the session view.
                 // In zoomed-list mode, flip the zoom to the view side
                 // so the pane the user is "entering" actually fills
@@ -2966,6 +2995,50 @@ impl App {
         } else {
             Vec::new()
         };
+
+        // Restart confirmation: single-key dispatch (`y` confirms,
+        // anything else cancels) so the user can press one key and
+        // move on, matching the way they invoked the prompt with a
+        // single Enter on the Done session.
+        let restart_intent = matches!(
+            self.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::RestartConfirm { .. })
+        );
+        if restart_intent {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // Pull the session_id out so we can drop the minibuffer
+            // borrow before we await the client call.
+            let session_id = match self.minibuffer.as_ref().map(|m| &m.intent) {
+                Some(MinibufferIntent::RestartConfirm { session_id }) => session_id.clone(),
+                _ => return,
+            };
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.minibuffer = None;
+                    match self.client.restart(&session_id).await {
+                        Ok(()) => {
+                            self.editor_states.remove(&session_id);
+                            self.agent_statuses.remove(&session_id);
+                            self.set_status(format!("restarted {}", short_id(&session_id)));
+                        }
+                        Err(e) => self.set_status(format!("restart failed: {e}")),
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.minibuffer = None;
+                    self.set_status("restart cancelled".to_string());
+                }
+                KeyCode::Char('g') if ctrl => {
+                    self.minibuffer = None;
+                    self.set_status("restart cancelled".to_string());
+                }
+                _ => {
+                    // Ignore other keys so a stray keystroke doesn't
+                    // accidentally cancel the prompt mid-thought.
+                }
+            }
+            return;
+        }
 
         // Approval prompt has single-key shortcuts; bypass the normal
         // editing path so the user can hit y/n/a without typing + Enter.
@@ -3255,6 +3328,30 @@ impl App {
                 match self.client.delete(&session_id).await {
                     Ok(()) => self.set_status(format!("deleted {}", short_id(&session_id))),
                     Err(e) => self.set_status(format!("delete failed: {e}")),
+                }
+            }
+            MinibufferIntent::RestartConfirm { session_id } => {
+                let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+                if !yes {
+                    self.set_status("restart cancelled".to_string());
+                    return;
+                }
+                match self.client.restart(&session_id).await {
+                    Ok(()) => {
+                        // After restart, the new adapter will emit
+                        // EditorState on first input — but the user
+                        // expects the prompt to be ready right away.
+                        // Drop any cached editor state from the dead
+                        // adapter so the next render reserves the
+                        // editor pane preemptively (the
+                        // bootstrap-replay path I landed earlier
+                        // will repopulate it from the resumed
+                        // adapter's transcript).
+                        self.editor_states.remove(&session_id);
+                        self.agent_statuses.remove(&session_id);
+                        self.set_status(format!("restarted {}", short_id(&session_id)));
+                    }
+                    Err(e) => self.set_status(format!("restart failed: {e}")),
                 }
             }
             MinibufferIntent::CommandPalette => {

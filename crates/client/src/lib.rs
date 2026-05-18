@@ -226,6 +226,19 @@ impl Client {
             .await?;
         Ok(())
     }
+    /// Respawn a session's adapter (TUI restart-confirm flow). Used
+    /// on a `Done` session to bring it back to life so the user can
+    /// keep typing. The daemon launches the new adapter with
+    /// `AGENTD_RESUME=1`.
+    pub async fn restart(&self, id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_RESTART,
+                &SessionIdParams { session_id: id.to_string() },
+            )
+            .await?;
+        Ok(())
+    }
     pub async fn set_pinned(&self, id: &str, pinned: bool) -> Result<()> {
         let _: serde_json::Value = self
             .request(

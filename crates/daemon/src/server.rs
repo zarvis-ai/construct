@@ -316,6 +316,13 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
+        m if m == ipc_method::SESSION_RESTART => {
+            let p = params!(SessionIdParams);
+            match manager.clone().restart(&p.session_id).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
         m if m == ipc_method::SESSION_SET_PINNED => {
             let p = params!(SessionSetPinnedParams);
             match manager.set_pinned(&p.session_id, p.pinned).await {
