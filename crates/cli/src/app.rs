@@ -795,44 +795,52 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             ev = input_stream.next() => {
                 match ev {
                     Some(Ok(ev)) => {
+                        // Only enter the drag-coalesce drain when the
+                        // event we just handled was itself a left-drag.
+                        // Polling `input_stream.next().now_or_never()`
+                        // poisons crossterm's `EventStream` wake task
+                        // with a noop waker — subsequent real events
+                        // call `.wake()` on the noop and never notify
+                        // the main `select!`, so input sits in the
+                        // buffer until something else (typically the
+                        // 120 ms `tick`) wakes the loop. Gating on
+                        // "was the last event a drag" keeps typing
+                        // off that code path entirely; a sustained
+                        // drag still coalesces because every drag
+                        // event re-enters the drain.
+                        let was_drag = should_drain_after(&ev);
                         app.on_term_event(ev).await;
-                        // Coalesce consecutive left-button drag events
-                        // before the next render. Mouse drags (resize
-                        // dividers, text selection) fire one event per
-                        // pixel of cursor movement — many per frame on
-                        // a fast mouse — and each event is a tiny state
-                        // mutation. Without this, every event triggers
-                        // a full TUI re-render, which on a session with
-                        // a large PTY history pegs CPU and makes the
-                        // drag feel laggy. Same shape as the
-                        // notification-drain below: apply all pending
-                        // drag updates, render once.
-                        const MAX_DRAG_DRAIN: usize = 64;
-                        let mut drained = 0;
-                        while drained < MAX_DRAG_DRAIN {
-                            match input_stream.next().now_or_never() {
-                                Some(Some(Ok(CtEvent::Mouse(m))))
-                                    if matches!(
-                                        m.kind,
-                                        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-                                    ) =>
-                                {
-                                    app.on_term_event(CtEvent::Mouse(m)).await;
-                                    drained += 1;
+                        if was_drag {
+                            const MAX_DRAG_DRAIN: usize = 64;
+                            let mut drained = 0;
+                            while drained < MAX_DRAG_DRAIN {
+                                match input_stream.next().now_or_never() {
+                                    Some(Some(Ok(CtEvent::Mouse(m))))
+                                        if matches!(
+                                            m.kind,
+                                            MouseEventKind::Drag(
+                                                crossterm::event::MouseButton::Left
+                                            )
+                                        ) =>
+                                    {
+                                        app.on_term_event(CtEvent::Mouse(m)).await;
+                                        drained += 1;
+                                    }
+                                    Some(Some(Ok(other_ev))) => {
+                                        // Non-drag event surfaced —
+                                        // handle it (so we don't drop
+                                        // input) and stop draining so
+                                        // it can render.
+                                        app.on_term_event(other_ev).await;
+                                        break;
+                                    }
+                                    Some(Some(Err(e))) => {
+                                        app.set_status(format!("input error: {e}"));
+                                        break;
+                                    }
+                                    // Stream ended OR no event ready.
+                                    Some(None) | None => break,
                                 }
-                                Some(Some(Ok(other_ev))) => {
-                                    // Non-drag event surfaced — handle
-                                    // it (so we don't drop input) and
-                                    // stop draining so it can render.
-                                    app.on_term_event(other_ev).await;
-                                    break;
-                                }
-                                Some(Some(Err(e))) => {
-                                    app.set_status(format!("input error: {e}"));
-                                    break;
-                                }
-                                // Stream ended OR no event ready.
-                                Some(None) | None => break,
                             }
                         }
                     }
@@ -3882,5 +3890,101 @@ fn encode_key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             Some(s.to_vec())
         }
         _ => None,
+    }
+}
+
+/// True when the just-handled input event should trigger the
+/// drag-coalesce drain (which calls `now_or_never` on the input
+/// stream, briefly poisoning crossterm's wake task). Only left-button
+/// drags qualify; gating like this keeps typing — and every other
+/// event — off the noop-waker path. See the comment at the drain
+/// call-site in `run_loop` for the full failure mode.
+fn should_drain_after(ev: &CtEvent) -> bool {
+    matches!(
+        ev,
+        CtEvent::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            )
+    )
+}
+
+#[cfg(test)]
+mod drain_gate_tests {
+    use super::should_drain_after;
+    use crossterm::event::{
+        Event as CtEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn mouse(kind: MouseEventKind) -> CtEvent {
+        CtEvent::Mouse(MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    fn key(code: KeyCode) -> CtEvent {
+        CtEvent::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        })
+    }
+
+    /// Regression for the typing-lag bug introduced by #24 and fixed
+    /// here: keystrokes must NOT trigger the drag-coalesce drain. If
+    /// this returns true for `Key('a')`, every keystroke calls
+    /// `now_or_never` on the EventStream and poisons crossterm's wake
+    /// task with a noop waker — subsequent keystrokes sit in the
+    /// buffer until the next tick (~120 ms).
+    #[test]
+    fn typing_does_not_trigger_drain() {
+        assert!(!should_drain_after(&key(KeyCode::Char('a'))));
+        assert!(!should_drain_after(&key(KeyCode::Char('Z'))));
+        assert!(!should_drain_after(&key(KeyCode::Enter)));
+        assert!(!should_drain_after(&key(KeyCode::Esc)));
+        assert!(!should_drain_after(&key(KeyCode::Backspace)));
+    }
+
+    #[test]
+    fn left_drag_triggers_drain() {
+        assert!(should_drain_after(&mouse(MouseEventKind::Drag(
+            MouseButton::Left
+        ))));
+    }
+
+    /// Other mouse events — including motion, scroll, clicks, and
+    /// non-left drags — should not trigger the drain. They go through
+    /// the normal one-event-per-render path.
+    #[test]
+    fn other_mouse_events_do_not_trigger_drain() {
+        assert!(!should_drain_after(&mouse(MouseEventKind::Moved)));
+        assert!(!should_drain_after(&mouse(MouseEventKind::ScrollUp)));
+        assert!(!should_drain_after(&mouse(MouseEventKind::ScrollDown)));
+        assert!(!should_drain_after(&mouse(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
+        assert!(!should_drain_after(&mouse(MouseEventKind::Up(
+            MouseButton::Left
+        ))));
+        assert!(!should_drain_after(&mouse(MouseEventKind::Drag(
+            MouseButton::Right
+        ))));
+        assert!(!should_drain_after(&mouse(MouseEventKind::Drag(
+            MouseButton::Middle
+        ))));
+    }
+
+    #[test]
+    fn resize_and_paste_do_not_trigger_drain() {
+        assert!(!should_drain_after(&CtEvent::Resize(120, 40)));
+        assert!(!should_drain_after(&CtEvent::Paste(String::from("hi"))));
+        assert!(!should_drain_after(&CtEvent::FocusGained));
+        assert!(!should_drain_after(&CtEvent::FocusLost));
     }
 }
