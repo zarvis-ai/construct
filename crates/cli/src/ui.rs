@@ -1274,42 +1274,49 @@ fn fleet_activity_target(app: &App, now: Instant) -> f32 {
     let mut score = 0.0f32;
     let mut peak = 0.0f32;
     for s in &user_sessions {
-        let mut session_score: f32 = match s.state {
-            SessionState::Running => 1.0,
-            SessionState::Pending => 0.55,
-            SessionState::Paused | SessionState::AwaitingInput | SessionState::Done => 0.0,
-            SessionState::Errored => 0.25,
-        };
-        if app
+        let active_agent = app
             .agent_statuses
             .get(&s.id)
             .map(|status| status.active)
-            .unwrap_or(false)
-        {
-            session_score = session_score.max(1.0);
-        }
-        if app
+            .unwrap_or(false);
+        let recent_live_pty = app
             .pty_activity
             .get(&s.id)
             .and_then(|at| now.checked_duration_since(*at))
             .map(|d| d.as_millis() < 900)
-            .unwrap_or(false)
-        {
-            session_score = session_score.max(1.0);
+            .unwrap_or(false);
+        let recent_persisted_pty = if recent_live_pty {
+            false
         } else if let Some(last) = s.last_pty_at_ms {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(last);
-            if now_ms.saturating_sub(last) < 1_200 {
-                session_score = session_score.max(0.7);
-            }
-        }
+            now_ms.saturating_sub(last) < 1_200
+        } else {
+            false
+        };
+        let session_score =
+            session_activity_score(active_agent, recent_live_pty, recent_persisted_pty);
         peak = peak.max(session_score);
         score += session_score;
     }
     let average = score / user_sessions.len().max(1) as f32;
     (peak * 0.7 + average * 0.3).clamp(0.0, 1.0)
+}
+
+fn session_activity_score(
+    active_agent: bool,
+    recent_live_pty: bool,
+    recent_persisted_pty: bool,
+) -> f32 {
+    if active_agent || recent_live_pty {
+        1.0
+    } else if recent_persisted_pty {
+        0.7
+    } else {
+        0.0
+    }
 }
 
 fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
@@ -3317,6 +3324,14 @@ mod tests {
             eased_matrix_rain_intensity(1.0, 0.0, Duration::from_secs(20)),
             0.0
         );
+    }
+
+    #[test]
+    fn session_activity_score_only_responds_to_busy_signals() {
+        assert_eq!(session_activity_score(false, false, false), 0.0);
+        assert_eq!(session_activity_score(true, false, false), 1.0);
+        assert_eq!(session_activity_score(false, true, false), 1.0);
+        assert_eq!(session_activity_score(false, false, true), 0.7);
     }
 
     #[test]
