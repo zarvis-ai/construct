@@ -2435,6 +2435,8 @@ emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
     C-c C-c         interrupt
 
   scrollback
+    C-x [ / C-x ]   scroll page up/down
+    C-x { / C-x }   scroll top / bottom
     C-v / M-v       scroll page down/up
     g g / G         scroll top / bottom
 

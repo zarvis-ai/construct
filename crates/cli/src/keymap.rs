@@ -225,6 +225,12 @@ fn emacs() -> Keymap {
         (Chord(vec![alt('x')]), OpenCommandPalette),
         (Chord(vec![ctrl('x'), ch('x')]), OpenCommandPalette),
         // Scroll
+        (Chord(vec![ctrl('x'), ch('[')]), ScrollPageUp),
+        (Chord(vec![ctrl('x'), ch(']')]), ScrollPageDown),
+        (Chord(vec![ctrl('x'), ch('{')]), ScrollTop),
+        (Chord(vec![ctrl('x'), shift('{')]), ScrollTop),
+        (Chord(vec![ctrl('x'), ch('}')]), ScrollBottom),
+        (Chord(vec![ctrl('x'), shift('}')]), ScrollBottom),
         (Chord(vec![ctrl('v')]), ScrollPageDown),
         (Chord(vec![alt('v')]), ScrollPageUp),
         (Chord(vec![ch('g'), ch('g')]), ScrollTop),
@@ -279,6 +285,12 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
         (Chord(vec![ctrl('x'), ctrl('c')]), Quit),
         (Chord(vec![ctrl('x'), ch('t')]), ToggleView),
+        (Chord(vec![ctrl('x'), ch('[')]), ScrollPageUp),
+        (Chord(vec![ctrl('x'), ch(']')]), ScrollPageDown),
+        (Chord(vec![ctrl('x'), ch('{')]), ScrollTop),
+        (Chord(vec![ctrl('x'), shift('{')]), ScrollTop),
+        (Chord(vec![ctrl('x'), ch('}')]), ScrollBottom),
+        (Chord(vec![ctrl('x'), shift('}')]), ScrollBottom),
         (Chord(vec![ctrl('f')]), ScrollPageDown),
         (Chord(vec![ctrl('b')]), ScrollPageUp),
         (Chord(vec![ch('g'), ch('g')]), ScrollTop),
@@ -318,4 +330,76 @@ pub fn format_key(k: &KeyEvent) -> String {
         other => s.push_str(&format!("{:?}", other)),
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve(km: &Keymap, keys: Vec<KeyEvent>) -> KeymapResult {
+        let mut state = ChordState::default();
+        let mut result = KeymapResult::Unhandled;
+        for key in keys {
+            result = state.handle(key, km);
+        }
+        result
+    }
+
+    #[test]
+    fn c_x_bracket_scroll_chords_work_in_emacs_profile() {
+        let km = default_for(Profile::Emacs);
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch('[')]),
+            KeymapResult::Action(KeyAction::ScrollPageUp)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch(']')]),
+            KeymapResult::Action(KeyAction::ScrollPageDown)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch('{')]),
+            KeymapResult::Action(KeyAction::ScrollTop)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), shift('{')]),
+            KeymapResult::Action(KeyAction::ScrollTop)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch('}')]),
+            KeymapResult::Action(KeyAction::ScrollBottom)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), shift('}')]),
+            KeymapResult::Action(KeyAction::ScrollBottom)
+        ));
+    }
+
+    #[test]
+    fn c_x_bracket_scroll_chords_work_in_vim_profile() {
+        let km = default_for(Profile::Vim);
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch('[')]),
+            KeymapResult::Action(KeyAction::ScrollPageUp)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch(']')]),
+            KeymapResult::Action(KeyAction::ScrollPageDown)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch('{')]),
+            KeymapResult::Action(KeyAction::ScrollTop)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), shift('{')]),
+            KeymapResult::Action(KeyAction::ScrollTop)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), ch('}')]),
+            KeymapResult::Action(KeyAction::ScrollBottom)
+        ));
+        assert!(matches!(
+            resolve(&km, vec![ctrl('x'), shift('}')]),
+            KeymapResult::Action(KeyAction::ScrollBottom)
+        ));
+    }
 }
