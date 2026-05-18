@@ -33,6 +33,13 @@ pub fn context_window_tokens(provider: &str, model: &str) -> usize {
         ("openai", _) => 32_000,
         ("anthropic", _) => 200_000,
         ("ollama", _) => 8_000,
+        // ChatGPT-subscription Codex backend. Same gpt-5* family,
+        // same advertised context window as the platform API — the
+        // billing pipe is what differs, not the model. Starting
+        // value; the runtime overflow-learn path in `model_limits.rs`
+        // will tighten if the subscription tier enforces something
+        // lower in practice.
+        ("codex-oauth", _) => 400_000,
         _ => 8_000,
     }
 }

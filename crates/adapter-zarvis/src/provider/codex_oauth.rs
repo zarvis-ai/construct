@@ -23,12 +23,38 @@
 
 use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use super::{LlmProvider, Message, ProviderTurn, TextSink, ToolSpec};
+use super::{
+    Content, LlmProvider, Message, ProviderTurn, Role, StopReason, TextSink, ToolCall,
+    ToolSpec, Usage,
+};
+
+/// Base URL for the OAuth-backed Codex backend. Not the public
+/// platform `api.openai.com`.
+const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
+
+/// Originator identifier that the codex CLI sends; Cloudflare uses
+/// this + the User-Agent + cookies to classify CLI traffic. Don't
+/// rebrand it — anonymous third-party identifiers get challenged.
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
+/// Required `OpenAI-Beta` header value (from openai/codex source).
+const CODEX_OPENAI_BETA: &str = "responses=experimental";
+
+/// Env var that supplies the canonical Codex system prompt
+/// (`instructions` field). Per design decision: we don't bundle the
+/// upstream `gpt_5_codex_prompt.md` — operators opt in by setting
+/// this so they can choose whether to mirror codex CLI exactly or
+/// ship their own prompt. The Codex backend rejects empty
+/// `instructions`, so an unset env var is a hard error.
+const INSTRUCTIONS_ENV: &str = "AGENTD_ZARVIS_CODEX_INSTRUCTIONS";
 
 /// Refresh tokens are good for ~30 days but the server-side window can
 /// be tighter under load. We refresh when the access_token is within
@@ -303,6 +329,149 @@ impl CodexOauth {
     }
 }
 
+/// Read the `instructions` field (Codex's canonical system prompt
+/// equivalent) from the operator-supplied env var. Returns an error
+/// with an actionable hint when unset / empty — sending an empty
+/// `instructions` field gets the request rejected server-side, so
+/// we'd rather fail fast with a useful message.
+fn instructions_from_env() -> Result<String> {
+    let raw = std::env::var(INSTRUCTIONS_ENV).map_err(|_| {
+        anyhow!(
+            "{INSTRUCTIONS_ENV} is not set. The Codex backend requires \
+             a non-empty `instructions` field; zarvis doesn't bundle \
+             the upstream codex CLI prompt by default. Either:\n  \
+             * Copy the canonical prompt from openai/codex \
+             (e.g. codex-rs/core/gpt_5_codex_prompt.md) and export it \
+             as {INSTRUCTIONS_ENV}, OR\n  * Write your own zarvis \
+             system prompt and export that. Empty / unset → request \
+             will be rejected with a 400."
+        )
+    })?;
+    if raw.trim().is_empty() {
+        return Err(anyhow!(
+            "{INSTRUCTIONS_ENV} is set but empty — Codex backend will \
+             reject the request. Set a non-empty value."
+        ));
+    }
+    Ok(raw)
+}
+
+/// Convert one of our `Message`s into Responses-API "input items".
+/// One Message can produce multiple items: the AssistantToolCalls
+/// variant fans out into one `message` item (for the prose, if any)
+/// plus one `function_call` item per tool call. The ToolResult
+/// variant produces a `function_call_output` item.
+fn message_to_input_items(m: &Message) -> Vec<Value> {
+    match &m.content {
+        Content::Text { text } => {
+            let role = match m.role {
+                Role::System => "system",
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                // Tool-role plain text shouldn't really happen (tool
+                // results use the dedicated variant), but be
+                // defensive — surface it as a `user` message rather
+                // than dropping it.
+                Role::Tool => "user",
+            };
+            let typ = if matches!(m.role, Role::Assistant) {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            vec![json!({
+                "type": "message",
+                "role": role,
+                "content": [{ "type": typ, "text": text }],
+            })]
+        }
+        Content::AssistantToolCalls { text, calls } => {
+            let mut out = Vec::with_capacity(calls.len() + 1);
+            if let Some(t) = text.as_deref().filter(|t| !t.is_empty()) {
+                out.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": t }],
+                }));
+            }
+            for c in calls {
+                out.push(json!({
+                    "type": "function_call",
+                    "call_id": c.id,
+                    "name": c.name,
+                    "arguments": serde_json::to_string(&c.input)
+                        .unwrap_or_else(|_| "{}".into()),
+                }));
+            }
+            out
+        }
+        Content::ToolResult {
+            call_id,
+            output,
+            is_error: _,
+        } => {
+            // Responses API doesn't have a dedicated error flag on
+            // function_call_output — error text just rides along in
+            // `output`. The model picks up on it from content.
+            vec![json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            })]
+        }
+    }
+}
+
+/// Convert a `ToolSpec` to Responses-API tool definition shape.
+/// Responses uses a flatter shape than chat-completions: no
+/// `{ "type": "function", "function": {...} }` wrapping.
+fn tool_spec_to_value(t: &ToolSpec) -> Value {
+    json!({
+        "type": "function",
+        "name": t.name,
+        "description": t.description,
+        "parameters": t.schema.clone(),
+    })
+}
+
+/// Build the request body for `POST /backend-api/codex/responses`.
+/// Public for unit testing — keeps the shape pinned independently
+/// of the live transport.
+pub fn build_responses_body(
+    model: &str,
+    instructions: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+) -> Value {
+    let input: Vec<Value> = messages.iter().flat_map(message_to_input_items).collect();
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "stream": true,
+        // Asks the server to emit reasoning summary deltas; we don't
+        // surface them to the user today but it costs nothing to
+        // request and the SSE parser handles them gracefully.
+        "reasoning": { "summary": "auto" },
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.iter().map(tool_spec_to_value).collect());
+        body["parallel_tool_calls"] = Value::Bool(true);
+    }
+    body
+}
+
+/// Tool-call accumulator for the SSE stream. The Responses API
+/// streams function_call items as item-added + arguments-delta
+/// events; we collect them keyed by `item_id` here and flush when
+/// `output_item.done` fires for that id.
+#[derive(Default, Debug)]
+struct FnCallAcc {
+    call_id: String,
+    name: String,
+    args: String,
+}
+
 #[async_trait]
 impl LlmProvider for CodexOauth {
     fn name(&self) -> &str {
@@ -311,30 +480,257 @@ impl LlmProvider for CodexOauth {
 
     async fn complete(
         &self,
-        _model: &str,
-        _system: &str,
-        _messages: &[Message],
-        _tools: &[ToolSpec],
-        _sink: &mut dyn TextSink,
+        model: &str,
+        _system: &str, // intentionally ignored — see instructions_from_env
+        messages: &[Message],
+        tools: &[ToolSpec],
+        sink: &mut dyn TextSink,
     ) -> Result<ProviderTurn> {
-        // Ensure auth is at least loadable + refresh if stale; the
-        // actual responses-call lands in a later commit. This keeps
-        // the error surface honest: today the failure mode for
-        // anyone trying `codex-oauth:` is "request shape not
-        // implemented yet", NOT a silent auth bug they'll have to
-        // re-diagnose later.
+        // The provider's `system` argument exists for the
+        // platform-API providers (OpenAI / Anthropic / Ollama) that
+        // accept system text inline. Codex's Responses API uses the
+        // dedicated `instructions` field instead, and the server
+        // enforces a non-trivial value. We DO NOT silently substitute
+        // the agent's `system` prompt here, because that would mean
+        // shipping zarvis's prompt into Codex's prompt-cache key and
+        // mis-billing reasoning that's been tuned for a different
+        // shape. Operator opts in via the env var.
+        let instructions = instructions_from_env()?;
+        let body = build_responses_body(model, &instructions, messages, tools);
+
+        // Take the auth lock for the duration of the request so
+        // concurrent zarvis turns don't race on token rotation.
         let mut state = self.state.lock().await;
         if Self::needs_refresh(&state.auth) {
             self.refresh_locked(&mut state).await?;
         }
+        let (access_token, account_id) = {
+            let tokens = state
+                .auth
+                .tokens
+                .as_ref()
+                .ok_or_else(|| anyhow!("auth.json tokens missing after refresh"))?;
+            (tokens.access_token.clone(), tokens.account_id.clone())
+        };
+        // Release the lock for the duration of the HTTP call — we
+        // don't need exclusive access to the auth state while the
+        // request streams, and holding the lock would serialize all
+        // codex-oauth turns within a process.
         drop(state);
-        Err(anyhow!(
-            "codex-oauth.complete: auth.json loaded and refresh path \
-             verified, but the Responses-API request body and SSE \
-             parser are still pending. Tracking: \
-             feat/codex-oauth-provider branch."
-        ))
+
+        let mut req = self
+            .http
+            .post(CODEX_RESPONSES_URL)
+            .bearer_auth(&access_token)
+            .header("OpenAI-Beta", CODEX_OPENAI_BETA)
+            .header("originator", CODEX_ORIGINATOR)
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .json(&body);
+        if !account_id.is_empty() {
+            req = req.header("ChatGPT-Account-ID", account_id);
+        }
+        let resp = req
+            .send()
+            .await
+            .context("POST chatgpt.com/backend-api/codex/responses")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let raw = resp.text().await.unwrap_or_default();
+            if status.as_u16() == 400 {
+                if let Some(extracted) = super::parse_overflow(&raw) {
+                    return Err(anyhow::Error::new(super::ContextOverflow {
+                        extracted,
+                        raw,
+                    }));
+                }
+            }
+            // Auth failures on this endpoint usually mean the access
+            // token expired between our refresh check and now (or
+            // the server invalidated it). Surface that distinctly so
+            // the agent loop can stop retrying — re-running `codex
+            // login` is the only fix.
+            if status.as_u16() == 401 {
+                return Err(anyhow!(
+                    "codex-oauth: 401 from chatgpt.com (access token \
+                     rejected). Try re-running `codex login`. Body: {raw}"
+                ));
+            }
+            return Err(anyhow!("codex-oauth: {status} from chatgpt.com: {raw}"));
+        }
+
+        let mut stream = resp.bytes_stream().eventsource();
+        let mut assistant_text = String::new();
+        let mut fn_calls: std::collections::HashMap<String, FnCallAcc> =
+            std::collections::HashMap::new();
+        let mut fn_call_order: Vec<String> = Vec::new();
+        let mut stop_reason = StopReason::EndTurn;
+        let mut usage = Usage::default();
+
+        while let Some(ev) = stream.next().await {
+            let ev = ev.context("codex-oauth SSE stream")?;
+            // The Codex Responses transport uses `event:` SSE names;
+            // `data:` carries the JSON body. eventsource_stream
+            // surfaces both as fields on the event.
+            let kind = ev.event.as_str();
+            let chunk: Value = match serde_json::from_str(&ev.data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match kind {
+                // Streaming assistant text.
+                "response.output_text.delta" => {
+                    if let Some(text) = chunk.get("delta").and_then(|v| v.as_str()) {
+                        if !text.is_empty() {
+                            sink.delta(text);
+                            assistant_text.push_str(text);
+                        }
+                    }
+                }
+                // A new item appeared. We care about function_call
+                // items — record the id/name so subsequent
+                // arguments-delta events can find the accumulator.
+                "response.output_item.added" => {
+                    let Some(item) = chunk.get("item") else { continue };
+                    if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                        continue;
+                    }
+                    let item_id = item
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !item_id.is_empty() {
+                        fn_call_order.push(item_id.clone());
+                        fn_calls.insert(
+                            item_id,
+                            FnCallAcc {
+                                call_id,
+                                name,
+                                args: String::new(),
+                            },
+                        );
+                    }
+                }
+                // Tool-call arguments stream a piece at a time.
+                "response.function_call_arguments.delta" => {
+                    let item_id = chunk
+                        .get("item_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if let Some(acc) = fn_calls.get_mut(item_id) {
+                        if let Some(delta) =
+                            chunk.get("delta").and_then(|v| v.as_str())
+                        {
+                            acc.args.push_str(delta);
+                        }
+                    }
+                }
+                // Final arguments value — some servers send this in
+                // addition to the deltas. Be defensive: overwrite if
+                // we got it, since `delta`s + final is a known
+                // shape.
+                "response.function_call_arguments.done" => {
+                    let item_id = chunk
+                        .get("item_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    if let Some(acc) = fn_calls.get_mut(item_id) {
+                        if let Some(args) =
+                            chunk.get("arguments").and_then(|v| v.as_str())
+                        {
+                            if !args.is_empty() {
+                                acc.args = args.to_string();
+                            }
+                        }
+                    }
+                }
+                // End of stream. Pull usage + stop reason if the
+                // server reported them.
+                "response.completed" | "response.incomplete" | "response.failed" => {
+                    if let Some(u) = chunk.pointer("/response/usage") {
+                        usage.input_tokens = u
+                            .get("input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(usage.input_tokens);
+                        usage.output_tokens = u
+                            .get("output_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(usage.output_tokens);
+                    }
+                    if let Some(reason) = chunk
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(|v| v.as_str())
+                    {
+                        if reason == "max_output_tokens" {
+                            stop_reason = StopReason::MaxTokens;
+                        }
+                    }
+                    break;
+                }
+                _ => {
+                    // Other events (reasoning summaries, status,
+                    // etc.) are not surfaced to the agent in v1.
+                }
+            }
+        }
+
+        // If the model emitted tool calls, that's the turn's stop
+        // reason regardless of what `response.completed` said.
+        let calls: Vec<ToolCall> = fn_call_order
+            .iter()
+            .filter_map(|id| fn_calls.remove(id))
+            .filter(|a| !a.name.is_empty())
+            .map(|a| {
+                let input = if a.args.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(&a.args).unwrap_or_else(|_| json!({}))
+                };
+                ToolCall {
+                    id: if a.call_id.is_empty() {
+                        format!("tool_{}", short_hash(&a.name))
+                    } else {
+                        a.call_id
+                    },
+                    name: a.name,
+                    input,
+                }
+            })
+            .collect();
+        if !calls.is_empty() {
+            stop_reason = StopReason::ToolUse;
+        }
+
+        Ok(ProviderTurn {
+            text: if assistant_text.is_empty() {
+                None
+            } else {
+                Some(assistant_text)
+            },
+            tool_calls: calls,
+            stop_reason,
+            usage,
+        })
     }
+}
+
+fn short_hash(s: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    format!("{:x}", h.finish())[..8].to_string()
 }
 
 #[cfg(test)]
@@ -464,6 +860,152 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn user(text: &str) -> Message {
+        Message {
+            role: Role::User,
+            content: Content::Text {
+                text: text.into(),
+            },
+        }
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content::Text {
+                text: text.into(),
+            },
+        }
+    }
+
+    /// Smoke test: plain user→assistant exchange maps to the
+    /// Responses-API `input` shape with `message` items, correct
+    /// roles, and `input_text` / `output_text` content kinds.
+    #[test]
+    fn build_body_emits_responses_message_shape() {
+        let body = build_responses_body(
+            "gpt-5-codex",
+            "system-prompt-here",
+            &[user("hi"), assistant("hello back")],
+            &[],
+        );
+        assert_eq!(body["model"], "gpt-5-codex");
+        assert_eq!(body["instructions"], "system-prompt-here");
+        assert_eq!(body["stream"], true);
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hi");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["type"], "output_text");
+        assert_eq!(input[1]["content"][0]["text"], "hello back");
+        // No tools were passed; the field should be absent rather
+        // than emitting `tools: []` (server-side has historically
+        // disliked empty arrays here).
+        assert!(body.get("tools").is_none());
+        assert!(body.get("parallel_tool_calls").is_none());
+    }
+
+    /// Tools are emitted in the flatter Responses shape (no
+    /// `function` wrapper) and `parallel_tool_calls: true` is set.
+    #[test]
+    fn build_body_emits_responses_tool_shape() {
+        let tools = vec![ToolSpec {
+            name: "shell".into(),
+            description: "run a shell command".into(),
+            schema: json!({
+                "type": "object",
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"],
+            }),
+        }];
+        let body = build_responses_body("gpt-5-codex", "sys", &[user("ls")], &tools);
+        let tools_v = body["tools"].as_array().expect("tools present");
+        assert_eq!(tools_v.len(), 1);
+        assert_eq!(tools_v[0]["type"], "function");
+        assert_eq!(tools_v[0]["name"], "shell");
+        assert_eq!(tools_v[0]["description"], "run a shell command");
+        assert!(tools_v[0]["parameters"]["properties"]["cmd"].is_object());
+        assert_eq!(body["parallel_tool_calls"], true);
+    }
+
+    /// An AssistantToolCalls message fans out into one `message`
+    /// item (for the pre-tool prose, if any) plus one `function_call`
+    /// item per call. Tool results map to `function_call_output`.
+    /// This is the long pole on round-trip correctness: getting it
+    /// wrong means the model can't see its own prior tool calls and
+    /// goes into a re-call loop.
+    #[test]
+    fn build_body_round_trips_tool_call_history() {
+        let msgs = vec![
+            user("list files"),
+            Message {
+                role: Role::Assistant,
+                content: Content::AssistantToolCalls {
+                    text: Some("calling shell".into()),
+                    calls: vec![ToolCall {
+                        id: "call_abc".into(),
+                        name: "shell".into(),
+                        input: json!({"cmd": "ls"}),
+                    }],
+                },
+            },
+            Message {
+                role: Role::Tool,
+                content: Content::ToolResult {
+                    call_id: "call_abc".into(),
+                    output: "Cargo.toml\nsrc".into(),
+                    is_error: false,
+                },
+            },
+        ];
+        let body = build_responses_body("gpt-5-codex", "sys", &msgs, &[]);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 4, "user + assistant-prose + fn_call + fn_output");
+        assert_eq!(input[0]["role"], "user");
+        // Assistant prose item.
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][0]["text"], "calling shell");
+        // function_call item.
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_abc");
+        assert_eq!(input[2]["name"], "shell");
+        // Arguments must be a JSON-encoded STRING, not an object —
+        // that's the Responses API contract.
+        let args_str = input[2]["arguments"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(args_str).unwrap();
+        assert_eq!(parsed["cmd"], "ls");
+        // function_call_output item.
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_abc");
+        assert_eq!(input[3]["output"], "Cargo.toml\nsrc");
+    }
+
+    /// An AssistantToolCalls with empty `text` does NOT emit an
+    /// empty-text message — the Responses API treats `output_text:
+    /// ""` as a malformed item.
+    #[test]
+    fn build_body_skips_empty_assistant_prose_before_tool_call() {
+        let msgs = vec![Message {
+            role: Role::Assistant,
+            content: Content::AssistantToolCalls {
+                text: None,
+                calls: vec![ToolCall {
+                    id: "x".into(),
+                    name: "shell".into(),
+                    input: json!({}),
+                }],
+            },
+        }];
+        let body = build_responses_body("gpt-5-codex", "sys", &msgs, &[]);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "function_call");
     }
 
     /// `needs_refresh` semantics: no `last_refresh` → refresh now;
