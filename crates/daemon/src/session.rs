@@ -24,6 +24,12 @@ const BROADCAST_CAP: usize = 4096;
 const ADAPTER_DRAIN_CAP: usize = 256;
 /// Per-session PTY history kept in memory for late-attach replay.
 const PTY_RING_CAP: usize = 256 * 1024;
+/// Delay between session.start succeeding on respawn and the
+/// force-redraw bump+restore that nudges the child into a full
+/// SIGWINCH redraw. Long enough for the child to finish its initial
+/// startup draw, short enough that the user sees the resumed pane
+/// painted by the time they navigate to it.
+const RESPAWN_REDRAW_DELAY: Duration = Duration::from_millis(250);
 
 fn should_resume_on_startup(state: SessionState) -> bool {
     !matches!(state, SessionState::Done)
@@ -876,6 +882,37 @@ impl SessionManager {
         tokio::spawn(async move {
             manager.drain_adapter(entry_for_drain, msg_rx).await;
         });
+
+        // Force-redraw cycle for PTY-backed adapters that don't
+        // silently resume. Codex / claude / shell only repaint past
+        // content when their PTY's SIGWINCH fires, and the child was
+        // just spawned at the cached pty_size — so any pty_resize a
+        // TUI sends with the same dimensions is a kernel no-op
+        // (ioctl(TIOCSWINSZ) only signals on actual size change),
+        // leaving the pane stuck on whatever the child happened to
+        // paint at startup (often just a banner / cursor) until the
+        // user manually resizes their terminal.
+        //
+        // We schedule a "bump by 1 col → restore" sequence on a
+        // background task. The 250 ms delay gives the child time to
+        // settle into its initial draw; the two ioctls then force
+        // two SIGWINCH'es, the second of which leaves the PTY at the
+        // correct cached size. zarvis (silent_resume) is skipped —
+        // it explicitly emits nothing on resume.
+        if let Some(size) = force_redraw_size_on_resume(&info.capabilities, start_params.pty_size) {
+            let manager_for_redraw = self.clone();
+            let id_owned = id.to_string();
+            tokio::spawn(async move {
+                tokio::time::sleep(RESPAWN_REDRAW_DELAY).await;
+                let bumped_cols = size.cols.saturating_add(1);
+                let _ = manager_for_redraw
+                    .pty_resize(&id_owned, bumped_cols, size.rows)
+                    .await;
+                let _ = manager_for_redraw
+                    .pty_resize(&id_owned, size.cols, size.rows)
+                    .await;
+            });
+        }
 
         tracing::info!(session = %id, %harness, "resumed");
         Ok(())
@@ -2086,9 +2123,37 @@ async fn generate_auto_title(
     tracing::info!(session = %entry.id, %title, "auto-title applied");
 }
 
+/// Decide whether to schedule the bump+restore SIGWINCH cycle after a
+/// session.start succeeds on respawn. Returns the size to restore to
+/// (we always restore to the cached size, then bump by one column for
+/// the first leg of the cycle). Returns `None` when no force-redraw
+/// is warranted:
+///   * the adapter advertises `supports_silent_resume` (zarvis paints
+///     nothing on resume — any forced SIGWINCH would corrupt its
+///     custom render);
+///   * no cached pty_size to restore to (fresh creates skip this);
+///   * the adapter doesn't expose a PTY at all.
+fn force_redraw_size_on_resume(
+    caps: &agentd_protocol::Capabilities,
+    cached: Option<agentd_protocol::PtySize>,
+) -> Option<agentd_protocol::PtySize> {
+    if caps.supports_silent_resume {
+        return None;
+    }
+    if !caps.supports_pty {
+        return None;
+    }
+    let size = cached?;
+    if size.cols == 0 || size.rows == 0 {
+        return None;
+    }
+    Some(size)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentd_protocol::{Capabilities, PtySize};
 
     #[test]
     fn startup_resume_retries_errored_sessions() {
@@ -2098,5 +2163,79 @@ mod tests {
         assert!(should_resume_on_startup(SessionState::Paused));
         assert!(should_resume_on_startup(SessionState::Errored));
         assert!(!should_resume_on_startup(SessionState::Done));
+    }
+
+    fn pty_caps() -> Capabilities {
+        Capabilities {
+            supports_pty: true,
+            supports_silent_resume: false,
+            ..Default::default()
+        }
+    }
+
+    /// Regression: codex / claude / shell sessions painted only their
+    /// startup banner after a daemon restart because the PTY was
+    /// spawned at the cached size and no SIGWINCH ever fired (kernel
+    /// dedup on `ioctl(TIOCSWINSZ)` when new size == current size).
+    /// The respawn path must schedule a bump+restore for these.
+    #[test]
+    fn force_redraw_runs_for_pty_adapters_with_cached_size() {
+        let caps = pty_caps();
+        let size = Some(PtySize { cols: 160, rows: 50 });
+        assert_eq!(
+            force_redraw_size_on_resume(&caps, size),
+            Some(PtySize { cols: 160, rows: 50 })
+        );
+    }
+
+    /// Zarvis advertises `supports_silent_resume = true` because its
+    /// `interactive.rs` deliberately paints nothing on resume — the
+    /// PTY ring carries the prior screen forward and the next
+    /// keystroke triggers a redraw. A forced SIGWINCH here would
+    /// double-paint the editor pane and confuse the line editor's
+    /// stored cursor.
+    #[test]
+    fn force_redraw_skipped_for_silent_resume_adapters() {
+        let mut caps = pty_caps();
+        caps.supports_silent_resume = true;
+        let size = Some(PtySize { cols: 160, rows: 50 });
+        assert_eq!(force_redraw_size_on_resume(&caps, size), None);
+    }
+
+    /// No cached size on disk (e.g., fresh session never had its
+    /// pty_size persisted) → nothing to restore to, skip the redraw.
+    /// The TUI's normal first-render pty_resize handles sizing.
+    #[test]
+    fn force_redraw_skipped_without_cached_size() {
+        let caps = pty_caps();
+        assert_eq!(force_redraw_size_on_resume(&caps, None), None);
+    }
+
+    /// Headless / non-PTY adapters (anything zarvis-headless-only or
+    /// future structured-only harnesses) shouldn't get a SIGWINCH.
+    #[test]
+    fn force_redraw_skipped_for_non_pty_adapters() {
+        let caps = Capabilities {
+            supports_pty: false,
+            supports_silent_resume: false,
+            ..Default::default()
+        };
+        let size = Some(PtySize { cols: 160, rows: 50 });
+        assert_eq!(force_redraw_size_on_resume(&caps, size), None);
+    }
+
+    /// Degenerate size (0×anything or anything×0) is unrepresentable
+    /// to `ioctl(TIOCSWINSZ)` — skip instead of forwarding garbage.
+    #[test]
+    fn force_redraw_skipped_for_degenerate_size() {
+        let caps = pty_caps();
+        assert_eq!(
+            force_redraw_size_on_resume(&caps, Some(PtySize { cols: 0, rows: 50 })),
+            None
+        );
+        assert_eq!(
+            force_redraw_size_on_resume(&caps, Some(PtySize { cols: 160, rows: 0 })),
+            None
+        );
     }
 }
