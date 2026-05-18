@@ -2198,6 +2198,24 @@ mod tests {
         n
     }
 
+    #[test]
+    fn taskstart_creates_toolblock() {
+        let mut h = ItemHistory::default();
+        // Initially empty
+        assert!(h.items.is_empty());
+        h.feed_task_start("call1".into(), "shell".into(), "ls -la".into());
+        assert_eq!(h.items.len(), 1);
+        match &h.items[0] {
+            Item::ToolBlock(b) => {
+                assert_eq!(b.call_id, "call1");
+                assert_eq!(b.tool.as_deref(), Some("shell"));
+                assert_eq!(b.args_summary.as_deref(), Some("ls -la"));
+                assert!(b.output.is_none());
+            }
+            _ => panic!("expected ToolBlock"),
+        }
+    }
+
     /// Regression: when a session is both visible in the main view
     /// and shown in the pin strip, the pin tile rendering must not
     /// clobber the main view's rendering on subsequent frames.
