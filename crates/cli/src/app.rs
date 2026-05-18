@@ -3542,6 +3542,27 @@ pub fn apply_transcript_to_local_state(
 ) {
     for ev in events {
         match &ev.event {
+            // TaskStart is the PRIMARY block-creation event for
+            // current zarvis sessions — it carries the explicit
+            // `call_id` and the live `on_notification` handler
+            // forwards it to `feed_task_start`. Without forwarding
+            // it here too, a fresh TUI re-attaching to an existing
+            // session sees no `ToolBlock` items in the replayed
+            // history (the OSC 7700 backstop only fires for legacy
+            // `pty.log` files; current zarvis doesn't write the
+            // fences), `has_blocks` is false, and the user can no
+            // longer see synthesized tool blocks at all — including
+            // when scrolling. See
+            // `zarvis_tool_block_visible_after_bootstrap_via_task_start`.
+            SessionEvent::TaskStart { call_id, tool, args_summary } => {
+                if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                    history.feed_task_start(
+                        call_id.clone(),
+                        tool.clone(),
+                        args_summary.clone(),
+                    );
+                }
+            }
             SessionEvent::ToolUse { tool, args } => {
                 // The TUI-dispatch tool (`tui`) is a slash-command
                 // short-circuit, not a real tool block — skip it
@@ -3691,6 +3712,77 @@ mod tests {
         assert_eq!(
             selection_bounds_for_layout(&test_layout(), 0, false, 0, 1),
             None
+        );
+    }
+
+    /// REGRESSION: a TUI re-attaching to an existing zarvis session
+    /// shows the tool blocks again. Current zarvis interactive
+    /// adapters never write OSC 7700 fences to the PTY (the helpers
+    /// `tool_block_open` / `tool_block_close` exist but no call
+    /// site remains); tool blocks are communicated entirely via
+    /// `SessionEvent::TaskStart` (carrying `call_id`) followed by
+    /// `ToolUse` and `ToolResult`. `apply_transcript_to_local_state`
+    /// must forward `TaskStart` to `feed_task_start` or no
+    /// `ToolBlock` items exist after bootstrap and the user sees
+    /// raw chat with no synthesized blocks at any scroll position.
+    #[test]
+    fn task_start_in_transcript_creates_tool_block() {
+        use agentd_protocol::{AgentStatus, SessionEvent, TimestampedEvent};
+        use chrono::Utc;
+        fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
+            TimestampedEvent {
+                seq,
+                at: Utc::now(),
+                event,
+            }
+        }
+        let events = vec![
+            ev(
+                1,
+                SessionEvent::TaskStart {
+                    call_id: "t1".into(),
+                    tool: "shell".into(),
+                    args_summary: "ls -la".into(),
+                },
+            ),
+            ev(
+                2,
+                SessionEvent::ToolResult {
+                    tool: "t1".into(),
+                    ok: true,
+                    output: "out".into(),
+                },
+            ),
+        ];
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor: Option<EditorState> = None;
+        let mut status: Option<AgentStatus> = None;
+        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
+
+        // The render must include the synthesized header for the
+        // block. Before the fix, no `ToolBlock` items existed and
+        // the renderer fell through to `replay_cached` — no header.
+        let screen_rows = 24u16;
+        let screen_cols = 80u16;
+        let out = history.replay(screen_cols, screen_rows, 0);
+        let text: String = (0..screen_rows)
+            .flat_map(|r| {
+                let mut row = String::new();
+                for c in 0..screen_cols {
+                    if let Some(cell) = out.screen.cell(r, c) {
+                        row.push_str(&cell.contents());
+                    }
+                }
+                row.push('\n');
+                row.chars().collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            text.contains("→ shell"),
+            "TaskStart must be forwarded to ItemHistory::feed_task_start. \
+             Without it, fresh-TUI bootstrap of an existing zarvis session \
+             rebuilds history with no tool blocks. Got render:\n{text}",
         );
     }
 

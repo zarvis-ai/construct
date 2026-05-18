@@ -621,27 +621,44 @@ impl ItemHistory {
         // user actually saw. This is a no-op when dims match.
         self.set_pty_size(cols, rows);
 
-        // Mouse-wheel scrollback: divert to the shadow parser
-        // when the caller is asking for older content. The shadow
-        // sees the same byte stream as main, with alt-screen
-        // toggles + content filtered out, so it stays in normal-
-        // screen mode and `set_scrollback` actually exposes
-        // history (alt-screen has no scrollback by design;
-        // codex's natural `\r\n` chat content still flows
-        // through). At scroll=0 we fall back to the live main
-        // parser so block hit-test geometry, animated tool block
-        // counters, etc. stay correct.
-        if scrollback > 0 {
+        let has_blocks = self
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::ToolBlock(_)));
+        // Mouse-wheel scrollback for non-tool-block sessions
+        // (shell / claude / codex): divert to the shadow parser.
+        // The shadow sees the same byte stream as main, with
+        // alt-screen toggles + content filtered out, so it stays
+        // in normal-screen mode and `set_scrollback` actually
+        // exposes history (alt-screen has no scrollback by
+        // design; codex's natural `\r\n` chat content still
+        // flows through). At scroll=0 we fall back to the live
+        // main parser so block hit-test geometry, animated tool
+        // block counters, etc. stay correct.
+        //
+        // Tool-block sessions (zarvis) take the main parser path
+        // even when scrolled. Two reasons:
+        //   1. zarvis is `\r\n`-shaped chat; its main parser
+        //      naturally populates scrollback, so the shadow
+        //      isn't needed.
+        //   2. The shadow only sees the truncated PTY-side
+        //      preview (one ✓-glyph line per call); the
+        //      synthesized multi-row `→ tool(args)` + status +
+        //      body block lives only in the main parser path. If
+        //      we diverted to the shadow as soon as the user
+        //      scrolled, every tool block would collapse to one
+        //      row and the surrounding chat would shift — the
+        //      user perceives that as "the tool block
+        //      disappeared". See
+        //      `zarvis_tool_block_survives_one_row_of_scroll`
+        //      for the regression repro.
+        if scrollback > 0 && !has_blocks {
             self.render_shadow(cols, rows, scrollback);
             return RenderOutput {
                 screen: self.shadow_parser.screen(),
                 blocks: Vec::new(),
             };
         }
-        let has_blocks = self
-            .items
-            .iter()
-            .any(|i| matches!(i, Item::ToolBlock(_)));
         if has_blocks {
             self.replay_full(cols, rows, scrollback)
         } else {
@@ -3067,6 +3084,131 @@ mod tests {
         assert_eq!(
             live, scrolled,
             "with no natural newlines, scrollback has nothing to expose"
+        );
+    }
+
+    /// REGRESSION: zarvis tool-call rendering "disappears" the
+    /// moment the user scrolls.
+    ///
+    /// Mechanism: the live view (`scrollback = 0`) renders a
+    /// `ToolBlock` as a multi-row synthesized UI (`→ tool(args)`
+    /// header + status row + optional output body — roughly 4-5
+    /// rows for a typical result). As soon as the user scrolls, the
+    /// renderer diverts to the shadow parser, which only sees the
+    /// raw PTY bytes the adapter wrote — the truncated one-line
+    /// preview (`✓ <line>`). Effect: the multi-row synthesized
+    /// block collapses to one row, every other row shifts by the
+    /// missing rows, and the user perceives "the tool block
+    /// disappeared".
+    ///
+    /// This test pins down the symptom by checking that the SAME
+    /// tool block visible in the live render survives into a render
+    /// where the user has scrolled only a single row.
+    #[test]
+    fn zarvis_tool_block_survives_one_row_of_scroll() {
+        let mut h = ItemHistory::new();
+        // Tool block: OSC open + truncated zarvis preview + close,
+        // followed by structured ToolUse/ToolResult so the live path
+        // can synthesize the rich block.
+        h.feed_pty(b"\x1b]7700;open;call=t1\x07");
+        h.feed_pty(b"  \x1b[1;32m\xe2\x9c\x93\x1b[0m  \x1b[2mTOOL-PREVIEW-LINE\x1b[0m\r\n");
+        h.feed_pty(b"\x1b]7700;close;call=t1\x07");
+        h.feed_tool_use("shell".to_string(), "ls".to_string());
+        h.feed_tool_result("t1", true, "TOOL-PREVIEW-LINE".to_string());
+
+        // Just enough chat to fill the viewport — the block stays
+        // visible at the top in the live render.
+        for i in 0..10u32 {
+            h.feed_pty(format!("chat after line {i:02}\r\n").as_bytes());
+        }
+
+        let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        // User scrolls a single row. Before the fix this diverted
+        // to the shadow parser and lost the synthesized rendering.
+        let scrolled = screen_text(h.replay(80, 24, 1).screen, 24, 80);
+
+        // Sanity: the synthesized block IS in the live render. The
+        // header line is part of `synth_block`'s output, fed through
+        // vt100 so the ANSI gets stripped from `cell.contents()`.
+        assert!(
+            live.contains("→ shell"),
+            "synthesized block header should be in live render, got:\n{live}",
+        );
+
+        // The regression assertion: ONE row of scroll should not
+        // wipe the synthesized rendering. Today it does — scrolled
+        // view only has the one-line truncated preview, no header.
+        assert!(
+            scrolled.contains("→ shell"),
+            "REGRESSION: scrolling a single row replaces the synthesized \
+             tool block (`→ tool(args)` + status row + body) with the \
+             one-line zarvis preview from the shadow parser. The user \
+             perceives the tool block as 'disappearing' since several \
+             rows of UI vanish and every row below shifts up. \
+             Got:\n{scrolled}",
+        );
+    }
+
+    /// REGRESSION: a fresh TUI re-attaching to an existing zarvis
+    /// session must show tool blocks just like the session that
+    /// originally rendered them — including in scrollback.
+    ///
+    /// `bootstrap_terminal` in `app.rs` does two steps to rehydrate
+    /// PTY-backed history:
+    ///   1. `client.pty_replay(id)` returns the PTY bytes the daemon
+    ///      buffered in `pty.log` + the in-memory ring.
+    ///   2. `client.transcript(id, …)` is replayed through
+    ///      `apply_transcript_to_local_state`, which forwards events
+    ///      to the history.
+    ///
+    /// Current zarvis interactive sessions do NOT write OSC 7700
+    /// fences to the PTY (they're defined in `interactive.rs` but
+    /// never called); the OSC backstop only fires for `pty.log`
+    /// files left over from older zarvis builds. New sessions
+    /// communicate tool blocks exclusively through
+    /// `SessionEvent::TaskStart` (which carries the `call_id`) +
+    /// `ToolUse` + `ToolResult`. If `apply_transcript_to_local_state`
+    /// drops `TaskStart` on the floor (which it did before this
+    /// fix), no `ToolBlock` items exist after bootstrap and the
+    /// `has_blocks` check in `replay()` is false — `replay_cached`
+    /// runs and the user sees raw chat with no synthesized blocks
+    /// at any scroll position.
+    ///
+    /// This test simulates a current zarvis session: PTY bytes
+    /// without OSC fences, plus a TaskStart + ToolResult on the
+    /// transcript side. After both replays the synthesized block
+    /// must appear in both live and scrolled renders.
+    #[test]
+    fn zarvis_tool_block_visible_after_bootstrap_via_task_start() {
+        let mut h = ItemHistory::new();
+        // Step 1: pty_replay bytes — pure chat, no OSC fences (that's
+        // what current zarvis adapters actually write).
+        for i in 0..10u32 {
+            h.feed_pty(format!("chat line {i:02}\r\n").as_bytes());
+        }
+        // Step 2: transcript replay — TaskStart carries the call_id
+        // and is the canonical block-creation event for new zarvis
+        // sessions. apply_transcript_to_local_state must forward it.
+        h.feed_task_start(
+            "t1".to_string(),
+            "shell".to_string(),
+            "ls".to_string(),
+        );
+        h.feed_tool_result("t1", true, "OUTPUT-LINE".to_string());
+
+        let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
+        let scrolled = screen_text(h.replay(80, 24, 1).screen, 24, 80);
+
+        assert!(
+            live.contains("→ shell"),
+            "live render after bootstrap should show synthesized header — \
+             feed_task_start must create a ToolBlock. got:\n{live}",
+        );
+        assert!(
+            scrolled.contains("→ shell"),
+            "scrolled render after bootstrap should keep the synthesized \
+             header (companion to zarvis_tool_block_survives_one_row_of_scroll \
+             — same fix, different bootstrap source). got:\n{scrolled}",
         );
     }
 }
