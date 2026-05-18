@@ -881,6 +881,29 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Public entry point for "bring a terminated session back to
+    /// life". Used by the TUI's restart-confirm flow: the user
+    /// pressed `y` on a `Done`/`Errored` session and wants to keep
+    /// typing. Refuses sessions that already have a live adapter
+    /// — those are running, not done.
+    ///
+    /// Internally just calls [`Manager::respawn`], which sets
+    /// `AGENTD_RESUME=1` in the adapter env so harnesses that
+    /// persist conversation state (zarvis) reload it on the new
+    /// process.
+    pub async fn restart(self: Arc<Self>, id: &str) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        if entry.adapter.lock().await.is_some() {
+            return Err(anyhow!(
+                "session already has a live adapter (state is not terminal)"
+            ));
+        }
+        self.respawn(id).await
+    }
+
     async fn drain_adapter(
         self: Arc<Self>,
         entry: Arc<SessionEntry>,

@@ -479,6 +479,12 @@ pub mod ipc_method {
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_KILL: &str = "session.kill";
     pub const SESSION_DELETE: &str = "session.delete";
+    /// Respawn a session's adapter — typically used to bring a `Done`
+    /// session back to life so the user can continue typing. The
+    /// adapter is launched with `AGENTD_RESUME=1` so harnesses that
+    /// persist conversation state (e.g. zarvis) can pick up where
+    /// they left off.
+    pub const SESSION_RESTART: &str = "session.restart";
     pub const SESSION_SET_PINNED: &str = "session.set_pinned";
     pub const SESSION_SET_TITLE: &str = "session.set_title";
     pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
