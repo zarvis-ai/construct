@@ -5,9 +5,38 @@
 //! renderer reveals by pinning letters when rain columns pass their target row.
 
 use agentd_protocol::{SessionEvent, SessionState};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_ACTIVE_REVEALS: usize = 4;
+
+/// Minimum gap between PTY-triggered reveal words for the same
+/// session. PTY events arrive in bursts (many bytes per agent turn);
+/// without throttling each chunk would queue a word and starve the
+/// active-reveal cap.
+const PTY_REVEAL_GAP: Duration = Duration::from_millis(3500);
+
+/// Fallback activity words used only when the PTY byte stream
+/// hasn't yielded any extractable word for a session yet (or the
+/// pool was already drained by the last reveal). Zarvis already
+/// emits structured tool events that map to richer words via
+/// `word_for_event`; this list is just so the rain isn't silent
+/// during the very first PTY chunk of a session.
+const PTY_ACTIVITY_WORDS: &[&str] = &[
+    "working", "thinking", "running", "writing", "reading", "typing",
+];
+
+/// Min/max characters for a word extracted from PTY content. Below
+/// the min we'd surface English filler ("the", "and"); above the max
+/// the matrix-reveal renderer struggles to fit it in the panel.
+const PTY_WORD_MIN_LEN: usize = 4;
+const PTY_WORD_MAX_LEN: usize = 12;
+
+/// Cap on how many extracted words to retain per session. The reveal
+/// path uses only the most recent one and then drains the pool, so a
+/// modest cap is enough to absorb a burst between throttle ticks
+/// without unbounded growth.
+const PTY_WORD_POOL_MAX: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashTone {
@@ -47,6 +76,18 @@ impl RevealWord {
 #[derive(Debug, Default, Clone)]
 pub struct MatrixRain {
     queue: Vec<RevealWord>,
+    /// Last PTY-triggered reveal per session — used to rate-limit
+    /// the heartbeat path so a single agent turn doesn't flood the
+    /// reveal queue.
+    pty_throttle: HashMap<String, Instant>,
+    /// Per-session FIFO of words harvested from the PTY byte stream
+    /// (ANSI-stripped, alphabetic, 4–12 chars). Each reveal pops the
+    /// newest one, so the matrix reflects what the harness most
+    /// recently printed instead of cycling a hard-coded list.
+    pty_word_pool: HashMap<String, VecDeque<String>>,
+    /// Monotonic cursor for the fallback rotation used when the
+    /// per-session word pool is empty.
+    pty_word_cursor: u32,
 }
 
 impl MatrixRain {
@@ -67,6 +108,56 @@ impl MatrixRain {
         }
     }
 
+    /// Heartbeat from a PTY-only harness (codex / claude in
+    /// interactive mode, shell). PTY adapters don't emit structured
+    /// `ToolUse` / `Status` events while the agent is working, so
+    /// without this the matrix rain reveals nothing for them. We
+    /// always harvest words from `bytes` into the per-session pool
+    /// (so the rain reflects current activity, not stale state) and
+    /// then — at most once per `PTY_REVEAL_GAP` per session — queue
+    /// the most recent extracted word. Falls back to a rotating
+    /// generic word for the first chunk when the pool is empty.
+    pub fn observe_pty_activity(&mut self, session_id: &str, bytes: &[u8], now: Instant) {
+        {
+            let pool = self
+                .pty_word_pool
+                .entry(session_id.to_string())
+                .or_default();
+            extract_pty_words(bytes, pool);
+        }
+        if let Some(prev) = self.pty_throttle.get(session_id) {
+            if now.duration_since(*prev) < PTY_REVEAL_GAP {
+                return;
+            }
+        }
+        self.pty_throttle.insert(session_id.to_string(), now);
+
+        let extracted = self.pty_word_pool.get_mut(session_id).and_then(|pool| {
+            let last = pool.pop_back();
+            // Drain the rest so the next reveal reflects fresh
+            // activity (or falls back to the rotation) instead of
+            // re-surfacing stale words.
+            pool.clear();
+            last
+        });
+        let text = extracted.unwrap_or_else(|| {
+            let idx = (self.pty_word_cursor as usize) % PTY_ACTIVITY_WORDS.len();
+            self.pty_word_cursor = self.pty_word_cursor.wrapping_add(1);
+            PTY_ACTIVITY_WORDS[idx].to_string()
+        });
+        let (x, y) = random_position(&text, self.queue.len());
+        self.queue_at(text, FlashTone::Work, x, y, 25, now);
+    }
+
+    /// Forget per-session throttle + extracted-word state. Call when
+    /// a session is reset, ends, or is deleted so the maps don't
+    /// grow unbounded and a future session reusing the id starts
+    /// fresh.
+    pub fn forget_session(&mut self, session_id: &str) {
+        self.pty_throttle.remove(session_id);
+        self.pty_word_pool.remove(session_id);
+    }
+
     pub fn observe_tool_decision(&mut self, decision: &str) {
         match decision {
             "approve" | "automode" => self.queue_random("approved", FlashTone::Good, 95),
@@ -76,8 +167,12 @@ impl MatrixRain {
     }
 
     fn queue_random(&mut self, text: &'static str, tone: FlashTone, priority: u8) {
+        self.queue_random_at(text, tone, priority, Instant::now());
+    }
+
+    fn queue_random_at(&mut self, text: &'static str, tone: FlashTone, priority: u8, now: Instant) {
         let (x, y) = random_position(text, self.queue.len());
-        self.queue(text, tone, x, y, priority);
+        self.queue_at(text, tone, x, y, priority, now);
     }
 
     pub fn queue(
@@ -88,7 +183,18 @@ impl MatrixRain {
         y: f32,
         priority: u8,
     ) {
-        let now = Instant::now();
+        self.queue_at(text, tone, x, y, priority, Instant::now());
+    }
+
+    fn queue_at(
+        &mut self,
+        text: impl Into<String>,
+        tone: FlashTone,
+        x: f32,
+        y: f32,
+        priority: u8,
+        now: Instant,
+    ) {
         self.queue.retain(|word| !word.expired(now));
         let duration = Duration::from_millis(12_000);
         self.queue.push(RevealWord {
@@ -113,6 +219,105 @@ impl MatrixRain {
             }
         }
     }
+}
+
+/// Walk `bytes`, skip ANSI escape sequences, and push each run of
+/// ASCII-alphabetic characters of length `[PTY_WORD_MIN_LEN,
+/// PTY_WORD_MAX_LEN]` onto `pool`. Multi-byte UTF-8 codepoints are
+/// treated as word boundaries — keeping the extracted words ASCII
+/// so they always render cleanly in the matrix panel.
+///
+/// The escape skipper handles the two sequence families codex /
+/// claude TUIs produce in bulk:
+/// - **CSI** (`ESC [ … <final 0x40–0x7E>`) — colors, cursor moves.
+/// - **OSC** (`ESC ] … (BEL | ESC \)`) — title sets, hyperlinks.
+///
+/// Everything else after `ESC` is treated as a 2-byte sequence
+/// (charset switches, simple escapes) — enough to avoid accidentally
+/// harvesting the escape's terminator as a word character.
+fn extract_pty_words(bytes: &[u8], pool: &mut VecDeque<String>) {
+    let mut i = 0;
+    let mut current = String::new();
+    // True when the current alphabetic run already exceeded
+    // PTY_WORD_MAX_LEN — we drop the rest of the run rather than
+    // letting its tail re-enter as a separate "word".
+    let mut poisoned = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            push_word(&mut current, pool);
+            poisoned = false;
+            i = skip_escape(bytes, i + 1);
+        } else if b.is_ascii_alphabetic() {
+            if poisoned {
+                i += 1;
+                continue;
+            }
+            current.push(b as char);
+            if current.len() > PTY_WORD_MAX_LEN {
+                current.clear();
+                poisoned = true;
+            }
+            i += 1;
+        } else {
+            push_word(&mut current, pool);
+            poisoned = false;
+            i += 1;
+        }
+    }
+    push_word(&mut current, pool);
+}
+
+fn push_word(current: &mut String, pool: &mut VecDeque<String>) {
+    let len = current.chars().count();
+    if (PTY_WORD_MIN_LEN..=PTY_WORD_MAX_LEN).contains(&len) {
+        let word = std::mem::take(current);
+        // Drop exact consecutive duplicates so a long "Thinking…"
+        // stretch doesn't fill the pool with one word.
+        if pool.back().map(|prev| prev != &word).unwrap_or(true) {
+            pool.push_back(word);
+            while pool.len() > PTY_WORD_POOL_MAX {
+                pool.pop_front();
+            }
+        }
+    } else {
+        current.clear();
+    }
+}
+
+fn skip_escape(bytes: &[u8], mut i: usize) -> usize {
+    if i >= bytes.len() {
+        return i;
+    }
+    let b = bytes[i];
+    i += 1;
+    match b {
+        b'[' => {
+            while i < bytes.len() {
+                let c = bytes[i];
+                i += 1;
+                if (0x40..=0x7e).contains(&c) {
+                    break;
+                }
+            }
+        }
+        b']' => {
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c == 0x07 {
+                    i += 1;
+                    break;
+                }
+                if c == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        _ => { /* 2-byte escape: ESC + one char already consumed. */ }
+    }
+    i
 }
 
 fn random_position(text: &str, salt: usize) -> (f32, f32) {
@@ -308,5 +513,162 @@ mod tests {
             assert!((0.08..=0.86).contains(&x));
             assert!((0.22..=0.88).contains(&y));
         }
+    }
+
+    #[test]
+    fn pty_activity_falls_back_to_rotation_when_pool_empty() {
+        // Codex / claude / shell emit only PTY events while the
+        // agent is working — when the very first chunk has no
+        // extractable words, the rain still reveals a generic
+        // activity word so the panel isn't silent.
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-a", b"\x1b[31m\x1b[0m", now);
+        let word = rain.active_reveal(now).map(|w| w.text.clone());
+        assert!(
+            word.as_deref().map(|w| PTY_ACTIVITY_WORDS.contains(&w)).unwrap_or(false),
+            "expected fallback rotation word, got {word:?}"
+        );
+    }
+
+    #[test]
+    fn pty_activity_prefers_extracted_word_over_rotation() {
+        // When the PTY chunk carries real text, the matrix should
+        // reveal a word from it instead of the rotation fallback —
+        // that's the whole "reflect actual work" point.
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-a", b"Editing src/foo.rs", now);
+        let word = rain
+            .active_reveal(now)
+            .map(|w| w.text.clone())
+            .expect("reveal");
+        assert!(
+            !PTY_ACTIVITY_WORDS.contains(&word.as_str()),
+            "expected extracted word, got fallback {word:?}"
+        );
+        assert_eq!(word, "Editing");
+    }
+
+    #[test]
+    fn pty_activity_throttles_repeated_calls_within_gap() {
+        // A burst of PTY events from a single session should produce
+        // exactly one reveal, not one per byte chunk.
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-a", b"Reading", now);
+        rain.observe_pty_activity("sess-a", b"more", now + Duration::from_millis(100));
+        rain.observe_pty_activity("sess-a", b"bytes", now + Duration::from_millis(1000));
+        let count = rain.active_reveals(now + Duration::from_millis(1100)).count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn pty_activity_uses_latest_word_after_burst() {
+        // Words harvested while throttled still go into the pool, so
+        // when the gate next opens the reveal reflects the most
+        // recent chunk — not the one that originally tripped the
+        // throttle.
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-a", b"Reading", now);
+        let first = rain
+            .active_reveal(now)
+            .map(|w| w.text.clone())
+            .expect("first reveal");
+        assert_eq!(first, "Reading");
+        // More bytes arrive while throttled — pool keeps growing.
+        rain.observe_pty_activity(
+            "sess-a",
+            b"Editing files",
+            now + Duration::from_millis(500),
+        );
+        let later = now + PTY_REVEAL_GAP + Duration::from_millis(10);
+        rain.observe_pty_activity("sess-a", b"", later);
+        let texts: Vec<_> = rain
+            .active_reveals(later)
+            .map(|w| w.text.clone())
+            .collect();
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[1], "files"); // most recent word from the pool
+    }
+
+    #[test]
+    fn pty_activity_per_session_throttle_is_independent() {
+        // Two different sessions can each get their own reveal
+        // within the gap window — the throttle is per-session.
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-a", b"Editing", now);
+        rain.observe_pty_activity("sess-b", b"Reading", now);
+        assert_eq!(rain.active_reveals(now).count(), 2);
+    }
+
+    #[test]
+    fn forget_session_clears_throttle_and_pool() {
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-a", b"Editing", now);
+        rain.forget_session("sess-a");
+        assert!(rain.pty_word_pool.get("sess-a").is_none());
+        rain.observe_pty_activity("sess-a", b"Reading", now + Duration::from_millis(50));
+        assert_eq!(rain.active_reveals(now + Duration::from_millis(50)).count(), 2);
+    }
+
+    #[test]
+    fn extract_pty_words_strips_csi_and_keeps_alpha_runs() {
+        let mut pool = VecDeque::new();
+        // Typical codex/claude output: ANSI color around words, file
+        // paths with non-alpha separators.
+        extract_pty_words(
+            b"\x1b[1mEditing\x1b[0m src/main.rs and tests/foo_bar.rs",
+            &mut pool,
+        );
+        let words: Vec<&str> = pool.iter().map(|s| s.as_str()).collect();
+        // "src", "rs", "and", "foo", "bar" all fall outside 4..=12 — only
+        // these qualify:
+        assert_eq!(words, vec!["Editing", "main", "tests"]);
+    }
+
+    #[test]
+    fn extract_pty_words_strips_osc_and_drops_long_runs() {
+        let mut pool = VecDeque::new();
+        // OSC sequence terminated by BEL, then a too-long word, then a fine one.
+        extract_pty_words(
+            b"\x1b]0;title\x07Supercalifragilisticexpialidocious\nReading",
+            &mut pool,
+        );
+        let words: Vec<&str> = pool.iter().map(|s| s.as_str()).collect();
+        // OSC payload contains "title" (5 chars) before BEL — it should be
+        // skipped along with the rest of the escape, so only "Reading"
+        // (the long word is past the 12-char cap) makes it in.
+        assert_eq!(words, vec!["Reading"]);
+    }
+
+    #[test]
+    fn extract_pty_words_deduplicates_consecutive_repeats() {
+        let mut pool = VecDeque::new();
+        // A spinner that repeatedly prints "Thinking" should leave
+        // only one entry, not flood the pool with duplicates.
+        for _ in 0..5 {
+            extract_pty_words(b"Thinking ", &mut pool);
+        }
+        assert_eq!(pool.iter().collect::<Vec<_>>(), vec![&"Thinking".to_string()]);
+    }
+
+    #[test]
+    fn extract_pty_words_caps_pool_at_max() {
+        let mut pool = VecDeque::new();
+        // Generate `PTY_WORD_POOL_MAX + 8` distinct alphabetic
+        // words (digits would split them mid-run and trip the
+        // dedupe path, masking the cap behavior we want to test).
+        let mut input = String::new();
+        for i in 0..(PTY_WORD_POOL_MAX + 8) {
+            let a = (b'a' + (i / 26) as u8) as char;
+            let b = (b'a' + (i % 26) as u8) as char;
+            input.push_str(&format!("word{a}{b} "));
+        }
+        extract_pty_words(input.as_bytes(), &mut pool);
+        assert_eq!(pool.len(), PTY_WORD_POOL_MAX);
     }
 }

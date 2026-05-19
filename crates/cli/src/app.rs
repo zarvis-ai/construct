@@ -1352,6 +1352,7 @@ impl App {
                             self.editor_states.remove(&payload.session_id);
                             self.agent_statuses.remove(&payload.session_id);
                             self.pty_activity.remove(&payload.session_id);
+                            self.matrix_rain.forget_session(&payload.session_id);
                             if Some(payload.session_id.as_str()) == self.transcript_session.as_deref() {
                                 self.transcript.clear();
                                 self.transcript_scroll = u16::MAX;
@@ -1383,16 +1384,30 @@ impl App {
                         }
                         // PTY events: feed into the per-session items history.
                         if let SessionEvent::Pty { .. } = &payload.event {
-                            if let Some(bytes) = payload.event.pty_bytes() {
+                            let now = Instant::now();
+                            let bytes = payload.event.pty_bytes();
+                            if let Some(b) = bytes.as_deref() {
                                 let history = self
                                     .histories
                                     .entry(payload.session_id.clone())
                                     .or_default();
-                                history.feed_pty(&bytes);
+                                history.feed_pty(b);
                             }
                             // Mark the session as freshly active for the spinner.
                             self.pty_activity
-                                .insert(payload.session_id.clone(), Instant::now());
+                                .insert(payload.session_id.clone(), now);
+                            // PTY-only harnesses (codex/claude in interactive
+                            // mode, shell) don't emit structured ToolUse/Status
+                            // events while working, so feed the matrix-rain
+                            // the byte stream too. It harvests recent words
+                            // and reveals them on a per-session throttle, so
+                            // the rain reflects what the harness is actually
+                            // printing instead of cycling a hard-coded list.
+                            self.matrix_rain.observe_pty_activity(
+                                &payload.session_id,
+                                bytes.as_deref().unwrap_or(&[]),
+                                now,
+                            );
                             return;
                         }
                         // Tool events feed the same history so the
@@ -1638,6 +1653,7 @@ impl App {
         self.histories.remove(id);
         self.block_hits.remove(id);
         self.pty_activity.remove(id);
+        self.matrix_rain.forget_session(id);
         // Orchestrator session went away → palette fallback after the
         // re-derive below. The orchestrator's PTY parser in
         // `terminals[id]` was already removed by the generic cleanup
