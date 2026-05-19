@@ -1538,16 +1538,17 @@ fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
 }
 
 /// Same head→tail shading as `rain_style`, but the bright endpoint
-/// is `theme.accent_alt` (teal) instead of `theme.accent` (green).
-/// Used for vertical-reveal letter cells so the word reads as a
-/// different hue from the surrounding random rain chars without
-/// jumping out of the matrix palette.
+/// is `theme.text` (near-white pale green in the default theme)
+/// instead of `theme.accent` (the rain's bright green). The vertical
+/// reveal letter ends up *brighter* than the brightest rain head —
+/// clearly readable, still in the matrix palette since the dim end
+/// is the same `matrix_dim` green as the rain.
 fn rain_letter_style(theme: &Theme, shade: f32, activity: f32) -> Style {
     let shade = shade.clamp(0.0, 1.0);
     let boost = activity.clamp(0.0, 1.0);
     let style = Style::default().fg(blend_color(
         theme.matrix_dim,
-        theme.accent_alt,
+        theme.text,
         (shade * 0.86 + boost * 0.14).clamp(0.0, 1.0),
     ));
     if shade > 0.72 {
