@@ -1272,16 +1272,22 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                 }
             }
             if let Some(style) = style {
-                let ch = if in_drop_body {
-                    col_overlay
-                        .and_then(|map| map.get(&(row as i16)).copied())
-                        .unwrap_or_else(|| {
+                // Vertical reveals override the random drop-body
+                // glyph with the word's letter at this row, *and*
+                // bold the cell — same color as the surrounding
+                // drop, just a hair heavier so the eye can pick the
+                // word out of the random tail chars.
+                let (ch, style) = if in_drop_body {
+                    match col_overlay.and_then(|map| map.get(&(row as i16)).copied()) {
+                        Some(letter) => (letter, style.add_modifier(Modifier::BOLD)),
+                        None => {
                             let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
-                            charset[(glyph_seed as usize) % charset.len()] as char
-                        })
+                            (charset[(glyph_seed as usize) % charset.len()] as char, style)
+                        }
+                    }
                 } else {
                     let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
-                    charset[(glyph_seed as usize) % charset.len()] as char
+                    (charset[(glyph_seed as usize) % charset.len()] as char, style)
                 };
                 f.buffer_mut().set_string(
                     rain_area.x + col,

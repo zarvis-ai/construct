@@ -315,15 +315,18 @@ impl MatrixRain {
     }
 }
 
-/// Orientation policy: 50/50 horizontal/vertical regardless of
-/// intensity. With per-cycle random column activation, even at low
-/// intensity every column gets a chance to fire — so both layouts
-/// have a reasonable shot at showing up, and the variety reads
-/// better than locking to one orientation by activity level.
-///
-/// Seeded by `(text, wall-clock nanos)` so consecutive reveals
-/// don't collapse onto the same orientation.
-fn pick_orientation(text: &str, _intensity: f32) -> RevealOrientation {
+/// Orientation policy:
+/// - `intensity < 0.5`: every reveal is vertical. Horizontal needs
+///   one drop per column to pass the same row — at low fleet
+///   activity most attempts never finish pinning, leaving the word
+///   half-written.
+/// - `intensity ≥ 0.5`: 50/50 horizontal/vertical, seeded by
+///   `(text, wall-clock nanos)` so consecutive reveals don't
+///   collapse onto the same orientation.
+fn pick_orientation(text: &str, intensity: f32) -> RevealOrientation {
+    if intensity < 0.5 {
+        return RevealOrientation::Vertical;
+    }
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -740,27 +743,34 @@ mod tests {
     }
 
     #[test]
-    fn pick_orientation_returns_both_at_low_and_high_intensity() {
-        // 50/50 split is enforced at every intensity — neither
-        // orientation should be locked out at low or high activity.
-        for intensity in [0.0_f32, 0.3, 0.5, 1.0] {
-            let mut saw_vertical = false;
-            let mut saw_horizontal = false;
-            for _ in 0..200 {
-                std::thread::sleep(Duration::from_nanos(50));
-                match pick_orientation("rotate", intensity) {
-                    RevealOrientation::Vertical => saw_vertical = true,
-                    RevealOrientation::Horizontal => saw_horizontal = true,
-                }
-                if saw_vertical && saw_horizontal {
-                    break;
-                }
-            }
-            assert!(
-                saw_vertical && saw_horizontal,
-                "expected both orientations at intensity {intensity}, saw v={saw_vertical} h={saw_horizontal}"
-            );
+    fn pick_orientation_locks_to_vertical_below_half_intensity() {
+        // At low fleet activity horizontal reveals would mostly
+        // never finish pinning, so the policy forces vertical there.
+        for variant in 0..64u32 {
+            let text = format!("word{variant}");
+            assert_eq!(pick_orientation(&text, 0.0), RevealOrientation::Vertical);
+            assert_eq!(pick_orientation(&text, 0.49), RevealOrientation::Vertical);
         }
+    }
+
+    #[test]
+    fn pick_orientation_returns_both_at_or_above_half_intensity() {
+        let mut saw_vertical = false;
+        let mut saw_horizontal = false;
+        for _ in 0..400 {
+            std::thread::sleep(Duration::from_nanos(50));
+            match pick_orientation("rotate", 0.8) {
+                RevealOrientation::Vertical => saw_vertical = true,
+                RevealOrientation::Horizontal => saw_horizontal = true,
+            }
+            if saw_vertical && saw_horizontal {
+                break;
+            }
+        }
+        assert!(
+            saw_vertical && saw_horizontal,
+            "expected both orientations at intensity 0.8, saw v={saw_vertical} h={saw_horizontal}"
+        );
     }
 
     #[test]
