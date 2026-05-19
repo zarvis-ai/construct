@@ -107,5 +107,29 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     }
 
     let socket_path = socket_override.unwrap_or_else(|| paths.socket());
+
+    // Phase 1A of the remote-control plan (issue #62): also start a
+    // WebSocket listener on localhost when `AGENTD_REMOTE_WS_PORT`
+    // is set. UNAUTHENTICATED in this commit — only meant to validate
+    // the transport layer behind a tunnel; auth + cloudflared
+    // bundling come in subsequent commits before this can be turned
+    // on for general use.
+    if let Ok(port) = std::env::var("AGENTD_REMOTE_WS_PORT") {
+        if let Ok(port) = port.parse::<u16>() {
+            let mgr = manager.clone();
+            let addr = format!("127.0.0.1:{port}");
+            tokio::spawn(async move {
+                if let Err(e) = server::serve_ws(mgr, &addr).await {
+                    tracing::error!(addr, error = %e, "ws server exited");
+                }
+            });
+        } else {
+            tracing::warn!(
+                value = %port,
+                "AGENTD_REMOTE_WS_PORT is not a valid u16; skipping ws listener"
+            );
+        }
+    }
+
     server::serve(manager, socket_path).await
 }

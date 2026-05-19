@@ -12,13 +12,15 @@ use agentd_protocol::{
     SessionSetTitleParams, SessionToolActionParams, SessionToolDecisionParams, SubscribeParams,
     TranscriptParams, IPC_VERSION,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
+use futures::{SinkExt as _, StreamExt as _};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::BufReader;
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::tungstenite;
 
 pub async fn serve(manager: Arc<SessionManager>, socket_path: PathBuf) -> Result<()> {
     let _ = std::fs::remove_file(&socket_path);
@@ -45,25 +47,54 @@ enum SubCmd {
 }
 
 async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>) -> Result<()> {
-    let (reader, writer) = stream.into_split();
-    let writer = Arc::new(Mutex::new(writer));
-    let (sub_cmd_tx, sub_cmd_rx) = mpsc::channel::<SubCmd>(8);
+    let (reader, mut writer) = stream.into_split();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
 
-    let sub_writer = writer.clone();
-    let sub_manager = manager.clone();
-    let sub_task = tokio::spawn(async move {
-        run_subscription_loop(sub_manager, sub_writer, sub_cmd_rx).await;
+    // Outbound writer: drain the shared channel and emit as
+    // newline-delimited JSON on the Unix socket.
+    let writer_task = tokio::spawn(async move {
+        while let Some(v) = out_rx.recv().await {
+            if transport::write_message(&mut writer, &v).await.is_err() {
+                break;
+            }
+        }
     });
 
-    let mut reader = BufReader::new(reader);
+    let inbound = ReadFromUnix {
+        reader: BufReader::new(reader),
+    };
+    run_session(inbound, out_tx, manager).await;
+    writer_task.abort();
+    Ok(())
+}
+
+/// Transport-agnostic per-connection dispatch loop. The transport
+/// shim is responsible for parsing inbound bytes into JSON values
+/// (`Inbound::next`) and for emitting outbound values from
+/// `out_tx`. Used by both the Unix socket and the WebSocket
+/// listeners so request dispatch, subscription forwarding, and the
+/// subscribe-cmd channel only live in one place.
+async fn run_session<I: Inbound>(
+    mut inbound: I,
+    out_tx: mpsc::UnboundedSender<serde_json::Value>,
+    manager: Arc<SessionManager>,
+) {
+    let (sub_cmd_tx, sub_cmd_rx) = mpsc::channel::<SubCmd>(8);
+
+    let sub_out_tx = out_tx.clone();
+    let sub_manager = manager.clone();
+    let sub_task = tokio::spawn(async move {
+        run_subscription_loop(sub_manager, sub_out_tx, sub_cmd_rx).await;
+    });
+
     loop {
-        let raw = match transport::read_message(&mut reader).await {
-            Ok(Some(v)) => v,
-            Ok(None) => break,
-            Err(e) => {
+        let raw = match inbound.next().await {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => {
                 tracing::warn!(error = %e, "client sent bad JSON");
                 continue;
             }
+            None => break,
         };
         if !matches!(jsonrpc::classify(&raw), Some(MessageKind::Request)) {
             continue;
@@ -83,19 +114,130 @@ async fn handle_connection(stream: UnixStream, manager: Arc<SessionManager>) -> 
                 continue;
             }
         };
-        let mut w = writer.lock().await;
-        if transport::write_message(&mut *w, &v).await.is_err() {
+        if out_tx.send(v).is_err() {
             break;
         }
     }
 
     sub_task.abort();
+}
+
+/// Inbound-value source for `run_session`. Yields the next JSON
+/// value the client sent (or `None` when the connection closes).
+/// Errors are non-fatal — `run_session` logs and continues.
+trait Inbound: Send {
+    async fn next(&mut self) -> Option<std::io::Result<serde_json::Value>>;
+}
+
+struct ReadFromUnix {
+    reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+}
+
+impl Inbound for ReadFromUnix {
+    async fn next(&mut self) -> Option<std::io::Result<serde_json::Value>> {
+        match transport::read_message(&mut self.reader).await {
+            Ok(Some(v)) => Some(Ok(v)),
+            Ok(None) => None,
+            Err(e) => Some(Err(std::io::Error::other(e))),
+        }
+    }
+}
+
+struct ReadFromWs {
+    rx: futures::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    >,
+}
+
+impl Inbound for ReadFromWs {
+    async fn next(&mut self) -> Option<std::io::Result<serde_json::Value>> {
+        loop {
+            let frame = self.rx.next().await?;
+            match frame {
+                Ok(tungstenite::Message::Text(s)) => {
+                    return Some(
+                        serde_json::from_str::<serde_json::Value>(&s)
+                            .map_err(std::io::Error::other),
+                    );
+                }
+                Ok(tungstenite::Message::Binary(b)) => {
+                    // Treat binary frames as JSON too — some WS
+                    // clients prefer binary for non-text payloads,
+                    // and JSON-RPC is small enough that either
+                    // works.
+                    return Some(
+                        serde_json::from_slice::<serde_json::Value>(&b)
+                            .map_err(std::io::Error::other),
+                    );
+                }
+                // tungstenite handles pings + close frames itself
+                // when we use the standard `next()` interface — but
+                // we still receive them here so we can ignore them.
+                Ok(tungstenite::Message::Ping(_))
+                | Ok(tungstenite::Message::Pong(_))
+                | Ok(tungstenite::Message::Frame(_)) => continue,
+                Ok(tungstenite::Message::Close(_)) => return None,
+                Err(e) => return Some(Err(std::io::Error::other(e))),
+            }
+        }
+    }
+}
+
+/// Spawn a WebSocket listener bound to `addr`. Uses the same
+/// `run_session` dispatch loop as the Unix socket — no transport-
+/// specific request handling. Caller is responsible for hooking up
+/// auth (token-in-URL gate) before promoting a request to a WS
+/// upgrade; the v1 form here is **localhost-only and unauthenticated**,
+/// suitable for behind-a-tunnel use only.
+pub async fn serve_ws(manager: Arc<SessionManager>, addr: &str) -> Result<()> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind WS listener {addr}"))?;
+    tracing::info!(addr, "ws listening (unauthenticated; tunnel only)");
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_ws_connection(stream, manager).await {
+                tracing::debug!(?peer, error = ?e, "ws connection closed with error");
+            }
+        });
+    }
+}
+
+async fn handle_ws_connection(
+    stream: tokio::net::TcpStream,
+    manager: Arc<SessionManager>,
+) -> Result<()> {
+    let ws_stream = tokio_tungstenite::accept_async(stream)
+        .await
+        .context("ws upgrade")?;
+    let (mut ws_tx, ws_rx) = ws_stream.split();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+
+    // Outbound writer: drain the shared channel and emit each value
+    // as a single WS text frame.
+    let writer_task = tokio::spawn(async move {
+        while let Some(v) = out_rx.recv().await {
+            let s = match serde_json::to_string(&v) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if ws_tx.send(tungstenite::Message::Text(s.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let inbound = ReadFromWs { rx: ws_rx };
+    run_session(inbound, out_tx, manager).await;
+    writer_task.abort();
     Ok(())
 }
 
 async fn run_subscription_loop(
     manager: Arc<SessionManager>,
-    writer: Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    out_tx: mpsc::UnboundedSender<serde_json::Value>,
     mut cmd_rx: mpsc::Receiver<SubCmd>,
 ) {
     let mut sub_rx: Option<broadcast::Receiver<BroadcastMsg>> = None;
@@ -120,7 +262,7 @@ async fn run_subscription_loop(
                 msg = rx.recv() => {
                     match msg {
                         Ok(m) => {
-                            forward_broadcast(&writer, &filter, m).await;
+                            forward_broadcast(&out_tx, &filter, m);
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(skipped = n, "subscriber lagged");
@@ -144,8 +286,8 @@ async fn run_subscription_loop(
     }
 }
 
-async fn forward_broadcast(
-    writer: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+fn forward_broadcast(
+    out_tx: &mpsc::UnboundedSender<serde_json::Value>,
     filter: &Option<String>,
     msg: BroadcastMsg,
 ) {
@@ -202,8 +344,7 @@ async fn forward_broadcast(
         Ok(v) => v,
         Err(_) => return,
     };
-    let mut w = writer.lock().await;
-    let _ = transport::write_message(&mut *w, &v).await;
+    let _ = out_tx.send(v);
 }
 
 fn parse_params<T: serde::de::DeserializeOwned>(
