@@ -1210,31 +1210,38 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     let cycle = rain_area.height + MATRIX_RAIN_TAIL_MAX + 1;
     let charset = b"01:|/\\{}[]<>+$#@*=-zrvshcodxgit";
     let mut current_drop_keys = HashSet::with_capacity(rain_area.width as usize);
+    // Per-column current head position for active foreground drops —
+    // captured here so the reveal pass can pin letters live the
+    // instant a drop's head reaches the letter's row (matches the
+    // visible animation exactly, no analytic prediction).
+    let mut drop_heads: Vec<Option<i16>> = vec![None; rain_area.width as usize];
 
     for col in 0..rain_area.width {
         let seed = hash64(col as u64 ^ ((rain_area.width as u64) << 24));
         let speed = 2 + (seed % 7);
         let threshold = foreground_column_threshold(seed);
-        let frame = foreground_rain_frame(
-            now,
-            app.matrix_rain_foreground_epoch,
-            seed,
-            threshold,
-            speed,
-            cycle,
-        );
-        let active = frame.and_then(|frame| {
-            current_drop_keys.insert(frame.key);
-            if activity >= threshold {
-                app.matrix_rain_active_drops
-                    .entry(frame.key)
-                    .or_insert(spawn_tail);
-            }
+        let frame = foreground_rain_frame(now, app.matrix_rain_foreground_epoch, seed, speed, cycle);
+        current_drop_keys.insert(frame.key);
+        // Register a fresh drop only at the *top* of its cycle, and
+        // only if current activity meets this column's threshold.
+        // This is what keeps drops from popping in mid-screen when
+        // activity rises — they wait for their next cycle to start.
+        // A drop already registered keeps falling for the rest of
+        // its cycle regardless of later activity dips (until its
+        // key disappears from current_drop_keys on cycle wrap).
+        if activity >= threshold && frame.head <= MATRIX_RAIN_REGISTRATION_TOP_ROW as i16 {
             app.matrix_rain_active_drops
-                .get(&frame.key)
-                .copied()
-                .map(|tail| (frame.head, tail))
-        });
+                .entry(frame.key)
+                .or_insert(spawn_tail);
+        }
+        let active = app
+            .matrix_rain_active_drops
+            .get(&frame.key)
+            .copied()
+            .map(|tail| (frame.head, tail));
+        if active.is_some() {
+            drop_heads[col as usize] = Some(frame.head);
+        }
         for row in 0..rain_area.height {
             let dist = active.map(|(head, _)| head).unwrap_or(-1) - row as i16;
             let mut style = None;
@@ -1266,25 +1273,18 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     app.matrix_rain_active_drops
         .retain(|key, _| current_drop_keys.contains(key));
 
-    for reveal in app.matrix_rain.active_reveals(now) {
-        if reveal.progress(now).is_some() {
-            let reveal_start_elapsed_ms = reveal
-                .started
-                .checked_duration_since(app.start_instant)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            render_matrix_reveal(
-                f,
-                rain_area,
-                &app.theme,
-                reveal,
-                elapsed,
-                reveal_start_elapsed_ms,
-                cycle,
-            );
-        }
+    let theme = app.theme.clone();
+    for reveal in app.matrix_rain.active_reveals_mut(now) {
+        render_matrix_reveal(f, rain_area, &theme, reveal, elapsed, &drop_heads);
     }
 }
+
+/// A column registers a new drop only when its `head` is at one of
+/// the top few rows of the cycle (i.e. about to start falling from
+/// the very top of the visible area). This avoids drops popping
+/// into existence mid-screen the moment activity rises above the
+/// column's threshold.
+const MATRIX_RAIN_REGISTRATION_TOP_ROW: u16 = 1;
 
 fn render_matrix_rain_header(f: &mut Frame, area: Rect, theme: &Theme) {
     let line_style = Style::default().fg(theme.matrix_line);
@@ -1303,14 +1303,16 @@ fn update_matrix_rain_intensity(app: &mut App, now: Instant) -> f32 {
     let elapsed = now
         .checked_duration_since(app.matrix_rain_intensity_updated_at)
         .unwrap_or(Duration::ZERO);
-    let prev = app.matrix_rain_intensity;
     app.matrix_rain_intensity =
         eased_matrix_rain_intensity(app.matrix_rain_intensity, target, elapsed);
-    if app.matrix_rain_intensity > prev {
-        let offset = Duration::from_secs_f32(app.matrix_rain_intensity * MATRIX_RAIN_RAMP_UP_SECS);
-        app.matrix_rain_foreground_epoch = now.checked_sub(offset).unwrap_or(now);
-    }
     app.matrix_rain_intensity_updated_at = now;
+    // NOTE: `matrix_rain_foreground_epoch` is intentionally left
+    // alone here. It's set once at app start and never moved — each
+    // column's head is `((now - epoch) / cell_ms + phase) % cycle`,
+    // so shifting the epoch would teleport every drop on screen.
+    // Activity gates *which* columns register a fresh drop at the
+    // top of each cycle (see `render_matrix_rain`), not the clock
+    // that drops fall on.
     app.matrix_rain_intensity
 }
 
@@ -1349,31 +1351,39 @@ struct MatrixRainFrame {
     head: i16,
 }
 
+/// Where this column's foreground drop is *right now*, on a clock
+/// that never moves once `foreground_epoch` is set at app start.
+///
+/// Each column has a fixed phase offset (from `seed`) so columns
+/// don't all start at head 0 in unison. The position is purely a
+/// function of wall time + seed + speed — activity / threshold do
+/// not appear here, so a change in fleet intensity cannot teleport
+/// drops mid-fall. Activity gating lives one level up in
+/// `render_matrix_rain`, which decides whether each cycle's drop is
+/// rendered at all (registered at head ≈ 0 if activity ≥ threshold).
 fn foreground_rain_frame(
     now: Instant,
     foreground_epoch: Instant,
     seed: u64,
-    threshold: f32,
     speed: u64,
     cycle: u16,
-) -> Option<MatrixRainFrame> {
-    let crossing = foreground_epoch.checked_add(Duration::from_secs_f32(
-        threshold * MATRIX_RAIN_RAMP_UP_SECS,
-    ))?;
-    let age = now.checked_duration_since(crossing)?;
+) -> MatrixRainFrame {
+    let age = now
+        .checked_duration_since(foreground_epoch)
+        .unwrap_or(Duration::ZERO);
     let cell_ms = 58 + speed * 19;
     let cycle = cycle.max(1) as u64;
     let step = age.as_millis() as u64 / cell_ms;
-    let cycle_index = step / cycle;
-    Some(MatrixRainFrame {
-        key: hash64(
-            seed ^ ((speed & 0xff) << 56)
-                ^ ((cycle & 0xffff) << 40)
-                ^ ((threshold.to_bits() as u64) << 8)
-                ^ cycle_index,
-        ),
-        head: (step % cycle) as i16,
-    })
+    // Stable per-column phase so columns are out of sync from frame
+    // 0 — gives the staggered look without depending on threshold or
+    // a shifting epoch.
+    let phase = (hash64(seed ^ 0x5a17_30c8_d3e1_4f29) % cycle) as u64;
+    let total = step + phase;
+    let cycle_index = total / cycle;
+    MatrixRainFrame {
+        key: hash64(seed ^ ((speed & 0xff) << 56) ^ ((cycle & 0xffff) << 40) ^ cycle_index),
+        head: (total % cycle) as i16,
+    }
 }
 
 fn fleet_activity_target(app: &App, now: Instant) -> f32 {
@@ -1420,14 +1430,24 @@ fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
     }
 }
 
+/// Render one reveal word. Letters are pinned the moment a real
+/// foreground drop's head reaches that letter's cell — `drop_heads`
+/// carries the *current* head per column captured during the main
+/// rain pass, so there's no analytic prediction that could disagree
+/// with the visible animation.
+///
+/// Once every letter is pinned the reveal enters a short hold and
+/// then fades. If some letters never get pinned (e.g. their column
+/// is consistently below the activity threshold), the hold/fade
+/// never starts — the reveal just expires naturally when its 12s
+/// `duration` elapses and the queue drops it.
 fn render_matrix_reveal(
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
-    reveal: &crate::matrix_rain::RevealWord,
+    reveal: &mut crate::matrix_rain::RevealWord,
     elapsed_ms: u64,
-    reveal_start_elapsed_ms: u64,
-    cycle: u16,
+    drop_heads: &[Option<i16>],
 ) {
     if area.width < 4 || area.height == 0 {
         return;
@@ -1446,21 +1466,40 @@ fn render_matrix_reveal(
             .round()
             .clamp(0.0, area.height.saturating_sub(1) as f32) as u16;
 
-    let target_rel_y = target_y.saturating_sub(area.y);
-    let mut pins = Vec::with_capacity(chars.len());
-    let mut all_pinned_at = reveal_start_elapsed_ms;
-    for i in 0..chars.len() {
-        let col = target_x.saturating_sub(area.x) + i as u16;
-        let pinned_at =
-            rain_pass_elapsed_ms(area.width, col, target_rel_y, cycle, reveal_start_elapsed_ms);
-        all_pinned_at = all_pinned_at.max(pinned_at);
-        pins.push(pinned_at);
+    let target_rel_y = target_y.saturating_sub(area.y) as i16;
+    let base_col = target_x.saturating_sub(area.x) as usize;
+
+    // Live pinning: for each letter still unpinned, check this
+    // frame's drop head in that column. The head moves at most a
+    // few cells per frame, so accept any frame where the head is
+    // at or just past `target_rel_y` (the drop's bright body still
+    // covers the cell or just exited).
+    let letter_count = reveal.pin_state().len();
+    for i in 0..letter_count {
+        if reveal.pin_state()[i].is_some() {
+            continue;
+        }
+        let col = base_col + i;
+        if let Some(Some(head)) = drop_heads.get(col) {
+            if *head >= target_rel_y {
+                reveal.pin_letter(i, elapsed_ms);
+            }
+        }
     }
+
+    let pin_state = reveal.pin_state();
+    let all_pinned_at = if pin_state.iter().all(Option::is_some) {
+        pin_state.iter().filter_map(|x| *x).max()
+    } else {
+        None
+    };
 
     let complete_hold_ms = 400;
     let fade_ms = 200;
-    let fade_start = all_pinned_at + complete_hold_ms;
-    let fade_end = fade_start + fade_ms;
+    let (fade_start, fade_end) = match all_pinned_at {
+        Some(t) => (t + complete_hold_ms, t + complete_hold_ms + fade_ms),
+        None => (u64::MAX, u64::MAX),
+    };
     let fade_level = if elapsed_ms < fade_start {
         1.0
     } else {
@@ -1469,10 +1508,9 @@ fn render_matrix_reveal(
     };
 
     for (i, ch) in chars.into_iter().enumerate() {
-        let pinned_at = pins[i];
-        if elapsed_ms < pinned_at {
+        let Some(pinned_at) = reveal.pin_state()[i] else {
             continue;
-        }
+        };
         if elapsed_ms >= fade_end {
             continue;
         }
@@ -1504,24 +1542,6 @@ fn matrix_reveal_style(theme: &Theme, brightness: f32, bold: bool) -> Style {
     } else {
         style
     }
-}
-
-fn rain_pass_elapsed_ms(
-    width: u16,
-    col: u16,
-    target_rel_y: u16,
-    cycle: u16,
-    start_elapsed_ms: u64,
-) -> u64 {
-    let seed = hash64(col as u64 ^ ((width as u64) << 24));
-    let speed = 2 + (seed % 7);
-    let tick_ms = 58 + speed * 19;
-    let offset = (seed >> 8) % cycle.max(1) as u64;
-    let cycle = cycle.max(1) as u64;
-    let start_step = start_elapsed_ms / tick_ms;
-    let target_step = (target_rel_y as u64 + cycle - offset) % cycle;
-    let delta = (target_step + cycle - (start_step % cycle)) % cycle;
-    (start_step + delta) * tick_ms
 }
 
 fn blend_color(a: Color, b: Color, t: f32) -> Color {
@@ -3366,27 +3386,6 @@ mod tests {
     }
 
     #[test]
-    fn rain_pass_elapsed_ms_waits_for_natural_column_pass() {
-        let width = 24;
-        let cycle = 13;
-        let target_rel_y = 4;
-
-        for col in 0..width {
-            let passed_at = rain_pass_elapsed_ms(width, col, target_rel_y, cycle, 1_000);
-
-            let seed = hash64(col as u64 ^ ((width as u64) << 24));
-            let tick_ms = 58 + (2 + (seed % 7)) * 19;
-            assert!(
-                passed_at >= 1_000 || passed_at + tick_ms > 1_000,
-                "the pass should either be upcoming or still be the current head position"
-            );
-            let offset = (seed >> 8) % cycle as u64;
-            let head = ((passed_at / tick_ms) + offset) % cycle as u64;
-            assert_eq!(head, target_rel_y as u64);
-        }
-    }
-
-    #[test]
     fn split_list_pane_reserves_matrix_height_so_list_scrolls_when_items_overflow() {
         // Tall pane: items would overflow but matrix should still be
         // anchored at the default 12 rows at the bottom, and the list
@@ -3471,26 +3470,53 @@ mod tests {
     }
 
     #[test]
-    fn foreground_rain_frame_starts_at_top_after_activation() {
+    fn foreground_rain_frame_position_is_deterministic_from_epoch() {
+        // The drop position is a pure function of (now - epoch),
+        // seed, speed, cycle. Same inputs ⇒ same head. The two
+        // calls below differ by exactly `cell_ms`, so the head
+        // advances by exactly one row — never teleports.
         let epoch = Instant::now();
-        let threshold = 0.5;
-        let crossing = epoch + Duration::from_millis(2500);
-        let seed = 42;
-        assert_eq!(
-            foreground_rain_frame(crossing, epoch, seed, threshold, 2, 20)
-                .map(|frame| frame.head),
-            Some(0)
+        let seed: u64 = 42;
+        let speed: u64 = 3;
+        let cycle: u16 = 20;
+        let cell_ms = 58 + speed * 19;
+        let a = foreground_rain_frame(
+            epoch + Duration::from_millis(cell_ms * 5),
+            epoch,
+            seed,
+            speed,
+            cycle,
         );
-        assert_eq!(
-            foreground_rain_frame(
-                crossing - Duration::from_millis(1),
-                epoch,
-                seed,
-                threshold,
-                2,
-                20,
-            ),
-            None
+        let b = foreground_rain_frame(
+            epoch + Duration::from_millis(cell_ms * 6),
+            epoch,
+            seed,
+            speed,
+            cycle,
+        );
+        // Heads advance by 1 (mod cycle); never jump.
+        let advance = (b.head as i32 - a.head as i32).rem_euclid(cycle as i32);
+        assert_eq!(advance, 1);
+    }
+
+    #[test]
+    fn foreground_rain_frame_columns_are_phase_staggered() {
+        // Two columns at the same instant must not share a head —
+        // their seed-derived phase offsets keep the field from
+        // looking like a marching curtain at frame 0.
+        let epoch = Instant::now();
+        let now = epoch + Duration::from_millis(0);
+        let cycle: u16 = 20;
+        let mut heads = std::collections::HashSet::new();
+        for col in 0u16..32 {
+            let seed = hash64(col as u64 ^ ((32u64) << 24));
+            let speed = 2 + (seed % 7);
+            heads.insert(foreground_rain_frame(now, epoch, seed, speed, cycle).head);
+        }
+        assert!(
+            heads.len() > 1,
+            "expected staggered phases across columns, got {} distinct heads",
+            heads.len()
         );
     }
 

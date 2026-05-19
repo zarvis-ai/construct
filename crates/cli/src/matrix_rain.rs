@@ -55,6 +55,11 @@ pub struct RevealWord {
     pub x: f32,
     pub y: f32,
     priority: u8,
+    /// Per-character pin time, in `start_instant`-elative ms. `None`
+    /// means the matrix rain hasn't dropped a head through that
+    /// letter's column yet — the renderer leaves the cell empty until
+    /// a real drop arrives. Length equals `text.chars().count()`.
+    pin_state: Vec<Option<u64>>,
 }
 
 impl RevealWord {
@@ -70,6 +75,24 @@ impl RevealWord {
         now.checked_duration_since(self.started)
             .map(|elapsed| elapsed >= self.duration)
             .unwrap_or(false)
+    }
+
+    /// Read-only view of the per-letter pin timestamps. The renderer
+    /// uses this to decide which letters are currently visible and
+    /// when the "all letters pinned" hold/fade timer can start.
+    pub fn pin_state(&self) -> &[Option<u64>] {
+        &self.pin_state
+    }
+
+    /// Pin one letter. No-op if already pinned, so calling this on
+    /// every frame is safe — the first pass wins. `at_elapsed_ms` is
+    /// measured from the app's `start_instant`.
+    pub fn pin_letter(&mut self, char_idx: usize, at_elapsed_ms: u64) {
+        if let Some(slot) = self.pin_state.get_mut(char_idx) {
+            if slot.is_none() {
+                *slot = Some(at_elapsed_ms);
+            }
+        }
     }
 }
 
@@ -99,6 +122,14 @@ impl MatrixRain {
     pub fn active_reveals(&self, now: Instant) -> impl Iterator<Item = &RevealWord> {
         self.queue
             .iter()
+            .filter(move |word| word.progress(now).is_some())
+    }
+
+    /// Same as [`active_reveals`] but yields `&mut RevealWord` so the
+    /// renderer can pin letters in place as drops pass them.
+    pub fn active_reveals_mut(&mut self, now: Instant) -> impl Iterator<Item = &mut RevealWord> {
+        self.queue
+            .iter_mut()
             .filter(move |word| word.progress(now).is_some())
     }
 
@@ -197,14 +228,17 @@ impl MatrixRain {
     ) {
         self.queue.retain(|word| !word.expired(now));
         let duration = Duration::from_millis(12_000);
+        let text: String = text.into();
+        let pin_state = vec![None; text.chars().count()];
         self.queue.push(RevealWord {
-            text: text.into(),
+            text,
             _tone: tone,
             started: now,
             duration,
             x: x.clamp(0.0, 1.0),
             y: y.clamp(0.0, 1.0),
             priority,
+            pin_state,
         });
         while self.queue.len() > MAX_ACTIVE_REVEALS {
             if let Some((idx, _)) = self
