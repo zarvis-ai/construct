@@ -1385,23 +1385,29 @@ impl App {
                         // PTY events: feed into the per-session items history.
                         if let SessionEvent::Pty { .. } = &payload.event {
                             let now = Instant::now();
-                            if let Some(bytes) = payload.event.pty_bytes() {
+                            let bytes = payload.event.pty_bytes();
+                            if let Some(b) = bytes.as_deref() {
                                 let history = self
                                     .histories
                                     .entry(payload.session_id.clone())
                                     .or_default();
-                                history.feed_pty(&bytes);
+                                history.feed_pty(b);
                             }
                             // Mark the session as freshly active for the spinner.
                             self.pty_activity
                                 .insert(payload.session_id.clone(), now);
                             // PTY-only harnesses (codex/claude in interactive
                             // mode, shell) don't emit structured ToolUse/Status
-                            // events while working, so feed the matrix-rain a
-                            // rate-limited heartbeat here too — otherwise the
-                            // rain stays silent for them.
-                            self.matrix_rain
-                                .observe_pty_activity(&payload.session_id, now);
+                            // events while working, so feed the matrix-rain
+                            // the byte stream too. It harvests recent words
+                            // and reveals them on a per-session throttle, so
+                            // the rain reflects what the harness is actually
+                            // printing instead of cycling a hard-coded list.
+                            self.matrix_rain.observe_pty_activity(
+                                &payload.session_id,
+                                bytes.as_deref().unwrap_or(&[]),
+                                now,
+                            );
                             return;
                         }
                         // Tool events feed the same history so the
