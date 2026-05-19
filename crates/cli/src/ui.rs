@@ -1273,13 +1273,18 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
             }
             if let Some(style) = style {
                 // Vertical reveals override the random drop-body
-                // glyph with the word's letter at this row, *and*
-                // bold the cell — same color as the surrounding
-                // drop, just a hair heavier so the eye can pick the
-                // word out of the random tail chars.
+                // glyph with the word's actual letter at this row,
+                // and shift the cell's color from the default rain
+                // green toward `theme.accent_alt` (teal). Same
+                // head→tail shading, no bold — distinct enough to
+                // pick the word out, still firmly in the matrix
+                // palette.
                 let (ch, style) = if in_drop_body {
                     match col_overlay.and_then(|map| map.get(&(row as i16)).copied()) {
-                        Some(letter) => (letter, style.add_modifier(Modifier::BOLD)),
+                        Some(letter) => {
+                            let shade = compute_drop_shade(active, row);
+                            (letter, rain_letter_style(&app.theme, shade, activity))
+                        }
                         None => {
                             let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
                             (charset[(glyph_seed as usize) % charset.len()] as char, style)
@@ -1529,6 +1534,46 @@ fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
         style.add_modifier(Modifier::BOLD)
     } else {
         style
+    }
+}
+
+/// Same head→tail shading as `rain_style`, but the bright endpoint
+/// is `theme.accent_alt` (teal) instead of `theme.accent` (green).
+/// Used for vertical-reveal letter cells so the word reads as a
+/// different hue from the surrounding random rain chars without
+/// jumping out of the matrix palette.
+fn rain_letter_style(theme: &Theme, shade: f32, activity: f32) -> Style {
+    let shade = shade.clamp(0.0, 1.0);
+    let boost = activity.clamp(0.0, 1.0);
+    let style = Style::default().fg(blend_color(
+        theme.matrix_dim,
+        theme.accent_alt,
+        (shade * 0.86 + boost * 0.14).clamp(0.0, 1.0),
+    ));
+    if shade > 0.72 {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+/// Recompute the per-cell shade used by `rain_style` /
+/// `rain_letter_style`: `1.0` at the drop head, fading linearly to
+/// `0` over `tail` rows. Returns `0.0` if the cell isn't in the
+/// drop body (caller should normally only call this with a body
+/// cell — `0.0` is a safe fallback that maps to the dim end of the
+/// palette).
+fn compute_drop_shade(active: Option<(i16, u16)>, row: u16) -> f32 {
+    match active {
+        Some((head, tail)) => {
+            let dist = head - row as i16;
+            if dist < 0 || dist >= tail as i16 {
+                0.0
+            } else {
+                1.0 - (dist as f32 / tail.max(1) as f32)
+            }
+        }
+        None => 0.0,
     }
 }
 
