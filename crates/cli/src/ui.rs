@@ -1090,26 +1090,46 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
             .bg(app.theme.inactive_highlight_bg)
             .fg(app.theme.text)
     };
+    // Split the bordered pane's inner area into a top "list items"
+    // region and a bottom "matrix rain" region so the rain panel
+    // stays anchored at the bottom even when the session list grows
+    // beyond the visible height. The list rows are sliced by
+    // `app.list_scroll_offset` before rendering so mouse-wheel scrolling
+    // can move the list viewport independently from the current selection.
+    let (list_items_area, matrix_area) =
+        split_list_pane(inner, app.matrix_rain_hidden, app.matrix_rain_h);
+    let max_scroll = app_items
+        .len()
+        .saturating_sub(list_items_area.height as usize);
+    app.list_scroll_offset = app.list_scroll_offset.min(max_scroll);
+    let visible_start = app.list_scroll_offset;
+    let visible_end = visible_start
+        .saturating_add(list_items_area.height as usize)
+        .min(items.len());
+    let selected_visible_idx = selected_idx.and_then(|idx| {
+        if idx >= visible_start && idx < visible_end {
+            Some(idx - visible_start)
+        } else {
+            None
+        }
+    });
+    let items: Vec<ListItem> = items
+        .into_iter()
+        .skip(visible_start)
+        .take(list_items_area.height as usize)
+        .collect();
     let mut state = ListState::default();
     state.select(if matches!(app.selection, Selection::None) {
         None
     } else {
-        selected_idx
+        selected_visible_idx
     });
-    // Split the bordered pane's inner area into a top "list items"
-    // region and a bottom "matrix rain" region so the rain panel
-    // stays anchored at the bottom even when the session list grows
-    // beyond the visible height. Rendering the block separately (so
-    // the List widget is given the items rect, not the full pane)
-    // is what makes ratatui scroll the list — when items > height,
-    // the offset auto-advances to keep the selection in view.
-    let (list_items_area, matrix_area) =
-        split_list_pane(inner, app.matrix_rain_hidden, app.matrix_rain_h);
     f.render_widget(block, area);
     let list = List::new(items).highlight_style(highlight_style);
     f.render_stateful_widget(list, list_items_area, &mut state);
     app.layout.list_items_area = Some(list_items_area);
-    app.layout.list_scroll_offset = state.offset();
+    app.layout.list_scroll_offset = visible_start + state.offset();
+    app.list_scroll_offset = app.layout.list_scroll_offset;
     clear_pane_side_borders(f, area, app);
     render_matrix_rain(f, matrix_area, app);
 }

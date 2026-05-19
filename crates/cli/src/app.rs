@@ -241,6 +241,10 @@ pub struct App {
     /// screen except for the minibuffer line at the bottom. Toggled with
     /// `C-x z` (emacs) / `z` (vim), matching tmux's prefix-z.
     pub zoom: ZoomMode,
+    /// User-controlled scroll offset for the session list. 0 = first item at
+    /// top. Mouse wheel over the list adjusts this; keyboard selection still
+    /// lets ratatui pull the selected item back into view when needed.
+    pub list_scroll_offset: usize,
     /// Scrollback offset (in rows) applied to the *focused* session's PTY
     /// parser when rendering. 0 = live view. Increased by mouse-wheel up,
     /// decreased by mouse-wheel down. Reset to 0 on user keystroke into
@@ -659,6 +663,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         tasks_popup: None,
         terminal_pane_size: (100, 30),
         zoom: initial_zoom,
+        list_scroll_offset: 0,
         view_scrollback: 0,
         orchestrator_scrollback: 0,
         orchestrator_panel_h: persisted.orchestrator_panel_h,
@@ -1729,8 +1734,16 @@ impl App {
         // tooltip, etc.) has a current position to render against.
         self.mouse_pos = Some((ev.column, ev.row));
         match ev.kind {
-            MouseEventKind::ScrollUp => self.adjust_mouse_scrollback(ev.column, ev.row, STEP),
-            MouseEventKind::ScrollDown => self.adjust_mouse_scrollback(ev.column, ev.row, -STEP),
+            MouseEventKind::ScrollUp => {
+                if !self.adjust_mouse_list_scroll(ev.column, ev.row, -STEP) {
+                    self.adjust_mouse_scrollback(ev.column, ev.row, STEP);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if !self.adjust_mouse_list_scroll(ev.column, ev.row, STEP) {
+                    self.adjust_mouse_scrollback(ev.column, ev.row, -STEP);
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 // List ↔ view divider: clicking the list pane's
                 // right border (col = list_width - 1), the view's
@@ -2483,6 +2496,32 @@ impl App {
             return;
         }
         self.view_scrollback = adjusted_scrollback(self.view_scrollback, delta);
+    }
+
+    fn adjust_mouse_list_scroll(&mut self, col: u16, row: u16, delta: i32) -> bool {
+        let Some(area) = self.layout.list_items_area else {
+            return false;
+        };
+        if col < area.x || col >= area.x + area.width || row < area.y || row >= area.y + area.height
+        {
+            return false;
+        }
+        self.adjust_list_scroll(delta);
+        true
+    }
+
+    fn adjust_list_scroll(&mut self, delta: i32) {
+        let visible_h = self
+            .layout
+            .list_items_area
+            .map(|area| area.height as usize)
+            .unwrap_or(0);
+        self.list_scroll_offset = adjusted_list_scroll_offset(
+            self.list_scroll_offset,
+            delta,
+            self.list_items().len(),
+            visible_h,
+        );
     }
 
     fn adjust_mouse_scrollback(&mut self, col: u16, row: u16, delta: i32) {
@@ -3963,11 +4002,31 @@ mod tests {
         assert_eq!(adjusted_scrollback(5, 3), 8);
         assert_eq!(adjusted_scrollback(SCROLLBACK_MAX - 1, 10), SCROLLBACK_MAX);
     }
+
+    #[test]
+    fn adjusted_list_scroll_offset_clamps_to_visible_range() {
+        assert_eq!(adjusted_list_scroll_offset(0, 3, 10, 4), 3);
+        assert_eq!(adjusted_list_scroll_offset(3, -1, 10, 4), 2);
+        assert_eq!(adjusted_list_scroll_offset(0, -99, 10, 4), 0);
+        assert_eq!(adjusted_list_scroll_offset(0, 99, 10, 4), 6);
+        assert_eq!(adjusted_list_scroll_offset(9, 0, 10, 4), 6);
+        assert_eq!(adjusted_list_scroll_offset(2, 1, 3, 4), 0);
+    }
 }
 
 fn adjusted_scrollback(current: usize, delta: i32) -> usize {
     let next = current as i32 + delta;
     next.max(0).min(SCROLLBACK_MAX as i32) as usize
+}
+
+fn adjusted_list_scroll_offset(
+    current: usize,
+    delta: i32,
+    item_count: usize,
+    visible_rows: usize,
+) -> usize {
+    let max_scroll = item_count.saturating_sub(visible_rows);
+    adjusted_scrollback(current, delta).min(max_scroll)
 }
 
 fn delete_back_char(mb: &mut Minibuffer) {
