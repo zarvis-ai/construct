@@ -1282,8 +1282,24 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                 let (ch, style) = if in_drop_body {
                     match col_overlay.and_then(|map| map.get(&(row as i16)).copied()) {
                         Some(letter) => {
-                            let shade = compute_drop_shade(active, row);
-                            (letter, rain_letter_style(&app.theme, shade, activity))
+                            // The frame the drop *head* is exactly
+                            // on the letter cell, flash it to the
+                            // brightest matrix-flash green — that's
+                            // the "moment of impact" the eye latches
+                            // onto. As the head moves on, the cell
+                            // falls back to the slow-fade letter
+                            // style (≈ 2× slower than the random
+                            // tail chars around it).
+                            let dist_from_head = active
+                                .map(|(h, _)| h - row as i16)
+                                .unwrap_or(i16::MAX);
+                            if dist_from_head == 0 {
+                                (letter, rain_head_flash_style(&app.theme))
+                            } else {
+                                let raw_shade = compute_drop_shade(active, row);
+                                let shade = 0.5 + raw_shade * 0.5;
+                                (letter, rain_letter_style(&app.theme, shade, activity))
+                            }
                         }
                         None => {
                             let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
@@ -1537,6 +1553,17 @@ fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
     }
 }
 
+/// Brightest-green flash for the single frame a drop head is
+/// directly over a reveal letter — applies to both vertical and
+/// horizontal reveals. The cell pops out of the rain palette for
+/// that one frame, then falls back to the regular slow-fade letter
+/// style as the head moves on.
+fn rain_head_flash_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.matrix_flash_good)
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Same head→tail shading as `rain_style`, but the bright endpoint
 /// is `theme.text` (near-white pale green in the default theme)
 /// instead of `theme.accent` (the rain's bright green). The vertical
@@ -1630,20 +1657,24 @@ fn render_matrix_reveal_horizontal(
     let tail = spawn_tail.max(1) as i16;
 
     let letter_count = reveal.pin_state().len();
+    // Per-letter "is the drop head sitting exactly on this letter's
+    // cell *right now*?" — driving the brightest-green flash one
+    // letter at a time as the drop falls through each column.
+    let mut head_on_letter = vec![false; letter_count];
     for i in 0..letter_count {
-        if reveal.pin_state()[i].is_some() {
-            continue;
-        }
         let col = base_col + i;
         if let Some(Some(head)) = drop_heads.get(col) {
+            let delta = *head - target_rel_y;
             // Pin only while the drop's BRIGHT BODY is currently
             // covering the cell — i.e. head ≥ row and head − row <
             // tail. Without the upper bound, on sparse frames the
             // letter would latch on a head that's already far past,
             // making it appear out of nowhere with no drop nearby.
-            let delta = *head - target_rel_y;
             if delta >= 0 && delta < tail {
                 reveal.pin_letter(i, elapsed_ms);
+                if delta == 0 {
+                    head_on_letter[i] = true;
+                }
             }
         }
     }
@@ -1654,6 +1685,7 @@ fn render_matrix_reveal_horizontal(
         reveal,
         elapsed_ms,
         &chars,
+        &head_on_letter,
         |i| target_x + i as u16,
         |_| target_y,
     );
@@ -1669,6 +1701,7 @@ fn render_pinned_letters_at(
     reveal: &crate::matrix_rain::RevealWord,
     elapsed_ms: u64,
     chars: &[char],
+    head_on_letter: &[bool],
     xs: impl Fn(usize) -> u16,
     ys: impl Fn(usize) -> u16,
 ) {
@@ -1699,17 +1732,24 @@ fn render_pinned_letters_at(
         if elapsed_ms >= fade_end {
             continue;
         }
-        let since_pin_ms = elapsed_ms.saturating_sub(pinned_at);
-        let brightness = if elapsed_ms < fade_start {
-            if since_pin_ms < 220 {
-                1.0
-            } else {
-                0.76
-            }
+        // Frame the drop head is sitting on the letter: brightest-
+        // green flash. Beats the hold/fade brightness for that one
+        // frame, then the cell goes back to the normal pinned look.
+        let style = if head_on_letter.get(i).copied().unwrap_or(false) {
+            rain_head_flash_style(theme)
         } else {
-            (0.12 + fade_level * 0.64).clamp(0.0, 1.0)
+            let since_pin_ms = elapsed_ms.saturating_sub(pinned_at);
+            let brightness = if elapsed_ms < fade_start {
+                if since_pin_ms < 220 {
+                    1.0
+                } else {
+                    0.76
+                }
+            } else {
+                (0.12 + fade_level * 0.64).clamp(0.0, 1.0)
+            };
+            matrix_reveal_style(theme, brightness, elapsed_ms < fade_start)
         };
-        let style = matrix_reveal_style(theme, brightness, elapsed_ms < fade_start);
         f.buffer_mut().set_string(xs(i), ys(i), ch.to_string(), style);
     }
 }

@@ -290,7 +290,7 @@ impl MatrixRain {
         // pin the whole word in a single drop pass, so 12 s is
         // plenty.
         let duration = match orientation {
-            RevealOrientation::Horizontal => Duration::from_millis(18_000),
+            RevealOrientation::Horizontal => Duration::from_millis(27_000),
             RevealOrientation::Vertical => Duration::from_millis(12_000),
         };
         let text: String = text.into();
