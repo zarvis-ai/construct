@@ -1282,7 +1282,16 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                 let (ch, style) = if in_drop_body {
                     match col_overlay.and_then(|map| map.get(&(row as i16)).copied()) {
                         Some(letter) => {
-                            let shade = compute_drop_shade(active, row);
+                            // Vertical letters fade ≈2× slower than
+                            // the random tail chars around them: at
+                            // the head shade=1.0 (full bright), at
+                            // the tail end shade still sits around
+                            // 0.5 instead of dimming to 0. Linear
+                            // remap of the raw drop shade into the
+                            // [0.5, 1.0] band keeps the head→tail
+                            // direction but compresses the fade.
+                            let raw_shade = compute_drop_shade(active, row);
+                            let shade = 0.5 + raw_shade * 0.5;
                             (letter, rain_letter_style(&app.theme, shade, activity))
                         }
                         None => {
