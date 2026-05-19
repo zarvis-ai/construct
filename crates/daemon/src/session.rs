@@ -1150,6 +1150,7 @@ impl SessionManager {
                 }
                 SessionEvent::Reset
                 | SessionEvent::Message { .. }
+                | SessionEvent::Reasoning { .. }
                 | SessionEvent::ToolUse { .. }
                 | SessionEvent::ToolResult { .. }
                 | SessionEvent::Diff { .. }

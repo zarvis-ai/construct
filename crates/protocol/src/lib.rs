@@ -195,6 +195,15 @@ pub enum SessionEvent {
         role: MessageRole,
         text: String,
     },
+    /// Free-form "thinking" / "reasoning" text streamed from the
+    /// model — separate from `Message` so the TUI can render it
+    /// distinctively (dim italic) and so harnesses that don't surface
+    /// reasoning don't see it in their normal message stream.
+    /// Adapters that don't have access to reasoning content can
+    /// simply never emit this.
+    Reasoning {
+        text: String,
+    },
     ToolUse {
         tool: String,
         #[serde(default)]

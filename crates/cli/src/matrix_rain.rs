@@ -498,6 +498,7 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
         SessionEvent::AgentStatus(status) if status.active => word_for_status(&status.status),
         SessionEvent::Reset => Some(("reset", FlashTone::Warn, 50)),
         SessionEvent::ContextCompacted { .. } => Some(("compact", FlashTone::Work, 50)),
+        SessionEvent::Reasoning { .. } => Some(("thinking", FlashTone::Work, 30)),
         SessionEvent::Message { .. }
         | SessionEvent::ToolResult { .. }
         | SessionEvent::Cost { .. }
@@ -573,6 +574,14 @@ mod tests {
             args: serde_json::json!({}),
         };
         assert_eq!(word_for_event(&ev).map(|w| w.0), Some("editing"));
+    }
+
+    #[test]
+    fn maps_reasoning_event_to_thinking_word() {
+        let ev = SessionEvent::Reasoning {
+            text: "deciding which file to edit".into(),
+        };
+        assert_eq!(word_for_event(&ev).map(|w| w.0), Some("thinking"));
     }
 
     #[test]

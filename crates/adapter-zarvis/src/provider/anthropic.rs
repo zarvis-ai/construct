@@ -197,20 +197,26 @@ impl LlmProvider for Anthropic {
                     }
                     let block = v.get("content_block").cloned().unwrap_or(Value::Null);
                     let bty = block.get("type").and_then(|s| s.as_str()).unwrap_or("");
-                    if bty == "tool_use" {
-                        blocks[idx].kind = BlockKind::ToolUse;
-                        blocks[idx].id = block
-                            .get("id")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        blocks[idx].name = block
-                            .get("name")
-                            .and_then(|s| s.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                    } else {
-                        blocks[idx].kind = BlockKind::Text;
+                    match bty {
+                        "tool_use" => {
+                            blocks[idx].kind = BlockKind::ToolUse;
+                            blocks[idx].id = block
+                                .get("id")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            blocks[idx].name = block
+                                .get("name")
+                                .and_then(|s| s.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        "thinking" => {
+                            blocks[idx].kind = BlockKind::Thinking;
+                        }
+                        _ => {
+                            blocks[idx].kind = BlockKind::Text;
+                        }
                     }
                 }
                 "content_block_delta" => {
@@ -234,6 +240,22 @@ impl LlmProvider for Anthropic {
                         "input_json_delta" => {
                             if let Some(j) = delta.get("partial_json").and_then(|s| s.as_str()) {
                                 blocks[idx].input_json.push_str(j);
+                            }
+                        }
+                        // Extended-thinking content: stream into the
+                        // sink's reasoning channel so the TUI renders
+                        // it dim/italic and the headless transcript
+                        // gets a separate `SessionEvent::Reasoning`.
+                        // The accompanying `signature_delta` event
+                        // (Anthropic-internal signature for the
+                        // thinking block; not user-visible) is
+                        // ignored by the catch-all below.
+                        "thinking_delta" => {
+                            if let Some(t) = delta.get("thinking").and_then(|s| s.as_str()) {
+                                if !t.is_empty() {
+                                    sink.reasoning_delta(t);
+                                    blocks[idx].text.push_str(t);
+                                }
                             }
                         }
                         _ => {}
@@ -300,4 +322,9 @@ enum BlockKind {
     #[default]
     Text,
     ToolUse,
+    /// Extended-thinking content block from Anthropic models that
+    /// support reasoning (e.g. claude-3.7-sonnet thinking mode).
+    /// Streamed via `thinking_delta` content-block deltas; we route
+    /// these to `TextSink::reasoning_delta` instead of `delta`.
+    Thinking,
 }
