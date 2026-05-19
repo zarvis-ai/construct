@@ -4,7 +4,7 @@
 use agentd_protocol::paths::Paths;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# agentd configuration
 # Each [adapters.<name>] entry registers a harness. The daemon looks up the
@@ -22,6 +22,13 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# agentd configuration
 # [adapters.codex]
 # binary = "agentd-adapter-codex"
 # description = "OpenAI Codex"
+
+# [adapters.zarvis.env]
+# # Per-harness env vars merged into every spawned session. Lets
+# # operators set defaults like the model from config.toml instead
+# # of needing to export them in the shell that launches the daemon.
+# # Per-session env (`agent new --env KEY=VAL`) takes precedence.
+# # AGENTD_ZARVIS_MODEL = "codex-oauth:gpt-5.5"
 
 # [defaults]
 # worktree = false   # default value of session.worktree if not specified
@@ -74,7 +81,7 @@ impl OrchestratorConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AdapterConfig {
     #[serde(default)]
     pub binary: Option<String>,
@@ -82,6 +89,23 @@ pub struct AdapterConfig {
     pub description: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
+    /// Extra environment variables to inject when spawning this
+    /// adapter. Lets operators set per-harness defaults — e.g. a
+    /// default model — from `config.toml` without touching the
+    /// shell where the daemon launches. Merged INTO the per-session
+    /// `env_with_meta` (see `daemon/src/session.rs`); existing
+    /// per-session env takes precedence so an explicit
+    /// `agent new --env KEY=VAL` still overrides.
+    ///
+    /// Example: pin every new zarvis session to use the Codex OAuth
+    /// path (subscription-billed) instead of the heuristic fallback:
+    ///
+    /// ```toml
+    /// [adapters.zarvis]
+    /// env = { AGENTD_ZARVIS_MODEL = "codex-oauth:gpt-5.5" }
+    /// ```
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -138,8 +162,45 @@ impl Config {
                     binary: Some(b.binary.to_string()),
                     description: Some(b.description.to_string()),
                     args: Vec::new(),
+                    env: HashMap::new(),
                 });
         }
         Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `[adapters.<name>].env` parses out of TOML and lands on the
+    /// resolved AdapterConfig.
+    #[test]
+    fn adapter_env_table_parses() {
+        let toml = r#"
+            [adapters.zarvis]
+            binary = "agentd-adapter-zarvis"
+            env = { AGENTD_ZARVIS_MODEL = "codex-oauth:gpt-5.5", DEBUG = "1" }
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let zarvis = cfg.adapters.get("zarvis").expect("zarvis adapter");
+        assert_eq!(
+            zarvis.env.get("AGENTD_ZARVIS_MODEL").map(String::as_str),
+            Some("codex-oauth:gpt-5.5"),
+        );
+        assert_eq!(zarvis.env.get("DEBUG").map(String::as_str), Some("1"));
+    }
+
+    /// Omitting `env` is fine — it defaults to empty rather than
+    /// failing the parse.
+    #[test]
+    fn adapter_env_defaults_to_empty() {
+        let toml = r#"
+            [adapters.zarvis]
+            binary = "agentd-adapter-zarvis"
+        "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let zarvis = cfg.adapters.get("zarvis").expect("zarvis adapter");
+        assert!(zarvis.env.is_empty());
     }
 }
