@@ -2880,6 +2880,22 @@ fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
             // chat transcript.
             vec![]
         }
+        SessionEvent::ContextCompacted {
+            dropped_turns,
+            tokens_before,
+            tokens_after,
+            summary_preview,
+            ..
+        } => vec![Span::styled(
+            format!(
+                "   ◧ compacted {} turns (~{}→{} tok): {}",
+                dropped_turns,
+                tokens_before,
+                tokens_after,
+                shorten(summary_preview, 120)
+            ),
+            Style::default().fg(theme.dim),
+        )],
     }
 }
 
@@ -3325,6 +3341,15 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
                 completions.len()
             )
         }
+        SessionEvent::ContextCompacted {
+            dropped_turns,
+            tokens_before,
+            tokens_after,
+            ..
+        } => format!(
+            "compact: {} turns ~{}→{} tok",
+            dropped_turns, tokens_before, tokens_after
+        ),
     }
 }
 

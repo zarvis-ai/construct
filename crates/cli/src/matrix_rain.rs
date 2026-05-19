@@ -461,8 +461,9 @@ fn unit_f32(seed: u64) -> f32 {
 }
 
 fn hash_text(text: &str) -> u64 {
-    text.bytes()
-        .fold(0xcbf29ce484222325, |acc, b| (acc ^ b as u64).wrapping_mul(0x100000001b3))
+    text.bytes().fold(0xcbf29ce484222325, |acc, b| {
+        (acc ^ b as u64).wrapping_mul(0x100000001b3)
+    })
 }
 
 fn hash64(mut x: u64) -> u64 {
@@ -496,6 +497,7 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
         SessionEvent::AwaitingInput { .. } => Some(("waiting", FlashTone::Warn, 35)),
         SessionEvent::AgentStatus(status) if status.active => word_for_status(&status.status),
         SessionEvent::Reset => Some(("reset", FlashTone::Warn, 50)),
+        SessionEvent::ContextCompacted { .. } => Some(("compact", FlashTone::Work, 50)),
         SessionEvent::Message { .. }
         | SessionEvent::ToolResult { .. }
         | SessionEvent::Cost { .. }
@@ -635,7 +637,8 @@ mod tests {
         rain.queue("failed", FlashTone::Bad, 0.6, 0.7, 100, RevealOrientation::Horizontal);
 
         assert_eq!(
-            rain.active_reveal(Instant::now()).map(|word| word.text.as_str()),
+            rain.active_reveal(Instant::now())
+                .map(|word| word.text.as_str()),
             Some("failed")
         );
     }

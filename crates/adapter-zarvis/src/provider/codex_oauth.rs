@@ -425,6 +425,18 @@ fn message_to_input_items(m: &Message) -> Vec<Value> {
                 "output": output,
             })]
         }
+        Content::Summary { text, .. } => {
+            // `/compact` artifact — serialize as a `user` message with
+            // the standard wire prefix so the model knows this stands
+            // in for earlier turns. Same treatment as the other
+            // providers.
+            let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
+            vec![json!({
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": body }],
+            })]
+        }
     }
 }
 

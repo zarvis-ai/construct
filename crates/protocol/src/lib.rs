@@ -278,7 +278,9 @@ pub enum SessionEvent {
     /// the agent's conversation got a placeholder result and moved
     /// on. A [`TaskEnd`] event will follow once the detached task
     /// actually completes.
-    TaskBackgrounded { call_id: String },
+    TaskBackgrounded {
+        call_id: String,
+    },
     /// The tool finished (whichever path it took). `ok` and
     /// `output_preview` mirror the corresponding `ToolResult` event
     /// — `output_preview` is truncated for `/tasks` display; the
@@ -288,6 +290,35 @@ pub enum SessionEvent {
         ok: bool,
         #[serde(default)]
         output_preview: String,
+    },
+    /// Adapter compacted older conversation turns into an
+    /// LLM-generated summary so the rolling context stays under the
+    /// model's input-token budget without silently dropping history.
+    /// Emitted by interactive adapters (currently zarvis) when either
+    /// the user runs `/compact` or auto-compact fires near the budget
+    /// ceiling. Carries enough info for the TUI to render a banner
+    /// card; full summary text is also in the transcript as the new
+    /// synthetic user turn the adapter inserted at the head.
+    ContextCompacted {
+        /// Number of turn pairs preserved verbatim after the summary.
+        #[serde(default)]
+        kept_turns: u32,
+        /// Number of turn pairs that were folded into the summary.
+        #[serde(default)]
+        dropped_turns: u32,
+        /// Approximate token count of the conversation *before* the
+        /// compaction ran (chars/3.5 heuristic, same as the rolling
+        /// budget check).
+        #[serde(default)]
+        tokens_before: u64,
+        /// Approximate token count *after* the compaction. Always
+        /// less than `tokens_before` on a successful compact.
+        #[serde(default)]
+        tokens_after: u64,
+        /// First ~160 chars of the summary, for the TUI banner. Full
+        /// text lives in the inserted user turn.
+        #[serde(default)]
+        summary_preview: String,
     },
     /// State of an adapter's input editor, rendered by the TUI in a
     /// fixed pane below the chat scrollback. Emitted by the adapter

@@ -51,7 +51,26 @@ pub enum Content {
         output: String,
         is_error: bool,
     },
+    /// Output of `/compact` (manual or automatic). Carries the
+    /// LLM-written summary of older turns it replaced. Providers
+    /// serialize this as a plain `user` text turn on the wire (prefixed
+    /// with [`SUMMARY_WIRE_PREFIX`]); the variant exists so on-disk and
+    /// in-memory code can identify compacted history — e.g. the next
+    /// compaction walks past it instead of re-summarizing the summary,
+    /// and the TUI can render it with a banner.
+    Summary {
+        text: String,
+        /// Number of *turn pairs* (user → assistant exchange, including
+        /// any interleaved tool calls) collapsed into this summary.
+        /// Used for telemetry and the TUI banner.
+        dropped_turn_pairs: u32,
+    },
 }
+
+/// Prefix prepended to a [`Content::Summary`] body when serialized on
+/// the wire. Kept out of the in-memory `text` field so re-compaction
+/// can recognize summaries without string-matching the body.
+pub const SUMMARY_WIRE_PREFIX: &str = "[Compacted earlier context]\n";
 
 #[derive(Debug, Clone)]
 pub struct ToolSpec {

@@ -71,11 +71,19 @@ fn messages_to_ollama(system: &str, messages: &[Message]) -> Vec<Value> {
                 }
                 out.push(entry);
             }
-            Content::ToolResult { call_id: _, output, is_error: _ } => {
+            Content::ToolResult {
+                call_id: _,
+                output,
+                is_error: _,
+            } => {
                 out.push(json!({
                     "role": "tool",
                     "content": output,
                 }));
+            }
+            Content::Summary { text, .. } => {
+                let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
+                out.push(json!({ "role": "user", "content": body }));
             }
         }
     }
