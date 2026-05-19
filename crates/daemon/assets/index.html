@@ -351,6 +351,108 @@
     pointer-events: none;
   }
   .terminal-loading.gone { display: none; }
+
+  /* Tool approval bottom sheet -------------------------------------- */
+  .approval-sheet {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
+    z-index: 1000;
+    /* Animate in. */
+    animation: approval-fade-in 120ms ease-out;
+  }
+  @keyframes approval-fade-in { from { opacity: 0; } to { opacity: 1; } }
+  .approval-sheet[hidden] { display: none; }
+  .approval-card {
+    width: 100%;
+    max-width: 480px;
+    background: var(--bg-elev);
+    border-top: 1px solid var(--border);
+    border-radius: 14px 14px 0 0;
+    padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+    box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.35);
+    animation: approval-slide-up 180ms cubic-bezier(0.2, 0.9, 0.3, 1);
+  }
+  @keyframes approval-slide-up {
+    from { transform: translateY(40%); opacity: 0; }
+    to   { transform: translateY(0);    opacity: 1; }
+  }
+  .approval-head { display: flex; gap: 8px; align-items: baseline; }
+  .approval-tool-name {
+    font-weight: 600;
+    font-size: 15px;
+    flex: 1;
+    word-break: break-word;
+  }
+  .approval-risk {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: var(--bg-elev-2);
+    color: var(--fg-dim);
+  }
+  .approval-risk.safe { background: rgba(92, 209, 166, 0.18); color: var(--ok); }
+  .approval-risk.risky { background: rgba(244, 124, 124, 0.18); color: var(--err); }
+  .approval-summary {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: var(--fg);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 36vh;
+    overflow-y: auto;
+  }
+  .approval-queue-hint {
+    color: var(--fg-dim);
+    font-size: 11px;
+    margin-top: 6px;
+  }
+  .approval-actions {
+    margin-top: 12px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .approval-actions .btn-automode {
+    grid-column: 1 / 3;
+  }
+  .approval-actions button {
+    appearance: none;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font: inherit;
+    font-weight: 500;
+    cursor: pointer;
+    color: var(--fg);
+    background: var(--bg-elev-2);
+  }
+  .approval-actions .btn-approve {
+    background: var(--accent);
+    color: #fff;
+  }
+  .approval-actions .btn-deny {
+    background: rgba(244, 124, 124, 0.18);
+    color: var(--err);
+  }
+  .approval-actions .btn-automode {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font-size: 13px;
+  }
+  .approval-actions button:disabled { opacity: 0.5; cursor: progress; }
 </style>
 </head>
 <body>
@@ -392,6 +494,31 @@
     </section>
   </main>
 
+  <!--
+    Tool-approval bottom sheet. Shown when the adapter emits
+    `tool_approval_request`; the user picks approve / deny /
+    approve-all (automode) and the client posts back via
+    `session.tool_decision`. Queued sheet if multiple arrive while
+    one is open.
+  -->
+  <div id="approvalSheet" class="approval-sheet" hidden role="dialog" aria-modal="true">
+    <div class="approval-card">
+      <div class="approval-head">
+        <div class="approval-tool-name" id="approvalToolName"></div>
+        <span class="approval-risk" id="approvalRisk"></span>
+      </div>
+      <pre class="approval-summary" id="approvalSummary"></pre>
+      <div class="approval-queue-hint" id="approvalQueueHint" hidden></div>
+      <div class="approval-actions">
+        <button type="button" class="btn-deny" id="approvalDeny">Deny</button>
+        <button type="button" class="btn-approve" id="approvalApprove">Approve</button>
+        <button type="button" class="btn-automode" id="approvalAutomode">
+          Approve all from now on (auto-mode)
+        </button>
+      </div>
+    </div>
+  </div>
+
 <script>
 "use strict";
 
@@ -413,6 +540,14 @@ const toggleListBtn = $("toggleList");
 const terminalWrapEl = $("terminalWrap");
 const terminalEl = $("terminal");
 const terminalLoadingEl = $("terminalLoading");
+const approvalSheetEl = $("approvalSheet");
+const approvalToolNameEl = $("approvalToolName");
+const approvalRiskEl = $("approvalRisk");
+const approvalSummaryEl = $("approvalSummary");
+const approvalQueueHintEl = $("approvalQueueHint");
+const approvalDenyBtn = $("approvalDeny");
+const approvalApproveBtn = $("approvalApprove");
+const approvalAutomodeBtn = $("approvalAutomode");
 
 const state = {
   ws: null,
@@ -442,6 +577,12 @@ const state = {
   // history-before-live ordering correct without a race window.
   ptyBuffer: [],
   ptyBuffering: false,
+  // FIFO queue of pending tool-approval requests for the active
+  // session. The bottom-sheet shows the head; each decision pops
+  // and re-shows for the next, so multiple back-to-back approval
+  // prompts (codex with tool-heavy turns) don't lose any.
+  approvalQueue: [],
+  approvalShown: null,
 };
 
 function setConnState(s, label) {
@@ -754,6 +895,14 @@ async function loadTranscript(id) {
 function handleNotification(method, params) {
   if (method === "session/event") {
     const { session_id, event } = params;
+    // Tool-approval requests are interactive and time-sensitive —
+    // surface them in the bottom sheet regardless of which session
+    // is currently being viewed. The session_id sticks with the
+    // queued entry so the eventual `tool_decision` RPC routes back
+    // to the right session even if the user switches views.
+    if (event && event.type === "tool_approval_request" && event.call_id) {
+      enqueueApproval(session_id, event);
+    }
     if (session_id !== state.currentId) return;
     renderEvent(event, params.at);
     scrollToBottom();
@@ -1005,6 +1154,85 @@ function escapeBin(bin) {
   }
   return out;
 }
+
+// --- Tool approval sheet ------------------------------------------------
+
+/**
+ * Queue a fresh approval request. The bottom sheet pops up if it
+ * isn't already showing one; otherwise the request waits in line.
+ */
+function enqueueApproval(sessionId, event) {
+  state.approvalQueue.push({
+    session_id: sessionId,
+    call_id: event.call_id,
+    tool: event.tool || "tool",
+    args_summary: event.args_summary || "",
+    risk: event.risk || "",
+  });
+  if (!state.approvalShown) showNextApproval();
+  else updateApprovalQueueHint();
+}
+
+function showNextApproval() {
+  const next = state.approvalQueue.shift();
+  if (!next) {
+    state.approvalShown = null;
+    approvalSheetEl.hidden = true;
+    return;
+  }
+  state.approvalShown = next;
+  approvalToolNameEl.textContent = next.tool;
+  approvalRiskEl.textContent = next.risk || "";
+  approvalRiskEl.classList.remove("safe", "risky");
+  if (next.risk === "safe" || next.risk === "risky") {
+    approvalRiskEl.classList.add(next.risk);
+  }
+  approvalSummaryEl.textContent = next.args_summary || "(no args)";
+  setApprovalButtonsDisabled(false);
+  updateApprovalQueueHint();
+  approvalSheetEl.hidden = false;
+}
+
+function updateApprovalQueueHint() {
+  const n = state.approvalQueue.length;
+  if (n > 0) {
+    approvalQueueHintEl.textContent =
+      `${n} more request${n === 1 ? "" : "s"} queued`;
+    approvalQueueHintEl.hidden = false;
+  } else {
+    approvalQueueHintEl.hidden = true;
+  }
+}
+
+function setApprovalButtonsDisabled(disabled) {
+  approvalDenyBtn.disabled = disabled;
+  approvalApproveBtn.disabled = disabled;
+  approvalAutomodeBtn.disabled = disabled;
+}
+
+async function decideApproval(decision) {
+  const pending = state.approvalShown;
+  if (!pending) return;
+  setApprovalButtonsDisabled(true);
+  try {
+    await rpc("session.tool_decision", {
+      session_id: pending.session_id,
+      call_id: pending.call_id,
+      decision,
+    });
+  } catch (e) {
+    // Surface the failure so the user can retry. The next approval
+    // doesn't auto-advance — the user re-decides this one.
+    appendError(`tool_decision failed: ${e.message}`);
+    setApprovalButtonsDisabled(false);
+    return;
+  }
+  showNextApproval();
+}
+
+approvalApproveBtn.addEventListener("click", () => decideApproval("approve"));
+approvalDenyBtn.addEventListener("click", () => decideApproval("deny"));
+approvalAutomodeBtn.addEventListener("click", () => decideApproval("automode"));
 
 // --- Boot ---------------------------------------------------------------
 
