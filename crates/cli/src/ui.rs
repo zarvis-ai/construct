@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
@@ -1210,38 +1210,58 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     let cycle = rain_area.height + MATRIX_RAIN_TAIL_MAX + 1;
     let charset = b"01:|/\\{}[]<>+$#@*=-zrvshcodxgit";
     let mut current_drop_keys = HashSet::with_capacity(rain_area.width as usize);
+    // Per-column current head position for active foreground drops —
+    // captured here so the horizontal reveal pass can pin letters
+    // live the instant a drop's head reaches the letter's row.
+    let mut drop_heads: Vec<Option<i16>> = vec![None; rain_area.width as usize];
+
+    // Resolve any not-yet-placed vertical reveals, then build a
+    // per-column row→letter overlay. The column loop below uses this
+    // to swap the random drop-body glyph for the word's letter where
+    // they line up, so a vertical reveal looks like a normal drop
+    // that happens to be spelling a word as it falls.
+    resolve_vertical_reveal_positions(&mut app.matrix_rain, rain_area, now);
+    let vertical_overlay = build_vertical_letter_overlay(&app.matrix_rain, rain_area, now);
 
     for col in 0..rain_area.width {
         let seed = hash64(col as u64 ^ ((rain_area.width as u64) << 24));
         let speed = 2 + (seed % 7);
-        let threshold = foreground_column_threshold(seed);
-        let frame = foreground_rain_frame(
-            now,
-            app.matrix_rain_foreground_epoch,
-            seed,
-            threshold,
-            speed,
-            cycle,
-        );
-        let active = frame.and_then(|frame| {
-            current_drop_keys.insert(frame.key);
-            if activity >= threshold {
+        let frame = foreground_rain_frame(now, app.matrix_rain_foreground_epoch, seed, speed, cycle);
+        current_drop_keys.insert(frame.key);
+        // Register a fresh drop only at the *top* of its cycle, and
+        // only if a per-cycle random roll comes in under the current
+        // activity. The roll is keyed on `frame.key` (which already
+        // includes the column seed + cycle index), so it's STABLE
+        // within a single cycle — no flicker — but scatters across
+        // cycles and columns. Every column gets a chance every
+        // cycle, instead of the old fixed per-column threshold that
+        // left some columns permanently dark at low intensity.
+        if frame.head <= MATRIX_RAIN_REGISTRATION_TOP_ROW as i16 {
+            let roll = unit_f32(hash64(frame.key ^ 0xc3d2_e1f0_a574_8b96));
+            if roll < activity {
                 app.matrix_rain_active_drops
                     .entry(frame.key)
                     .or_insert(spawn_tail);
             }
-            app.matrix_rain_active_drops
-                .get(&frame.key)
-                .copied()
-                .map(|tail| (frame.head, tail))
-        });
+        }
+        let active = app
+            .matrix_rain_active_drops
+            .get(&frame.key)
+            .copied()
+            .map(|tail| (frame.head, tail));
+        if active.is_some() {
+            drop_heads[col as usize] = Some(frame.head);
+        }
+        let col_overlay = vertical_overlay.get(col as usize);
         for row in 0..rain_area.height {
             let dist = active.map(|(head, _)| head).unwrap_or(-1) - row as i16;
             let mut style = None;
+            let mut in_drop_body = false;
             if let Some((_, tail)) = active {
                 if dist >= 0 && dist < tail as i16 {
                     let shade = 1.0 - (dist as f32 / tail.max(1) as f32);
                     style = Some(rain_style(&app.theme, shade, activity));
+                    in_drop_body = true;
                 }
             }
             if style.is_none() {
@@ -1252,8 +1272,28 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                 }
             }
             if let Some(style) = style {
-                let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
-                let ch = charset[(glyph_seed as usize) % charset.len()] as char;
+                // Vertical reveals override the random drop-body
+                // glyph with the word's actual letter at this row,
+                // and shift the cell's color from the default rain
+                // green toward `theme.accent_alt` (teal). Same
+                // head→tail shading, no bold — distinct enough to
+                // pick the word out, still firmly in the matrix
+                // palette.
+                let (ch, style) = if in_drop_body {
+                    match col_overlay.and_then(|map| map.get(&(row as i16)).copied()) {
+                        Some(letter) => {
+                            let shade = compute_drop_shade(active, row);
+                            (letter, rain_letter_style(&app.theme, shade, activity))
+                        }
+                        None => {
+                            let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
+                            (charset[(glyph_seed as usize) % charset.len()] as char, style)
+                        }
+                    }
+                } else {
+                    let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
+                    (charset[(glyph_seed as usize) % charset.len()] as char, style)
+                };
                 f.buffer_mut().set_string(
                     rain_area.x + col,
                     rain_area.y + row,
@@ -1266,25 +1306,96 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     app.matrix_rain_active_drops
         .retain(|key, _| current_drop_keys.contains(key));
 
-    for reveal in app.matrix_rain.active_reveals(now) {
-        if reveal.progress(now).is_some() {
-            let reveal_start_elapsed_ms = reveal
-                .started
-                .checked_duration_since(app.start_instant)
-                .map(|duration| duration.as_millis() as u64)
-                .unwrap_or(0);
-            render_matrix_reveal(
+    let theme = app.theme.clone();
+    for reveal in app.matrix_rain.active_reveals_mut(now) {
+        if let crate::matrix_rain::RevealOrientation::Horizontal = reveal.orientation {
+            render_matrix_reveal_horizontal(
                 f,
                 rain_area,
-                &app.theme,
+                &theme,
                 reveal,
                 elapsed,
-                reveal_start_elapsed_ms,
-                cycle,
+                &drop_heads,
+                spawn_tail,
             );
         }
+        // Vertical reveals are rendered inline above as a drop-body
+        // letter overlay — no separate pass / no pin-and-hold.
     }
 }
+
+/// First-frame placement for vertical reveals: pick the absolute
+/// (col, row) for any reveal that doesn't have a resolved position
+/// yet. Idempotent: calling on subsequent frames is a no-op because
+/// `set_resolved_position` only sets when unset.
+fn resolve_vertical_reveal_positions(
+    matrix_rain: &mut crate::matrix_rain::MatrixRain,
+    area: Rect,
+    now: Instant,
+) {
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    for reveal in matrix_rain.active_reveals_mut(now) {
+        if !matches!(reveal.orientation, crate::matrix_rain::RevealOrientation::Vertical) {
+            continue;
+        }
+        if reveal.resolved_position().is_some() {
+            continue;
+        }
+        let text_len = reveal.text.chars().count() as u16;
+        if text_len == 0 || text_len > area.height {
+            continue;
+        }
+        let col_rel = ((area.width.saturating_sub(1)) as f32 * reveal.x)
+            .round()
+            .clamp(0.0, area.width.saturating_sub(1) as f32) as u16;
+        let row_rel = ((area.height.saturating_sub(text_len)) as f32 * reveal.y)
+            .round()
+            .clamp(0.0, area.height.saturating_sub(text_len) as f32) as u16;
+        reveal.set_resolved_position(area.x + col_rel, area.y + row_rel);
+    }
+}
+
+/// Build a per-column `row → letter` map for all currently-active
+/// vertical reveals. The column loop consults this when rendering
+/// drop-body cells; a cell that matches an overlay entry shows the
+/// word's letter instead of a random charset character.
+fn build_vertical_letter_overlay(
+    matrix_rain: &crate::matrix_rain::MatrixRain,
+    area: Rect,
+    now: Instant,
+) -> Vec<HashMap<i16, char>> {
+    let mut overlay = vec![HashMap::<i16, char>::new(); area.width as usize];
+    for reveal in matrix_rain.active_reveals(now) {
+        if !matches!(reveal.orientation, crate::matrix_rain::RevealOrientation::Vertical) {
+            continue;
+        }
+        let Some((col_abs, row_abs)) = reveal.resolved_position() else {
+            continue;
+        };
+        if col_abs < area.x || col_abs >= area.x + area.width {
+            continue;
+        }
+        let col_idx = (col_abs - area.x) as usize;
+        let row_start_rel = row_abs.saturating_sub(area.y) as i16;
+        for (i, ch) in reveal.text.chars().enumerate() {
+            let row_rel = row_start_rel + i as i16;
+            if row_rel < 0 || row_rel >= area.height as i16 {
+                continue;
+            }
+            overlay[col_idx].insert(row_rel, ch);
+        }
+    }
+    overlay
+}
+
+/// A column registers a new drop only when its `head` is at one of
+/// the top few rows of the cycle (i.e. about to start falling from
+/// the very top of the visible area). This avoids drops popping
+/// into existence mid-screen the moment activity rises above the
+/// column's threshold.
+const MATRIX_RAIN_REGISTRATION_TOP_ROW: u16 = 1;
 
 fn render_matrix_rain_header(f: &mut Frame, area: Rect, theme: &Theme) {
     let line_style = Style::default().fg(theme.matrix_line);
@@ -1303,14 +1414,16 @@ fn update_matrix_rain_intensity(app: &mut App, now: Instant) -> f32 {
     let elapsed = now
         .checked_duration_since(app.matrix_rain_intensity_updated_at)
         .unwrap_or(Duration::ZERO);
-    let prev = app.matrix_rain_intensity;
     app.matrix_rain_intensity =
         eased_matrix_rain_intensity(app.matrix_rain_intensity, target, elapsed);
-    if app.matrix_rain_intensity > prev {
-        let offset = Duration::from_secs_f32(app.matrix_rain_intensity * MATRIX_RAIN_RAMP_UP_SECS);
-        app.matrix_rain_foreground_epoch = now.checked_sub(offset).unwrap_or(now);
-    }
     app.matrix_rain_intensity_updated_at = now;
+    // NOTE: `matrix_rain_foreground_epoch` is intentionally left
+    // alone here. It's set once at app start and never moved — each
+    // column's head is `((now - epoch) / cell_ms + phase) % cycle`,
+    // so shifting the epoch would teleport every drop on screen.
+    // Activity gates *which* columns register a fresh drop at the
+    // top of each cycle (see `render_matrix_rain`), not the clock
+    // that drops fall on.
     app.matrix_rain_intensity
 }
 
@@ -1333,10 +1446,6 @@ fn eased_matrix_rain_intensity(current: f32, target: f32, elapsed: Duration) -> 
     }
 }
 
-fn foreground_column_threshold(seed: u64) -> f32 {
-    unit_f32(hash64(seed ^ 0x9a4b_2f1d_87c6_e503))
-}
-
 fn matrix_rain_tail(activity: f32) -> u16 {
     (MATRIX_RAIN_TAIL_MIN as f32
         + activity.clamp(0.0, 1.0) * (MATRIX_RAIN_TAIL_MAX - MATRIX_RAIN_TAIL_MIN) as f32)
@@ -1349,31 +1458,39 @@ struct MatrixRainFrame {
     head: i16,
 }
 
+/// Where this column's foreground drop is *right now*, on a clock
+/// that never moves once `foreground_epoch` is set at app start.
+///
+/// Each column has a fixed phase offset (from `seed`) so columns
+/// don't all start at head 0 in unison. The position is purely a
+/// function of wall time + seed + speed — activity / threshold do
+/// not appear here, so a change in fleet intensity cannot teleport
+/// drops mid-fall. Activity gating lives one level up in
+/// `render_matrix_rain`, which decides whether each cycle's drop is
+/// rendered at all (registered at head ≈ 0 if activity ≥ threshold).
 fn foreground_rain_frame(
     now: Instant,
     foreground_epoch: Instant,
     seed: u64,
-    threshold: f32,
     speed: u64,
     cycle: u16,
-) -> Option<MatrixRainFrame> {
-    let crossing = foreground_epoch.checked_add(Duration::from_secs_f32(
-        threshold * MATRIX_RAIN_RAMP_UP_SECS,
-    ))?;
-    let age = now.checked_duration_since(crossing)?;
+) -> MatrixRainFrame {
+    let age = now
+        .checked_duration_since(foreground_epoch)
+        .unwrap_or(Duration::ZERO);
     let cell_ms = 58 + speed * 19;
     let cycle = cycle.max(1) as u64;
     let step = age.as_millis() as u64 / cell_ms;
-    let cycle_index = step / cycle;
-    Some(MatrixRainFrame {
-        key: hash64(
-            seed ^ ((speed & 0xff) << 56)
-                ^ ((cycle & 0xffff) << 40)
-                ^ ((threshold.to_bits() as u64) << 8)
-                ^ cycle_index,
-        ),
-        head: (step % cycle) as i16,
-    })
+    // Stable per-column phase so columns are out of sync from frame
+    // 0 — gives the staggered look without depending on threshold or
+    // a shifting epoch.
+    let phase = (hash64(seed ^ 0x5a17_30c8_d3e1_4f29) % cycle) as u64;
+    let total = step + phase;
+    let cycle_index = total / cycle;
+    MatrixRainFrame {
+        key: hash64(seed ^ ((speed & 0xff) << 56) ^ ((cycle & 0xffff) << 40) ^ cycle_index),
+        head: (total % cycle) as i16,
+    }
 }
 
 fn fleet_activity_target(app: &App, now: Instant) -> f32 {
@@ -1420,14 +1537,67 @@ fn rain_style(theme: &Theme, shade: f32, activity: f32) -> Style {
     }
 }
 
-fn render_matrix_reveal(
+/// Same head→tail shading as `rain_style`, but the bright endpoint
+/// is `theme.text` (near-white pale green in the default theme)
+/// instead of `theme.accent` (the rain's bright green). The vertical
+/// reveal letter ends up *brighter* than the brightest rain head —
+/// clearly readable, still in the matrix palette since the dim end
+/// is the same `matrix_dim` green as the rain.
+fn rain_letter_style(theme: &Theme, shade: f32, activity: f32) -> Style {
+    let shade = shade.clamp(0.0, 1.0);
+    let boost = activity.clamp(0.0, 1.0);
+    let style = Style::default().fg(blend_color(
+        theme.matrix_dim,
+        theme.text,
+        (shade * 0.86 + boost * 0.14).clamp(0.0, 1.0),
+    ));
+    if shade > 0.72 {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+/// Recompute the per-cell shade used by `rain_style` /
+/// `rain_letter_style`: `1.0` at the drop head, fading linearly to
+/// `0` over `tail` rows. Returns `0.0` if the cell isn't in the
+/// drop body (caller should normally only call this with a body
+/// cell — `0.0` is a safe fallback that maps to the dim end of the
+/// palette).
+fn compute_drop_shade(active: Option<(i16, u16)>, row: u16) -> f32 {
+    match active {
+        Some((head, tail)) => {
+            let dist = head - row as i16;
+            if dist < 0 || dist >= tail as i16 {
+                0.0
+            } else {
+                1.0 - (dist as f32 / tail.max(1) as f32)
+            }
+        }
+        None => 0.0,
+    }
+}
+
+/// Render a horizontal reveal word (letters laid left-to-right at a
+/// single row). Each letter pins the first frame a real foreground
+/// drop's body is currently *covering* its cell — checked against
+/// `drop_heads` from the rain pass, not predicted analytically. The
+/// pin window is the drop's bright body (`tail` rows wide), so a
+/// letter never latches based on a stale head position from many
+/// rows below.
+///
+/// Once every letter is pinned the reveal enters a short hold and
+/// then fades. If some letters never pin (their column is
+/// consistently below activity threshold), the reveal simply expires
+/// when its `duration` elapses.
+fn render_matrix_reveal_horizontal(
     f: &mut Frame,
     area: Rect,
     theme: &Theme,
-    reveal: &crate::matrix_rain::RevealWord,
+    reveal: &mut crate::matrix_rain::RevealWord,
     elapsed_ms: u64,
-    reveal_start_elapsed_ms: u64,
-    cycle: u16,
+    drop_heads: &[Option<i16>],
+    spawn_tail: u16,
 ) {
     if area.width < 4 || area.height == 0 {
         return;
@@ -1437,30 +1607,84 @@ fn render_matrix_reveal(
     if text_w == 0 || text_w + 2 > area.width {
         return;
     }
-    let target_x = area.x
-        + ((area.width.saturating_sub(text_w) as f32) * reveal.x)
-            .round()
-            .clamp(0.0, area.width.saturating_sub(text_w) as f32) as u16;
-    let target_y = area.y
-        + ((area.height.saturating_sub(1) as f32) * reveal.y)
-            .round()
-            .clamp(0.0, area.height.saturating_sub(1) as f32) as u16;
+    // Lock the absolute (col, row) on the first frame so already-
+    // pinned letters don't drift if the area resizes mid-reveal.
+    let (target_x, target_y) = match reveal.resolved_position() {
+        Some((c, r)) => (c, r),
+        None => {
+            let cx = area.x
+                + ((area.width.saturating_sub(text_w) as f32) * reveal.x)
+                    .round()
+                    .clamp(0.0, area.width.saturating_sub(text_w) as f32) as u16;
+            let ry = area.y
+                + ((area.height.saturating_sub(1) as f32) * reveal.y)
+                    .round()
+                    .clamp(0.0, area.height.saturating_sub(1) as f32) as u16;
+            reveal.set_resolved_position(cx, ry);
+            (cx, ry)
+        }
+    };
 
-    let target_rel_y = target_y.saturating_sub(area.y);
-    let mut pins = Vec::with_capacity(chars.len());
-    let mut all_pinned_at = reveal_start_elapsed_ms;
-    for i in 0..chars.len() {
-        let col = target_x.saturating_sub(area.x) + i as u16;
-        let pinned_at =
-            rain_pass_elapsed_ms(area.width, col, target_rel_y, cycle, reveal_start_elapsed_ms);
-        all_pinned_at = all_pinned_at.max(pinned_at);
-        pins.push(pinned_at);
+    let target_rel_y = target_y.saturating_sub(area.y) as i16;
+    let base_col = target_x.saturating_sub(area.x) as usize;
+    let tail = spawn_tail.max(1) as i16;
+
+    let letter_count = reveal.pin_state().len();
+    for i in 0..letter_count {
+        if reveal.pin_state()[i].is_some() {
+            continue;
+        }
+        let col = base_col + i;
+        if let Some(Some(head)) = drop_heads.get(col) {
+            // Pin only while the drop's BRIGHT BODY is currently
+            // covering the cell — i.e. head ≥ row and head − row <
+            // tail. Without the upper bound, on sparse frames the
+            // letter would latch on a head that's already far past,
+            // making it appear out of nowhere with no drop nearby.
+            let delta = *head - target_rel_y;
+            if delta >= 0 && delta < tail {
+                reveal.pin_letter(i, elapsed_ms);
+            }
+        }
     }
+
+    render_pinned_letters_at(
+        f,
+        theme,
+        reveal,
+        elapsed_ms,
+        &chars,
+        |i| target_x + i as u16,
+        |_| target_y,
+    );
+}
+
+/// Brightness / hold / fade pipeline for horizontal reveals. Once
+/// every letter is pinned the word holds briefly then fades; if
+/// some letters never get pinned (their column never fires a drop
+/// through `target_y`) the reveal just expires.
+fn render_pinned_letters_at(
+    f: &mut Frame,
+    theme: &Theme,
+    reveal: &crate::matrix_rain::RevealWord,
+    elapsed_ms: u64,
+    chars: &[char],
+    xs: impl Fn(usize) -> u16,
+    ys: impl Fn(usize) -> u16,
+) {
+    let pin_state = reveal.pin_state();
+    let all_pinned_at = if !pin_state.is_empty() && pin_state.iter().all(Option::is_some) {
+        pin_state.iter().filter_map(|x| *x).max()
+    } else {
+        None
+    };
 
     let complete_hold_ms = 400;
     let fade_ms = 200;
-    let fade_start = all_pinned_at + complete_hold_ms;
-    let fade_end = fade_start + fade_ms;
+    let (fade_start, fade_end) = match all_pinned_at {
+        Some(t) => (t + complete_hold_ms, t + complete_hold_ms + fade_ms),
+        None => (u64::MAX, u64::MAX),
+    };
     let fade_level = if elapsed_ms < fade_start {
         1.0
     } else {
@@ -1468,11 +1692,10 @@ fn render_matrix_reveal(
         (1.0 - elapsed_fade as f32 / fade_ms.max(1) as f32).clamp(0.0, 1.0)
     };
 
-    for (i, ch) in chars.into_iter().enumerate() {
-        let pinned_at = pins[i];
-        if elapsed_ms < pinned_at {
+    for (i, ch) in chars.iter().copied().enumerate() {
+        let Some(pinned_at) = pin_state[i] else {
             continue;
-        }
+        };
         if elapsed_ms >= fade_end {
             continue;
         }
@@ -1487,11 +1710,10 @@ fn render_matrix_reveal(
             (0.12 + fade_level * 0.64).clamp(0.0, 1.0)
         };
         let style = matrix_reveal_style(theme, brightness, elapsed_ms < fade_start);
-        let x = target_x + i as u16;
-        f.buffer_mut()
-            .set_string(x, target_y, ch.to_string(), style);
+        f.buffer_mut().set_string(xs(i), ys(i), ch.to_string(), style);
     }
 }
+
 
 fn matrix_reveal_style(theme: &Theme, brightness: f32, bold: bool) -> Style {
     let brightness = brightness.clamp(0.0, 1.0);
@@ -1504,24 +1726,6 @@ fn matrix_reveal_style(theme: &Theme, brightness: f32, bold: bool) -> Style {
     } else {
         style
     }
-}
-
-fn rain_pass_elapsed_ms(
-    width: u16,
-    col: u16,
-    target_rel_y: u16,
-    cycle: u16,
-    start_elapsed_ms: u64,
-) -> u64 {
-    let seed = hash64(col as u64 ^ ((width as u64) << 24));
-    let speed = 2 + (seed % 7);
-    let tick_ms = 58 + speed * 19;
-    let offset = (seed >> 8) % cycle.max(1) as u64;
-    let cycle = cycle.max(1) as u64;
-    let start_step = start_elapsed_ms / tick_ms;
-    let target_step = (target_rel_y as u64 + cycle - offset) % cycle;
-    let delta = (target_step + cycle - (start_step % cycle)) % cycle;
-    (start_step + delta) * tick_ms
 }
 
 fn blend_color(a: Color, b: Color, t: f32) -> Color {
@@ -3366,27 +3570,6 @@ mod tests {
     }
 
     #[test]
-    fn rain_pass_elapsed_ms_waits_for_natural_column_pass() {
-        let width = 24;
-        let cycle = 13;
-        let target_rel_y = 4;
-
-        for col in 0..width {
-            let passed_at = rain_pass_elapsed_ms(width, col, target_rel_y, cycle, 1_000);
-
-            let seed = hash64(col as u64 ^ ((width as u64) << 24));
-            let tick_ms = 58 + (2 + (seed % 7)) * 19;
-            assert!(
-                passed_at >= 1_000 || passed_at + tick_ms > 1_000,
-                "the pass should either be upcoming or still be the current head position"
-            );
-            let offset = (seed >> 8) % cycle as u64;
-            let head = ((passed_at / tick_ms) + offset) % cycle as u64;
-            assert_eq!(head, target_rel_y as u64);
-        }
-    }
-
-    #[test]
     fn split_list_pane_reserves_matrix_height_so_list_scrolls_when_items_overflow() {
         // Tall pane: items would overflow but matrix should still be
         // anchored at the default 12 rows at the bottom, and the list
@@ -3471,26 +3654,53 @@ mod tests {
     }
 
     #[test]
-    fn foreground_rain_frame_starts_at_top_after_activation() {
+    fn foreground_rain_frame_position_is_deterministic_from_epoch() {
+        // The drop position is a pure function of (now - epoch),
+        // seed, speed, cycle. Same inputs ⇒ same head. The two
+        // calls below differ by exactly `cell_ms`, so the head
+        // advances by exactly one row — never teleports.
         let epoch = Instant::now();
-        let threshold = 0.5;
-        let crossing = epoch + Duration::from_millis(2500);
-        let seed = 42;
-        assert_eq!(
-            foreground_rain_frame(crossing, epoch, seed, threshold, 2, 20)
-                .map(|frame| frame.head),
-            Some(0)
+        let seed: u64 = 42;
+        let speed: u64 = 3;
+        let cycle: u16 = 20;
+        let cell_ms = 58 + speed * 19;
+        let a = foreground_rain_frame(
+            epoch + Duration::from_millis(cell_ms * 5),
+            epoch,
+            seed,
+            speed,
+            cycle,
         );
-        assert_eq!(
-            foreground_rain_frame(
-                crossing - Duration::from_millis(1),
-                epoch,
-                seed,
-                threshold,
-                2,
-                20,
-            ),
-            None
+        let b = foreground_rain_frame(
+            epoch + Duration::from_millis(cell_ms * 6),
+            epoch,
+            seed,
+            speed,
+            cycle,
+        );
+        // Heads advance by 1 (mod cycle); never jump.
+        let advance = (b.head as i32 - a.head as i32).rem_euclid(cycle as i32);
+        assert_eq!(advance, 1);
+    }
+
+    #[test]
+    fn foreground_rain_frame_columns_are_phase_staggered() {
+        // Two columns at the same instant must not share a head —
+        // their seed-derived phase offsets keep the field from
+        // looking like a marching curtain at frame 0.
+        let epoch = Instant::now();
+        let now = epoch + Duration::from_millis(0);
+        let cycle: u16 = 20;
+        let mut heads = std::collections::HashSet::new();
+        for col in 0u16..32 {
+            let seed = hash64(col as u64 ^ ((32u64) << 24));
+            let speed = 2 + (seed % 7);
+            heads.insert(foreground_rain_frame(now, epoch, seed, speed, cycle).head);
+        }
+        assert!(
+            heads.len() > 1,
+            "expected staggered phases across columns, got {} distinct heads",
+            heads.len()
         );
     }
 

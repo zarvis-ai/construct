@@ -1330,7 +1330,8 @@ impl App {
             m if m == agentd_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
-                        self.matrix_rain.observe_event(&payload.event);
+                        self.matrix_rain
+                            .observe_event(&payload.event, self.matrix_rain_intensity);
                         // Tool-approval prompt: if no minibuffer is in use,
                         // open the approval prompt for the matching session.
                         // Otherwise the user sees the request in the
@@ -1412,6 +1413,7 @@ impl App {
                                 &payload.session_id,
                                 bytes.as_deref().unwrap_or(&[]),
                                 now,
+                                self.matrix_rain_intensity,
                             );
                             return;
                         }
@@ -3157,7 +3159,8 @@ impl App {
                     self.minibuffer = None;
                     match self.client.tool_decision(&session_id, call_id, d).await {
                         Ok(()) => {
-                            self.matrix_rain.observe_tool_decision(d);
+                            self.matrix_rain
+                                .observe_tool_decision(d, self.matrix_rain_intensity);
                             self.set_status(format!("tool {d}"));
                         }
                         Err(e) => self.set_status(format!("tool_decision failed: {e}")),
@@ -3483,7 +3486,8 @@ impl App {
                 {
                     self.set_status(format!("tool_decision failed: {e}"));
                 } else {
-                    self.matrix_rain.observe_tool_decision("approve");
+                    self.matrix_rain
+                        .observe_tool_decision("approve", self.matrix_rain_intensity);
                 }
             }
         }
