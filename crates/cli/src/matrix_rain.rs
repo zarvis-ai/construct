@@ -284,7 +284,15 @@ impl MatrixRain {
         now: Instant,
     ) {
         self.queue.retain(|word| !word.expired(now));
-        let duration = Duration::from_millis(12_000);
+        // Horizontal reveals need *every* column under the word to
+        // fire a drop at the same row, so they need a longer window
+        // to have a fair shot at completing. Vertical reveals can
+        // pin the whole word in a single drop pass, so 12 s is
+        // plenty.
+        let duration = match orientation {
+            RevealOrientation::Horizontal => Duration::from_millis(18_000),
+            RevealOrientation::Vertical => Duration::from_millis(12_000),
+        };
         let text: String = text.into();
         let pin_state = vec![None; text.chars().count()];
         self.queue.push(RevealWord {
