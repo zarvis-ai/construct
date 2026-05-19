@@ -544,15 +544,26 @@ impl SessionManager {
             a
         };
 
-        // Build the full env (user-provided + daemon meta) BEFORE spawn so
-        // the adapter process inherits AGENTD_SESSION_DATA_DIR /
-        // AGENTD_SESSION_KIND — not just the session.start params.env. The
-        // codex adapter (and claude) reads these via std::env::var, so
-        // leaving them only in session.start meant their first-spawn
-        // bookkeeping (originator-tagged rollout capture, session-id
-        // minting) silently no-op'd; respawn already merged them in time,
-        // so the bug only surfaced on initial create.
-        let mut env_with_meta = params.env.clone();
+        // Build the full env (adapter-config + user-provided + daemon
+        // meta) BEFORE spawn so the adapter process inherits
+        // AGENTD_SESSION_DATA_DIR / AGENTD_SESSION_KIND — not just
+        // the session.start params.env. The codex adapter (and
+        // claude) reads these via std::env::var, so leaving them
+        // only in session.start meant their first-spawn bookkeeping
+        // (originator-tagged rollout capture, session-id minting)
+        // silently no-op'd; respawn already merged them in time, so
+        // the bug only surfaced on initial create.
+        //
+        // Precedence: `[adapters.<name>].env` is the per-harness
+        // baseline (operator-set default model, etc.), overridden
+        // by the per-session `params.env` (explicit `agent new
+        // --env KEY=VAL`), overridden in turn by daemon-meta. So a
+        // CLI flag always wins over config.toml, and daemon meta
+        // always wins over both.
+        let mut env_with_meta = adapter_cfg.env.clone();
+        for (k, v) in &params.env {
+            env_with_meta.insert(k.clone(), v.clone());
+        }
         env_with_meta.insert(
             "AGENTD_SESSION_DATA_DIR".to_string(),
             self.storage.session_dir(&id).to_string_lossy().to_string(),
@@ -818,12 +829,26 @@ impl SessionManager {
             a
         };
 
+        // Merge `[adapters.<name>].env` underneath the persisted
+        // start-params env so config.toml-driven defaults apply on
+        // respawn too. Per-session env (from `agent new --env`)
+        // still wins because start_params.env was constructed with
+        // it on top of adapter_cfg.env at create time and gets the
+        // same treatment again here.
+        let respawn_env = {
+            let mut e = adapter_cfg.env.clone();
+            for (k, v) in &start_params.env {
+                e.insert(k.clone(), v.clone());
+            }
+            e
+        };
+
         let (msg_tx, msg_rx) = mpsc::channel::<AdapterMessage>(ADAPTER_DRAIN_CAP);
         let (adapter, info) = Adapter::spawn(
             harness.clone(),
             binary,
             combined_args,
-            start_params.env.clone(),
+            respawn_env,
             msg_tx.clone(),
         )
         .await
