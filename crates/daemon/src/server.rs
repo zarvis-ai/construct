@@ -144,13 +144,17 @@ impl Inbound for ReadFromUnix {
     }
 }
 
-struct ReadFromWs {
-    rx: futures::stream::SplitStream<
-        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-    >,
+struct ReadFromWs<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    rx: futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>,
 }
 
-impl Inbound for ReadFromWs {
+impl<S> Inbound for ReadFromWs<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     async fn next(&mut self) -> Option<std::io::Result<serde_json::Value>> {
         loop {
             let frame = self.rx.next().await?;
@@ -214,19 +218,80 @@ pub async fn serve_ws(
     }
 }
 
-/// Build a 403 response for `accept_hdr_async` to abort the upgrade
-/// with. The body is short and plain-text; clients that send
-/// malformed tokens shouldn't need detailed diagnostics from the
-/// server.
-fn error_response_403(
-    msg: &str,
-) -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
-    use tokio_tungstenite::tungstenite::http;
-    http::Response::builder()
-        .status(http::StatusCode::FORBIDDEN)
-        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-        .body(Some(msg.to_string()))
-        .expect("static 403 response should always build")
+/// Embedded mobile-first web client served on the same URL the QR
+/// code points at. One file, inline JS + CSS, no build pipeline —
+/// loaded via `include_str!` at compile time. See
+/// `crates/daemon/assets/index.html` to edit.
+const REMOTE_INDEX_HTML: &str = include_str!("../assets/index.html");
+
+/// Cap on the HTTP request prelude (request-line + headers, up to
+/// `\r\n\r\n`). 16 KiB is generous enough for any real browser
+/// request and small enough that a malicious client can't grow our
+/// buffer unbounded.
+const MAX_HTTP_PRELUDE_BYTES: usize = 16 * 1024;
+
+/// What we extract from the HTTP prelude — just the path and
+/// whether this is a WS upgrade. Everything else (method, version,
+/// host) is uninteresting for our two-route surface.
+struct PreludeInfo {
+    path: String,
+    is_ws_upgrade: bool,
+}
+
+/// Parse an HTTP/1.1 request prelude using `httparse`. Returns
+/// `None` on malformed input (we treat it as a 400 + close, not a
+/// fatal error).
+fn parse_http_prelude(buf: &[u8]) -> Option<PreludeInfo> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(buf).ok()? {
+        httparse::Status::Complete(_) => {
+            let path = req.path?.to_string();
+            let is_ws_upgrade = req.headers.iter().any(|h| {
+                h.name.eq_ignore_ascii_case("Upgrade")
+                    && std::str::from_utf8(h.value)
+                        .map(|v| v.eq_ignore_ascii_case("websocket"))
+                        .unwrap_or(false)
+            });
+            Some(PreludeInfo { path, is_ws_upgrade })
+        }
+        httparse::Status::Partial => None,
+    }
+}
+
+/// Find the offset *just past* the `\r\n\r\n` terminator that ends
+/// an HTTP prelude. Returns `None` if the buffer doesn't (yet)
+/// contain a full prelude.
+fn find_prelude_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+/// Write a minimal HTTP/1.1 response with the given status, body,
+/// and content type. Uses `Connection: close` so the wire shape is
+/// dead-simple (no chunked encoding, no keep-alive bookkeeping).
+async fn write_http_response<W>(
+    wr: &mut W,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt as _;
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\n\
+         Content-Type: {content_type}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         \r\n",
+        body.len(),
+    );
+    wr.write_all(head.as_bytes()).await?;
+    wr.write_all(body).await?;
+    wr.flush().await
 }
 
 async fn handle_ws_connection(
@@ -234,37 +299,117 @@ async fn handle_ws_connection(
     manager: Arc<SessionManager>,
     remote: RemoteState,
 ) -> Result<()> {
-    // Token gate: read the HTTP upgrade request, check the URI
-    // path for `/t/<token>` against `remote`. Reject the upgrade
-    // with HTTP 403 if missing / wrong. Doing this inside the
-    // upgrade callback means an unauthorized client never gets a
-    // WS stream — no JSON-RPC dispatch, no event subscription,
-    // nothing.
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    // Token gate + transport demux. The same URL the QR code points
+    // at serves two flows:
     //
-    // The token is immutable for the daemon's lifetime, so we can
-    // do the full constant-time compare synchronously inside the
-    // callback. (The `RemoteState` clone is cheap — one `Arc`.)
-    let ws_stream = tokio_tungstenite::accept_hdr_async(
-        stream,
-        move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
-              resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
-            let path = req.uri().path();
-            let candidate = match token_from_uri_path(path) {
-                Some(t) => t,
-                None => {
-                    return Err(error_response_403(
-                        "missing token; expected ws upgrade at /t/<token>",
-                    ));
-                }
-            };
-            if !remote.token_matches(candidate) {
-                return Err(error_response_403("invalid token"));
-            }
-            Ok(resp)
-        },
-    )
-    .await
-    .context("ws upgrade")?;
+    //   GET /t/<token>                              → HTML web client
+    //   GET /t/<token>  + Upgrade: websocket header → WS handshake
+    //
+    // tungstenite's upgrade handshake validates the WS-specific
+    // headers (`Sec-WebSocket-Key`, etc.) before ever calling its
+    // callback, and refuses any 2xx response from the callback —
+    // so we can't use `accept_hdr_async` to also serve HTML.
+    // Instead we peek the HTTP prelude ourselves, route, and either
+    // write a plain HTTP response or hand a replay-prefixed stream
+    // to `accept_async`.
+    let (mut rd, mut wr) = stream.into_split();
+
+    // Buffered HTTP request prelude. We grow this until we see
+    // `\r\n\r\n`, capped at `MAX_HTTP_PRELUDE_BYTES` to keep
+    // resource use bounded against a slow / malicious client.
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    let prelude_end = loop {
+        let n = match rd.read(&mut chunk).await {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(_) => return Ok(()),
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = find_prelude_end(&buf) {
+            break end;
+        }
+        if buf.len() > MAX_HTTP_PRELUDE_BYTES {
+            let _ = write_http_response(
+                &mut wr,
+                413,
+                "Payload Too Large",
+                "text/plain; charset=utf-8",
+                b"prelude too large",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let info = match parse_http_prelude(&buf[..prelude_end]) {
+        Some(i) => i,
+        None => {
+            let _ = write_http_response(
+                &mut wr,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                b"bad request",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let candidate = match token_from_uri_path(&info.path) {
+        Some(t) => t.to_string(),
+        None => {
+            let _ = write_http_response(
+                &mut wr,
+                403,
+                "Forbidden",
+                "text/plain; charset=utf-8",
+                b"forbidden: missing token; expected /t/<token>",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    if !remote.token_matches(&candidate) {
+        let _ = write_http_response(
+            &mut wr,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"forbidden: invalid token",
+        )
+        .await;
+        return Ok(());
+    }
+
+    if !info.is_ws_upgrade {
+        // Authenticated plain GET — phone browser navigating to the
+        // QR URL. Serve the embedded client.
+        let _ = write_http_response(
+            &mut wr,
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            REMOTE_INDEX_HTML.as_bytes(),
+        )
+        .await;
+        return Ok(());
+    }
+
+    // WS upgrade path. We've already consumed the prelude bytes from
+    // the TCP stream, so we hand tungstenite a stream that replays
+    // `buf` (containing the full prelude tungstenite still wants to
+    // parse) before reading further bytes from `rd`. `tokio::io::join`
+    // recombines this with `wr` into a single `AsyncRead + AsyncWrite`
+    // stream the way `accept_async` expects.
+    let replay = std::io::Cursor::new(buf).chain(rd);
+    let joined = tokio::io::join(replay, wr);
+    let ws_stream = tokio_tungstenite::accept_async(joined)
+        .await
+        .context("ws upgrade")?;
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
@@ -687,5 +832,60 @@ async fn dispatch(
             Response::ok(id.clone(), serde_json::Value::Null)
         }
         other => Response::err(id.clone(), ErrorObject::method_not_found(other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `find_prelude_end` locates the `\r\n\r\n` separator that ends
+    /// an HTTP/1.1 request prelude. Returns `None` while the buffer
+    /// still has only a partial prelude, so the I/O loop knows to
+    /// read more.
+    #[test]
+    fn find_prelude_end_locates_double_crlf() {
+        let buf = b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody-bytes";
+        assert_eq!(find_prelude_end(buf), Some(buf.len() - "body-bytes".len()));
+
+        let partial = b"GET / HTTP/1.1\r\nHost: x\r\n";
+        assert_eq!(find_prelude_end(partial), None);
+
+        let empty = b"";
+        assert_eq!(find_prelude_end(empty), None);
+    }
+
+    /// Plain `GET` request — path captured, `is_ws_upgrade` is false
+    /// because there's no `Upgrade` header.
+    #[test]
+    fn parses_plain_get() {
+        let buf = b"GET /t/abc HTTP/1.1\r\nHost: x\r\n\r\n";
+        let info = parse_http_prelude(buf).expect("should parse");
+        assert_eq!(info.path, "/t/abc");
+        assert!(!info.is_ws_upgrade);
+    }
+
+    /// A real WS upgrade request — path captured and the upgrade
+    /// flag set. Case-insensitive on both the header name and value
+    /// (some clients lowercase `websocket`).
+    #[test]
+    fn parses_ws_upgrade() {
+        let buf = b"GET /t/abc HTTP/1.1\r\n\
+                    Host: x\r\n\
+                    Upgrade: WebSocket\r\n\
+                    Connection: Upgrade\r\n\
+                    Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                    Sec-WebSocket-Version: 13\r\n\
+                    \r\n";
+        let info = parse_http_prelude(buf).expect("should parse");
+        assert_eq!(info.path, "/t/abc");
+        assert!(info.is_ws_upgrade);
+    }
+
+    /// Malformed input returns `None` so the caller writes a 400.
+    #[test]
+    fn parses_malformed_returns_none() {
+        let buf = b"not an http request";
+        assert!(parse_http_prelude(buf).is_none());
     }
 }

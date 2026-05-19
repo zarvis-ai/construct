@@ -12,6 +12,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
+ "httparse",
  "nix 0.29.0",
  "qrcode",
  "serde",
