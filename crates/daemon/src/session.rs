@@ -287,6 +287,7 @@ impl GroupEntry {
 pub struct SessionManager {
     storage: Arc<Storage>,
     config: Arc<Config>,
+    adapter_runtime_dir: PathBuf,
     sessions: RwLock<HashMap<String, Arc<SessionEntry>>>,
     groups: RwLock<HashMap<String, Arc<GroupEntry>>>,
     broadcast: broadcast::Sender<BroadcastMsg>,
@@ -296,7 +297,11 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub async fn new(storage: Arc<Storage>, config: Arc<Config>) -> Result<Self> {
+    pub async fn new(
+        storage: Arc<Storage>,
+        config: Arc<Config>,
+        runtime_dir: PathBuf,
+    ) -> Result<Self> {
         let summaries = storage.list_summaries()?;
         let mut sessions = HashMap::new();
         for s in summaries {
@@ -370,14 +375,21 @@ impl SessionManager {
             storage.data_dir().to_path_buf(),
         ));
         loops.hydrate_from_disk(&session_ids).await;
+        let adapter_runtime_dir = runtime_dir.join("adapters");
+        std::fs::create_dir_all(&adapter_runtime_dir).ok();
         Ok(Self {
             storage,
             config,
+            adapter_runtime_dir,
             sessions: RwLock::new(sessions),
             groups: RwLock::new(groups),
             broadcast,
             loops,
         })
+    }
+
+    fn adapter_socket_path(&self, id: &str) -> PathBuf {
+        self.adapter_runtime_dir.join(format!("{id}.sock"))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BroadcastMsg> {
@@ -569,11 +581,12 @@ impl SessionManager {
             .to_string(),
         );
 
-        let (adapter, info) = Adapter::spawn(
+        let (adapter, info) = Adapter::spawn_reconnectable(
             params.harness.clone(),
             binary,
             combined_args,
             env_with_meta.clone(),
+            self.adapter_socket_path(&id),
             msg_tx.clone(),
         )
         .await
@@ -811,6 +824,42 @@ impl SessionManager {
             let s = entry.summary.read().await;
             s.harness.clone()
         };
+        let (msg_tx, msg_rx) = mpsc::channel::<AdapterMessage>(ADAPTER_DRAIN_CAP);
+
+        match Adapter::attach(
+            harness.clone(),
+            self.adapter_socket_path(id),
+            msg_tx.clone(),
+        )
+        .await
+        {
+            Ok((adapter, _info)) => {
+                *entry.adapter.lock().await = Some(adapter);
+                let snapshot = {
+                    let mut s = entry.summary.write().await;
+                    s.state = SessionState::Running;
+                    s.pending_input = false;
+                    s.clone()
+                };
+                let _ = self.storage.save_summary(&snapshot);
+                let _ = self
+                    .broadcast
+                    .send(BroadcastMsg::State(StateNotificationPayload {
+                        session: snapshot,
+                    }));
+                let manager = self.clone();
+                let entry_for_drain = entry.clone();
+                tokio::spawn(async move {
+                    manager.drain_adapter(entry_for_drain, msg_rx).await;
+                });
+                tracing::info!(session = %id, %harness, "reattached adapter");
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::debug!(session = %id, %harness, error = ?e, "adapter attach failed; respawning");
+            }
+        }
+
         let adapter_cfg = self
             .config
             .adapters
@@ -843,12 +892,12 @@ impl SessionManager {
             e
         };
 
-        let (msg_tx, msg_rx) = mpsc::channel::<AdapterMessage>(ADAPTER_DRAIN_CAP);
-        let (adapter, info) = Adapter::spawn(
+        let (adapter, info) = Adapter::spawn_reconnectable(
             harness.clone(),
             binary,
             combined_args,
             respawn_env,
+            self.adapter_socket_path(id),
             msg_tx.clone(),
         )
         .await
@@ -966,6 +1015,21 @@ impl SessionManager {
             ));
         }
         self.respawn(id).await
+    }
+
+    /// Gracefully stop every live adapter. Used for intentional daemon
+    /// termination; restart-oriented signals skip this so reconnectable
+    /// adapters can survive the daemon process.
+    pub async fn shutdown_adapters(&self) {
+        let entries: Vec<Arc<SessionEntry>> = {
+            let guard = self.sessions.read().await;
+            guard.values().cloned().collect()
+        };
+        for entry in entries {
+            if let Some(adapter) = entry.adapter.lock().await.clone() {
+                let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
+            }
+        }
     }
 
     async fn drain_adapter(

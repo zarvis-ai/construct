@@ -40,16 +40,17 @@ use crate::{
     SessionStartParams,
 };
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::future::Future;
+use std::path::PathBuf;
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
 #[cfg(feature = "pty")]
 pub mod pty;
 
 use crate::paths;
-use std::path::PathBuf;
-
 /// Build a friendly "failed to start binary" message for adapters to emit
 /// when spawning the agent CLI fails (e.g. binary not on PATH). Adapters
 /// trust the user's shell to provide PATH; if that doesn't work, this
@@ -81,9 +82,8 @@ pub fn maybe_inject_codex_mcp_args(session_id: &str) -> Vec<String> {
     };
     let bin_lit = toml_quote(&bin.to_string_lossy());
     let sid_lit = toml_quote(session_id);
-    let inline = format!(
-        "{{ command = {bin_lit}, args = [], env = {{ AGENTD_SESSION_ID = {sid_lit} }} }}"
-    );
+    let inline =
+        format!("{{ command = {bin_lit}, args = [], env = {{ AGENTD_SESSION_ID = {sid_lit} }} }}");
     vec!["-c".into(), format!("mcp_servers.agentd={inline}")]
 }
 
@@ -116,10 +116,7 @@ pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
     let paths = paths::Paths::discover();
     let dir = paths.state_dir.join("mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "agentd MCP inject: mkdir {} failed: {e}",
-            dir.display()
-        );
+        eprintln!("agentd MCP inject: mkdir {} failed: {e}", dir.display());
         return None;
     }
     let cfg_path = dir.join(format!("{session_id}.json"));
@@ -234,9 +231,351 @@ where
     F: FnOnce(SessionStartParams, AdapterContext) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    if let Some(socket) = std::env::var_os("AGENTD_ADAPTER_SOCKET") {
+        return run_reconnectable(metadata, handler, PathBuf::from(socket)).await;
+    }
     let reader = BufReader::new(tokio::io::stdin());
     let writer = tokio::io::stdout();
     run_with_io(metadata, handler, reader, writer).await
+}
+
+/// Socket-backed adapter runner used when `AGENTD_ADAPTER_SOCKET` is set.
+///
+/// Unlike stdio mode, daemon disconnect is not adapter shutdown: the session
+/// task keeps running, outgoing events are retained in memory, and a restarted
+/// daemon can reconnect to the same adapter process.
+pub async fn run_reconnectable<F, Fut>(
+    metadata: InitializeResult,
+    handler: F,
+    socket_path: PathBuf,
+) -> Result<()>
+where
+    F: FnOnce(SessionStartParams, AdapterContext) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("bind adapter socket {}", socket_path.display()))?;
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let mut handler = Some(handler);
+    let mut inbox_tx: Option<mpsc::Sender<AdapterInboxMsg>> = None;
+    let mut session_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut backlog = VecDeque::<serde_json::Value>::new();
+    let mut should_exit = false;
+
+    while !should_exit {
+        let stream = tokio::select! {
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _)) => stream,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "adapter: reconnect accept failed");
+                        continue;
+                    }
+                }
+            }
+            event = event_rx.recv() => {
+                match event {
+                    Some(v) => backlog.push_back(v),
+                    None => break,
+                }
+                continue;
+            }
+            _ = wait_session_done(&mut session_handle), if session_handle.is_some() => {
+                session_handle = None;
+                break;
+            }
+        };
+
+        let disconnected = run_reconnectable_connection(
+            stream,
+            &metadata,
+            &mut handler,
+            &mut inbox_tx,
+            &mut session_handle,
+            &event_tx,
+            &mut event_rx,
+            &mut backlog,
+            &mut should_exit,
+        )
+        .await?;
+        if disconnected {
+            tracing::debug!("adapter: daemon disconnected; waiting for reconnect");
+        }
+    }
+
+    if let Some(h) = session_handle.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    }
+    let _ = std::fs::remove_file(&socket_path);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_reconnectable_connection<F, Fut>(
+    stream: UnixStream,
+    metadata: &InitializeResult,
+    handler: &mut Option<F>,
+    inbox_tx: &mut Option<mpsc::Sender<AdapterInboxMsg>>,
+    session_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    event_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    event_rx: &mut mpsc::UnboundedReceiver<serde_json::Value>,
+    backlog: &mut VecDeque<serde_json::Value>,
+    should_exit: &mut bool,
+) -> Result<bool>
+where
+    F: FnOnce(SessionStartParams, AdapterContext) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    while let Some(v) = backlog.pop_front() {
+        if transport::write_message(&mut write_half, &v).await.is_err() {
+            backlog.push_front(v);
+            return Ok(true);
+        }
+    }
+
+    while !*should_exit {
+        let raw_msg = {
+            let read_fut = transport::read_message(&mut reader);
+            tokio::pin!(read_fut);
+            tokio::select! {
+                biased;
+                msg = &mut read_fut => Some(msg),
+                event = event_rx.recv() => {
+                    match event {
+                        Some(v) => {
+                            if transport::write_message(&mut write_half, &v).await.is_err() {
+                                backlog.push_back(v);
+                                return Ok(true);
+                            }
+                        }
+                        None => return Ok(false),
+                    }
+                    continue;
+                }
+                _ = wait_session_done(session_handle), if session_handle.is_some() => {
+                    *session_handle = None;
+                    *should_exit = true;
+                    continue;
+                }
+            }
+        };
+        let raw = match raw_msg {
+            Some(Ok(Some(v))) => v,
+            Some(Ok(None)) => return Ok(true),
+            Some(Err(e)) => {
+                tracing::warn!(error = %e, "adapter: invalid input, ignoring");
+                continue;
+            }
+            None => continue,
+        };
+        if !matches!(jsonrpc::classify(&raw), Some(MessageKind::Request)) {
+            continue;
+        }
+        let req: Request = match serde_json::from_value(raw) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let resp = handle_request(
+            req,
+            metadata,
+            handler,
+            inbox_tx,
+            session_handle,
+            event_tx,
+            should_exit,
+        )
+        .await;
+        if transport::write_message(&mut write_half, &resp)
+            .await
+            .is_err()
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+async fn wait_session_done(handle: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(h) = handle.as_mut() {
+        let _ = h.await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+async fn handle_request<F, Fut>(
+    req: Request,
+    metadata: &InitializeResult,
+    handler: &mut Option<F>,
+    inbox_tx: &mut Option<mpsc::Sender<AdapterInboxMsg>>,
+    session_handle: &mut Option<tokio::task::JoinHandle<()>>,
+    out_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    should_exit: &mut bool,
+) -> serde_json::Value
+where
+    F: FnOnce(SessionStartParams, AdapterContext) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let id = req.id.clone();
+    let ok = |result: serde_json::Value| {
+        serde_json::to_value(&Response::ok(id.clone(), result)).unwrap()
+    };
+    let err = |err: ErrorObject| serde_json::to_value(&Response::err(id.clone(), err)).unwrap();
+
+    match req.method.as_str() {
+        ahp_method::INITIALIZE => {
+            ok(serde_json::to_value(metadata).unwrap_or(serde_json::Value::Null))
+        }
+        ahp_method::SESSION_START => {
+            let params: SessionStartParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            let handler_fn = match handler.take() {
+                Some(h) => h,
+                None => return err(ErrorObject::invalid_request("session already started")),
+            };
+            let (tx, rx) = mpsc::channel::<AdapterInboxMsg>(64);
+            *inbox_tx = Some(tx);
+            let ctx = AdapterContext {
+                session_id: params.session_id.clone(),
+                emit: EventEmitter {
+                    out_tx: out_tx.clone(),
+                    session_id: params.session_id.clone(),
+                },
+                inbox: rx,
+            };
+            *session_handle = Some(tokio::spawn(handler_fn(params, ctx)));
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_INPUT => {
+            let p: SessionInputParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            if let Some(tx) = inbox_tx {
+                let _ = tx.send(AdapterInboxMsg::Input(p.text)).await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_PTY_INPUT => {
+            let p: SessionPtyInputParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            let bytes = match p.decode() {
+                Ok(b) => b,
+                Err(e) => {
+                    return err(ErrorObject::invalid_params(format!(
+                        "pty_input base64 decode: {e}"
+                    )))
+                }
+            };
+            if let Some(tx) = inbox_tx {
+                let _ = tx.send(AdapterInboxMsg::PtyInput(bytes)).await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_PTY_RESIZE => {
+            let p: SessionPtyResizeParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            if let Some(tx) = inbox_tx {
+                let _ = tx
+                    .send(AdapterInboxMsg::PtyResize {
+                        cols: p.cols,
+                        rows: p.rows,
+                    })
+                    .await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_INTERRUPT => {
+            if let Some(tx) = inbox_tx {
+                let _ = tx.send(AdapterInboxMsg::Interrupt).await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_STOP => {
+            if let Some(tx) = inbox_tx {
+                let _ = tx.send(AdapterInboxMsg::Stop).await;
+            }
+            if let Some(h) = session_handle.take() {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), h).await;
+            }
+            *should_exit = true;
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_TOOL_DECISION => {
+            let p: crate::SessionToolDecisionParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            if let Some(tx) = inbox_tx {
+                let _ = tx
+                    .send(AdapterInboxMsg::ToolDecision {
+                        call_id: p.call_id,
+                        decision: p.decision,
+                    })
+                    .await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_TOOL_ACTION => {
+            let p: crate::SessionToolActionParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            if let Some(tx) = inbox_tx {
+                let _ = tx
+                    .send(AdapterInboxMsg::ToolAction {
+                        call_id: p.call_id,
+                        action: p.action,
+                    })
+                    .await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SESSION_SET_AUTOMODE => {
+            let p: crate::SessionSetAutomodeParams =
+                match req.params.clone().map(serde_json::from_value).transpose() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => return err(ErrorObject::invalid_params("missing params")),
+                    Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
+                };
+            if let Some(tx) = inbox_tx {
+                let _ = tx.send(AdapterInboxMsg::SetAutoMode(p.on)).await;
+            }
+            ok(serde_json::Value::Null)
+        }
+        ahp_method::SHUTDOWN => {
+            *should_exit = true;
+            ok(serde_json::Value::Null)
+        }
+        other => err(ErrorObject::method_not_found(other)),
+    }
 }
 
 /// I/O-generic core of [`run`]. Split out so unit tests can drive the
@@ -336,22 +675,18 @@ where
                 send_ok(serde_json::to_value(&metadata).unwrap_or(serde_json::Value::Null));
             }
             ahp_method::SESSION_START => {
-                let params: SessionStartParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let params: SessionStartParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 let handler_fn = match handler.take() {
                     Some(h) => h,
                     None => {
@@ -374,44 +709,36 @@ where
                 send_ok(serde_json::Value::Null);
             }
             ahp_method::SESSION_INPUT => {
-                let p: SessionInputParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let p: SessionInputParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 if let Some(tx) = &inbox_tx {
                     let _ = tx.send(AdapterInboxMsg::Input(p.text)).await;
                 }
                 send_ok(serde_json::Value::Null);
             }
             ahp_method::SESSION_PTY_INPUT => {
-                let p: SessionPtyInputParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let p: SessionPtyInputParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 let bytes = match p.decode() {
                     Ok(b) => b,
                     Err(e) => {
@@ -427,22 +754,18 @@ where
                 send_ok(serde_json::Value::Null);
             }
             ahp_method::SESSION_PTY_RESIZE => {
-                let p: SessionPtyResizeParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let p: SessionPtyResizeParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 if let Some(tx) = &inbox_tx {
                     let _ = tx
                         .send(AdapterInboxMsg::PtyResize {
@@ -470,22 +793,18 @@ where
                 should_exit = true;
             }
             ahp_method::SESSION_TOOL_DECISION => {
-                let p: crate::SessionToolDecisionParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let p: crate::SessionToolDecisionParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 if let Some(tx) = &inbox_tx {
                     let _ = tx
                         .send(AdapterInboxMsg::ToolDecision {
@@ -497,22 +816,18 @@ where
                 send_ok(serde_json::Value::Null);
             }
             ahp_method::SESSION_TOOL_ACTION => {
-                let p: crate::SessionToolActionParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let p: crate::SessionToolActionParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 if let Some(tx) = &inbox_tx {
                     let _ = tx
                         .send(AdapterInboxMsg::ToolAction {
@@ -524,22 +839,18 @@ where
                 send_ok(serde_json::Value::Null);
             }
             ahp_method::SESSION_SET_AUTOMODE => {
-                let p: crate::SessionSetAutomodeParams = match req
-                    .params
-                    .clone()
-                    .map(serde_json::from_value)
-                    .transpose()
-                {
-                    Ok(Some(p)) => p,
-                    Ok(None) => {
-                        send_err(ErrorObject::invalid_params("missing params"));
-                        continue;
-                    }
-                    Err(e) => {
-                        send_err(ErrorObject::invalid_params(e.to_string()));
-                        continue;
-                    }
-                };
+                let p: crate::SessionSetAutomodeParams =
+                    match req.params.clone().map(serde_json::from_value).transpose() {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            send_err(ErrorObject::invalid_params("missing params"));
+                            continue;
+                        }
+                        Err(e) => {
+                            send_err(ErrorObject::invalid_params(e.to_string()));
+                            continue;
+                        }
+                    };
                 if let Some(tx) = &inbox_tx {
                     let _ = tx.send(AdapterInboxMsg::SetAutoMode(p.on)).await;
                 }
@@ -575,8 +886,10 @@ fn _unused_context() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Capabilities, SessionState};
+    use crate::{Capabilities, MessageRole, SessionIdParams, SessionState};
     use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+    use tokio::sync::oneshot;
 
     fn test_metadata() -> InitializeResult {
         InitializeResult {
@@ -626,13 +939,7 @@ mod tests {
         };
 
         let adapter_task = tokio::spawn(async move {
-            run_with_io(
-                test_metadata(),
-                handler,
-                adapter_reader,
-                tokio::io::sink(),
-            )
-            .await
+            run_with_io(test_metadata(), handler, adapter_reader, tokio::io::sink()).await
         });
 
         // Drive the protocol: INITIALIZE, then SESSION_START. The
@@ -664,18 +971,253 @@ mod tests {
         // Keep daemon_side alive (not dropped) so the adapter's
         // stdin doesn't see EOF — only the session-handle race
         // should drive the exit.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            adapter_task,
-        )
-        .await
-        .expect(
-            "adapter did not exit after session handler returned \
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), adapter_task)
+            .await
+            .expect(
+                "adapter did not exit after session handler returned \
              — run_with_io kept blocking on stdin (zombie loop)",
-        );
+            );
         let inner = result.expect("adapter task panicked");
         inner.expect("adapter returned Err");
         // daemon_side dropped here; not relied on for exit.
         drop(daemon_side);
+    }
+
+    #[tokio::test]
+    async fn reconnectable_request_dispatch_forwards_session_input() {
+        let (seen_tx, seen_rx) = oneshot::channel::<String>();
+        let handler = move |_params: SessionStartParams, mut ctx: AdapterContext| async move {
+            if let Some(AdapterInboxMsg::Input(text)) = ctx.inbox.recv().await {
+                let _ = seen_tx.send(text);
+            }
+        };
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+        let mut handler = Some(handler);
+        let mut inbox_tx = None;
+        let mut session_handle = None;
+        let mut should_exit = false;
+
+        let start = Request::new(
+            serde_json::json!(1),
+            ahp_method::SESSION_START.to_string(),
+            Some(
+                serde_json::to_value(SessionStartParams {
+                    session_id: "s_dispatch".to_string(),
+                    cwd: "/".to_string(),
+                    prompt: None,
+                    model: None,
+                    mode: None,
+                    pty_size: None,
+                    env: Default::default(),
+                    args: Vec::new(),
+                })
+                .unwrap(),
+            ),
+        );
+        let raw = handle_request(
+            start,
+            &test_metadata(),
+            &mut handler,
+            &mut inbox_tx,
+            &mut session_handle,
+            &out_tx,
+            &mut should_exit,
+        )
+        .await;
+        let resp: Response = serde_json::from_value(raw).unwrap();
+        assert!(resp.error.is_none());
+
+        let input = Request::new(
+            serde_json::json!(2),
+            ahp_method::SESSION_INPUT.to_string(),
+            Some(
+                serde_json::to_value(SessionInputParams {
+                    session_id: "s_dispatch".to_string(),
+                    text: "hello".to_string(),
+                })
+                .unwrap(),
+            ),
+        );
+        let raw = handle_request(
+            input,
+            &test_metadata(),
+            &mut handler,
+            &mut inbox_tx,
+            &mut session_handle,
+            &out_tx,
+            &mut should_exit,
+        )
+        .await;
+        let resp: Response = serde_json::from_value(raw).unwrap();
+        assert!(resp.error.is_none());
+        assert_eq!(seen_rx.await.unwrap(), "hello");
+        if let Some(handle) = session_handle.take() {
+            handle.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Unix socket bind permission in the test sandbox"]
+    async fn reconnectable_adapter_buffers_events_until_daemon_reconnects() {
+        let socket_path = std::env::temp_dir().join(format!(
+            "a{}{}.sock",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+                .simple()
+                .to_string()
+                .chars()
+                .take(4)
+                .collect::<String>()
+        ));
+        let socket_for_task = socket_path.clone();
+        let handler = |_params: SessionStartParams, mut ctx: AdapterContext| async move {
+            ctx.emit.emit(SessionEvent::Status {
+                state: SessionState::Running,
+                detail: None,
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            ctx.emit.emit(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "buffered while daemon was gone".to_string(),
+            });
+            while let Some(msg) = ctx.inbox.recv().await {
+                if matches!(msg, AdapterInboxMsg::Stop) {
+                    break;
+                }
+            }
+            ctx.emit.emit(SessionEvent::Done { exit_code: 0 });
+        };
+
+        let adapter_task = tokio::spawn(async move {
+            run_reconnectable(test_metadata(), handler, socket_for_task).await
+        });
+        tokio::task::yield_now().await;
+        if adapter_task.is_finished() {
+            let result = adapter_task.await.expect("adapter task panicked");
+            panic!("reconnectable adapter exited before the first connection: {result:?}");
+        }
+
+        let (reader, mut writer) = connect_test_socket(&socket_path).await.into_split();
+        let mut reader = BufReader::new(reader);
+        write_request(
+            &mut writer,
+            1,
+            ahp_method::INITIALIZE,
+            serde_json::json!({}),
+        )
+        .await;
+        read_response(&mut reader, 1).await;
+        write_request(
+            &mut writer,
+            2,
+            ahp_method::SESSION_START,
+            serde_json::to_value(SessionStartParams {
+                session_id: "s_reconnect".to_string(),
+                cwd: "/".to_string(),
+                prompt: None,
+                model: None,
+                mode: None,
+                pty_size: None,
+                env: Default::default(),
+                args: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .await;
+        read_response(&mut reader, 2).await;
+        drop(writer);
+        drop(reader);
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let (reader, mut writer) = connect_test_socket(&socket_path).await.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut saw_buffered = false;
+        for _ in 0..4 {
+            let raw = transport::read_message(&mut reader)
+                .await
+                .unwrap()
+                .expect("adapter closed before buffered event");
+            if event_text(&raw).as_deref() == Some("buffered while daemon was gone") {
+                saw_buffered = true;
+                break;
+            }
+        }
+        assert!(saw_buffered, "buffered event was not replayed on reconnect");
+
+        write_request(
+            &mut writer,
+            3,
+            ahp_method::SESSION_STOP,
+            serde_json::to_value(SessionIdParams {
+                session_id: "s_reconnect".to_string(),
+            })
+            .unwrap(),
+        )
+        .await;
+        read_response(&mut reader, 3).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), adapter_task)
+            .await
+            .expect("reconnectable adapter did not exit after session.stop");
+        result
+            .expect("adapter task panicked")
+            .expect("adapter returned Err");
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    async fn connect_test_socket(path: &std::path::Path) -> UnixStream {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match UnixStream::connect(path).await {
+                Ok(stream) => return stream,
+                Err(e) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        panic!("failed to connect test socket {}: {e}", path.display());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
+
+    async fn write_request<W: AsyncWrite + Unpin>(
+        writer: &mut W,
+        id: u64,
+        method: &str,
+        params: serde_json::Value,
+    ) {
+        let req = Request::new(serde_json::json!(id), method.to_string(), Some(params));
+        let raw = serde_json::to_value(req).unwrap();
+        transport::write_message(writer, &raw).await.unwrap();
+    }
+
+    async fn read_response<R: AsyncBufRead + Unpin>(reader: &mut R, expected_id: u64) {
+        loop {
+            let raw = transport::read_message(reader)
+                .await
+                .unwrap()
+                .expect("adapter closed before response");
+            if !matches!(jsonrpc::classify(&raw), Some(MessageKind::Response)) {
+                continue;
+            }
+            let resp: Response = serde_json::from_value(raw).unwrap();
+            if resp.id.as_u64() == Some(expected_id) {
+                assert!(resp.error.is_none(), "response had error: {:?}", resp.error);
+                return;
+            }
+        }
+    }
+
+    fn event_text(raw: &serde_json::Value) -> Option<String> {
+        let notif: Notification = serde_json::from_value(raw.clone()).ok()?;
+        if notif.method != ahp_notif::EVENT {
+            return None;
+        }
+        let env: EventEnvelope = serde_json::from_value(notif.params?).ok()?;
+        match env.event {
+            SessionEvent::Message { text, .. } => Some(text),
+            _ => None,
+        }
     }
 }

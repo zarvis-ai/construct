@@ -80,7 +80,7 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
 
     let storage = Arc::new(storage::Storage::new(paths.data_dir.clone())?);
     let manager = Arc::new(
-        session::SessionManager::new(storage.clone(), Arc::new(config))
+        session::SessionManager::new(storage.clone(), Arc::new(config), paths.runtime_dir.clone())
             .await
             .context("init session manager")?,
     );
@@ -107,5 +107,46 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     }
 
     let socket_path = socket_override.unwrap_or_else(|| paths.socket());
-    server::serve(manager, socket_path).await
+    tokio::select! {
+        result = server::serve(manager.clone(), socket_path) => result,
+        signal = shutdown_signal() => {
+            match signal {
+                DaemonSignal::Reload => {
+                    tracing::info!("received SIGHUP; exiting without stopping adapters");
+                }
+                DaemonSignal::Terminate => {
+                    tracing::info!("received termination signal; shutting down adapters");
+                    manager.shutdown_adapters().await;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DaemonSignal {
+    Reload,
+    Terminate,
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> DaemonSignal {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let mut hup = signal(SignalKind::hangup()).expect("install SIGHUP handler");
+    let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+    let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+
+    tokio::select! {
+        _ = hup.recv() => DaemonSignal::Reload,
+        _ = int.recv() => DaemonSignal::Terminate,
+        _ = term.recv() => DaemonSignal::Terminate,
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> DaemonSignal {
+    let _ = tokio::signal::ctrl_c().await;
+    DaemonSignal::Terminate
 }
