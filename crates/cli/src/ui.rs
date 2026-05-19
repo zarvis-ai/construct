@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_width::UnicodeWidthStr;
 
@@ -1211,10 +1211,17 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     let charset = b"01:|/\\{}[]<>+$#@*=-zrvshcodxgit";
     let mut current_drop_keys = HashSet::with_capacity(rain_area.width as usize);
     // Per-column current head position for active foreground drops —
-    // captured here so the reveal pass can pin letters live the
-    // instant a drop's head reaches the letter's row (matches the
-    // visible animation exactly, no analytic prediction).
+    // captured here so the horizontal reveal pass can pin letters
+    // live the instant a drop's head reaches the letter's row.
     let mut drop_heads: Vec<Option<i16>> = vec![None; rain_area.width as usize];
+
+    // Resolve any not-yet-placed vertical reveals, then build a
+    // per-column row→letter overlay. The column loop below uses this
+    // to swap the random drop-body glyph for the word's letter where
+    // they line up, so a vertical reveal looks like a normal drop
+    // that happens to be spelling a word as it falls.
+    resolve_vertical_reveal_positions(&mut app.matrix_rain, rain_area, now);
+    let vertical_overlay = build_vertical_letter_overlay(&app.matrix_rain, rain_area, now);
 
     for col in 0..rain_area.width {
         let seed = hash64(col as u64 ^ ((rain_area.width as u64) << 24));
@@ -1226,9 +1233,9 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         // activity. The roll is keyed on `frame.key` (which already
         // includes the column seed + cycle index), so it's STABLE
         // within a single cycle — no flicker — but scatters across
-        // cycles and columns. With this every column gets a chance
-        // every cycle, instead of the old fixed per-column threshold
-        // that left some columns permanently dark at low intensity.
+        // cycles and columns. Every column gets a chance every
+        // cycle, instead of the old fixed per-column threshold that
+        // left some columns permanently dark at low intensity.
         if frame.head <= MATRIX_RAIN_REGISTRATION_TOP_ROW as i16 {
             let roll = unit_f32(hash64(frame.key ^ 0xc3d2_e1f0_a574_8b96));
             if roll < activity {
@@ -1245,13 +1252,16 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         if active.is_some() {
             drop_heads[col as usize] = Some(frame.head);
         }
+        let col_overlay = vertical_overlay.get(col as usize);
         for row in 0..rain_area.height {
             let dist = active.map(|(head, _)| head).unwrap_or(-1) - row as i16;
             let mut style = None;
+            let mut in_drop_body = false;
             if let Some((_, tail)) = active {
                 if dist >= 0 && dist < tail as i16 {
                     let shade = 1.0 - (dist as f32 / tail.max(1) as f32);
                     style = Some(rain_style(&app.theme, shade, activity));
+                    in_drop_body = true;
                 }
             }
             if style.is_none() {
@@ -1262,8 +1272,17 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                 }
             }
             if let Some(style) = style {
-                let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
-                let ch = charset[(glyph_seed as usize) % charset.len()] as char;
+                let ch = if in_drop_body {
+                    col_overlay
+                        .and_then(|map| map.get(&(row as i16)).copied())
+                        .unwrap_or_else(|| {
+                            let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
+                            charset[(glyph_seed as usize) % charset.len()] as char
+                        })
+                } else {
+                    let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
+                    charset[(glyph_seed as usize) % charset.len()] as char
+                };
                 f.buffer_mut().set_string(
                     rain_area.x + col,
                     rain_area.y + row,
@@ -1278,8 +1297,8 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
 
     let theme = app.theme.clone();
     for reveal in app.matrix_rain.active_reveals_mut(now) {
-        match reveal.orientation {
-            crate::matrix_rain::RevealOrientation::Horizontal => render_matrix_reveal_horizontal(
+        if let crate::matrix_rain::RevealOrientation::Horizontal = reveal.orientation {
+            render_matrix_reveal_horizontal(
                 f,
                 rain_area,
                 &theme,
@@ -1287,18 +1306,77 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                 elapsed,
                 &drop_heads,
                 spawn_tail,
-            ),
-            crate::matrix_rain::RevealOrientation::Vertical => render_matrix_reveal_vertical(
-                f,
-                rain_area,
-                &theme,
-                reveal,
-                elapsed,
-                &drop_heads,
-                spawn_tail,
-            ),
+            );
+        }
+        // Vertical reveals are rendered inline above as a drop-body
+        // letter overlay — no separate pass / no pin-and-hold.
+    }
+}
+
+/// First-frame placement for vertical reveals: pick the absolute
+/// (col, row) for any reveal that doesn't have a resolved position
+/// yet. Idempotent: calling on subsequent frames is a no-op because
+/// `set_resolved_position` only sets when unset.
+fn resolve_vertical_reveal_positions(
+    matrix_rain: &mut crate::matrix_rain::MatrixRain,
+    area: Rect,
+    now: Instant,
+) {
+    if area.width == 0 || area.height < 2 {
+        return;
+    }
+    for reveal in matrix_rain.active_reveals_mut(now) {
+        if !matches!(reveal.orientation, crate::matrix_rain::RevealOrientation::Vertical) {
+            continue;
+        }
+        if reveal.resolved_position().is_some() {
+            continue;
+        }
+        let text_len = reveal.text.chars().count() as u16;
+        if text_len == 0 || text_len > area.height {
+            continue;
+        }
+        let col_rel = ((area.width.saturating_sub(1)) as f32 * reveal.x)
+            .round()
+            .clamp(0.0, area.width.saturating_sub(1) as f32) as u16;
+        let row_rel = ((area.height.saturating_sub(text_len)) as f32 * reveal.y)
+            .round()
+            .clamp(0.0, area.height.saturating_sub(text_len) as f32) as u16;
+        reveal.set_resolved_position(area.x + col_rel, area.y + row_rel);
+    }
+}
+
+/// Build a per-column `row → letter` map for all currently-active
+/// vertical reveals. The column loop consults this when rendering
+/// drop-body cells; a cell that matches an overlay entry shows the
+/// word's letter instead of a random charset character.
+fn build_vertical_letter_overlay(
+    matrix_rain: &crate::matrix_rain::MatrixRain,
+    area: Rect,
+    now: Instant,
+) -> Vec<HashMap<i16, char>> {
+    let mut overlay = vec![HashMap::<i16, char>::new(); area.width as usize];
+    for reveal in matrix_rain.active_reveals(now) {
+        if !matches!(reveal.orientation, crate::matrix_rain::RevealOrientation::Vertical) {
+            continue;
+        }
+        let Some((col_abs, row_abs)) = reveal.resolved_position() else {
+            continue;
+        };
+        if col_abs < area.x || col_abs >= area.x + area.width {
+            continue;
+        }
+        let col_idx = (col_abs - area.x) as usize;
+        let row_start_rel = row_abs.saturating_sub(area.y) as i16;
+        for (i, ch) in reveal.text.chars().enumerate() {
+            let row_rel = row_start_rel + i as i16;
+            if row_rel < 0 || row_rel >= area.height as i16 {
+                continue;
+            }
+            overlay[col_idx].insert(row_rel, ch);
         }
     }
+    overlay
 }
 
 /// A column registers a new drop only when its `head` is at one of
@@ -1529,92 +1607,10 @@ fn render_matrix_reveal_horizontal(
     );
 }
 
-/// Render a vertical reveal word: the letters live stacked top-to-
-/// bottom in a single column. As one foreground drop falls through
-/// that column, its head passes each letter's row in turn — pinning
-/// the letters one by one from the top. A single drop pass is enough
-/// to pin the entire word, which is why this orientation works well
-/// at low fleet intensity (the horizontal layout would need every
-/// column under the word to fire a drop independently).
-///
-/// At render time the column is biased toward one whose threshold
-/// the *current* activity already meets, so the drop actually shows
-/// up within the reveal's lifetime.
-fn render_matrix_reveal_vertical(
-    f: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    reveal: &mut crate::matrix_rain::RevealWord,
-    elapsed_ms: u64,
-    drop_heads: &[Option<i16>],
-    spawn_tail: u16,
-) {
-    if area.width == 0 || area.height < 2 {
-        return;
-    }
-    let chars: Vec<char> = reveal.text.chars().collect();
-    let text_len = chars.len() as u16;
-    if text_len == 0 || text_len > area.height {
-        return;
-    }
-
-    // Resolve column + starting row once; stored on the reveal so
-    // the word doesn't shift if intensity changes mid-reveal. Every
-    // column gets a per-cycle random chance of firing a drop (see
-    // `render_matrix_rain`), so we just pick the column directly
-    // from the reveal's x hint — within the 12 s reveal window
-    // even a low-activity column is very likely to see at least one
-    // drop pass through.
-    let (col_abs, row_start_abs) = match reveal.resolved_position() {
-        Some((c, r)) => (c, r),
-        None => {
-            let col_rel = ((area.width.saturating_sub(1)) as f32 * reveal.x)
-                .round()
-                .clamp(0.0, area.width.saturating_sub(1) as f32) as u16;
-            let row_rel = ((area.height.saturating_sub(text_len)) as f32 * reveal.y)
-                .round()
-                .clamp(0.0, area.height.saturating_sub(text_len) as f32) as u16;
-            let c = area.x + col_rel;
-            let r = area.y + row_rel;
-            reveal.set_resolved_position(c, r);
-            (c, r)
-        }
-    };
-
-    let col_idx = col_abs.saturating_sub(area.x) as usize;
-    let row_start_rel = row_start_abs.saturating_sub(area.y) as i16;
-    let tail = spawn_tail.max(1) as i16;
-
-    // Per-letter live pinning. All letters share one column, so a
-    // single drop's head passing through this column will pin them
-    // top-to-bottom in order.
-    let letter_count = reveal.pin_state().len();
-    if let Some(Some(head)) = drop_heads.get(col_idx) {
-        for i in 0..letter_count {
-            if reveal.pin_state()[i].is_some() {
-                continue;
-            }
-            let row_rel = row_start_rel + i as i16;
-            let delta = *head - row_rel;
-            if delta >= 0 && delta < tail {
-                reveal.pin_letter(i, elapsed_ms);
-            }
-        }
-    }
-
-    render_pinned_letters_at(
-        f,
-        theme,
-        reveal,
-        elapsed_ms,
-        &chars,
-        |_| col_abs,
-        |i| row_start_abs + i as u16,
-    );
-}
-
-/// Shared brightness / hold / fade pipeline for both reveal
-/// orientations — only the per-letter `(x, y)` placement differs.
+/// Brightness / hold / fade pipeline for horizontal reveals. Once
+/// every letter is pinned the word holds briefly then fades; if
+/// some letters never get pinned (their column never fires a drop
+/// through `target_y`) the reveal just expires.
 fn render_pinned_letters_at(
     f: &mut Frame,
     theme: &Theme,

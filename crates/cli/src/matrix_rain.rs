@@ -315,27 +315,20 @@ impl MatrixRain {
     }
 }
 
-/// Orientation policy: a single drop in one column can pin an
-/// entire vertical word in one pass, so vertical reveals are
-/// robust at low fleet activity. Horizontal reveals need many
-/// columns to *each* fire a drop through the same row, which only
-/// happens at higher activity. We bias toward vertical to make sure
-/// codex / claude with one busy session still see legible reveals.
+/// Orientation policy: 50/50 horizontal/vertical regardless of
+/// intensity. With per-cycle random column activation, even at low
+/// intensity every column gets a chance to fire — so both layouts
+/// have a reasonable shot at showing up, and the variety reads
+/// better than locking to one orientation by activity level.
 ///
-/// Rules:
-/// - `intensity < 0.5`: every reveal is vertical.
-/// - `intensity ≥ 0.5`: ~20% horizontal, ~80% vertical (random per
-///   reveal, seeded by text + wall-clock nanos so consecutive
-///   reveals don't all collapse to one orientation).
-fn pick_orientation(text: &str, intensity: f32) -> RevealOrientation {
-    if intensity < 0.5 {
-        return RevealOrientation::Vertical;
-    }
+/// Seeded by `(text, wall-clock nanos)` so consecutive reveals
+/// don't collapse onto the same orientation.
+fn pick_orientation(text: &str, _intensity: f32) -> RevealOrientation {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    if hash64(nanos ^ hash_text(text)) % 5 == 0 {
+    if hash64(nanos ^ hash_text(text)) & 1 == 0 {
         RevealOrientation::Horizontal
     } else {
         RevealOrientation::Vertical
@@ -747,38 +740,27 @@ mod tests {
     }
 
     #[test]
-    fn pick_orientation_is_vertical_only_below_50_intensity() {
-        // At low intensity, only one session is busy and many
-        // columns sit idle — horizontal reveals would never finish
-        // pinning, so the policy locks them out entirely.
-        for variant in 0..32u32 {
-            let text = format!("word{variant}");
-            assert_eq!(
-                pick_orientation(&text, 0.0),
-                RevealOrientation::Vertical
-            );
-            assert_eq!(
-                pick_orientation(&text, 0.49),
-                RevealOrientation::Vertical
-            );
-        }
-    }
-
-    #[test]
-    fn pick_orientation_can_choose_horizontal_above_50_intensity() {
-        // At ≥ 0.5 we expect a roughly 1-in-5 horizontal rate. Run
-        // enough samples that the chance of zero horizontals here is
-        // tiny; this guards against accidentally flipping to a
-        // "vertical only" policy.
-        let mut saw_horizontal = false;
-        for _ in 0..200 {
-            std::thread::sleep(Duration::from_nanos(50));
-            if pick_orientation("rotate", 0.8) == RevealOrientation::Horizontal {
-                saw_horizontal = true;
-                break;
+    fn pick_orientation_returns_both_at_low_and_high_intensity() {
+        // 50/50 split is enforced at every intensity — neither
+        // orientation should be locked out at low or high activity.
+        for intensity in [0.0_f32, 0.3, 0.5, 1.0] {
+            let mut saw_vertical = false;
+            let mut saw_horizontal = false;
+            for _ in 0..200 {
+                std::thread::sleep(Duration::from_nanos(50));
+                match pick_orientation("rotate", intensity) {
+                    RevealOrientation::Vertical => saw_vertical = true,
+                    RevealOrientation::Horizontal => saw_horizontal = true,
+                }
+                if saw_vertical && saw_horizontal {
+                    break;
+                }
             }
+            assert!(
+                saw_vertical && saw_horizontal,
+                "expected both orientations at intensity {intensity}, saw v={saw_vertical} h={saw_horizontal}"
+            );
         }
-        assert!(saw_horizontal, "expected at least one horizontal in 200 picks at intensity 0.8");
     }
 
     #[test]
