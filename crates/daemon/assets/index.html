@@ -5,6 +5,28 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <meta name="color-scheme" content="dark light" />
 <title>agentd · remote</title>
+<!--
+  xterm.js loaded from jsdelivr at runtime. Pinned versions; no SRI in
+  v1 — adding it is a follow-up once we wire build-time hash generation.
+  If the phone's network can reach the cloudflared tunnel but not the
+  public internet, the terminal view falls back to a "loading xterm…"
+  placeholder; chat-mode sessions still work.
+-->
+<link
+  rel="stylesheet"
+  href="https://cdn.jsdelivr.net/npm/xterm@5.5.0/css/xterm.css"
+  crossorigin="anonymous"
+/>
+<script
+  src="https://cdn.jsdelivr.net/npm/xterm@5.5.0/lib/xterm.js"
+  crossorigin="anonymous"
+  defer
+></script>
+<script
+  src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"
+  crossorigin="anonymous"
+  defer
+></script>
 <style>
   :root {
     --bg: #0e1014;
@@ -298,6 +320,37 @@
   @media (max-width: 720px) {
     .toggle-list { display: inline-block; }
   }
+
+  .terminal-wrap {
+    flex: 1 1 0;
+    min-height: 0;
+    background: #000;
+    position: relative;
+    padding: 6px 0 0 6px;
+    /* iOS safe-area inset on the right edge for landscape with notch. */
+    padding-right: env(safe-area-inset-right);
+  }
+  .terminal-host {
+    width: 100%;
+    height: 100%;
+  }
+  .terminal-host:focus,
+  .terminal-host .xterm:focus { outline: none; }
+  /* xterm.js paints into the host element; ensure it fills the wrap. */
+  .terminal-host .xterm,
+  .terminal-host .xterm .xterm-viewport,
+  .terminal-host .xterm .xterm-screen { height: 100%; }
+  .terminal-loading {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fg-faint);
+    font-size: 13px;
+    pointer-events: none;
+  }
+  .terminal-loading.gone { display: none; }
 </style>
 </head>
 <body>
@@ -314,6 +367,7 @@
       <div class="empty">connecting…</div>
     </aside>
     <section class="view">
+      <!-- Chat view: zarvis / shell / any non-PTY session. -->
       <div class="transcript" id="transcript"></div>
       <form class="composer" id="composer">
         <textarea
@@ -326,6 +380,15 @@
         ></textarea>
         <button type="submit" id="send" disabled>send</button>
       </form>
+      <!--
+        Terminal view: PTY-backed sessions (codex / claude / shell).
+        Mutually exclusive with the chat view above; toggled in
+        `selectSession()` based on the summary's `has_pty` flag.
+      -->
+      <div class="terminal-wrap" id="terminalWrap" hidden>
+        <div class="terminal-host" id="terminal"></div>
+        <div class="terminal-loading" id="terminalLoading">loading xterm…</div>
+      </div>
     </section>
   </main>
 
@@ -347,6 +410,9 @@ const composerEl = $("composer");
 const inputEl = $("input");
 const sendBtn = $("send");
 const toggleListBtn = $("toggleList");
+const terminalWrapEl = $("terminalWrap");
+const terminalEl = $("terminal");
+const terminalLoadingEl = $("terminalLoading");
 
 const state = {
   ws: null,
@@ -359,6 +425,23 @@ const state = {
   // session_id so switching sessions is just a re-render of cached
   // events. Cleared on explicit `Reset` events from the adapter.
   byId: new Map(),
+  // Current view mode — "chat" (zarvis-style transcript + composer)
+  // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
+  // `selectSession` based on the summary's `has_pty` flag.
+  mode: "chat",
+  // Lazily-initialized xterm.js handle + fit addon. Reused across
+  // PTY-session switches; `term.reset()` clears between sessions.
+  term: null,
+  fitAddon: null,
+  // Last cols/rows we reported to the daemon, to avoid spamming
+  // `session.pty_resize` on every paint when nothing actually
+  // changed (ResizeObserver fires generously).
+  lastReportedSize: { cols: 0, rows: 0 },
+  // PTY events that arrived during the `pty_replay` round-trip get
+  // queued here, then drained after the snapshot is written. Keeps
+  // history-before-live ordering correct without a race window.
+  ptyBuffer: [],
+  ptyBuffering: false,
 };
 
 function setConnState(s, label) {
@@ -491,8 +574,160 @@ async function selectSession(id) {
   if (window.matchMedia("(max-width: 720px)").matches) {
     sessionListEl.classList.add("collapsed");
   }
-  await loadTranscript(id);
-  sendBtn.disabled = !(state.ws && state.ws.readyState === 1);
+  if (s && s.has_pty) {
+    await enterTerminalMode(id);
+  } else {
+    enterChatMode();
+    await loadTranscript(id);
+  }
+  // Composer is meaningful only in chat mode; PTY sessions route
+  // input through xterm directly.
+  sendBtn.disabled =
+    state.mode !== "chat" || !(state.ws && state.ws.readyState === 1);
+}
+
+// --- PTY / xterm.js mode -------------------------------------------------
+
+function enterChatMode() {
+  state.mode = "chat";
+  transcriptEl.hidden = false;
+  composerEl.hidden = false;
+  terminalWrapEl.hidden = true;
+}
+
+async function enterTerminalMode(id) {
+  state.mode = "terminal";
+  transcriptEl.hidden = true;
+  composerEl.hidden = true;
+  terminalWrapEl.hidden = false;
+
+  // Wait for xterm.js (CDN-loaded). If the phone has no public
+  // internet but reached the cloudflared tunnel, we never resolve
+  // and the placeholder stays — user sees "loading xterm…" instead
+  // of a confusing empty pane.
+  const ok = await waitForXterm(8000);
+  if (!ok) {
+    terminalLoadingEl.textContent =
+      "couldn't load xterm.js from cdn.jsdelivr.net";
+    return;
+  }
+  terminalLoadingEl.classList.add("gone");
+
+  if (!state.term) initTerminal();
+  state.term.reset();
+
+  // Buffer PTY events that arrive while we're waiting on the
+  // snapshot RPC. Drained after the snapshot is written so
+  // history → live ordering stays correct.
+  state.ptyBuffer = [];
+  state.ptyBuffering = true;
+
+  try {
+    const r = await rpc("session.pty_replay", { session_id: id });
+    if (r && r.size) {
+      // Daemon's last-known size wins as the initial geometry; we
+      // refit below in case the phone screen is narrower.
+      state.term.resize(r.size.cols, r.size.rows);
+    }
+    if (r && r.data) state.term.write(decodeBase64(r.data));
+  } catch (e) {
+    state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
+  }
+
+  // Flush any live PTY events that buffered during the replay.
+  for (const chunk of state.ptyBuffer) state.term.write(chunk);
+  state.ptyBuffer = [];
+  state.ptyBuffering = false;
+
+  refitTerminal();
+  state.term.focus();
+}
+
+/**
+ * Resolves to true when xterm.js + addon-fit have loaded from the CDN.
+ * Polls window.Terminal / window.FitAddon since both UMD bundles
+ * attach themselves to those globals.
+ */
+function waitForXterm(timeoutMs) {
+  const start = performance.now();
+  return new Promise((resolve) => {
+    const tick = () => {
+      if (window.Terminal && window.FitAddon) return resolve(true);
+      if (performance.now() - start > timeoutMs) return resolve(false);
+      setTimeout(tick, 80);
+    };
+    tick();
+  });
+}
+
+function initTerminal() {
+  state.term = new window.Terminal({
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontSize: 13,
+    convertEol: false,
+    cursorBlink: true,
+    // Mobile-friendly defaults; the daemon controls actual PTY size
+    // via `session.pty_resize` after we report the fit.
+    scrollback: 4000,
+    // Match the surrounding dark theme — xterm's default xtermjs
+    // palette already does OK in dark mode; tweak background to
+    // pure black so the canvas blends with the wrap.
+    theme: { background: "#000000" },
+  });
+  state.fitAddon = new window.FitAddon.FitAddon();
+  state.term.loadAddon(state.fitAddon);
+  state.term.open(terminalEl);
+
+  // Forward user keystrokes (and pasted text) as base64-encoded
+  // PTY input. xterm's onData yields a JS string of UTF-8
+  // codepoints; we re-encode through TextEncoder so multi-byte
+  // input round-trips cleanly.
+  state.term.onData((s) => {
+    if (state.mode !== "terminal" || !state.currentId) return;
+    const data = encodeBase64Utf8(s);
+    rpc("session.pty_input", { session_id: state.currentId, data })
+      .catch((e) => console.error("pty_input failed:", e));
+  });
+
+  // Refit when the viewport changes (orientation, soft-keyboard
+  // showing, etc.). ResizeObserver covers the layout-changes case;
+  // visualViewport covers the soft-keyboard case on mobile.
+  new ResizeObserver(refitTerminal).observe(terminalEl);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", refitTerminal);
+  }
+
+  // Tapping the terminal area focuses xterm's helper textarea, which
+  // is what summons the soft keyboard on iOS/Android.
+  terminalEl.addEventListener("click", () => state.term && state.term.focus());
+}
+
+function refitTerminal() {
+  if (!state.term || !state.fitAddon) return;
+  if (state.mode !== "terminal") return;
+  try {
+    state.fitAddon.fit();
+  } catch (_) { return; }
+  const cols = state.term.cols;
+  const rows = state.term.rows;
+  if (!cols || !rows) return;
+  if (cols === state.lastReportedSize.cols && rows === state.lastReportedSize.rows) {
+    return;
+  }
+  state.lastReportedSize = { cols, rows };
+  if (state.currentId) {
+    rpc("session.pty_resize", { session_id: state.currentId, cols, rows })
+      .catch((e) => console.warn("pty_resize failed:", e));
+  }
+}
+
+function encodeBase64Utf8(s) {
+  const bytes = new TextEncoder().encode(s);
+  let bin = "";
+  // Build a latin-1 binary string (each char 0..255) so btoa accepts
+  // it. Looping bytewise is fine for typical keystroke / paste sizes.
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin);
 }
 
 toggleListBtn.addEventListener("click", () => {
@@ -547,6 +782,30 @@ function handleNotification(method, params) {
 
 function renderEvent(event, at) {
   if (!event || !event.type) return;
+  // PTY events go to xterm in terminal mode (decoded raw bytes →
+  // term.write); fall through to the chat-style `appendPty`
+  // otherwise so the user still sees something for non-PTY views.
+  if (event.type === "pty") {
+    const text = decodeBase64(event.data || "");
+    if (state.mode === "terminal" && state.term) {
+      if (state.ptyBuffering) state.ptyBuffer.push(text);
+      else state.term.write(text);
+    } else {
+      appendPty(text);
+    }
+    return;
+  }
+  // In terminal mode we deliberately skip the structured rendering
+  // for everything except `reset` and `error` — those are useful
+  // signals that wouldn't otherwise reach the terminal surface. The
+  // PTY itself already paints the rest.
+  if (state.mode === "terminal") {
+    if (event.type === "reset" && state.term) state.term.reset();
+    if (event.type === "error" && state.term) {
+      state.term.write(`\r\n\x1b[31m[error] ${event.message || ""}\x1b[0m\r\n`);
+    }
+    return;
+  }
   switch (event.type) {
     case "message":
       appendMessage(event.role || "assistant", event.text || "");
@@ -556,9 +815,6 @@ function renderEvent(event, at) {
       break;
     case "tool_result":
       appendToolResult(event.tool, event.ok, event.output);
-      break;
-    case "pty":
-      appendPty(decodeBase64(event.data || ""));
       break;
     case "error":
       appendError(event.message || "(error)");
