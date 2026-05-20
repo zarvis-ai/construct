@@ -170,6 +170,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.pin_strip_area = pin_strip_area;
     app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
+    app.layout.modal_area = None;
     app.layout.list_row_count = app.list_items().len();
     app.layout.list_items_area = None;
     app.layout.list_scroll_offset = 0;
@@ -200,7 +201,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_tasks_popup(f, app);
     render_remote_control_popup(f, app);
     if app.help_visible {
-        render_help(f, area, &app.theme);
+        app.layout.modal_area = Some(render_help(f, area, &app.theme));
     }
     finish_frame(f, app);
 }
@@ -936,6 +937,7 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.pin_strip_area = None;
     app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
+    app.layout.modal_area = None;
     app.layout.list_items_area = None;
     app.layout.list_scroll_offset = 0;
 
@@ -950,7 +952,7 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     }
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        render_help(f, area, &app.theme);
+        app.layout.modal_area = Some(render_help(f, area, &app.theme));
     }
 }
 
@@ -972,6 +974,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.pin_strip_area = None;
     app.layout.matrix_rain_area = None;
     app.layout.minibuffer_area = Some(minibuffer_area);
+    app.layout.modal_area = None;
     app.layout.list_row_count = app.list_items().len();
     app.layout.list_items_area = None;
     app.layout.list_scroll_offset = 0;
@@ -979,7 +982,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     render_sessions(f, main_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        render_help(f, area, &app.theme);
+        app.layout.modal_area = Some(render_help(f, area, &app.theme));
     }
 }
 
@@ -2721,7 +2724,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
-fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
+fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
     // Target a comfortable reading width — long enough to keep each
     // command line on one row without wrapping, capped so it doesn't
     // span an ultra-wide terminal edge-to-edge. The outer rect adds
@@ -2764,6 +2767,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) {
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: false });
     f.render_widget(para, popup);
+    popup
 }
 
 const HELP_TEXT: &str = "
@@ -3535,7 +3539,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
 /// in-block `[kill]` / `[bg]` buttons stay the way to act on a
 /// running task. Future iterations can wire per-row kill buttons
 /// here without changing the data model.
-fn render_tasks_popup(f: &mut Frame, app: &App) {
+fn render_tasks_popup(f: &mut Frame, app: &mut App) {
     let Some(popup) = app.tasks_popup.as_ref() else {
         return;
     };
@@ -3556,6 +3560,7 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
         width: w,
         height: h,
     };
+    app.layout.modal_area = Some(rect);
     let title = format!(
         " tasks — session {} ({} entries) — Esc to close ",
         short_id(&popup.session_id),
@@ -3620,7 +3625,7 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
 /// diagnostic (tunnel timeout). Auto-sizes around the actual
 /// content — wide enough for the QR block, tall enough for the
 /// rows + URL + optional hint. Esc to dismiss (wired in `app.rs`).
-fn render_remote_control_popup(f: &mut Frame, app: &App) {
+fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
     let Some(popup) = app.remote_control_popup.as_ref() else {
         return;
     };
@@ -3643,6 +3648,7 @@ fn render_remote_control_popup(f: &mut Frame, app: &App) {
     let x = total.x + (total.width.saturating_sub(w)) / 2;
     let y = total.y + (total.height.saturating_sub(h)) / 2;
     let rect = Rect { x, y, width: w, height: h };
+    app.layout.modal_area = Some(rect);
 
     let block = Block::default()
         .borders(Borders::ALL)
