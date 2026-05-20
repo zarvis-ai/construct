@@ -380,15 +380,50 @@
     user-select: none;
     -webkit-user-select: none;
   }
+  /* Header row: scrollable special keys on the left + the
+     minimize toggle pinned to the right so it's reachable at any
+     viewport width. */
+  .vkbd-header {
+    display: flex;
+    align-items: stretch;
+    gap: 4px;
+    padding-bottom: 4px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
   .vkbd-special {
+    flex: 1 1 0;
+    min-width: 0;
     display: flex;
     gap: 4px;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: thin;
-    padding-bottom: 4px;
-    margin-bottom: 4px;
-    border-bottom: 1px solid var(--border);
+  }
+  .vkbd-toggle {
+    flex: 0 0 auto;
+    width: 44px;
+    height: 34px;
+    border-radius: 5px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 14px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  /* When minimized, hide the main keyboard rows entirely so only
+     the special-keys row + toggle are visible — about 50px of
+     screen total, vs ~220px with the full keyboard open. */
+  .vkbd.minimized .vkbd-main { display: none; }
+  .vkbd.minimized .vkbd-header {
+    /* Drop the separator/spacing under the special row when
+       nothing's below it — visually merges into a single bar. */
+    padding-bottom: 0;
+    margin-bottom: 0;
+    border-bottom: none;
   }
   .vkbd-main {
     display: flex;
@@ -424,7 +459,10 @@
   .vk:active { background: var(--accent); color: #fff; }
   .vk.modifier { background: var(--bg); }
   .vk.modifier.on { background: var(--accent); color: #fff; }
-  .vk.wide { flex: 2.2 1 0; }
+  /* Wide keys for the bottom row (space). Enter intentionally
+     stays at default flex:1 so it's the same size as the `123`
+     layer toggle — large enter is easy to mash by accident when
+     reaching for backspace / right-hand letters. */
   .vk.xwide { flex: 3.4 1 0; }
   /* Special-keys row buttons stay sized intrinsic; they don't
      flex-fill because the row scrolls horizontally. */
@@ -586,7 +624,19 @@
         path. Hidden in chat mode.
       -->
       <div class="vkbd" id="vkbd" hidden>
-        <div class="vkbd-special" id="vkbdSpecial"></div>
+        <div class="vkbd-header">
+          <div class="vkbd-special" id="vkbdSpecial"></div>
+          <!--
+            Minimize toggle, right-aligned, always visible. Default
+            state is minimized so the keyboard doesn't immediately
+            eat half the screen on first connect; user expands when
+            they need to type a letter. Tapping Ctrl/Alt also
+            auto-expands so modifier+letter combos work without an
+            extra tap.
+          -->
+          <button type="button" class="vkbd-toggle" id="vkbdToggle"
+                  aria-label="toggle keyboard">▴</button>
+        </div>
         <div class="vkbd-main" id="vkbdMain"></div>
       </div>
     </section>
@@ -1057,11 +1107,19 @@ function encodeBase64Utf8(s) {
 // (literal character to send) or `data-key` (named special key
 // dispatched through KEYBAR_BYTES / SPECIAL_HANDLERS).
 
-/** Top row — special keys + Ctrl combos. Renders once and
- *  doesn't depend on shift / layer state. */
+/** Top row — special keys + Ctrl/Alt modifiers + common Ctrl
+ *  combos. Modifier buttons (`ctrl`, `alt`) work like Shift —
+ *  3-state cycle (off → next → lock → off) — but they apply to
+ *  the next *letter* typed on the main keyboard (Ctrl+letter
+ *  produces the corresponding control byte; Alt+letter prepends
+ *  ESC). Tapping Ctrl/Alt also auto-expands the keyboard if
+ *  minimized, since the modifier is useless without a letter
+ *  visible to tap. */
 const VKBD_SPECIAL = [
   { key: "esc", label: "Esc" },
   { key: "tab", label: "Tab" },
+  { key: "ctrl", label: "Ctrl" },
+  { key: "alt", label: "Alt" },
   { key: "up", label: "↑" },
   { key: "down", label: "↓" },
   { key: "left", label: "←" },
@@ -1073,8 +1131,6 @@ const VKBD_SPECIAL = [
   { key: "ca", label: "^A" },
   { key: "ce", label: "^E" },
   { key: "ck", label: "^K" },
-  { key: "cu", label: "^U" },
-  { key: "cw", label: "^W" },
 ];
 
 /** Byte sequences for named keys (top row + main-row specials). */
@@ -1092,8 +1148,6 @@ const KEYBAR_BYTES = {
   ca: "\x01",
   ce: "\x05",
   ck: "\x0b",
-  cu: "\x15",
-  cw: "\x17",
   // Main-keyboard special keys.
   enter: "\r",
   backspace: "\x7f",
@@ -1125,7 +1179,7 @@ const VKBD_LAYERS = {
     [
       { key: "layer-symbols", label: "123", class: "modifier" },
       { key: "space", label: " ", class: "xwide" },
-      { key: "enter", label: "⏎", class: "wide" },
+      { key: "enter", label: "⏎" },
     ],
   ],
   symbols: [
@@ -1139,7 +1193,7 @@ const VKBD_LAYERS = {
     [
       { key: "layer-letters", label: "abc", class: "modifier" },
       { key: "space", label: " ", class: "xwide" },
-      { key: "enter", label: "⏎", class: "wide" },
+      { key: "enter", label: "⏎" },
     ],
   ],
   // Third layer reached via shift in symbols mode. Just enough to
@@ -1156,20 +1210,61 @@ const VKBD_LAYERS = {
     [
       { key: "layer-letters", label: "abc", class: "modifier" },
       { key: "space", label: " ", class: "xwide" },
-      { key: "enter", label: "⏎", class: "wide" },
+      { key: "enter", label: "⏎" },
     ],
   ],
 };
 
 const vkbd = {
   layer: "letters",
-  // Shift state machine. `off`: lowercase letters. `next`: next
-  // letter is uppercased, then state reverts to `off` (tap-and-
-  // type pattern). `lock`: stays uppercase until shift is tapped
-  // again. From the symbols layer, the same button toggles to
-  // `more`.
+  // Three independent modifier state machines. Each cycles
+  // `off → next → lock → off` on tap, mirroring iOS's
+  // tap-shift-twice-for-caps-lock pattern. `next` is consumed by
+  // the next character typed; `lock` persists. Combinations are
+  // supported (Ctrl+Alt+letter → ESC + Ctrl-letter).
+  //
+  // From the *symbols* layer, the shift button instead toggles
+  // between symbols and the `more` layer — shift-as-modifier
+  // doesn't apply outside letters.
   shift: "off",
+  ctrl: "off",
+  alt: "off",
+  // Default minimized so the keyboard doesn't immediately occupy
+  // half the screen. The user expands when they need to type a
+  // letter; tapping Ctrl / Alt auto-expands too. The minimize
+  // state is shown via the `.vkbd.minimized` class on the root.
+  minimized: true,
 };
+
+/** Apply active modifiers to a base character and return the
+ *  byte sequence to send. Shift uppercases ASCII letters. Ctrl
+ *  converts A–Z to control bytes (Ctrl+A=0x01 … Ctrl+Z=0x1A).
+ *  Alt prepends ESC (xterm's meta-prefix convention). */
+function applyVkbdModifiers(ch) {
+  const shiftOn = vkbd.shift === "next" || vkbd.shift === "lock";
+  const ctrlOn = vkbd.ctrl === "next" || vkbd.ctrl === "lock";
+  const altOn = vkbd.alt === "next" || vkbd.alt === "lock";
+  let out = ch;
+  if (shiftOn && /^[a-z]$/.test(out)) out = out.toUpperCase();
+  if (ctrlOn && /^[a-zA-Z]$/.test(out)) {
+    const code = out.toUpperCase().charCodeAt(0) - 64;
+    out = String.fromCharCode(code);
+  }
+  if (altOn) out = "\x1b" + out;
+  return out;
+}
+
+/** Reset any modifier still in the `next` state after it's been
+ *  consumed by a character. `lock` modifiers stay active. */
+function consumeNextVkbdModifiers() {
+  if (vkbd.shift === "next") vkbd.shift = "off";
+  if (vkbd.ctrl === "next") vkbd.ctrl = "off";
+  if (vkbd.alt === "next") vkbd.alt = "off";
+}
+
+function cycleModifierState(s) {
+  return s === "off" ? "next" : s === "next" ? "lock" : "off";
+}
 
 /** Send a synthetic PTY input chunk — same code path as
  *  `term.onData`, used by the virtual keyboard to fire bytes
@@ -1183,14 +1278,30 @@ function sendPtyBytes(s) {
 
 /** Rebuild the keyboard markup from VKBD_SPECIAL + the current
  *  layer in VKBD_LAYERS. Idempotent; called on terminal-mode
- *  enter and on every layer/shift change. */
+ *  enter and on every layer / modifier / minimize change. */
 function renderVirtualKeyboard() {
-  // Top row — special keys (fixed across layers).
-  vkbdSpecialEl.innerHTML = VKBD_SPECIAL.map(
-    (k) => `<button type="button" class="vk" data-key="${attr(k.key)}">${escape(k.label)}</button>`,
-  ).join("");
+  // Root visibility class — drives `.vkbd.minimized` CSS rule
+  // that hides the main rows.
+  vkbdEl.classList.toggle("minimized", vkbd.minimized);
+  // Toggle glyph: ▾ shows "minimize me" (visible when expanded),
+  // ▴ shows "expand me" (visible when minimized).
+  const toggleEl = $("vkbdToggle");
+  if (toggleEl) toggleEl.textContent = vkbd.minimized ? "▴" : "▾";
 
-  // Main rows — current layer.
+  // Special row — highlight Ctrl/Alt when armed/locked so the
+  // user can see modifier state at a glance.
+  vkbdSpecialEl.innerHTML = VKBD_SPECIAL.map((k) => {
+    let modOn = "";
+    if (k.key === "ctrl" && vkbd.ctrl !== "off") modOn = "on";
+    if (k.key === "alt" && vkbd.alt !== "off") modOn = "on";
+    const cls = ["vk", k.key === "ctrl" || k.key === "alt" ? "modifier" : "", modOn]
+      .filter(Boolean)
+      .join(" ");
+    return `<button type="button" class="${cls}" data-key="${attr(k.key)}">${escape(k.label)}</button>`;
+  }).join("");
+
+  // Main rows — current layer (skipped from DOM update when
+  // minimized; harmless but saves a few microseconds).
   const rows = VKBD_LAYERS[vkbd.layer] || VKBD_LAYERS.letters;
   const isLetters = vkbd.layer === "letters";
   const shiftOn = vkbd.shift === "next" || vkbd.shift === "lock";
@@ -1204,9 +1315,7 @@ function renderVirtualKeyboard() {
           }
           // Object cell.
           const cls = ["vk", cell.class || ""].filter(Boolean).join(" ");
-          // Highlight the shift modifier when it's "armed" or
-          // locked so the user sees that next-letter-is-capital
-          // is sticky.
+          // Highlight modifiers when armed/locked.
           const modOn = cell.key === "shift" && shiftOn ? "on" : "";
           return `<button type="button" class="${cls} ${modOn}" data-key="${attr(cell.key)}">${escape(cell.label)}</button>`;
         })
@@ -1217,21 +1326,26 @@ function renderVirtualKeyboard() {
 }
 
 /** Handle a virtual-keyboard tap. Dispatches by attribute:
- *  `data-char` → literal character (uppercased if shift on);
- *  `data-key` → named special key (KEYBAR_BYTES + modifiers). */
+ *  `data-char` → literal character (with modifiers applied);
+ *  `data-key` → named special key (modifier toggle, layer
+ *  switch, or KEYBAR_BYTES lookup). */
 function handleVkbdClick(ev) {
+  // Minimize toggle lives outside the .vk button family so it
+  // gets its own check first.
+  if (ev.target.id === "vkbdToggle") {
+    vkbd.minimized = !vkbd.minimized;
+    renderVirtualKeyboard();
+    return;
+  }
   const btn = ev.target.closest(".vk");
   if (!btn) return;
-  // Literal character.
+  // Literal character → apply modifiers, send, consume `next`
+  // states.
   if (btn.dataset.char !== undefined) {
-    const ch = btn.dataset.char;
-    sendPtyBytes(ch);
-    // Auto-reset "next" shift after a single letter, to mirror
-    // the iOS keyboard behavior. Stay locked when in "lock".
-    if (vkbd.shift === "next") {
-      vkbd.shift = "off";
-      renderVirtualKeyboard();
-    }
+    const baseCh = vkbd.layer === "letters" ? btn.dataset.char.toLowerCase() : btn.dataset.char;
+    sendPtyBytes(applyVkbdModifiers(baseCh));
+    consumeNextVkbdModifiers();
+    renderVirtualKeyboard();
     return;
   }
   // Named special key.
@@ -1239,16 +1353,30 @@ function handleVkbdClick(ev) {
   if (!k) return;
   switch (k) {
     case "shift":
-      // 3-state cycle: off → next → lock → off. In the symbols
-      // layer, shift instead toggles between symbols and `more`.
+      // 3-state cycle in letters. In symbols, the shift button
+      // toggles between symbols and `more` layers — that's its
+      // role in the existing iOS-style layout.
       if (vkbd.layer === "symbols") {
         vkbd.layer = "more";
       } else if (vkbd.layer === "more") {
         vkbd.layer = "symbols";
       } else {
-        vkbd.shift =
-          vkbd.shift === "off" ? "next" : vkbd.shift === "next" ? "lock" : "off";
+        vkbd.shift = cycleModifierState(vkbd.shift);
       }
+      renderVirtualKeyboard();
+      return;
+    case "ctrl":
+      vkbd.ctrl = cycleModifierState(vkbd.ctrl);
+      // The modifier has no effect on the special row itself —
+      // it applies to the next letter on the main keyboard, which
+      // is hidden when minimized. Auto-expand on activate so the
+      // user can immediately reach a letter.
+      if (vkbd.ctrl !== "off") vkbd.minimized = false;
+      renderVirtualKeyboard();
+      return;
+    case "alt":
+      vkbd.alt = cycleModifierState(vkbd.alt);
+      if (vkbd.alt !== "off") vkbd.minimized = false;
       renderVirtualKeyboard();
       return;
     case "layer-symbols":
