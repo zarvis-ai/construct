@@ -1175,6 +1175,23 @@ impl SessionManager {
                 }));
             return;
         }
+        // Persist zarvis/chat PTY bytes in the transcript as lightweight
+        // ordering markers. PTY replay still comes from pty.log, but these
+        // markers let a fresh TUI interleave transcript-only items (tool
+        // blocks) with the raw byte stream at the right point after restart.
+        if let SessionEvent::Pty { .. } = &event {
+            let seq = entry.transcript_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = Utc::now();
+            let ts = TimestampedEvent {
+                seq,
+                at: now,
+                event: event.clone(),
+            };
+            if let Err(e) = self.storage.append_event(&entry.id, &ts) {
+                tracing::warn!(session = %entry.id, error = ?e, "append PTY marker failed");
+            }
+        }
+
         // AgentStatus is ephemeral live UI state. The CLI may render
         // inactive statuses as display-only history rows, but they
         // should not enter the structured transcript or PTY log.
@@ -1192,8 +1209,8 @@ impl SessionManager {
             return;
         }
         // PTY events take a fast path: they go to the in-memory ring +
-        // append to the on-disk pty.log + a live broadcast, but they don't
-        // bloat the structured transcript.
+        // append to the on-disk pty.log + a live broadcast. A copy was
+        // also appended to the transcript above as an ordering marker.
         if let SessionEvent::Pty { .. } = &event {
             if let Some(bytes) = event.pty_bytes() {
                 entry.pty.lock().await.push(&bytes);
