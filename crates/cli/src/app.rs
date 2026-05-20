@@ -1173,6 +1173,14 @@ impl App {
         let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
         match self.client.transcript(id, 0, None).await {
             Ok(t) => {
+                if t.events.iter().any(|ev| matches!(ev.event, SessionEvent::Pty { .. })) {
+                    // New daemons persist PTY events in the transcript as ordering
+                    // markers. Prefer rebuilding from those markers so transcript-only
+                    // items (zarvis tool blocks) are interleaved with the raw bytes in
+                    // chronological order. The pty_replay path above remains the
+                    // fallback for older sessions whose transcripts do not contain PTY.
+                    history.clear_items();
+                }
                 apply_transcript_to_local_state(
                     &t.events,
                     &mut history,
@@ -3718,13 +3726,18 @@ pub fn apply_transcript_to_local_state(
             // longer see synthesized tool blocks at all — including
             // when scrolling. See
             // `zarvis_tool_block_visible_after_bootstrap_via_task_start`.
-            SessionEvent::TaskStart { call_id, tool, args_summary } => {
+            SessionEvent::TaskStart {
+                call_id,
+                tool,
+                args_summary,
+            } => {
                 if tool != agentd_protocol::TUI_DISPATCH_TOOL {
-                    history.feed_task_start(
-                        call_id.clone(),
-                        tool.clone(),
-                        args_summary.clone(),
-                    );
+                    history.feed_task_start(call_id.clone(), tool.clone(), args_summary.clone());
+                }
+            }
+            SessionEvent::Pty { .. } => {
+                if let Some(bytes) = ev.event.pty_bytes() {
+                    history.feed_pty(&bytes);
                 }
             }
             SessionEvent::ToolUse { tool, args } => {
@@ -3759,14 +3772,21 @@ pub fn apply_transcript_to_local_state(
                 });
             }
             // Mirror the live notification handler: `active=true`
-            // sets the running status; `active=false` clears it so
-            // the chat doesn't keep showing a stale spinner.
+            // sets the running status; `active=false` clears it and
+            // appends the dim completion line into the local PTY
+            // history. The adapter only emits this as a structured
+            // event, so a fresh TUI must synthesize the same history
+            // row during transcript replay or the completed-turn
+            // message disappears after reconnect/restart.
             SessionEvent::AgentStatus(status) => {
-                *agent_status = if status.active {
-                    Some(status.clone())
+                if status.active {
+                    *agent_status = Some(status.clone());
                 } else {
-                    None
-                };
+                    *agent_status = None;
+                    if let Some(bytes) = agent_status_history_line(status) {
+                        history.feed_pty(&bytes);
+                    }
+                }
             }
             _ => {}
         }
@@ -4109,6 +4129,128 @@ mod tests {
             "TaskStart must be forwarded to ItemHistory::feed_task_start. \
              Without it, fresh-TUI bootstrap of an existing zarvis session \
              rebuilds history with no tool blocks. Got render:\n{text}",
+        );
+    }
+
+    #[test]
+    fn transcript_replay_preserves_answer_after_tool_order() {
+        use agentd_protocol::{SessionEvent, TimestampedEvent};
+        use chrono::Utc;
+
+        fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
+            TimestampedEvent {
+                seq,
+                at: Utc::now(),
+                event,
+            }
+        }
+
+        let events = vec![
+            ev(1, SessionEvent::pty(b"before tool\r\n")),
+            ev(
+                2,
+                SessionEvent::TaskStart {
+                    call_id: "t1".into(),
+                    tool: "shell".into(),
+                    args_summary: "echo hi".into(),
+                },
+            ),
+            ev(
+                3,
+                SessionEvent::ToolResult {
+                    tool: "t1".into(),
+                    ok: true,
+                    output: "hi".into(),
+                },
+            ),
+            ev(4, SessionEvent::pty(b"after tool answer\r\n")),
+        ];
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor: Option<EditorState> = None;
+        let mut status = None;
+        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
+
+        let screen_rows = 24u16;
+        let screen_cols = 80u16;
+        let out = history.replay(screen_cols, screen_rows, 0);
+        let text: String = (0..screen_rows)
+            .flat_map(|r| {
+                let mut row = String::new();
+                for c in 0..screen_cols {
+                    if let Some(cell) = out.screen.cell(r, c) {
+                        row.push_str(&cell.contents());
+                    }
+                }
+                row.push('\n');
+                row.chars().collect::<Vec<_>>()
+            })
+            .collect();
+
+        let tool_idx = text
+            .find("→ shell")
+            .expect("transcript replay should synthesize the tool block");
+        let answer_idx = text
+            .find("after tool answer")
+            .expect("transcript replay should restore assistant PTY bytes after the tool");
+        assert!(
+            answer_idx > tool_idx,
+            "assistant answer emitted after a tool call must replay after the tool block. got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn transcript_replay_restores_completed_turn_status_line() {
+        use agentd_protocol::{AgentStatus, SessionEvent, TimestampedEvent};
+        use chrono::Utc;
+
+        let started_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+            .saturating_sub(2_000);
+        let events = vec![TimestampedEvent {
+            seq: 1,
+            at: Utc::now(),
+            event: SessionEvent::AgentStatus(AgentStatus {
+                active: false,
+                started_at_ms,
+                status: "Finished".into(),
+            }),
+        }];
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor: Option<EditorState> = None;
+        let mut status: Option<AgentStatus> = Some(AgentStatus {
+            active: true,
+            started_at_ms,
+            status: "Working".into(),
+        });
+        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
+
+        assert!(
+            status.is_none(),
+            "inactive AgentStatus should clear any live running status on bootstrap"
+        );
+
+        let screen_rows = 24u16;
+        let screen_cols = 80u16;
+        let out = history.replay(screen_cols, screen_rows, 0);
+        let text: String = (0..screen_rows)
+            .flat_map(|r| {
+                let mut row = String::new();
+                for c in 0..screen_cols {
+                    if let Some(cell) = out.screen.cell(r, c) {
+                        row.push_str(&cell.contents());
+                    }
+                }
+                row.push('\n');
+                row.chars().collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            text.contains("* Finished"),
+            "bootstrap transcript replay must restore the completed-turn history line. got:\n{text}"
         );
     }
 

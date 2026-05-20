@@ -286,6 +286,19 @@ impl ItemHistory {
         self.items.is_empty() && self.pending_chunk.is_empty()
     }
 
+    /// Remove all accumulated items while preserving the current PTY
+    /// geometry. Used by bootstrap when the transcript contains PTY
+    /// ordering markers: rebuilding from the transcript preserves the
+    /// chronological interleaving between raw bytes and transcript-only
+    /// tool blocks, while older sessions without markers still fall back
+    /// to pty.log replay.
+    pub fn clear_items(&mut self) {
+        let cols = self.shadow_cols;
+        let rows = self.shadow_rows;
+        *self = Self::new();
+        self.set_pty_size(cols, rows);
+    }
+
     /// Resize the shadow parser to match the PTY child's geometry.
     /// Call this before `feed_pty` whenever the caller knows the
     /// child's current size — bootstrap replay from `pty_replay`,
