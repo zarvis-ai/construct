@@ -42,43 +42,8 @@ fn init_tracing() {
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
 }
 
-/// Strip session-scoped `AGENTD_*` variables from the daemon's
-/// inherited environment so child adapters don't pick them up on
-/// first-spawn paths.
-///
-/// `AGENTD_RESUME=1` is the dangerous one: it tells the adapter
-/// "this is a respawn after a daemon restart — the initial prompt
-/// is already in the transcript, don't re-run it". The daemon
-/// explicitly inserts it on its own respawn path
-/// (`session.rs::restore_session`), so a value inherited from the
-/// outer shell can only be wrong. When the daemon itself is
-/// launched from inside another agentd-spawned process
-/// (Claude Code running as a zarvis session, an orchestrator
-/// tool that spawns a nested daemon, …) the var leaks through
-/// `Command::env`'s default-inherit behaviour and every new
-/// session boots in resume mode — silently swallowing its
-/// initial prompt and sitting at `awaiting_input` with no output
-/// and no error event.
-///
-/// `AGENTD_SESSION_ID` / `AGENTD_SESSION_KIND` /
-/// `AGENTD_SESSION_DATA_DIR` are always overwritten per-adapter
-/// in `session.rs::create_session`, so leakage there is
-/// theoretically harmless — strip them anyway for defense in
-/// depth and so `printenv` inside the daemon looks clean.
-fn sanitize_inherited_env() {
-    for key in [
-        "AGENTD_RESUME",
-        "AGENTD_SESSION_ID",
-        "AGENTD_SESSION_KIND",
-        "AGENTD_SESSION_DATA_DIR",
-    ] {
-        std::env::remove_var(key);
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
-    sanitize_inherited_env();
     init_tracing();
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Run { socket: None }) {
