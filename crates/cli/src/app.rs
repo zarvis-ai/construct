@@ -2885,20 +2885,23 @@ impl App {
                 // anyway (adapter exited; PTY writes go nowhere), so
                 // surface a path back to a live adapter while we're
                 // here. Live sessions keep the original drill-in.
-                if matches!(self.focus, PaneFocus::List) {
-                    if let Some(s) = self.selected_session() {
-                        if s.state.is_terminal() {
-                            let session_id = s.id.clone();
-                            let short = short_id(&session_id).to_string();
-                            self.minibuffer = Some(Minibuffer {
-                                prompt: format!("Restart session {short}? (y/N): "),
-                                input: String::new(),
-                                cursor: 0,
-                                intent: MinibufferIntent::RestartConfirm { session_id },
-                                error: None,
-                            });
-                            return;
-                        }
+                //
+                // This applies from both panes: when a terminated
+                // session is already focused in the view, the PTY is
+                // no longer capturing keys, so Enter should offer the
+                // same restart path as it does from the list.
+                if let Some(s) = self.selected_session() {
+                    if s.state.is_terminal() {
+                        let session_id = s.id.clone();
+                        let short = short_id(&session_id).to_string();
+                        self.minibuffer = Some(Minibuffer {
+                            prompt: format!("Restart session {short}? (y/N): "),
+                            input: String::new(),
+                            cursor: 0,
+                            intent: MinibufferIntent::RestartConfirm { session_id },
+                            error: None,
+                        });
+                        return;
                     }
                 }
                 // Enter from the list drills into the session view.
