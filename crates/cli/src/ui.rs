@@ -2830,6 +2830,15 @@ fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
                 Span::raw(text.clone()),
             ]
         }
+        SessionEvent::Reasoning { text } => {
+            // Model's private thinking — dim + italic so the user can
+            // tell it apart from the actual response.
+            let style = Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC);
+            vec![
+                Span::styled("thinking: ".to_string(), style),
+                Span::styled(text.clone(), style),
+            ]
+        }
         SessionEvent::ToolUse { tool, args } => {
             let args_s = serde_json::to_string(args).unwrap_or_default();
             vec![
@@ -3369,6 +3378,7 @@ fn shorten(s: &str, max: usize) -> String {
 pub fn short_event_label(ev: &SessionEvent) -> String {
     match ev {
         SessionEvent::Message { role, text } => format!("msg:{:?} {}", role, shorten(text, 60)),
+        SessionEvent::Reasoning { text } => format!("reasoning {}", shorten(text, 60)),
         SessionEvent::ToolUse { tool, .. } => format!("tool {tool}"),
         SessionEvent::ToolResult { tool, ok, .. } => format!("tool-result {tool} ok={ok}"),
         SessionEvent::AwaitingInput { .. } => "awaiting input".to_string(),

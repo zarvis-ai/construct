@@ -122,6 +122,12 @@ pub struct ProviderTurn {
 /// flow in the terminal pane. Provider impls don't care which it is.
 pub trait TextSink: Send {
     fn delta(&mut self, text: &str);
+    /// Streaming "thinking" / reasoning text from the model — e.g.
+    /// Anthropic's `thinking_delta` content blocks or Codex
+    /// Responses' `reasoning_summary_text.delta` events. Default is
+    /// a no-op so providers and sinks that don't care about
+    /// reasoning don't have to opt out.
+    fn reasoning_delta(&mut self, _text: &str) {}
 }
 
 /// Sentinel error for "the input you sent is over the model's

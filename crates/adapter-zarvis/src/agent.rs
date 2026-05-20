@@ -29,6 +29,11 @@ impl<'a> TextSink for MessageSink<'a> {
             text: text.to_string(),
         });
     }
+    fn reasoning_delta(&mut self, text: &str) {
+        self.emit.emit(SessionEvent::Reasoning {
+            text: text.to_string(),
+        });
+    }
 }
 
 pub(crate) const SYSTEM_PROMPT_USER: &str = r#"You are zarvis, an AI agent embedded in agentd (a multi-session terminal agent fleet).

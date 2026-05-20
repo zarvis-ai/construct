@@ -474,9 +474,10 @@ pub fn build_responses_body(
         // `400 "Store must be set to false"`. Codex CLI sets this
         // explicitly in `codex-rs/core/src/client.rs`.
         "store": false,
-        // Asks the server to emit reasoning summary deltas; we don't
-        // surface them to the user today but it costs nothing to
-        // request and the SSE parser handles them gracefully.
+        // Asks the server to emit reasoning summary deltas. We
+        // surface them via `sink.reasoning_delta`, which the
+        // PtySink renders dim-italic in the live PTY and the
+        // headless MessageSink turns into `SessionEvent::Reasoning`.
         "reasoning": { "summary": "auto" },
     });
     if !tools.is_empty() {
@@ -606,6 +607,20 @@ impl LlmProvider for CodexOauth {
                         if !text.is_empty() {
                             sink.delta(text);
                             assistant_text.push_str(text);
+                        }
+                    }
+                }
+                // Streaming reasoning-summary text. We requested
+                // `"reasoning": { "summary": "auto" }` in the body, so
+                // the server emits these whenever the model produced
+                // a reasoning trace. Surface them via the sink's
+                // reasoning channel so the TUI can render them dim
+                // italic and the headless transcript records them as
+                // distinct `SessionEvent::Reasoning` events.
+                "response.reasoning_summary_text.delta" => {
+                    if let Some(text) = chunk.get("delta").and_then(|v| v.as_str()) {
+                        if !text.is_empty() {
+                            sink.reasoning_delta(text);
                         }
                     }
                 }

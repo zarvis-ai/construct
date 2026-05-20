@@ -309,6 +309,21 @@ const RESPONSE_BULLET: &[u8] = b"\xe2\x97\x8f ";
 /// after the bullet. Must visually match the bullet's cell width
 /// (1 dot + 1 space = 2 cells).
 const RESPONSE_INDENT: &[u8] = b"  ";
+/// First-line marker for streaming reasoning / "thinking" text from
+/// providers that emit it (Anthropic extended thinking, Codex
+/// Responses reasoning summaries). `\xc2\xb7` = `·`. Visually
+/// smaller and dimmer than the response bullet so it reads as
+/// secondary context, not the agent's actual answer.
+const REASONING_BULLET: &[u8] = b"\xc2\xb7 ";
+/// SGR escape that opens the dim+italic styling we paint reasoning
+/// text in. Matches `REASONING_RESET` below — every newline inside
+/// the reasoning block has to bracket the line break with reset
+/// then re-enter, otherwise some terminals leak the attribute onto
+/// the next blank line.
+const REASONING_OPEN_SGR: &[u8] = b"\x1b[2;3m";
+/// Matching SGR escape that closes the reasoning styling so the
+/// regular response block isn't accidentally dim-italic.
+const REASONING_RESET_SGR: &[u8] = b"\x1b[0m";
 /// Left margin in visible cells (counts toward soft-wrap math).
 const LEFT_MARGIN_CELLS: usize = 2;
 /// Hard floor on usable width so a tiny pane doesn't crash the wrap
@@ -362,6 +377,11 @@ struct PtySink<'a> {
     emit_messages: bool,
     /// Start time of the current live turn, used for `AgentStatus`.
     status_started_at_ms: i64,
+    /// True while a reasoning sub-block is currently open. Streaming
+    /// reasoning deltas keep appending to it; the first regular text
+    /// delta (or `finalize`) closes it before the response block
+    /// opens.
+    in_reasoning: bool,
 }
 impl<'a> PtySink<'a> {
     fn new(emit: &'a EventEmitter, width: usize, status_started_at_ms: i64) -> Self {
@@ -375,6 +395,7 @@ impl<'a> PtySink<'a> {
             col: 0,
             emit_messages: true,
             status_started_at_ms,
+            in_reasoning: false,
         }
     }
     /// Replay constructor — emits PTY bytes only, never `Message`
@@ -411,6 +432,48 @@ impl<'a> PtySink<'a> {
         self.at_line_start = true;
     }
 
+    /// Open a reasoning sub-block: top padding (only if nothing has
+    /// rendered yet), bullet, dim+italic SGR. Bracketed by
+    /// `close_reasoning_block` before any regular response text or
+    /// finalize so the styling doesn't leak.
+    fn open_reasoning_block(&mut self, out: &mut Vec<u8>) {
+        if !self.emitted {
+            for _ in 0..PAD_TOP {
+                out.extend_from_slice(b"\r\n");
+            }
+            self.emitted = true;
+        }
+        out.push(b'\r');
+        out.extend_from_slice(REASONING_OPEN_SGR);
+        out.extend_from_slice(REASONING_BULLET);
+        self.col = 0;
+        self.at_line_start = true;
+        self.in_reasoning = true;
+    }
+
+    fn reasoning_newline(&mut self, out: &mut Vec<u8>) {
+        // Reset SGR over the line break to keep the next blank line
+        // from inheriting the dim+italic on some terminals, then
+        // re-enter the styling on the continuation line.
+        out.extend_from_slice(REASONING_RESET_SGR);
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(REASONING_OPEN_SGR);
+        out.extend_from_slice(REASONING_BULLET);
+        self.col = 0;
+        self.at_line_start = true;
+    }
+
+    fn close_reasoning_block(&mut self, out: &mut Vec<u8>) {
+        if !self.in_reasoning {
+            return;
+        }
+        out.extend_from_slice(REASONING_RESET_SGR);
+        out.extend_from_slice(b"\r\n");
+        self.in_reasoning = false;
+        self.col = 0;
+        self.at_line_start = true;
+    }
+
     /// Emit any tail state + bottom padding. Called by the agent loop
     /// once `provider.complete` returns and the streamed text portion
     /// is done.
@@ -419,6 +482,9 @@ impl<'a> PtySink<'a> {
             return;
         }
         let mut out: Vec<u8> = Vec::with_capacity(32);
+        if self.in_reasoning {
+            self.close_reasoning_block(&mut out);
+        }
         // If we still have a partial dim-prefix candidate buffered
         // (e.g., the model ended on "Summa" without a colon), flush it
         // verbatim so we don't lose bytes.
@@ -444,6 +510,11 @@ impl<'a> TextSink for PtySink<'a> {
             emit_agent_status(self.emit, self.status_started_at_ms, "Working");
         }
         let mut out: Vec<u8> = Vec::with_capacity(text.len() + 32);
+        // Reasoning ran into the answer — drop the SGR + newline
+        // separator before the response bullet opens.
+        if self.in_reasoning {
+            self.close_reasoning_block(&mut out);
+        }
         if !self.emitted {
             self.open_block(&mut out);
         }
@@ -512,6 +583,45 @@ impl<'a> TextSink for PtySink<'a> {
             // Transcript copy stays raw (unpadded).
             self.emit.emit(SessionEvent::Message {
                 role: agentd_protocol::MessageRole::Assistant,
+                text: text.to_string(),
+            });
+        }
+    }
+
+    /// Streaming reasoning text — open a dim+italic sub-block on
+    /// first call, emit each char with simple soft-wrap. The dim
+    /// styling and bullet visually separate the reasoning trace
+    /// from the actual response, which lands later via `delta` (and
+    /// `delta` automatically closes the reasoning block first).
+    fn reasoning_delta(&mut self, text: &str) {
+        if self.emit_messages {
+            emit_agent_status(self.emit, self.status_started_at_ms, "Thinking");
+        }
+        let mut out: Vec<u8> = Vec::with_capacity(text.len() + 32);
+        if !self.in_reasoning {
+            self.open_reasoning_block(&mut out);
+        }
+        for c in text.chars() {
+            if c == '\n' {
+                self.reasoning_newline(&mut out);
+                continue;
+            }
+            if !self.at_line_start && self.col >= self.usable_width() {
+                // Soft-wrap inside the reasoning block — same gutter
+                // as `delta` so right-margin alignment matches.
+                self.reasoning_newline(&mut out);
+            }
+            self.at_line_start = false;
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            out.extend_from_slice(s.as_bytes());
+            self.col += 1;
+        }
+        if !out.is_empty() {
+            self.emit.emit(SessionEvent::pty(&out));
+        }
+        if self.emit_messages {
+            self.emit.emit(SessionEvent::Reasoning {
                 text: text.to_string(),
             });
         }
