@@ -289,8 +289,8 @@ const DIM_LINE_PREFIXES: &[&str] = &["Summary:"];
 /// `agentd_loop_create` call. Keep this in lockstep with the
 /// after-submit match block + the TUI's `run_slash_command`.
 const SLASH_COMMANDS: &[&str] = &[
-    "/border", "/compact", "/help", "/loop", "/model", "/new", "/quit", "/reset", "/exit",
-    "/refresh", "/rename", "/send", "/tasks", "/zoom",
+    "/border", "/compact", "/help", "/loop", "/model", "/new", "/quit", "/remote-control",
+    "/reset", "/exit", "/refresh", "/rename", "/send", "/tasks", "/zoom",
 ];
 
 /// Padding around the assistant's streamed response. The response is

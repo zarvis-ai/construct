@@ -216,6 +216,12 @@ pub struct App {
     pub last_diff: Option<String>,
     pub should_quit: bool,
     pub connected: bool,
+    /// How many remote WS clients are currently attached to the
+    /// daemon. Surfaced as a "● remote" badge in the modeline so
+    /// the local user can see when the phone (or any future remote
+    /// client) is also driving sessions. Updated by the
+    /// `remote/state` notification handler.
+    pub remote_clients: u32,
     // Terminal-pane state.
     pub view: ViewMode,
     /// Per-session items history. Replaces the old direct
@@ -331,6 +337,10 @@ pub struct App {
     /// /tasks popup state: `None` = closed, `Some(...)` = open with
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
+    /// Live `/remote-control` modal — URL + QR for the active
+    /// remote-WS deployment. `Some` while open, `None` otherwise.
+    /// Dismissed with Esc the same way `tasks_popup` is.
+    pub remote_control_popup: Option<RemoteControlPopup>,
     /// Per-session input editor state, fed by `SessionEvent::EditorState`
     /// from the adapter (currently zarvis interactive). Drives the
     /// fixed bottom input pane.
@@ -421,6 +431,41 @@ fn format_elapsed(started_at_ms: i64) -> String {
 pub struct TasksPopup {
     pub session_id: String,
     pub tasks: Vec<agentd_protocol::TaskInfo>,
+}
+
+/// Live state of the `/remote-control` (or `/remote-control-debug`)
+/// modal. The `url` and `qr` are served verbatim by the daemon
+/// (`remote.start` IPC); the popup just displays them.
+///
+/// `Ok` variant: tunnel mode that succeeded, or local-only mode.
+/// `Err` variant: tunnel mode that timed out — the daemon returned
+/// a diagnostic explaining why (cloudflared missing, slow network,
+/// etc.). Renderer paints the diagnostic instead of a fake URL,
+/// which is the fix for the "tunnel is warming up" UX trap.
+#[derive(Debug, Clone)]
+pub enum RemoteControlPopup {
+    Ok(RemoteControlOk),
+    Err {
+        /// Which slash was invoked, so the title still reads
+        /// "/remote-control" vs "/remote-control-debug".
+        local_only: bool,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteControlOk {
+    pub url: String,
+    pub qr: String,
+    pub tunnel_ready: bool,
+    /// HTTP Basic auth password for the phone to enter when the
+    /// browser prompts. Displayed verbatim in the popup — copying
+    /// is the easy path on macOS Terminal.app via mouse drag.
+    pub password: String,
+    pub hint: Option<String>,
+    /// Mode the user invoked. `false` for `/remote-control` (the
+    /// public-tunnel happy path), `true` for `/remote-control-debug`.
+    pub local_only: bool,
 }
 
 /// Smallest list-pane width that still leaves room for the session
@@ -670,11 +715,13 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         last_diff: None,
         should_quit: false,
         connected: true,
+        remote_clients: 0,
         view: ViewMode::Transcript,
         histories: HashMap::new(),
         block_hits: HashMap::new(),
         orchestrator_desired_size: None,
         tasks_popup: None,
+        remote_control_popup: None,
         terminal_pane_size: (100, 30),
         zoom: initial_zoom,
         list_scroll_offset: 0,
@@ -1602,6 +1649,16 @@ impl App {
                     >(p)
                     {
                         self.on_group_deleted(&payload.group_id).await;
+                    }
+                }
+            }
+            m if m == agentd_protocol::ipc_notif::REMOTE_STATE => {
+                if let Some(p) = n.params {
+                    if let Ok(payload) = serde_json::from_value::<
+                        agentd_protocol::RemoteStateNotificationPayload,
+                    >(p)
+                    {
+                        self.remote_clients = payload.clients;
                     }
                 }
             }
@@ -2669,6 +2726,30 @@ impl App {
                 return;
             }
         }
+        // /remote-control modal: Esc closes the popup *and* the
+        // orchestrator panel it was launched from, so a single Esc
+        // returns the user to whichever session they had focused
+        // before typing the slash. Without the orchestrator-close
+        // step, the panel keeps routing every subsequent keystroke
+        // to god's PTY — the user reported "couldn't type prompt
+        // from tui after enabling remote control" because of this.
+        //
+        // Non-Esc keys are *eaten* while the popup is visible — the
+        // popup body is informational only (URL + QR), and falling
+        // through to the underlying handler would silently route
+        // typing into god / a session under the modal.
+        if self.remote_control_popup.is_some() {
+            if matches!(key.code, KeyCode::Esc) {
+                self.remote_control_popup = None;
+                if matches!(
+                    self.minibuffer.as_ref().map(|m| &m.intent),
+                    Some(MinibufferIntent::Orchestrator)
+                ) {
+                    self.minibuffer = None;
+                }
+            }
+            return;
+        }
         // Minibuffer captures all input when open — with one exception:
         // the orchestrator intent is just a focus marker for a
         // PTY-backed panel, so keys go to the orchestrator session's
@@ -3585,7 +3666,16 @@ impl App {
     /// no orchestrator is present).
     pub async fn run_slash_command(&mut self, cmd: &str) {
         let cmd = cmd.trim();
-        match cmd {
+        // Split into verb + remaining args. Commands that don't
+        // take args ignore the tail silently (slight behavior
+        // change from the previous strict-match style, but more
+        // forgiving and lets verbs like `remote-control <pw>` reuse
+        // the same dispatcher).
+        let (verb, arg) = cmd
+            .split_once(char::is_whitespace)
+            .map(|(v, a)| (v, a.trim()))
+            .unwrap_or((cmd, ""));
+        match verb {
             "" => {}
             "quit" | "exit" => self.should_quit = true,
             "refresh" => {
@@ -3625,6 +3715,39 @@ impl App {
             "tasks" => {
                 self.open_tasks_popup().await;
             }
+            "remote-control" | "remote" => {
+                // Subcommand dispatch: `stop` and `debug` are
+                // reserved keywords; anything else is treated as
+                // a literal password override (so a user who
+                // wants the password `stop` has to pick a
+                // different word — fine for v1).
+                //
+                //   /remote-control                  → start (auto pw)
+                //   /remote-control stop             → stop
+                //   /remote-control debug            → local-only
+                //   /remote-control debug myword     → local-only + pw
+                //   /remote-control <anything else>  → start + pw=<that>
+                let (sub, rest) = arg
+                    .split_once(char::is_whitespace)
+                    .map(|(s, r)| (s, r.trim()))
+                    .unwrap_or((arg, ""));
+                match sub {
+                    "stop" => self.stop_remote_control().await,
+                    "debug" => {
+                        let pw = (!rest.is_empty()).then(|| rest.to_string());
+                        self.open_remote_control_popup(true, pw).await;
+                    }
+                    "" => self.open_remote_control_popup(false, None).await,
+                    _ => {
+                        // Everything (including any trailing
+                        // whitespace-separated tokens) becomes
+                        // the password — supports passwords with
+                        // spaces like `/remote-control my secret`.
+                        let pw = arg.to_string();
+                        self.open_remote_control_popup(false, Some(pw)).await;
+                    }
+                }
+            }
             "harnesses" => {
                 self.harnesses = self.client.harnesses().await.unwrap_or_default();
                 let names: Vec<String> = self
@@ -3659,6 +3782,63 @@ impl App {
                 });
             }
             Err(e) => self.set_status(format!("list_tasks failed: {e}")),
+        }
+    }
+
+    /// Call `remote.start` on the daemon and surface the resulting
+    /// URL + QR in the modal.
+    ///
+    /// `local_only=false` is the `/remote-control` slash: the
+    /// daemon waits for cloudflared and the result is always the
+    /// public `wss://…trycloudflare.com` URL — or, on timeout, a
+    /// JSON-RPC error with an actionable diagnostic that the popup
+    /// shows in an error state. No more "warming up" trap where
+    /// rerunning loops on the same hint.
+    ///
+    /// `local_only=true` is the `/remote-control-debug` slash:
+    /// returns the local `ws://127.0.0.1` URL immediately, never
+    /// touches cloudflared. Useful for desktop-browser smoke tests
+    /// and CI.
+    pub async fn open_remote_control_popup(
+        &mut self,
+        local_only: bool,
+        password: Option<String>,
+    ) {
+        match self.client.remote_start(local_only, password).await {
+            Ok(r) => {
+                self.remote_control_popup = Some(RemoteControlPopup::Ok(RemoteControlOk {
+                    url: r.url,
+                    qr: r.qr,
+                    tunnel_ready: r.tunnel_ready,
+                    password: r.password,
+                    hint: r.hint,
+                    local_only,
+                }));
+            }
+            Err(e) => {
+                self.remote_control_popup = Some(RemoteControlPopup::Err {
+                    local_only,
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Tear down the remote WS listener + cloudflared tunnel on the
+    /// daemon side. Surfaces `was_running` so the user gets
+    /// distinct status messages for "we stopped it" vs "nothing
+    /// was running to stop". Also auto-dismisses any open
+    /// `/remote-control` popup since the URL it shows is now dead.
+    pub async fn stop_remote_control(&mut self) {
+        match self.client.remote_stop().await {
+            Ok(r) if r.was_running => {
+                self.remote_control_popup = None;
+                self.set_status("remote stopped; QR + URL invalidated".into());
+            }
+            Ok(_) => {
+                self.set_status("remote wasn't running".into());
+            }
+            Err(e) => self.set_status(format!("remote-control stop failed: {e}")),
         }
     }
 
