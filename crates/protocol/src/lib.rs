@@ -560,6 +560,17 @@ pub mod ipc_method {
     /// once cloudflared exits. Idempotent — calling stop when
     /// nothing is running returns Ok with `was_running: false`.
     pub const REMOTE_STOP: &str = "remote.stop";
+    /// Restart the daemon process in place — persist remote state
+    /// (token, password, port, tunnel URL) to disk, exec() the
+    /// current executable so any on-disk binary upgrade is picked
+    /// up. cloudflared subprocess is left running (detached process
+    /// group) so the public URL survives the restart; the new
+    /// daemon binds the same local port and adopts the still-alive
+    /// tunnel without re-spawning. Returns the new exe path and
+    /// timestamp the new daemon will report on startup; the IPC
+    /// connection is closed by the kernel during exec(), so clients
+    /// detect the restart as a socket close and reconnect.
+    pub const DAEMON_RESTART: &str = "daemon.restart";
 }
 
 pub mod ipc_notif {
@@ -1006,6 +1017,23 @@ pub struct RemoteStartResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteStopResult {
     pub was_running: bool,
+}
+
+/// Result of `daemon.restart`. Echoed back to the caller right
+/// before the daemon exec()s itself — clients see this reply, then
+/// observe the IPC socket close as the new process replaces the
+/// old. `exe` is the path the new process will load from (typically
+/// the same `current_exe()`, but useful for the CLI to show "now
+/// running build X" once it reconnects).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonRestartResult {
+    pub exe: String,
+    pub pid: u32,
+    /// True iff a still-running cloudflared subprocess was found
+    /// and the new daemon will adopt it rather than spawn a fresh
+    /// tunnel. Lets the CLI emit "remote URL preserved" vs
+    /// "remote URL will rotate" in the status line.
+    pub tunnel_preserved: bool,
 }
 
 /// A user-created group used to organize sessions in the list view.

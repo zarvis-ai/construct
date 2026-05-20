@@ -10,8 +10,12 @@
 //! Both are reasonable follow-ups once we have a web client driving
 //! real usage and can see what the access patterns are.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU16, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -48,12 +52,104 @@ pub struct RemoteState {
     /// clients (e.g. the desktop TUI) can show a "remote attached"
     /// badge without polling.
     clients: Arc<AtomicUsize>,
+    /// PID of the cloudflared subprocess (or 0 when unknown / not
+    /// running). Captured at spawn time and persisted to
+    /// `remote.json` so a restart-and-adopt path can check whether
+    /// the still-running tunnel can be reused. Atomic because the
+    /// tunnel supervisor may respawn cloudflared mid-life.
+    tunnel_pid: Arc<AtomicU32>,
+    /// Local WS port the listener is bound to. Set once at install
+    /// time (`with_port`) and read by `persist()` so each
+    /// snapshot write knows the port without callers having to
+    /// thread it through every mutator. Atomic so the install
+    /// step doesn't need a `&mut self`.
+    port: Arc<AtomicU16>,
+    /// On-disk snapshot file. Cloning is cheap (Arc<PathBuf>) and
+    /// every mutator (`set_tunnel_url`, `set_tunnel_pid`) writes
+    /// through to this path so an `exec()`-and-restart picks up a
+    /// fresh snapshot. `None` means "don't persist" — used by
+    /// the unit tests that don't want a touched filesystem.
+    snapshot_path: Arc<Option<PathBuf>>,
+}
+
+/// On-disk representation of `RemoteState`. Loaded at startup
+/// before any new state is minted — if a recent snapshot exists
+/// AND the cloudflared PID it names is still alive, the new
+/// daemon restores the token/password/URL/port instead of minting
+/// fresh ones. That's what makes `/agentd restart` preserve the
+/// remote URL + password across the restart gap.
+///
+/// Versioned so future field additions (e.g. per-session token
+/// scopes) can be migrated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSnapshot {
+    pub version: u32,
+    pub token: String,
+    pub password: String,
+    pub port: u16,
+    #[serde(default)]
+    pub tunnel_url: Option<String>,
+    /// PID of the cloudflared subprocess at snapshot time. 0 means
+    /// "no tunnel was running" (debug-mode `/remote-control debug`).
+    /// The restoring daemon `kill(pid, 0)`s this to verify
+    /// liveness before adopting.
+    #[serde(default)]
+    pub tunnel_pid: u32,
+    /// Unix seconds when the snapshot was last written. Snapshots
+    /// older than the daemon-defined freshness window are ignored
+    /// at startup — a stale `remote.json` from a long-dead daemon
+    /// shouldn't grant access on next boot.
+    pub generated_at: u64,
+}
+
+impl RemoteSnapshot {
+    pub const CURRENT_VERSION: u32 = 1;
+
+    /// Read a snapshot from `path`. Returns `Ok(None)` if the file
+    /// doesn't exist (a non-error: fresh daemon). Returns `Err` if
+    /// the file exists but is malformed.
+    pub fn read(path: &Path) -> std::io::Result<Option<Self>> {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let snap: RemoteSnapshot = serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        Ok(Some(snap))
+    }
+
+    /// Atomic write via `tmp + rename`. Failures are best-effort
+    /// logged at the call site — losing a snapshot only degrades
+    /// the next restart to "mint fresh credentials", never breaks
+    /// anything.
+    pub fn write(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    pub fn fresh_enough(&self, now: u64, max_age_secs: u64) -> bool {
+        // generated_at is recorded by us; if the clock skews
+        // backwards between snapshot + read, treat as fresh
+        // (saturating sub).
+        now.saturating_sub(self.generated_at) <= max_age_secs
+    }
 }
 
 impl RemoteState {
     /// Mint a fresh state with a new token and an auto-generated
     /// password. Called once per active remote-control session
     /// (re-minted after `/remote-stop` + `/remote-control`).
+    /// Snapshot path defaults to `None` — call `with_snapshot_path`
+    /// to install one if persistence is desired.
     pub fn new() -> Self {
         Self::with_password(None)
     }
@@ -69,7 +165,106 @@ impl RemoteState {
             password: Arc::new(password),
             tunnel_url: Arc::new(RwLock::new(None)),
             clients: Arc::new(AtomicUsize::new(0)),
+            tunnel_pid: Arc::new(AtomicU32::new(0)),
+            port: Arc::new(AtomicU16::new(0)),
+            snapshot_path: Arc::new(None),
         }
+    }
+
+    /// Restore from a previously-persisted snapshot. Used by the
+    /// `/agentd restart` path: when the new daemon starts and finds
+    /// a fresh `remote.json` whose `tunnel_pid` is still alive, it
+    /// constructs a `RemoteState` from the snapshot instead of
+    /// minting a new one — that's what preserves the URL + password
+    /// across the restart.
+    pub fn from_snapshot(snap: &RemoteSnapshot) -> Self {
+        Self {
+            token: Arc::new(snap.token.clone()),
+            password: Arc::new(snap.password.clone()),
+            tunnel_url: Arc::new(RwLock::new(snap.tunnel_url.clone())),
+            clients: Arc::new(AtomicUsize::new(0)),
+            tunnel_pid: Arc::new(AtomicU32::new(snap.tunnel_pid)),
+            port: Arc::new(AtomicU16::new(snap.port)),
+            snapshot_path: Arc::new(None),
+        }
+    }
+
+    /// Record the listening port. Called once at bind time.
+    /// Triggers a persist so the snapshot file is up-to-date
+    /// immediately after the listener comes up.
+    pub async fn set_port(&self, port: u16) {
+        self.port.store(port, Ordering::SeqCst);
+        self.persist().await;
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port.load(Ordering::SeqCst)
+    }
+
+    /// Install a snapshot path on an existing state. The state
+    /// writes through to this path on every mutator call. Called
+    /// once by the supervisor when a `RemoteState` is installed
+    /// (boot, `/remote-control` start, or restore-from-snapshot).
+    pub fn with_snapshot_path(mut self, path: PathBuf) -> Self {
+        self.snapshot_path = Arc::new(Some(path));
+        self
+    }
+
+    /// Build a snapshot capturing the current in-memory state.
+    /// `tunnel_url` is read async-locked.
+    pub async fn snapshot(&self) -> RemoteSnapshot {
+        let url = self.tunnel_url.read().await.clone();
+        RemoteSnapshot {
+            version: RemoteSnapshot::CURRENT_VERSION,
+            token: (*self.token).clone(),
+            password: (*self.password).clone(),
+            port: self.port.load(Ordering::SeqCst),
+            tunnel_url: url,
+            tunnel_pid: self.tunnel_pid.load(Ordering::SeqCst),
+            generated_at: unix_now(),
+        }
+    }
+
+    /// Best-effort persist of the current state to the installed
+    /// snapshot path. Logs and swallows IO errors — failing to
+    /// persist only degrades the next restart to "mint fresh
+    /// credentials". Returns immediately if no snapshot path is
+    /// installed or the port is still 0 (not yet bound).
+    pub async fn persist(&self) {
+        let Some(path) = self.snapshot_path.as_ref().clone() else {
+            return;
+        };
+        if self.port.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        let snap = self.snapshot().await;
+        if let Err(e) = snap.write(&path) {
+            tracing::warn!(error = %e, path = %path.display(), "remote snapshot write failed");
+        }
+    }
+
+    /// Remove any persisted snapshot. Called from `/remote-control
+    /// stop` so a subsequent boot doesn't try to adopt a stale
+    /// URL. Errors are logged-only.
+    pub fn clear_persisted(&self) {
+        let Some(path) = self.snapshot_path.as_ref().clone() else {
+            return;
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "remote snapshot delete failed"),
+        }
+    }
+
+    /// Record the PID of the cloudflared subprocess + persist.
+    pub async fn set_tunnel_pid(&self, pid: u32) {
+        self.tunnel_pid.store(pid, Ordering::SeqCst);
+        self.persist().await;
+    }
+
+    pub fn tunnel_pid(&self) -> u32 {
+        self.tunnel_pid.load(Ordering::SeqCst)
     }
 
     /// Atomically increment the active-client counter and return the
@@ -142,14 +337,41 @@ impl RemoteState {
 
     /// Update the public tunnel URL. Called by the cloudflared
     /// monitor once it reads the `*.trycloudflare.com` URL out of
-    /// the subprocess output.
+    /// the subprocess output. Persists if a snapshot path + port
+    /// have been installed.
     pub async fn set_tunnel_url(&self, url: Option<String>) {
         *self.tunnel_url.write().await = url;
+        self.persist().await;
     }
 
     pub async fn tunnel_url(&self) -> Option<String> {
         self.tunnel_url.read().await.clone()
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `kill(pid, 0)`: does this process exist + is it signalable by
+/// us? Returns false on PID==0 (sentinel) and any error. Used by
+/// the boot-time restore path to confirm the `cloudflared`
+/// subprocess named in the snapshot is still alive before
+/// adopting its URL.
+///
+/// A pid that exists but is owned by a different user surfaces as
+/// `EPERM`; we treat that as "not adoptable" because we can't
+/// kill it later for `/remote-control stop` either.
+pub fn process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    use nix::sys::signal::kill;
+    use nix::unistd::Pid;
+    kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
 impl Default for RemoteState {

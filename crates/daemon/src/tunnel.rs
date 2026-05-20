@@ -57,6 +57,7 @@ pub async fn run(remote: RemoteState, local_port: u16) {
             }
         }
         remote.set_tunnel_url(None).await;
+        remote.set_tunnel_pid(0).await;
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
@@ -74,10 +75,16 @@ async fn run_once(remote: &RemoteState, local_port: u16) -> Result<()> {
         .stderr(Stdio::piped())
         // If the daemon dies, kill the subprocess too — otherwise
         // a crashed daemon would leak a public tunnel into the
-        // ether.
+        // ether. NOTE: this also means `/agentd restart` rotates
+        // the tunnel URL (see issue #90 follow-up for URL
+        // preservation across restart).
         .kill_on_drop(true)
         .spawn()
         .context("spawn cloudflared")?;
+    let pid = child.id().unwrap_or(0);
+    if pid != 0 {
+        remote.set_tunnel_pid(pid).await;
+    }
 
     let stderr = child
         .stderr

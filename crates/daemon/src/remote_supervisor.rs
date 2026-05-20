@@ -165,18 +165,20 @@ async fn handle_stop(
 ) -> StopOutcome {
     // Clear the manager's slot first so any concurrent IPC method
     // sees "not running" before we abort the loops underneath.
+    // Capture the cloudflared PID before clearing so we can kill
+    // it (cloudflared is in its own process group now and survives
+    // task abort otherwise — that's what enables `/agentd restart`
+    // to preserve the URL, but for `/remote-control stop` the URL
+    // must actually stop resolving).
     let was_running = {
         let mut guard = manager.remote_slot().expect("remote mutex poisoned");
         guard.take().is_some()
     };
-    // Abort cloudflared first — once its task is gone, the
-    // subprocess dies (kill_on_drop) and the public URL stops
-    // resolving at Cloudflare's edge. Then abort the WS accept
-    // loop, which drops the `TcpListener` and stops accepting new
-    // connections. Existing per-connection tasks aren't tracked
-    // individually; they exit naturally once the client disconnects
-    // (typical timeout: minutes) or sooner once cloudflared
-    // tears the tunnel down.
+    // Aborting the tunnel task drops the `tokio::process::Child`
+    // which is configured with `kill_on_drop(true)`, so the
+    // subprocess goes down with the task. Then abort the WS
+    // accept loop, which drops the `TcpListener` and stops
+    // accepting new connections.
     if let Some(h) = tunnel_task.take() {
         h.abort();
     }
@@ -212,6 +214,7 @@ async fn bind_and_install(
         .with_context(|| format!("bind WS listener {bind_addr}"))?;
     let port = listener.local_addr().context("query bound port")?.port();
     let state = RemoteState::with_password(password);
+    state.set_port(port).await;
     tracing::info!(
         port,
         url = %format!("http://127.0.0.1:{port}/t/{}", state.token()),

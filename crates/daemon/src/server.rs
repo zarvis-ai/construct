@@ -1123,6 +1123,30 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
+        m if m == ipc_method::DAEMON_RESTART => {
+            // Hand off to main's `tokio::select!` arm which calls
+            // `exec()` on the resolved current_exe. The reply
+            // races the kernel: we send it back here, then the
+            // IPC socket closes when exec() replaces the process
+            // image. Clients detect that as a disconnect and
+            // reconnect.
+            match manager.request_daemon_restart() {
+                Ok(cmd) => {
+                    let r = agentd_protocol::DaemonRestartResult {
+                        exe: cmd.exe.display().to_string(),
+                        pid: std::process::id(),
+                        // Tunnel preservation is follow-up work (see
+                        // issue #90 follow-up). Today the cloudflared
+                        // subprocess is killed by `kill_on_drop` as
+                        // the runtime tears down, so the public URL
+                        // rotates on each restart.
+                        tunnel_preserved: false,
+                    };
+                    ok!(&r)
+                }
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
         other => Response::err(id.clone(), ErrorObject::method_not_found(other)),
     }
 }
