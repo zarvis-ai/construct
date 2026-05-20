@@ -105,16 +105,23 @@
       grid-template-columns: 1fr;
       grid-template-rows: auto 1fr;
     }
-    /* On phones the list shares the screen with the session
-       view, so cap its height — but leave enough room for 5-6
-       rows + the new-session button + toolbar without forcing
-       the user to scroll inside the list to find anything.
-       50vh is the rough sweet spot on a 6.x" portrait viewport. */
-    .session-list {
+    /* Bound the WRAP (grid row 1) directly so the inner aside's
+       `flex: 1 1 0; min-height: 0` rule (which is needed for flex
+       sizing to work at all) doesn't collapse the row down to
+       just the new-session button + toolbar. ~45vh sweet-spots a
+       6.x" portrait viewport — ~5-6 session rows visible without
+       eating too much of the view pane.
+       When the list is collapsed via the `≡` toggle, ignore both
+       bounds so it disappears completely. */
+    .session-list-wrap {
+      min-height: 300px;
       max-height: 50vh;
-      min-height: 200px;
     }
-    .session-list.collapsed { max-height: 0; min-height: 0; padding: 0; border-bottom: none; }
+    .session-list-wrap:has(.session-list.collapsed) {
+      min-height: 0;
+      max-height: none;
+    }
+    .session-list.collapsed { max-height: 0; padding: 0; border-bottom: none; }
   }
 
   .session-list {
