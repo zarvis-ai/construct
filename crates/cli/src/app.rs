@@ -562,6 +562,10 @@ pub struct LayoutSnapshot {
     /// (`MinibufferIntent::NewSessionHarness`). Click → submit the
     /// matching name as if the user typed it and hit Enter.
     pub minibuffer_harness_hits: Vec<HarnessHit>,
+    /// Bounds of the topmost modal/dialog rendered in the last frame.
+    /// Mouse clicks outside this rect dismiss the modal instead of
+    /// falling through to panes underneath it.
+    pub modal_area: Option<ratatui::layout::Rect>,
 }
 
 #[derive(Debug, Clone)]
@@ -2170,6 +2174,16 @@ impl App {
         fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
         }
+        if let Some(modal) = self.layout.modal_area {
+            if !contains(modal, col, row) {
+                self.dismiss_modal();
+                return;
+            }
+            // The current modals are informational/read-only. Clicks
+            // inside them are consumed so they don't focus or activate
+            // controls in panes underneath the modal.
+            return;
+        }
         if let Some(hit) = self.url_hit_at(col, row) {
             match open_url(&hit.url) {
                 Ok(()) => self.set_status(format!("opened {}", hit.url)),
@@ -2272,6 +2286,22 @@ impl App {
                 return;
             }
         }
+    }
+
+    fn dismiss_modal(&mut self) {
+        if self.tasks_popup.take().is_some() {
+            return;
+        }
+        if self.remote_control_popup.take().is_some() {
+            if matches!(
+                self.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::Orchestrator)
+            ) {
+                self.minibuffer = None;
+            }
+            return;
+        }
+        self.help_visible = false;
     }
 
     pub fn hovered_url(&self) -> Option<UrlHit> {
@@ -4227,6 +4257,7 @@ mod tests {
             list_scroll_offset: 0,
             minibuffer_hints: Vec::new(),
             minibuffer_harness_hits: Vec::new(),
+            modal_area: None,
         }
     }
 
