@@ -1792,6 +1792,40 @@ approvalApproveBtn.addEventListener("click", () => decideApproval("approve"));
 approvalDenyBtn.addEventListener("click", () => decideApproval("deny"));
 approvalAutomodeBtn.addEventListener("click", () => decideApproval("automode"));
 
+// --- Mobile keyboard awareness ------------------------------------------
+//
+// When the OS soft keyboard slides up on a phone, `visualViewport`
+// shrinks (the actually-visible page area), while the layout
+// viewport stays full-size. Without intervention, the bottom of
+// our page — including the xterm cursor and our vkbd's special
+// row — is hidden behind the OS keyboard and the user has to
+// manually scroll up.
+//
+// Fix: bind `body.height` to `visualViewport.height`. The existing
+// flex layout reflows automatically (xterm refits via its
+// `ResizeObserver` on `#terminal`, the vkbd stays pinned just
+// above the OS keyboard), so the user never sees the cursor
+// disappear behind the OS keyboard. Setting `body.height` is also
+// a no-op on desktop where visualViewport tracks the inner window
+// height exactly.
+
+function syncBodyHeightToVisualViewport() {
+  if (!window.visualViewport) return;
+  const h = Math.round(window.visualViewport.height);
+  // Direct style override of the CSS `height: 100%` rule. The
+  // existing rule re-applies as soon as we clear this when the
+  // keyboard hides (visualViewport.height === innerHeight).
+  document.body.style.height = `${h}px`;
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", syncBodyHeightToVisualViewport);
+  // Run once at boot to handle the case where the page is loaded
+  // with an already-open keyboard (rare but possible after
+  // page-refresh while focused).
+  syncBodyHeightToVisualViewport();
+}
+
 // --- Boot ---------------------------------------------------------------
 
 connect();
