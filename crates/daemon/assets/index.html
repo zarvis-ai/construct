@@ -789,6 +789,8 @@
                 id="toolbarUpBtn" aria-label="move selected up" disabled>↑</button>
         <button type="button" class="row-action" data-action="move-down"
                 id="toolbarDownBtn" aria-label="move selected down" disabled>↓</button>
+        <button type="button" class="row-action" data-action="rename"
+                id="toolbarRenameBtn" aria-label="rename selected" disabled>✎</button>
         <button type="button" class="row-action" data-action="restart"
                 id="toolbarRestartBtn" aria-label="restart selected" disabled>↻</button>
       </div>
@@ -914,6 +916,29 @@
       <div class="approval-actions">
         <button type="button" class="btn-deny" id="newSessionCancel">Cancel</button>
         <button type="submit" class="btn-approve" id="newSessionCreate">Create</button>
+      </div>
+    </form>
+  </div>
+
+  <!--
+    Rename-session sheet. Same slide-up pattern as the new-session
+    sheet. Single text field; empty submission clears the title
+    (the daemon falls back to the hash-derived label).
+  -->
+  <div id="renameSheet" class="approval-sheet" hidden role="dialog" aria-modal="true">
+    <form class="approval-card" id="renameForm">
+      <div class="approval-head">
+        <div class="approval-tool-name">Rename session</div>
+      </div>
+      <label class="ns-row ns-row-grow">
+        <span class="ns-label">title</span>
+        <input id="renameTitle" type="text" class="ns-input"
+               placeholder="leave empty to clear" autocomplete="off" />
+      </label>
+      <div class="ns-error" id="renameError" hidden></div>
+      <div class="approval-actions">
+        <button type="button" class="btn-deny" id="renameCancel">Cancel</button>
+        <button type="submit" class="btn-approve" id="renameSave">Save</button>
       </div>
     </form>
   </div>
@@ -1226,9 +1251,12 @@ function refreshListToolbar() {
   const terminal = ["done", "errored", "killed", "stopped"].includes(status);
   const upBtn = $("toolbarUpBtn");
   const downBtn = $("toolbarDownBtn");
+  const renameBtn = $("toolbarRenameBtn");
   const restartBtn = $("toolbarRestartBtn");
   if (upBtn) upBtn.disabled = !isUserSession;
   if (downBtn) downBtn.disabled = !isUserSession;
+  // Rename a user session only — god's label is daemon-owned.
+  if (renameBtn) renameBtn.disabled = !isUserSession;
   if (restartBtn) restartBtn.disabled = !sel || !terminal;
 }
 
@@ -1249,9 +1277,15 @@ async function toggleGroupCollapsed(groupId) {
 
 /** Dispatch a session action by name. Wired up to the shared
  *  list toolbar (acts on `state.currentId`). Future candidates:
- *  delete, kill, pin, rename. */
+ *  delete, kill, pin. Rename hands off to a slide-up sheet
+ *  instead of firing the RPC directly because it needs a text
+ *  input from the user. */
 async function handleRowAction(action, sessionId) {
   if (!sessionId) return;
+  if (action === "rename") {
+    openRenameDialog(sessionId);
+    return;
+  }
   try {
     if (action === "restart") {
       await rpc("session.restart", { session_id: sessionId });
@@ -2290,6 +2324,72 @@ async function submitNewSession(ev) {
 newSessionBtn.addEventListener("click", openNewSessionDialog);
 newSessionCancelBtn.addEventListener("click", closeNewSessionDialog);
 newSessionFormEl.addEventListener("submit", submitNewSession);
+
+// --- Rename-session dialog ---------------------------------------------
+//
+// Single text input; submitting empty clears the user-set title
+// (the daemon falls back to its hash-derived label). State held
+// on the form element so we don't accidentally rename the wrong
+// session if the selection changes while the sheet is open.
+
+const renameSheetEl = $("renameSheet");
+const renameFormEl = $("renameForm");
+const renameTitleEl = $("renameTitle");
+const renameErrorEl = $("renameError");
+const renameCancelBtn = $("renameCancel");
+const renameSaveBtn = $("renameSave");
+
+function openRenameDialog(sessionId) {
+  const s = state.sessions.find((x) => x.id === sessionId);
+  if (!s) return;
+  renameFormEl.dataset.sessionId = sessionId;
+  renameTitleEl.value = s.title || "";
+  renameErrorEl.hidden = true;
+  renameSaveBtn.disabled = false;
+  renameSheetEl.hidden = false;
+  setTimeout(() => {
+    renameTitleEl.focus();
+    renameTitleEl.select();
+  }, 200);
+}
+
+function closeRenameDialog() {
+  renameSheetEl.hidden = true;
+  renameErrorEl.hidden = true;
+  renameSaveBtn.disabled = false;
+  delete renameFormEl.dataset.sessionId;
+}
+
+async function submitRename(ev) {
+  ev.preventDefault();
+  const sessionId = renameFormEl.dataset.sessionId;
+  if (!sessionId) {
+    closeRenameDialog();
+    return;
+  }
+  const raw = renameTitleEl.value.trim();
+  // Empty input → omit `title` so the daemon clears the override
+  // (it's an `Option<String>` server-side).
+  const params = { session_id: sessionId };
+  if (raw) params.title = raw;
+  renameSaveBtn.disabled = true;
+  renameErrorEl.hidden = true;
+  try {
+    await rpc("session.set_title", params);
+    closeRenameDialog();
+  } catch (e) {
+    renameSaveBtn.disabled = false;
+    renameErrorEl.textContent = `rename failed: ${e.message}`;
+    renameErrorEl.hidden = false;
+  }
+}
+
+renameCancelBtn.addEventListener("click", closeRenameDialog);
+renameFormEl.addEventListener("submit", submitRename);
+renameSheetEl.addEventListener("click", (ev) => {
+  // Click on the backdrop (the sheet itself, not the card) closes.
+  if (ev.target === renameSheetEl) closeRenameDialog();
+});
 
 // Shared list toolbar — delegate the click to the same
 // `handleRowAction` the per-row buttons used to call. After the
