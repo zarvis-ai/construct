@@ -9,11 +9,11 @@ All code changes go through a branch, worktree, and PR — no exceptions.
 - **No `Co-Authored-By: Claude` trailer in commits.** Don't append model attribution to commit messages. `Co-authored-by:` for other humans is fine.
 - **Clean up after merge.** Remove the worktree (`git worktree remove <path>`), delete the local branch (`git branch -d <name>`), and delete the remote branch (e.g. via GitHub's "delete branch after merge", or `git push <remote> --delete <name>`).
 - **When the change is testable, build all binaries in the worktree and report paths in the agent response.** Run `cargo build` inside the worktree (debug profile — much faster to iterate on than release; the binaries live under `.claude/worktrees/<branch>/target/debug/`), then print the absolute path of every binary the workspace produces — `agent`, `agentd`, `agentd-mcp`, and every `agentd-adapter-*` — in the agent response so the user can copy and run them. Explicitly call out *which* binary the PR's code lives in so the user can run the right one without grepping the diff (e.g. "this PR only touches `crates/cli` → relevant binary is `agent`; the others are built but unchanged from main").
-- **Record a video / screenshot when it helps the reviewer, and post it on the PR.** This is a judgment call:
+- **Record a video / screenshot when it helps the reviewer, and post accessible artifacts on the PR.** This is a judgment call:
   - Sometimes only an "after" recording makes sense (a brand-new pane / popup / view that didn't exist before).
   - Sometimes a before/after pair is needed (a tweak to an existing render: a color, a fade rate, a layout shift).
   - Sometimes neither is useful (refactors, internal API changes, daemon logic with no user-visible surface).
-  Use [Recording the TUI](#recording-the-tui) below for the mechanics. **When unsure which of the three applies, ask the user before recording.**
+  Use [Recording the TUI](#recording-the-tui) below for the mechanics. Report local artifact paths in the agent response so the user can open them; if posting on the PR, attach or upload the actual media so reviewers can access it. **When unsure which of the three applies, ask the user before recording.**
 
 ## Recording the TUI
 
