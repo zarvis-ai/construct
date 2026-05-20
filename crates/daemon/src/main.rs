@@ -6,9 +6,12 @@ use std::sync::Arc;
 mod adapter;
 mod config;
 mod loops;
+mod remote;
+mod remote_supervisor;
 mod server;
 mod session;
 mod storage;
+mod tunnel;
 mod worktree;
 
 use agentd_protocol::paths::Paths;
@@ -79,11 +82,20 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     );
 
     let storage = Arc::new(storage::Storage::new(paths.data_dir.clone())?);
-    let manager = Arc::new(
+    let (manager, remote_rx) =
         session::SessionManager::new(storage.clone(), Arc::new(config), paths.runtime_dir.clone())
             .await
-            .context("init session manager")?,
-    );
+            .context("init session manager")?;
+    let manager = Arc::new(manager);
+    // Spawn the remote supervisor first so any subsequent
+    // `start_remote` call (boot-time env-var path or in-flight
+    // `remote.start` IPC) has a live receiver to send to.
+    {
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            remote_supervisor::run(mgr, remote_rx).await;
+        });
+    }
     // Best-effort resume: re-spawn adapters for sessions that were alive at
     // the previous shutdown. Sessions whose adapter binary is missing or
     // whose start params can't be loaded get marked Errored. Logs only;
@@ -107,6 +119,50 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     }
 
     let socket_path = socket_override.unwrap_or_else(|| paths.socket());
+
+    // Auto-start the remote WS listener at boot when
+    // `AGENTD_REMOTE_WS_PORT` is set — the headless / scripted
+    // entry point. Interactive users get the same machinery via
+    // the TUI's `/remote-control` slash (which calls
+    // `remote.start` over IPC and shows a QR), so the env var is
+    // only needed when nobody is at the terminal to type the
+    // command.
+    if let Ok(port_raw) = std::env::var("AGENTD_REMOTE_WS_PORT") {
+        match port_raw.parse::<u16>() {
+            Ok(port) => {
+                let mgr = manager.clone();
+                tokio::spawn(async move {
+                    // Boot path = tunnel mode. The 15s wait is
+                    // tolerable here because the daemon is starting
+                    // and nobody is staring at a UI. Failure
+                    // (cloudflared missing, no public URL) is
+                    // logged but doesn't kill the daemon — local
+                    // WS is still up.
+                    // Env-var boot path uses the auto-generated
+                    // password; nobody is at the TUI to type one.
+                    // The password lands in the info log so it's
+                    // visible to the operator running the daemon.
+                    let params = agentd_protocol::RemoteStartParams {
+                        local_only: false,
+                        password: None,
+                    };
+                    if let Err(e) = mgr.start_remote(Some(port), params).await {
+                        tracing::error!(error = %e, "boot-time start_remote failed");
+                    }
+                });
+            }
+            Err(_) => tracing::warn!(
+                value = %port_raw,
+                "AGENTD_REMOTE_WS_PORT is not a valid u16; skipping ws listener"
+            ),
+        }
+    }
+
+    // Race the IPC accept loop against shutdown signals so
+    // SIGTERM/SIGINT drains adapters before exit (gives them a
+    // chance to flush state). SIGHUP exits without touching
+    // adapters so the daemon-reload path doesn't kill running
+    // sessions.
     tokio::select! {
         result = server::serve(manager.clone(), socket_path) => result,
         signal = shutdown_signal() => {

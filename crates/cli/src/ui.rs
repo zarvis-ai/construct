@@ -198,6 +198,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_view_uncollapse_tooltip(f, app);
     render_harness_unavailable_tooltip(f, app);
     render_tasks_popup(f, app);
+    render_remote_control_popup(f, app);
     if app.help_visible {
         render_help(f, area, &app.theme);
     }
@@ -2536,11 +2537,21 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
         Some(s) if s.automode => "[automode]  ".to_string(),
         _ => String::new(),
     };
+    // "● remote: N" badge when at least one phone / remote client is
+    // attached to the daemon. Visible signal that another surface
+    // is also driving sessions, so the local user doesn't get
+    // surprised by a session changing under them.
+    let remote_badge = if app.remote_clients > 0 {
+        format!("[● remote: {}]  ", app.remote_clients)
+    } else {
+        String::new()
+    };
     let modeline = format!(
-        " agentd  focus:{focus}  {sel}  {model}  {automode}{scrollback}{chord}{status}{conn} ",
+        " agentd  focus:{focus}  {sel}  {model}  {remote}{automode}{scrollback}{chord}{status}{conn} ",
         focus = focus_label,
         scrollback = scrollback_label,
         automode = automode_badge,
+        remote = remote_badge,
         sel = match s {
             Some(s) => format!("\"{}\"", primary_label(s)),
             None => "-".into(),
@@ -3603,6 +3614,160 @@ fn render_tasks_popup(f: &mut Frame, app: &App) {
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+}
+
+/// Centered modal that paints either the URL+QR (success) or a
+/// diagnostic (tunnel timeout). Auto-sizes around the actual
+/// content — wide enough for the QR block, tall enough for the
+/// rows + URL + optional hint. Esc to dismiss (wired in `app.rs`).
+fn render_remote_control_popup(f: &mut Frame, app: &App) {
+    let Some(popup) = app.remote_control_popup.as_ref() else {
+        return;
+    };
+    let total = f.area();
+
+    let (title, title_color, body_lines, body_w, body_h) = match popup {
+        crate::app::RemoteControlPopup::Ok(p) => render_remote_ok(app, p),
+        crate::app::RemoteControlPopup::Err { local_only, message } => {
+            render_remote_err(app, *local_only, message)
+        }
+    };
+
+    let want_w = body_w + 6;
+    let want_h = body_h + 4;
+    let w = want_w.min(total.width.saturating_sub(4)).max(40);
+    let h = want_h.min(total.height.saturating_sub(2)).max(8);
+    if w < 30 || h < 6 {
+        return;
+    }
+    let x = total.x + (total.width.saturating_sub(w)) / 2;
+    let y = total.y + (total.height.saturating_sub(h)) / 2;
+    let rect = Rect { x, y, width: w, height: h };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border_focused))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+    let para = Paragraph::new(body_lines).wrap(Wrap { trim: false });
+    f.render_widget(para, inner);
+}
+
+/// Build the popup body for a successful `remote.start`. Returns
+/// `(title, title_color, lines, body_w, body_h)`.
+fn render_remote_ok<'a>(
+    app: &App,
+    p: &'a crate::app::RemoteControlOk,
+) -> (&'static str, ratatui::style::Color, Vec<Line<'a>>, u16, u16) {
+    let qr_lines: Vec<&str> = p.qr.lines().collect();
+    let qr_w = qr_lines.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0);
+    let qr_h = qr_lines.len() as u16;
+    let url_w = p.url.chars().count() as u16;
+    let user_line = "user: remote";
+    let user_w = user_line.chars().count() as u16;
+    let password_line = format!("password: {}", p.password);
+    let pw_w = password_line.chars().count() as u16;
+    let hint_w = p.hint.as_deref().map(|s| s.chars().count() as u16).unwrap_or(0);
+    let body_w = qr_w.max(url_w).max(user_w).max(pw_w).max(hint_w);
+    // QR + blank + URL + user + password (+ blank + hint if present).
+    let body_h = qr_h + 4 + if p.hint.is_some() { 2 } else { 0 };
+
+    let (title, title_color) = match (p.local_only, p.tunnel_ready) {
+        (true, _) => (
+            " /remote-control debug — local URL only — Esc to close ",
+            app.theme.warning,
+        ),
+        (false, true) => (
+            " /remote-control — public tunnel ready — Esc to close ",
+            app.theme.success,
+        ),
+        // local_only=false + tunnel_ready=false is no longer
+        // reachable on the daemon side (tunnel timeout now
+        // returns an error), but keep a graceful title just in
+        // case the shape evolves.
+        (false, false) => (
+            " /remote-control — Esc to close ",
+            app.theme.warning,
+        ),
+    };
+
+    let mut lines: Vec<Line> = Vec::with_capacity(qr_lines.len() + 4);
+    for ql in &qr_lines {
+        lines.push(Line::from(Span::raw((*ql).to_string())));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        p.url.clone(),
+        Style::default().fg(app.theme.info).add_modifier(Modifier::BOLD),
+    )));
+    // Browser's basic-auth prompt asks for both username and
+    // password; render both so the user knows what to type. The
+    // daemon enforces username == "remote" (see REMOTE_USERNAME)
+    // so this value isn't decorative — anything else 401s.
+    lines.push(Line::from(vec![
+        Span::styled("user:     ", Style::default().fg(app.theme.dim)),
+        Span::styled(
+            "remote",
+            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("password: ", Style::default().fg(app.theme.dim)),
+        Span::styled(
+            p.password.clone(),
+            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(hint) = p.hint.as_deref() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            hint.to_string(),
+            Style::default().fg(app.theme.dim),
+        )));
+    }
+
+    (title, title_color, lines, body_w, body_h)
+}
+
+/// Build the popup body for a failed `remote.start`. Used when the
+/// tunnel-mode call times out: the daemon returned a diagnostic;
+/// we paint it instead of a fake URL so the user knows exactly
+/// what to fix.
+fn render_remote_err<'a>(
+    app: &App,
+    local_only: bool,
+    message: &'a str,
+) -> (&'static str, ratatui::style::Color, Vec<Line<'a>>, u16, u16) {
+    let title = if local_only {
+        " /remote-control debug — failed — Esc to close "
+    } else {
+        " /remote-control — tunnel didn't come up — Esc to close "
+    };
+    let header = "tunnel start failed:";
+    let body_lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            header.to_string(),
+            Style::default().fg(app.theme.danger).add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(app.theme.text),
+        )),
+    ];
+    let body_w = message
+        .lines()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(40)
+        .max(header.chars().count() as u16);
+    let body_h = 3 + message.lines().count() as u16;
+    (title, app.theme.danger, body_lines, body_w, body_h)
 }
 
 #[cfg(test)]

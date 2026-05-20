@@ -30,6 +30,9 @@ nix.workspace = true
 which.workspace = true
 futures.workspace = true
 base64.workspace = true
+tokio-tungstenite.workspace = true
+qrcode.workspace = true
+httparse.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

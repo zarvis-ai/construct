@@ -131,6 +131,36 @@ impl Client {
     pub async fn harnesses(&self) -> Result<Vec<HarnessInfo>> {
         self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null).await
     }
+    /// Start (or look up) the daemon's remote WS listener and
+    /// return a QR + URL ready to display.
+    ///
+    /// `local_only=false` is the `/remote-control` path: blocks
+    /// for up to ~15s while cloudflared publishes its
+    /// `*.trycloudflare.com` URL and returns the public URL or a
+    /// clear error.
+    ///
+    /// `local_only=true` is the `/remote-control-debug` path:
+    /// returns the `ws://127.0.0.1:<port>` URL immediately and
+    /// never spawns cloudflared.
+    ///
+    /// Idempotent — repeat calls return the same token + URL.
+    pub async fn remote_start(
+        &self,
+        local_only: bool,
+        password: Option<String>,
+    ) -> Result<agentd_protocol::RemoteStartResult> {
+        let params = agentd_protocol::RemoteStartParams {
+            local_only,
+            password,
+        };
+        self.request(ipc_method::REMOTE_START, &params).await
+    }
+    /// Tear down the remote WS listener + cloudflared tunnel.
+    /// Idempotent — `was_running: false` is the natural state when
+    /// stop is called without an active listener.
+    pub async fn remote_stop(&self) -> Result<agentd_protocol::RemoteStopResult> {
+        self.request(ipc_method::REMOTE_STOP, &serde_json::Value::Null).await
+    }
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
         self.request(ipc_method::SESSION_LIST, &serde_json::Value::Null).await
     }

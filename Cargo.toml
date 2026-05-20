@@ -49,6 +49,9 @@ bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 async-trait = "0.1"
 eventsource-stream = "0.2"
+tokio-tungstenite = "0.24"
+qrcode = { version = "0.14", default-features = false }
+httparse = "1"
 
 agentd-protocol = { path = "crates/protocol" }
 agentd-client = { path = "crates/client" }

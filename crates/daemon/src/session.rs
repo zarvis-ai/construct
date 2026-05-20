@@ -77,6 +77,10 @@ pub enum BroadcastMsg {
     Deleted(DeletedNotificationPayload),
     GroupState(GroupStateNotificationPayload),
     GroupDeleted(GroupDeletedNotificationPayload),
+    /// Aggregate state for the remote WS transport. Emitted by
+    /// `server::handle_ws_connection` on every accept/drop so the
+    /// local TUI can show a "remote attached" badge.
+    RemoteState(agentd_protocol::RemoteStateNotificationPayload),
 }
 
 pub struct SessionEntry {
@@ -105,6 +109,31 @@ pub struct SessionEntry {
     /// Surfaced by `session.list_tasks` for the TUI `/tasks` popup
     /// and the MCP `agentd_get_tasks` tool.
     pub tasks: tokio::sync::Mutex<TaskRegistry>,
+    /// "Active client wins" PTY-size policy. A POSIX PTY can only
+    /// have one size, so when both the TUI and the remote web
+    /// client are attached to the same session we resize the OS
+    /// PTY to whichever kind most recently sent a `pty_input` or
+    /// `pty_resize`. Switching attention (typing on TUI →
+    /// `last_active = Tui`; typing on phone → `Remote`) flips the
+    /// size. The other client's view temporarily looks wrong until
+    /// they re-engage. See `SessionManager::note_pty_activity`.
+    pub pty_client_policy: std::sync::Mutex<PtyClientPolicy>,
+}
+
+/// Tracking state for the per-session "active client wins" PTY
+/// resize policy. Kept on `SessionEntry`. `std::sync::Mutex` (not
+/// tokio) is deliberate — every critical section is tiny and we
+/// never want to hold this across an .await.
+#[derive(Debug, Default)]
+pub struct PtyClientPolicy {
+    /// Last viewport the TUI client claimed for this session.
+    pub tui_size: Option<(u16, u16)>,
+    /// Last viewport a remote (WS) client claimed for this session.
+    pub remote_size: Option<(u16, u16)>,
+    /// The kind whose viewport currently owns the OS PTY size. On
+    /// any further activity from a *different* kind, the daemon
+    /// resizes to that kind's stored viewport.
+    pub last_active: Option<crate::server::ClientKind>,
 }
 
 /// Bounded log of recent + in-flight task entries. Held inside
@@ -303,14 +332,57 @@ pub struct SessionManager {
     /// otherwise a graceful `kill -TERM` of the daemon would mark
     /// every live session terminal and skip them on restart.
     is_shutting_down: AtomicBool,
+    /// Remote-WS transport: `None` until `start_remote` is called
+    /// (either by env-var-at-boot in `main.rs` or by the
+    /// `remote.start` IPC method invoked from the TUI's
+    /// `/remote-control` slash). Subsequent calls return the same
+    /// `RemoteState` so the URL + token stay stable for the
+    /// daemon's lifetime.
+    ///
+    /// Uses `std::sync::Mutex` deliberately — we never want to
+    /// hold this guard across an `.await`, so an explicitly non-
+    /// `Send` guard makes the compiler enforce that invariant.
+    /// All critical sections are tiny snapshot reads / single
+    /// writes.
+    remote: std::sync::Mutex<Option<RemoteHandle>>,
+    /// Outbound side of the channel to the remote supervisor task
+    /// (`crate::remote_supervisor::run`). `start_remote` posts
+    /// requests here and awaits the reply rather than spawning
+    /// `serve_ws_on` directly — see the comment on
+    /// `remote_supervisor` for why that indirection is mandatory.
+    remote_starter: tokio::sync::mpsc::UnboundedSender<crate::remote_supervisor::SupervisorMsg>,
+}
+
+/// Daemon-local sidecar for an active remote-WS deployment. Holds
+/// the immutable `RemoteState` plus the listener-port we picked
+/// (so we can construct the localhost URL without re-querying the
+/// socket). Lives inside `SessionManager::remote` once the
+/// listener is spawned. Visible to `remote_supervisor` because
+/// that module's `handle_one` is the only place that ever
+/// installs one.
+pub(crate) struct RemoteHandle {
+    pub(crate) state: crate::remote::RemoteState,
+    pub(crate) port: u16,
 }
 
 impl SessionManager {
+    /// Construct the manager along with the receiver side of the
+    /// remote-start channel. The caller (`main.rs`) spawns the
+    /// supervisor task with that receiver so on-demand
+    /// `/remote-control` calls work without static recursion
+    /// between `dispatch` and `serve_ws_on`.
+    ///
+    /// `runtime_dir` is where per-adapter Unix sockets land for
+    /// the reconnectable-adapter path (PR #69); we layer the
+    /// `adapters/` subdir under it.
     pub async fn new(
         storage: Arc<Storage>,
         config: Arc<Config>,
         runtime_dir: PathBuf,
-    ) -> Result<Self> {
+    ) -> Result<(
+        Self,
+        tokio::sync::mpsc::UnboundedReceiver<crate::remote_supervisor::SupervisorMsg>,
+    )> {
         let summaries = storage.list_summaries()?;
         let mut sessions = HashMap::new();
         for s in summaries {
@@ -356,6 +428,7 @@ impl SessionManager {
                 title_gen_attempted: AtomicBool::new(s.title.is_some()),
                 pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+                pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -386,16 +459,31 @@ impl SessionManager {
         loops.hydrate_from_disk(&session_ids).await;
         let adapter_runtime_dir = runtime_dir.join("adapters");
         std::fs::create_dir_all(&adapter_runtime_dir).ok();
-        Ok(Self {
-            storage,
-            config,
-            adapter_runtime_dir,
-            sessions: RwLock::new(sessions),
-            groups: RwLock::new(groups),
-            broadcast,
-            loops,
-            is_shutting_down: AtomicBool::new(false),
-        })
+        let (remote_tx, remote_rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok((
+            Self {
+                storage,
+                config,
+                adapter_runtime_dir,
+                sessions: RwLock::new(sessions),
+                groups: RwLock::new(groups),
+                broadcast,
+                loops,
+                is_shutting_down: AtomicBool::new(false),
+                remote: std::sync::Mutex::new(None),
+                remote_starter: remote_tx,
+            },
+            remote_rx,
+        ))
+    }
+
+    /// Access to the remote-handle slot. Used by the supervisor
+    /// task to install the handle after a successful bind, and by
+    /// `start_remote`'s fast path to snapshot the existing state.
+    pub(crate) fn remote_slot(
+        &self,
+    ) -> std::sync::LockResult<std::sync::MutexGuard<'_, Option<RemoteHandle>>> {
+        self.remote.lock()
     }
 
     fn adapter_socket_path(&self, id: &str) -> PathBuf {
@@ -404,6 +492,173 @@ impl SessionManager {
 
     pub fn subscribe(&self) -> broadcast::Receiver<BroadcastMsg> {
         self.broadcast.subscribe()
+    }
+
+    /// Send a `remote/state` broadcast announcing the current remote-
+    /// WS client count. Best-effort — silently skipped if no
+    /// subscribers (the broadcast channel is the same one all
+    /// notifications flow through).
+    pub fn broadcast_remote_state(&self, clients: u32) {
+        let _ = self.broadcast.send(BroadcastMsg::RemoteState(
+            agentd_protocol::RemoteStateNotificationPayload { clients },
+        ));
+    }
+
+    /// Start (or look up) the remote WS listener + cloudflared
+    /// tunnel and return a URL + QR ready for the user. Idempotent
+    /// — calling more than once returns the existing token+URL so
+    /// the QR code stays stable for the daemon's lifetime.
+    ///
+    /// `port_hint` is honored when set (env-var-at-boot path);
+    /// otherwise an ephemeral localhost port is bound. The cloudflared
+    /// supervisor is also launched on first call (skipped when
+    /// `AGENTD_REMOTE_NO_TUNNEL` is set, same as the boot path).
+    ///
+    /// `wait_for_tunnel` caps how long we wait for cloudflared to
+    /// publish its `*.trycloudflare.com` URL before returning the
+    /// localhost URL with a "still warming up" hint. ~3s is enough
+    /// for a typical fresh cloudflared start; the user can refresh
+    /// to grab the public URL once it lands.
+    pub async fn start_remote(
+        self: Arc<Self>,
+        port_hint: Option<u16>,
+        params: agentd_protocol::RemoteStartParams,
+    ) -> anyhow::Result<agentd_protocol::RemoteStartResult> {
+        use anyhow::Context as _;
+
+        // Always-on bind path: ask the supervisor to ensure the
+        // listener is up (and, if requested, to start cloudflared
+        // too). Static call edge from here goes through an mpsc
+        // channel, NOT a direct call to `serve_ws_on`, which
+        // keeps the dispatch-loop Send inference from going into
+        // a cycle. Idempotent — repeat requests are no-ops on the
+        // bind side; the tunnel is spawned at most once per
+        // daemon lifetime.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.remote_starter
+            .send(crate::remote_supervisor::SupervisorMsg::Start(
+                crate::remote_supervisor::StartRequest {
+                    port_hint,
+                    spawn_tunnel: !params.local_only,
+                    password: params.password.clone(),
+                    respond: tx,
+                },
+            ))
+            .map_err(|_| anyhow::anyhow!("remote supervisor task is not running"))?;
+        let outcome = rx
+            .await
+            .context("remote supervisor dropped reply channel")??;
+
+        Ok(self
+            .build_remote_result(outcome.state, outcome.port, params.local_only)
+            .await?)
+    }
+
+    /// Tear down the remote WS listener + cloudflared tunnel via
+    /// the supervisor. Idempotent — calling when nothing is running
+    /// is not an error; the result's `was_running` field tells the
+    /// caller whether anything was actually torn down. Token
+    /// rotates on the next `start_remote` so the old QR is dead.
+    pub async fn stop_remote(
+        self: Arc<Self>,
+    ) -> anyhow::Result<agentd_protocol::RemoteStopResult> {
+        use anyhow::Context as _;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.remote_starter
+            .send(crate::remote_supervisor::SupervisorMsg::Stop(
+                crate::remote_supervisor::StopRequest { respond: tx },
+            ))
+            .map_err(|_| anyhow::anyhow!("remote supervisor task is not running"))?;
+        let outcome = rx
+            .await
+            .context("remote supervisor dropped reply channel")??;
+        Ok(agentd_protocol::RemoteStopResult {
+            was_running: outcome.was_running,
+        })
+    }
+
+    /// Render the final `RemoteStartResult` for either mode.
+    ///
+    /// Local-only mode: return the `http://127.0.0.1:<port>` URL
+    /// immediately, no waiting. Tunnel mode: poll for the
+    /// `*.trycloudflare.com` URL up to ~15s and either return it
+    /// (`tunnel_ready = true`) or fail with a JSON-RPC error that
+    /// tells the user exactly what's wrong — never silently fall
+    /// back to the local URL the way the old single-mode shape did
+    /// (that's `/remote-control-debug`'s job).
+    async fn build_remote_result(
+        &self,
+        state: crate::remote::RemoteState,
+        port: u16,
+        local_only: bool,
+    ) -> anyhow::Result<agentd_protocol::RemoteStartResult> {
+        use std::time::Duration;
+
+        if local_only {
+            // Same reasoning as the tunnel-mode URL: this is the
+            // URL the user opens in a browser. The HTML's JS does
+            // the `http` → `ws` swap for its WebSocket back to
+            // this same daemon. Showing `ws://` here would mean
+            // the URL can't be pasted into a browser at all,
+            // which defeats `/remote-control-debug`'s whole
+            // point.
+            let url = format!("http://127.0.0.1:{port}/t/{}", state.token());
+            let qr = crate::remote::render_qr_dense1x2(&url).unwrap_or_default();
+            return Ok(agentd_protocol::RemoteStartResult {
+                url,
+                qr,
+                tunnel_ready: false,
+                password: state.password().to_string(),
+                hint: None,
+            });
+        }
+
+        // Tunnel mode: poll the shared tunnel-url slot. 15s
+        // covers a typical cloudflared cold start (1–3s) plus
+        // slack for slow networks. We poll rather than wire a
+        // notifier because the call shape is request/reply over
+        // IPC — the caller already blocks on this future anyway.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(u) = state.tunnel_url().await {
+                let qr = crate::remote::render_qr_dense1x2(&u).unwrap_or_default();
+                return Ok(agentd_protocol::RemoteStartResult {
+                    url: u,
+                    qr,
+                    tunnel_ready: true,
+                    password: state.password().to_string(),
+                    hint: None,
+                });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+
+        // Timeout: emit an error with the most useful diagnostic
+        // we can muster. The CLI surfaces this verbatim in the
+        // popup so the user knows why the tunnel didn't come up.
+        let cloudflared_available = which::which("cloudflared").is_ok();
+        let no_tunnel_env = std::env::var("AGENTD_REMOTE_NO_TUNNEL").is_ok();
+        let msg = if no_tunnel_env {
+            "AGENTD_REMOTE_NO_TUNNEL is set; unset it and rerun \
+             `/remote-control`. Use `/remote-control debug` for the \
+             local-only URL."
+        } else if !cloudflared_available {
+            "cloudflared not on PATH. Install with `brew install \
+             cloudflared` (or from \
+             github.com/cloudflare/cloudflared/releases) and rerun \
+             `/remote-control`. Use `/remote-control debug` for the \
+             local-only URL."
+        } else {
+            "cloudflared is running but hasn't published a \
+             *.trycloudflare.com URL within 15s. Check the daemon \
+             log (RUST_LOG=info,agentd=debug) for cloudflared's \
+             stderr, or use `/remote-control debug` for the local \
+             URL."
+        };
+        anyhow::bail!("{msg}")
     }
 
     pub fn harnesses(&self) -> Vec<HarnessInfo> {
@@ -637,6 +892,7 @@ impl SessionManager {
             title_gen_attempted: AtomicBool::new(summary.title.is_some()),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+            pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
         });
 
         // Record the user's initial prompt as the first transcript event so
@@ -1510,6 +1766,64 @@ impl SessionManager {
                     cap.esc = 0;
                 }
                 _ => cap.esc = 0,
+            }
+        }
+    }
+
+    /// Record that a given client kind just acted on a session's
+    /// PTY (typed input or sent a resize). Updates the kind's
+    /// last-known viewport (if `resize_to` was supplied), flips
+    /// `last_active` to that kind, and — if the kind switched
+    /// since last time — issues a `pty_resize` to match the kind's
+    /// stored viewport. No-op when only one kind is attached.
+    ///
+    /// This is the daemon-side half of the "active client wins"
+    /// PTY-size policy. The complementary half lives in
+    /// `server::dispatch`'s `SESSION_PTY_INPUT` and
+    /// `SESSION_PTY_RESIZE` arms, which call this method before
+    /// forwarding the actual request to the PTY.
+    pub async fn note_pty_activity(
+        self: &Arc<Self>,
+        id: &str,
+        kind: crate::server::ClientKind,
+        resize_to: Option<(u16, u16)>,
+    ) {
+        let Some(entry) = self.get_entry(id).await else {
+            return;
+        };
+        let to_apply = {
+            let mut policy = entry
+                .pty_client_policy
+                .lock()
+                .expect("pty_client_policy mutex poisoned");
+            if let Some(sz) = resize_to {
+                match kind {
+                    crate::server::ClientKind::Tui => policy.tui_size = Some(sz),
+                    crate::server::ClientKind::Remote => policy.remote_size = Some(sz),
+                }
+            }
+            let switched = policy.last_active != Some(kind);
+            policy.last_active = Some(kind);
+            // Only re-resize on a *switch*, or when this call was
+            // itself a pty_resize. Plain pty_input from the same
+            // kind that's already active is a no-op for the size
+            // policy (the per-call pty_resize handler still runs
+            // separately).
+            if switched || resize_to.is_some() {
+                match kind {
+                    crate::server::ClientKind::Tui => policy.tui_size,
+                    crate::server::ClientKind::Remote => policy.remote_size,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((cols, rows)) = to_apply {
+            // Best-effort. The pty_resize dedup inside
+            // `SessionManager::pty_resize` handles the case where
+            // the OS PTY is already at this size.
+            if let Err(e) = self.pty_resize(id, cols, rows).await {
+                tracing::debug!(session = %id, error = %e, "policy-driven pty_resize failed");
             }
         }
     }
@@ -2497,11 +2811,10 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
         let config = Arc::new(crate::config::Config::default());
-        let manager = Arc::new(
-            SessionManager::new(storage, config, tmp.path().join("run"))
-                .await
-                .expect("session manager"),
-        );
+        let (mgr, _remote_rx) = SessionManager::new(storage, config, tmp.path().join("run"))
+            .await
+            .expect("session manager");
+        let manager = Arc::new(mgr);
 
         // Synthetic session in `Running` (what a live shell / zarvis
         // session looks like just before the user hits Ctrl-C on the
@@ -2543,6 +2856,7 @@ mod tests {
             title_gen_attempted: AtomicBool::new(false),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+            pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
         });
         manager.sessions.write().await.insert(id.clone(), entry.clone());
 

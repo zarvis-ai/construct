@@ -254,6 +254,18 @@ impl ItemSig {
 /// How many output lines a collapsed tool block shows (must match
 /// the zarvis-side cap so the synthesized version mirrors the
 /// inline-stream version's information density).
+/// Minimum geometry we'll feed into `vt100::Parser`. The crate
+/// (0.16.2) underflows in `grid.rs::col_wrap` when rows or cols is
+/// 1 and a wide character wraps — `prev_pos.row -= scrolled` goes
+/// negative because the cursor is already at row 0. The 2×2 floor
+/// is the smallest size that exercises only the safe code paths.
+/// Real PTYs are never this small, but the orchestrator panel
+/// shrinks its chat area to 1 row when the editor pane absorbs
+/// most of a narrow panel, and `/remote-control`'s C-x x trip
+/// exposed it. Removing this floor requires either a vt100
+/// upstream fix or switching parsers.
+pub const VT100_MIN_DIM: u16 = 2;
+
 pub const TOOL_BLOCK_COLLAPSED_LINES: usize = 5;
 /// Per-line truncation in collapsed mode (mirrors zarvis).
 pub const TOOL_BLOCK_MAX_COLS: usize = 200;
@@ -314,8 +326,8 @@ impl ItemHistory {
     /// — scrollback then shows incoherent fragments instead of the
     /// real chat history.
     pub fn set_pty_size(&mut self, cols: u16, rows: u16) {
-        let cols = cols.max(1);
-        let rows = rows.max(1);
+        let cols = cols.max(VT100_MIN_DIM);
+        let rows = rows.max(VT100_MIN_DIM);
         if self.shadow_cols != cols || self.shadow_rows != rows {
             self.shadow_parser.screen_mut().set_size(rows, cols);
             self.shadow_cols = cols;
@@ -692,7 +704,7 @@ impl ItemHistory {
         };
         if need_reset {
             self.cached = Some(CachedParser {
-                parser: vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX),
+                parser: vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX),
                 cols,
                 rows,
                 processed_count: 0,
@@ -728,14 +740,14 @@ impl ItemHistory {
         //     cost is paid once per resize instead of per chunk.)
         if cache.cols != cols {
             cache.parser =
-                vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX);
+                vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX);
             cache.cols = cols;
             cache.rows = rows;
             cache.processed_count = 0;
             cache.pending_consumed = 0;
         } else if rows > cache.rows {
             cache.parser =
-                vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX);
+                vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX);
             cache.rows = rows;
             cache.processed_count = 0;
             cache.pending_consumed = 0;
@@ -748,7 +760,7 @@ impl ItemHistory {
             cache.processed_count = self.items.len();
             cache.pending_consumed = self.pending_chunk.len();
         } else if cache.rows != rows {
-            cache.parser.screen_mut().set_size(rows.max(1), cols.max(1));
+            cache.parser.screen_mut().set_size(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM));
             cache.rows = rows;
         }
 
@@ -778,7 +790,7 @@ impl ItemHistory {
             // pending_chunk was flushed or shrunk under us — rebuild
             // to stay consistent.
             *cache = CachedParser {
-                parser: vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX),
+                parser: vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX),
                 cols,
                 rows,
                 processed_count: 0,
@@ -833,7 +845,7 @@ impl ItemHistory {
 
         if needs_rebuild {
             self.cached = Some(CachedParser {
-                parser: vt100::Parser::new(rows.max(1), cols.max(1), super::app::SCROLLBACK_MAX),
+                parser: vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX),
                 cols,
                 rows,
                 processed_count: 0,
@@ -982,7 +994,7 @@ impl Default for ItemHistory {
 fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
     let mut lines = 0usize;
     let mut col = 0usize;
-    let cols = cols.max(1) as usize;
+    let cols = cols.max(VT100_MIN_DIM) as usize;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
@@ -2030,6 +2042,28 @@ mod tests {
         assert!(!cell.is_empty(), "orchestrator panel last row populated");
     }
 
+    /// Regression: `C-x x` on a narrow / tall layout used to crash
+    /// the TUI because the orchestrator panel's chat area can
+    /// shrink to 1 row (editor pane absorbs the rest), and
+    /// vt100-0.16.2's `col_wrap` underflows when rows / cols is 1
+    /// and a wide character forces a wrap.
+    ///
+    /// `ItemHistory::replay` now floors parser geometry to
+    /// `VT100_MIN_DIM` (2) at every callsite. This test feeds a
+    /// PTY stream containing a wide char + wrap, calls `replay`
+    /// with degenerate dims, and just checks we don't panic.
+    #[test]
+    fn replay_with_degenerate_dims_does_not_panic() {
+        let mut h = ItemHistory::new();
+        // Wide char ("中") followed by ASCII that will need to
+        // wrap. Combined with `\r\n` markers this exercises the
+        // col_wrap path that was crashing.
+        h.feed_pty(b"hi\xe4\xb8\xad\xe6\x96\x87wrap-stress-with-narrow-screen\r\n");
+        for (cols, rows) in [(1u16, 1u16), (1, 2), (2, 1), (1, 80), (80, 1), (2, 2)] {
+            let _ = h.replay(cols, rows, 0);
+        }
+    }
+
     #[test]
     fn orchestrator_resize_is_cheap() {
         let mut h = ItemHistory::new();
@@ -3019,9 +3053,15 @@ mod tests {
         h.set_pty_size(140, 30);
         assert_eq!((h.shadow_cols, h.shadow_rows), (140, 30));
 
-        // Defensive clamps for absurd inputs.
+        // Defensive clamps for absurd inputs. Floor is
+        // `VT100_MIN_DIM` (=2), not 1 — see the constant's
+        // comment for the vt100-0.16.2 col_wrap underflow bug
+        // this is guarding against.
         h.set_pty_size(0, 0);
-        assert_eq!((h.shadow_cols, h.shadow_rows), (1, 1));
+        assert_eq!(
+            (h.shadow_cols, h.shadow_rows),
+            (VT100_MIN_DIM, VT100_MIN_DIM),
+        );
     }
 
     /// Symptom-level regression for the unzoomed-codex scroll bug.

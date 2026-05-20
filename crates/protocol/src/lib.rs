@@ -547,6 +547,19 @@ pub mod ipc_method {
     pub const SESSION_TRANSCRIPT: &str = "session.transcript";
     pub const SUBSCRIBE_EVENTS: &str = "subscribe.events";
     pub const UNSUBSCRIBE_EVENTS: &str = "unsubscribe.events";
+    /// Start the remote WS listener + cloudflared tunnel (idempotent)
+    /// and return a URL + QR the caller can show the user. Lets the
+    /// TUI's `/remote-control` slash command surface the QR on
+    /// demand instead of requiring the env-var-at-startup flow.
+    pub const REMOTE_START: &str = "remote.start";
+    /// Take the remote WS listener back down: kill the cloudflared
+    /// subprocess (URL stops resolving), drop the listener (no new
+    /// connections accepted), and clear the daemon-side
+    /// `RemoteState` so the next `/remote-control` invocation mints
+    /// a fresh token. Existing in-flight connections die naturally
+    /// once cloudflared exits. Idempotent — calling stop when
+    /// nothing is running returns Ok with `was_running: false`.
+    pub const REMOTE_STOP: &str = "remote.stop";
 }
 
 pub mod ipc_notif {
@@ -555,6 +568,12 @@ pub mod ipc_notif {
     pub const DELETED: &str = "session/deleted";
     pub const GROUP_STATE: &str = "group/state";
     pub const GROUP_DELETED: &str = "group/deleted";
+    /// Aggregate state for the daemon's remote WebSocket transport:
+    /// how many remote clients are currently attached. Broadcast on
+    /// every connect / disconnect so the local TUI can render a
+    /// "● remote attached" badge as a visible signal that another
+    /// surface is also driving the daemon.
+    pub const REMOTE_STATE: &str = "remote/state";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -912,6 +931,81 @@ pub struct StateNotificationPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeletedNotificationPayload {
     pub session_id: String,
+}
+
+/// Payload of the `remote/state` notification — number of remote WS
+/// clients currently attached to the daemon. Local clients (Unix
+/// socket) don't count; this is specifically the "is someone else
+/// also driving this daemon over the phone web client" signal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteStateNotificationPayload {
+    pub clients: u32,
+}
+
+/// Params for the `remote.start` IPC method. Default = "set up
+/// the full public tunnel" (what the user typing `/remote-control`
+/// gets). `local_only` flips to localhost-only mode for the
+/// `/remote-control-debug` flow and CI smoke tests — no
+/// cloudflared spawn, no tunnel wait, just bind + return.
+///
+/// `password` is the optional user-supplied override for the HTTP
+/// Basic auth gate. When unset, the daemon auto-generates a
+/// memorable 3-token password (`swift-fox-42` shape). The chosen
+/// password is returned in `RemoteStartResult` so the popup can
+/// display it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RemoteStartParams {
+    #[serde(default)]
+    pub local_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+/// Result of the `remote.start` IPC method. Always reflects what
+/// the daemon was *asked* for (via `RemoteStartParams`), never a
+/// "best effort fallback" — that asymmetry is what makes the two
+/// slash verbs feel distinct. In tunnel mode the daemon waits up
+/// to ~15s for cloudflared to publish its URL and returns a
+/// JSON-RPC *error* if it doesn't; in local-only mode the URL is
+/// always the `ws://127.0.0.1:<port>` form with `tunnel_ready =
+/// false`, no hint, no waiting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteStartResult {
+    /// The URL to share. `wss://<rand>.trycloudflare.com/t/<token>`
+    /// in tunnel mode (always — failure produces a JSON-RPC error
+    /// instead of a degraded URL), `ws://127.0.0.1:<port>/t/<token>`
+    /// in local-only mode.
+    pub url: String,
+    /// Multi-line Unicode QR rendering of `url`. Empty when the
+    /// encoder rejected the input (rare); callers should fall back
+    /// to printing the URL alone.
+    pub qr: String,
+    /// True iff `url` is the public tunnel URL. Always true in
+    /// successful tunnel mode; always false in local-only mode.
+    pub tunnel_ready: bool,
+    /// HTTP Basic auth password required to load the URL. Either
+    /// the caller's override (from `RemoteStartParams.password`)
+    /// or the daemon's auto-generated 3-token string. Username on
+    /// the wire is ignored by the daemon — only the password
+    /// matters.
+    pub password: String,
+    /// Optional user-readable hint. Reserved for unusual states —
+    /// typically `None` because callers can infer from
+    /// `tunnel_ready` whether they're looking at a public or
+    /// local URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// Result of the `remote.stop` IPC method. `was_running: false` is
+/// not an error — it means the caller invoked stop while nothing
+/// was running, which is the natural state after fresh daemon
+/// boot or a prior stop. The CLI surfaces this distinction so the
+/// status line can say "remote stopped" vs "remote wasn't
+/// running".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteStopResult {
+    pub was_running: bool,
 }
 
 /// A user-created group used to organize sessions in the list view.
