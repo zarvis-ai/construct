@@ -51,6 +51,10 @@ pub enum ListItem {
     },
 }
 
+fn is_list_visible_session(s: &SessionSummary) -> bool {
+    matches!(s.kind, agentd_protocol::SessionKind::User)
+}
+
 impl ListItem {
     pub fn matches(&self, sel: &Selection) -> bool {
         match (self, sel) {
@@ -683,13 +687,13 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         .and_then(|id| {
             sessions
                 .iter()
-                .find(|s| s.id == *id && s.kind != agentd_protocol::SessionKind::Orchestrator)
+                .find(|s| s.id == *id && is_list_visible_session(s))
                 .map(|s| Selection::Session(s.id.clone()))
         })
         .or_else(|| {
             sessions
                 .iter()
-                .find(|s| s.kind != agentd_protocol::SessionKind::Orchestrator)
+                .find(|s| is_list_visible_session(s))
                 .map(|s| Selection::Session(s.id.clone()))
         })
         .unwrap_or(Selection::None);
@@ -1076,8 +1080,10 @@ impl App {
             .iter()
             .filter(|s| s.group_id.is_none())
             // Hide the orchestrator from the list — it's rendered in
-            // the minibuffer instead.
+            // the minibuffer instead. Subagents are implementation
+            // details of their parent Zarvis task surface.
             .filter(|s| Some(s.id.as_str()) != orch_id)
+            .filter(|s| is_list_visible_session(s))
             .collect();
         ungrouped.sort_by(|a, b| {
             a.position
@@ -1098,6 +1104,7 @@ impl App {
                 .sessions
                 .iter()
                 .filter(|s| s.group_id.as_deref() == Some(g.id.as_str()))
+                .filter(|s| is_list_visible_session(s))
                 .collect();
             members.sort_by_key(|s| s.position);
             out.push(ListItem::GroupHeader {
@@ -4323,6 +4330,45 @@ mod tests {
             selection_bounds_for_layout(&test_layout(), 0, false, 0, 1),
             None
         );
+    }
+
+    fn summary_with_kind(kind: agentd_protocol::SessionKind) -> SessionSummary {
+        SessionSummary {
+            id: "s1".into(),
+            harness: "shell".into(),
+            cwd: "/tmp".into(),
+            title: None,
+            state: agentd_protocol::SessionState::Running,
+            created_at: chrono::Utc::now(),
+            last_event_at: None,
+            cost_usd: None,
+            model: None,
+            worktree: None,
+            pending_input: false,
+            last_prompt: None,
+            event_count: 0,
+            has_pty: false,
+            mode: None,
+            pinned: false,
+            position: 0,
+            group_id: None,
+            last_pty_at_ms: None,
+            automode: false,
+            kind,
+        }
+    }
+
+    #[test]
+    fn only_user_sessions_are_visible_list_items() {
+        assert!(is_list_visible_session(&summary_with_kind(
+            agentd_protocol::SessionKind::User
+        )));
+        assert!(!is_list_visible_session(&summary_with_kind(
+            agentd_protocol::SessionKind::Orchestrator
+        )));
+        assert!(!is_list_visible_session(&summary_with_kind(
+            agentd_protocol::SessionKind::Subagent
+        )));
     }
 
     /// REGRESSION: a TUI re-attaching to an existing zarvis session

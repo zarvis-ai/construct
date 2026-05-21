@@ -1541,7 +1541,7 @@ fn fleet_activity_target(app: &App, now: Instant) -> f32 {
     for s in app
         .sessions
         .iter()
-        .filter(|s| s.kind != agentd_protocol::SessionKind::Orchestrator)
+        .filter(|s| s.kind == agentd_protocol::SessionKind::User)
     {
         let active_agent = app
             .agent_statuses

@@ -611,6 +611,7 @@ pub enum SessionKind {
     #[default]
     User,
     Orchestrator,
+    Subagent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

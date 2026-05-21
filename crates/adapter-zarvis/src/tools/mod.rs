@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod agentd;
 pub mod fs;
 pub mod shell;
+pub mod subagent;
 
 /// Per-tool result. `output` is the full tool output as the user should
 /// see it in the transcript; the agent loop separately calls
@@ -88,6 +89,14 @@ impl ToolRegistry {
             Box::new(agentd::LoopList),
             Box::new(agentd::LoopUpdate),
             Box::new(agentd::LoopRemove),
+            // Zarvis-owned subagents: hidden backing sessions exposed as
+            // task-like child agents to this parent session.
+            Box::new(subagent::Create),
+            Box::new(subagent::List),
+            Box::new(subagent::Peek),
+            Box::new(subagent::Enqueue),
+            Box::new(subagent::Cancel),
+            Box::new(subagent::Delete),
         ];
         Self { tools }
     }
@@ -178,5 +187,20 @@ mod tests {
         let out = truncate_for_model(&s, 100);
         // Should be valid UTF-8 (just by virtue of String existing).
         assert!(out.contains("[… "));
+    }
+
+    #[test]
+    fn registry_includes_subagent_tools() {
+        let registry = ToolRegistry::with_defaults();
+        for name in [
+            "agentd_subagent_create",
+            "agentd_subagent_list",
+            "agentd_subagent_peek",
+            "agentd_subagent_enqueue",
+            "agentd_subagent_cancel",
+            "agentd_subagent_delete",
+        ] {
+            assert!(registry.get(name).is_some(), "missing tool {name}");
+        }
     }
 }

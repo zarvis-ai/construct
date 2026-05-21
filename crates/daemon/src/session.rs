@@ -734,7 +734,11 @@ impl SessionManager {
         let guard = self.sessions.read().await;
         let mut out = Vec::with_capacity(guard.len());
         for entry in guard.values() {
-            out.push(entry.summary().await);
+            let summary = entry.summary().await;
+            if summary.kind == agentd_protocol::SessionKind::Subagent {
+                continue;
+            }
+            out.push(summary);
         }
         // Primary: user-controlled position ASC. Tiebreaker: newer first.
         out.sort_by(|a, b| {
@@ -893,6 +897,7 @@ impl SessionManager {
             match params.kind {
                 agentd_protocol::SessionKind::User => "user",
                 agentd_protocol::SessionKind::Orchestrator => "orchestrator",
+                agentd_protocol::SessionKind::Subagent => "subagent",
             }
             .to_string(),
         );
@@ -2853,6 +2858,80 @@ mod tests {
             force_redraw_size_on_resume(&caps, Some(PtySize { cols: 160, rows: 0 })),
             None
         );
+    }
+
+    fn synthetic_entry(
+        id: &str,
+        kind: agentd_protocol::SessionKind,
+        position: i64,
+    ) -> Arc<SessionEntry> {
+        use chrono::Utc;
+        use std::sync::atomic::AtomicU64;
+        use tokio::sync::RwLock;
+
+        Arc::new(SessionEntry {
+            id: id.to_string(),
+            summary: RwLock::new(agentd_protocol::SessionSummary {
+                id: id.to_string(),
+                harness: "shell".into(),
+                cwd: "/tmp".into(),
+                title: None,
+                state: SessionState::Running,
+                created_at: Utc::now(),
+                last_event_at: None,
+                cost_usd: None,
+                model: None,
+                worktree: None,
+                pending_input: false,
+                last_prompt: None,
+                event_count: 0,
+                has_pty: true,
+                mode: None,
+                pinned: false,
+                position,
+                group_id: None,
+                last_pty_at_ms: None,
+                automode: false,
+                kind,
+            }),
+            transcript_count: AtomicU64::new(0),
+            adapter: tokio::sync::Mutex::new(None),
+            pty: tokio::sync::Mutex::new(PtyState {
+                ring: Default::default(),
+                size: None,
+            }),
+            deleted: AtomicBool::new(false),
+            title_gen_attempted: AtomicBool::new(false),
+            pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+            tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+            pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+        })
+    }
+
+    #[tokio::test]
+    async fn list_hides_subagent_sessions() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) = SessionManager::new(storage, config, tmp.path().join("run"))
+            .await
+            .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "suser".into(),
+            synthetic_entry("suser", agentd_protocol::SessionKind::User, 0),
+        );
+        mgr.sessions.write().await.insert(
+            "ssub".into(),
+            synthetic_entry("ssub", agentd_protocol::SessionKind::Subagent, -1),
+        );
+
+        let sessions = mgr.list().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "suser");
+        assert_eq!(sessions[0].kind, agentd_protocol::SessionKind::User);
     }
 
     /// Regression for the post-#69 "all sessions go to `done` after
