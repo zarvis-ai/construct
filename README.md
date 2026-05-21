@@ -94,11 +94,16 @@ Upload artifacts and keep the URLs for markdown:
 ```sh
 PR=123
 REPO=owner/repo
-TAG="pr-${PR}-review-artifacts"
+TAG="review-artifacts-YYYY-MM"
 
-before_url=$(gh attach --repo "$REPO" --issue "$PR" --image ./artifacts/before.png --url-only --release --release-tag "$TAG")
-after_url=$(gh attach --repo "$REPO" --issue "$PR" --image ./artifacts/after.png --url-only --release --release-tag "$TAG")
-video_url=$(gh attach --repo "$REPO" --issue "$PR" --image ./artifacts/demo.mp4 --url-only --release --release-tag "$TAG")
+mkdir -p /tmp/agentd-pr-artifacts
+cp ./artifacts/before.png "/tmp/agentd-pr-artifacts/pr-${PR}-before.png"
+cp ./artifacts/after.png "/tmp/agentd-pr-artifacts/pr-${PR}-after.png"
+cp ./artifacts/demo.mp4 "/tmp/agentd-pr-artifacts/pr-${PR}-demo.mp4"
+
+before_url=$(gh attach --repo "$REPO" --issue "$PR" --image "/tmp/agentd-pr-artifacts/pr-${PR}-before.png" --url-only --release --release-tag "$TAG")
+after_url=$(gh attach --repo "$REPO" --issue "$PR" --image "/tmp/agentd-pr-artifacts/pr-${PR}-after.png" --url-only --release --release-tag "$TAG")
+video_url=$(gh attach --repo "$REPO" --issue "$PR" --image "/tmp/agentd-pr-artifacts/pr-${PR}-demo.mp4" --url-only --release --release-tag "$TAG")
 ```
 
 Post them as a PR comment:
@@ -127,8 +132,20 @@ cat /tmp/agentd-pr-artifacts.md >> /tmp/agentd-pr-body.md
 gh pr edit "$PR" --repo "$REPO" --body-file /tmp/agentd-pr-body.md
 ```
 
-Release-mode uploads create or reuse the tag in `TAG`. Clean it up after the PR
-is merged only if the rendered links no longer matter:
+Use one monthly `TAG`, such as `review-artifacts-2026-05`, and prefix asset
+names with the PR number. That keeps review artifacts grouped so old months can
+be removed together.
+
+Delete one asset from the monthly release:
+
+```sh
+ASSET="pr-${PR}-before.png"
+asset_id=$(gh release view "$TAG" --repo "$REPO" --json assets --jq ".assets[] | select(.name == \"$ASSET\") | .id")
+gh api --method DELETE "repos/$REPO/releases/assets/$asset_id"
+```
+
+Delete an old monthly artifact bucket only if the rendered links no longer
+matter:
 
 ```sh
 gh release delete "$TAG" --repo "$REPO" --yes
