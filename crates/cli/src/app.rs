@@ -25,6 +25,7 @@ use std::io::{Stdout, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 
 /// Which pane currently owns the keyboard. `View` covers both the transcript
 /// and the terminal renderer — when the view shows a PTY-backed session and
@@ -384,6 +385,8 @@ pub struct App {
     pub selected_text: Option<String>,
     pub selected_text_bounds: Option<ratatui::layout::Rect>,
     pub selected_text_range: Option<TextSelectionRange>,
+    pty_input_tx: mpsc::UnboundedSender<PtyInputJob>,
+    pty_input_errors: mpsc::UnboundedReceiver<String>,
 }
 
 struct SessionHydration {
@@ -400,6 +403,12 @@ struct SessionHydrationRequest {
     session_id: String,
     needs_history: bool,
     terminal_pane_size: (u16, u16),
+}
+
+struct PtyInputJob {
+    session_id: String,
+    bytes: Vec<u8>,
+    label: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -556,6 +565,24 @@ where
     Ok(serde_json::from_value(
         resp.result.unwrap_or(serde_json::Value::Null),
     )?)
+}
+
+fn spawn_pty_input_pump(
+    client: Arc<Client>,
+) -> (
+    mpsc::UnboundedSender<PtyInputJob>,
+    mpsc::UnboundedReceiver<String>,
+) {
+    let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+    let (err_tx, err_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(job) = rx.recv().await {
+            if let Err(e) = client.pty_input(&job.session_id, job.bytes).await {
+                let _ = err_tx.send(format!("{} failed: {e}", job.label));
+            }
+        }
+    });
+    (tx, err_rx)
 }
 
 /// State for the `/tasks` modal popup. v1 is read-only at the UI
@@ -829,6 +856,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         .unwrap_or(Selection::None);
 
     let now = Instant::now();
+    let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
     let mut app = App {
         client: client.clone(),
         sessions,
@@ -896,6 +924,8 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         selected_text: None,
         selected_text_bounds: None,
         selected_text_range: None,
+        pty_input_tx,
+        pty_input_errors,
     };
     if let Some(warning) = theme_warning {
         app.status = Some((warning, Instant::now()));
@@ -982,6 +1012,9 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     let mut hydration_session: Option<String> = None;
     let mut hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
     while !app.should_quit {
+        while let Ok(msg) = app.pty_input_errors.try_recv() {
+            app.set_status(msg);
+        }
         app.prune_finished_transitions();
         terminal.draw(|f| ui::render(f, app))?;
 
@@ -1176,6 +1209,20 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 impl App {
     pub fn set_status(&mut self, msg: String) {
         self.status = Some((msg, Instant::now()));
+    }
+
+    fn queue_pty_input(&mut self, session_id: String, bytes: Vec<u8>, label: &'static str) {
+        if self
+            .pty_input_tx
+            .send(PtyInputJob {
+                session_id,
+                bytes,
+                label,
+            })
+            .is_err()
+        {
+            self.set_status(format!("{label} failed: input pump stopped"));
+        }
     }
 
     pub fn start_session_transition(&mut self) {
@@ -3053,7 +3100,7 @@ impl App {
                 self.chord_state = ChordState::default();
                 self.chord_label.clear();
                 if let Some(id) = self.selected_id() {
-                    let _ = self.client.pty_input(&id, vec![0x18]).await;
+                    self.queue_pty_input(id, vec![0x18], "pty_input");
                 }
                 return;
             }
@@ -3063,9 +3110,7 @@ impl App {
                 self.view_scrollback = 0;
                 if let Some(bytes) = encode_key_to_bytes(key) {
                     if let Some(id) = self.selected_id() {
-                        if let Err(e) = self.client.pty_input(&id, bytes).await {
-                            self.set_status(format!("pty_input failed: {e}"));
-                        }
+                        self.queue_pty_input(id, bytes, "pty_input");
                     }
                 }
                 return;
@@ -3473,7 +3518,7 @@ impl App {
         if !self.chord_state.is_empty() && is_ctrl_x {
             self.chord_state = ChordState::default();
             self.chord_label.clear();
-            let _ = self.client.pty_input(&orch_id, vec![0x18]).await;
+            self.queue_pty_input(orch_id, vec![0x18], "orchestrator pty_input");
             return;
         }
         // Start of a chord or continuation: dispatch through the keymap.
@@ -3497,9 +3542,7 @@ impl App {
             // Typing into god snaps back to live output, matching the main
             // PTY pane's behavior.
             self.orchestrator_scrollback = 0;
-            if let Err(e) = self.client.pty_input(&orch_id, bytes).await {
-                self.set_status(format!("orchestrator pty_input: {e}"));
-            }
+            self.queue_pty_input(orch_id, bytes, "orchestrator pty_input");
         }
     }
 
@@ -4548,6 +4591,78 @@ mod tests {
         }
     }
 
+    fn test_app(client: Arc<Client>, sessions: Vec<SessionSummary>) -> App {
+        let now = Instant::now();
+        let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
+        App {
+            client,
+            sessions,
+            groups: Vec::new(),
+            selection: Selection::Session("s1".into()),
+            focus: PaneFocus::View,
+            transcript: Vec::new(),
+            transcript_session: None,
+            transcript_scroll: 0,
+            minibuffer: None,
+            harnesses: Vec::new(),
+            theme: crate::theme::Theme::default(),
+            help_visible: false,
+            profile: Profile::Emacs,
+            keymap: keymap::default_for(Profile::Emacs),
+            chord_state: ChordState::default(),
+            chord_label: String::new(),
+            status: None,
+            last_diff: None,
+            should_quit: false,
+            connected: true,
+            remote_clients: 0,
+            view: ViewMode::Terminal,
+            histories: HashMap::new(),
+            block_hits: HashMap::new(),
+            orchestrator_desired_size: None,
+            terminal_pane_size: (80, 24),
+            zoom: ZoomMode::None,
+            list_scroll_offset: 0,
+            view_scrollback: 0,
+            orchestrator_scrollback: 0,
+            orchestrator_panel_h: None,
+            resizing_orchestrator_panel: None,
+            pty_activity: HashMap::new(),
+            start_instant: now,
+            layout: LayoutSnapshot::default(),
+            mouse_pos: None,
+            mouse_capture_enabled: true,
+            orchestrator_id: None,
+            list_panel_w: LIST_PANEL_W_DEFAULT,
+            resizing_list: None,
+            pin_strip_h: None,
+            resizing_pin_strip: None,
+            matrix_rain_h: None,
+            resizing_matrix_rain: None,
+            list_collapsed: false,
+            tasks_popup: None,
+            remote_control_popup: None,
+            editor_states: HashMap::new(),
+            agent_statuses: HashMap::new(),
+            session_transition: None,
+            pin_transitions: HashMap::new(),
+            matrix_rain: crate::matrix_rain::MatrixRain::default(),
+            matrix_rain_intensity: 0.0,
+            matrix_rain_intensity_updated_at: now,
+            matrix_rain_foreground_epoch: now,
+            matrix_rain_active_drops: HashMap::new(),
+            matrix_rain_hidden: false,
+            hide_pane_side_borders: false,
+            frame_text: Vec::new(),
+            text_selection: None,
+            selected_text: None,
+            selected_text_bounds: None,
+            selected_text_range: None,
+            pty_input_tx,
+            pty_input_errors,
+        }
+    }
+
     #[test]
     fn selection_bounds_use_list_inner_area() {
         let bounds = selection_bounds_for_layout(&test_layout(), 0, false, 1, 1);
@@ -4596,6 +4711,85 @@ mod tests {
         assert!(!is_list_visible_session(&summary_with_kind(
             agentd_protocol::SessionKind::Subagent
         )));
+    }
+
+    #[tokio::test]
+    async fn pty_typing_does_not_wait_for_input_rpc_response() {
+        use agentd_client::Client;
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use tokio::sync::{mpsc, Notify};
+
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let release_input = Arc::new(Notify::new());
+        let (input_seen_tx, mut input_seen_rx) = mpsc::unbounded_channel();
+        let release_for_server = release_input.clone();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                if method == ipc_method::SESSION_PTY_INPUT {
+                    let _ = input_seen_tx.send(());
+                    release_for_server.notified().await;
+                }
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": Value::Null,
+                });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut app = test_app(
+            client,
+            vec![summary_with_kind(agentd_protocol::SessionKind::User)],
+        );
+        app.sessions[0].has_pty = true;
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            app.on_term_event(CtEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            ))),
+        )
+        .await
+        .expect("typing should queue PTY input without waiting for daemon response");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), input_seen_rx.recv())
+            .await
+            .expect("mock daemon should receive queued PTY input")
+            .expect("pty input seen");
+        release_input.notify_waiters();
+        server.abort();
     }
 
     #[tokio::test]
