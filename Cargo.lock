@@ -125,6 +125,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentd-e2e"
+version = "0.1.0"
+dependencies = [
+ "agentd-client",
+ "agentd-protocol",
+ "anyhow",
+ "portable-pty",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "vt100",
+]
+
+[[package]]
 name = "agentd-mcp"
 version = "0.1.0"
 dependencies = [
