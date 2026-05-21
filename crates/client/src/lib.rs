@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::io::BufReader;
@@ -29,6 +29,31 @@ pub struct Client {
     pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RpcResult>>>>,
     next_id: AtomicU64,
     notif_rx: Mutex<Option<mpsc::UnboundedReceiver<Notification>>>,
+    /// Set by the reader / writer tasks when their socket I/O
+    /// fails — i.e. when the daemon has gone away. `request()`
+    /// checks this and short-circuits with a "daemon
+    /// disconnected" error instead of inserting into `pending`
+    /// and awaiting a response that will never come. Without
+    /// this, every key the user pressed after a daemon crash
+    /// would hang the TUI on the 120s response timeout.
+    disconnected: Arc<AtomicBool>,
+}
+
+/// Mark the client as disconnected and immediately fail every
+/// in-flight RPC. Called from both the reader task (whose exit
+/// is the canonical signal "no responses will arrive") and the
+/// writer task (whose exit means we can't send anything either).
+/// Idempotent — second call's `pending.drain()` finds an empty
+/// map.
+fn mark_disconnected(
+    disconnected: &AtomicBool,
+    pending: &StdMutex<HashMap<u64, oneshot::Sender<RpcResult>>>,
+) {
+    disconnected.store(true, Ordering::SeqCst);
+    let mut map = pending.lock().unwrap();
+    for (_, tx) in map.drain() {
+        let _ = tx.send(Err(ErrorObject::internal("daemon disconnected")));
+    }
 }
 
 impl Client {
@@ -41,20 +66,27 @@ impl Client {
         let (notif_tx, notif_rx) = mpsc::unbounded_channel::<Notification>();
         let pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RpcResult>>>> =
             Arc::new(StdMutex::new(HashMap::new()));
+        let disconnected = Arc::new(AtomicBool::new(false));
 
         // writer task
-        tokio::spawn(async move {
-            let mut writer = writer;
-            while let Some(v) = out_rx.recv().await {
-                if transport::write_message(&mut writer, &v).await.is_err() {
-                    break;
+        {
+            let disconnected = disconnected.clone();
+            let pending = pending.clone();
+            tokio::spawn(async move {
+                let mut writer = writer;
+                while let Some(v) = out_rx.recv().await {
+                    if transport::write_message(&mut writer, &v).await.is_err() {
+                        break;
+                    }
                 }
-            }
-        });
+                mark_disconnected(&disconnected, &pending);
+            });
+        }
 
         // reader task
         {
             let pending = pending.clone();
+            let disconnected = disconnected.clone();
             tokio::spawn(async move {
                 let mut reader = BufReader::new(reader);
                 loop {
@@ -87,6 +119,15 @@ impl Client {
                         _ => {}
                     }
                 }
+                // Daemon closed the socket (clean EOF or I/O
+                // error). Drop the notif sender so the consumer
+                // sees `None` on its next `recv` (the TUI's
+                // notification loop relies on that to set
+                // `connected=false`), and fail every pending RPC
+                // so the UI thread doesn't hang on responses
+                // that will never come.
+                drop(notif_tx);
+                mark_disconnected(&disconnected, &pending);
             });
         }
 
@@ -95,7 +136,16 @@ impl Client {
             pending,
             next_id: AtomicU64::new(1),
             notif_rx: Mutex::new(Some(notif_rx)),
+            disconnected,
         }))
+    }
+
+    /// Has the underlying I/O task detected a closed socket? When
+    /// true, every `request()` call returns immediately with a
+    /// disconnected error — no more 120s response-timeout hangs.
+    /// Cheap to call (atomic load).
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::SeqCst)
     }
 
     pub async fn take_notifications(&self) -> Option<mpsc::UnboundedReceiver<Notification>> {
@@ -107,9 +157,21 @@ impl Client {
         P: Serialize + ?Sized,
         R: DeserializeOwned,
     {
+        if self.disconnected.load(Ordering::SeqCst) {
+            return Err(anyhow!("daemon disconnected"));
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel::<RpcResult>();
         self.pending.lock().unwrap().insert(id, tx);
+        // Race: the I/O tasks might have transitioned to
+        // disconnected between our check above and our insert.
+        // Re-check now and clean up our pending entry if so,
+        // otherwise `rx.await` would hang on a sender that the
+        // mark_disconnected() drain already missed.
+        if self.disconnected.load(Ordering::SeqCst) {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(anyhow!("daemon disconnected"));
+        }
         let req = Request::new(
             serde_json::json!(id),
             method.to_string(),
@@ -117,7 +179,7 @@ impl Client {
         );
         self.out_tx
             .send(serde_json::to_value(&req)?)
-            .map_err(|_| anyhow!("client writer closed"))?;
+            .map_err(|_| anyhow!("daemon disconnected"))?;
         let res = tokio::time::timeout(Duration::from_secs(120), rx).await??;
         match res {
             Ok(v) => Ok(serde_json::from_value(v)?),

@@ -978,7 +978,14 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                     }
                     None => {
                         app.connected = false;
-                        app.set_status("daemon disconnected".to_string());
+                        // Spell out the recovery path: q quits, and
+                        // re-running `agent` reconnects. Without
+                        // this the user just sees "disconnected"
+                        // and may not realize they can press q to
+                        // get out cleanly (issue #101).
+                        app.set_status(
+                            "daemon disconnected — press q to quit (re-run `agent` to reconnect)".to_string(),
+                        );
                     }
                 }
             }
