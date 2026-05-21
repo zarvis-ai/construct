@@ -204,6 +204,65 @@ async fn web_client_loads_and_websocket_connects() {
         "terminal momentum scroller was not installed"
     );
 
+    // Overlay buttons are compact terminal-only controls for jumping
+    // scrollback to the top or bottom without dragging through a long
+    // transcript. Verify they are present, styled as small overlays,
+    // and wired to terminal scroll APIs.
+    let scroll_buttons: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const overlay = document.getElementById('terminalScrollOverlay');
+              const top = document.getElementById('terminalTopBtn');
+              const bottom = document.getElementById('terminalBottomBtn');
+              const overlayStyle = getComputedStyle(overlay);
+              const topStyle = getComputedStyle(top);
+              let calls = [];
+              state.term = {
+                scrollToTop: () => calls.push('top'),
+                scrollToBottom: () => calls.push('bottom'),
+                focus: () => calls.push('focus'),
+              };
+              initTerminalScrollButtons();
+              top.click();
+              bottom.click();
+              return {
+                topText: top.textContent,
+                bottomText: bottom.textContent,
+                position: overlayStyle.position,
+                top: overlayStyle.top,
+                right: overlayStyle.right,
+                background: topStyle.backgroundColor,
+                fontSize: topStyle.fontSize,
+                calls,
+                hook: window.__agentdTerminalScrollButtons === true,
+              };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate terminal scroll buttons")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(scroll_buttons["topText"], "top");
+    assert_eq!(scroll_buttons["bottomText"], "bottom");
+    assert_eq!(scroll_buttons["position"], "absolute");
+    assert_eq!(scroll_buttons["top"], "8px");
+    assert_eq!(scroll_buttons["right"], "8px");
+    assert_eq!(scroll_buttons["fontSize"], "11px");
+    assert_eq!(scroll_buttons["hook"], true);
+    assert!(
+        scroll_buttons["background"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rgba"),
+        "expected transparent overlay background, got {scroll_buttons:?}"
+    );
+    assert_eq!(
+        scroll_buttons["calls"],
+        serde_json::json!(["top", "focus", "bottom", "focus"])
+    );
+
     // The remote client mirrors zarvis EditorState events in a
     // terminal-mode strip so PTY-backed zarvis input is visible even
     // though zarvis deliberately does not echo its live editor into

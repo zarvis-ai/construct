@@ -496,6 +496,40 @@
     pointer-events: none;
   }
   .terminal-loading.gone { display: none; }
+  .terminal-scroll-overlay {
+    position: absolute;
+    top: 8px;
+    right: calc(8px + env(safe-area-inset-right));
+    z-index: 5;
+    display: flex;
+    gap: 4px;
+    pointer-events: none;
+  }
+  .terminal-scroll-overlay[hidden] { display: none; }
+  .terminal-scroll-overlay button {
+    pointer-events: auto;
+    appearance: none;
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    border-radius: 999px;
+    padding: 2px 6px;
+    background: rgba(0, 0, 0, 0.28);
+    color: rgba(255, 255, 255, 0.76);
+    font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    letter-spacing: 0.01em;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    backdrop-filter: blur(4px);
+  }
+  .terminal-scroll-overlay button:hover,
+  .terminal-scroll-overlay button:focus-visible {
+    background: rgba(0, 0, 0, 0.48);
+    color: #fff;
+    outline: none;
+  }
+  .terminal-scroll-overlay button:active {
+    background: rgba(110, 168, 254, 0.42);
+    border-color: rgba(110, 168, 254, 0.7);
+  }
 
   /* Virtual keyboard — sits below the terminal in PTY mode.
      Two-section layout: a horizontally-scrolling special-keys
@@ -867,6 +901,10 @@
       <div class="transcript" id="transcript"></div>
       <div class="terminal-wrap" id="terminalWrap" hidden>
         <div class="terminal-host" id="terminal"></div>
+        <div class="terminal-scroll-overlay" id="terminalScrollOverlay" hidden>
+          <button type="button" id="terminalTopBtn" aria-label="scroll terminal to top">top</button>
+          <button type="button" id="terminalBottomBtn" aria-label="scroll terminal to bottom">bottom</button>
+        </div>
         <div class="terminal-loading" id="terminalLoading">loading xterm…</div>
       </div>
       <!--
@@ -1029,6 +1067,9 @@ const toggleListBtn = $("toggleList");
 const terminalWrapEl = $("terminalWrap");
 const terminalEl = $("terminal");
 const terminalLoadingEl = $("terminalLoading");
+const terminalScrollOverlayEl = $("terminalScrollOverlay");
+const terminalTopBtn = $("terminalTopBtn");
+const terminalBottomBtn = $("terminalBottomBtn");
 const editorStateEl = $("editorState");
 const vkbdEl = $("vkbd");
 const vkbdSpecialEl = $("vkbdSpecial");
@@ -1406,6 +1447,7 @@ function enterChatMode() {
   transcriptEl.hidden = false;
   composerEl.hidden = false;
   terminalWrapEl.hidden = true;
+  terminalScrollOverlayEl.hidden = true;
   renderEditorState(null);
   // Virtual keyboard only makes sense over xterm — chat sessions
   // have a text-style editor instead.
@@ -1423,6 +1465,7 @@ async function enterTerminalMode(id) {
   // for committing a whole prompt at once.
   composerEl.hidden = false;
   terminalWrapEl.hidden = false;
+  terminalScrollOverlayEl.hidden = false;
   vkbdEl.hidden = false;
   renderEditorState(state.editorById.get(id) || null);
   // Build the keyboard markup once per session-switch; cheap, and
@@ -1595,6 +1638,28 @@ function installTerminalScrollContainment() {
   window.__agentdTerminalMomentumScroll = true;
 }
 
+function initTerminalScrollButtons() {
+  const stop = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+  };
+  terminalTopBtn.addEventListener("click", (ev) => {
+    stop(ev);
+    if (state.term) state.term.scrollToTop();
+    state.term && state.term.focus();
+  });
+  terminalBottomBtn.addEventListener("click", (ev) => {
+    stop(ev);
+    if (state.term) state.term.scrollToBottom();
+    state.term && state.term.focus();
+  });
+  for (const btn of [terminalTopBtn, terminalBottomBtn]) {
+    btn.addEventListener("touchstart", (ev) => ev.stopPropagation(), { passive: true });
+    btn.addEventListener("touchmove", stop, { passive: false });
+  }
+  window.__agentdTerminalScrollButtons = true;
+}
+
 function initTerminal() {
   state.term = new window.Terminal({
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
@@ -1613,6 +1678,7 @@ function initTerminal() {
   state.term.loadAddon(state.fitAddon);
   state.term.open(terminalEl);
   installTerminalScrollContainment();
+  initTerminalScrollButtons();
 
   // Forward user keystrokes (and pasted text) as base64-encoded
   // PTY input. xterm's onData yields a JS string of UTF-8
