@@ -378,6 +378,11 @@
     animation: editor-cursor-blink 1s steps(1) infinite;
   }
   .editor-state .editor-queued { color: var(--fg-dim); }
+  .editor-state .editor-agent-status {
+    color: var(--fg-dim);
+    font-style: italic;
+  }
+  .editor-state .editor-agent-status::before { content: "* "; }
   .editor-state .editor-completions {
     color: var(--fg-faint);
     font-size: 11px;
@@ -1099,6 +1104,9 @@ const state = {
   // Latest Zarvis editor_state by session id. Claude/Codex/shell do not
   // emit this and continue to rely on their PTY UI echoing input.
   editorById: new Map(),
+  // Latest active Zarvis agent_status by session id, rendered in the
+  // same fixed editor strip as the TUI's "* Working.." line.
+  agentStatusById: new Map(),
   // Current view mode — "chat" (zarvis-style transcript + composer)
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on the summary's `has_pty` flag.
@@ -1467,7 +1475,7 @@ async function enterTerminalMode(id) {
   terminalWrapEl.hidden = false;
   terminalScrollOverlayEl.hidden = false;
   vkbdEl.hidden = false;
-  renderEditorState(state.editorById.get(id) || null);
+  renderEditorStateForSession(id);
   // Build the keyboard markup once per session-switch; cheap, and
   // makes future per-session layout customization easy if it ever
   // becomes a thing.
@@ -2089,6 +2097,7 @@ function handleNotification(method, params) {
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
     renderSessions();
     state.editorById.delete(params.session_id);
+    state.agentStatusById.delete(params.session_id);
     if (params.session_id === state.currentId) {
       state.currentId = null;
       transcriptEl.innerHTML = "";
@@ -2139,11 +2148,17 @@ function renderEvent(event, at) {
   if (state.mode === "terminal") {
     if (event.type === "editor_state") {
       state.editorById.set(state.currentId, event);
-      renderEditorState(event);
+      renderEditorStateForSession(state.currentId);
+    }
+    if (event.type === "agent_status") {
+      if (event.active) state.agentStatusById.set(state.currentId, event);
+      else state.agentStatusById.delete(state.currentId);
+      renderEditorStateForSession(state.currentId);
     }
     if (event.type === "reset") {
       if (state.term) state.term.reset();
       state.editorById.delete(state.currentId);
+      state.agentStatusById.delete(state.currentId);
       renderEditorState(null);
     }
     if (event.type === "error" && state.term) {
@@ -2170,11 +2185,17 @@ function renderEvent(event, at) {
     case "reset":
       transcriptEl.innerHTML = "";
       state.editorById.delete(state.currentId);
+      state.agentStatusById.delete(state.currentId);
       renderEditorState(null);
       break;
     case "editor_state":
       state.editorById.set(state.currentId, event);
-      renderEditorState(event);
+      renderEditorStateForSession(state.currentId);
+      break;
+    case "agent_status":
+      if (event.active) state.agentStatusById.set(state.currentId, event);
+      else state.agentStatusById.delete(state.currentId);
+      renderEditorStateForSession(state.currentId);
       break;
     case "tool_approval_request":
       // Render as a tool-use card; v1 doesn't yet implement
@@ -2182,7 +2203,7 @@ function renderEvent(event, at) {
       // already useful signal.
       appendToolApproval(event);
       break;
-    // Quietly ignore: agent_status, cost, task_*,
+    // Quietly ignore: cost, task_*,
     // context_compacted, diff, awaiting_input, done. These map
     // onto richer chrome in the desktop TUI; Phase 2 surfaces
     // only message + tool + raw PTY. A small "(<type>)" line on
@@ -2193,23 +2214,39 @@ function renderEvent(event, at) {
   }
 }
 
-function renderEditorState(event) {
-  if (!event || state.mode !== "terminal") {
+function renderEditorStateForSession(id) {
+  renderEditorState(state.editorById.get(id) || null, state.agentStatusById.get(id) || null);
+}
+
+function renderEditorState(event, agentStatus = null) {
+  if ((!event && !agentStatus) || state.mode !== "terminal") {
     editorStateEl.hidden = true;
     editorStateEl.innerHTML = "";
     return;
   }
-  const queued = Array.isArray(event.queued) ? event.queued : [];
-  const completions = Array.isArray(event.completions) ? event.completions : [];
-  const buf = String(event.buf || "");
-  const cursor = Math.max(0, Math.min(Number(event.cursor) || 0, Array.from(buf).length));
+  const queued = Array.isArray(event && event.queued) ? event.queued : [];
+  const completions = Array.isArray(event && event.completions) ? event.completions : [];
+  const buf = String((event && event.buf) || "");
+  const cursor = Math.max(0, Math.min(Number((event && event.cursor) || 0), Array.from(buf).length));
   const active = editorLineHtml("❯", buf, cursor, false);
   const queuedRows = queued.map((q) => editorLineHtml("↥", String(q), null, true)).join("");
+  const statusRow = agentStatus && agentStatus.active
+    ? `<div class="editor-agent-status">${escape(agentStatus.status || "Working")}.. ${escape(formatElapsed(agentStatus.started_at_ms || 0))}</div>`
+    : "";
   const completionRow = completions.length
     ? `<div class="editor-completions">${escape(completions.join("  "))}</div>`
     : "";
-  editorStateEl.innerHTML = queuedRows + active + completionRow;
+  editorStateEl.innerHTML = statusRow + queuedRows + active + completionRow;
   editorStateEl.hidden = false;
+}
+
+function formatElapsed(startedAtMs) {
+  const start = Number(startedAtMs) || 0;
+  if (start <= 0) return "0s";
+  const elapsed = Math.max(0, Math.floor((Date.now() - start) / 1000));
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  return mins > 0 ? `${mins}m${String(secs).padStart(2, "0")}s` : `${secs}s`;
 }
 
 function editorLineHtml(prompt, text, cursor, queued) {

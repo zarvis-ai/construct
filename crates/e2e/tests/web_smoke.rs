@@ -278,6 +278,11 @@ async fn web_client_loads_and_websocket_connects() {
           buf: 'hello zarvis',
           cursor: 5,
           completions: ['/help', '/hello']
+        }, {
+          type: 'agent_status',
+          active: true,
+          started_at_ms: Date.now() - 2200,
+          status: 'Working'
         });
         "#,
     )
@@ -292,7 +297,8 @@ async fn web_client_loads_and_websocket_connects() {
     assert!(
         editor_text.contains("hello zarvis")
             && editor_text.contains("queued prompt")
-            && editor_text.contains("/help"),
+            && editor_text.contains("/help")
+            && editor_text.contains("Working.."),
         "expected editor_state mirror content, got:\n{editor_text}"
     );
 
