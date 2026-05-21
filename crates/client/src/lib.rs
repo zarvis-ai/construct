@@ -194,10 +194,12 @@ impl Client {
     }
 
     pub async fn ping(&self) -> Result<PingResult> {
-        self.request(ipc_method::PING, &serde_json::Value::Null).await
+        self.request(ipc_method::PING, &serde_json::Value::Null)
+            .await
     }
     pub async fn harnesses(&self) -> Result<Vec<HarnessInfo>> {
-        self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null).await
+        self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null)
+            .await
     }
     /// Start (or look up) the daemon's remote WS listener and
     /// return a QR + URL ready to display.
@@ -217,9 +219,19 @@ impl Client {
         local_only: bool,
         password: Option<String>,
     ) -> Result<agentd_protocol::RemoteStartResult> {
+        self.remote_start_with_wait(local_only, password, true)
+            .await
+    }
+    pub async fn remote_start_with_wait(
+        &self,
+        local_only: bool,
+        password: Option<String>,
+        wait_for_tunnel: bool,
+    ) -> Result<agentd_protocol::RemoteStartResult> {
         let params = agentd_protocol::RemoteStartParams {
             local_only,
             password,
+            wait_for_tunnel,
         };
         self.request(ipc_method::REMOTE_START, &params).await
     }
@@ -227,7 +239,8 @@ impl Client {
     /// Idempotent — `was_running: false` is the natural state when
     /// stop is called without an active listener.
     pub async fn remote_stop(&self) -> Result<agentd_protocol::RemoteStopResult> {
-        self.request(ipc_method::REMOTE_STOP, &serde_json::Value::Null).await
+        self.request(ipc_method::REMOTE_STOP, &serde_json::Value::Null)
+            .await
     }
     /// Restart the daemon in place (exec self). The IPC connection
     /// is closed by the kernel during exec(), so the reply is the
@@ -236,15 +249,19 @@ impl Client {
     /// reply (Ok or `BrokenPipe`-style error) as "restart in flight"
     /// and re-attempt connect with backoff.
     pub async fn daemon_restart(&self) -> Result<agentd_protocol::DaemonRestartResult> {
-        self.request(ipc_method::DAEMON_RESTART, &serde_json::Value::Null).await
+        self.request(ipc_method::DAEMON_RESTART, &serde_json::Value::Null)
+            .await
     }
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
-        self.request(ipc_method::SESSION_LIST, &serde_json::Value::Null).await
+        self.request(ipc_method::SESSION_LIST, &serde_json::Value::Null)
+            .await
     }
     pub async fn get(&self, id: &str) -> Result<SessionDetail> {
         self.request(
             ipc_method::SESSION_GET,
-            &SessionIdParams { session_id: id.to_string() },
+            &SessionIdParams {
+                session_id: id.to_string(),
+            },
         )
         .await
     }
@@ -293,7 +310,9 @@ impl Client {
     pub async fn pty_replay(&self, id: &str) -> Result<PtyReplayResult> {
         self.request(
             ipc_method::SESSION_PTY_REPLAY,
-            &SessionIdParams { session_id: id.to_string() },
+            &SessionIdParams {
+                session_id: id.to_string(),
+            },
         )
         .await
     }
@@ -301,7 +320,9 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_INTERRUPT,
-                &SessionIdParams { session_id: id.to_string() },
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
             )
             .await?;
         Ok(())
@@ -310,7 +331,9 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_STOP,
-                &SessionIdParams { session_id: id.to_string() },
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
             )
             .await?;
         Ok(())
@@ -319,7 +342,9 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_KILL,
-                &SessionIdParams { session_id: id.to_string() },
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
             )
             .await?;
         Ok(())
@@ -328,7 +353,9 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_DELETE,
-                &SessionIdParams { session_id: id.to_string() },
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
             )
             .await?;
         Ok(())
@@ -341,7 +368,9 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_RESTART,
-                &SessionIdParams { session_id: id.to_string() },
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
             )
             .await?;
         Ok(())
@@ -406,10 +435,7 @@ impl Client {
     ) -> Result<agentd_protocol::Loop> {
         self.request(ipc_method::LOOP_CREATE, &params).await
     }
-    pub async fn loop_list(
-        &self,
-        session_id: Option<&str>,
-    ) -> Result<Vec<agentd_protocol::Loop>> {
+    pub async fn loop_list(&self, session_id: Option<&str>) -> Result<Vec<agentd_protocol::Loop>> {
         let r: agentd_protocol::LoopListResult = self
             .request(
                 ipc_method::LOOP_LIST,
@@ -442,10 +468,7 @@ impl Client {
     /// + recent terminal entries. Empty for sessions whose adapter
     /// doesn't emit `TaskStart` lifecycle events (claude / codex /
     /// shell today).
-    pub async fn list_tasks(
-        &self,
-        id: &str,
-    ) -> Result<Vec<agentd_protocol::TaskInfo>> {
+    pub async fn list_tasks(&self, id: &str) -> Result<Vec<agentd_protocol::TaskInfo>> {
         let r: agentd_protocol::ListTasksResult = self
             .request(
                 ipc_method::SESSION_LIST_TASKS,
@@ -513,13 +536,21 @@ impl Client {
         Ok(())
     }
     pub async fn list_groups(&self) -> Result<Vec<GroupSummary>> {
-        self.request(ipc_method::GROUP_LIST, &serde_json::Value::Null).await
+        self.request(ipc_method::GROUP_LIST, &serde_json::Value::Null)
+            .await
     }
     pub async fn create_group(&self, name: &str) -> Result<String> {
         #[derive(serde::Deserialize)]
-        struct R { group_id: String }
+        struct R {
+            group_id: String,
+        }
         let r: R = self
-            .request(ipc_method::GROUP_CREATE, &GroupCreateParams { name: name.to_string() })
+            .request(
+                ipc_method::GROUP_CREATE,
+                &GroupCreateParams {
+                    name: name.to_string(),
+                },
+            )
             .await?;
         Ok(r.group_id)
     }
@@ -527,7 +558,10 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::GROUP_RENAME,
-                &GroupRenameParams { group_id: id.to_string(), name: name.to_string() },
+                &GroupRenameParams {
+                    group_id: id.to_string(),
+                    name: name.to_string(),
+                },
             )
             .await?;
         Ok(())
@@ -553,7 +587,10 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::GROUP_SET_COLLAPSED,
-                &GroupSetCollapsedParams { group_id: id.to_string(), collapsed },
+                &GroupSetCollapsedParams {
+                    group_id: id.to_string(),
+                    collapsed,
+                },
             )
             .await?;
         Ok(())
@@ -562,7 +599,10 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::GROUP_MOVE,
-                &GroupMoveParams { group_id: id.to_string(), direction },
+                &GroupMoveParams {
+                    group_id: id.to_string(),
+                    direction,
+                },
             )
             .await?;
         Ok(())
@@ -570,7 +610,9 @@ impl Client {
     pub async fn diff(&self, id: &str) -> Result<DiffResult> {
         self.request(
             ipc_method::SESSION_DIFF,
-            &SessionIdParams { session_id: id.to_string() },
+            &SessionIdParams {
+                session_id: id.to_string(),
+            },
         )
         .await
     }
@@ -592,7 +634,10 @@ impl Client {
     }
     pub async fn subscribe(&self, session_id: Option<String>) -> Result<()> {
         let _: serde_json::Value = self
-            .request(ipc_method::SUBSCRIBE_EVENTS, &SubscribeParams { session_id })
+            .request(
+                ipc_method::SUBSCRIBE_EVENTS,
+                &SubscribeParams { session_id },
+            )
             .await?;
         Ok(())
     }

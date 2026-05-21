@@ -601,7 +601,12 @@ impl SessionManager {
             .context("remote supervisor dropped reply channel")??;
 
         Ok(self
-            .build_remote_result(outcome.state, outcome.port, params.local_only)
+            .build_remote_result(
+                outcome.state,
+                outcome.port,
+                params.local_only,
+                params.wait_for_tunnel,
+            )
             .await?)
     }
 
@@ -610,9 +615,7 @@ impl SessionManager {
     /// is not an error; the result's `was_running` field tells the
     /// caller whether anything was actually torn down. Token
     /// rotates on the next `start_remote` so the old QR is dead.
-    pub async fn stop_remote(
-        self: Arc<Self>,
-    ) -> anyhow::Result<agentd_protocol::RemoteStopResult> {
+    pub async fn stop_remote(self: Arc<Self>) -> anyhow::Result<agentd_protocol::RemoteStopResult> {
         use anyhow::Context as _;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.remote_starter
@@ -642,6 +645,7 @@ impl SessionManager {
         state: crate::remote::RemoteState,
         port: u16,
         local_only: bool,
+        wait_for_tunnel: bool,
     ) -> anyhow::Result<agentd_protocol::RemoteStartResult> {
         use std::time::Duration;
 
@@ -661,6 +665,21 @@ impl SessionManager {
                 tunnel_ready: false,
                 password: state.password().to_string(),
                 hint: None,
+            });
+        }
+
+        if !wait_for_tunnel {
+            let url = format!("http://127.0.0.1:{port}/t/{}", state.token());
+            let qr = crate::remote::render_qr_dense1x2(&url).unwrap_or_default();
+            return Ok(agentd_protocol::RemoteStartResult {
+                url,
+                qr,
+                tunnel_ready: false,
+                password: state.password().to_string(),
+                hint: Some(
+                    "Starting public tunnel… QR will update when cloudflared publishes a URL."
+                        .to_string(),
+                ),
             });
         }
 
@@ -2913,11 +2932,13 @@ mod tests {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
-        let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
         let config = Arc::new(crate::config::Config::default());
-        let (mgr, _remote_rx, _restart_rx) = SessionManager::new(storage, config, tmp.path().join("run"))
-            .await
-            .expect("session manager");
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
 
         mgr.sessions.write().await.insert(
             "suser".into(),
@@ -2949,11 +2970,13 @@ mod tests {
         use tokio::sync::RwLock;
 
         let tmp = tempdir().expect("tempdir");
-        let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
         let config = Arc::new(crate::config::Config::default());
-        let (mgr, _remote_rx, _restart_rx) = SessionManager::new(storage, config, tmp.path().join("run"))
-            .await
-            .expect("session manager");
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
         let manager = Arc::new(mgr);
 
         // Synthetic session in `Running` (what a live shell / zarvis
@@ -2998,7 +3021,11 @@ mod tests {
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
         });
-        manager.sessions.write().await.insert(id.clone(), entry.clone());
+        manager
+            .sessions
+            .write()
+            .await
+            .insert(id.clone(), entry.clone());
 
         // Pre-shutdown: a `Done` event WOULD transition state.
         manager

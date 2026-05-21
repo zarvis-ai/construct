@@ -1253,7 +1253,8 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     for col in 0..rain_area.width {
         let seed = hash64(col as u64 ^ ((rain_area.width as u64) << 24));
         let speed = 2 + (seed % 7);
-        let frame = foreground_rain_frame(now, app.matrix_rain_foreground_epoch, seed, speed, cycle);
+        let frame =
+            foreground_rain_frame(now, app.matrix_rain_foreground_epoch, seed, speed, cycle);
         current_drop_keys.insert(frame.key);
         // Register a fresh drop only at the *top* of its cycle, and
         // only if a per-cycle random roll comes in under the current
@@ -1317,9 +1318,8 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                             // falls back to the slow-fade letter
                             // style (≈ 2× slower than the random
                             // tail chars around it).
-                            let dist_from_head = active
-                                .map(|(h, _)| h - row as i16)
-                                .unwrap_or(i16::MAX);
+                            let dist_from_head =
+                                active.map(|(h, _)| h - row as i16).unwrap_or(i16::MAX);
                             if dist_from_head == 0 {
                                 (letter, rain_head_flash_style(&app.theme))
                             } else {
@@ -1330,12 +1330,18 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
                         }
                         None => {
                             let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
-                            (charset[(glyph_seed as usize) % charset.len()] as char, style)
+                            (
+                                charset[(glyph_seed as usize) % charset.len()] as char,
+                                style,
+                            )
                         }
                     }
                 } else {
                     let glyph_seed = hash64(seed ^ row as u64 ^ (elapsed / 180));
-                    (charset[(glyph_seed as usize) % charset.len()] as char, style)
+                    (
+                        charset[(glyph_seed as usize) % charset.len()] as char,
+                        style,
+                    )
                 };
                 f.buffer_mut().set_string(
                     rain_area.x + col,
@@ -1380,7 +1386,10 @@ fn resolve_vertical_reveal_positions(
         return;
     }
     for reveal in matrix_rain.active_reveals_mut(now) {
-        if !matches!(reveal.orientation, crate::matrix_rain::RevealOrientation::Vertical) {
+        if !matches!(
+            reveal.orientation,
+            crate::matrix_rain::RevealOrientation::Vertical
+        ) {
             continue;
         }
         if reveal.resolved_position().is_some() {
@@ -1411,7 +1420,10 @@ fn build_vertical_letter_overlay(
 ) -> Vec<HashMap<i16, char>> {
     let mut overlay = vec![HashMap::<i16, char>::new(); area.width as usize];
     for reveal in matrix_rain.active_reveals(now) {
-        if !matches!(reveal.orientation, crate::matrix_rain::RevealOrientation::Vertical) {
+        if !matches!(
+            reveal.orientation,
+            crate::matrix_rain::RevealOrientation::Vertical
+        ) {
             continue;
         }
         let Some((col_abs, row_abs)) = reveal.resolved_position() else {
@@ -1777,10 +1789,10 @@ fn render_pinned_letters_at(
             };
             matrix_reveal_style(theme, brightness, elapsed_ms < fade_start)
         };
-        f.buffer_mut().set_string(xs(i), ys(i), ch.to_string(), style);
+        f.buffer_mut()
+            .set_string(xs(i), ys(i), ch.to_string(), style);
     }
 }
-
 
 fn matrix_reveal_style(theme: &Theme, brightness: f32, bold: bool) -> Style {
     let brightness = brightness.clamp(0.0, 1.0);
@@ -2848,7 +2860,9 @@ fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
         SessionEvent::Reasoning { text } => {
             // Model's private thinking — dim + italic so the user can
             // tell it apart from the actual response.
-            let style = Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC);
+            let style = Style::default()
+                .fg(theme.dim)
+                .add_modifier(Modifier::ITALIC);
             vec![
                 Span::styled("thinking: ".to_string(), style),
                 Span::styled(text.clone(), style),
@@ -2995,11 +3009,15 @@ fn pane_border_style(theme: &Theme, focused: bool) -> Style {
 }
 
 fn group_name_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.group).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(theme.group)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn harness_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.harness).add_modifier(Modifier::BOLD)
+    Style::default()
+        .fg(theme.harness)
+        .add_modifier(Modifier::BOLD)
 }
 
 /// Clip `s` to at most `max` display columns, appending `…` when the
@@ -3185,7 +3203,11 @@ fn render_pty_screen(
             let x = area.x + col;
             let y = area.y + row;
             if let Some(buf_cell) = f.buffer_mut().cell_mut(Position { x, y }) {
-                if screen.cell(row, col).map(|c| c.has_contents()).unwrap_or(false) {
+                if screen
+                    .cell(row, col)
+                    .map(|c| c.has_contents())
+                    .unwrap_or(false)
+                {
                     buf_cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
                 } else {
                     buf_cell.set_symbol("█");
@@ -3632,10 +3654,12 @@ fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
     let total = f.area();
 
     let (title, title_color, body_lines, body_w, body_h) = match popup {
+        crate::app::RemoteControlPopup::Starting(p) => render_remote_starting(app, p),
         crate::app::RemoteControlPopup::Ok(p) => render_remote_ok(app, p),
-        crate::app::RemoteControlPopup::Err { local_only, message } => {
-            render_remote_err(app, *local_only, message)
-        }
+        crate::app::RemoteControlPopup::Err {
+            local_only,
+            message,
+        } => render_remote_err(app, *local_only, message),
     };
 
     let want_w = body_w + 6;
@@ -3647,7 +3671,12 @@ fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
     }
     let x = total.x + (total.width.saturating_sub(w)) / 2;
     let y = total.y + (total.height.saturating_sub(h)) / 2;
-    let rect = Rect { x, y, width: w, height: h };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     app.layout.modal_area = Some(rect);
 
     let block = Block::default()
@@ -3655,13 +3684,37 @@ fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(app.theme.border_focused))
         .title(Line::from(Span::styled(
             title,
-            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(title_color)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(rect);
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
     let para = Paragraph::new(body_lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+}
+
+fn render_remote_starting<'a>(
+    app: &App,
+    p: &'a crate::app::RemoteControlOk,
+) -> (&'static str, ratatui::style::Color, Vec<Line<'a>>, u16, u16) {
+    let mut title_tuple = render_remote_ok(app, p);
+    title_tuple.0 = " /remote-control — starting public tunnel… — Esc to close ";
+    title_tuple.1 = app.theme.warning;
+    title_tuple.2.insert(
+        0,
+        Line::from(Span::styled(
+            "Setting up public tunnel… local URL is ready; QR will update automatically.",
+            Style::default()
+                .fg(app.theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )),
+    );
+    title_tuple.2.insert(1, Line::raw(""));
+    title_tuple.3 = title_tuple.3.max(72);
+    title_tuple.4 = title_tuple.4.saturating_add(2);
+    title_tuple
 }
 
 /// Build the popup body for a successful `remote.start`. Returns
@@ -3671,14 +3724,22 @@ fn render_remote_ok<'a>(
     p: &'a crate::app::RemoteControlOk,
 ) -> (&'static str, ratatui::style::Color, Vec<Line<'a>>, u16, u16) {
     let qr_lines: Vec<&str> = p.qr.lines().collect();
-    let qr_w = qr_lines.iter().map(|l| l.chars().count() as u16).max().unwrap_or(0);
+    let qr_w = qr_lines
+        .iter()
+        .map(|l| l.chars().count() as u16)
+        .max()
+        .unwrap_or(0);
     let qr_h = qr_lines.len() as u16;
     let url_w = p.url.chars().count() as u16;
     let user_line = "user: remote";
     let user_w = user_line.chars().count() as u16;
     let password_line = format!("password: {}", p.password);
     let pw_w = password_line.chars().count() as u16;
-    let hint_w = p.hint.as_deref().map(|s| s.chars().count() as u16).unwrap_or(0);
+    let hint_w = p
+        .hint
+        .as_deref()
+        .map(|s| s.chars().count() as u16)
+        .unwrap_or(0);
     let body_w = qr_w.max(url_w).max(user_w).max(pw_w).max(hint_w);
     // QR + blank + URL + user + password (+ blank + hint if present).
     let body_h = qr_h + 4 + if p.hint.is_some() { 2 } else { 0 };
@@ -3696,10 +3757,7 @@ fn render_remote_ok<'a>(
         // reachable on the daemon side (tunnel timeout now
         // returns an error), but keep a graceful title just in
         // case the shape evolves.
-        (false, false) => (
-            " /remote-control — Esc to close ",
-            app.theme.warning,
-        ),
+        (false, false) => (" /remote-control — Esc to close ", app.theme.warning),
     };
 
     let mut lines: Vec<Line> = Vec::with_capacity(qr_lines.len() + 4);
@@ -3709,7 +3767,9 @@ fn render_remote_ok<'a>(
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         p.url.clone(),
-        Style::default().fg(app.theme.info).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(app.theme.info)
+            .add_modifier(Modifier::BOLD),
     )));
     // Browser's basic-auth prompt asks for both username and
     // password; render both so the user knows what to type. The
@@ -3719,14 +3779,18 @@ fn render_remote_ok<'a>(
         Span::styled("user:     ", Style::default().fg(app.theme.dim)),
         Span::styled(
             "remote",
-            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     lines.push(Line::from(vec![
         Span::styled("password: ", Style::default().fg(app.theme.dim)),
         Span::styled(
             p.password.clone(),
-            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     if let Some(hint) = p.hint.as_deref() {
@@ -3758,7 +3822,9 @@ fn render_remote_err<'a>(
     let body_lines: Vec<Line> = vec![
         Line::from(Span::styled(
             header.to_string(),
-            Style::default().fg(app.theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(app.theme.danger)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
         Line::from(Span::styled(
@@ -3891,7 +3957,10 @@ mod tests {
             crate::app::MATRIX_RAIN_H_DEFAULT
         );
         assert_eq!(matrix_rain_panel_height(None, 8), 8);
-        assert_eq!(matrix_rain_panel_height(Some(2), 30), crate::app::MATRIX_RAIN_H_MIN);
+        assert_eq!(
+            matrix_rain_panel_height(Some(2), 30),
+            crate::app::MATRIX_RAIN_H_MIN
+        );
         assert_eq!(matrix_rain_panel_height(Some(50), 30), 30);
         assert_eq!(matrix_rain_panel_height(Some(8), 3), 3);
     }
@@ -4055,14 +4124,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_editor_pane(
-                    f,
-                    Rect::new(0, 0, 20, 3),
-                    Some(&state),
-                    None,
-                    &theme,
-                    false,
-                );
+                render_editor_pane(f, Rect::new(0, 0, 20, 3), Some(&state), None, &theme, false);
             })
             .expect("draw");
 
@@ -4088,14 +4150,7 @@ mod tests {
 
         terminal
             .draw(|f| {
-                render_editor_pane(
-                    f,
-                    Rect::new(0, 0, 20, 3),
-                    Some(&state),
-                    None,
-                    &theme,
-                    true,
-                );
+                render_editor_pane(f, Rect::new(0, 0, 20, 3), Some(&state), None, &theme, true);
             })
             .expect("draw");
 
