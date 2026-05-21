@@ -75,6 +75,62 @@ cargo build --workspace
 scripts/smoke.sh
 ```
 
+## PR review artifacts
+
+When a change benefits from visual review, upload before/after screenshots or
+recordings with [`gh-attach`](https://github.com/atani/gh-attach) and reference
+the returned URLs from the PR description or a PR comment. This produces the
+same `user-attachments/assets/...` URLs GitHub creates when you drag and drop a
+file into the markdown editor.
+
+Install once:
+
+```sh
+gh extension install atani/gh-attach
+```
+
+Upload artifacts and keep the URLs for markdown:
+
+```sh
+PR=123
+REPO=owner/repo
+
+before_url=$(gh attach --repo "$REPO" --issue "$PR" --image ./artifacts/before.png --url-only)
+after_url=$(gh attach --repo "$REPO" --issue "$PR" --image ./artifacts/after.png --url-only)
+video_url=$(gh attach --repo "$REPO" --issue "$PR" --image ./artifacts/demo.mp4 --url-only)
+```
+
+Post them as a PR comment:
+
+```sh
+cat > /tmp/agentd-pr-artifacts.md <<EOF
+### Review artifacts
+
+| Before | After |
+|---|---|
+| <img src="$before_url" width="800"> | <img src="$after_url" width="800"> |
+
+Demo video:
+
+$video_url
+EOF
+
+gh pr comment "$PR" --repo "$REPO" --body-file /tmp/agentd-pr-artifacts.md
+```
+
+Or merge them into the PR description:
+
+```sh
+gh pr view "$PR" --repo "$REPO" --json body --jq .body > /tmp/agentd-pr-body.md
+cat /tmp/agentd-pr-artifacts.md >> /tmp/agentd-pr-body.md
+gh pr edit "$PR" --repo "$REPO" --body-file /tmp/agentd-pr-body.md
+```
+
+For GitHub Enterprise or SAML-backed accounts, keep a persistent browser session
+and add `--session <name> --keep-session --browser` to the `gh attach` commands.
+Keep all files for one upload batch in the same directory so the browser
+automation can read them.
+
 ## Paths
 
 `agentd` reads/writes under XDG-style directories, with `AGENTD_*_DIR` overrides:
