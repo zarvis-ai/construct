@@ -846,7 +846,7 @@ impl SessionManager {
             last_prompt: params.prompt.clone(),
             event_count: 0,
             has_pty: false,
-            mode: params.mode.clone(),
+            mode: Some(effective_mode(&params)),
             pinned: false,
             // Negative timestamp so newer sessions sort to the top by default.
             position: -now.timestamp_millis(),
@@ -2715,6 +2715,14 @@ async fn generate_auto_title(
         session: snapshot,
     }));
     tracing::info!(session = %entry.id, %title, "auto-title applied");
+}
+
+fn effective_mode(params: &CreateSessionParams) -> String {
+    match params.mode.as_ref() {
+        Some(mode) => mode.clone(),
+        None if params.pty_size.is_some() => "interactive".to_string(),
+        None => "headless".to_string(),
+    }
 }
 
 fn builtin_harness_capabilities(name: &str) -> agentd_protocol::Capabilities {
