@@ -1509,12 +1509,90 @@ function installTerminalScrollContainment() {
   // up to the page visual viewport. The page is a fixed app shell, so that
   // rubber-bands the header/list/composer/vkbd instead of only scrolling the
   // terminal buffer. CSS `overscroll-behavior` is not reliable for this case
-  // on iOS, so stop touch/wheel propagation at the terminal surface. xterm's
-  // own listeners still receive the event and update terminal scrollback.
+  // on iOS, so keep terminal touch scrolling fully local and drive xterm's
+  // scrollback ourselves with a small momentum scroller.
   const stop = (ev) => ev.stopPropagation();
-  terminalEl.addEventListener("touchstart", stop, { passive: true });
-  terminalEl.addEventListener("touchmove", stop, { passive: true });
   terminalEl.addEventListener("wheel", stop, { passive: true });
+
+  let active = false;
+  let lastY = 0;
+  let lastT = 0;
+  let velocity = 0;
+  let carryPx = 0;
+  let inertiaFrame = 0;
+  const stopInertia = () => {
+    if (inertiaFrame) cancelAnimationFrame(inertiaFrame);
+    inertiaFrame = 0;
+  };
+  const pxPerLine = () => {
+    if (!state.term || !state.term.rows) return 16;
+    return Math.max(8, terminalEl.clientHeight / state.term.rows);
+  };
+  const scrollPixels = (px) => {
+    if (!state.term) return;
+    carryPx += px;
+    const lineH = pxPerLine();
+    const lines = carryPx > 0 ? Math.floor(carryPx / lineH) : Math.ceil(carryPx / lineH);
+    if (lines !== 0) {
+      state.term.scrollLines(lines);
+      carryPx -= lines * lineH;
+    }
+  };
+  const beginInertia = () => {
+    stopInertia();
+    let prev = performance.now();
+    const tick = (now) => {
+      const dt = Math.min(32, now - prev);
+      prev = now;
+      scrollPixels(velocity * dt);
+      // Exponential-ish decay tuned to feel close to native inertial scroll
+      // without running forever at tiny sub-line velocities.
+      velocity *= Math.pow(0.95, dt / 16);
+      if (Math.abs(velocity) >= 0.02) inertiaFrame = requestAnimationFrame(tick);
+      else inertiaFrame = 0;
+    };
+    if (Math.abs(velocity) >= 0.02) inertiaFrame = requestAnimationFrame(tick);
+  };
+
+  terminalEl.addEventListener("touchstart", (ev) => {
+    if (ev.touches.length !== 1) return;
+    stopInertia();
+    active = true;
+    lastY = ev.touches[0].clientY;
+    lastT = performance.now();
+    velocity = 0;
+    carryPx = 0;
+    ev.stopPropagation();
+  }, { passive: true });
+
+  terminalEl.addEventListener("touchmove", (ev) => {
+    if (!active || ev.touches.length !== 1) return;
+    const y = ev.touches[0].clientY;
+    const now = performance.now();
+    const dy = lastY - y;
+    const dt = Math.max(1, now - lastT);
+    lastY = y;
+    lastT = now;
+    velocity = dy / dt;
+    scrollPixels(dy);
+    ev.preventDefault();
+    ev.stopPropagation();
+  }, { passive: false });
+
+  terminalEl.addEventListener("touchend", (ev) => {
+    if (!active) return;
+    active = false;
+    ev.stopPropagation();
+    beginInertia();
+  }, { passive: true });
+  terminalEl.addEventListener("touchcancel", () => {
+    active = false;
+    stopInertia();
+  }, { passive: true });
+
+  // Test hook: lets the web smoke assert the custom momentum scroller is
+  // installed without poking at browser-private event listener internals.
+  window.__agentdTerminalMomentumScroll = true;
 }
 
 function initTerminal() {

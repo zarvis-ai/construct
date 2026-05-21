@@ -187,6 +187,23 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(scroll_containment["hostOverscroll"], "contain");
     assert_eq!(scroll_containment["hostTouchAction"], "pan-y");
 
+    // Regression coverage for the terminal-specific momentum scroller:
+    // xterm's built-in touch path lacks native inertial scrolling on
+    // mobile, so the web client installs a custom touch scroller that
+    // continues scrollback movement after touchend.
+    let momentum_installed: bool = page
+        .evaluate(
+            "installTerminalScrollContainment(); window.__agentdTerminalMomentumScroll === true",
+        )
+        .await
+        .expect("evaluate momentum scroller hook")
+        .into_value::<bool>()
+        .expect("bool");
+    assert!(
+        momentum_installed,
+        "terminal momentum scroller was not installed"
+    );
+
     // The remote client mirrors zarvis EditorState events in a
     // terminal-mode strip so PTY-backed zarvis input is visible even
     // though zarvis deliberately does not echo its live editor into
