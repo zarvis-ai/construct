@@ -14,7 +14,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -25,6 +25,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 type RpcResult = Result<serde_json::Value, ErrorObject>;
 
 pub struct Client {
+    socket: PathBuf,
     out_tx: mpsc::UnboundedSender<serde_json::Value>,
     pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<RpcResult>>>>,
     next_id: AtomicU64,
@@ -132,6 +133,7 @@ impl Client {
         }
 
         Ok(Arc::new(Self {
+            socket: socket.to_path_buf(),
             out_tx,
             pending,
             next_id: AtomicU64::new(1),
@@ -146,6 +148,10 @@ impl Client {
     /// Cheap to call (atomic load).
     pub fn is_disconnected(&self) -> bool {
         self.disconnected.load(Ordering::SeqCst)
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.socket
     }
 
     pub async fn take_notifications(&self) -> Option<mpsc::UnboundedReceiver<Notification>> {

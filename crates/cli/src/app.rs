@@ -5,7 +5,7 @@ use crate::ui;
 use agentd_client::Client;
 use agentd_protocol::{
     EventNotificationPayload, GroupSummary, HarnessInfo, SessionEvent, SessionSummary,
-    StateNotificationPayload, TimestampedEvent,
+    StateNotificationPayload, TimestampedEvent, Request,
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -386,6 +386,22 @@ pub struct App {
     pub selected_text_range: Option<TextSelectionRange>,
 }
 
+struct SessionHydration {
+    session_id: String,
+    transcript: Vec<TimestampedEvent>,
+    history: Option<crate::pty_render::ItemHistory>,
+    editor_state: Option<EditorState>,
+    agent_status: Option<agentd_protocol::AgentStatus>,
+    status_messages: Vec<String>,
+}
+
+struct SessionHydrationRequest {
+    socket: std::path::PathBuf,
+    session_id: String,
+    needs_history: bool,
+    terminal_pane_size: (u16, u16),
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionTransition {
     pub started_at: Instant,
@@ -426,6 +442,120 @@ fn format_elapsed(started_at_ms: i64) -> String {
     } else {
         format!("{seconds}s")
     }
+}
+
+async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionHydration> {
+    tokio::task::spawn_blocking(move || {
+        let mut status_messages = Vec::new();
+        let transcript: agentd_protocol::TranscriptResult = blocking_request(
+            &req.socket,
+            agentd_protocol::ipc_method::SESSION_TRANSCRIPT,
+            &agentd_protocol::TranscriptParams {
+                session_id: req.session_id.clone(),
+                from: 0,
+                limit: None,
+            },
+        )?;
+
+        let history = if req.needs_history {
+            let mut h = crate::pty_render::ItemHistory::new();
+            let pty: Result<agentd_protocol::PtyReplayResult> = blocking_request(
+                &req.socket,
+                agentd_protocol::ipc_method::SESSION_PTY_REPLAY,
+                &agentd_protocol::SessionIdParams {
+                    session_id: req.session_id.clone(),
+                },
+            );
+            match pty {
+                Ok(snap) => {
+                    let (cols, rows) = snap
+                        .size
+                        .as_ref()
+                        .map(|s| (s.cols, s.rows))
+                        .unwrap_or(req.terminal_pane_size);
+                    h.set_pty_size(cols, rows);
+                    use base64::Engine;
+                    if let Ok(bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(&snap.data)
+                    {
+                        h.feed_pty(&bytes);
+                    }
+                }
+                Err(e) => status_messages.push(format!("pty_replay: {e}")),
+            }
+
+            let mut editor_state = None;
+            let mut agent_status = None;
+            if transcript
+                .events
+                .iter()
+                .any(|ev| matches!(ev.event, SessionEvent::Pty { .. }))
+            {
+                // New daemons persist PTY events in the transcript as ordering
+                // markers. Prefer rebuilding from those markers so transcript-only
+                // items (zarvis tool blocks) are interleaved with the raw bytes in
+                // chronological order. The pty_replay path above remains the
+                // fallback for older sessions whose transcripts do not contain PTY.
+                h.clear_items();
+            }
+            apply_transcript_to_local_state(
+                &transcript.events,
+                &mut h,
+                &mut editor_state,
+                &mut agent_status,
+            );
+            let (cols, rows) = req.terminal_pane_size;
+            let _ = h.replay(cols.max(1), rows.max(1), 0);
+            (Some(h), editor_state, agent_status)
+        } else {
+            (None, None, None)
+        };
+
+        Ok(SessionHydration {
+            session_id: req.session_id,
+            transcript: transcript.events,
+            history: history.0,
+            editor_state: history.1,
+            agent_status: history.2,
+            status_messages,
+        })
+    })
+    .await
+    .context("join session hydration worker")?
+}
+
+fn blocking_request<P, R>(socket: &std::path::Path, method: &str, params: &P) -> Result<R>
+where
+    P: serde::Serialize + ?Sized,
+    R: serde::de::DeserializeOwned,
+{
+    use anyhow::anyhow;
+    use std::io::{BufRead, Write};
+
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .with_context(|| format!("connect {}", socket.display()))?;
+    let req = Request::new(
+        serde_json::json!(1),
+        method.to_string(),
+        Some(serde_json::to_value(params)?),
+    );
+    serde_json::to_writer(&mut stream, &req)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    let n = reader.read_line(&mut line)?;
+    if n == 0 {
+        return Err(anyhow!("daemon disconnected"));
+    }
+    let resp: agentd_protocol::Response = serde_json::from_str(line.trim())?;
+    if let Some(err) = resp.error {
+        return Err(anyhow!("daemon error: {}", err.message));
+    }
+    Ok(serde_json::from_value(
+        resp.result.unwrap_or(serde_json::Value::Null),
+    )?)
 }
 
 /// State for the `/tasks` modal popup. v1 is read-only at the UI
@@ -849,9 +979,32 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     // without a SIGWINCH, so the focused session needs a fresh resize
     // every time it gains focus.
     let mut last_session_sent: Option<String> = None;
+    let mut hydration_session: Option<String> = None;
+    let mut hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
     while !app.should_quit {
         app.prune_finished_transitions();
         terminal.draw(|f| ui::render(f, app))?;
+
+        // A session switch should stay interactive while history-sized
+        // work runs. Selection handlers only mark the transcript as
+        // stale; after the frame above has painted the new list highlight
+        // / placeholder view, start transcript + PTY hydration in the
+        // background. If the user switches again, abort the old task and
+        // discard any stale result.
+        let desired_hydration_session = app.selection.session_id().map(|s| s.to_string());
+        if hydration_session != desired_hydration_session {
+            if let Some(task) = hydration_task.take() {
+                task.abort();
+            }
+            hydration_session = None;
+        }
+        if app.selected_transcript_needs_refresh() && hydration_task.is_none() {
+            if let Some(req) = app.selected_hydration_request() {
+                hydration_session = Some(req.session_id.clone());
+                hydration_task = Some(tokio::spawn(load_session_hydration(req)));
+            }
+        }
+
         // Right pane (main session) resize — debounced fire. Also
         // refires if the *selected* session changed since last sent.
         let cur = app.terminal_pane_size;
@@ -894,6 +1047,21 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
             }
         }
         tokio::select! {
+            hydrated = async {
+                match hydration_task.as_mut() {
+                    Some(task) => task.await,
+                    None => futures::future::pending().await,
+                }
+            }, if hydration_task.is_some() => {
+                hydration_task = None;
+                hydration_session = None;
+                match hydrated {
+                    Ok(Ok(h)) => app.apply_session_hydration(h).await,
+                    Ok(Err(e)) => app.set_status(format!("load transcript: {e}")),
+                    Err(e) if e.is_cancelled() => {}
+                    Err(e) => app.set_status(format!("load transcript task failed: {e}")),
+                }
+            }
             ev = input_stream.next() => {
                 match ev {
                     Some(Ok(ev)) => {
@@ -1026,7 +1194,15 @@ impl App {
             self.start_session_transition();
         }
         self.selection = Selection::Session(id);
+        self.transcript.clear();
         self.transcript_session = None;
+        self.transcript_scroll = u16::MAX;
+        self.view_scrollback = 0;
+        self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
+            ViewMode::Terminal
+        } else {
+            ViewMode::Transcript
+        };
     }
 
     pub fn select_group(&mut self, id: String) {
@@ -1065,6 +1241,61 @@ impl App {
 
     pub fn selected_id(&self) -> Option<String> {
         self.selected_session().map(|s| s.id.clone())
+    }
+
+    fn selected_transcript_needs_refresh(&self) -> bool {
+        let Some(id) = self.selection.session_id() else {
+            return false;
+        };
+        self.transcript_session.as_deref() != Some(id)
+    }
+
+    fn selected_hydration_request(&self) -> Option<SessionHydrationRequest> {
+        let id = self.selection.session_id()?.to_string();
+        let needs_history = self
+            .selected_session()
+            .map(|s| s.has_pty && !self.histories.contains_key(&s.id))
+            .unwrap_or(false);
+        Some(SessionHydrationRequest {
+            socket: self.client.socket_path().to_path_buf(),
+            session_id: id,
+            needs_history,
+            terminal_pane_size: self.terminal_pane_size,
+        })
+    }
+
+    async fn apply_session_hydration(&mut self, hydration: SessionHydration) {
+        if self.selection.session_id() != Some(hydration.session_id.as_str()) {
+            return;
+        }
+
+        self.transcript = hydration.transcript;
+        self.transcript_session = Some(hydration.session_id.clone());
+        self.transcript_scroll = u16::MAX;
+
+        if let Some(history) = hydration.history {
+            self.histories
+                .insert(hydration.session_id.clone(), history);
+            let (cols, rows) = self.terminal_pane_size;
+            let _ = self
+                .client
+                .pty_resize(&hydration.session_id, cols, rows)
+                .await;
+        }
+        if let Some(state) = hydration.editor_state {
+            self.editor_states
+                .insert(hydration.session_id.clone(), state);
+        }
+        if let Some(status) = hydration.agent_status {
+            self.agent_statuses
+                .insert(hydration.session_id.clone(), status);
+        }
+        if let Some(msg) = hydration.status_messages.last() {
+            self.set_status(msg.clone());
+        }
+        if self.selection.session_id() == Some(hydration.session_id.as_str()) {
+            self.start_session_transition();
+        }
     }
 
     /// Materialize the rendered list: ungrouped sessions (sorted by
@@ -1395,7 +1626,6 @@ impl App {
             ListItem::Session { summary, .. } => self.select_session(summary.id.clone()),
             ListItem::GroupHeader { group, .. } => self.select_group(group.id.clone()),
         }
-        self.refresh_selected_transcript().await;
     }
 
     /// After any list mutation, make sure `self.selection` still refers to
@@ -2600,7 +2830,6 @@ impl App {
         match &items[idx] {
             ListItem::Session { summary, .. } => {
                 self.select_session(summary.id.clone());
-                self.refresh_selected_transcript().await;
             }
             ListItem::GroupHeader { group, .. } => {
                 let id = group.id.clone();
@@ -2656,7 +2885,6 @@ impl App {
             }
             // Body click: select + drop focus into the view.
             self.select_session(id.clone());
-            self.refresh_selected_transcript().await;
             self.collapse_orchestrator_panel_on_focus_change();
             self.focus = PaneFocus::View;
             return;
@@ -3550,7 +3778,6 @@ impl App {
                                 .insert(id.clone(), crate::pty_render::ItemHistory::new());
                         }
                         self.select_session(id);
-                        self.refresh_selected_transcript().await;
                         self.focus = PaneFocus::View;
                     }
                     Err(e) => self.set_status(format!("create failed: {e}")),
@@ -4369,6 +4596,124 @@ mod tests {
         assert!(!is_list_visible_session(&summary_with_kind(
             agentd_protocol::SessionKind::Subagent
         )));
+    }
+
+    #[tokio::test]
+    async fn background_hydration_does_not_block_primary_client_rpc() {
+        use agentd_client::Client;
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use std::sync::Arc;
+        use tempfile::tempdir;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use tokio::sync::{mpsc, Notify};
+
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let release_transcript = Arc::new(Notify::new());
+        let (transcript_seen_tx, mut transcript_seen_rx) = mpsc::unbounded_channel();
+        let release_for_server = release_transcript.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let release = release_for_server.clone();
+                let transcript_seen_tx = transcript_seen_tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let Ok(n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let result = match method {
+                            ipc_method::PING => {
+                                serde_json::json!({"pong": true, "version": "test"})
+                            }
+                            ipc_method::SESSION_TRANSCRIPT => {
+                                let _ = transcript_seen_tx.send(());
+                                release.notified().await;
+                                let events: Vec<Value> = (0..2_000)
+                                    .map(|i| {
+                                        serde_json::json!({
+                                            "seq": i + 1,
+                                            "at": "2026-05-21T00:00:00Z",
+                                            "event": {
+                                                "type": "pty",
+                                                "data": base64::Engine::encode(
+                                                    &base64::engine::general_purpose::STANDARD,
+                                                    format!("line {i}\r\n")
+                                                )
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                serde_json::json!({"events": events, "total": 2_000})
+                            }
+                            ipc_method::SESSION_PTY_REPLAY => {
+                                serde_json::json!({"data": "", "size": {"cols": 80, "rows": 24}})
+                            }
+                            _ => Value::Null,
+                        };
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": result,
+                        });
+                        if writer
+                            .write_all((resp.to_string() + "\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = Client::connect(&sock).await.expect("primary client connects");
+        let hydration = tokio::spawn(load_session_hydration(SessionHydrationRequest {
+            socket: sock.clone(),
+            session_id: "s-big".to_string(),
+            needs_history: true,
+            terminal_pane_size: (80, 24),
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), transcript_seen_rx.recv())
+            .await
+            .expect("hydration transcript request should reach mock daemon")
+            .expect("transcript request marker");
+
+        let ping = tokio::time::timeout(std::time::Duration::from_millis(100), client.ping())
+            .await
+            .expect("primary client RPC should not wait for hydration transcript")
+            .expect("ping should succeed");
+        assert!(ping.pong);
+
+        release_transcript.notify_waiters();
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(2), hydration)
+            .await
+            .expect("hydration should finish")
+            .expect("hydration task should join")
+            .expect("hydration should succeed");
+        assert_eq!(loaded.session_id, "s-big");
+        assert_eq!(loaded.transcript.len(), 2_000);
+
+        server.abort();
     }
 
     /// REGRESSION: a TUI re-attaching to an existing zarvis session
