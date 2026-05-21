@@ -971,6 +971,16 @@ pub struct RemoteStartParams {
     pub local_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Tunnel mode normally waits for cloudflared's public URL before
+    /// replying. Interactive clients can set this false to get an
+    /// immediate localhost result, paint a progress dialog, then poll
+    /// again with waiting enabled in the background.
+    #[serde(default = "default_true")]
+    pub wait_for_tunnel: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Result of the `remote.start` IPC method. Always reflects what

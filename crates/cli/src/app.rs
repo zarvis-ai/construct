@@ -4,8 +4,8 @@ use crate::keymap::{self, ChordState, KeyAction, Keymap, KeymapResult, Profile};
 use crate::ui;
 use agentd_client::Client;
 use agentd_protocol::{
-    EventNotificationPayload, GroupSummary, HarnessInfo, SessionEvent, SessionSummary,
-    StateNotificationPayload, TimestampedEvent, Request,
+    EventNotificationPayload, GroupSummary, HarnessInfo, Request, SessionEvent, SessionSummary,
+    StateNotificationPayload, TimestampedEvent,
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -345,6 +345,8 @@ pub struct App {
     /// remote-WS deployment. `Some` while open, `None` otherwise.
     /// Dismissed with Esc the same way `tasks_popup` is.
     pub remote_control_popup: Option<RemoteControlPopup>,
+    pub remote_control_task:
+        Option<tokio::task::JoinHandle<(bool, Result<agentd_protocol::RemoteStartResult>)>>,
     /// Per-session input editor state, fed by `SessionEvent::EditorState`
     /// from the adapter (currently zarvis interactive). Drives the
     /// fixed bottom input pane.
@@ -475,8 +477,7 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
                         .unwrap_or(req.terminal_pane_size);
                     h.set_pty_size(cols, rows);
                     use base64::Engine;
-                    if let Ok(bytes) =
-                        base64::engine::general_purpose::STANDARD.decode(&snap.data)
+                    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&snap.data)
                     {
                         h.feed_pty(&bytes);
                     }
@@ -578,6 +579,7 @@ pub struct TasksPopup {
 /// which is the fix for the "tunnel is warming up" UX trap.
 #[derive(Debug, Clone)]
 pub enum RemoteControlPopup {
+    Starting(RemoteControlOk),
     Ok(RemoteControlOk),
     Err {
         /// Which slash was invoked, so the title still reads
@@ -860,6 +862,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         orchestrator_desired_size: None,
         tasks_popup: None,
         remote_control_popup: None,
+        remote_control_task: None,
         terminal_pane_size: (100, 30),
         zoom: initial_zoom,
         list_scroll_offset: 0,
@@ -983,6 +986,7 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
     let mut hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
     while !app.should_quit {
         app.prune_finished_transitions();
+        app.poll_remote_control_task().await;
         terminal.draw(|f| ui::render(f, app))?;
 
         // A session switch should stay interactive while history-sized
@@ -1274,8 +1278,7 @@ impl App {
         self.transcript_scroll = u16::MAX;
 
         if let Some(history) = hydration.history {
-            self.histories
-                .insert(hydration.session_id.clone(), history);
+            self.histories.insert(hydration.session_id.clone(), history);
             let (cols, rows) = self.terminal_pane_size;
             let _ = self
                 .client
@@ -1469,7 +1472,10 @@ impl App {
         let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
         match self.client.transcript(id, 0, None).await {
             Ok(t) => {
-                if t.events.iter().any(|ev| matches!(ev.event, SessionEvent::Pty { .. })) {
+                if t.events
+                    .iter()
+                    .any(|ev| matches!(ev.event, SessionEvent::Pty { .. }))
+                {
                     // New daemons persist PTY events in the transcript as ordering
                     // markers. Prefer rebuilding from those markers so transcript-only
                     // items (zarvis tool blocks) are interleaved with the raw bytes in
@@ -1676,7 +1682,9 @@ impl App {
                             self.agent_statuses.remove(&payload.session_id);
                             self.pty_activity.remove(&payload.session_id);
                             self.matrix_rain.forget_session(&payload.session_id);
-                            if Some(payload.session_id.as_str()) == self.transcript_session.as_deref() {
+                            if Some(payload.session_id.as_str())
+                                == self.transcript_session.as_deref()
+                            {
                                 self.transcript.clear();
                                 self.transcript_scroll = u16::MAX;
                             }
@@ -1717,8 +1725,7 @@ impl App {
                                 history.feed_pty(b);
                             }
                             // Mark the session as freshly active for the spinner.
-                            self.pty_activity
-                                .insert(payload.session_id.clone(), now);
+                            self.pty_activity.insert(payload.session_id.clone(), now);
                             // PTY-only harnesses (codex/claude in interactive
                             // mode, shell) don't emit structured ToolUse/Status
                             // events while working, so feed the matrix-rain
@@ -1902,9 +1909,8 @@ impl App {
             }
             m if m == agentd_protocol::ipc_notif::REMOTE_STATE => {
                 if let Some(p) = n.params {
-                    if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::RemoteStateNotificationPayload,
-                    >(p)
+                    if let Ok(payload) =
+                        serde_json::from_value::<agentd_protocol::RemoteStateNotificationPayload>(p)
                     {
                         self.remote_clients = payload.clients;
                     }
@@ -2166,10 +2172,8 @@ impl App {
                     let delta = anchor_row as i32 - ev.row as i32;
                     let raw = (anchor_h as i32 + delta).max(MATRIX_RAIN_H_MIN as i32) as u16;
                     let available = self.matrix_rain_available_height().unwrap_or(raw);
-                    self.matrix_rain_h = Some(crate::ui::matrix_rain_panel_height(
-                        Some(raw),
-                        available,
-                    ));
+                    self.matrix_rain_h =
+                        Some(crate::ui::matrix_rain_panel_height(Some(raw), available));
                 } else if let Some(sel) = self.text_selection.as_mut() {
                     sel.head = ScreenPoint {
                         col: ev.column,
@@ -2180,11 +2184,10 @@ impl App {
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                let was_resizing =
-                    self.resizing_list.is_some()
-                        || self.resizing_pin_strip.is_some()
-                        || self.resizing_orchestrator_panel.is_some()
-                        || self.resizing_matrix_rain.is_some();
+                let was_resizing = self.resizing_list.is_some()
+                    || self.resizing_pin_strip.is_some()
+                    || self.resizing_orchestrator_panel.is_some()
+                    || self.resizing_matrix_rain.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
                 self.resizing_orchestrator_panel = None;
@@ -2295,13 +2298,7 @@ impl App {
             self.minibuffer.as_ref().map(|m| &m.intent),
             Some(MinibufferIntent::Orchestrator)
         );
-        selection_bounds_for_layout(
-            &self.layout,
-            pinned_count,
-            is_orchestrator_panel,
-            col,
-            row,
-        )
+        selection_bounds_for_layout(&self.layout, pinned_count, is_orchestrator_panel, col, row)
     }
 
     /// True if `(col, row)` sits on the main view's bottom border
@@ -2558,11 +2555,7 @@ impl App {
         url_hit_in_frame(&self.frame_text, col, row, bounds)
     }
 
-    fn url_click_bounds(
-        &self,
-        col: u16,
-        row: u16,
-    ) -> Option<ratatui::layout::Rect> {
+    fn url_click_bounds(&self, col: u16, row: u16) -> Option<ratatui::layout::Rect> {
         fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
         }
@@ -2794,12 +2787,15 @@ impl App {
         // of the list pane focus the list but do NOT count as a row
         // click — without this guard, clicks past the last visible
         // item would map to phantom indices when items overflow.
-        let items_area = self.layout.list_items_area.unwrap_or(ratatui::layout::Rect {
-            x: list.x,
-            y: list.y.saturating_add(1),
-            width: list.width,
-            height: list.height.saturating_sub(2),
-        });
+        let items_area = self
+            .layout
+            .list_items_area
+            .unwrap_or(ratatui::layout::Rect {
+                x: list.x,
+                y: list.y.saturating_add(1),
+                width: list.width,
+                height: list.height.saturating_sub(2),
+            });
         if row < items_area.y || row >= items_area.y + items_area.height {
             return;
         }
@@ -3094,12 +3090,7 @@ impl App {
     }
 
     fn should_autofocus_view_from_list(&self, key: KeyEvent) -> bool {
-        should_autofocus_view_from_list(
-            self.focus,
-            self.zoom,
-            self.chord_state.is_empty(),
-            key,
-        )
+        should_autofocus_view_from_list(self.focus, self.zoom, self.chord_state.is_empty(), key)
     }
 
     /// True when keystrokes should be forwarded to the session's PTY by
@@ -3977,7 +3968,11 @@ impl App {
                 self.matrix_rain_hidden = !self.matrix_rain_hidden;
                 self.set_status(format!(
                     "matrix rain {}",
-                    if self.matrix_rain_hidden { "hidden" } else { "shown" }
+                    if self.matrix_rain_hidden {
+                        "hidden"
+                    } else {
+                        "shown"
+                    }
                 ));
             }
             "border" => {
@@ -4086,9 +4081,9 @@ impl App {
                         }
                     }
                     "" => self.set_status("agentd: subcommand required (e.g. `restart`)".into()),
-                    other => {
-                        self.set_status(format!("agentd: unknown subcommand '{other}'; try `restart`"))
-                    }
+                    other => self.set_status(format!(
+                        "agentd: unknown subcommand '{other}'; try `restart`"
+                    )),
                 }
             }
             other => self.set_status(format!("unknown command: {other}")),
@@ -4130,26 +4125,87 @@ impl App {
     /// returns the local `ws://127.0.0.1` URL immediately, never
     /// touches cloudflared. Useful for desktop-browser smoke tests
     /// and CI.
-    pub async fn open_remote_control_popup(
+    pub async fn open_remote_control_popup(&mut self, local_only: bool, password: Option<String>) {
+        if let Some(task) = self.remote_control_task.take() {
+            task.abort();
+        }
+        if local_only {
+            match self.client.remote_start(local_only, password).await {
+                Ok(r) => self.apply_remote_control_result(local_only, r, false),
+                Err(e) => {
+                    self.remote_control_popup = Some(RemoteControlPopup::Err {
+                        local_only,
+                        message: e.to_string(),
+                    });
+                }
+            }
+            return;
+        }
+
+        match self
+            .client
+            .remote_start_with_wait(false, password.clone(), false)
+            .await
+        {
+            Ok(r) => self.apply_remote_control_result(false, r, true),
+            Err(e) => {
+                self.remote_control_popup = Some(RemoteControlPopup::Err {
+                    local_only: false,
+                    message: e.to_string(),
+                });
+                return;
+            }
+        }
+
+        let client = self.client.clone();
+        self.remote_control_task = Some(tokio::spawn(async move {
+            let result = client.remote_start_with_wait(false, password, true).await;
+            (false, result)
+        }));
+    }
+
+    fn apply_remote_control_result(
         &mut self,
         local_only: bool,
-        password: Option<String>,
+        r: agentd_protocol::RemoteStartResult,
+        starting: bool,
     ) {
-        match self.client.remote_start(local_only, password).await {
-            Ok(r) => {
-                self.remote_control_popup = Some(RemoteControlPopup::Ok(RemoteControlOk {
-                    url: r.url,
-                    qr: r.qr,
-                    tunnel_ready: r.tunnel_ready,
-                    password: r.password,
-                    hint: r.hint,
-                    local_only,
-                }));
-            }
-            Err(e) => {
+        let ok = RemoteControlOk {
+            url: r.url,
+            qr: r.qr,
+            tunnel_ready: r.tunnel_ready,
+            password: r.password,
+            hint: r.hint,
+            local_only,
+        };
+        self.remote_control_popup = Some(if starting {
+            RemoteControlPopup::Starting(ok)
+        } else {
+            RemoteControlPopup::Ok(ok)
+        });
+    }
+
+    async fn poll_remote_control_task(&mut self) {
+        let Some(task) = self.remote_control_task.as_mut() else {
+            return;
+        };
+        let Some(joined) = task.now_or_never() else {
+            return;
+        };
+        self.remote_control_task = None;
+        match joined {
+            Ok((local_only, Ok(r))) => self.apply_remote_control_result(local_only, r, false),
+            Ok((local_only, Err(e))) => {
                 self.remote_control_popup = Some(RemoteControlPopup::Err {
                     local_only,
                     message: e.to_string(),
+                });
+            }
+            Err(e) if e.is_cancelled() => {}
+            Err(e) => {
+                self.remote_control_popup = Some(RemoteControlPopup::Err {
+                    local_only: false,
+                    message: format!("remote-control task failed: {e}"),
                 });
             }
         }
@@ -4161,6 +4217,9 @@ impl App {
     /// was running to stop". Also auto-dismisses any open
     /// `/remote-control` popup since the URL it shows is now dead.
     pub async fn stop_remote_control(&mut self) {
+        if let Some(task) = self.remote_control_task.take() {
+            task.abort();
+        }
         match self.client.remote_stop().await {
             Ok(r) if r.was_running => {
                 self.remote_control_popup = None;
@@ -4348,13 +4407,12 @@ fn url_hit_in_frame(
     bounds: ratatui::layout::Rect,
 ) -> Option<UrlHit> {
     let (text, positions) = wrapped_text_with_positions(frame_text, bounds);
-    let idx = positions.iter().position(|p| p.col == col && p.row == row)?;
+    let idx = positions
+        .iter()
+        .position(|p| p.col == col && p.row == row)?;
     let (start, end, url) = url_range_at_col(&text, idx)?;
     let ranges = url_line_ranges(&positions[start..end]);
-    Some(UrlHit {
-        url,
-        ranges,
-    })
+    Some(UrlHit { url, ranges })
 }
 
 fn wrapped_text_with_positions(
@@ -4699,7 +4757,9 @@ mod tests {
             }
         });
 
-        let client = Client::connect(&sock).await.expect("primary client connects");
+        let client = Client::connect(&sock)
+            .await
+            .expect("primary client connects");
         let hydration = tokio::spawn(load_session_hydration(SessionHydrationRequest {
             socket: sock.clone(),
             session_id: "s-big".to_string(),
@@ -5214,7 +5274,11 @@ fn encode_key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
                 Some(c.encode_utf8(&mut buf).as_bytes().to_vec())
             }
         }
-        KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+        KeyCode::Enter
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+        {
             Some(vec![b'\n'])
         }
         KeyCode::Enter => Some(vec![b'\r']),
@@ -5266,7 +5330,10 @@ fn should_autofocus_view_from_list(
     if !chord_is_empty {
         return false;
     }
-    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
         return false;
     }
     matches!(key.code, KeyCode::Char(c) if c.is_ascii_alphabetic())

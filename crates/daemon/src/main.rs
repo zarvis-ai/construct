@@ -145,6 +145,7 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
                     let params = agentd_protocol::RemoteStartParams {
                         local_only: false,
                         password: None,
+                        wait_for_tunnel: true,
                     };
                     if let Err(e) = mgr.start_remote(Some(port), params).await {
                         tracing::error!(error = %e, "boot-time start_remote failed");
@@ -169,6 +170,7 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
             let params = agentd_protocol::RemoteStartParams {
                 local_only: false,
                 password: None,
+                wait_for_tunnel: true,
             };
             // port_hint=None — the supervisor reads the snapshot
             // and uses snapshot.port instead.
