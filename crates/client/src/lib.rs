@@ -161,6 +161,15 @@ impl Client {
     pub async fn remote_stop(&self) -> Result<agentd_protocol::RemoteStopResult> {
         self.request(ipc_method::REMOTE_STOP, &serde_json::Value::Null).await
     }
+    /// Restart the daemon in place (exec self). The IPC connection
+    /// is closed by the kernel during exec(), so the reply is the
+    /// last thing this client sees — the call will likely error on
+    /// the recv side with "broken pipe". Callers should treat any
+    /// reply (Ok or `BrokenPipe`-style error) as "restart in flight"
+    /// and re-attempt connect with backoff.
+    pub async fn daemon_restart(&self) -> Result<agentd_protocol::DaemonRestartResult> {
+        self.request(ipc_method::DAEMON_RESTART, &serde_json::Value::Null).await
+    }
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
         self.request(ipc_method::SESSION_LIST, &serde_json::Value::Null).await
     }

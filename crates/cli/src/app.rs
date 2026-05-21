@@ -3790,6 +3790,52 @@ impl App {
                     .collect();
                 self.set_status(format!("harnesses: {}", names.join(", ")));
             }
+            "agentd" => {
+                // Subcommand dispatch:
+                //
+                //   /agentd restart   → daemon.restart (exec self)
+                //
+                // Other subcommands are reserved for future use
+                // (e.g. `/agentd info` to print build version). The
+                // daemon.restart RPC will close the IPC connection
+                // as the new process replaces the old; the TUI
+                // observes that as a "daemon disconnected" status
+                // and the user must re-run `agent` to reconnect
+                // (auto-reconnect is follow-up work, see issue #90).
+                let sub = arg.trim();
+                match sub {
+                    "restart" => {
+                        match self.client.daemon_restart().await {
+                            Ok(r) => self.set_status(format!(
+                                "agentd: restart requested (exe={}, pid={}) — reconnect when ready",
+                                r.exe, r.pid
+                            )),
+                            // BrokenPipe / connection closed is the
+                            // expected outcome — the daemon execs
+                            // before fully writing the reply on
+                            // some platforms. Treat it as success.
+                            Err(e) => {
+                                let msg = e.to_string().to_lowercase();
+                                if msg.contains("broken pipe")
+                                    || msg.contains("connection reset")
+                                    || msg.contains("eof")
+                                    || msg.contains("closed")
+                                {
+                                    self.set_status(
+                                        "agentd: restart in flight (socket closed) — reconnect when ready".to_string(),
+                                    );
+                                } else {
+                                    self.set_status(format!("agentd restart failed: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    "" => self.set_status("agentd: subcommand required (e.g. `restart`)".into()),
+                    other => {
+                        self.set_status(format!("agentd: unknown subcommand '{other}'; try `restart`"))
+                    }
+                }
+            }
             other => self.set_status(format!("unknown command: {other}")),
         }
     }

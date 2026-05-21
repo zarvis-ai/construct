@@ -82,7 +82,7 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     );
 
     let storage = Arc::new(storage::Storage::new(paths.data_dir.clone())?);
-    let (manager, remote_rx) =
+    let (manager, remote_rx, mut restart_rx) =
         session::SessionManager::new(storage.clone(), Arc::new(config), paths.runtime_dir.clone())
             .await
             .context("init session manager")?;
@@ -156,28 +156,83 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
                 "AGENTD_REMOTE_WS_PORT is not a valid u16; skipping ws listener"
             ),
         }
+    } else if paths.runtime_dir.join("remote.json").exists() {
+        // `/agentd restart` path: the prior daemon had the remote
+        // listener up and persisted a snapshot. Auto-start so the
+        // new daemon picks the port + token + password back up
+        // without waiting for the user to retype `/remote-control`.
+        // Supervisor's `bind_and_install` checks freshness + PID
+        // liveness before adopting; if anything's off it falls
+        // through to mint-fresh + the snapshot file is cleaned up.
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            let params = agentd_protocol::RemoteStartParams {
+                local_only: false,
+                password: None,
+            };
+            // port_hint=None — the supervisor reads the snapshot
+            // and uses snapshot.port instead.
+            if let Err(e) = mgr.start_remote(None, params).await {
+                tracing::warn!(error = %e, "remote snapshot resume failed");
+            }
+        });
     }
 
-    // Race the IPC accept loop against shutdown signals so
-    // SIGTERM/SIGINT drains adapters before exit (gives them a
-    // chance to flush state). SIGHUP exits without touching
-    // adapters so the daemon-reload path doesn't kill running
-    // sessions.
-    tokio::select! {
-        result = server::serve(manager.clone(), socket_path) => result,
-        signal = shutdown_signal() => {
-            match signal {
-                DaemonSignal::Reload => {
-                    tracing::info!("received SIGHUP; exiting without stopping adapters");
-                }
-                DaemonSignal::Terminate => {
-                    tracing::info!("received termination signal; shutting down adapters");
-                    manager.shutdown_adapters().await;
-                }
-            }
+    // Race the IPC accept loop against shutdown signals + the
+    // restart channel:
+    //
+    //   - SIGTERM/SIGINT: drain adapters first (flush state), then
+    //     exit normally.
+    //   - SIGHUP: exit without touching adapters so reload-like
+    //     supervisors don't kill running sessions.
+    //   - daemon.restart RPC: skip adapter drain (the new daemon
+    //     will resume them from on-disk state immediately) and
+    //     `exec()` the current binary in place, picking up any
+    //     on-disk upgrade. PID is preserved; cloudflared (a child
+    //     subprocess) gets killed via `kill_on_drop` and a new
+    //     one is spawned by the new daemon if `/remote-control`
+    //     is re-issued — URL preservation across restart is
+    //     follow-up work, see issue #90 comments.
+    let outcome = tokio::select! {
+        result = server::serve(manager.clone(), socket_path) => MainOutcome::Server(result),
+        signal = shutdown_signal() => MainOutcome::Signal(signal),
+        Some(cmd) = restart_rx.recv() => MainOutcome::Restart(cmd),
+    };
+    match outcome {
+        MainOutcome::Server(r) => r,
+        MainOutcome::Signal(DaemonSignal::Reload) => {
+            tracing::info!("received SIGHUP; exiting without stopping adapters");
             Ok(())
         }
+        MainOutcome::Signal(DaemonSignal::Terminate) => {
+            tracing::info!("received termination signal; shutting down adapters");
+            manager.shutdown_adapters().await;
+            Ok(())
+        }
+        MainOutcome::Restart(cmd) => {
+            tracing::info!(exe = %cmd.exe.display(), "daemon restart requested; exec self");
+            // exec() replaces the process image in place — kernel
+            // closes any FDs marked CLOEXEC (which tokio sockets
+            // are by default), so the IPC + WS listeners are
+            // released cleanly. cloudflared (child subprocess)
+            // is taken down via kill_on_drop as the tokio runtime
+            // tears down. The new daemon will rebind whichever
+            // listeners are configured.
+            //
+            // Returns only on error — successful exec doesn't
+            // return. Surface the error as the daemon's exit
+            // status so the operator sees why the restart failed.
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new(&cmd.exe).args(&cmd.args).exec();
+            Err(anyhow::anyhow!("exec({}) failed: {err}", cmd.exe.display()))
+        }
     }
+}
+
+enum MainOutcome {
+    Server(Result<()>),
+    Signal(DaemonSignal),
+    Restart(crate::session::RestartCommand),
 }
 
 #[derive(Debug, Clone, Copy)]

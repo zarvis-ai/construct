@@ -1123,6 +1123,39 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
+        m if m == ipc_method::DAEMON_RESTART => {
+            // Hand off to main's `tokio::select!` arm which calls
+            // `exec()` on the resolved current_exe. The reply
+            // races the kernel: we send it back here, then the
+            // IPC socket closes when exec() replaces the process
+            // image. Clients detect that as a disconnect and
+            // reconnect.
+            match manager.request_daemon_restart() {
+                Ok(cmd) => {
+                    // Cloudflared survives the daemon's exec()
+                    // because it's spawned in a separate process
+                    // group. The new daemon adopts it via the
+                    // persisted snapshot, so the public URL +
+                    // password stay valid across the restart. We
+                    // report that to the caller — `false` only if
+                    // remote was never running, or if the snapshot
+                    // is missing for some reason.
+                    let tunnel_preserved = manager
+                        .remote_slot()
+                        .ok()
+                        .and_then(|g| g.as_ref().map(|h| h.state.tunnel_pid()))
+                        .map(|pid| pid != 0)
+                        .unwrap_or(false);
+                    let r = agentd_protocol::DaemonRestartResult {
+                        exe: cmd.exe.display().to_string(),
+                        pid: std::process::id(),
+                        tunnel_preserved,
+                    };
+                    ok!(&r)
+                }
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
         other => Response::err(id.clone(), ErrorObject::method_not_found(other)),
     }
 }

@@ -351,6 +351,27 @@ pub struct SessionManager {
     /// `serve_ws_on` directly — see the comment on
     /// `remote_supervisor` for why that indirection is mandatory.
     remote_starter: tokio::sync::mpsc::UnboundedSender<crate::remote_supervisor::SupervisorMsg>,
+    /// Where the supervisor writes (and the next-boot supervisor
+    /// reads) the `RemoteSnapshot`. Lives under `runtime_dir`
+    /// because it's tightly coupled to the live cloudflared PID;
+    /// `XDG_RUNTIME_DIR` is the natural home for such files.
+    remote_snapshot_path: PathBuf,
+    /// Sender side of the daemon-restart channel. Holding `Some`
+    /// means `daemon.restart` has been issued and main's
+    /// `tokio::select!` should observe it and `exec()` the current
+    /// binary. `RestartCommand` carries the resolved exe path so
+    /// the reply to the RPC caller can echo what's about to load.
+    restart_tx: tokio::sync::mpsc::UnboundedSender<RestartCommand>,
+}
+
+/// Payload of a `daemon.restart` request, sent from the IPC
+/// handler to the main loop. Main resolves the current_exe + args
+/// before the runtime tear-down so the reply can echo what's
+/// about to load.
+#[derive(Debug, Clone)]
+pub struct RestartCommand {
+    pub exe: PathBuf,
+    pub args: Vec<String>,
 }
 
 /// Daemon-local sidecar for an active remote-WS deployment. Holds
@@ -382,6 +403,7 @@ impl SessionManager {
     ) -> Result<(
         Self,
         tokio::sync::mpsc::UnboundedReceiver<crate::remote_supervisor::SupervisorMsg>,
+        tokio::sync::mpsc::UnboundedReceiver<RestartCommand>,
     )> {
         let summaries = storage.list_summaries()?;
         let mut sessions = HashMap::new();
@@ -460,6 +482,8 @@ impl SessionManager {
         let adapter_runtime_dir = runtime_dir.join("adapters");
         std::fs::create_dir_all(&adapter_runtime_dir).ok();
         let (remote_tx, remote_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
+        let remote_snapshot_path = runtime_dir.join("remote.json");
         Ok((
             Self {
                 storage,
@@ -472,9 +496,36 @@ impl SessionManager {
                 is_shutting_down: AtomicBool::new(false),
                 remote: std::sync::Mutex::new(None),
                 remote_starter: remote_tx,
+                remote_snapshot_path,
+                restart_tx,
             },
             remote_rx,
+            restart_rx,
         ))
+    }
+
+    /// Path where the supervisor reads / writes the remote
+    /// `RemoteSnapshot`. Exposed so the supervisor can hand it to
+    /// `RemoteState::with_snapshot_path`.
+    pub(crate) fn remote_snapshot_path(&self) -> PathBuf {
+        self.remote_snapshot_path.clone()
+    }
+
+    /// Request a daemon restart. Resolves the current exe and
+    /// args, sends a `RestartCommand` to main's restart channel,
+    /// and returns the command so the IPC handler can echo it
+    /// back to the caller before the runtime tears down. Returns
+    /// `Err` if `current_exe()` fails or the receiver was dropped
+    /// (which shouldn't happen — main holds it for the daemon's
+    /// lifetime).
+    pub fn request_daemon_restart(&self) -> Result<RestartCommand> {
+        let exe = std::env::current_exe().context("resolve current_exe")?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let cmd = RestartCommand { exe, args };
+        self.restart_tx
+            .send(cmd.clone())
+            .map_err(|_| anyhow::anyhow!("restart channel closed"))?;
+        Ok(cmd)
     }
 
     /// Access to the remote-handle slot. Used by the supervisor
@@ -2811,7 +2862,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
         let config = Arc::new(crate::config::Config::default());
-        let (mgr, _remote_rx) = SessionManager::new(storage, config, tmp.path().join("run"))
+        let (mgr, _remote_rx, _restart_rx) = SessionManager::new(storage, config, tmp.path().join("run"))
             .await
             .expect("session manager");
         let manager = Arc::new(mgr);

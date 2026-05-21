@@ -20,8 +20,59 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::remote::RemoteState;
+use crate::remote::{process_alive, RemoteSnapshot, RemoteState};
 use crate::session::{RemoteHandle, SessionManager};
+
+/// Snapshots older than this are treated as stale and ignored
+/// at restore time. The `/agentd restart` gap is sub-second on
+/// healthy systems; minutes give plenty of headroom for slow
+/// hardware, swap, or a paused-with-debugger restart, while
+/// rejecting yesterday's leftover snapshot from a long-dead
+/// daemon.
+const SNAPSHOT_MAX_AGE_SECS: u64 = 300;
+
+/// Inspect the snapshot file at `path`. Returns `Some(snap)` iff
+/// the file exists, parses, is fresh, AND the cloudflared PID it
+/// records is still alive (so the URL is actually adoptable).
+/// Returns `None` in every other case — boot-time "no snapshot"
+/// and "stale/dead snapshot" both fall through to fresh-mint.
+///
+/// On stale-or-dead, the file is deleted as a side effect so a
+/// later boot doesn't keep retrying a hopeless adoption.
+fn load_restore_snapshot(path: &std::path::Path) -> Option<RemoteSnapshot> {
+    let snap = match RemoteSnapshot::read(path) {
+        Ok(Some(s)) => s,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "remote snapshot read failed; ignoring");
+            // Best-effort cleanup of an unreadable snapshot so it
+            // doesn't keep producing warnings on every boot.
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if !snap.fresh_enough(now, SNAPSHOT_MAX_AGE_SECS) {
+        tracing::info!(
+            age_secs = now.saturating_sub(snap.generated_at),
+            "remote snapshot is stale; minting fresh credentials"
+        );
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    if snap.tunnel_pid != 0 && !process_alive(snap.tunnel_pid) {
+        tracing::info!(
+            pid = snap.tunnel_pid,
+            "snapshot's cloudflared PID is gone; minting fresh credentials"
+        );
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    Some(snap)
+}
 
 /// Supervisor command set. `Start` is the `/remote-control` /
 /// `/remote-control-debug` path; `Stop` is the `/remote-stop`
@@ -143,9 +194,15 @@ async fn handle_start(
     // cloudflared with the (new) token.
     if spawn_tunnel && tunnel_task.is_none() {
         if std::env::var("AGENTD_REMOTE_NO_TUNNEL").is_err() {
+            // `adopt_pid` is non-zero only after a `/agentd
+            // restart`: the snapshot captured a still-running
+            // cloudflared PID and `bind_and_install` rehydrated
+            // the state from it. `tunnel::run` watches that PID
+            // and falls back to spawning only when it dies.
+            let adopt_pid = state.tunnel_pid();
             let st = state.clone();
             let handle = tokio::spawn(async move {
-                crate::tunnel::run(st, port).await;
+                crate::tunnel::run(st, port, adopt_pid).await;
             });
             *tunnel_task = Some(handle);
         } else {
@@ -165,23 +222,36 @@ async fn handle_stop(
 ) -> StopOutcome {
     // Clear the manager's slot first so any concurrent IPC method
     // sees "not running" before we abort the loops underneath.
-    let was_running = {
+    // Capture the cloudflared PID + state for cleanup after the
+    // slot is empty (cloudflared is in its own process group, so
+    // aborting the tokio task no longer takes the subprocess down
+    // — we have to SIGTERM by PID).
+    let (was_running, tunnel_pid, state_for_cleanup) = {
         let mut guard = manager.remote_slot().expect("remote mutex poisoned");
-        guard.take().is_some()
+        let pid = guard.as_ref().map(|h| h.state.tunnel_pid()).unwrap_or(0);
+        let state = guard.as_ref().map(|h| h.state.clone());
+        let was = guard.take().is_some();
+        (was, pid, state)
     };
-    // Abort cloudflared first — once its task is gone, the
-    // subprocess dies (kill_on_drop) and the public URL stops
-    // resolving at Cloudflare's edge. Then abort the WS accept
-    // loop, which drops the `TcpListener` and stops accepting new
-    // connections. Existing per-connection tasks aren't tracked
-    // individually; they exit naturally once the client disconnects
-    // (typical timeout: minutes) or sooner once cloudflared
-    // tears the tunnel down.
+    if tunnel_pid != 0 {
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+        match kill(Pid::from_raw(tunnel_pid as i32), Signal::SIGTERM) {
+            Ok(()) => tracing::info!(pid = tunnel_pid, "sent SIGTERM to cloudflared"),
+            Err(e) => tracing::warn!(error = %e, pid = tunnel_pid, "SIGTERM cloudflared failed"),
+        }
+    }
     if let Some(h) = tunnel_task.take() {
         h.abort();
     }
     if let Some(h) = ws_task.take() {
         h.abort();
+    }
+    // Delete the on-disk snapshot so the next daemon boot doesn't
+    // try to adopt the (now-killed) URL. Idempotent — missing
+    // file is fine.
+    if let Some(state) = state_for_cleanup {
+        state.clear_persisted();
     }
     // Broadcast `remote/state` with clients=0 so the local TUI
     // drops its `[● remote: N]` badge even if individual per-
@@ -206,12 +276,46 @@ async fn bind_and_install(
     port_hint: Option<u16>,
     password: Option<String>,
 ) -> Result<(RemoteState, u16)> {
-    let bind_addr = format!("127.0.0.1:{}", port_hint.unwrap_or(0));
+    let snapshot_path = manager.remote_snapshot_path();
+    // Try restoring from a freshly-written snapshot whose
+    // cloudflared PID is still alive — that's the `/agentd
+    // restart` path. If anything is off (no file, stale, PID
+    // gone), mint fresh as usual. The user-supplied `password`
+    // override is honored only for fresh starts; on restore the
+    // existing password is preserved (the user expects same URL
+    // + same pw on restart).
+    let restored = load_restore_snapshot(&snapshot_path);
+    let (bind_port, snapshot_pid) = match &restored {
+        Some(snap) => (Some(snap.port), snap.tunnel_pid),
+        None => (port_hint, 0),
+    };
+    let bind_addr = format!("127.0.0.1:{}", bind_port.unwrap_or(0));
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("bind WS listener {bind_addr}"))?;
     let port = listener.local_addr().context("query bound port")?.port();
-    let state = RemoteState::with_password(password);
+    let state = match restored {
+        Some(snap) => {
+            tracing::info!(
+                token_prefix = &snap.token[..8.min(snap.token.len())],
+                port = snap.port,
+                tunnel_pid = snap.tunnel_pid,
+                tunnel_url = ?snap.tunnel_url,
+                "remote: restored from snapshot — preserving URL + password"
+            );
+            RemoteState::from_snapshot(&snap).with_snapshot_path(snapshot_path)
+        }
+        None => RemoteState::with_password(password).with_snapshot_path(snapshot_path),
+    };
+    // Record the (possibly fresh) port — restore already has it
+    // but it's idempotent + ensures the snapshot file gets a
+    // post-bind write.
+    state.set_port(port).await;
+    // Carry the snapshot's tunnel_pid forward so the supervisor's
+    // tunnel-spawn step picks "adopt" vs "spawn fresh".
+    if snapshot_pid != 0 {
+        state.set_tunnel_pid(snapshot_pid).await;
+    }
     tracing::info!(
         port,
         url = %format!("http://127.0.0.1:{port}/t/{}", state.token()),

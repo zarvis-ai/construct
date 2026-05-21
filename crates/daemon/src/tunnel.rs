@@ -27,14 +27,22 @@ use anyhow::{anyhow, Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use crate::remote::RemoteState;
+use crate::remote::{process_alive, RemoteState};
 
 /// Long-running supervisor. Loops forever; designed to be
 /// `tokio::spawn`ed once from `main` alongside the WS listener.
 /// On cloudflared death the tunnel URL is cleared on `remote`
 /// before respawning so connected clients can tell the URL is
 /// stale.
-pub async fn run(remote: RemoteState, local_port: u16) {
+///
+/// `adopt_pid != 0`: skip the initial spawn and instead watch
+/// the already-running cloudflared with that PID — the
+/// `/agentd restart` path. cloudflared was spawned by the prior
+/// daemon in its own process group, survived the daemon's
+/// `exec()`, and the URL it terminates is still valid. We just
+/// poll its liveness; once it dies, fall through to the spawn
+/// loop with a fresh URL.
+pub async fn run(remote: RemoteState, local_port: u16, adopt_pid: u32) {
     if which::which("cloudflared").is_err() {
         tracing::info!(
             "cloudflared not found on PATH; remote tunnel disabled. \
@@ -43,6 +51,26 @@ pub async fn run(remote: RemoteState, local_port: u16) {
              daemon over the internet."
         );
         return;
+    }
+
+    if adopt_pid != 0 && process_alive(adopt_pid) {
+        let adopted_url = remote.tunnel_url().await;
+        tracing::info!(
+            pid = adopt_pid,
+            url = adopted_url.as_deref().unwrap_or("(unknown)"),
+            "adopting existing cloudflared tunnel across restart"
+        );
+        // The adopted PID is NOT a child of this daemon (it was
+        // a child of the prior daemon, now reparented to init
+        // because of `setsid`). We can't `wait()` on it, so we
+        // poll with `kill(pid, 0)` every 2s. The polling overhead
+        // is negligible compared to keeping the URL alive.
+        while process_alive(adopt_pid) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        tracing::warn!(pid = adopt_pid, "adopted cloudflared exited; spawning fresh");
+        remote.set_tunnel_url(None).await;
+        remote.set_tunnel_pid(0).await;
     }
 
     let mut backoff_secs: u64 = 1;
@@ -57,6 +85,7 @@ pub async fn run(remote: RemoteState, local_port: u16) {
             }
         }
         remote.set_tunnel_url(None).await;
+        remote.set_tunnel_pid(0).await;
         tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
         backoff_secs = (backoff_secs * 2).min(30);
     }
@@ -72,12 +101,24 @@ async fn run_once(remote: &RemoteState, local_port: u16) -> Result<()> {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        // If the daemon dies, kill the subprocess too — otherwise
-        // a crashed daemon would leak a public tunnel into the
-        // ether.
-        .kill_on_drop(true)
+        // Detach into a new process group so cloudflared survives
+        // the daemon's `exec()` on `/agentd restart`. With this,
+        // the new daemon adopts the still-running subprocess and
+        // the public URL stays valid across the restart.
+        //
+        // `kill_on_drop` defaults to false — we explicitly SIGTERM
+        // the recorded PID from `handle_stop` / signal-handlers
+        // when we actually want it gone. A daemon SIGKILL still
+        // leaks the subprocess; that's the trade-off for URL
+        // preservation, and the next daemon boot's "stale
+        // snapshot" check sweeps any orphans.
+        .process_group(0)
         .spawn()
         .context("spawn cloudflared")?;
+    let pid = child.id().unwrap_or(0);
+    if pid != 0 {
+        remote.set_tunnel_pid(pid).await;
+    }
 
     let stderr = child
         .stderr
