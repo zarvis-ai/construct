@@ -346,6 +346,45 @@
     overflow-x: auto;
   }
 
+  .editor-state {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 10px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-elev);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: var(--fg);
+  }
+  .editor-state[hidden] { display: none; }
+  .editor-state .editor-row {
+    display: flex;
+    gap: 6px;
+    min-width: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .editor-state .editor-prompt { color: var(--accent); flex: 0 0 auto; }
+  .editor-state .editor-text { min-width: 0; }
+  .editor-state .editor-cursor {
+    display: inline-block;
+    width: 0.6ch;
+    background: var(--fg);
+    color: var(--bg);
+    animation: editor-cursor-blink 1s steps(1) infinite;
+  }
+  .editor-state .editor-queued { color: var(--fg-dim); }
+  .editor-state .editor-completions {
+    color: var(--fg-faint);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  @keyframes editor-cursor-blink { 50% { opacity: 0; } }
+
   .composer {
     flex: 0 0 auto;
     display: flex;
@@ -803,9 +842,10 @@
           1. transcript    — chat-mode content (zarvis / shell)
           2. terminal-wrap — PTY-mode content (codex / claude /
              zarvis interactive)
-          3. composer      — always visible; sends `session.input`
+          3. editor-state — Zarvis live editor mirror in terminal mode
+          4. composer      — always visible; sends `session.input`
              in both modes
-          4. vkbd          — terminal-mode virtual keyboard
+          5. vkbd          — terminal-mode virtual keyboard
         Mutual exclusion is via the `hidden` attribute set in
         `enterChatMode` / `enterTerminalMode`.
       -->
@@ -814,6 +854,13 @@
         <div class="terminal-host" id="terminal"></div>
         <div class="terminal-loading" id="terminalLoading">loading xterm…</div>
       </div>
+      <!--
+        Zarvis interactive emits structured editor_state events instead
+        of echoing its live input buffer into PTY scrollback. Mirror that
+        state here so remote-control users can see virtual-keyboard and
+        composer-insert typing while terminal mode keeps transcript hidden.
+      -->
+      <div class="editor-state" id="editorState" hidden></div>
       <!--
         Composer: two submit-style buttons. "Insert" writes the
         textarea contents into the session as keystrokes — for
@@ -967,6 +1014,7 @@ const toggleListBtn = $("toggleList");
 const terminalWrapEl = $("terminalWrap");
 const terminalEl = $("terminal");
 const terminalLoadingEl = $("terminalLoading");
+const editorStateEl = $("editorState");
 const vkbdEl = $("vkbd");
 const vkbdSpecialEl = $("vkbdSpecial");
 const vkbdMainEl = $("vkbdMain");
@@ -992,6 +1040,9 @@ const state = {
   // session_id so switching sessions is just a re-render of cached
   // events. Cleared on explicit `Reset` events from the adapter.
   byId: new Map(),
+  // Latest Zarvis editor_state by session id. Claude/Codex/shell do not
+  // emit this and continue to rely on their PTY UI echoing input.
+  editorById: new Map(),
   // Current view mode — "chat" (zarvis-style transcript + composer)
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on the summary's `has_pty` flag.
@@ -1340,6 +1391,7 @@ function enterChatMode() {
   transcriptEl.hidden = false;
   composerEl.hidden = false;
   terminalWrapEl.hidden = true;
+  renderEditorState(null);
   // Virtual keyboard only makes sense over xterm — chat sessions
   // have a text-style editor instead.
   vkbdEl.hidden = true;
@@ -1357,6 +1409,7 @@ async function enterTerminalMode(id) {
   composerEl.hidden = false;
   terminalWrapEl.hidden = false;
   vkbdEl.hidden = false;
+  renderEditorState(state.editorById.get(id) || null);
   // Build the keyboard markup once per session-switch; cheap, and
   // makes future per-session layout customization easy if it ever
   // becomes a thing.
@@ -1861,9 +1914,11 @@ function handleNotification(method, params) {
   } else if (method === "session/deleted") {
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
     renderSessions();
+    state.editorById.delete(params.session_id);
     if (params.session_id === state.currentId) {
       state.currentId = null;
       transcriptEl.innerHTML = "";
+      renderEditorState(null);
       sessionTitleEl.textContent = "";
       refreshListToolbar();
     }
@@ -1908,7 +1963,15 @@ function renderEvent(event, at) {
   // signals that wouldn't otherwise reach the terminal surface. The
   // PTY itself already paints the rest.
   if (state.mode === "terminal") {
-    if (event.type === "reset" && state.term) state.term.reset();
+    if (event.type === "editor_state") {
+      state.editorById.set(state.currentId, event);
+      renderEditorState(event);
+    }
+    if (event.type === "reset") {
+      if (state.term) state.term.reset();
+      state.editorById.delete(state.currentId);
+      renderEditorState(null);
+    }
     if (event.type === "error" && state.term) {
       state.term.write(`\r\n\x1b[31m[error] ${event.message || ""}\x1b[0m\r\n`);
     }
@@ -1932,6 +1995,12 @@ function renderEvent(event, at) {
       break;
     case "reset":
       transcriptEl.innerHTML = "";
+      state.editorById.delete(state.currentId);
+      renderEditorState(null);
+      break;
+    case "editor_state":
+      state.editorById.set(state.currentId, event);
+      renderEditorState(event);
       break;
     case "tool_approval_request":
       // Render as a tool-use card; v1 doesn't yet implement
@@ -1939,7 +2008,7 @@ function renderEvent(event, at) {
       // already useful signal.
       appendToolApproval(event);
       break;
-    // Quietly ignore: editor_state, agent_status, cost, task_*,
+    // Quietly ignore: agent_status, cost, task_*,
     // context_compacted, diff, awaiting_input, done. These map
     // onto richer chrome in the desktop TUI; Phase 2 surfaces
     // only message + tool + raw PTY. A small "(<type>)" line on
@@ -1948,6 +2017,40 @@ function renderEvent(event, at) {
       // Skip silently.
       break;
   }
+}
+
+function renderEditorState(event) {
+  if (!event || state.mode !== "terminal") {
+    editorStateEl.hidden = true;
+    editorStateEl.innerHTML = "";
+    return;
+  }
+  const queued = Array.isArray(event.queued) ? event.queued : [];
+  const completions = Array.isArray(event.completions) ? event.completions : [];
+  const buf = String(event.buf || "");
+  const cursor = Math.max(0, Math.min(Number(event.cursor) || 0, Array.from(buf).length));
+  const active = editorLineHtml("❯", buf, cursor, false);
+  const queuedRows = queued.map((q) => editorLineHtml("↥", String(q), null, true)).join("");
+  const completionRow = completions.length
+    ? `<div class="editor-completions">${escape(completions.join("  "))}</div>`
+    : "";
+  editorStateEl.innerHTML = queuedRows + active + completionRow;
+  editorStateEl.hidden = false;
+}
+
+function editorLineHtml(prompt, text, cursor, queued) {
+  const chars = Array.from(text);
+  let body;
+  if (cursor == null) {
+    body = escape(text);
+  } else {
+    const before = chars.slice(0, cursor).join("");
+    const at = chars[cursor] || " ";
+    const after = chars.slice(cursor + 1).join("");
+    body = `${escape(before)}<span class="editor-cursor">${escape(at)}</span>${escape(after)}`;
+  }
+  const cls = queued ? "editor-row editor-queued" : "editor-row";
+  return `<div class="${cls}"><span class="editor-prompt">${escape(prompt)}</span><span class="editor-text">${body}</span></div>`;
 }
 
 function appendMessage(role, text) {

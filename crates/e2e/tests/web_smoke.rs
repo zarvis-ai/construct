@@ -19,8 +19,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::{
-    EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat,
-    StartScreencastParams, StopScreencastParams,
+    EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+    StopScreencastParams,
 };
 use chromiumoxide::page::Page;
 use futures::StreamExt;
@@ -58,9 +58,7 @@ async fn web_client_loads_and_websocket_connects() {
             return;
         }
     };
-    let _handler_task = tokio::spawn(async move {
-        while handler.next().await.is_some() {}
-    });
+    let _handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let page = browser.new_page("about:blank").await.expect("new page");
 
@@ -147,6 +145,39 @@ async fn web_client_loads_and_websocket_connects() {
         "bundled xterm.js never loaded (window.Terminal !== 'function')"
     );
 
+    // The remote client mirrors zarvis EditorState events in a
+    // terminal-mode strip so PTY-backed zarvis input is visible even
+    // though zarvis deliberately does not echo its live editor into
+    // PTY scrollback. Exercise the renderer directly in the browser so
+    // the smoke catches JS/schema regressions without needing a live
+    // zarvis adapter in CI.
+    page.evaluate(
+        r#"
+        state.mode = 'terminal';
+        renderEditorState({
+          type: 'editor_state',
+          queued: ['queued prompt'],
+          buf: 'hello zarvis',
+          cursor: 5,
+          completions: ['/help', '/hello']
+        });
+        "#,
+    )
+    .await
+    .expect("render editor_state");
+    let editor_text: String = page
+        .evaluate("document.getElementById('editorState')?.innerText || ''")
+        .await
+        .expect("editorState innerText")
+        .into_value::<String>()
+        .expect("string");
+    assert!(
+        editor_text.contains("hello zarvis")
+            && editor_text.contains("queued prompt")
+            && editor_text.contains("/help"),
+        "expected editor_state mirror content, got:\n{editor_text}"
+    );
+
     // Pause briefly so the final rendered state lands in the
     // video before we stop the screencast — otherwise reviewers
     // see the page mid-load with no payoff frame.
@@ -198,7 +229,10 @@ impl Drop for ScreencastRecording {
                 }
             });
             let count = frame_count.load(std::sync::atomic::Ordering::SeqCst);
-            eprintln!("screencast: captured {count} frame(s) at {}", frames_dir.display());
+            eprintln!(
+                "screencast: captured {count} frame(s) at {}",
+                frames_dir.display()
+            );
             run_ffmpeg(&frames_dir, &mp4_path);
         })
         .join()
