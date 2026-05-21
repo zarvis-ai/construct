@@ -20,6 +20,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install ffmpeg + agg
+        # ffmpeg assembles the web smoke's CDP-captured JPEG frames
+        # into an MP4. agg turns the TUI smoke's asciinema .cast
+        # into a GIF. Both produced as e2e artifacts so reviewers
+        # can replay the test interactively from the workflow run
+        # page.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -sSL -o /usr/local/bin/agg \
+            https://github.com/asciinema/agg/releases/latest/download/agg-x86_64-unknown-linux-gnu
+          chmod +x /usr/local/bin/agg
+
       - name: Build
         run: cargo build --workspace --all-targets --locked
 
@@ -35,3 +48,20 @@ jobs:
             --skip pty_render::tests::many_pinned_sessions_resize_within_budget \
             --skip pty_render::tests::pseudo_terminal_render_is_fast_per_frame \
             --skip pty_render::tests::codex_resize_bound_is_reasonable
+
+      - name: Render TUI casts to GIFs
+        if: always()
+        run: |
+          for cast in target/e2e-artifacts/*.cast; do
+            [ -f "$cast" ] || continue
+            agg "$cast" "${cast%.cast}.gif" || echo "agg failed for $cast"
+          done
+
+      - name: Upload e2e artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: target/e2e-artifacts/
+          if-no-files-found: ignore
+          retention-days: 30

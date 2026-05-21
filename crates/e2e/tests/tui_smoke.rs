@@ -25,7 +25,8 @@ use agentd_e2e::{Daemon, Tui};
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tui_starts_and_quits() {
     let d = Daemon::spawn().await.expect("spawn daemon");
-    let mut tui = Tui::spawn(&d.socket).expect("spawn TUI");
+    let mut tui = Tui::spawn_with_recording(&d.socket, "tui_starts_and_quits")
+        .expect("spawn TUI");
 
     // Modeline. The format starts with " agentd  focus:" — see
     // `render_modeline` in crates/cli/src/ui.rs.
@@ -58,7 +59,8 @@ async fn tui_starts_and_quits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tui_remote_control_popup_via_palette() {
     let d = Daemon::spawn().await.expect("spawn daemon");
-    let mut tui = Tui::spawn(&d.socket).expect("spawn TUI");
+    let mut tui = Tui::spawn_with_recording(&d.socket, "tui_remote_control_popup_via_palette")
+        .expect("spawn TUI");
 
     tui.wait_for("agentd  focus:", Duration::from_secs(15))
         .await

@@ -19,11 +19,11 @@ anyhow.workspace = true
 tokio.workspace = true
 portable-pty.workspace = true
 vt100.workspace = true
-tempfile = "3"
-
-[dev-dependencies]
 serde_json.workspace = true
-reqwest = { workspace = true }
 chromiumoxide = { workspace = true }
 futures.workspace = true
 base64.workspace = true
+tempfile = "3"
+
+[dev-dependencies]
+reqwest = { workspace = true }

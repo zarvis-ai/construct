@@ -178,7 +178,25 @@ impl Tui {
     /// Spawn `agent tui --socket <socket>` in a 30x100 PTY. The
     /// dimensions are arbitrary but match what the TUI tests
     /// expect for layout assertions.
+    ///
+    /// Old non-recording entrypoint; new tests should call
+    /// `spawn_with_recording` so artifact uploads include a
+    /// playable `.cast` of the test run.
     pub fn spawn(socket: &Path) -> Result<Self> {
+        Self::spawn_inner(socket, None)
+    }
+
+    /// Like `spawn` but additionally writes an asciinema v2
+    /// `.cast` recording of the entire PTY session to
+    /// `artifact_dir()/<name>.cast`. CI converts these to GIFs
+    /// via `agg` and uploads them so reviewers can replay the
+    /// test interactively from the workflow run page.
+    pub fn spawn_with_recording(socket: &Path, name: &str) -> Result<Self> {
+        let path = artifact_dir()?.join(format!("{name}.cast"));
+        Self::spawn_inner(socket, Some(path))
+    }
+
+    fn spawn_inner(socket: &Path, cast_path: Option<PathBuf>) -> Result<Self> {
         let agent = agent_bin_path()?;
         let pty_system = portable_pty::native_pty_system();
         let size = portable_pty::PtySize {
@@ -229,15 +247,64 @@ impl Tui {
             // to hold huge memory.
             1000,
         )));
+        // Open the asciinema cast file (if a path was supplied)
+        // and write the v2 header. Each subsequent read from the
+        // PTY appends a `[time, "o", "<bytes>"]` line. Writes are
+        // best-effort: an IO error in the recording path
+        // shouldn't fail the test, since the cast is a nice-to-
+        // have artifact not a correctness check.
+        let cast_writer = cast_path.and_then(|p| {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut file = match std::fs::File::create(&p) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("warning: could not open cast file {}: {e}", p.display());
+                    return None;
+                }
+            };
+            let header = serde_json::json!({
+                "version": 2,
+                "width": size.cols,
+                "height": size.rows,
+                "timestamp": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                "env": { "TERM": "xterm-256color" },
+            });
+            if writeln!(file, "{header}").is_err() {
+                return None;
+            }
+            Some(file)
+        });
         let parser_for_task = parser.clone();
         let reader_task = tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
+            let start = std::time::Instant::now();
+            let mut cast = cast_writer;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let mut p = parser_for_task.lock().unwrap();
                         p.process(&buf[..n]);
+                        drop(p);
+                        if let Some(w) = cast.as_mut() {
+                            // Lossy UTF-8 is acceptable here —
+                            // the cast is for human review of
+                            // the test run, not a faithful
+                            // byte-for-byte log. Most PTY
+                            // output is UTF-8 anyway.
+                            let chunk = String::from_utf8_lossy(&buf[..n]);
+                            let event = serde_json::json!([
+                                start.elapsed().as_secs_f64(),
+                                "o",
+                                chunk,
+                            ]);
+                            let _ = writeln!(w, "{event}");
+                        }
                     }
                 }
             }
@@ -314,6 +381,18 @@ impl Tui {
             .map_err(|e| anyhow!("child.wait: {e}"))?;
         Ok(status)
     }
+}
+
+/// Directory where e2e tests deposit artifacts (cast files,
+/// screencast frames, screenshots, daemon logs). Idempotently
+/// created on every call. CI's `actions/upload-artifact` step
+/// picks up the whole directory so reviewers can download from
+/// the workflow run page.
+pub fn artifact_dir() -> Result<PathBuf> {
+    let dir = target_dir().join("e2e-artifacts");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("create artifact_dir {}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Locate the `agentd` binary in the workspace `target/`
