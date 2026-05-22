@@ -4989,6 +4989,91 @@ mod tests {
         server.abort();
     }
 
+    // Typing into a zarvis prompt grows the editor pane, shrinking the
+    // chat area. The chat parser must stay at the full pane height so
+    // editor growth never resizes (and O(history)-rebuilds) it — that
+    // rebuild-per-keystroke was the typing lag. Structural, timing-free.
+    #[tokio::test]
+    async fn zarvis_editor_growth_does_not_resize_chat_parser() {
+        use agentd_client::Client;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            futures::future::pending::<()>().await;
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        summary.harness = "zarvis".into();
+        summary.has_pty = true;
+        let mut app = test_app(client, vec![summary]);
+        app.view = ViewMode::Terminal;
+        app.focus = PaneFocus::View;
+
+        let mut h = crate::pty_render::ItemHistory::new();
+        for i in 0..40u32 {
+            h.feed_pty(format!("\x1b[33mchat line {i}\x1b[0m\r\n").as_bytes());
+            let call = format!("c{i}");
+            h.feed_tool_use("shell".into(), format!("cmd {i}"));
+            h.feed_pty(
+                format!("\x1b]7700;open;call={call}\x07o\x1b]7700;close;call={call}\x07")
+                    .as_bytes(),
+            );
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+        app.histories.insert("s1".into(), h);
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        let render_with_buf = |app: &mut App, terminal: &mut ratatui::Terminal<_>, buf: &str| {
+            app.editor_states.insert(
+                "s1".into(),
+                EditorState {
+                    queued: Vec::new(),
+                    buf: buf.to_string(),
+                    cursor: buf.len(),
+                    completions: Vec::new(),
+                },
+            );
+            terminal.draw(|f| crate::ui::render(f, app)).expect("draw");
+            app.histories.get("s1").unwrap().cached_dims()
+        };
+
+        // Short prompt: editor pane is 1-2 rows.
+        let small = render_with_buf(&mut app, &mut terminal, "hi");
+        // Long multi-line prompt: editor pane grows several rows, so the
+        // chat area shrinks. The parser dims must be unchanged.
+        let big = render_with_buf(
+            &mut app,
+            &mut terminal,
+            "line one\nline two\nline three\nline four\nline five\nline six",
+        );
+
+        assert!(small.is_some() && small == big,
+            "editor growth resized the chat parser: {small:?} -> {big:?}");
+
+        // And the shrunk chat must still show the MOST RECENT content
+        // (the bottom slice), not stale/older lines.
+        let buf = terminal.backend().buffer();
+        let mut screen = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                screen.push_str(buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            screen.push('\n');
+        }
+        assert!(
+            screen.contains("cmd 39"),
+            "shrunk chat lost the most-recent content; got:\n{screen}"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn background_hydration_does_not_block_primary_client_rpc() {
         use agentd_client::Client;

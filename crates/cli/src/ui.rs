@@ -2146,7 +2146,14 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
             return;
         }
     };
-    let out = history.replay(chat_area.width, chat_area.height, scroll);
+    // Render the chat at the FULL pane height, not `chat_area.height`.
+    // The zarvis editor pane below grows/shrinks on nearly every
+    // keystroke; sizing the parser to the shrinking chat area forced an
+    // O(history) vt100 rebuild each time (the typing lag). Keeping the
+    // parser at the stable `area.height` means editor growth never
+    // resizes it — we just show its bottom `chat_area.height` rows.
+    let row_offset = area.height.saturating_sub(chat_area.height);
+    let out = history.replay(area.width, area.height, scroll);
     // Hide the chat pane's cursor block if we have our own editor pane
     // — otherwise the chat's vt100 cursor would render as a stray
     // block. For non-editor-pane sessions (claude / codex / shell)
@@ -2167,8 +2174,16 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         };
         f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
     }
-    render_pty_screen(f, chat_area, out.screen, &app.theme, editor_area.is_none());
-    app.block_hits.insert(id, out.blocks);
+    render_pty_screen(
+        f,
+        chat_area,
+        out.screen,
+        &app.theme,
+        editor_area.is_none(),
+        row_offset,
+    );
+    app.block_hits
+        .insert(id, translate_block_hits(out.blocks, row_offset, chat_area.height));
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)
         f.render_widget(Clear, area);
@@ -3170,12 +3185,64 @@ pub fn pin_tile_layout(area: Rect, n: usize) -> Vec<Rect> {
 /// attributes. The window is anchored at the bottom of the source screen so
 /// harness status/input bars (zarvis, codex, claude all park them in the
 /// last few rows) stay visible on pinned tiles. Used by the pin strip.
+/// Translate tool-block hit-rects from full-parser-screen rows into
+/// `chat_area`-relative rows when the chat is rendered as the bottom
+/// slice of a taller parser (see `render_pty_screen`). Blocks scrolled
+/// entirely above the visible slice are dropped; partially-visible ones
+/// are clipped. Header/button hit zones only survive if the header row
+/// itself is visible. A `row_offset` of 0 is the identity transform.
+fn translate_block_hits(
+    blocks: Vec<crate::pty_render::BlockHitRect>,
+    row_offset: u16,
+    visible_h: u16,
+) -> Vec<crate::pty_render::BlockHitRect> {
+    if row_offset == 0 {
+        return blocks;
+    }
+    blocks
+        .into_iter()
+        .filter_map(|b| {
+            if b.row_end <= row_offset {
+                return None; // entirely above the visible slice
+            }
+            let row_start = b.row_start.saturating_sub(row_offset);
+            let row_end = (b.row_end - row_offset).min(visible_h);
+            if row_end <= row_start {
+                return None;
+            }
+            let header_visible =
+                b.header_row >= row_offset && (b.header_row - row_offset) < visible_h;
+            Some(crate::pty_render::BlockHitRect {
+                call_id: b.call_id,
+                row_start,
+                row_end,
+                bg_button: if header_visible { b.bg_button } else { None },
+                kill_button: if header_visible { b.kill_button } else { None },
+                header_row: if header_visible {
+                    b.header_row - row_offset
+                } else {
+                    row_start
+                },
+            })
+        })
+        .collect()
+}
+
+/// Paint `screen` into `area`, showing the rows starting at `row_offset`.
+///
+/// `row_offset` is non-zero only when the parser is taller than the chat
+/// area — i.e. a zarvis editor pane is carved out below. We keep the
+/// parser at the full pane height (so the editor growing/shrinking on
+/// every keystroke never resizes — and rebuilds — it) and render only
+/// its bottom `area.height` rows here. `row_offset = full_height -
+/// area.height`.
 fn render_pty_screen(
     f: &mut Frame,
     area: Rect,
     screen: &vt100::Screen,
     theme: &Theme,
     show_cursor: bool,
+    row_offset: u16,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -3186,7 +3253,7 @@ fn render_pty_screen(
     let buf = f.buffer_mut();
     for row in 0..visible_h {
         for col in 0..visible_w {
-            let Some(cell) = screen.cell(row, col) else {
+            let Some(cell) = screen.cell(row_offset + row, col) else {
                 continue;
             };
             let x = area.x + col;
@@ -3198,13 +3265,15 @@ fn render_pty_screen(
     }
     if show_cursor && !screen.hide_cursor() {
         let (row, col) = screen.cursor_position();
-        let row = row.saturating_add(u16::try_from(screen.scrollback()).unwrap_or(u16::MAX));
+        let row = row
+            .saturating_add(u16::try_from(screen.scrollback()).unwrap_or(u16::MAX))
+            .saturating_sub(row_offset);
         if row < area.height && col < area.width {
             let x = area.x + col;
             let y = area.y + row;
             if let Some(buf_cell) = f.buffer_mut().cell_mut(Position { x, y }) {
                 if screen
-                    .cell(row, col)
+                    .cell(row + row_offset, col)
                     .map(|c| c.has_contents())
                     .unwrap_or(false)
                 {
@@ -3547,13 +3616,21 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     };
 
     let history = app.histories.entry(id.clone()).or_default();
-    let out = history.replay(
-        chat_area.width,
-        chat_area.height,
-        app.orchestrator_scrollback,
+    // Full panel height (stable) keeps the parser from being rebuilt as
+    // the editor pane grows on each keystroke; render only the bottom
+    // slice. See the matching note in `render_terminal`.
+    let row_offset = inner.height.saturating_sub(chat_area.height);
+    let out = history.replay(inner.width, inner.height, app.orchestrator_scrollback);
+    render_pty_screen(
+        f,
+        chat_area,
+        out.screen,
+        &app.theme,
+        editor_area.is_none(),
+        row_offset,
     );
-    render_pty_screen(f, chat_area, out.screen, &app.theme, editor_area.is_none());
-    app.block_hits.insert(id, out.blocks);
+    app.block_hits
+        .insert(id, translate_block_hits(out.blocks, row_offset, chat_area.height));
     if let Some(area) = editor_area {
         render_editor_pane(
             f,
@@ -4093,6 +4170,42 @@ mod tests {
         let ranges = find_text_ranges(&frame, "target", None, Some(original));
 
         assert_eq!(ranges, vec![(2, 5, 10)]);
+    }
+
+    #[test]
+    fn translate_block_hits_shifts_clips_and_drops() {
+        use crate::pty_render::BlockHitRect;
+        let mk = |row_start, row_end, header_row| BlockHitRect {
+            call_id: "c".into(),
+            row_start,
+            row_end,
+            bg_button: Some((1, 5)),
+            kill_button: Some((6, 10)),
+            header_row,
+        };
+
+        // offset 0 is the identity.
+        let out = translate_block_hits(vec![mk(2, 5, 2)], 0, 30);
+        assert_eq!((out[0].row_start, out[0].row_end, out[0].header_row), (2, 5, 2));
+        assert!(out[0].bg_button.is_some());
+
+        // chat shows the bottom slice; parser is 10 rows taller than the
+        // chat area (editor pane = 10 rows). A block fully above the
+        // slice is dropped.
+        assert!(translate_block_hits(vec![mk(3, 9, 3)], 10, 20).is_empty());
+
+        // A block straddling the slice top is clipped: its header (above
+        // the slice) is gone, so buttons drop and row_start pins to 0.
+        let out = translate_block_hits(vec![mk(8, 14, 8)], 10, 20);
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].row_start, out[0].row_end), (0, 4));
+        assert!(out[0].bg_button.is_none() && out[0].kill_button.is_none());
+
+        // A block fully inside the slice shifts up by the offset and
+        // keeps its buttons.
+        let out = translate_block_hits(vec![mk(15, 18, 15)], 10, 20);
+        assert_eq!((out[0].row_start, out[0].row_end, out[0].header_row), (5, 8, 5));
+        assert!(out[0].bg_button.is_some());
     }
 
     #[test]

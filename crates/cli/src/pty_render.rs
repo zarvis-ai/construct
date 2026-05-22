@@ -363,6 +363,15 @@ impl ItemHistory {
         }
     }
 
+    /// Dimensions the live (non-shadow) parser was last built/sized at,
+    /// or `None` before the first replay. Test-only: lets the render
+    /// layer assert that editor-pane growth doesn't resize (and thus
+    /// rebuild) the chat parser.
+    #[cfg(test)]
+    pub fn cached_dims(&self) -> Option<(u16, u16)> {
+        self.cached.as_ref().map(|c| (c.cols, c.rows))
+    }
+
     /// Feed a raw PTY byte chunk. Parses inline OSC `7700` markers
     /// out, drops the bytes between paired markers, and accumulates
     /// the rest into `Item::PtyChunk` entries.
