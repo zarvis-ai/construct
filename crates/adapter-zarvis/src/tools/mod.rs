@@ -11,6 +11,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 pub mod agentd;
+pub mod browser;
 pub mod fs;
 pub mod shell;
 pub mod subagent;
@@ -65,6 +66,10 @@ impl ToolRegistry {
             Box::new(fs::EditFile),
             Box::new(fs::ListDir),
             Box::new(fs::FindFiles),
+            // Chrome DevTools browser tools
+            Box::new(browser::BrowserOpen),
+            Box::new(browser::BrowserInspect),
+            Box::new(browser::BrowserEval),
             // agentd-control tools
             Box::new(agentd::Whoami),
             Box::new(agentd::ListSessions),
