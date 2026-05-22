@@ -200,6 +200,23 @@ pub struct TextSelectionRange {
     pub end: ScreenPoint,
 }
 
+/// A matrix-rain horizontal reveal word's clickable span on screen.
+/// `col_start..=col_end` at `row` (absolute terminal coords).
+#[derive(Debug, Clone)]
+pub struct MatrixRevealHit {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub row: u16,
+    pub text: String,
+    pub session_id: String,
+}
+
+impl MatrixRevealHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.col_start && col <= self.col_end
+    }
+}
+
 pub struct App {
     pub client: Arc<Client>,
     pub sessions: Vec<SessionSummary>,
@@ -242,6 +259,11 @@ pub struct App {
     /// after each `replay`. Mouse clicks in the PTY pane consult
     /// this to toggle the right block.
     pub block_hits: HashMap<String, Vec<crate::pty_render::BlockHitRect>>,
+    /// Screen rects of the matrix-rain horizontal reveal words rendered
+    /// this frame, each tagged with the session that produced the word.
+    /// Written by `render_matrix_rain`, consumed by mouse hover (tooltip)
+    /// and click (switch to the session). Reset every frame.
+    pub matrix_reveal_hits: Vec<MatrixRevealHit>,
     /// The orchestrator panel's most recent inner (cols, rows) as
     /// computed during render. Written by `ui::render`, consumed by
     /// `run_loop`'s debounce — once the value stays stable for
@@ -931,6 +953,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         view: ViewMode::Transcript,
         histories: HashMap::new(),
         block_hits: HashMap::new(),
+        matrix_reveal_hits: Vec::new(),
         orchestrator_desired_size: None,
         tasks_popup: None,
         remote_control_popup: None,
@@ -1883,8 +1906,11 @@ impl App {
             m if m == agentd_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
-                        self.matrix_rain
-                            .observe_event(&payload.event, self.matrix_rain_intensity);
+                        self.matrix_rain.observe_event(
+                            &payload.event,
+                            self.matrix_rain_intensity,
+                            &payload.session_id,
+                        );
                         // Tool-approval prompt: if no minibuffer is in use,
                         // open the approval prompt for the matching session.
                         // Otherwise the user sees the request in the
@@ -2664,6 +2690,24 @@ impl App {
             match open_url(&hit.url) {
                 Ok(()) => self.set_status(format!("opened {}", hit.url)),
                 Err(e) => self.set_status(format!("open URL failed: {e}")),
+            }
+            return;
+        }
+        // Matrix-rain horizontal reveal word: jump to the session that
+        // produced it (issue #140). Checked before the pane hit-tests —
+        // the rain panel is its own region, so this never shadows a real
+        // list/view click.
+        if let Some(hit) = self
+            .matrix_reveal_hits
+            .iter()
+            .find(|h| h.contains(col, row))
+            .cloned()
+        {
+            if self.sessions.iter().any(|s| s.id == hit.session_id) {
+                self.focus = PaneFocus::List;
+                self.select_session(hit.session_id);
+            } else {
+                self.set_status(format!("session for \u{201c}{}\u{201d} has ended", hit.text));
             }
             return;
         }
@@ -3843,8 +3887,11 @@ impl App {
                     self.minibuffer = None;
                     match self.client.tool_decision(&session_id, call_id, d).await {
                         Ok(()) => {
-                            self.matrix_rain
-                                .observe_tool_decision(d, self.matrix_rain_intensity);
+                            self.matrix_rain.observe_tool_decision(
+                                d,
+                                self.matrix_rain_intensity,
+                                &session_id,
+                            );
                             self.set_status(format!("tool {d}"));
                         }
                         Err(e) => self.set_status(format!("tool_decision failed: {e}")),
@@ -4170,8 +4217,11 @@ impl App {
                 {
                     self.set_status(format!("tool_decision failed: {e}"));
                 } else {
-                    self.matrix_rain
-                        .observe_tool_decision("approve", self.matrix_rain_intensity);
+                    self.matrix_rain.observe_tool_decision(
+                        "approve",
+                        self.matrix_rain_intensity,
+                        &session_id,
+                    );
                 }
             }
         }
@@ -4901,6 +4951,7 @@ mod tests {
             view: ViewMode::Terminal,
             histories: HashMap::new(),
             block_hits: HashMap::new(),
+            matrix_reveal_hits: Vec::new(),
             orchestrator_desired_size: None,
             terminal_pane_size: (80, 24),
             zoom: ZoomMode::None,
@@ -5006,6 +5057,64 @@ mod tests {
             .await;
 
         assert!(app.should_quit);
+        server.abort();
+    }
+
+    // issue #140: clicking a matrix-rain horizontal reveal word switches
+    // the selection to the session that produced it; clicking a word
+    // whose session has ended is a no-op (just a status message).
+    #[tokio::test]
+    async fn matrix_reveal_click_switches_to_source_session() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            futures::future::pending::<()>().await;
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        let mut app = test_app(client, vec![s1, s2]);
+        assert_eq!(app.selection.session_id(), Some("s1"));
+
+        app.matrix_reveal_hits = vec![MatrixRevealHit {
+            col_start: 5,
+            col_end: 10,
+            row: 20,
+            text: "deploy".into(),
+            session_id: "s2".into(),
+        }];
+        // Click inside the word span -> switch to s2.
+        app.handle_left_click(7, 20).await;
+        assert_eq!(
+            app.selection.session_id(),
+            Some("s2"),
+            "click on a reveal word switches to its session"
+        );
+        // Click outside the span -> no change.
+        app.handle_left_click(30, 20).await;
+        assert_eq!(app.selection.session_id(), Some("s2"));
+
+        // Word whose session has ended -> no switch.
+        app.matrix_reveal_hits = vec![MatrixRevealHit {
+            col_start: 5,
+            col_end: 10,
+            row: 20,
+            text: "ghost".into(),
+            session_id: "gone".into(),
+        }];
+        app.handle_left_click(7, 20).await;
+        assert_eq!(
+            app.selection.session_id(),
+            Some("s2"),
+            "click for a missing session must not switch selection"
+        );
         server.abort();
     }
 

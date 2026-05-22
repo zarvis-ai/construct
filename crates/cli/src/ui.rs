@@ -1213,6 +1213,10 @@ fn split_list_pane(
 
 fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     app.layout.matrix_rain_area = None;
+    // Reset hover/click targets every frame, including the early-return
+    // paths below — otherwise a hidden/too-small panel would leave stale
+    // hits from a prior frame clickable.
+    app.matrix_reveal_hits.clear();
     if app.matrix_rain_hidden {
         return;
     }
@@ -1356,13 +1360,64 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         .retain(|key, _| current_drop_keys.contains(key));
 
     let theme = app.theme.clone();
+    let mut hits: Vec<crate::app::MatrixRevealHit> = Vec::new();
     for reveal in app.matrix_rain.active_reveals_mut(now) {
         if let crate::matrix_rain::RevealOrientation::Horizontal = reveal.orientation {
-            render_matrix_reveal_horizontal(f, rain_area, &theme, reveal, elapsed, &drop_heads);
+            if let Some(hit) =
+                render_matrix_reveal_horizontal(f, rain_area, &theme, reveal, elapsed, &drop_heads)
+            {
+                hits.push(hit);
+            }
         }
         // Vertical reveals are rendered inline above as a drop-body
         // letter overlay — no separate pass / no pin-and-hold.
     }
+    app.matrix_reveal_hits = hits;
+    // Hover tooltip: if the cursor is over a horizontal word, name the
+    // session it came from. Drawn last so it sits on top of the rain.
+    render_matrix_reveal_tooltip(f, rain_area, app);
+}
+
+/// If the mouse is hovering a matrix-rain horizontal reveal word, draw a
+/// one-line tooltip on an adjacent row naming the source session.
+fn render_matrix_reveal_tooltip(f: &mut Frame, rain_area: Rect, app: &App) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    let Some(hit) = app.matrix_reveal_hits.iter().find(|h| h.contains(mx, my)) else {
+        return;
+    };
+    let label = match app.sessions.iter().find(|s| s.id == hit.session_id) {
+        Some(s) => {
+            let harness = harness_label(s);
+            // Title if the session has a distinct one, else just the
+            // harness; append harness too when a title exists so the
+            // tooltip says both (e.g. "fix auth · zarvis").
+            let title = s.title.as_deref().filter(|t| !t.is_empty());
+            match title {
+                Some(t) => format!(" {t} · {harness} "),
+                None => format!(" {harness} "),
+            }
+        }
+        None => format!(" {} · session ended ", hit.text),
+    };
+    let label: String = label.chars().take(rain_area.width.saturating_sub(1) as usize).collect();
+    let w = label.chars().count() as u16;
+    // Prefer the row above the word; fall back to below at the panel top.
+    let ty = if hit.row > rain_area.y {
+        hit.row - 1
+    } else {
+        (hit.row + 1).min(rain_area.y + rain_area.height.saturating_sub(1))
+    };
+    let max_x = rain_area.x + rain_area.width.saturating_sub(w);
+    let tx = hit.col_start.min(max_x).max(rain_area.x);
+    let area = Rect { x: tx, y: ty, width: w, height: 1 };
+    let style = Style::default()
+        .fg(app.theme.highlight_fg)
+        .bg(app.theme.highlight_bg)
+        .add_modifier(Modifier::BOLD);
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), area);
 }
 
 /// First-frame placement for vertical reveals: pick the absolute
@@ -1654,14 +1709,14 @@ fn render_matrix_reveal_horizontal(
     reveal: &mut crate::matrix_rain::RevealWord,
     elapsed_ms: u64,
     drop_heads: &[Option<i16>],
-) {
+) -> Option<crate::app::MatrixRevealHit> {
     if area.width < 4 || area.height == 0 {
-        return;
+        return None;
     }
     let chars: Vec<char> = reveal.text.chars().collect();
     let text_w = chars.len() as u16;
     if text_w == 0 || text_w + 2 > area.width {
-        return;
+        return None;
     }
     // Lock the absolute (col, row) on the first frame so already-
     // pinned letters don't drift if the area resizes mid-reveal.
@@ -1718,6 +1773,19 @@ fn render_matrix_reveal_horizontal(
         |i| target_x + i as u16,
         |_| target_y,
     );
+
+    // The whole word span is a hover/click target — even while letters
+    // are still pinning in — so the user can always reach the source
+    // session. Only words tagged with a session are interactive.
+    reveal
+        .session_id()
+        .map(|sid| crate::app::MatrixRevealHit {
+            col_start: target_x,
+            col_end: target_x + text_w - 1,
+            row: target_y,
+            text: reveal.text.clone(),
+            session_id: sid.to_string(),
+        })
 }
 
 /// Brightness / hold / fade pipeline for horizontal reveals. Once

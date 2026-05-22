@@ -83,6 +83,11 @@ pub struct RevealWord {
     resolved_col: Option<u16>,
     /// Absolute starting row, locked alongside `resolved_col`.
     resolved_row: Option<u16>,
+    /// Session that produced this word (the PTY chunk / event it was
+    /// harvested from). Lets the renderer make horizontal words
+    /// hover/click targets that link back to their session. `None` for
+    /// words not tied to a specific session.
+    session_id: Option<String>,
 }
 
 impl RevealWord {
@@ -132,6 +137,11 @@ impl RevealWord {
     pub fn resolved_position(&self) -> Option<(u16, u16)> {
         Some((self.resolved_col?, self.resolved_row?))
     }
+
+    /// Session id this word was harvested from, if any.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -171,9 +181,9 @@ impl MatrixRain {
             .filter(move |word| word.progress(now).is_some())
     }
 
-    pub fn observe_event(&mut self, event: &SessionEvent, intensity: f32) {
+    pub fn observe_event(&mut self, event: &SessionEvent, intensity: f32, session_id: &str) {
         if let Some((text, tone, priority)) = word_for_event(event) {
-            self.queue_random(text, tone, priority, intensity);
+            self.queue_random(text, tone, priority, intensity, Some(session_id));
         }
     }
 
@@ -222,7 +232,16 @@ impl MatrixRain {
         });
         let (x, y) = random_position(&text, self.queue.len());
         let orientation = pick_orientation(&text, intensity);
-        self.queue_at(text, FlashTone::Work, x, y, 25, orientation, now);
+        self.queue_at(
+            text,
+            FlashTone::Work,
+            x,
+            y,
+            25,
+            orientation,
+            now,
+            Some(session_id.to_string()),
+        );
     }
 
     /// Forget per-session throttle + extracted-word state. Call when
@@ -234,18 +253,25 @@ impl MatrixRain {
         self.pty_word_pool.remove(session_id);
     }
 
-    pub fn observe_tool_decision(&mut self, decision: &str, intensity: f32) {
+    pub fn observe_tool_decision(&mut self, decision: &str, intensity: f32, session_id: &str) {
         match decision {
             "approve" | "automode" => {
-                self.queue_random("approved", FlashTone::Good, 95, intensity)
+                self.queue_random("approved", FlashTone::Good, 95, intensity, Some(session_id))
             }
-            "deny" => self.queue_random("denied", FlashTone::Bad, 95, intensity),
+            "deny" => self.queue_random("denied", FlashTone::Bad, 95, intensity, Some(session_id)),
             _ => {}
         }
     }
 
-    fn queue_random(&mut self, text: &'static str, tone: FlashTone, priority: u8, intensity: f32) {
-        self.queue_random_at(text, tone, priority, intensity, Instant::now());
+    fn queue_random(
+        &mut self,
+        text: &'static str,
+        tone: FlashTone,
+        priority: u8,
+        intensity: f32,
+        session_id: Option<&str>,
+    ) {
+        self.queue_random_at(text, tone, priority, intensity, Instant::now(), session_id);
     }
 
     fn queue_random_at(
@@ -255,10 +281,20 @@ impl MatrixRain {
         priority: u8,
         intensity: f32,
         now: Instant,
+        session_id: Option<&str>,
     ) {
         let (x, y) = random_position(text, self.queue.len());
         let orientation = pick_orientation(text, intensity);
-        self.queue_at(text, tone, x, y, priority, orientation, now);
+        self.queue_at(
+            text,
+            tone,
+            x,
+            y,
+            priority,
+            orientation,
+            now,
+            session_id.map(str::to_string),
+        );
     }
 
     pub fn queue(
@@ -269,10 +305,12 @@ impl MatrixRain {
         y: f32,
         priority: u8,
         orientation: RevealOrientation,
+        session_id: Option<String>,
     ) {
-        self.queue_at(text, tone, x, y, priority, orientation, Instant::now());
+        self.queue_at(text, tone, x, y, priority, orientation, Instant::now(), session_id);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_at(
         &mut self,
         text: impl Into<String>,
@@ -282,6 +320,7 @@ impl MatrixRain {
         priority: u8,
         orientation: RevealOrientation,
         now: Instant,
+        session_id: Option<String>,
     ) {
         self.queue.retain(|word| !word.expired(now));
         // Horizontal reveals need *every* column under the word to
@@ -307,6 +346,7 @@ impl MatrixRain {
             pin_state,
             resolved_col: None,
             resolved_row: None,
+            session_id,
         });
         while self.queue.len() > MAX_ACTIVE_REVEALS {
             if let Some((idx, _)) = self
@@ -594,6 +634,7 @@ mod tests {
                 detail: None,
             },
             1.0,
+            "s1",
         );
         rain.observe_event(
             &SessionEvent::ToolApprovalRequest {
@@ -603,6 +644,7 @@ mod tests {
                 risk: ToolRisk::Risky,
             },
             1.0,
+            "s1",
         );
         rain.observe_event(
             &SessionEvent::Message {
@@ -610,6 +652,7 @@ mod tests {
                 text: "low signal".into(),
             },
             1.0,
+            "s1",
         );
         assert_eq!(
             rain.active_reveal(Instant::now()).map(|f| f.text.as_str()),
@@ -618,9 +661,35 @@ mod tests {
     }
 
     #[test]
+    fn pty_activity_tags_reveal_with_session() {
+        let mut rain = MatrixRain::default();
+        let now = Instant::now();
+        rain.observe_pty_activity("sess-xyz", b"deploying service modules", now, 1.0);
+        let w = rain.active_reveal(now).expect("reveal word");
+        assert_eq!(w.session_id(), Some("sess-xyz"));
+    }
+
+    #[test]
+    fn observe_event_tags_reveal_with_session() {
+        let mut rain = MatrixRain::default();
+        rain.observe_event(
+            &SessionEvent::ToolApprovalRequest {
+                call_id: "c".into(),
+                tool: "shell".into(),
+                args_summary: "x".into(),
+                risk: ToolRisk::Risky,
+            },
+            1.0,
+            "sess-abc",
+        );
+        let w = rain.active_reveal(Instant::now()).expect("reveal word");
+        assert_eq!(w.session_id(), Some("sess-abc"));
+    }
+
+    #[test]
     fn queue_sets_target_position() {
         let mut rain = MatrixRain::default();
-        rain.queue("matrix", FlashTone::Work, 0.2, 0.8, 10, RevealOrientation::Horizontal);
+        rain.queue("matrix", FlashTone::Work, 0.2, 0.8, 10, RevealOrientation::Horizontal, None);
         let reveal = rain.active_reveal(Instant::now()).expect("reveal word");
         assert_eq!(reveal.text, "matrix");
         assert_eq!(reveal.x, 0.2);
@@ -630,8 +699,8 @@ mod tests {
     #[test]
     fn multiple_reveals_can_be_active_together() {
         let mut rain = MatrixRain::default();
-        rain.queue("working", FlashTone::Work, 0.2, 0.4, 10, RevealOrientation::Horizontal);
-        rain.queue("worked", FlashTone::Good, 0.6, 0.7, 20, RevealOrientation::Horizontal);
+        rain.queue("working", FlashTone::Work, 0.2, 0.4, 10, RevealOrientation::Horizontal, None);
+        rain.queue("worked", FlashTone::Good, 0.6, 0.7, 20, RevealOrientation::Horizontal, None);
 
         let active: Vec<_> = rain
             .active_reveals(Instant::now())
@@ -643,8 +712,8 @@ mod tests {
     #[test]
     fn active_reveal_reports_highest_priority_word() {
         let mut rain = MatrixRain::default();
-        rain.queue("working", FlashTone::Work, 0.2, 0.4, 10, RevealOrientation::Horizontal);
-        rain.queue("failed", FlashTone::Bad, 0.6, 0.7, 100, RevealOrientation::Horizontal);
+        rain.queue("working", FlashTone::Work, 0.2, 0.4, 10, RevealOrientation::Horizontal, None);
+        rain.queue("failed", FlashTone::Bad, 0.6, 0.7, 100, RevealOrientation::Horizontal, None);
 
         assert_eq!(
             rain.active_reveal(Instant::now())
