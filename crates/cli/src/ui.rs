@@ -60,6 +60,8 @@ fn clear_pane_side_borders(f: &mut Frame, area: Rect, app: &App) {
 }
 
 pub fn render(f: &mut Frame, app: &mut App) {
+    app.layout.browser_preview_area = None;
+    app.layout.browser_preview_close = None;
     let area = f.area();
     match app.zoom {
         ZoomMode::View => {
@@ -196,6 +198,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_diamond_tooltip(f, app);
     render_pin_diamond_tooltip(f, app, &pinned_ids);
     render_view_close_tooltip(f, app);
+    render_browser_preview_close_tooltip(f, app);
     render_list_title_button_tooltips(f, app);
     render_view_uncollapse_tooltip(f, app);
     render_harness_unavailable_tooltip(f, app);
@@ -718,6 +721,18 @@ fn render_view_close_tooltip(f: &mut Frame, app: &App) {
         .style(Style::default().fg(app.theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
+}
+
+fn render_browser_preview_close_tooltip(f: &mut Frame, app: &App) {
+    let Some((x_start, x_end, y)) = app.layout.browser_preview_close else {
+        return;
+    };
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    if my == y && mx >= x_start && mx < x_end {
+        render_button_tooltip(f, &app.theme, " Close preview ", x_start, y);
+    }
 }
 
 /// Tooltip that appears when the cursor is hovering an
@@ -2247,6 +2262,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         render_browser_preview_overlay(f, chat_area, &app.theme, app.mouse_pos, preview.as_ref());
     app.layout.browser_preview_area = preview_area;
     app.layout.browser_preview_close = preview_close;
+
     app.block_hits.insert(
         id,
         translate_block_hits(out.blocks, row_offset, chat_area.height),
@@ -2289,11 +2305,37 @@ fn render_browser_preview_overlay(
     if area.width < 40 || area.height < 12 {
         return (None, None);
     }
-    let panel_w = area.width.min((area.width / 3).max(36)).min(64);
-    let panel_h = area.height.min(18).min((area.height * 2 / 3).max(10));
-    if panel_w < 20 || panel_h < 8 {
+
+    // Decode the browser preview image first to calculate the exact dimensions
+    let Ok(png) = base64::engine::general_purpose::STANDARD.decode(&preview.image) else {
+        return (None, None);
+    };
+    let Ok(img) = image::load_from_memory(&png).map(|img| img.to_rgba8()) else {
+        return (None, None);
+    };
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
         return (None, None);
     }
+
+    let max_w = area.width.min((area.width / 3).max(36)).min(64);
+    let max_h = area.height.min(18).min((area.height * 2 / 3).max(10));
+    if max_w < 20 || max_h < 8 {
+        return (None, None);
+    }
+
+    let caption_rows = 1;
+    let max_inner_w = max_w.saturating_sub(2).max(1) as u32;
+    let max_inner_h = max_h.saturating_sub(2 + caption_rows).max(1) as u32;
+
+    let scale = (max_inner_w as f32 / w as f32).min((max_inner_h as f32 * 2.0) / h as f32);
+    let out_w = ((w as f32 * scale).round() as u32).clamp(1, max_inner_w) as u16;
+    let out_h_px = ((h as f32 * scale).round() as u32).clamp(1, max_inner_h * 2) as u16;
+    let rows = out_h_px.div_ceil(2);
+
+    let panel_w = out_w + 2;
+    let panel_h = rows + caption_rows + 2;
+
     let panel = Rect {
         x: area.x + area.width.saturating_sub(panel_w + 1),
         y: area.y + 1,
@@ -2316,7 +2358,7 @@ fn render_browser_preview_overlay(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.matrix_dim))
+        .border_style(Style::default().fg(theme.text))
         .title(
             Line::from(Span::styled(" x ", close_style))
                 .alignment(ratatui::layout::Alignment::Right),
@@ -2327,14 +2369,13 @@ fn render_browser_preview_overlay(
     if inner.width == 0 || inner.height == 0 {
         return (Some(panel), Some(close_bounds));
     }
-    let caption_rows = 1;
     let image_area = Rect {
         x: inner.x,
         y: inner.y,
         width: inner.width,
         height: inner.height.saturating_sub(caption_rows),
     };
-    render_browser_preview_image(f, image_area, preview);
+    render_browser_preview_image(f, image_area, &img);
     if inner.height > 0 {
         let caption = preview
             .title
@@ -2362,17 +2403,11 @@ fn render_browser_preview_overlay(
 fn render_browser_preview_image(
     f: &mut Frame,
     area: Rect,
-    preview: &agentd_protocol::BrowserPreview,
+    img: &image::RgbaImage,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Ok(png) = base64::engine::general_purpose::STANDARD.decode(&preview.image) else {
-        return;
-    };
-    let Ok(img) = image::load_from_memory(&png).map(|img| img.to_rgba8()) else {
-        return;
-    };
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return;
@@ -2383,7 +2418,7 @@ fn render_browser_preview_image(
     let out_w = ((w as f32 * scale).round() as u32).clamp(1, max_cols);
     let out_h_px = ((h as f32 * scale).round() as u32).clamp(1, max_cell_rows * 2);
     let resized =
-        image::imageops::resize(&img, out_w, out_h_px, image::imageops::FilterType::Triangle);
+        image::imageops::resize(img, out_w, out_h_px, image::imageops::FilterType::Triangle);
     let x0 = area.x + ((area.width as u32).saturating_sub(out_w) / 2) as u16;
     let rows = out_h_px.div_ceil(2).min(max_cell_rows);
     let y0 = area.y + ((area.height as u32).saturating_sub(rows) / 2) as u16;
