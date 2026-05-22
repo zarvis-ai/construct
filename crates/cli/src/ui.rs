@@ -2369,7 +2369,6 @@ fn render_browser_preview_overlay(
     let Some(preview_state) = preview else {
         return (None, None);
     };
-    let preview = &preview_state.preview;
     if area.width < 40 || area.height < 12 {
         return (None, None);
     }
@@ -2390,9 +2389,8 @@ fn render_browser_preview_overlay(
         return (None, None);
     }
 
-    let caption_rows = 1;
     let max_inner_w = max_w.saturating_sub(2).max(1) as u32;
-    let max_inner_h = max_h.saturating_sub(2 + caption_rows).max(1) as u32;
+    let max_inner_h = max_h.saturating_sub(2).max(1) as u32;
 
     let scale = (max_inner_w as f32 / w as f32).min((max_inner_h as f32 * 2.0) / h as f32);
     let out_w = ((w as f32 * scale).round() as u32).clamp(1, max_inner_w) as u16;
@@ -2400,7 +2398,7 @@ fn render_browser_preview_overlay(
     let rows = out_h_px.div_ceil(2);
 
     let panel_w = out_w + 2;
-    let panel_h = rows + caption_rows + 2;
+    let panel_h = rows + 2;
 
     let panel = Rect {
         x: area.x + area.width.saturating_sub(panel_w + 1),
@@ -2439,7 +2437,7 @@ fn render_browser_preview_overlay(
         x: inner.x,
         y: inner.y,
         width: inner.width,
-        height: inner.height.saturating_sub(caption_rows),
+        height: inner.height,
     };
     if let Some(img) = preview_state.decoded.as_ref() {
         // Same dial-up reveal/erase as the matrix wallpaper, in sync.
@@ -2455,27 +2453,6 @@ fn render_browser_preview_overlay(
             let resized = resized_image(resize_cache, img, ow, oh);
             paint_resized_half_blocks(f, image_area, &resized, 1.0, row_frac);
         }
-    }
-    if inner.height > 0 {
-        let caption = preview
-            .title
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(&preview.url);
-        let caption = truncate_to_width(caption, inner.width as usize);
-        let caption_area = Rect {
-            x: inner.x,
-            y: inner.y + inner.height - 1,
-            width: inner.width,
-            height: 1,
-        };
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                caption,
-                Style::default().fg(theme.dim),
-            ))),
-            caption_area,
-        );
     }
     (Some(panel), Some(close_bounds))
 }

@@ -517,7 +517,6 @@ pub fn decode_browser_preview_image(b64: &str) -> Option<std::sync::Arc<image::R
 
 #[derive(Debug, Clone)]
 pub struct BrowserPreviewState {
-    pub preview: agentd_protocol::BrowserPreview,
     pub hide_after: Instant,
     pub hover_started: Option<Instant>,
     /// When this preview first arrived — drives the matrix-rain
@@ -1414,7 +1413,6 @@ impl App {
         self.browser_previews.insert(
             session_id,
             BrowserPreviewState {
-                preview,
                 hide_after: now + BROWSER_PREVIEW_TTL,
                 hover_started: None,
                 decoded,
@@ -5303,13 +5301,6 @@ mod tests {
         app.browser_previews.insert(
             "s1".into(),
             BrowserPreviewState {
-                preview: agentd_protocol::BrowserPreview {
-                    url: "http://example.com".into(),
-                    title: None,
-                    image: String::new(),
-                    width: 32,
-                    height: 24,
-                },
                 hide_after: Instant::now() + Duration::from_secs(60),
                 hover_started: None,
                 decoded: Some(std::sync::Arc::new(image::RgbaImage::from_pixel(
