@@ -4,8 +4,8 @@ use crate::keymap::{self, ChordState, KeyAction, Keymap, KeymapResult, Profile};
 use crate::ui;
 use agentd_client::Client;
 use agentd_protocol::{
-    EventNotificationPayload, GroupSummary, HarnessInfo, Request, SessionEvent, SessionSummary,
-    StateNotificationPayload, TimestampedEvent,
+    EventNotificationPayload, GroupSummary, HarnessInfo, Notification, Request, SessionEvent,
+    SessionSummary, StateNotificationPayload, TimestampedEvent,
 };
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -389,6 +389,25 @@ pub struct App {
     pub selected_text_range: Option<TextSelectionRange>,
     pty_input_tx: mpsc::UnboundedSender<PtyInputJob>,
     pty_input_errors: mpsc::UnboundedReceiver<String>,
+}
+
+struct ReconnectState {
+    next_attempt: Instant,
+    backoff: Duration,
+}
+
+impl ReconnectState {
+    fn new(now: Instant) -> Self {
+        Self {
+            next_attempt: now,
+            backoff: Duration::from_millis(250),
+        }
+    }
+
+    fn schedule_next(&mut self, now: Instant) {
+        self.next_attempt = now + self.backoff;
+        self.backoff = (self.backoff * 2).min(Duration::from_secs(5));
+    }
 }
 
 struct SessionHydration {
@@ -819,7 +838,13 @@ pub const SPINNER_FRAMES: [&str; 8] = ["✦", "✧", "✶", "✷", "✸", "✷",
 /// Duration of the session-switch visual transition.
 pub const SESSION_TRANSITION_MS: u128 = 200;
 
+#[allow(dead_code)]
 pub async fn run(client: Arc<Client>) -> Result<()> {
+    run_with_socket(client.socket_path().to_path_buf()).await
+}
+
+pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
+    let client = Client::connect(&socket).await?;
     let profile = Profile::from_env();
     let keymap = keymap::default_for(profile);
 
@@ -858,6 +883,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
         .unwrap_or(Selection::None);
 
     let now = Instant::now();
+    let socket = client.socket_path().to_path_buf();
     let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
     let mut app = App {
         client: client.clone(),
@@ -958,7 +984,7 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
-    let result = run_loop(&mut terminal, &mut app).await;
+    let result = run_loop(&mut terminal, &mut app, socket).await;
 
     // Teardown — best effort.
     let _ = disable_raw_mode();
@@ -984,13 +1010,18 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     result
 }
 
-async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+async fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    socket: std::path::PathBuf,
+) -> Result<()> {
     let mut input_stream = EventStream::new();
     let mut notifications = app
         .client
         .take_notifications()
         .await
         .context("notifications channel already taken")?;
+    let mut reconnect: Option<ReconnectState> = None;
     // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
 
@@ -1018,8 +1049,37 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
         while let Ok(msg) = app.pty_input_errors.try_recv() {
             app.set_status(msg);
         }
+        if app.connected && app.client.is_disconnected() {
+            app.connected = false;
+            reconnect = Some(ReconnectState::new(Instant::now()));
+            app.set_status("daemon disconnected — reconnecting… (press q to quit)".to_string());
+        }
         app.prune_finished_transitions();
         app.poll_remote_control_task().await;
+        if let Some(state) = reconnect.as_mut() {
+            let now = Instant::now();
+            if now >= state.next_attempt {
+                match app.reconnect(&socket).await {
+                    Ok(rx) => {
+                        notifications = rx;
+                        reconnect = None;
+                        last_size_sent = (0, 0);
+                        last_orch_sent = (0, 0);
+                        last_session_sent = None;
+                        hydration_session = None;
+                        if let Some(task) = hydration_task.take() {
+                            task.abort();
+                        }
+                    }
+                    Err(e) => {
+                        state.schedule_next(now);
+                        app.set_status(format!(
+                            "daemon disconnected — reconnecting… (press q to quit; last error: {e})"
+                        ));
+                    }
+                }
+            }
+        }
         terminal.draw(|f| ui::render(f, app))?;
 
         // A session switch should stay interactive while history-sized
@@ -1186,15 +1246,13 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
                         }
                     }
                     None => {
-                        app.connected = false;
-                        // Spell out the recovery path: q quits, and
-                        // re-running `agent` reconnects. Without
-                        // this the user just sees "disconnected"
-                        // and may not realize they can press q to
-                        // get out cleanly (issue #101).
-                        app.set_status(
-                            "daemon disconnected — press q to quit (re-run `agent` to reconnect)".to_string(),
-                        );
+                        if app.connected {
+                            app.connected = false;
+                            reconnect = Some(ReconnectState::new(Instant::now()));
+                            app.set_status(
+                                "daemon disconnected — reconnecting… (press q to quit)".to_string(),
+                            );
+                        }
                     }
                 }
             }
@@ -1211,6 +1269,43 @@ async fn run_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut A
 }
 
 impl App {
+    async fn reconnect(
+        &mut self,
+        socket: &std::path::Path,
+    ) -> Result<mpsc::UnboundedReceiver<Notification>> {
+        let client = Client::connect(socket).await?;
+        client.subscribe(None).await?;
+        let notifications = client
+            .take_notifications()
+            .await
+            .context("notifications channel already taken")?;
+        let sessions = client.list().await.unwrap_or_default();
+        let groups = client.list_groups().await.unwrap_or_default();
+        let harnesses = client.harnesses().await.unwrap_or_default();
+        let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
+
+        self.client = client;
+        self.pty_input_tx = pty_input_tx;
+        self.pty_input_errors = pty_input_errors;
+        self.sessions = sessions;
+        self.groups = groups;
+        self.harnesses = harnesses;
+        self.connected = true;
+        self.ensure_selection_valid();
+        self.orchestrator_id = self
+            .sessions
+            .iter()
+            .find(|s| {
+                s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
+            })
+            .map(|s| s.id.clone());
+        self.transcript_session = None;
+        self.refresh_selected_transcript().await;
+        self.ensure_pinned_parsers().await;
+        self.set_status("reconnected to daemon".to_string());
+        Ok(notifications)
+    }
+
     pub fn set_status(&mut self, msg: String) {
         self.status = Some((msg, Instant::now()));
     }
@@ -3035,6 +3130,10 @@ impl App {
         // /tasks modal: Esc closes it; everything else falls through
         // (the popup itself is read-only at the keyboard layer in
         // v1 — mouse-only row interactions).
+        if !self.connected && matches!(key.code, KeyCode::Char('q')) {
+            self.should_quit = true;
+            return;
+        }
         if self.tasks_popup.is_some() {
             if matches!(key.code, KeyCode::Esc) {
                 self.tasks_popup = None;
@@ -4771,6 +4870,31 @@ mod tests {
             automode: false,
             kind,
         }
+    }
+
+    #[tokio::test]
+    async fn disconnected_q_quits_even_when_pty_would_capture_keys() {
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            futures::future::pending::<()>().await;
+        });
+
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        summary.has_pty = true;
+        let mut app = test_app(client, vec![summary]);
+        app.connected = false;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+
+        assert!(app.should_quit);
+        server.abort();
     }
 
     #[test]
