@@ -1107,9 +1107,9 @@ const state = {
   // Latest active Zarvis agent_status by session id, rendered in the
   // same fixed editor strip as the TUI's "* Working.." line.
   agentStatusById: new Map(),
-  // Current view mode — "chat" (zarvis-style transcript + composer)
+  // Current view mode — "chat" (headless transcript + composer)
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
-  // `selectSession` based on the summary's `has_pty` flag.
+  // `selectSession` based on `has_pty` plus the session mode.
   mode: "chat",
   // Lazily-initialized xterm.js handle + fit addon. Reused across
   // PTY-session switches; `term.reset()` clears between sessions.
@@ -1336,8 +1336,8 @@ function renderSessions() {
       // The shared toolbar below the list handles
       // restart / move actions, so each row is just a tappable
       // surface that selects the session.
-      const title = s.title || s.harness || s.id.slice(0, 8);
-      const harness = s.harness ? `<div class="sub">${escape(s.harness)}</div>` : "";
+      const title = sessionDisplayTitle(s);
+      const harness = s.harness ? `<div class="sub">${escape(sessionHarnessLabel(s))}</div>` : "";
       return `
         <div class="item ${active} ${indent}" data-id="${attr(s.id)}">
           <div class="row-main">
@@ -1407,7 +1407,7 @@ async function handleRowAction(action, sessionId) {
   }
   if (action === "delete") {
     const s = state.sessions.find((x) => x.id === sessionId);
-    const label = (s && (s.title || s.harness || s.id.slice(0, 8))) || sessionId.slice(0, 8);
+    const label = (s && sessionDisplayTitle(s)) || sessionId.slice(0, 8);
     if (!window.confirm(`Delete session “${label}”? This cannot be undone.`)) return;
   }
   try {
@@ -1430,12 +1430,12 @@ async function selectSession(id) {
   state.currentId = id;
   renderSessions();
   const s = state.sessions.find((x) => x.id === id);
-  sessionTitleEl.textContent = s ? (s.title || s.harness || s.id.slice(0, 8)) : "";
+  sessionTitleEl.textContent = s ? sessionViewTitle(s) : "";
   // Hide the session list on narrow screens after selection.
   if (window.matchMedia("(max-width: 720px)").matches) {
     sessionListEl.classList.add("collapsed");
   }
-  if (s && s.has_pty) {
+  if (isTerminalSession(s)) {
     await enterTerminalMode(id);
   } else {
     enterChatMode();
@@ -2091,7 +2091,7 @@ function handleNotification(method, params) {
     else state.sessions.push(session);
     renderSessions();
     if (session.id === state.currentId) {
-      sessionTitleEl.textContent = session.title || session.harness || session.id.slice(0, 8);
+      sessionTitleEl.textContent = sessionViewTitle(session);
     }
   } else if (method === "session/deleted") {
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
@@ -2404,7 +2404,7 @@ function resetInputHeight() {
 
 function currentSessionHasPty() {
   const s = state.sessions.find((x) => x.id === state.currentId);
-  return !!(s && s.has_pty);
+  return isTerminalSession(s);
 }
 
 /** Insert vs Enter — see the comment on the Composer section. */
@@ -2442,6 +2442,31 @@ async function submitComposer({ enter }) {
 }
 
 // --- Tiny helpers --------------------------------------------------------
+
+function isHeadlessSession(s) {
+  return !!(s && String(s.mode || "").toLowerCase() === "headless");
+}
+
+function isTerminalSession(s) {
+  return !!(s && s.has_pty && !isHeadlessSession(s));
+}
+
+function sessionHarnessLabel(s) {
+  const harness = (s && s.harness) || "";
+  return isHeadlessSession(s) && harness ? `(headless) ${harness}` : harness;
+}
+
+function sessionDisplayTitle(s) {
+  if (!s) return "";
+  return s.title || sessionHarnessLabel(s) || s.id.slice(0, 8);
+}
+
+function sessionViewTitle(s) {
+  if (!s) return "";
+  const title = sessionDisplayTitle(s);
+  const harness = sessionHarnessLabel(s);
+  return s.title && harness ? `${title} — ${harness}` : title;
+}
 
 function escape(s) {
   return String(s ?? "")

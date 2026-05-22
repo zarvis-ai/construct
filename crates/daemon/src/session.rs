@@ -869,7 +869,7 @@ impl SessionManager {
             last_prompt: params.prompt.clone(),
             event_count: 0,
             has_pty: false,
-            mode: params.mode.clone(),
+            mode: Some(effective_mode(&params)),
             pinned: false,
             // Negative timestamp so newer sessions sort to the top by default.
             position: -now.timestamp_millis(),
@@ -2741,6 +2741,14 @@ async fn generate_auto_title(
     tracing::info!(session = %entry.id, %title, "auto-title applied");
 }
 
+fn effective_mode(params: &CreateSessionParams) -> String {
+    match params.mode.as_ref() {
+        Some(mode) => mode.clone(),
+        None if params.pty_size.is_some() => "interactive".to_string(),
+        None => "headless".to_string(),
+    }
+}
+
 fn builtin_harness_capabilities(name: &str) -> agentd_protocol::Capabilities {
     match name {
         "shell" | "claude" | "codex" | "zarvis" => agentd_protocol::Capabilities {
@@ -3069,5 +3077,63 @@ mod tests {
             SessionState::Running,
             "Error during shutdown must NOT transition state either",
         );
+    }
+
+    fn create_params(mode: Option<&str>, pty: Option<PtySize>) -> CreateSessionParams {
+        CreateSessionParams {
+            harness: "shell".into(),
+            cwd: "/tmp".into(),
+            prompt: None,
+            model: None,
+            title: None,
+            mode: mode.map(str::to_string),
+            pty_size: pty,
+            worktree: false,
+            env: Default::default(),
+            args: Vec::new(),
+            kind: agentd_protocol::SessionKind::User,
+            group_id: None,
+        }
+    }
+
+    /// An explicit `mode` from the client always wins, regardless of
+    /// whether a PTY size was supplied.
+    #[test]
+    fn effective_mode_honors_explicit_mode() {
+        assert_eq!(
+            effective_mode(&create_params(Some("headless"), None)),
+            "headless"
+        );
+        assert_eq!(
+            effective_mode(&create_params(Some("interactive"), None)),
+            "interactive"
+        );
+        // Explicit mode wins even when a PTY size is also present.
+        assert_eq!(
+            effective_mode(&create_params(
+                Some("headless"),
+                Some(PtySize { cols: 80, rows: 24 })
+            )),
+            "headless"
+        );
+    }
+
+    /// No explicit mode, but a PTY size was requested → the session is
+    /// interactive (matches the adapters' own default heuristic).
+    #[test]
+    fn effective_mode_defaults_to_interactive_with_pty() {
+        assert_eq!(
+            effective_mode(&create_params(None, Some(PtySize { cols: 80, rows: 24 }))),
+            "interactive"
+        );
+    }
+
+    /// No explicit mode and no PTY size → headless. This is the case
+    /// the PR fixes: previously `mode` stayed `None` on disk, so the
+    /// remote UI couldn't tell a headless session apart from an
+    /// interactive one and rendered it as a terminal instead of chat.
+    #[test]
+    fn effective_mode_defaults_to_headless_without_pty() {
+        assert_eq!(effective_mode(&create_params(None, None)), "headless");
     }
 }

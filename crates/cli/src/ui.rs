@@ -1060,7 +1060,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let indent_prefix = if *indented { "  " } else { "" };
                     // Fixed-width left side: indent + pin (1) + " glyph " (3).
                     let prefix_w = indent_prefix.chars().count() + 1 + 3;
-                    let harness = s.harness.as_str();
+                    let harness = harness_label(s);
                     let harness_w = harness.chars().count();
                     // Always leave at least one cell of gap between the name
                     // and the right-aligned harness.
@@ -1085,7 +1085,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         ),
                         Span::styled(name_display, Style::default().fg(app.theme.text)),
                         Span::raw(gap_str),
-                        Span::styled(harness.to_string(), harness_style(&app.theme)),
+                        Span::styled(harness, harness_style(&app.theme)),
                     ]))
                 }
                 AppListItem::GroupHeader {
@@ -1969,7 +1969,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     let total = area.width as usize;
     let close_w: usize = if summary.is_some() { 3 } else { 0 };
     let harness_w: usize = summary
-        .map(|s| 2 + UnicodeWidthStr::width(s.harness.as_str()))
+        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
     // Label budget = total − 2 corners − right-side blocks − fixed
     // title scaffolding (` <glyph> <label> ` is 3 spaces + glyph
@@ -1998,7 +1998,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // title bar's frame, not as a separately-styled badge.
     let harness_right = summary.map(|s| {
         Line::from(Span::styled(
-            format!(" {} ", s.harness),
+            format!(" {} ", harness_label(s)),
             pane_border_style(&app.theme, focused),
         ))
         .alignment(ratatui::layout::Alignment::Right)
@@ -2087,7 +2087,7 @@ fn render_group_overview(
                 ),
                 Span::styled(primary_label(s), Style::default().fg(app.theme.text)),
                 Span::raw("  "),
-                Span::styled(s.harness.clone(), harness_style(&app.theme)),
+                Span::styled(harness_label(s), harness_style(&app.theme)),
             ]));
         }
     }
@@ -3066,7 +3066,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         // fit both.
         let total_pin = tile_area.width as usize;
         let harness_w = summary
-            .map(|s| 2 + UnicodeWidthStr::width(s.harness.as_str()))
+            .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
             .unwrap_or(0);
         let glyph_w = summary
             .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
@@ -3088,7 +3088,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         };
         let harness_right = summary.map(|s| {
             Line::from(Span::styled(
-                format!(" {} ", s.harness),
+                format!(" {} ", harness_label(s)),
                 pane_border_style(&app.theme, is_selected),
             ))
             .alignment(ratatui::layout::Alignment::Right)
@@ -3466,6 +3466,18 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
 fn short_id(id: &str) -> &str {
     let n = id.len().min(10);
     &id[..n]
+}
+
+fn is_headless(s: &agentd_protocol::SessionSummary) -> bool {
+    matches!(s.mode.as_deref(), Some("headless"))
+}
+
+fn harness_label(s: &agentd_protocol::SessionSummary) -> String {
+    if is_headless(s) {
+        format!("(headless) {}", s.harness)
+    } else {
+        s.harness.clone()
+    }
 }
 
 /// User-facing primary label for a session: the user-set title when present,
@@ -4191,5 +4203,44 @@ mod tests {
             editor_pane_rows(Some(&big_state), None, 80)
                 > editor_pane_rows(Some(&small_state), None, 80)
         );
+    }
+
+    fn summary_with_mode(harness: &str, mode: Option<&str>) -> agentd_protocol::SessionSummary {
+        let mut json = serde_json::json!({
+            "id": "s1",
+            "harness": harness,
+            "cwd": "/tmp",
+            "state": "running",
+            "created_at": "2026-05-20T00:00:00Z",
+        });
+        if let Some(m) = mode {
+            json["mode"] = serde_json::json!(m);
+        }
+        serde_json::from_value(json).expect("valid SessionSummary")
+    }
+
+    #[test]
+    fn is_headless_only_for_headless_mode() {
+        assert!(is_headless(&summary_with_mode("zarvis", Some("headless"))));
+        assert!(!is_headless(&summary_with_mode("zarvis", Some("interactive"))));
+        // Missing mode is treated as not-headless (older sessions
+        // persisted before the mode fix, and PTY harnesses).
+        assert!(!is_headless(&summary_with_mode("shell", None)));
+    }
+
+    #[test]
+    fn harness_label_prefixes_headless() {
+        // Headless sessions get a "(headless) " prefix so the list /
+        // title bar visibly distinguish them from interactive ones.
+        assert_eq!(
+            harness_label(&summary_with_mode("zarvis", Some("headless"))),
+            "(headless) zarvis"
+        );
+        // Interactive and mode-less sessions render the bare harness.
+        assert_eq!(
+            harness_label(&summary_with_mode("zarvis", Some("interactive"))),
+            "zarvis"
+        );
+        assert_eq!(harness_label(&summary_with_mode("shell", None)), "shell");
     }
 }
