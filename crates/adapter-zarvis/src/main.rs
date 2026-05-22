@@ -15,6 +15,7 @@ mod observe;
 mod persist;
 mod project_guide;
 mod provider;
+mod provider_watchdog;
 mod skills;
 mod tasks;
 mod title_mode;

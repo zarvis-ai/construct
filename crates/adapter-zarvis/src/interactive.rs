@@ -2210,9 +2210,15 @@ pub async fn run(
                 &emit,
                 tasks.clone(),
                 async {
-                    provider
-                        .complete(&model, &system_prompt, &messages, &specs, &mut sink)
-                        .await
+                    crate::provider_watchdog::complete(
+                        provider.as_ref(),
+                        &model,
+                        &system_prompt,
+                        &messages,
+                        &specs,
+                        &mut sink,
+                    )
+                    .await
                 },
             )
             .await;
@@ -2258,9 +2264,15 @@ pub async fn run(
                             &emit,
                             tasks.clone(),
                             async {
-                                provider
-                                    .complete(&model, &system_prompt, &messages, &specs, &mut sink2)
-                                    .await
+                                crate::provider_watchdog::complete(
+                                    provider.as_ref(),
+                                    &model,
+                                    &system_prompt,
+                                    &messages,
+                                    &specs,
+                                    &mut sink2,
+                                )
+                                .await
                             },
                         )
                         .await;

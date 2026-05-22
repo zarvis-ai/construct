@@ -343,9 +343,15 @@ pub async fn run(
             let _pruned = context::prune_to_budget(&mut messages, budget);
 
             let mut sink = MessageSink { emit: &emit };
-            let turn = match provider
-                .complete(&model, &system_prompt, &messages, &specs, &mut sink)
-                .await
+            let turn = match crate::provider_watchdog::complete(
+                provider.as_ref(),
+                &model,
+                &system_prompt,
+                &messages,
+                &specs,
+                &mut sink,
+            )
+            .await
             {
                 Ok(t) => t,
                 Err(e) => {
@@ -372,9 +378,15 @@ pub async fn run(
                             )),
                         });
                         let mut sink = MessageSink { emit: &emit };
-                        match provider
-                            .complete(&model, &system_prompt, &messages, &specs, &mut sink)
-                            .await
+                        match crate::provider_watchdog::complete(
+                            provider.as_ref(),
+                            &model,
+                            &system_prompt,
+                            &messages,
+                            &specs,
+                            &mut sink,
+                        )
+                        .await
                         {
                             Ok(t) => t,
                             Err(e2) => {
