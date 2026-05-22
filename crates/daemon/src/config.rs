@@ -137,6 +137,11 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         description: "OpenAI Codex (wraps the `codex` CLI)",
     },
     BuiltinAdapter {
+        name: "antigravity",
+        binary: "agentd-adapter-antigravity",
+        description: "Google Antigravity (wraps the `agy` CLI)",
+    },
+    BuiltinAdapter {
         name: "zarvis",
         binary: "agentd-adapter-zarvis",
         description: "Built-in multi-provider agent (OpenAI / Anthropic / Ollama)",

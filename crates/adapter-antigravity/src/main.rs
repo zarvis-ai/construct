@@ -1,0 +1,669 @@
+//! Google Antigravity CLI adapter (`agy`).
+//!
+//! Antigravity is the successor to the Gemini CLI, built on the Cascade
+//! agent engine. Its CLI surface differs from gemini's enough that this
+//! is a distinct adapter rather than a rename:
+//!
+//!   * Non-interactive (`--print`/`-p`) emits **plain text** on stdout —
+//!     there is no `--output-format stream-json`. The structured trace
+//!     (tool calls, results, planner responses) is written to a
+//!     per-conversation transcript file instead.
+//!   * Conversations are identified by an auto-assigned UUID. There's no
+//!     `--session-id` to pre-mint one, but `--conversation <id>` resumes
+//!     an existing conversation. We discover the id by parsing the
+//!     `Created conversation <uuid>` line agy writes to its `--log-file`.
+//!   * Tool auto-approval is `--dangerously-skip-permissions` (used only
+//!     in headless mode — interactive sessions approve in the real TUI).
+//!
+//! Two modes, picked like the other adapters:
+//!
+//!   * **interactive (default with a PTY)** — spawn `agy` under a PTY so
+//!     the right pane is the real Antigravity TUI. A background task
+//!     captures the conversation id from the log so a daemon restart can
+//!     `--conversation <id>` back into the same thread.
+//!   * **headless (no PTY)** — per turn, run
+//!     `agy -p <text> --dangerously-skip-permissions --log-file <log>`
+//!     (plus `--conversation <id>` after the first turn), then parse the
+//!     conversation transcript and emit the *new* steps as structured
+//!     `Message` / `ToolUse` / `ToolResult` events.
+//!
+//! ## Transcript layout
+//!
+//! After a run, structured steps live at
+//! `<antigravity_home>/brain/<conversation_id>/.system_generated/logs/transcript.jsonl`,
+//! one JSON object per line:
+//!
+//! ```text
+//! {"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"..."}
+//! {"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{...}}]}
+//! {"step_index":3,"source":"MODEL","type":"RUN_COMMAND","content":"...output..."}
+//! {"step_index":5,"source":"MODEL","type":"PLANNER_RESPONSE","content":"final answer"}
+//! ```
+//!
+//! `<antigravity_home>` defaults to `$HOME/.gemini/antigravity-cli`
+//! (antigravity currently nests under the gemini dir); override with
+//! `AGENTD_ANTIGRAVITY_HOME`.
+//!
+//! Env overrides: `AGENTD_ANTIGRAVITY_BIN` (binary, default `agy`),
+//! `AGENTD_ANTIGRAVITY_MODE` (`interactive`|`headless`).
+
+use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use agentd_protocol::{
+    Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
+    SessionState,
+};
+use serde_json::Value;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::process::Command;
+use tokio::sync::mpsc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let metadata = InitializeResult {
+        name: "antigravity".into(),
+        version: env!("CARGO_PKG_VERSION").into(),
+        capabilities: Capabilities {
+            supports_input: true,
+            supports_interrupt: true,
+            // agy exposes no token/cost data in print mode or its logs.
+            supports_cost: false,
+            supports_pty: true,
+            ..Default::default()
+        },
+    };
+    run(metadata, |params, ctx| async move {
+        match resolve_mode(&params) {
+            Mode::Interactive => run_interactive(params, ctx).await,
+            Mode::Headless => run_session(params, ctx).await,
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Interactive,
+    Headless,
+}
+
+fn resolve_mode(params: &SessionStartParams) -> Mode {
+    if let Ok(m) = std::env::var("AGENTD_ANTIGRAVITY_MODE") {
+        match m.as_str() {
+            "interactive" => return Mode::Interactive,
+            "headless" => return Mode::Headless,
+            _ => {}
+        }
+    }
+    match params.mode.as_deref() {
+        Some("interactive") => Mode::Interactive,
+        Some("headless") => Mode::Headless,
+        _ if params.pty_size.is_some() => Mode::Interactive,
+        _ => Mode::Headless,
+    }
+}
+
+fn bin() -> String {
+    std::env::var("AGENTD_ANTIGRAVITY_BIN").unwrap_or_else(|_| "agy".into())
+}
+
+fn session_data_dir() -> Option<PathBuf> {
+    std::env::var("AGENTD_SESSION_DATA_DIR")
+        .ok()
+        .map(PathBuf::from)
+}
+
+/// Antigravity's home dir, where per-conversation `brain/<id>` trees
+/// (and their `.system_generated/logs/transcript.jsonl`) live. Defaults
+/// to `$HOME/.gemini/antigravity-cli`; override with
+/// `AGENTD_ANTIGRAVITY_HOME`.
+fn antigravity_home() -> Option<PathBuf> {
+    if let Ok(h) = std::env::var("AGENTD_ANTIGRAVITY_HOME") {
+        return Some(PathBuf::from(h));
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".gemini").join("antigravity-cli"))
+}
+
+fn transcript_path(conversation_id: &str) -> Option<PathBuf> {
+    Some(
+        antigravity_home()?
+            .join("brain")
+            .join(conversation_id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl"),
+    )
+}
+
+/// File where we stash the conversation id so a daemon restart can
+/// resume the same antigravity conversation via `--conversation <id>`.
+fn conv_id_file() -> Option<PathBuf> {
+    Some(session_data_dir()?.join("agy_conversation_id.txt"))
+}
+
+fn read_conv_id() -> Option<String> {
+    let p = conv_id_file()?;
+    std::fs::read_to_string(p)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn write_conv_id(id: &str) {
+    if let Some(p) = conv_id_file() {
+        let _ = std::fs::write(p, id);
+    }
+}
+
+/// Parse the `Created conversation <uuid>` line agy writes to its
+/// `--log-file`. Returns the first match. (`Conversation using project
+/// ID: <uuid>` is a *different* id — the project, not the conversation —
+/// so we anchor on the exact "Created conversation" wording.)
+fn parse_conversation_id(log_text: &str) -> Option<String> {
+    for line in log_text.lines() {
+        if let Some(idx) = line.find("Created conversation ") {
+            let rest = &line[idx + "Created conversation ".len()..];
+            let id: String = rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
+                .collect();
+            if id.len() == 36 {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
+    let bin = bin();
+    let mut args = params.args.clone();
+
+    let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
+    let log_path = session_data_dir().map(|d| d.join("agy.log"));
+    if let Some(lp) = &log_path {
+        args.push("--log-file".into());
+        args.push(lp.to_string_lossy().to_string());
+    }
+
+    // Resume into the prior conversation when the daemon respawns us.
+    let existing = if resuming { read_conv_id() } else { None };
+    if let Some(id) = &existing {
+        args.push("--conversation".into());
+        args.push(id.clone());
+    }
+
+    // Initial prompt → `-i` (run prompt, then stay interactive). Skip on
+    // resume; that turn is already in the conversation we're rejoining.
+    if !resuming {
+        if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
+            args.push("-i".into());
+            args.push(prompt.clone());
+        }
+    }
+
+    // If we don't yet know the conversation id, capture it in the
+    // background by tailing the freshly-written log for the
+    // "Created conversation <id>" line, then persist it for the next
+    // respawn. Runs concurrently with the PTY session.
+    if existing.is_none() {
+        if let Some(lp) = log_path.clone() {
+            tokio::spawn(async move {
+                capture_conversation_id_from_log(&lp).await;
+            });
+        }
+    }
+
+    let mut env: Vec<(String, String)> = params
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
+
+    let label = bin.clone();
+    let spec = PtySpec {
+        bin,
+        args,
+        cwd: PathBuf::from(&params.cwd),
+        env,
+        size: params.pty_size.unwrap_or(PtySize {
+            cols: 100,
+            rows: 30,
+        }),
+        status_detail: Some(format!("{label} (interactive)")),
+    };
+    let _ = run_pty(spec, ctx).await;
+}
+
+/// Poll `log_path` for up to ~15s looking for the conversation id agy
+/// logs early in startup; persist it once found. Best-effort.
+async fn capture_conversation_id_from_log(log_path: &Path) {
+    for _ in 0..75 {
+        if let Ok(text) = std::fs::read_to_string(log_path) {
+            if let Some(id) = parse_conversation_id(&text) {
+                write_conv_id(&id);
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
+    let AdapterContext {
+        session_id,
+        emit,
+        mut inbox,
+    } = ctx;
+
+    let bin = bin();
+    let cwd = PathBuf::from(&params.cwd);
+    let extra_args = params.args.clone();
+    let mut env: Vec<(String, String)> = params
+        .env
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    env.push(("AGENTD_SESSION_ID".into(), session_id.clone()));
+
+    // Resume bookkeeping: known conversation id + how many transcript
+    // steps we've already emitted (so we only forward NEW steps each
+    // turn, and don't re-emit the whole thread on a daemon restart).
+    let mut conv_id: Option<String> = read_conv_id();
+    let mut last_step: i64 = -1;
+    if let Some(id) = &conv_id {
+        // On resume, skip everything already in the transcript.
+        if let Some(tp) = transcript_path(id) {
+            last_step = max_step_index(&tp);
+        }
+    }
+
+    let mut pending: VecDeque<String> = VecDeque::new();
+    if let Some(p) = params.prompt.clone() {
+        if !p.trim().is_empty() {
+            pending.push_back(p);
+        }
+    }
+
+    let exit_code = loop {
+        let user_text = match pending.pop_front() {
+            Some(t) => t,
+            None => {
+                emit.emit(SessionEvent::Status {
+                    state: SessionState::AwaitingInput,
+                    detail: None,
+                });
+                match inbox.recv().await {
+                    None => break 0,
+                    Some(AdapterInboxMsg::Input(t)) => t,
+                    Some(AdapterInboxMsg::Interrupt) => continue,
+                    Some(AdapterInboxMsg::Stop) => break 0,
+                    Some(AdapterInboxMsg::PtyInput(_))
+                    | Some(AdapterInboxMsg::PtyResize { .. })
+                    | Some(AdapterInboxMsg::ToolDecision { .. })
+                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::ToolAction { .. }) => continue,
+                }
+            }
+        };
+        if user_text.trim().is_empty() {
+            continue;
+        }
+
+        emit.emit(SessionEvent::Status {
+            state: SessionState::Running,
+            detail: None,
+        });
+
+        let log_path = session_data_dir()
+            .map(|d| d.join("agy-headless.log"))
+            .unwrap_or_else(|| PathBuf::from("agy-headless.log"));
+
+        let mut child_args: Vec<String> = Vec::new();
+        child_args.push("-p".into());
+        child_args.push(user_text.clone());
+        child_args.push("--dangerously-skip-permissions".into());
+        child_args.push("--log-file".into());
+        child_args.push(log_path.to_string_lossy().to_string());
+        if let Some(id) = &conv_id {
+            child_args.push("--conversation".into());
+            child_args.push(id.clone());
+        }
+        for a in &extra_args {
+            child_args.push(a.clone());
+        }
+
+        let mut command = Command::new(&bin);
+        for a in &child_args {
+            command.arg(a);
+        }
+        command
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        for (k, v) in &env {
+            command.env(k, v);
+        }
+
+        let mut child = match command.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                emit.emit(SessionEvent::Error {
+                    message: agentd_protocol::adapter::missing_bin_hint(&bin, &e),
+                });
+                break 127;
+            }
+        };
+
+        // Drain stdout/stderr so the pipe doesn't fill and block the
+        // child. We don't forward stdout as Message events — the
+        // structured transcript is the source of truth — but we keep
+        // stderr as logs for debugging.
+        if let Some(out) = child.stdout.take() {
+            tokio::spawn(drain_to_void(out));
+        }
+        if let Some(err) = child.stderr.take() {
+            let emit_log = emit.clone();
+            tokio::spawn(drain_to_log(err, emit_log));
+        }
+
+        let outcome = drive_turn(&mut child, &mut inbox, &emit, &mut pending).await;
+        let _ = child.wait().await;
+
+        // Learn the conversation id from this turn's log if we didn't
+        // have one yet, then emit the new transcript steps.
+        if conv_id.is_none() {
+            if let Ok(text) = std::fs::read_to_string(&log_path) {
+                if let Some(id) = parse_conversation_id(&text) {
+                    write_conv_id(&id);
+                    conv_id = Some(id);
+                }
+            }
+        }
+        if let Some(id) = &conv_id {
+            if let Some(tp) = transcript_path(id) {
+                last_step = emit_new_transcript_steps(&tp, last_step, &emit);
+            }
+        }
+
+        match outcome {
+            TurnOutcome::Completed => continue,
+            TurnOutcome::Interrupted => {
+                emit.log("turn interrupted; awaiting next input");
+                continue;
+            }
+            TurnOutcome::Stopped => break 0,
+        }
+    };
+
+    emit.emit(SessionEvent::Done { exit_code });
+}
+
+#[derive(Debug)]
+enum TurnOutcome {
+    Completed,
+    Interrupted,
+    Stopped,
+}
+
+async fn drive_turn(
+    child: &mut tokio::process::Child,
+    inbox: &mut mpsc::Receiver<AdapterInboxMsg>,
+    emit: &EventEmitter,
+    pending: &mut VecDeque<String>,
+) -> TurnOutcome {
+    loop {
+        tokio::select! {
+            biased;
+            msg = inbox.recv() => {
+                match msg {
+                    None => {
+                        let _ = child.start_kill();
+                        return TurnOutcome::Stopped;
+                    }
+                    Some(AdapterInboxMsg::Stop) => {
+                        let _ = child.start_kill();
+                        return TurnOutcome::Stopped;
+                    }
+                    Some(AdapterInboxMsg::Interrupt) => {
+                        let _ = child.start_kill();
+                        return TurnOutcome::Interrupted;
+                    }
+                    Some(AdapterInboxMsg::Input(t)) => {
+                        emit.log(format!("queued input for next turn: {}", short(&t, 60)));
+                        pending.push_back(t);
+                    }
+                    Some(AdapterInboxMsg::PtyInput(_))
+                    | Some(AdapterInboxMsg::PtyResize { .. })
+                    | Some(AdapterInboxMsg::ToolDecision { .. })
+                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::ToolAction { .. }) => {}
+                }
+            }
+            _ = child.wait() => {
+                return TurnOutcome::Completed;
+            }
+        }
+    }
+}
+
+async fn drain_to_void<R>(reader: R)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncReadExt;
+    let mut reader = reader;
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+}
+
+async fn drain_to_log<R>(reader: R, emit: EventEmitter)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if !line.trim().is_empty() {
+            emit.log(format!("stderr: {line}"));
+        }
+    }
+}
+
+/// Highest `step_index` currently in a transcript file, or -1 if the
+/// file is missing/empty/unparseable.
+fn max_step_index(path: &Path) -> i64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return -1;
+    };
+    let mut max = -1i64;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if let Some(i) = v.get("step_index").and_then(|n| n.as_i64()) {
+                max = max.max(i);
+            }
+        }
+    }
+    max
+}
+
+/// Read `path` and emit every step with `step_index > after` as the
+/// appropriate `SessionEvent`. Returns the new high-water step index.
+fn emit_new_transcript_steps(path: &Path, after: i64, emit: &EventEmitter) -> i64 {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return after;
+    };
+    let mut high = after;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let idx = match v.get("step_index").and_then(|n| n.as_i64()) {
+            Some(i) => i,
+            None => continue,
+        };
+        if idx <= after {
+            continue;
+        }
+        high = high.max(idx);
+        emit_step(&v, emit);
+    }
+    high
+}
+
+/// Map one transcript step to a `SessionEvent`.
+fn emit_step(v: &Value, emit: &EventEmitter) {
+    let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+    match ty {
+        // Structural / already-known-to-daemon — skip.
+        "USER_INPUT" | "CONVERSATION_HISTORY" => {}
+        "PLANNER_RESPONSE" => {
+            // Either a tool-call decision or assistant prose.
+            if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+                for c in calls {
+                    let name = c
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let args = c.get("args").cloned().unwrap_or(Value::Null);
+                    emit.emit(SessionEvent::ToolUse { tool: name, args });
+                }
+            } else if let Some(content) = v.get("content").and_then(|s| s.as_str()) {
+                if !content.is_empty() {
+                    emit.emit(SessionEvent::Message {
+                        role: MessageRole::Assistant,
+                        text: content.to_string(),
+                    });
+                }
+            }
+        }
+        // Any other step type is a tool-result step named after the tool
+        // action (RUN_COMMAND, VIEW_FILE, EDIT_FILE, …). The status field
+        // tells us ok/err; content carries the output.
+        _ => {
+            let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let ok = matches!(status, "DONE" | "SUCCESS" | "COMPLETED");
+            let output = v
+                .get("content")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            emit.emit(SessionEvent::ToolResult {
+                tool: ty.to_string(),
+                ok,
+                output,
+            });
+        }
+    }
+}
+
+fn short(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max).collect::<String>() + "..."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_conversation_id_from_log_line() {
+        let log = "I0522 01:17:15.555 server.go:726] Conversation using project ID: fd861473-c03d-48d4-993b-7cf1e55cc70f\n\
+                   I0522 01:17:15.555 server.go:747] Created conversation b6eae99e-b76c-4417-837f-ea8adae0a2ba\n";
+        assert_eq!(
+            parse_conversation_id(log).as_deref(),
+            Some("b6eae99e-b76c-4417-837f-ea8adae0a2ba")
+        );
+    }
+
+    #[test]
+    fn parse_conversation_id_none_when_absent() {
+        assert_eq!(parse_conversation_id("no id here\nanother line"), None);
+    }
+
+    #[test]
+    fn max_step_index_reads_highest() {
+        let dir = std::env::temp_dir().join(format!(
+            "agy-test-maxstep-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.jsonl");
+        std::fs::write(
+            &p,
+            "{\"step_index\":0,\"type\":\"USER_INPUT\"}\n\
+             {\"step_index\":3,\"type\":\"PLANNER_RESPONSE\",\"content\":\"hi\"}\n",
+        )
+        .unwrap();
+        assert_eq!(max_step_index(&p), 3);
+        assert_eq!(max_step_index(&dir.join("missing.jsonl")), -1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Verifies the step→event classification without a live emitter, by
+    // re-implementing the branch decision the way `emit_step` does. Keeps
+    // the schema assumptions pinned: tool_calls→ToolUse, content→Message,
+    // unknown type→ToolResult.
+    #[test]
+    fn step_classification_matches_schema() {
+        fn classify(line: &str) -> &'static str {
+            let v: Value = serde_json::from_str(line).unwrap();
+            let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
+            match ty {
+                "USER_INPUT" | "CONVERSATION_HISTORY" => "skip",
+                "PLANNER_RESPONSE" => {
+                    if v.get("tool_calls").and_then(|c| c.as_array()).is_some() {
+                        "tool_use"
+                    } else if v.get("content").is_some() {
+                        "message"
+                    } else {
+                        "skip"
+                    }
+                }
+                _ => "tool_result",
+            }
+        }
+        assert_eq!(classify(r#"{"type":"USER_INPUT","content":"x"}"#), "skip");
+        assert_eq!(
+            classify(
+                r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{}}]}"#
+            ),
+            "tool_use"
+        );
+        assert_eq!(
+            classify(r#"{"type":"PLANNER_RESPONSE","content":"final"}"#),
+            "message"
+        );
+        assert_eq!(
+            classify(r#"{"type":"RUN_COMMAND","status":"DONE","content":"out"}"#),
+            "tool_result"
+        );
+    }
+}

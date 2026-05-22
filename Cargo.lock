@@ -30,6 +30,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentd-adapter-antigravity"
+version = "0.1.0"
+dependencies = [
+ "agentd-protocol",
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "agentd-adapter-claude"
 version = "0.1.0"
 dependencies = [
