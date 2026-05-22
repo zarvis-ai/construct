@@ -1095,7 +1095,7 @@ async fn run_loop(
             }
             hydration_session = None;
         }
-        if app.selected_transcript_needs_refresh() && hydration_task.is_none() {
+        if app.selected_needs_hydration() && hydration_task.is_none() {
             if let Some(req) = app.selected_hydration_request() {
                 hydration_session = Some(req.session_id.clone());
                 hydration_task = Some(tokio::spawn(load_session_hydration(req)));
@@ -1389,19 +1389,35 @@ impl App {
         self.selected_session().map(|s| s.id.clone())
     }
 
-    fn selected_transcript_needs_refresh(&self) -> bool {
+    fn selected_needs_hydration(&self) -> bool {
         let Some(id) = self.selection.session_id() else {
             return false;
         };
-        self.transcript_session.as_deref() != Some(id)
+        // New selection: transcript not yet loaded for this session.
+        if self.transcript_session.as_deref() != Some(id) {
+            return true;
+        }
+        // Already transcript-hydrated, but the Terminal view has no PTY
+        // history to render. The entry can go missing *after* a switch —
+        // e.g. a `SessionEvent::Reset` removed it, or `has_pty` was
+        // momentarily false (adapter reconnecting) when the original
+        // hydration request was built, so `needs_history` came back
+        // false and nothing was fetched. Without this re-trigger the
+        // view stays stuck on "(no PTY history yet)" until a live PTY
+        // event (e.g. the user presses a key) recreates the entry.
+        self.view == ViewMode::Terminal && !self.histories.contains_key(id)
     }
 
     fn selected_hydration_request(&self) -> Option<SessionHydrationRequest> {
         let id = self.selection.session_id()?.to_string();
-        let needs_history = self
-            .selected_session()
-            .map(|s| s.has_pty && !self.histories.contains_key(&s.id))
-            .unwrap_or(false);
+        // Fetch the PTY snapshot whenever the Terminal view lacks history
+        // for this session. Driven by the view rather than `has_pty` so a
+        // reconnecting adapter (transiently `has_pty == false`) can't
+        // leave us without history — and so this stays consistent with
+        // `selected_needs_hydration`, which guarantees `needs_history`
+        // ends up true here (the fetch always inserts an entry, so the
+        // re-trigger can't spin).
+        let needs_history = self.view == ViewMode::Terminal && !self.histories.contains_key(&id);
         Some(SessionHydrationRequest {
             socket: self.client.socket_path().to_path_buf(),
             session_id: id,
@@ -4894,6 +4910,82 @@ mod tests {
             .await;
 
         assert!(app.should_quit);
+        server.abort();
+    }
+
+    // Regression: switching to a session showed "(no PTY history yet)"
+    // even though history existed, until a keystroke recreated the entry
+    // from a live PTY event. Root cause: once the transcript was
+    // hydrated, the trigger never re-fired even if the history entry was
+    // later dropped (e.g. a `SessionEvent::Reset`, or a reconnecting
+    // adapter making the first fetch skip history). Hydration must
+    // self-heal whenever the Terminal view has no history.
+    #[tokio::test]
+    async fn terminal_view_rehydrates_after_history_dropped() {
+        use agentd_client::Client;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            futures::future::pending::<()>().await;
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        summary.has_pty = true;
+        let mut app = test_app(client, vec![summary]);
+        app.view = ViewMode::Terminal;
+
+        // Simulate a completed hydration: transcript loaded + history present.
+        app.transcript_session = Some("s1".into());
+        app.histories
+            .insert("s1".into(), crate::pty_render::ItemHistory::new());
+        assert!(
+            !app.selected_needs_hydration(),
+            "fully hydrated terminal session must not re-fetch"
+        );
+
+        // A Reset event drops the history while the session stays selected
+        // (transcript_session stays == "s1", so the old transcript-only
+        // trigger would never re-fire).
+        let reset = agentd_protocol::Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::EVENT.into(),
+            params: Some(
+                serde_json::to_value(agentd_protocol::EventNotificationPayload {
+                    session_id: "s1".into(),
+                    at: chrono::Utc::now(),
+                    event: agentd_protocol::SessionEvent::Reset,
+                    seq: 1,
+                })
+                .unwrap(),
+            ),
+        };
+        app.on_notification(reset).await;
+
+        assert!(
+            !app.histories.contains_key("s1"),
+            "Reset removes the history entry"
+        );
+        assert!(
+            app.selected_needs_hydration(),
+            "dropped history on a selected Terminal session must re-trigger hydration"
+        );
+        assert!(
+            app.selected_hydration_request().unwrap().needs_history,
+            "the re-hydration request must actually fetch the PTY snapshot"
+        );
+
+        // In Transcript view a missing history must NOT spin up fetches.
+        app.view = ViewMode::Transcript;
+        assert!(
+            !app.selected_needs_hydration(),
+            "transcript view should not re-fetch PTY history"
+        );
+
         server.abort();
     }
 
