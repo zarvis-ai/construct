@@ -145,6 +145,89 @@ async fn web_client_loads_and_websocket_connects() {
         "bundled xterm.js never loaded (window.Terminal !== 'function')"
     );
 
+    // Issue #132: the web session list exposes pin/unpin in the
+    // selected-session toolbar and marks pinned rows visibly.
+    let pin_ui: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const calls = [];
+              const oldRpc = rpc;
+              rpc = async (method, params) => {
+                calls.push({ method, params });
+                return null;
+              };
+              state.currentId = 's1';
+              state.sessions = [
+                {
+                  id: 's1',
+                  title: 'Alpha',
+                  harness: 'shell',
+                  state: 'running',
+                  kind: 'user',
+                  pinned: false,
+                  position: 0,
+                },
+                {
+                  id: 's2',
+                  title: 'Beta',
+                  harness: 'zarvis',
+                  state: 'awaiting_input',
+                  kind: 'user',
+                  pinned: true,
+                  position: 1,
+                },
+              ];
+              state.groups = [];
+              renderSessions();
+              const initialButton = document.getElementById('toolbarPinBtn');
+              const initial = {
+                rowText: document.querySelector('[data-id="s2"]')?.innerText || '',
+                buttonText: initialButton?.textContent || '',
+                aria: initialButton?.getAttribute('aria-label') || '',
+                disabled: initialButton?.disabled === true,
+              };
+              await handleRowAction('pin', 's1');
+              state.currentId = 's2';
+              renderSessions();
+              const pinnedButton = document.getElementById('toolbarPinBtn');
+              const pinned = {
+                buttonText: pinnedButton?.textContent || '',
+                aria: pinnedButton?.getAttribute('aria-label') || '',
+                active: pinnedButton?.classList.contains('is-on') === true,
+              };
+              rpc = oldRpc;
+              return { initial, pinned, calls };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate pin UI")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert!(
+        pin_ui["initial"]["rowText"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("★"),
+        "pinned session row did not include visible pin marker: {pin_ui:?}"
+    );
+    assert_eq!(pin_ui["initial"]["buttonText"], "☆");
+    assert_eq!(pin_ui["initial"]["aria"], "pin selected");
+    assert_eq!(pin_ui["initial"]["disabled"], false);
+    assert_eq!(pin_ui["pinned"]["buttonText"], "★");
+    assert_eq!(pin_ui["pinned"]["aria"], "unpin selected");
+    assert_eq!(pin_ui["pinned"]["active"], true);
+    assert_eq!(
+        pin_ui["calls"],
+        serde_json::json!([
+            {
+                "method": "session.set_pinned",
+                "params": { "session_id": "s1", "pinned": true }
+            }
+        ])
+    );
+
     // Regression coverage for mobile terminal scroll containment:
     // when the native keyboard shrinks the visual viewport, scroll
     // gestures starting on xterm must stay inside the terminal rather

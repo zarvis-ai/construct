@@ -163,6 +163,18 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .session-list .item .name-line {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .session-list .item .pin-indicator {
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-size: 12px;
+    line-height: 1;
+  }
   .session-list .item .sub {
     color: var(--fg-faint);
     font-size: 11px;
@@ -215,7 +227,8 @@
   }
   /* Per-row action button (restart, move up/down, future delete).
      Small touch target on the right edge of each session row. */
-  .session-list .row-action {
+  .session-list .row-action,
+  .list-toolbar .row-action {
     flex: 0 0 auto;
     width: 24px;
     height: 24px;
@@ -229,13 +242,21 @@
     -webkit-tap-highlight-color: transparent;
     line-height: 1;
   }
-  .session-list .row-action:hover {
+  .session-list .row-action:hover,
+  .list-toolbar .row-action:hover {
     background: var(--bg-elev-2);
     color: var(--fg);
   }
-  .session-list .row-action:active {
+  .session-list .row-action:active,
+  .list-toolbar .row-action:active {
     background: var(--accent);
     color: #fff;
+  }
+  .session-list .row-action.is-on,
+  .list-toolbar .row-action.is-on {
+    color: var(--accent);
+    border-color: rgba(107, 123, 255, 0.55);
+    background: rgba(107, 123, 255, 0.12);
   }
   .session-list .empty {
     color: var(--fg-dim);
@@ -882,6 +903,8 @@
                 id="toolbarUpBtn" aria-label="move selected up" disabled>↑</button>
         <button type="button" class="row-action" data-action="move-down"
                 id="toolbarDownBtn" aria-label="move selected down" disabled>↓</button>
+        <button type="button" class="row-action" data-action="pin"
+                id="toolbarPinBtn" aria-label="pin selected" disabled>☆</button>
         <button type="button" class="row-action" data-action="rename"
                 id="toolbarRenameBtn" aria-label="rename selected" disabled>✎</button>
         <button type="button" class="row-action" data-action="restart"
@@ -1338,10 +1361,14 @@ function renderSessions() {
       // surface that selects the session.
       const title = sessionDisplayTitle(s);
       const harness = s.harness ? `<div class="sub">${escape(sessionHarnessLabel(s))}</div>` : "";
+      const pin = s.pinned
+        ? `<span class="pin-indicator" title="pinned" aria-label="pinned">★</span>`
+        : "";
+      const pinnedClass = s.pinned ? "is-pinned" : "";
       return `
-        <div class="item ${active} ${indent}" data-id="${attr(s.id)}">
+        <div class="item ${active} ${indent} ${pinnedClass}" data-id="${attr(s.id)}">
           <div class="row-main">
-            <div class="name">${escape(title)}</div>
+            <div class="name-line">${pin}<div class="name">${escape(title)}</div></div>
             ${harness}
           </div>
           <div class="state">${escape(status)}</div>
@@ -1369,11 +1396,20 @@ function refreshListToolbar() {
   const terminal = ["done", "errored", "killed", "stopped"].includes(status);
   const upBtn = $("toolbarUpBtn");
   const downBtn = $("toolbarDownBtn");
+  const pinBtn = $("toolbarPinBtn");
   const renameBtn = $("toolbarRenameBtn");
   const restartBtn = $("toolbarRestartBtn");
   const deleteBtn = $("toolbarDeleteBtn");
   if (upBtn) upBtn.disabled = !isUserSession;
   if (downBtn) downBtn.disabled = !isUserSession;
+  if (pinBtn) {
+    pinBtn.disabled = !isUserSession;
+    const pinned = !!(sel && sel.pinned);
+    pinBtn.textContent = pinned ? "★" : "☆";
+    pinBtn.classList.toggle("is-on", pinned);
+    pinBtn.setAttribute("aria-label", pinned ? "unpin selected" : "pin selected");
+    pinBtn.title = pinned ? "Unpin selected" : "Pin selected";
+  }
   // Rename/delete user sessions only — god's label/lifecycle is daemon-owned.
   if (renameBtn) renameBtn.disabled = !isUserSession;
   if (deleteBtn) deleteBtn.disabled = !isUserSession;
@@ -1417,6 +1453,12 @@ async function handleRowAction(action, sessionId) {
       await rpc("session.move", { session_id: sessionId, direction: "up" });
     } else if (action === "move-down") {
       await rpc("session.move", { session_id: sessionId, direction: "down" });
+    } else if (action === "pin") {
+      const s = state.sessions.find((x) => x.id === sessionId);
+      await rpc("session.set_pinned", {
+        session_id: sessionId,
+        pinned: !(s && s.pinned),
+      });
     } else if (action === "delete") {
       await rpc("session.delete", { session_id: sessionId });
     }
