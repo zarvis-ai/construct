@@ -1306,9 +1306,12 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     if let Some((img, revealed_at, hide_after, hovered)) = &wallpaper {
         let row_frac = preview_reveal_range(*revealed_at, *hide_after, now, *hovered);
         if row_frac.1 > row_frac.0 {
+            // 2 sub-pixels per cell in each axis for quadrant rendering:
+            // `oh` is already 2*rows (half-cell tall), so only the width
+            // doubles here.
             let (ow, oh) = blit_scale_dims(img.dimensions(), rain_area, true);
-            let resized = resized_image(&mut app.image_resize_cache, img, ow, oh);
-            paint_resized_half_blocks(f, rain_area, &resized, MATRIX_WALLPAPER_DIM, row_frac);
+            let resized = resized_image(&mut app.image_resize_cache, img, ow * 2, oh);
+            paint_resized_quadrants(f, rain_area, &resized, MATRIX_WALLPAPER_DIM, row_frac);
         }
     }
 
@@ -2450,8 +2453,8 @@ fn render_browser_preview_overlay(
         );
         if row_frac.1 > row_frac.0 {
             let (ow, oh) = blit_scale_dims(img.dimensions(), image_area, false);
-            let resized = resized_image(resize_cache, img, ow, oh);
-            paint_resized_half_blocks(f, image_area, &resized, 1.0, row_frac);
+            let resized = resized_image(resize_cache, img, ow * 2, oh);
+            paint_resized_quadrants(f, image_area, &resized, 1.0, row_frac);
         }
     }
     (Some(panel), Some(close_bounds))
@@ -2522,7 +2525,71 @@ fn resized_image(
 /// fraction of the image's cell rows to paint (rest stay blank):
 /// `(0.0, 1.0)` draws all; `(0.0, a)` reveals the top `a` (appear);
 /// `(d, 1.0)` keeps only the bottom `1-d` (top-down erase on disappear).
-fn paint_resized_half_blocks(
+/// Block-Elements quadrant glyph for a 2x2 foreground mask. Bit i set
+/// means sub-cell i is foreground: 0=top-left, 1=top-right,
+/// 2=bottom-left, 3=bottom-right.
+const QUAD_CHARS: [&str; 16] = [
+    " ", "▘", "▝", "▀", "▖", "▌", "▞", "▛", "▗", "▚", "▐", "▜", "▄", "▙", "▟", "█",
+];
+
+/// Best-fit quadrant glyph + (fg, bg) for a 2x2 block of pixels
+/// (`[tl, tr, bl, br]`). Tries all 16 fg/bg partitions and keeps the one
+/// with the lowest squared color error — chafa's symbol-mode core over
+/// the universally-supported Block-Elements set. Doubles the effective
+/// resolution vs a single half-block (4 sub-cells instead of 2).
+fn best_quadrant(px: [[u8; 3]; 4]) -> (&'static str, [u8; 3], [u8; 3]) {
+    let mut best_err = f32::INFINITY;
+    let mut best = (0u8, [0u8; 3], [0u8; 3]);
+    for pat in 0u8..16 {
+        let (mut fg, mut bg) = ([0f32; 3], [0f32; 3]);
+        let (mut fg_n, mut bg_n) = (0f32, 0f32);
+        for (i, p) in px.iter().enumerate() {
+            if pat & (1 << i) != 0 {
+                (0..3).for_each(|c| fg[c] += p[c] as f32);
+                fg_n += 1.0;
+            } else {
+                (0..3).for_each(|c| bg[c] += p[c] as f32);
+                bg_n += 1.0;
+            }
+        }
+        if fg_n > 0.0 {
+            (0..3).for_each(|c| fg[c] /= fg_n);
+        }
+        if bg_n > 0.0 {
+            (0..3).for_each(|c| bg[c] /= bg_n);
+        }
+        // Degenerate all-fg / all-bg: the empty set borrows the other's
+        // mean so the cell renders as a single solid color.
+        if fg_n == 0.0 {
+            fg = bg;
+        }
+        if bg_n == 0.0 {
+            bg = fg;
+        }
+        let mut err = 0f32;
+        for (i, p) in px.iter().enumerate() {
+            let t = if pat & (1 << i) != 0 { fg } else { bg };
+            (0..3).for_each(|c| {
+                let dd = p[c] as f32 - t[c];
+                err += dd * dd;
+            });
+        }
+        if err < best_err {
+            best_err = err;
+            let q = |v: [f32; 3]| [v[0].round() as u8, v[1].round() as u8, v[2].round() as u8];
+            best = (pat, q(fg), q(bg));
+        }
+    }
+    (QUAD_CHARS[best.0 as usize], best.1, best.2)
+}
+
+/// Paint `resized` (sampled at 2 sub-pixels per cell in each axis, i.e.
+/// `2*cols × 2*rows`) into `area` as best-fit quadrant glyphs. Each cell
+/// reads its 2x2 block and picks the glyph + fg/bg via [`best_quadrant`].
+/// Center-crops into the area (cover crops, contain letterboxes). `dim`
+/// scales brightness; `row_frac` is the `[start, end)` cell-row reveal
+/// window (top-down appear / erase).
+fn paint_resized_quadrants(
     f: &mut Frame,
     area: Rect,
     resized: &image::RgbaImage,
@@ -2532,51 +2599,43 @@ fn paint_resized_half_blocks(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let (out_w, out_h) = resized.dimensions();
-    if out_w == 0 || out_h == 0 {
+    let (rw, rh) = resized.dimensions();
+    if rw < 2 || rh < 2 {
         return;
     }
-    let target_w = area.width as u32;
-    let target_h_px = area.height as u32 * 2;
-    let crop_w = out_w.min(target_w);
-    let crop_h = out_h.min(target_h_px);
-    let src_off_x = (out_w - crop_w) / 2;
-    let src_off_y = (out_h - crop_h) / 2;
-    let cell_rows = crop_h.div_ceil(2).min(area.height as u32);
-    let x0 = area.x + ((target_w - crop_w) / 2) as u16;
-    let y0 = area.y + ((area.height as u32 - cell_rows) / 2) as u16;
-    // Only paint cell rows inside the reveal window; the rest stay blank
-    // this frame (the appear/erase animation).
-    let cf = cell_rows as f32;
-    let start_row = ((row_frac.0 * cf).floor() as u32).min(cell_rows);
-    let end_row = ((row_frac.1 * cf).ceil() as u32).min(cell_rows);
+    let avail_cols = rw / 2;
+    let avail_rows = rh / 2;
+    let cols = avail_cols.min(area.width as u32);
+    let rows = avail_rows.min(area.height as u32);
+    // Center-crop in cell space, then center the result in the area.
+    let cell_off_x = (avail_cols - cols) / 2;
+    let cell_off_y = (avail_rows - rows) / 2;
+    let x0 = area.x + ((area.width as u32 - cols) / 2) as u16;
+    let y0 = area.y + ((area.height as u32 - rows) / 2) as u16;
+    let rf = rows as f32;
+    let start_row = ((row_frac.0 * rf).floor() as u32).min(rows);
+    let end_row = ((row_frac.1 * rf).ceil() as u32).min(rows);
     let dim = dim.clamp(0.0, 1.0);
     let d = |c: u8| (c as f32 * dim).round() as u8;
     let buf = f.buffer_mut();
-    for ry in (0..crop_h).step_by(2) {
-        let row = ry / 2;
-        if row >= end_row {
-            break;
-        }
-        if row < start_row {
-            continue;
-        }
-        for rx in 0..crop_w {
-            let top = resized.get_pixel(src_off_x + rx, src_off_y + ry).0;
-            let bot = if ry + 1 < crop_h {
-                resized.get_pixel(src_off_x + rx, src_off_y + ry + 1).0
-            } else {
-                [0, 0, 0, 255]
+    for cy in start_row..end_row {
+        let sy = (cell_off_y + cy) * 2;
+        for cx in 0..cols {
+            let sx = (cell_off_x + cx) * 2;
+            let p = |dx: u32, dy: u32| {
+                let q = resized.get_pixel(sx + dx, sy + dy).0;
+                [q[0], q[1], q[2]]
             };
+            let (ch, fg, bg) = best_quadrant([p(0, 0), p(1, 0), p(0, 1), p(1, 1)]);
             if let Some(cell) = buf.cell_mut(Position {
-                x: x0 + rx as u16,
-                y: y0 + row as u16,
+                x: x0 + cx as u16,
+                y: y0 + cy as u16,
             }) {
-                cell.set_symbol("▀");
+                cell.set_symbol(ch);
                 cell.set_style(
                     Style::default()
-                        .fg(Color::Rgb(d(top[0]), d(top[1]), d(top[2])))
-                        .bg(Color::Rgb(d(bot[0]), d(bot[1]), d(bot[2]))),
+                        .fg(Color::Rgb(d(fg[0]), d(fg[1]), d(fg[2])))
+                        .bg(Color::Rgb(d(bg[0]), d(bg[1]), d(bg[2]))),
                 );
             }
         }
@@ -2585,13 +2644,13 @@ fn paint_resized_half_blocks(
 
 /// Test-only convenience: resize + paint in one shot (no cache).
 #[cfg(test)]
-fn blit_image_half_blocks(f: &mut Frame, area: Rect, img: &image::RgbaImage, cover: bool, dim: f32) {
+fn blit_image_quadrants(f: &mut Frame, area: Rect, img: &image::RgbaImage, cover: bool, dim: f32) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let (ow, oh) = blit_scale_dims(img.dimensions(), area, cover);
-    let resized = image::imageops::resize(img, ow, oh, image::imageops::FilterType::Triangle);
-    paint_resized_half_blocks(f, area, &resized, dim, (0.0, 1.0));
+    let resized = image::imageops::resize(img, ow * 2, oh, image::imageops::FilterType::Triangle);
+    paint_resized_quadrants(f, area, &resized, dim, (0.0, 1.0));
 }
 
 /// Paint the fixed bottom input pane:
@@ -4330,23 +4389,52 @@ fn render_remote_err<'a>(
 mod tests {
     use super::*;
 
+    // A cell is "painted" by the quadrant renderer iff it has an explicit
+    // Rgb foreground (solid regions render as a space with fg==bg color).
+    fn cell_painted(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {
+        matches!(buf.cell((x, y)).map(|c| c.style().fg), Some(Some(Color::Rgb(..))))
+    }
+
     fn blit_filled_cells(area_w: u16, area_h: u16, img: &image::RgbaImage, cover: bool) -> usize {
         let backend = ratatui::backend::TestBackend::new(area_w, area_h);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| {
-            blit_image_half_blocks(f, Rect::new(0, 0, area_w, area_h), img, cover, 1.0);
+            blit_image_quadrants(f, Rect::new(0, 0, area_w, area_h), img, cover, 1.0);
         })
         .expect("draw");
         let buf = term.backend().buffer();
         let mut n = 0;
         for y in 0..area_h {
             for x in 0..area_w {
-                if buf.cell((x, y)).map(|c| c.symbol()) == Some("▀") {
+                if cell_painted(buf, x, y) {
                     n += 1;
                 }
             }
         }
         n
+    }
+
+    #[test]
+    fn best_quadrant_matches_two_color_blocks() {
+        let r = [200, 0, 0];
+        let b = [0, 0, 200];
+        let w = [255, 255, 255];
+        let k = [0, 0, 0];
+        // Top row one color, bottom row another → a top/bottom half block,
+        // fg = top color, bg = bottom color (px order TL,TR,BL,BR).
+        let (ch, fg, bg) = best_quadrant([r, r, b, b]);
+        assert!(ch == "▀" || ch == "▄", "top/bottom split glyph, got {ch:?}");
+        assert!((fg == r && bg == b) || (fg == b && bg == r));
+        // Left/right split → vertical half block.
+        let (ch, _, _) = best_quadrant([r, b, r, b]);
+        assert!(ch == "▌" || ch == "▐", "left/right split glyph, got {ch:?}");
+        // A single bright sub-cell → that one quadrant, exact colors.
+        let (ch, fg, bg) = best_quadrant([w, k, k, k]);
+        assert_eq!(ch, "▘");
+        assert_eq!((fg, bg), (w, k));
+        // Uniform block → a single solid color (fg == bg), zero error.
+        let (_, fg, bg) = best_quadrant([r, r, r, r]);
+        assert_eq!((fg, bg), (r, r));
     }
 
     #[test]
@@ -4359,9 +4447,9 @@ mod tests {
             15,
             "cover must fill every cell"
         );
-        // A very wide, short image fit into a tall area letterboxes —
-        // some cells stay empty.
-        let wide = image::RgbaImage::from_pixel(16, 1, image::Rgba([30, 200, 30, 255]));
+        // A wide image fit into a square area letterboxes — some cells
+        // stay empty.
+        let wide = image::RgbaImage::from_pixel(16, 8, image::Rgba([30, 200, 30, 255]));
         let filled = blit_filled_cells(4, 4, &wide, false);
         assert!(
             filled > 0 && filled < 16,
@@ -4399,14 +4487,15 @@ mod tests {
         let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]));
         let area = Rect::new(0, 0, 4, 6);
         let (ow, oh) = blit_scale_dims(img.dimensions(), area, true);
-        let resized = image::imageops::resize(&img, ow, oh, image::imageops::FilterType::Triangle);
+        let resized =
+            image::imageops::resize(&img, ow * 2, oh, image::imageops::FilterType::Triangle);
         let backend = ratatui::backend::TestBackend::new(4, 6);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
-        term.draw(|f| paint_resized_half_blocks(f, area, &resized, 1.0, row_frac))
+        term.draw(|f| paint_resized_quadrants(f, area, &resized, 1.0, row_frac))
             .expect("draw");
         let buf = term.backend().buffer();
         (0..6)
-            .map(|y| (0..4).all(|x| buf.cell((x, y)).map(|c| c.symbol()) == Some("▀")))
+            .map(|y| (0..4).all(|x| cell_painted(buf, x, y)))
             .collect()
     }
 
@@ -4444,7 +4533,7 @@ mod tests {
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 200, 200, 255]));
         let backend = ratatui::backend::TestBackend::new(2, 1);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
-        term.draw(|f| blit_image_half_blocks(f, Rect::new(0, 0, 2, 1), &img, true, 0.5))
+        term.draw(|f| blit_image_quadrants(f, Rect::new(0, 0, 2, 1), &img, true, 0.5))
             .expect("draw");
         let buf = term.backend().buffer();
         // 200 * 0.5 = 100, so the dimmed fg should be well below 200.

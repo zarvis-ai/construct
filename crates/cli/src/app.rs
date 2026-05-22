@@ -5285,7 +5285,12 @@ mod tests {
             let mut n = 0;
             for y in area.y..area.y + area.height {
                 for x in area.x..area.x + area.width {
-                    if buf.cell((x, y)).map(|c| c.symbol()) == Some("▀") {
+                    // The quadrant wallpaper is the only thing that sets an
+                    // Rgb *background*; the rain only ever sets fg.
+                    if matches!(
+                        buf.cell((x, y)).map(|c| c.style().bg),
+                        Some(Some(ratatui::style::Color::Rgb(..)))
+                    ) {
                         n += 1;
                     }
                 }
@@ -5293,8 +5298,8 @@ mod tests {
             n
         };
 
-        // No preview → no wallpaper cells in the rain (the rain charset
-        // never uses `▀`).
+        // No preview → no wallpaper cells in the rain (the rain only
+        // sets fg colors, never an Rgb background).
         assert_eq!(count_wallpaper_cells(&mut app), 0);
 
         // Insert a preview for the selected session → wallpaper appears.
