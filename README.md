@@ -75,86 +75,10 @@ cargo build --workspace
 scripts/smoke.sh
 ```
 
-## PR review artifacts
+## Contributor workflow
 
-When a change benefits from visual review, upload before/after screenshots or
-recordings with [`gh-attach`](https://github.com/atani/gh-attach) and reference
-the returned URLs from the PR description or a PR comment. Use release mode for
-scriptable uploads: it only needs `gh` CLI authentication and stores the files
-as assets on a temporary GitHub Release.
-
-Install once:
-
-```sh
-gh extension install atani/gh-attach
-```
-
-Upload artifacts and keep the URLs for markdown:
-
-```sh
-PR=123
-REPO=owner/repo
-TAG="review-artifacts-YYYY-MM"
-
-mkdir -p /tmp/agentd-pr-artifacts
-cp ./artifacts/before.png "/tmp/agentd-pr-artifacts/pr-${PR}-before.png"
-cp ./artifacts/after.png "/tmp/agentd-pr-artifacts/pr-${PR}-after.png"
-cp ./artifacts/demo.mp4 "/tmp/agentd-pr-artifacts/pr-${PR}-demo.mp4"
-
-before_url=$(gh attach --repo "$REPO" --issue "$PR" --image "/tmp/agentd-pr-artifacts/pr-${PR}-before.png" --url-only --release --release-tag "$TAG")
-after_url=$(gh attach --repo "$REPO" --issue "$PR" --image "/tmp/agentd-pr-artifacts/pr-${PR}-after.png" --url-only --release --release-tag "$TAG")
-video_url=$(gh attach --repo "$REPO" --issue "$PR" --image "/tmp/agentd-pr-artifacts/pr-${PR}-demo.mp4" --url-only --release --release-tag "$TAG")
-```
-
-Post them as a PR comment:
-
-```sh
-cat > /tmp/agentd-pr-artifacts.md <<EOF
-### Review artifacts
-
-| Before | After |
-|---|---|
-| <img src="$before_url" width="800"> | <img src="$after_url" width="800"> |
-
-Demo video:
-
-$video_url
-EOF
-
-gh pr comment "$PR" --repo "$REPO" --body-file /tmp/agentd-pr-artifacts.md
-```
-
-Or merge them into the PR description:
-
-```sh
-gh pr view "$PR" --repo "$REPO" --json body --jq .body > /tmp/agentd-pr-body.md
-cat /tmp/agentd-pr-artifacts.md >> /tmp/agentd-pr-body.md
-gh pr edit "$PR" --repo "$REPO" --body-file /tmp/agentd-pr-body.md
-```
-
-Use one monthly `TAG`, such as `review-artifacts-2026-05`, and prefix asset
-names with the PR number. That keeps review artifacts grouped so old months can
-be removed together.
-
-Delete one asset from the monthly release:
-
-```sh
-ASSET="pr-${PR}-before.png"
-asset_id=$(gh release view "$TAG" --repo "$REPO" --json assets --jq ".assets[] | select(.name == \"$ASSET\") | .id")
-gh api --method DELETE "repos/$REPO/releases/assets/$asset_id"
-```
-
-Delete an old monthly artifact bucket only if the rendered links no longer
-matter:
-
-```sh
-gh release delete "$TAG" --repo "$REPO" --yes
-git push origin --delete "$TAG"
-```
-
-If you need the exact same `https://github.com/user-attachments/assets/...` URL
-shape that GitHub creates on drag/drop, omit `--release` and use a logged-in
-browser session with `gh-attach`'s browser mode instead.
+Contributor workflow notes, including PR review artifact guidance and TUI
+recording instructions, live in [`AGENTS.md`](./AGENTS.md).
 
 ## Paths
 
