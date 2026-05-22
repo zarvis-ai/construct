@@ -215,6 +215,34 @@ struct CachedParser {
     /// per frame for block-span row math — we just add the new
     /// tail's visible-line count.
     pending_visible_lines: usize,
+    /// Per-item rendered layout for `replay_full` — the visible-line
+    /// count and (for tool blocks) the hit-rect metadata. Parallel to
+    /// `self.items`. Lets steady-state frames skip the O(history)
+    /// `count_visible_lines` / `synth_block` re-scan of every item:
+    /// the unchanged prefix is reused, only new items are computed.
+    /// Valid only while `cols` is unchanged (rebuild clears it).
+    item_layouts: Vec<ItemLayout>,
+}
+
+/// Cached per-item render layout used by `replay_full`. Depends only
+/// on the item contents and `cols` (not `rows`), so it survives every
+/// frame that doesn't change column width or mutate an item.
+#[derive(Clone)]
+struct ItemLayout {
+    /// Visible row count this item contributes (incl. soft wraps).
+    lines: usize,
+    /// Tool-block hit-rect metadata, `None` for plain PTY chunks.
+    block: Option<BlockLayout>,
+}
+
+#[derive(Clone)]
+struct BlockLayout {
+    call_id: String,
+    /// Offset (in visible rows) of the block's status row from the
+    /// block's first row; `None` if the block has no status row.
+    status_row_offset: Option<usize>,
+    bg_cols: Option<(u16, u16)>,
+    kill_cols: Option<(u16, u16)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -711,6 +739,7 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
+                item_layouts: Vec::new(),
             });
         }
         let cache = self.cached.as_mut().expect("just populated above");
@@ -797,6 +826,7 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
+                item_layouts: Vec::new(),
             };
             for item in &self.items {
                 if let Item::PtyChunk(b) = item {
@@ -852,6 +882,7 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
+                item_layouts: Vec::new(),
             });
         }
         let cache = self.cached.as_mut().expect("just populated above");
@@ -864,45 +895,64 @@ impl ItemHistory {
             bg_cols: Option<(u16, u16)>,
             kill_cols: Option<(u16, u16)>,
         }
-        let mut block_spans: Vec<BlockSpan> = Vec::new();
-        let mut abs_line: usize = 0;
-
-        // On rebuild, process every item; on incremental, just the
-        // new tail past `processed_count`. We still iterate ALL items
-        // so we can compute block-span row positions for hit-testing
-        // (those depend on visible-line counts even for items we
-        // don't re-feed to the parser).
+        // Compute layouts only for items past the cached prefix.
+        // Cached layouts for `[0..reuse_upto)` stay valid because the
+        // non-rebuild path guarantees `cols` is unchanged (a cols
+        // change forces a rebuild, which clears `item_layouts`), and
+        // any signature mutation in the prefix also forces a rebuild.
+        // The unchanged prefix is exactly the items already fed into
+        // the persistent parser, so we only `process` the new tail —
+        // and we no longer re-scan the whole history with
+        // `count_visible_lines` / `synth_block` every frame. That
+        // O(history)-per-frame re-scan was the zarvis typing lag.
         let start_processing_at = if needs_rebuild { 0 } else { cache.processed_count };
-        for (idx, item) in self.items.iter().enumerate() {
-            let start = abs_line;
-            match item {
+        let reuse_upto = cache.item_layouts.len().min(self.items.len());
+        for (idx, item) in self.items.iter().enumerate().skip(reuse_upto) {
+            let layout = match item {
                 Item::PtyChunk(b) => {
                     if idx >= start_processing_at {
-                        abs_line += count_visible_lines(b, cols);
                         cache.parser.process(b);
-                    } else {
-                        abs_line += count_visible_lines(b, cols);
+                    }
+                    ItemLayout {
+                        lines: count_visible_lines(b, cols),
+                        block: None,
                     }
                 }
                 Item::ToolBlock(block) => {
                     let synth = synth_block(block, cols);
-                    let lines = count_visible_lines(&synth.bytes, cols);
                     if idx >= start_processing_at {
                         cache.parser.process(&synth.bytes);
                     }
-                    abs_line += lines;
-                    let status_abs_row = synth
-                        .status_row_offset
-                        .map(|off| start + off as usize);
-                    block_spans.push(BlockSpan {
-                        call_id: block.call_id.clone(),
-                        abs_start: start,
-                        abs_end: abs_line,
-                        status_abs_row,
-                        bg_cols: synth.bg_button_cols,
-                        kill_cols: synth.kill_button_cols,
-                    });
+                    ItemLayout {
+                        lines: count_visible_lines(&synth.bytes, cols),
+                        block: Some(BlockLayout {
+                            call_id: block.call_id.clone(),
+                            status_row_offset: synth.status_row_offset.map(|off| off as usize),
+                            bg_cols: synth.bg_button_cols,
+                            kill_cols: synth.kill_button_cols,
+                        }),
+                    }
                 }
+            };
+            cache.item_layouts.push(layout);
+        }
+
+        // Cumulative line positions + block-span hit rects, summed from
+        // the (mostly cached) per-item layouts. O(items), no byte scan.
+        let mut block_spans: Vec<BlockSpan> = Vec::new();
+        let mut abs_line: usize = 0;
+        for layout in &cache.item_layouts {
+            let start = abs_line;
+            abs_line += layout.lines;
+            if let Some(bl) = &layout.block {
+                block_spans.push(BlockSpan {
+                    call_id: bl.call_id.clone(),
+                    abs_start: start,
+                    abs_end: abs_line,
+                    status_abs_row: bl.status_row_offset.map(|off| start + off),
+                    bg_cols: bl.bg_cols,
+                    kill_cols: bl.kill_cols,
+                });
             }
         }
 
@@ -2018,6 +2068,71 @@ mod tests {
         let _ = h.replay(120, 30, 0);
         let us = t.elapsed().as_micros();
         assert!(us < 5_000, "zarvis resize too slow: {us} µs");
+    }
+
+    /// PERF / regression: typing into a long zarvis session was
+    /// "super laggy". zarvis history has tool blocks, so it takes the
+    /// `replay_full` path. Unlike the streaming-bootstrap case (where
+    /// the bulk sits in `pending_chunk` and is handled incrementally),
+    /// a real session FLUSHES chat into many `Item::PtyChunk` entries
+    /// interleaved with `Item::ToolBlock`s. `replay_full` re-walked
+    /// every item calling `count_visible_lines` / `synth_block` on
+    /// every frame to position tool-block hit rects — O(total history
+    /// bytes) per frame. Each keystroke triggers a redraw (via the
+    /// EditorState round-trip), so the per-frame cost was paid on
+    /// every character → the lag.
+    ///
+    /// Steady-state re-render (same size, nothing changed) must be
+    /// cheap regardless of history size.
+    #[test]
+    fn zarvis_steady_state_render_is_cheap_with_many_items() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        // 300 chat-then-tool cycles. Each chat span is flushed into a
+        // PtyChunk item when the following tool block opens, so we end
+        // up with ~600 sizable items — the shape of a long working
+        // session, not one giant pending chunk.
+        for i in 0..300u32 {
+            let mut chat = Vec::with_capacity(1500);
+            for j in 0..15 {
+                chat.extend_from_slice(
+                    format!("\x1b[33mline {i}.{j} of accumulated assistant chat content\x1b[0m\r\n")
+                        .as_bytes(),
+                );
+            }
+            h.feed_pty(&chat);
+            let call = format!("c{i}");
+            h.feed_tool_use("shell".into(), format!("cmd {i}"));
+            h.feed_pty(format!("\x1b]7700;open;call={call}\x07out\x1b]7700;close;call={call}\x07").as_bytes());
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+
+        // Warm the cache so we measure steady state, not the one-time
+        // post-bootstrap rebuild.
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        // Steady state: same size, no new bytes, no signature changes —
+        // this is what a keystroke's redraw does. Should be cheap.
+        let frames = 100u32;
+        let t = Instant::now();
+        for _ in 0..frames {
+            let _ = h.replay(cols, rows, 0);
+        }
+        let total_us = t.elapsed().as_micros();
+        let per_frame = total_us / frames as u128;
+        eprintln!("zarvis steady-state: {per_frame} µs/frame ({total_us} µs / {frames})");
+
+        // A no-op re-render must not re-scan the whole history. Loose
+        // bound to avoid CI flakiness; the pre-fix cost was ~10-50×
+        // this on the same hardware.
+        assert!(
+            per_frame < 300,
+            "zarvis steady-state render too slow: {per_frame} µs/frame — replay_full is re-scanning history every frame"
+        );
     }
 
     // ----- orchestrator / minibuffer (zarvis-like content, no
