@@ -68,6 +68,14 @@ async fn main() -> Result<()> {
 }
 
 async fn run(socket_override: Option<PathBuf>) -> Result<()> {
+    // Capture the executable path now, before anything can replace
+    // the binary on disk. `/agentd restart` re-`exec()`s this path;
+    // resolving it lazily at restart time is unreliable once an
+    // upgrade has rename-replaced the file (Linux's
+    // `current_exe()` then reads as "… (deleted)"). See
+    // `session::capture_startup_exe`.
+    session::capture_startup_exe();
+
     let paths = Paths::discover();
     std::fs::create_dir_all(&paths.state_dir).ok();
     std::fs::create_dir_all(&paths.data_dir).ok();
