@@ -4149,4 +4149,43 @@ mod tests {
                 > editor_pane_rows(Some(&small_state), None, 80)
         );
     }
+
+    fn summary_with_mode(harness: &str, mode: Option<&str>) -> agentd_protocol::SessionSummary {
+        let mut json = serde_json::json!({
+            "id": "s1",
+            "harness": harness,
+            "cwd": "/tmp",
+            "state": "running",
+            "created_at": "2026-05-20T00:00:00Z",
+        });
+        if let Some(m) = mode {
+            json["mode"] = serde_json::json!(m);
+        }
+        serde_json::from_value(json).expect("valid SessionSummary")
+    }
+
+    #[test]
+    fn is_headless_only_for_headless_mode() {
+        assert!(is_headless(&summary_with_mode("zarvis", Some("headless"))));
+        assert!(!is_headless(&summary_with_mode("zarvis", Some("interactive"))));
+        // Missing mode is treated as not-headless (older sessions
+        // persisted before the mode fix, and PTY harnesses).
+        assert!(!is_headless(&summary_with_mode("shell", None)));
+    }
+
+    #[test]
+    fn harness_label_prefixes_headless() {
+        // Headless sessions get a "(headless) " prefix so the list /
+        // title bar visibly distinguish them from interactive ones.
+        assert_eq!(
+            harness_label(&summary_with_mode("zarvis", Some("headless"))),
+            "(headless) zarvis"
+        );
+        // Interactive and mode-less sessions render the bare harness.
+        assert_eq!(
+            harness_label(&summary_with_mode("zarvis", Some("interactive"))),
+            "zarvis"
+        );
+        assert_eq!(harness_label(&summary_with_mode("shell", None)), "shell");
+    }
 }

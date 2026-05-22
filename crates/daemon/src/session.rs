@@ -2972,4 +2972,62 @@ mod tests {
             "Error during shutdown must NOT transition state either",
         );
     }
+
+    fn create_params(mode: Option<&str>, pty: Option<PtySize>) -> CreateSessionParams {
+        CreateSessionParams {
+            harness: "shell".into(),
+            cwd: "/tmp".into(),
+            prompt: None,
+            model: None,
+            title: None,
+            mode: mode.map(str::to_string),
+            pty_size: pty,
+            worktree: false,
+            env: Default::default(),
+            args: Vec::new(),
+            kind: agentd_protocol::SessionKind::User,
+            group_id: None,
+        }
+    }
+
+    /// An explicit `mode` from the client always wins, regardless of
+    /// whether a PTY size was supplied.
+    #[test]
+    fn effective_mode_honors_explicit_mode() {
+        assert_eq!(
+            effective_mode(&create_params(Some("headless"), None)),
+            "headless"
+        );
+        assert_eq!(
+            effective_mode(&create_params(Some("interactive"), None)),
+            "interactive"
+        );
+        // Explicit mode wins even when a PTY size is also present.
+        assert_eq!(
+            effective_mode(&create_params(
+                Some("headless"),
+                Some(PtySize { cols: 80, rows: 24 })
+            )),
+            "headless"
+        );
+    }
+
+    /// No explicit mode, but a PTY size was requested → the session is
+    /// interactive (matches the adapters' own default heuristic).
+    #[test]
+    fn effective_mode_defaults_to_interactive_with_pty() {
+        assert_eq!(
+            effective_mode(&create_params(None, Some(PtySize { cols: 80, rows: 24 }))),
+            "interactive"
+        );
+    }
+
+    /// No explicit mode and no PTY size → headless. This is the case
+    /// the PR fixes: previously `mode` stayed `None` on disk, so the
+    /// remote UI couldn't tell a headless session apart from an
+    /// interactive one and rendered it as a terminal instead of chat.
+    #[test]
+    fn effective_mode_defaults_to_headless_without_pty() {
+        assert_eq!(effective_mode(&create_params(None, None)), "headless");
+    }
 }
