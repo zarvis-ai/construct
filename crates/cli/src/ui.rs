@@ -37,11 +37,14 @@ fn preview_reveal_range(
     revealed_at: std::time::Instant,
     hide_after: std::time::Instant,
     now: std::time::Instant,
+    hovered: bool,
 ) -> (f32, f32) {
     let appear =
         (now.saturating_duration_since(revealed_at).as_secs_f32() / PREVIEW_REVEAL_SECS).clamp(0.0, 1.0);
     let remaining = hide_after.saturating_duration_since(now).as_secs_f32();
-    let disappear = if remaining < PREVIEW_REVEAL_SECS {
+    // Hovering pins the preview (the expiry timer is frozen), so don't
+    // play the disappear erase while the cursor is over it.
+    let disappear = if !hovered && remaining < PREVIEW_REVEAL_SECS {
         (1.0 - remaining / PREVIEW_REVEAL_SECS).clamp(0.0, 1.0)
     } else {
         0.0
@@ -1282,11 +1285,11 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
             state
                 .decoded
                 .clone()
-                .map(|img| (img, state.revealed_at, state.hide_after))
+                .map(|img| (img, state.revealed_at, state.hide_after, state.hover_started.is_some()))
         },
     );
-    if let Some((img, revealed_at, hide_after)) = &wallpaper {
-        let row_frac = preview_reveal_range(*revealed_at, *hide_after, now);
+    if let Some((img, revealed_at, hide_after, hovered)) = &wallpaper {
+        let row_frac = preview_reveal_range(*revealed_at, *hide_after, now, *hovered);
         if row_frac.1 > row_frac.0 {
             let (ow, oh) = blit_scale_dims(img.dimensions(), rain_area, true);
             let resized = resized_image(&mut app.image_resize_cache, img, ow, oh);
@@ -2401,10 +2404,12 @@ fn render_browser_preview_overlay(
     };
     if let Some(img) = preview_state.decoded.as_ref() {
         // Same dial-up reveal/erase as the matrix wallpaper, in sync.
+        // Hovering this overlay pins it, so the erase won't start.
         let row_frac = preview_reveal_range(
             preview_state.revealed_at,
             preview_state.hide_after,
             std::time::Instant::now(),
+            preview_state.hover_started.is_some(),
         );
         if row_frac.1 > row_frac.0 {
             let (ow, oh) = blit_scale_dims(img.dimensions(), image_area, false);
@@ -4387,6 +4392,19 @@ mod tests {
         (0..6)
             .map(|y| (0..4).all(|x| buf.cell((x, y)).map(|c| c.symbol()) == Some("▀")))
             .collect()
+    }
+
+    #[test]
+    fn preview_reveal_range_freezes_erase_on_hover() {
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let revealed = now - Duration::from_secs(5); // fully appeared
+        let hide_soon = now + Duration::from_millis(300); // inside the erase window
+        let (start, end) = preview_reveal_range(revealed, hide_soon, now, false);
+        assert!(start > 0.0, "erase should be underway when not hovered: {start}");
+        assert!((end - 1.0).abs() < 1e-3);
+        let (start_h, _) = preview_reveal_range(revealed, hide_soon, now, true);
+        assert_eq!(start_h, 0.0, "hover must freeze the top-down erase");
     }
 
     #[test]

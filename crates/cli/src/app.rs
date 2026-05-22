@@ -489,6 +489,10 @@ pub type ImageResizeCache = Vec<((usize, u32, u32), std::sync::Arc<image::RgbaIm
 /// cap makes every subsequent resize cheap with no visible quality loss.
 const PREVIEW_MAX_DIM: u32 = 400;
 
+/// How long a browser preview stays up (before its top-to-bottom erase)
+/// when not hovered. Hovering keeps it and resets this on un-hover.
+const BROWSER_PREVIEW_TTL: Duration = Duration::from_secs(7);
+
 /// Decode a base64-PNG browser-preview image to a shared RGBA buffer,
 /// downscaled once to `PREVIEW_MAX_DIM`. `None` if the base64 or the
 /// image fails to decode. Done once on insert so per-frame rendering
@@ -1411,7 +1415,7 @@ impl App {
             session_id,
             BrowserPreviewState {
                 preview,
-                hide_after: now + Duration::from_secs(5),
+                hide_after: now + BROWSER_PREVIEW_TTL,
                 hover_started: None,
                 decoded,
                 revealed_at: now,
@@ -1441,7 +1445,7 @@ impl App {
                 true
             } else {
                 if state.hover_started.take().is_some() {
-                    state.hide_after = now + Duration::from_secs(5);
+                    state.hide_after = now + BROWSER_PREVIEW_TTL;
                 }
                 now < state.hide_after
             }
