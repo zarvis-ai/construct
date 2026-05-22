@@ -22,9 +22,32 @@ const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
 /// matrix rain — kept very dim so the green rain clearly stays the
 /// foreground and the image reads as a faint backdrop.
 const MATRIX_WALLPAPER_DIM: f32 = 0.22;
-/// Seconds for the wallpaper's top-to-bottom "dial-up" reveal when a
-/// browser preview first appears.
-const MATRIX_WALLPAPER_REVEAL_SECS: f32 = 3.0;
+/// Seconds for a browser preview's top-to-bottom "dial-up" reveal on
+/// appear, and the top-to-bottom erase on disappear. Applies to both the
+/// terminal-view overlay and the matrix-rain wallpaper.
+const PREVIEW_REVEAL_SECS: f32 = 1.0;
+
+/// Row-fraction range `[start, end)` of a preview image to paint this
+/// frame. On appear the image fills from the top over `PREVIEW_REVEAL_SECS`
+/// (range `(0, a)`); while shown it's full (`(0, 1)`); on disappear it
+/// erases from the top over the last `PREVIEW_REVEAL_SECS` before
+/// `hide_after` (range `(d, 1)` — only the bottom remains). The same
+/// curve drives the overlay and the wallpaper so they stay in sync.
+fn preview_reveal_range(
+    revealed_at: std::time::Instant,
+    hide_after: std::time::Instant,
+    now: std::time::Instant,
+) -> (f32, f32) {
+    let appear =
+        (now.saturating_duration_since(revealed_at).as_secs_f32() / PREVIEW_REVEAL_SECS).clamp(0.0, 1.0);
+    let remaining = hide_after.saturating_duration_since(now).as_secs_f32();
+    let disappear = if remaining < PREVIEW_REVEAL_SECS {
+        (1.0 - remaining / PREVIEW_REVEAL_SECS).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (disappear, appear)
+}
 const MATRIX_RAIN_TAIL_MIN: u16 = 5;
 const MATRIX_RAIN_TAIL_MAX: u16 = 9;
 
@@ -1250,25 +1273,24 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     // cells with a drop/letter overwrite the image, empty cells keep it,
     // so the animation runs uninterrupted on top of the wallpaper.
     //
-    // Dial-up nostalgia: when the preview first arrives the image draws
-    // in top-to-bottom over `MATRIX_WALLPAPER_REVEAL_SECS`, like a JPEG
-    // crawling in over a slow modem. The matrix tick (~8fps) already
-    // redraws each frame, so the reveal advances on its own.
-    let wallpaper = app
-        .selected_id()
-        .and_then(|id| app.browser_previews.get(&id))
-        .and_then(|state| state.decoded.clone().map(|img| (img, state.revealed_at)));
-    if let Some((img, revealed_at)) = &wallpaper {
-        let frac = (now.saturating_duration_since(*revealed_at).as_secs_f32()
-            / MATRIX_WALLPAPER_REVEAL_SECS)
-            .clamp(0.0, 1.0);
-        // Cover fills the whole panel, so the displayed image is
-        // `rain_area.height` cell rows tall; reveal that many top-down.
-        let reveal_rows = (frac * rain_area.height as f32).ceil() as u16;
-        if reveal_rows > 0 {
+    // Dial-up nostalgia: the image draws in top-to-bottom when the
+    // preview arrives and erases top-to-bottom when it's about to hide,
+    // like a JPEG over a slow modem. The matrix tick (~8fps) already
+    // redraws each frame, so the animation advances on its own.
+    let wallpaper = app.selected_id().and_then(|id| app.browser_previews.get(&id)).and_then(
+        |state| {
+            state
+                .decoded
+                .clone()
+                .map(|img| (img, state.revealed_at, state.hide_after))
+        },
+    );
+    if let Some((img, revealed_at, hide_after)) = &wallpaper {
+        let row_frac = preview_reveal_range(*revealed_at, *hide_after, now);
+        if row_frac.1 > row_frac.0 {
             let (ow, oh) = blit_scale_dims(img.dimensions(), rain_area, true);
             let resized = resized_image(&mut app.image_resize_cache, img, ow, oh);
-            paint_resized_half_blocks(f, rain_area, &resized, MATRIX_WALLPAPER_DIM, reveal_rows);
+            paint_resized_half_blocks(f, rain_area, &resized, MATRIX_WALLPAPER_DIM, row_frac);
         }
     }
 
@@ -2378,9 +2400,17 @@ fn render_browser_preview_overlay(
         height: inner.height.saturating_sub(caption_rows),
     };
     if let Some(img) = preview_state.decoded.as_ref() {
-        let (ow, oh) = blit_scale_dims(img.dimensions(), image_area, false);
-        let resized = resized_image(resize_cache, img, ow, oh);
-        paint_resized_half_blocks(f, image_area, &resized, 1.0, u16::MAX);
+        // Same dial-up reveal/erase as the matrix wallpaper, in sync.
+        let row_frac = preview_reveal_range(
+            preview_state.revealed_at,
+            preview_state.hide_after,
+            std::time::Instant::now(),
+        );
+        if row_frac.1 > row_frac.0 {
+            let (ow, oh) = blit_scale_dims(img.dimensions(), image_area, false);
+            let resized = resized_image(resize_cache, img, ow, oh);
+            paint_resized_half_blocks(f, image_area, &resized, 1.0, row_frac);
+        }
     }
     if inner.height > 0 {
         let caption = preview
@@ -2467,15 +2497,16 @@ fn resized_image(
 /// Paint an already-resized RGBA image into `area` as half-block (`▀`)
 /// cells — fg = top pixel, bg = bottom pixel. Center-crops `resized`
 /// into the area (so cover images crop, contain images letterbox). `dim`
-/// in `0.0..=1.0` multiplies brightness. `reveal_rows` caps how many cell
-/// rows are drawn from the top (the rest stay blank) — `u16::MAX` draws
-/// all; smaller values give the wallpaper's top-to-bottom reveal.
+/// in `0.0..=1.0` multiplies brightness. `row_frac` is the `[start, end)`
+/// fraction of the image's cell rows to paint (rest stay blank):
+/// `(0.0, 1.0)` draws all; `(0.0, a)` reveals the top `a` (appear);
+/// `(d, 1.0)` keeps only the bottom `1-d` (top-down erase on disappear).
 fn paint_resized_half_blocks(
     f: &mut Frame,
     area: Rect,
     resized: &image::RgbaImage,
     dim: f32,
-    reveal_rows: u16,
+    row_frac: (f32, f32),
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2493,16 +2524,21 @@ fn paint_resized_half_blocks(
     let cell_rows = crop_h.div_ceil(2).min(area.height as u32);
     let x0 = area.x + ((target_w - crop_w) / 2) as u16;
     let y0 = area.y + ((area.height as u32 - cell_rows) / 2) as u16;
-    // Top-to-bottom reveal: paint only the top `reveal_rows` cell rows of
-    // the (centered) image; the rest stay blank this frame.
-    let paint_rows = cell_rows.min(reveal_rows as u32);
+    // Only paint cell rows inside the reveal window; the rest stay blank
+    // this frame (the appear/erase animation).
+    let cf = cell_rows as f32;
+    let start_row = ((row_frac.0 * cf).floor() as u32).min(cell_rows);
+    let end_row = ((row_frac.1 * cf).ceil() as u32).min(cell_rows);
     let dim = dim.clamp(0.0, 1.0);
     let d = |c: u8| (c as f32 * dim).round() as u8;
     let buf = f.buffer_mut();
     for ry in (0..crop_h).step_by(2) {
         let row = ry / 2;
-        if row >= paint_rows {
+        if row >= end_row {
             break;
+        }
+        if row < start_row {
+            continue;
         }
         for rx in 0..crop_w {
             let top = resized.get_pixel(src_off_x + rx, src_off_y + ry).0;
@@ -2534,7 +2570,7 @@ fn blit_image_half_blocks(f: &mut Frame, area: Rect, img: &image::RgbaImage, cov
     }
     let (ow, oh) = blit_scale_dims(img.dimensions(), area, cover);
     let resized = image::imageops::resize(img, ow, oh, image::imageops::FilterType::Triangle);
-    paint_resized_half_blocks(f, area, &resized, dim, u16::MAX);
+    paint_resized_half_blocks(f, area, &resized, dim, (0.0, 1.0));
 }
 
 /// Paint the fixed bottom input pane:
@@ -4337,27 +4373,36 @@ mod tests {
         assert!(cache.len() <= 4, "cache must stay bounded, got {}", cache.len());
     }
 
-    #[test]
-    fn wallpaper_reveal_rows_draws_top_down() {
+    fn paint_rows_for(row_frac: (f32, f32)) -> Vec<bool> {
+        // 4x6 cover-filled image; return per-cell-row whether it's painted.
         let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]));
         let area = Rect::new(0, 0, 4, 6);
         let (ow, oh) = blit_scale_dims(img.dimensions(), area, true);
         let resized = image::imageops::resize(&img, ow, oh, image::imageops::FilterType::Triangle);
         let backend = ratatui::backend::TestBackend::new(4, 6);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
-        // Reveal only the top 2 of 6 cell rows.
-        term.draw(|f| paint_resized_half_blocks(f, area, &resized, 1.0, 2))
+        term.draw(|f| paint_resized_half_blocks(f, area, &resized, 1.0, row_frac))
             .expect("draw");
         let buf = term.backend().buffer();
-        let is_img = |x, y| buf.cell((x, y)).map(|c| c.symbol()) == Some("▀");
-        for x in 0..4 {
-            assert!(is_img(x, 0) && is_img(x, 1), "top rows revealed");
-        }
-        for y in 2..6 {
-            for x in 0..4 {
-                assert!(!is_img(x, y), "row {y} must not be revealed yet");
-            }
-        }
+        (0..6)
+            .map(|y| (0..4).all(|x| buf.cell((x, y)).map(|c| c.symbol()) == Some("▀")))
+            .collect()
+    }
+
+    #[test]
+    fn wallpaper_appears_top_down() {
+        // Appear half-done → top ~3 of 6 rows drawn, bottom blank.
+        let rows = paint_rows_for((0.0, 0.5));
+        assert!(rows[0] && rows[1] && rows[2], "top rows revealed: {rows:?}");
+        assert!(!rows[3] && !rows[4] && !rows[5], "bottom not yet: {rows:?}");
+    }
+
+    #[test]
+    fn wallpaper_erases_top_down_on_disappear() {
+        // Disappear half-done → top ~3 rows erased (blank), bottom remains.
+        let rows = paint_rows_for((0.5, 1.0));
+        assert!(!rows[0] && !rows[1] && !rows[2], "top rows erased: {rows:?}");
+        assert!(rows[3] && rows[4] && rows[5], "bottom still shown: {rows:?}");
     }
 
     #[test]
