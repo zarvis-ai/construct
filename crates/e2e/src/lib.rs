@@ -44,10 +44,15 @@ pub struct Daemon {
     /// already connected to this; the path is exposed mainly for
     /// passing to the TUI helper.
     pub socket: PathBuf,
+    /// Path the daemon binary was launched from. For `spawn()`
+    /// this is the workspace `target/debug/agentd`. For
+    /// `spawn_relocatable()` it's a private copy under the
+    /// tempdir that the test can swap to exercise the
+    /// "exec picks up an upgraded binary" path.
+    pub binary_path: PathBuf,
     /// Pre-connected IPC client. Tests start using it directly —
     /// no separate "connect" step.
     pub client: Arc<Client>,
-    #[allow(dead_code)]
     child: Child,
 }
 
@@ -63,6 +68,22 @@ impl Daemon {
     /// orchestrator-spawn timeout on hosts where the adapter
     /// binaries can't be located.
     pub async fn spawn() -> Result<Self> {
+        Self::spawn_inner(false).await
+    }
+
+    /// Like `spawn`, but copies the `agentd` binary into the
+    /// tempdir and launches that copy instead of the workspace
+    /// binary. The copy lives at `Daemon::binary_path`, so a
+    /// test can atomically swap it (write-then-rename) and then
+    /// `daemon.restart` to verify the daemon exec()s the new
+    /// on-disk bytes. Running from a private copy also keeps the
+    /// swap from disturbing other tests that share the workspace
+    /// binary.
+    pub async fn spawn_relocatable() -> Result<Self> {
+        Self::spawn_inner(true).await
+    }
+
+    async fn spawn_inner(relocatable: bool) -> Result<Self> {
         let dir = tempfile::tempdir().context("create tempdir")?;
         let runtime_dir = dir.path().join("run");
         let state_dir = dir.path().join("state");
@@ -87,8 +108,44 @@ impl Daemon {
         .context("write e2e config.toml")?;
         let socket = runtime_dir.join("agentd.sock");
 
-        let bin = agentd_bin_path()?;
-        let mut cmd = Command::new(&bin);
+        // For the relocatable case, copy the workspace binary into
+        // the tempdir's `bin/`. Adapter binaries are resolved by
+        // the daemon next to its own exe (`locate_sibling_binary`),
+        // so copy those too — otherwise `session.create` in a
+        // relocated daemon couldn't find them. The orchestrator is
+        // disabled, but a test might still create a shell session.
+        let binary_path = if relocatable {
+            let bin_dir = dir.path().join("bin");
+            std::fs::create_dir_all(&bin_dir)?;
+            let src = agentd_bin_path()?;
+            let dst = bin_dir.join("agentd");
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+            copy_executable_perms(&dst)?;
+            // Best-effort copy of sibling adapter binaries.
+            if let Some(src_dir) = src.parent() {
+                for name in [
+                    "agentd-adapter-shell",
+                    "agentd-adapter-claude",
+                    "agentd-adapter-codex",
+                    "agentd-adapter-zarvis",
+                    "agentd-mcp",
+                ] {
+                    let from = src_dir.join(name);
+                    if from.exists() {
+                        let to = bin_dir.join(name);
+                        if std::fs::copy(&from, &to).is_ok() {
+                            let _ = copy_executable_perms(&to);
+                        }
+                    }
+                }
+            }
+            dst
+        } else {
+            agentd_bin_path()?
+        };
+
+        let mut cmd = Command::new(&binary_path);
         cmd.env("AGENTD_RUNTIME_DIR", &runtime_dir)
             .env("AGENTD_STATE_DIR", &state_dir)
             .env("AGENTD_DATA_DIR", &data_dir)
@@ -106,7 +163,7 @@ impl Daemon {
 
         let child = cmd
             .spawn()
-            .with_context(|| format!("spawn {}", bin.display()))?;
+            .with_context(|| format!("spawn {}", binary_path.display()))?;
 
         let deadline = Instant::now() + Duration::from_secs(15);
         while !socket.exists() {
@@ -131,9 +188,37 @@ impl Daemon {
         Ok(Daemon {
             dir,
             socket,
+            binary_path,
             client,
             child,
         })
+    }
+
+    /// OS PID of the daemon process. Stable across `daemon.restart`
+    /// because the daemon `exec()`s itself in place rather than
+    /// forking — that invariant is exactly what the restart test
+    /// asserts.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// After a `daemon.restart`, the old IPC connection is dead
+    /// (the socket closed during `exec()`). Poll a fresh client +
+    /// ping until the new daemon is serving again, then return the
+    /// reconnected client. Errors on timeout.
+    pub async fn wait_until_back(&self, timeout: Duration) -> Result<Arc<Client>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(client) = Client::connect(&self.socket).await {
+                if client.ping().await.is_ok() {
+                    return Ok(client);
+                }
+            }
+            if Instant::now() > deadline {
+                anyhow::bail!("daemon did not come back within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
@@ -393,6 +478,21 @@ pub fn artifact_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create artifact_dir {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Mark a freshly-copied file executable. `std::fs::copy`
+/// preserves the source's mode on Unix, but be explicit so the
+/// copied daemon is runnable regardless of the source's perms.
+fn copy_executable_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
+    let _ = path;
+    Ok(())
 }
 
 /// Locate the `agentd` binary in the workspace `target/`

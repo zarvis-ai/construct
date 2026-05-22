@@ -365,13 +365,54 @@ pub struct SessionManager {
 }
 
 /// Payload of a `daemon.restart` request, sent from the IPC
-/// handler to the main loop. Main resolves the current_exe + args
+/// handler to the main loop. Main resolves the exe path + args
 /// before the runtime tear-down so the reply can echo what's
 /// about to load.
 #[derive(Debug, Clone)]
 pub struct RestartCommand {
     pub exe: PathBuf,
     pub args: Vec<String>,
+}
+
+/// Executable path captured once at daemon startup, before any
+/// on-disk binary upgrade can unlink the original inode. See
+/// [`capture_startup_exe`].
+static STARTUP_EXE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Record the daemon's executable path at startup. Call once,
+/// early in `main`, before serving any requests.
+///
+/// This exists because `std::env::current_exe()` is unreliable at
+/// *restart* time: the primary `/agentd restart` use case is
+/// picking up an upgraded binary, and upgrades replace the file
+/// via atomic rename (a new inode at the same path). On Linux,
+/// `current_exe()` reads `/proc/self/exe`, which after that
+/// replacement resolves to `"/path/agentd (deleted)"` — and
+/// `exec()`ing that literal path fails with `ENOENT`, so the
+/// daemon would never come back. Capturing the clean path at
+/// startup (when the file definitely still exists) and `exec()`ing
+/// *that* loads the new binary now sitting at the same path.
+pub fn capture_startup_exe() {
+    if let Ok(p) = std::env::current_exe() {
+        let _ = STARTUP_EXE.set(p);
+    }
+}
+
+/// Best exe path for re-`exec()` on restart: the startup-captured
+/// path if available, else `current_exe()` with any trailing
+/// `" (deleted)"` marker stripped (defensive — the startup capture
+/// should always win in practice).
+fn restart_exe_path() -> Result<PathBuf> {
+    if let Some(p) = STARTUP_EXE.get() {
+        return Ok(p.clone());
+    }
+    let p = std::env::current_exe()?;
+    if let Some(s) = p.to_str() {
+        if let Some(stripped) = s.strip_suffix(" (deleted)") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(p)
 }
 
 /// Daemon-local sidecar for an active remote-WS deployment. Holds
@@ -511,15 +552,15 @@ impl SessionManager {
         self.remote_snapshot_path.clone()
     }
 
-    /// Request a daemon restart. Resolves the current exe and
-    /// args, sends a `RestartCommand` to main's restart channel,
-    /// and returns the command so the IPC handler can echo it
-    /// back to the caller before the runtime tears down. Returns
-    /// `Err` if `current_exe()` fails or the receiver was dropped
+    /// Request a daemon restart. Resolves the exe path + args,
+    /// sends a `RestartCommand` to main's restart channel, and
+    /// returns the command so the IPC handler can echo it back to
+    /// the caller before the runtime tears down. Returns `Err` if
+    /// the exe path can't be resolved or the receiver was dropped
     /// (which shouldn't happen — main holds it for the daemon's
     /// lifetime).
     pub fn request_daemon_restart(&self) -> Result<RestartCommand> {
-        let exe = std::env::current_exe().context("resolve current_exe")?;
+        let exe = restart_exe_path().context("resolve restart exe")?;
         let args: Vec<String> = std::env::args().skip(1).collect();
         let cmd = RestartCommand { exe, args };
         self.restart_tx
