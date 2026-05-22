@@ -4,7 +4,7 @@
 
 use crate::provider::ToolSpec;
 use agentd_client::Client;
-use agentd_protocol::ToolRisk;
+use agentd_protocol::{adapter::EventEmitter, ToolRisk};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -51,6 +51,7 @@ pub struct ToolCtx {
     pub cwd: std::path::PathBuf,
     pub session_id: String,
     pub client: tokio::sync::OnceCell<Arc<Client>>,
+    pub emit: Option<EventEmitter>,
 }
 
 pub struct ToolRegistry {
@@ -69,6 +70,7 @@ impl ToolRegistry {
             // Chrome DevTools browser tools
             Box::new(browser::BrowserOpen),
             Box::new(browser::BrowserInspect),
+            Box::new(browser::BrowserScreenshot),
             Box::new(browser::BrowserEval),
             // agentd-control tools
             Box::new(agentd::Whoami),

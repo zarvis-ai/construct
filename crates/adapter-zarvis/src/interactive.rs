@@ -1776,6 +1776,7 @@ pub async fn run(
         cwd,
         session_id,
         client: tokio::sync::OnceCell::new(),
+        emit: Some(emit.clone()),
     };
 
     // Prompt bytes the line editor will re-emit on every redraw. Must
@@ -3023,6 +3024,7 @@ async fn run_with_supervisor(
 ) -> crate::tasks::SupervisorOutcome {
     let cwd = ctx.cwd.clone();
     let session_id = ctx.session_id.clone();
+    let emit = ctx.emit.clone();
     let client_seed = ctx.client.get().cloned();
     let tool_name_for_runner = tool_name.clone();
     let tool_runner = async move {
@@ -3030,6 +3032,7 @@ async fn run_with_supervisor(
             cwd,
             session_id,
             client: tokio::sync::OnceCell::new(),
+            emit,
         };
         if let Some(c) = client_seed {
             let _ = local_ctx.client.set(c);

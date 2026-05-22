@@ -6,10 +6,12 @@
 //! full browser-automation dependency.
 
 use super::{Tool, ToolCtx, ToolOutcome};
-use agentd_protocol::ToolRisk;
+use agentd_protocol::{BrowserPreview, SessionEvent, ToolRisk};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
+use base64::Engine;
 use futures::{SinkExt, StreamExt};
+use image::GenericImageView;
 use serde_json::{json, Value};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,6 +25,7 @@ const MAX_TEXT_CHARS: usize = 12_000;
 
 pub struct BrowserOpen;
 pub struct BrowserInspect;
+pub struct BrowserScreenshot;
 pub struct BrowserEval;
 
 #[async_trait]
@@ -42,7 +45,8 @@ impl Tool for BrowserOpen {
                 "url": { "type": "string", "description": "URL to open, e.g. https://www.google.com/search?q=..." },
                 "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": DEFAULT_PORT },
                 "host": { "type": "string", "default": DEFAULT_HOST },
-                "start_if_needed": { "type": "boolean", "default": true }
+                "start_if_needed": { "type": "boolean", "default": true },
+                "preview": { "type": "boolean", "default": true, "description": "Emit a UI-only browser preview overlay after opening. Tool output remains JSON metadata." }
             },
             "required": ["url"]
         })
@@ -60,7 +64,7 @@ impl Tool for BrowserOpen {
             .to_string()
     }
 
-    async fn run(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
         let url = input
             .get("url")
             .and_then(|s| s.as_str())
@@ -84,6 +88,9 @@ impl Tool for BrowserOpen {
             .error_for_status()?
             .json()
             .await?;
+        if should_emit_preview(&input) {
+            let _ = emit_browser_preview_from_response(ctx, &resp).await;
+        }
         Ok(ToolOutcome {
             ok: true,
             output: serde_json::to_string_pretty(&resp)?,
@@ -109,7 +116,8 @@ impl Tool for BrowserInspect {
                 "url_contains": { "type": "string", "description": "Select the first tab whose URL contains this substring." },
                 "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": DEFAULT_PORT },
                 "host": { "type": "string", "default": DEFAULT_HOST },
-                "max_text_chars": { "type": "integer", "minimum": 0, "maximum": 50000, "default": MAX_TEXT_CHARS }
+                "max_text_chars": { "type": "integer", "minimum": 0, "maximum": 50000, "default": MAX_TEXT_CHARS },
+                "preview": { "type": "boolean", "default": true, "description": "Emit a UI-only browser preview overlay for the inspected tab." }
             }
         })
     }
@@ -118,7 +126,7 @@ impl Tool for BrowserInspect {
         ToolRisk::Safe
     }
 
-    async fn run(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
         let endpoint = Endpoint::from_input(&input);
         let tabs = list_tabs(&endpoint).await?;
         let Some(tab) = select_tab(&tabs, &input) else {
@@ -143,9 +151,60 @@ impl Tool for BrowserInspect {
             }})()"#
         );
         let value = cdp_eval(&tab.websocket_url, &script).await?;
+        if should_emit_preview(&input) {
+            let _ = emit_browser_preview_from_tab(ctx, &tab, false).await;
+        }
         Ok(ToolOutcome {
             ok: true,
             output: serde_json::to_string_pretty(&value)?,
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserScreenshot {
+    fn name(&self) -> &str {
+        "browser_screenshot"
+    }
+
+    fn description(&self) -> &str {
+        "Capture a Chrome tab screenshot through DevTools, return screenshot metadata, and emit a UI-only browser preview overlay. Select the tab by tab_id or url_contains."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string" },
+                "url_contains": { "type": "string" },
+                "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": DEFAULT_PORT },
+                "host": { "type": "string", "default": DEFAULT_HOST },
+                "full_page": { "type": "boolean", "default": false },
+                "preview": { "type": "boolean", "default": true, "description": "Emit a UI-only browser preview overlay for this screenshot." }
+            }
+        })
+    }
+
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
+
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let endpoint = Endpoint::from_input(&input);
+        let tabs = list_tabs(&endpoint).await?;
+        let tab = select_tab(&tabs, &input).ok_or_else(|| anyhow!("no matching tab"))?;
+        let full_page = input
+            .get("full_page")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let png = cdp_capture_screenshot(&tab.websocket_url, full_page).await?;
+        let dims = image::load_from_memory(&png)?.dimensions();
+        if should_emit_preview(&input) {
+            emit_browser_preview(ctx, &tab.url, tab.title.clone(), png.clone(), dims).await;
+        }
+        Ok(ToolOutcome {
+            ok: true,
+            output: format!("screenshot: {}x{} png, {} bytes", dims.0, dims.1, png.len()),
         })
     }
 }
@@ -168,7 +227,8 @@ impl Tool for BrowserEval {
                 "tab_id": { "type": "string" },
                 "url_contains": { "type": "string" },
                 "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": DEFAULT_PORT },
-                "host": { "type": "string", "default": DEFAULT_HOST }
+                "host": { "type": "string", "default": DEFAULT_HOST },
+                "preview": { "type": "boolean", "default": true, "description": "Emit a UI-only browser preview overlay after evaluating JavaScript." }
             },
             "required": ["script"]
         })
@@ -190,7 +250,7 @@ impl Tool for BrowserEval {
         }
     }
 
-    async fn run(&self, input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
         let script = input
             .get("script")
             .and_then(|s| s.as_str())
@@ -199,6 +259,9 @@ impl Tool for BrowserEval {
         let tabs = list_tabs(&endpoint).await?;
         let tab = select_tab(&tabs, &input).ok_or_else(|| anyhow!("no matching tab"))?;
         let value = cdp_eval(&tab.websocket_url, script).await?;
+        if should_emit_preview(&input) {
+            let _ = emit_browser_preview_from_tab(ctx, &tab, false).await;
+        }
         Ok(ToolOutcome {
             ok: true,
             output: serde_json::to_string_pretty(&value)?,
@@ -233,6 +296,8 @@ impl Endpoint {
 
 struct Tab {
     websocket_url: String,
+    url: String,
+    title: Option<String>,
 }
 
 async fn devtools_version(endpoint: &Endpoint) -> Result<Value> {
@@ -323,29 +388,146 @@ fn select_tab(tabs: &[Value], input: &Value) -> Option<Tab> {
     })?;
     Some(Tab {
         websocket_url: tab.get("webSocketDebuggerUrl")?.as_str()?.to_string(),
+        url: tab
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        title: tab
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     })
 }
 
 async fn cdp_eval(ws_url: &str, expression: &str) -> Result<Value> {
+    let value = cdp_call(
+        ws_url,
+        "Runtime.evaluate",
+        json!({
+            "expression": expression,
+            "awaitPromise": true,
+            "returnByValue": true
+        }),
+    )
+    .await?;
+    if let Some(exception) = value.pointer("/result/exceptionDetails") {
+        return Err(anyhow!("JavaScript exception: {exception}"));
+    }
+    Ok(value
+        .pointer("/result/result/value")
+        .cloned()
+        .unwrap_or_else(|| {
+            value
+                .pointer("/result/result")
+                .cloned()
+                .unwrap_or(Value::Null)
+        }))
+}
+
+fn should_emit_preview(input: &Value) -> bool {
+    input
+        .get("preview")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+async fn emit_browser_preview_from_tab(
+    ctx: &ToolCtx,
+    tab: &Tab,
+    full_page: bool,
+) -> Result<()> {
+    let png = cdp_capture_screenshot(&tab.websocket_url, full_page).await?;
+    let dims = image::load_from_memory(&png)?.dimensions();
+    emit_browser_preview(ctx, &tab.url, tab.title.clone(), png, dims).await;
+    Ok(())
+}
+
+async fn emit_browser_preview_from_response(ctx: &ToolCtx, tab_response: &Value) -> Result<()> {
+    let ws_url = tab_response
+        .get("webSocketDebuggerUrl")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("browser_open response had no webSocketDebuggerUrl"))?;
+    for _ in 0..20 {
+        let ready = cdp_eval(ws_url, "document.readyState").await.ok();
+        if matches!(
+            ready.as_ref().and_then(|v| v.as_str()),
+            Some("complete" | "interactive")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let png = cdp_capture_screenshot(ws_url, false).await?;
+    let dims = image::load_from_memory(&png)?.dimensions();
+    let url = tab_response
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let title = tab_response
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    emit_browser_preview(ctx, url, title, png, dims).await;
+    Ok(())
+}
+
+async fn emit_browser_preview(
+    ctx: &ToolCtx,
+    url: &str,
+    title: Option<String>,
+    png: Vec<u8>,
+    dims: (u32, u32),
+) {
+    if let Some(emit) = &ctx.emit {
+        emit.emit(SessionEvent::BrowserPreview(BrowserPreview {
+            url: url.to_string(),
+            title,
+            image: base64::engine::general_purpose::STANDARD.encode(png),
+            width: dims.0,
+            height: dims.1,
+        }));
+    }
+}
+
+async fn cdp_capture_screenshot(ws_url: &str, full_page: bool) -> Result<Vec<u8>> {
+    let value = cdp_call(
+        ws_url,
+        "Page.captureScreenshot",
+        json!({
+            "format": "png",
+            "captureBeyondViewport": full_page,
+            "fromSurface": true
+        }),
+    )
+    .await?;
+    let data = value
+        .pointer("/result/data")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Page.captureScreenshot returned no data"))?;
+    Ok(base64::engine::general_purpose::STANDARD.decode(data.as_bytes())?)
+}
+
+async fn cdp_call(ws_url: &str, method: &str, params: Value) -> Result<Value> {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let (mut ws, _) = connect_async(ws_url).await?;
+    if method.starts_with("Runtime.") {
+        let enable_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "id": enable_id, "method": "Runtime.enable" }).to_string(),
+        ))
+        .await?;
+    } else if method.starts_with("Page.") {
+        let enable_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            json!({ "id": enable_id, "method": "Page.enable" }).to_string(),
+        ))
+        .await?;
+    }
+
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        json!({ "id": id, "method": "Runtime.enable" }).to_string(),
-    ))
-    .await?;
-    let eval_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        json!({
-            "id": eval_id,
-            "method": "Runtime.evaluate",
-            "params": {
-                "expression": expression,
-                "awaitPromise": true,
-                "returnByValue": true
-            }
-        })
-        .to_string(),
+        json!({ "id": id, "method": method, "params": params }).to_string(),
     ))
     .await?;
 
@@ -356,25 +538,16 @@ async fn cdp_eval(ws_url: &str, expression: &str) -> Result<Value> {
             _ => continue,
         };
         let value: Value = serde_json::from_str(&text)?;
-        if value.get("id").and_then(|v| v.as_u64()) == Some(eval_id) {
+        if value.get("id").and_then(|v| v.as_u64()) == Some(id) {
             if let Some(err) = value.get("error") {
-                return Err(anyhow!("CDP eval error: {err}"));
+                return Err(anyhow!("CDP {method} error: {err}"));
             }
-            if let Some(exception) = value.pointer("/result/exceptionDetails") {
-                return Err(anyhow!("JavaScript exception: {exception}"));
-            }
-            return Ok(value
-                .pointer("/result/result/value")
-                .cloned()
-                .unwrap_or_else(|| {
-                    value
-                        .pointer("/result/result")
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                }));
+            return Ok(value);
         }
     }
-    Err(anyhow!("DevTools websocket closed before eval response"))
+    Err(anyhow!(
+        "DevTools websocket closed before {method} response"
+    ))
 }
 
 fn urlencoding(s: &str) -> String {
