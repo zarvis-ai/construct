@@ -22,6 +22,9 @@ const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
 /// matrix rain — kept very dim so the green rain clearly stays the
 /// foreground and the image reads as a faint backdrop.
 const MATRIX_WALLPAPER_DIM: f32 = 0.22;
+/// Seconds for the wallpaper's top-to-bottom "dial-up" reveal when a
+/// browser preview first appears.
+const MATRIX_WALLPAPER_REVEAL_SECS: f32 = 3.0;
 const MATRIX_RAIN_TAIL_MIN: u16 = 5;
 const MATRIX_RAIN_TAIL_MAX: u16 = 9;
 
@@ -1238,23 +1241,37 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         return;
     }
 
+    let now = Instant::now();
+
     // Wallpaper: if the selected session has a live browser preview (the
     // same one shown as the terminal-view overlay — appears/disappears in
     // lock-step since both read `browser_previews`), paint it dimmed and
     // cropped-to-fill as a backdrop. The rain loop below draws over it:
     // cells with a drop/letter overwrite the image, empty cells keep it,
     // so the animation runs uninterrupted on top of the wallpaper.
+    //
+    // Dial-up nostalgia: when the preview first arrives the image draws
+    // in top-to-bottom over `MATRIX_WALLPAPER_REVEAL_SECS`, like a JPEG
+    // crawling in over a slow modem. The matrix tick (~8fps) already
+    // redraws each frame, so the reveal advances on its own.
     let wallpaper = app
         .selected_id()
         .and_then(|id| app.browser_previews.get(&id))
-        .and_then(|state| state.decoded.clone());
-    if let Some(img) = &wallpaper {
-        let (ow, oh) = blit_scale_dims(img.dimensions(), rain_area, true);
-        let resized = resized_image(&mut app.image_resize_cache, img, ow, oh);
-        paint_resized_half_blocks(f, rain_area, &resized, MATRIX_WALLPAPER_DIM);
+        .and_then(|state| state.decoded.clone().map(|img| (img, state.revealed_at)));
+    if let Some((img, revealed_at)) = &wallpaper {
+        let frac = (now.saturating_duration_since(*revealed_at).as_secs_f32()
+            / MATRIX_WALLPAPER_REVEAL_SECS)
+            .clamp(0.0, 1.0);
+        // Cover fills the whole panel, so the displayed image is
+        // `rain_area.height` cell rows tall; reveal that many top-down.
+        let reveal_rows = (frac * rain_area.height as f32).ceil() as u16;
+        if reveal_rows > 0 {
+            let (ow, oh) = blit_scale_dims(img.dimensions(), rain_area, true);
+            let resized = resized_image(&mut app.image_resize_cache, img, ow, oh);
+            paint_resized_half_blocks(f, rain_area, &resized, MATRIX_WALLPAPER_DIM, reveal_rows);
+        }
     }
 
-    let now = Instant::now();
     let activity = update_matrix_rain_intensity(app, now);
     let elapsed = app.start_instant.elapsed().as_millis() as u64;
     let cycle = rain_area.height + MATRIX_RAIN_TAIL_MAX + 1;
@@ -2363,7 +2380,7 @@ fn render_browser_preview_overlay(
     if let Some(img) = preview_state.decoded.as_ref() {
         let (ow, oh) = blit_scale_dims(img.dimensions(), image_area, false);
         let resized = resized_image(resize_cache, img, ow, oh);
-        paint_resized_half_blocks(f, image_area, &resized, 1.0);
+        paint_resized_half_blocks(f, image_area, &resized, 1.0, u16::MAX);
     }
     if inner.height > 0 {
         let caption = preview
@@ -2450,8 +2467,16 @@ fn resized_image(
 /// Paint an already-resized RGBA image into `area` as half-block (`▀`)
 /// cells — fg = top pixel, bg = bottom pixel. Center-crops `resized`
 /// into the area (so cover images crop, contain images letterbox). `dim`
-/// in `0.0..=1.0` multiplies brightness.
-fn paint_resized_half_blocks(f: &mut Frame, area: Rect, resized: &image::RgbaImage, dim: f32) {
+/// in `0.0..=1.0` multiplies brightness. `reveal_rows` caps how many cell
+/// rows are drawn from the top (the rest stay blank) — `u16::MAX` draws
+/// all; smaller values give the wallpaper's top-to-bottom reveal.
+fn paint_resized_half_blocks(
+    f: &mut Frame,
+    area: Rect,
+    resized: &image::RgbaImage,
+    dim: f32,
+    reveal_rows: u16,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -2468,12 +2493,15 @@ fn paint_resized_half_blocks(f: &mut Frame, area: Rect, resized: &image::RgbaIma
     let cell_rows = crop_h.div_ceil(2).min(area.height as u32);
     let x0 = area.x + ((target_w - crop_w) / 2) as u16;
     let y0 = area.y + ((area.height as u32 - cell_rows) / 2) as u16;
+    // Top-to-bottom reveal: paint only the top `reveal_rows` cell rows of
+    // the (centered) image; the rest stay blank this frame.
+    let paint_rows = cell_rows.min(reveal_rows as u32);
     let dim = dim.clamp(0.0, 1.0);
     let d = |c: u8| (c as f32 * dim).round() as u8;
     let buf = f.buffer_mut();
     for ry in (0..crop_h).step_by(2) {
         let row = ry / 2;
-        if row >= cell_rows {
+        if row >= paint_rows {
             break;
         }
         for rx in 0..crop_w {
@@ -2506,7 +2534,7 @@ fn blit_image_half_blocks(f: &mut Frame, area: Rect, img: &image::RgbaImage, cov
     }
     let (ow, oh) = blit_scale_dims(img.dimensions(), area, cover);
     let resized = image::imageops::resize(img, ow, oh, image::imageops::FilterType::Triangle);
-    paint_resized_half_blocks(f, area, &resized, dim);
+    paint_resized_half_blocks(f, area, &resized, dim, u16::MAX);
 }
 
 /// Paint the fixed bottom input pane:
@@ -4307,6 +4335,29 @@ mod tests {
             let _ = resized_image(&mut cache, &src, w, 10);
         }
         assert!(cache.len() <= 4, "cache must stay bounded, got {}", cache.len());
+    }
+
+    #[test]
+    fn wallpaper_reveal_rows_draws_top_down() {
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]));
+        let area = Rect::new(0, 0, 4, 6);
+        let (ow, oh) = blit_scale_dims(img.dimensions(), area, true);
+        let resized = image::imageops::resize(&img, ow, oh, image::imageops::FilterType::Triangle);
+        let backend = ratatui::backend::TestBackend::new(4, 6);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        // Reveal only the top 2 of 6 cell rows.
+        term.draw(|f| paint_resized_half_blocks(f, area, &resized, 1.0, 2))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let is_img = |x, y| buf.cell((x, y)).map(|c| c.symbol()) == Some("▀");
+        for x in 0..4 {
+            assert!(is_img(x, 0) && is_img(x, 1), "top rows revealed");
+        }
+        for y in 2..6 {
+            for x in 0..4 {
+                assert!(!is_img(x, y), "row {y} must not be revealed yet");
+            }
+        }
     }
 
     #[test]

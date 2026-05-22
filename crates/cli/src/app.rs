@@ -516,6 +516,9 @@ pub struct BrowserPreviewState {
     pub preview: agentd_protocol::BrowserPreview,
     pub hide_after: Instant,
     pub hover_started: Option<Instant>,
+    /// When this preview first arrived — drives the matrix-rain
+    /// wallpaper's top-to-bottom "dial-up" reveal.
+    pub revealed_at: Instant,
     /// PNG decoded to RGBA once on insert, shared (`Arc`) so both the
     /// terminal-view overlay and the matrix-rain wallpaper can blit it
     /// every frame without re-decoding. `None` if the bytes failed to
@@ -1403,13 +1406,15 @@ impl App {
         preview: agentd_protocol::BrowserPreview,
     ) {
         let decoded = decode_browser_preview_image(&preview.image);
+        let now = Instant::now();
         self.browser_previews.insert(
             session_id,
             BrowserPreviewState {
                 preview,
-                hide_after: Instant::now() + Duration::from_secs(5),
+                hide_after: now + Duration::from_secs(5),
                 hover_started: None,
                 decoded,
+                revealed_at: now,
             },
         );
     }
@@ -5305,6 +5310,9 @@ mod tests {
                     24,
                     image::Rgba([180, 40, 40, 255]),
                 ))),
+                // In the past so the top-to-bottom reveal has completed
+                // and the full wallpaper is drawn.
+                revealed_at: Instant::now() - Duration::from_secs(10),
             },
         );
         assert!(
