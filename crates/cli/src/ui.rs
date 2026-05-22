@@ -18,8 +18,8 @@ use unicode_width::UnicodeWidthStr;
 
 const MATRIX_RAIN_RAMP_UP_SECS: f32 = 5.0;
 const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
-const MATRIX_RAIN_TAIL_MIN: u16 = 3;
-const MATRIX_RAIN_TAIL_MAX: u16 = 12;
+const MATRIX_RAIN_TAIL_MIN: u16 = 5;
+const MATRIX_RAIN_TAIL_MAX: u16 = 9;
 
 fn clear_pane_side_borders(f: &mut Frame, area: Rect, app: &App) {
     if !app.hide_pane_side_borders || area.width == 0 || area.height <= 1 {
@@ -1233,7 +1233,6 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     let now = Instant::now();
     let activity = update_matrix_rain_intensity(app, now);
     let elapsed = app.start_instant.elapsed().as_millis() as u64;
-    let spawn_tail = matrix_rain_tail(activity);
     let cycle = rain_area.height + MATRIX_RAIN_TAIL_MAX + 1;
     let charset = b"01:|/\\{}[]<>+$#@*=-zrvshcodxgit";
     let mut current_drop_keys = HashSet::with_capacity(rain_area.width as usize);
@@ -1269,7 +1268,7 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
             if roll < activity {
                 app.matrix_rain_active_drops
                     .entry(frame.key)
-                    .or_insert(spawn_tail);
+                    .or_insert_with(|| matrix_rain_tail_for_key(frame.key));
             }
         }
         let active = app
@@ -1358,15 +1357,7 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     let theme = app.theme.clone();
     for reveal in app.matrix_rain.active_reveals_mut(now) {
         if let crate::matrix_rain::RevealOrientation::Horizontal = reveal.orientation {
-            render_matrix_reveal_horizontal(
-                f,
-                rain_area,
-                &theme,
-                reveal,
-                elapsed,
-                &drop_heads,
-                spawn_tail,
-            );
+            render_matrix_reveal_horizontal(f, rain_area, &theme, reveal, elapsed, &drop_heads);
         }
         // Vertical reveals are rendered inline above as a drop-body
         // letter overlay — no separate pass / no pin-and-hold.
@@ -1501,10 +1492,9 @@ fn eased_matrix_rain_intensity(current: f32, target: f32, elapsed: Duration) -> 
     }
 }
 
-fn matrix_rain_tail(activity: f32) -> u16 {
-    (MATRIX_RAIN_TAIL_MIN as f32
-        + activity.clamp(0.0, 1.0) * (MATRIX_RAIN_TAIL_MAX - MATRIX_RAIN_TAIL_MIN) as f32)
-        .round() as u16
+fn matrix_rain_tail_for_key(key: u64) -> u16 {
+    let span = MATRIX_RAIN_TAIL_MAX - MATRIX_RAIN_TAIL_MIN + 1;
+    MATRIX_RAIN_TAIL_MIN + (hash64(key ^ 0x8d12_6f43_b9e0_5c7a) % span as u64) as u16
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1648,9 +1638,9 @@ fn compute_drop_shade(active: Option<(i16, u16)>, row: u16) -> f32 {
 /// single row). Each letter pins the first frame a real foreground
 /// drop's body is currently *covering* its cell — checked against
 /// `drop_heads` from the rain pass, not predicted analytically. The
-/// pin window is the drop's bright body (`tail` rows wide), so a
-/// letter never latches based on a stale head position from many
-/// rows below.
+/// pin window is the maximum randomized drop body width; tail lengths
+/// are intentionally independent from activity, and activity only
+/// gates whether a fresh top-of-cycle drop is registered.
 ///
 /// Once every letter is pinned the reveal enters a short hold and
 /// then fades. If some letters never pin (their column is
@@ -1663,7 +1653,6 @@ fn render_matrix_reveal_horizontal(
     reveal: &mut crate::matrix_rain::RevealWord,
     elapsed_ms: u64,
     drop_heads: &[Option<i16>],
-    spawn_tail: u16,
 ) {
     if area.width < 4 || area.height == 0 {
         return;
@@ -1693,7 +1682,6 @@ fn render_matrix_reveal_horizontal(
 
     let target_rel_y = target_y.saturating_sub(area.y) as i16;
     let base_col = target_x.saturating_sub(area.x) as usize;
-    let tail = spawn_tail.max(1) as i16;
 
     let letter_count = reveal.pin_state().len();
     // Per-letter "is the drop head sitting exactly on this letter's
@@ -1704,12 +1692,13 @@ fn render_matrix_reveal_horizontal(
         let col = base_col + i;
         if let Some(Some(head)) = drop_heads.get(col) {
             let delta = *head - target_rel_y;
-            // Pin only while the drop's BRIGHT BODY is currently
-            // covering the cell — i.e. head ≥ row and head − row <
-            // tail. Without the upper bound, on sparse frames the
-            // letter would latch on a head that's already far past,
-            // making it appear out of nowhere with no drop nearby.
-            if delta >= 0 && delta < tail {
+            // Pin only while a drop body could plausibly be
+            // covering the cell. Individual drop tails are
+            // randomized and not stored in `drop_heads`, so use the
+            // maximum tail as a conservative window; without an
+            // upper bound, a letter could latch on a head that's
+            // already far past and appear with no drop nearby.
+            if delta >= 0 && delta < MATRIX_RAIN_TAIL_MAX as i16 {
                 reveal.pin_letter(i, elapsed_ms);
                 if delta == 0 {
                     head_on_letter[i] = true;
@@ -2182,8 +2171,10 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         editor_area.is_none(),
         row_offset,
     );
-    app.block_hits
-        .insert(id, translate_block_hits(out.blocks, row_offset, chat_area.height));
+    app.block_hits.insert(
+        id,
+        translate_block_hits(out.blocks, row_offset, chat_area.height),
+    );
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)
         f.render_widget(Clear, area);
@@ -3629,8 +3620,10 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
         editor_area.is_none(),
         row_offset,
     );
-    app.block_hits
-        .insert(id, translate_block_hits(out.blocks, row_offset, chat_area.height));
+    app.block_hits.insert(
+        id,
+        translate_block_hits(out.blocks, row_offset, chat_area.height),
+    );
     if let Some(area) = editor_area {
         render_editor_pane(
             f,
@@ -4132,11 +4125,12 @@ mod tests {
     }
 
     #[test]
-    fn matrix_rain_tail_scales_with_activity() {
-        assert_eq!(matrix_rain_tail(0.0), MATRIX_RAIN_TAIL_MIN);
-        assert_eq!(matrix_rain_tail(1.0), MATRIX_RAIN_TAIL_MAX);
-        assert_eq!(matrix_rain_tail(-1.0), MATRIX_RAIN_TAIL_MIN);
-        assert_eq!(matrix_rain_tail(2.0), MATRIX_RAIN_TAIL_MAX);
+    fn matrix_rain_tail_is_keyed_not_activity_scaled() {
+        let a = matrix_rain_tail_for_key(42);
+        let b = matrix_rain_tail_for_key(43);
+        assert!((MATRIX_RAIN_TAIL_MIN..=MATRIX_RAIN_TAIL_MAX).contains(&a));
+        assert!((MATRIX_RAIN_TAIL_MIN..=MATRIX_RAIN_TAIL_MAX).contains(&b));
+        assert_eq!(matrix_rain_tail_for_key(42), a);
     }
 
     #[test]
@@ -4186,7 +4180,10 @@ mod tests {
 
         // offset 0 is the identity.
         let out = translate_block_hits(vec![mk(2, 5, 2)], 0, 30);
-        assert_eq!((out[0].row_start, out[0].row_end, out[0].header_row), (2, 5, 2));
+        assert_eq!(
+            (out[0].row_start, out[0].row_end, out[0].header_row),
+            (2, 5, 2)
+        );
         assert!(out[0].bg_button.is_some());
 
         // chat shows the bottom slice; parser is 10 rows taller than the
@@ -4204,7 +4201,10 @@ mod tests {
         // A block fully inside the slice shifts up by the offset and
         // keeps its buttons.
         let out = translate_block_hits(vec![mk(15, 18, 15)], 10, 20);
-        assert_eq!((out[0].row_start, out[0].row_end, out[0].header_row), (5, 8, 5));
+        assert_eq!(
+            (out[0].row_start, out[0].row_end, out[0].header_row),
+            (5, 8, 5)
+        );
         assert!(out[0].bg_button.is_some());
     }
 
@@ -4335,7 +4335,10 @@ mod tests {
     #[test]
     fn is_headless_only_for_headless_mode() {
         assert!(is_headless(&summary_with_mode("zarvis", Some("headless"))));
-        assert!(!is_headless(&summary_with_mode("zarvis", Some("interactive"))));
+        assert!(!is_headless(&summary_with_mode(
+            "zarvis",
+            Some("interactive")
+        )));
         // Missing mode is treated as not-headless (older sessions
         // persisted before the mode fix, and PTY harnesses).
         assert!(!is_headless(&summary_with_mode("shell", None)));
