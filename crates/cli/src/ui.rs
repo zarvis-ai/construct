@@ -7,7 +7,6 @@ use crate::app::{
 use crate::keymap::KeyAction;
 use crate::theme::Theme;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
-use base64::Engine;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -19,6 +18,9 @@ use unicode_width::UnicodeWidthStr;
 
 const MATRIX_RAIN_RAMP_UP_SECS: f32 = 5.0;
 const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
+/// Brightness multiplier for the browser-preview wallpaper behind the
+/// matrix rain — dimmed so the green rain stays the foreground.
+const MATRIX_WALLPAPER_DIM: f32 = 0.42;
 const MATRIX_RAIN_TAIL_MIN: u16 = 5;
 const MATRIX_RAIN_TAIL_MAX: u16 = 9;
 
@@ -1235,6 +1237,20 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         return;
     }
 
+    // Wallpaper: if the selected session has a live browser preview (the
+    // same one shown as the terminal-view overlay — appears/disappears in
+    // lock-step since both read `browser_previews`), paint it dimmed and
+    // cropped-to-fill as a backdrop. The rain loop below draws over it:
+    // cells with a drop/letter overwrite the image, empty cells keep it,
+    // so the animation runs uninterrupted on top of the wallpaper.
+    let wallpaper = app
+        .selected_id()
+        .and_then(|id| app.browser_previews.get(&id))
+        .and_then(|state| state.decoded.clone());
+    if let Some(img) = &wallpaper {
+        blit_image_half_blocks(f, rain_area, img, true, MATRIX_WALLPAPER_DIM);
+    }
+
     let now = Instant::now();
     let activity = update_matrix_rain_intensity(app, now);
     let elapsed = app.start_instant.elapsed().as_millis() as u64;
@@ -2334,7 +2350,9 @@ fn render_browser_preview_overlay(
         width: inner.width,
         height: inner.height.saturating_sub(caption_rows),
     };
-    render_browser_preview_image(f, image_area, preview);
+    if let Some(img) = preview_state.decoded.as_ref() {
+        blit_image_half_blocks(f, image_area, img, false, 1.0);
+    }
     if inner.height > 0 {
         let caption = preview
             .title
@@ -2359,56 +2377,66 @@ fn render_browser_preview_overlay(
     (Some(panel), Some(close_bounds))
 }
 
-fn render_browser_preview_image(
-    f: &mut Frame,
-    area: Rect,
-    preview: &agentd_protocol::BrowserPreview,
-) {
+/// Blit an RGBA image into `area` using half-block cells — each cell is
+/// two vertically-stacked pixels rendered as `▀` (fg = top pixel, bg =
+/// bottom pixel), so a cell row is 2 image rows.
+///
+/// - `cover = false` (contain): scale to fit inside `area`, centered,
+///   letterboxed — the whole image is visible.
+/// - `cover = true`: scale to fill `area` and crop the overflow,
+///   preserving aspect ratio — no empty margins. Used for the wallpaper.
+///
+/// `dim` in `0.0..=1.0` multiplies brightness (1.0 = untouched); the
+/// wallpaper dims so the rain stays legible on top.
+fn blit_image_half_blocks(f: &mut Frame, area: Rect, img: &image::RgbaImage, cover: bool, dim: f32) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let Ok(png) = base64::engine::general_purpose::STANDARD.decode(&preview.image) else {
-        return;
-    };
-    let Ok(img) = image::load_from_memory(&png).map(|img| img.to_rgba8()) else {
-        return;
-    };
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return;
     }
-    let max_cols = area.width as u32;
-    let max_cell_rows = area.height as u32;
-    let scale = (max_cols as f32 / w as f32).min((max_cell_rows as f32 * 2.0) / h as f32);
-    let out_w = ((w as f32 * scale).round() as u32).clamp(1, max_cols);
-    let out_h_px = ((h as f32 * scale).round() as u32).clamp(1, max_cell_rows * 2);
-    let resized =
-        image::imageops::resize(&img, out_w, out_h_px, image::imageops::FilterType::Triangle);
-    let x0 = area.x + ((area.width as u32).saturating_sub(out_w) / 2) as u16;
-    let rows = out_h_px.div_ceil(2).min(max_cell_rows);
-    let y0 = area.y + ((area.height as u32).saturating_sub(rows) / 2) as u16;
+    let target_w = area.width as u32;
+    let target_h_px = area.height as u32 * 2;
+    let sx = target_w as f32 / w as f32;
+    let sy = target_h_px as f32 / h as f32;
+    let scale = if cover { sx.max(sy) } else { sx.min(sy) };
+    let out_w = ((w as f32 * scale).round() as u32).max(1);
+    let out_h = ((h as f32 * scale).round() as u32).max(1);
+    let resized = image::imageops::resize(img, out_w, out_h, image::imageops::FilterType::Triangle);
+    // Crop to the target (cover: image >= target; contain: image <=
+    // target, so this is a no-op and we just center it).
+    let crop_w = out_w.min(target_w);
+    let crop_h = out_h.min(target_h_px);
+    let src_off_x = (out_w - crop_w) / 2;
+    let src_off_y = (out_h - crop_h) / 2;
+    let cell_rows = crop_h.div_ceil(2).min(area.height as u32);
+    let x0 = area.x + ((target_w - crop_w) / 2) as u16;
+    let y0 = area.y + ((area.height as u32 - cell_rows) / 2) as u16;
+    let dim = dim.clamp(0.0, 1.0);
+    let d = |c: u8| (c as f32 * dim).round() as u8;
     let buf = f.buffer_mut();
-    for y in (0..out_h_px).step_by(2) {
-        let row = y / 2;
-        if row >= rows {
+    for ry in (0..crop_h).step_by(2) {
+        let row = ry / 2;
+        if row >= cell_rows {
             break;
         }
-        for x in 0..out_w {
-            let top = resized.get_pixel(x, y).0;
-            let bot = if y + 1 < out_h_px {
-                resized.get_pixel(x, y + 1).0
+        for rx in 0..crop_w {
+            let top = resized.get_pixel(src_off_x + rx, src_off_y + ry).0;
+            let bot = if ry + 1 < crop_h {
+                resized.get_pixel(src_off_x + rx, src_off_y + ry + 1).0
             } else {
                 [0, 0, 0, 255]
             };
             if let Some(cell) = buf.cell_mut(Position {
-                x: x0 + x as u16,
+                x: x0 + rx as u16,
                 y: y0 + row as u16,
             }) {
                 cell.set_symbol("▀");
                 cell.set_style(
                     Style::default()
-                        .fg(Color::Rgb(top[0], top[1], top[2]))
-                        .bg(Color::Rgb(bot[0], bot[1], bot[2])),
+                        .fg(Color::Rgb(d(top[0]), d(top[1]), d(top[2])))
+                        .bg(Color::Rgb(d(bot[0]), d(bot[1]), d(bot[2]))),
                 );
             }
         }
@@ -4150,6 +4178,62 @@ fn render_remote_err<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn blit_filled_cells(area_w: u16, area_h: u16, img: &image::RgbaImage, cover: bool) -> usize {
+        let backend = ratatui::backend::TestBackend::new(area_w, area_h);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            blit_image_half_blocks(f, Rect::new(0, 0, area_w, area_h), img, cover, 1.0);
+        })
+        .expect("draw");
+        let buf = term.backend().buffer();
+        let mut n = 0;
+        for y in 0..area_h {
+            for x in 0..area_w {
+                if buf.cell((x, y)).map(|c| c.symbol()) == Some("▀") {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn wallpaper_cover_fills_area_contain_letterboxes() {
+        // Square-ish image into a non-matching aspect area.
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([200, 30, 30, 255]));
+        // Cover fills every cell of a 5x3 area (no empty margins).
+        assert_eq!(
+            blit_filled_cells(5, 3, &img, true),
+            15,
+            "cover must fill every cell"
+        );
+        // A very wide, short image fit into a tall area letterboxes —
+        // some cells stay empty.
+        let wide = image::RgbaImage::from_pixel(16, 1, image::Rgba([30, 200, 30, 255]));
+        let filled = blit_filled_cells(4, 4, &wide, false);
+        assert!(
+            filled > 0 && filled < 16,
+            "contain should letterbox (partial fill), got {filled}/16"
+        );
+    }
+
+    #[test]
+    fn wallpaper_dim_darkens_pixels() {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 200, 200, 255]));
+        let backend = ratatui::backend::TestBackend::new(2, 1);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| blit_image_half_blocks(f, Rect::new(0, 0, 2, 1), &img, true, 0.5))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        // 200 * 0.5 = 100, so the dimmed fg should be well below 200.
+        match buf.cell((0, 0)).map(|c| c.style().fg) {
+            Some(Some(Color::Rgb(r, _, _))) => {
+                assert!(r <= 110, "dim should darken (~100), got {r}")
+            }
+            other => panic!("expected an Rgb fg cell, got {other:?}"),
+        }
+    }
 
     /// User-reported regression: zarvis emits `\x1b[2m` (DIM/faint)
     /// for markers like `[+N lines — click to expand]` and tool
