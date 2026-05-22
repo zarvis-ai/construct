@@ -4714,6 +4714,7 @@ mod tests {
             list_collapsed: false,
             tasks_popup: None,
             remote_control_popup: None,
+            remote_control_task: None,
             editor_states: HashMap::new(),
             agent_statuses: HashMap::new(),
             session_transition: None,
