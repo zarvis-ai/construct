@@ -302,6 +302,101 @@ async fn web_client_loads_and_websocket_connects() {
         "expected editor_state mirror content, got:\n{editor_text}"
     );
 
+    // Tool-call rendering in terminal mode (issue #134): zarvis emits
+    // tool calls as structured events, not PTY bytes, so the xterm view
+    // showed nothing for them. `renderEvent` now synthesizes an inline
+    // representation. Mock `state.term.write` to capture what reaches the
+    // terminal and drive a few events through the real handler.
+    let tool_render: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const calls = [];
+              state.term = { write: (s) => calls.push(s), reset: () => {} };
+              state.mode = 'terminal';
+              state.ptyBuffering = false;
+              state.currentId = 'sX';
+              renderEvent({ type: 'tool_use', tool: 'shell', args: { command: 'ls -la /tmp' } });
+              renderEvent({ type: 'tool_result', tool: 'c1', ok: true, output: 'a.txt\nb.txt\nc.txt' });
+              renderEvent({ type: 'tool_result', tool: 'c2', ok: false, output: '' });
+              // Agent-supplied text must not be able to inject ANSI.
+              renderEvent({ type: 'tool_use', tool: 'evil\x1b[31m', args: {} });
+              const raw = calls.join('');
+              const stripped = raw.replace(/\x1b\[[0-9;]*m/g, '');
+              return { text: stripped, hasRawEsc: /\x1b/.test(stripped) };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate tool render")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    let tool_text = tool_render["text"].as_str().unwrap_or_default();
+    assert!(
+        tool_text.contains("→ shell")
+            && tool_text.contains("command: ls -la /tmp")
+            && tool_text.contains("✓")
+            && tool_text.contains("a.txt")
+            && tool_text.contains("[+2 more lines]")
+            && tool_text.contains("✗")
+            && tool_text.contains("(no output)")
+            && tool_text.contains("→ evil"),
+        "expected synthesized tool-call rendering, got:\n{tool_text}"
+    );
+    assert_eq!(
+        tool_render["hasRawEsc"], false,
+        "agent-supplied tool text leaked a raw ESC into the terminal (ANSI injection)"
+    );
+
+    // Historical hydration (issue #134): switching to a zarvis session
+    // replays its transcript into xterm so PAST tool calls show, not just
+    // live ones. Drive `replayTranscriptToTerm` with a synthetic
+    // transcript and confirm prose + tool blocks render in order, while
+    // prose-bearing structured events (message) are skipped (their text
+    // is already in the PTY events — rendering them would double up).
+    let replay: String = page
+        .evaluate(
+            r#"
+            (() => {
+              const calls = [];
+              // Mimic xterm: decode byte chunks (Uint8Array) to text the
+              // way the real terminal's UTF-8 decoder would.
+              const dec = new TextDecoder();
+              state.term = {
+                write: (s) => calls.push(typeof s === 'string' ? s : dec.decode(s)),
+                reset: () => {},
+                resize: () => {},
+              };
+              state.currentId = 'sH';
+              replayTranscriptToTerm([
+                { event: { type: 'pty', data: btoa('hello from agent\r\n') } },
+                { event: { type: 'tool_use', tool: 'shell', args: { command: 'echo hi' } } },
+                { event: { type: 'tool_result', tool: 'c1', ok: true, output: 'hi there' } },
+                { event: { type: 'message', role: 'assistant', text: 'SHOULD_NOT_DOUBLE' } },
+                { event: { type: 'pty', data: btoa('all done\r\n') } },
+              ]);
+              return calls.join('').replace(/\x1b\[[0-9;]*m/g, '');
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate transcript replay")
+        .into_value::<String>()
+        .expect("string");
+    assert!(
+        replay.contains("hello from agent")
+            && replay.contains("→ shell")
+            && replay.contains("command: echo hi")
+            && replay.contains("✓")
+            && replay.contains("hi there")
+            && replay.contains("all done"),
+        "expected transcript replay to render prose + tool blocks, got:\n{replay}"
+    );
+    assert!(
+        !replay.contains("SHOULD_NOT_DOUBLE"),
+        "message event was rendered in terminal mode — prose would double up:\n{replay}"
+    );
+
     // Pause briefly so the final rendered state lands in the
     // video before we stop the screencast — otherwise reviewers
     // see the page mid-load with no payoff frame.

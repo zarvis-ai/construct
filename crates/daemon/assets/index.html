@@ -1503,18 +1503,28 @@ async function enterTerminalMode(id) {
   state.ptyBuffering = true;
 
   try {
-    const r = await rpc("session.pty_replay", { session_id: id });
-    if (r && r.size) {
-      // Daemon's last-known size wins as the initial geometry; we
-      // refit below in case the phone screen is narrower.
-      state.term.resize(r.size.cols, r.size.rows);
+    const s = state.sessions.find((x) => x.id === id);
+    if (isStructuredToolSession(s)) {
+      // Zarvis: hydrate from the transcript so historical tool calls
+      // (which are never written to the PTY) appear, interleaved with
+      // prose. pty_replay alone would omit them.
+      const t = await rpc("session.transcript", { session_id: id, from: 0 });
+      replayTranscriptToTerm((t && t.events) || []);
+      renderEditorStateForSession(id);
+    } else {
+      const r = await rpc("session.pty_replay", { session_id: id });
+      if (r && r.size) {
+        // Daemon's last-known size wins as the initial geometry; we
+        // refit below in case the phone screen is narrower.
+        state.term.resize(r.size.cols, r.size.rows);
+      }
+      // Hand xterm the raw bytes (not a decoded string) so its
+      // built-in streaming UTF-8 decoder owns boundary handling
+      // across this and any subsequent `term.write` call. Passing a
+      // string forces a one-shot per-call decode and corrupts
+      // multi-byte glyphs that straddle PTY frame boundaries.
+      if (r && r.data) state.term.write(decodeBase64ToBytes(r.data));
     }
-    // Hand xterm the raw bytes (not a decoded string) so its
-    // built-in streaming UTF-8 decoder owns boundary handling
-    // across this and any subsequent `term.write` call. Passing a
-    // string forces a one-shot per-call decode and corrupts
-    // multi-byte glyphs that straddle PTY frame boundaries.
-    if (r && r.data) state.term.write(decodeBase64ToBytes(r.data));
   } catch (e) {
     state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
   }
@@ -2164,6 +2174,25 @@ function renderEvent(event, at) {
     if (event.type === "error" && state.term) {
       state.term.write(`\r\n\x1b[31m[error] ${event.message || ""}\x1b[0m\r\n`);
     }
+    // Tool calls (Zarvis): unlike codex/claude, Zarvis does NOT paint
+    // tool blocks into its PTY stream — it emits structured tool_use /
+    // tool_result events and the desktop TUI synthesizes the block. So
+    // the xterm view would show nothing for tool calls. Synthesize an
+    // inline rendering here, in event order with the surrounding PTY
+    // prose. (issue #134)
+    if (event.type === "tool_use") {
+      writeToTerm(toolUseLine(event.tool, event.args));
+    }
+    if (event.type === "tool_result") {
+      writeToTerm(toolResultLines(event.ok, event.output));
+    }
+    if (event.type === "tool_approval_request") {
+      const risk = event.risk ? ` [${sanitizeForTerm(event.risk)}]` : "";
+      writeToTerm(
+        `\r\n\x1b[1;33m? approve${risk}\x1b[0m ${sanitizeForTerm(event.tool || "")}` +
+          `\x1b[2m(${sanitizeForTerm(event.args_summary || "")})\x1b[0m\r\n`
+      );
+    }
     return;
   }
   switch (event.type) {
@@ -2272,6 +2301,93 @@ function appendMessage(role, text) {
     <div class="bubble"></div>`;
   row.querySelector(".bubble").textContent = text;
   transcriptEl.appendChild(row);
+}
+
+// --- terminal-mode tool-call synthesis (issue #134) ----------------------
+// Zarvis emits tool calls as structured events, not PTY bytes. Render an
+// inline xterm representation that mirrors the desktop TUI's tool block.
+
+// Strip ESC + other control bytes from agent-supplied text so a tool
+// name / args / output can't inject cursor moves or colors into xterm.
+function sanitizeForTerm(s) {
+  return String(s ?? "").replace(/[\x00-\x1f\x7f]/g, " ");
+}
+
+// One-line summary of a tool's args object for the `→ tool(...)` header.
+function summarizeToolArgs(args) {
+  if (args == null) return "";
+  let s;
+  if (typeof args === "string") {
+    s = args;
+  } else if (typeof args === "object") {
+    s = Object.entries(args)
+      .map(([k, v]) => `${k}: ${typeof v === "string" ? v : JSON.stringify(v)}`)
+      .join(", ");
+  } else {
+    s = String(args);
+  }
+  s = sanitizeForTerm(s);
+  return s.length > 120 ? s.slice(0, 117) + "…" : s;
+}
+
+function toolUseLine(tool, args) {
+  const summary = summarizeToolArgs(args);
+  const argPart = summary ? `\x1b[2m(${summary})\x1b[0m` : "";
+  return `\r\n\x1b[1;32m→ ${sanitizeForTerm(tool || "tool")}\x1b[0m${argPart}\r\n`;
+}
+
+function toolResultLines(ok, output) {
+  const glyph = ok === false ? "\x1b[1;31m✗\x1b[0m" : "\x1b[1;32m✓\x1b[0m";
+  const lines = String(output ?? "").split("\n");
+  const first = lines[0] ? sanitizeForTerm(lines[0]).slice(0, 200) : "(no output)";
+  let out = `  ${glyph}  \x1b[2m${first}\x1b[0m\r\n`;
+  const extra = lines.length - 1;
+  if (extra > 0) {
+    out += `     \x1b[2;36m[+${extra} more line${extra === 1 ? "" : "s"}]\x1b[0m\r\n`;
+  }
+  return out;
+}
+
+// Write to xterm, respecting the pty_replay buffering window so a tool
+// event that lands mid-replay stays ordered with the buffered PTY chunks.
+function writeToTerm(s) {
+  if (state.ptyBuffering) state.ptyBuffer.push(s);
+  else if (state.term) state.term.write(s);
+}
+
+// Hydrate the terminal from a session's transcript (used for zarvis,
+// whose tool blocks aren't in the PTY stream). Writes PTY prose and
+// synthesized tool blocks in chronological order, directly to xterm —
+// this is the historical baseline, so it bypasses the live-event
+// `ptyBuffer` (which is flushed afterwards). Prose-bearing structured
+// events (message / reasoning) are skipped: their text is already in
+// the PTY events.
+function replayTranscriptToTerm(events) {
+  if (!state.term) return;
+  for (const te of events) {
+    const e = te && te.event;
+    if (!e || !e.type) continue;
+    switch (e.type) {
+      case "pty":
+        state.term.write(decodeBase64ToBytes(e.data || ""));
+        break;
+      case "tool_use":
+        state.term.write(toolUseLine(e.tool, e.args));
+        break;
+      case "tool_result":
+        state.term.write(toolResultLines(e.ok, e.output));
+        break;
+      case "editor_state":
+        state.editorById.set(state.currentId, e);
+        break;
+      case "agent_status":
+        if (e.active) state.agentStatusById.set(state.currentId, e);
+        else state.agentStatusById.delete(state.currentId);
+        break;
+      // message / reasoning / status / cost / …: prose is already in
+      // the PTY events; structured chrome isn't shown in terminal mode.
+    }
+  }
 }
 
 function appendToolUse(tool, args) {
@@ -2449,6 +2565,16 @@ function isHeadlessSession(s) {
 
 function isTerminalSession(s) {
   return !!(s && s.has_pty && !isHeadlessSession(s));
+}
+
+// Zarvis renders tool calls as structured events, not PTY bytes (codex /
+// claude / shell paint their own tool UI into the PTY). For those
+// sessions the xterm view is hydrated from the transcript — which
+// interleaves PTY prose with the tool events — instead of the
+// `pty_replay` screen snapshot, so past tool calls show on switch.
+// Mirrors the desktop TUI's transcript-preferred hydration. (issue #134)
+function isStructuredToolSession(s) {
+  return !!(s && s.harness === "zarvis");
 }
 
 function sessionHarnessLabel(s) {
