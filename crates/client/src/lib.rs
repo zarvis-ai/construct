@@ -5,10 +5,10 @@ use agentd_protocol::{
     ipc_method, transport, CreateSessionParams, DiffResult, ErrorObject, GroupCreateParams,
     GroupDeleteParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, GroupSummary,
     HarnessInfo, MoveDirection, Notification, PingResult, PtyReplayResult, Request, Response,
-    SessionDetail, SessionIdParams, SessionInputParams, SessionMoveParams, SessionPtyInputParams,
-    SessionPtyResizeParams, SessionSetAutomodeParams, SessionSetPinnedParams,
-    SessionSetTitleParams, SessionSummary, SessionToolDecisionParams, SubscribeParams,
-    TranscriptParams, TranscriptResult,
+    SessionDetail, SessionEmitEventParams, SessionIdParams, SessionInputParams, SessionMoveParams,
+    SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams,
+    SessionSetPinnedParams, SessionSetTitleParams, SessionSummary, SessionToolDecisionParams,
+    SubscribeParams, TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -406,6 +406,18 @@ impl Client {
                 &SessionSetAutomodeParams {
                     session_id: id.to_string(),
                     on,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn emit_event(&self, id: &str, event: agentd_protocol::SessionEvent) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_EMIT_EVENT,
+                &SessionEmitEventParams {
+                    session_id: id.to_string(),
+                    event,
                 },
             )
             .await?;

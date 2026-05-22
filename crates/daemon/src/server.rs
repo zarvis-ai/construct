@@ -983,6 +983,13 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
+        m if m == ipc_method::SESSION_EMIT_EVENT => {
+            let p = params!(agentd_protocol::SessionEmitEventParams);
+            match manager.emit_session_event(p).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
         m if m == ipc_method::LOOP_CREATE => {
             let p = params!(agentd_protocol::LoopCreateParams);
             match manager.loop_create(p).await {

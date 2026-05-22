@@ -147,7 +147,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
     let AdapterContext {
-        session_id: _,
+        session_id: agentd_session_id,
         emit,
         mut inbox,
     } = ctx;
@@ -205,6 +205,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         child_args.push("--output-format".into());
         child_args.push("stream-json".into());
         child_args.push("--verbose".into());
+        if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&agentd_session_id) {
+            child_args.push("--mcp-config".into());
+            child_args.push(cfg.to_string_lossy().to_string());
+        }
         if let Some(sid) = &session_id {
             child_args.push("--resume".into());
             child_args.push(sid.clone());
@@ -229,6 +233,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         for (k, v) in &env {
             command.env(k, v);
         }
+        command.env("AGENTD_SESSION_ID", &agentd_session_id);
 
         let mut child = match command.spawn() {
             Ok(c) => c,

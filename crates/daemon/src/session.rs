@@ -7,9 +7,9 @@ use crate::worktree;
 use agentd_protocol::{
     ahp_method, CreateSessionParams, DeletedNotificationPayload, EventNotificationPayload,
     GroupDeletedNotificationPayload, GroupStateNotificationPayload, GroupSummary, HarnessInfo,
-    MessageRole, MoveDirection, PtyReplayResult, PtySize, SessionDetail, SessionEvent,
-    SessionStartParams, SessionState, SessionSummary, StateNotificationPayload, TimestampedEvent,
-    TranscriptResult,
+    MessageRole, MoveDirection, PtyReplayResult, PtySize, SessionDetail, SessionEmitEventParams,
+    SessionEvent, SessionStartParams, SessionState, SessionSummary, StateNotificationPayload,
+    TimestampedEvent, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -1739,6 +1739,15 @@ impl SessionManager {
             .send(BroadcastMsg::State(StateNotificationPayload {
                 session: summary,
             }));
+    }
+
+    pub async fn emit_session_event(&self, p: SessionEmitEventParams) -> Result<()> {
+        let entry = self
+            .get_entry(&p.session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", p.session_id))?;
+        self.handle_event(&entry, p.event).await;
+        Ok(())
     }
 
     pub async fn send_input(&self, id: &str, text: String) -> Result<()> {

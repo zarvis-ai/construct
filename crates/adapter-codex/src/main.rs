@@ -358,7 +358,7 @@ fn uuid_from_rollout_name(name: &str) -> Option<String> {
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
     let AdapterContext {
-        session_id: _,
+        session_id: agentd_session_id,
         emit,
         mut inbox,
     } = ctx;
@@ -418,6 +418,9 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             child_args.push("-m".into());
             child_args.push(m.clone());
         }
+        for a in agentd_protocol::adapter::maybe_inject_codex_mcp_args(&agentd_session_id) {
+            child_args.push(a);
+        }
         for a in &extra_args {
             child_args.push(a.clone());
         }
@@ -435,6 +438,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         for (k, v) in &env {
             command.env(k, v);
         }
+        command.env("AGENTD_SESSION_ID", &agentd_session_id);
 
         let mut child = match command.spawn() {
             Ok(c) => c,

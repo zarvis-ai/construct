@@ -106,7 +106,7 @@ fn toml_quote(s: &str) -> String {
 /// `agentd-mcp` as an MCP server. Returns the config path on success; pass
 /// it to the child CLI via `--mcp-config <path>` (claude-style).
 ///
-/// Used by the claude adapter in interactive mode. Codex uses
+/// Used by the claude adapter. Codex uses
 /// [`maybe_inject_codex_mcp_args`] instead.
 pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
     if std::env::var("AGENTD_INJECT_MCP").as_deref() == Ok("0") {

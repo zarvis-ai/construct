@@ -277,6 +277,12 @@ Agentd-control (16 tools, same surface as `agentd-mcp`):
 sessions on the same daemon. `agentd_whoami` returns the session id
 this zarvis is running inside (auto-injected via env).
 
+Browser: `browser_open`, `browser_inspect`, `browser_screenshot`, and
+`browser_eval` drive Chrome through DevTools and emit the same browser
+preview thumbnail that the TUI renders above the session. These tools
+are native to zarvis and are also exposed through `agentd-mcp` for
+MCP-capable harnesses.
+
 ### Approval / automode
 
 Tool calls run with your permissions, so zarvis classifies each tool
@@ -381,10 +387,10 @@ Deferred to later milestones:
 
 An agent (claude / codex) running inside an agentd session can drive the
 daemon itself — list other sessions, read their PTY output, send input,
-spawn helper sessions, etc. — via an MCP stdio server, `agentd-mcp`.
+spawn helper sessions, browse with Chrome DevTools, etc. — via an MCP
+stdio server, `agentd-mcp`.
 
-When the claude / codex adapter spawns the child CLI in interactive mode,
-it automatically:
+When the claude / codex adapter spawns the child CLI, it automatically:
 - Writes a per-session MCP config under `$STATE_DIR/mcp/<session_id>.json`
 - Passes `--mcp-config <path>` to the child
 - Sets `AGENTD_SESSION_ID=<session_id>` in the child's environment
@@ -396,6 +402,16 @@ The MCP server exposes a read + write tool surface that mirrors the IPC:
 `agentd_send_keys` (raw PTY bytes), `agentd_interrupt_session`,
 `agentd_stop_session`, `agentd_kill_session`, `agentd_delete_session`,
 `agentd_pin_session`, `agentd_rename_session`.
+
+It also exposes browser tools for MCP-capable harnesses:
+`browser_open`, `browser_inspect`, `browser_screenshot`, and
+`browser_eval`. Browser tools emit a `BrowserPreview` event back to the
+calling session, so the TUI thumbnail window updates for claude/codex MCP
+calls the same way it does for zarvis-native browser calls.
+
+`agy`/Antigravity currently receives `AGENTD_SESSION_ID`, but its CLI has
+no MCP injection flag; browser tools become available there once the
+upstream CLI exposes an MCP server configuration surface.
 
 Opt out with `AGENTD_INJECT_MCP=0` in the daemon's environment.
 

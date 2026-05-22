@@ -164,6 +164,12 @@ pub struct SessionInputParams {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEmitEventParams {
+    pub session_id: String,
+    pub event: SessionEvent,
+}
+
 /// Payload carried by the [`ahp_notif::EVENT`] notification from adapter → daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -551,6 +557,11 @@ pub mod ipc_method {
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
     pub const SESSION_TOOL_ACTION: &str = "session.tool_action";
     pub const SESSION_LIST_TASKS: &str = "session.list_tasks";
+    /// Append/broadcast a structured event for a session. Intended for trusted
+    /// local helpers such as agentd-mcp that run outside an adapter but need to
+    /// surface UI-only state (for example browser previews) in the caller's
+    /// session.
+    pub const SESSION_EMIT_EVENT: &str = "session.emit_event";
     pub const LOOP_CREATE: &str = "loop.create";
     pub const LOOP_LIST: &str = "loop.list";
     pub const LOOP_UPDATE: &str = "loop.update";
