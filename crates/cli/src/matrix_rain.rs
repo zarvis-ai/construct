@@ -505,6 +505,7 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
         | SessionEvent::Diff { .. }
         | SessionEvent::Pty { .. }
         | SessionEvent::EditorState { .. }
+        | SessionEvent::BrowserPreview(_)
         | SessionEvent::AgentStatus(_) => None,
     }
 }

@@ -7,6 +7,7 @@ use crate::app::{
 use crate::keymap::KeyAction;
 use crate::theme::Theme;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
+use base64::Engine;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -2141,6 +2142,9 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     // O(history) vt100 rebuild each time (the typing lag). Keeping the
     // parser at the stable `area.height` means editor growth never
     // resizes it — we just show its bottom `chat_area.height` rows.
+    let preview = app.browser_previews.get(&id).cloned();
+    app.layout.browser_preview_area = None;
+    app.layout.browser_preview_close = None;
     let row_offset = area.height.saturating_sub(chat_area.height);
     let out = history.replay(area.width, area.height, scroll);
     // Hide the chat pane's cursor block if we have our own editor pane
@@ -2171,6 +2175,10 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         editor_area.is_none(),
         row_offset,
     );
+    let (preview_area, preview_close) =
+        render_browser_preview_overlay(f, chat_area, &app.theme, app.mouse_pos, preview.as_ref());
+    app.layout.browser_preview_area = preview_area;
+    app.layout.browser_preview_close = preview_close;
     app.block_hits.insert(
         id,
         translate_block_hits(out.blocks, row_offset, chat_area.height),
@@ -2196,6 +2204,146 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
             &app.theme,
             true,
         );
+    }
+}
+
+fn render_browser_preview_overlay(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    mouse_pos: Option<(u16, u16)>,
+    preview: Option<&crate::app::BrowserPreviewState>,
+) -> (Option<Rect>, Option<(u16, u16, u16)>) {
+    let Some(preview_state) = preview else {
+        return (None, None);
+    };
+    let preview = &preview_state.preview;
+    if area.width < 40 || area.height < 12 {
+        return (None, None);
+    }
+    let panel_w = area.width.min((area.width / 3).max(36)).min(64);
+    let panel_h = area.height.min(18).min((area.height * 2 / 3).max(10));
+    if panel_w < 20 || panel_h < 8 {
+        return (None, None);
+    }
+    let panel = Rect {
+        x: area.x + area.width.saturating_sub(panel_w + 1),
+        y: area.y + 1,
+        width: panel_w,
+        height: panel_h,
+    };
+    let close_w = 3;
+    let close_bounds = (
+        panel.x + panel.width.saturating_sub(close_w + 1),
+        panel.x + panel.width.saturating_sub(1),
+        panel.y,
+    );
+    let close_hovered = mouse_pos
+        .map(|(mx, my)| my == close_bounds.2 && mx >= close_bounds.0 && mx < close_bounds.1)
+        .unwrap_or(false);
+    let close_style = if close_hovered {
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.matrix_dim)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.matrix_dim))
+        .title(
+            Line::from(Span::styled(" x ", close_style))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    let inner = block.inner(panel);
+    f.render_widget(Clear, panel);
+    f.render_widget(block, panel);
+    if inner.width == 0 || inner.height == 0 {
+        return (Some(panel), Some(close_bounds));
+    }
+    let caption_rows = 1;
+    let image_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(caption_rows),
+    };
+    render_browser_preview_image(f, image_area, preview);
+    if inner.height > 0 {
+        let caption = preview
+            .title
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&preview.url);
+        let caption = truncate_to_width(caption, inner.width as usize);
+        let caption_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height - 1,
+            width: inner.width,
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                caption,
+                Style::default().fg(theme.dim),
+            ))),
+            caption_area,
+        );
+    }
+    (Some(panel), Some(close_bounds))
+}
+
+fn render_browser_preview_image(
+    f: &mut Frame,
+    area: Rect,
+    preview: &agentd_protocol::BrowserPreview,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let Ok(png) = base64::engine::general_purpose::STANDARD.decode(&preview.image) else {
+        return;
+    };
+    let Ok(img) = image::load_from_memory(&png).map(|img| img.to_rgba8()) else {
+        return;
+    };
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let max_cols = area.width as u32;
+    let max_cell_rows = area.height as u32;
+    let scale = (max_cols as f32 / w as f32).min((max_cell_rows as f32 * 2.0) / h as f32);
+    let out_w = ((w as f32 * scale).round() as u32).clamp(1, max_cols);
+    let out_h_px = ((h as f32 * scale).round() as u32).clamp(1, max_cell_rows * 2);
+    let resized =
+        image::imageops::resize(&img, out_w, out_h_px, image::imageops::FilterType::Triangle);
+    let x0 = area.x + ((area.width as u32).saturating_sub(out_w) / 2) as u16;
+    let rows = out_h_px.div_ceil(2).min(max_cell_rows);
+    let y0 = area.y + ((area.height as u32).saturating_sub(rows) / 2) as u16;
+    let buf = f.buffer_mut();
+    for y in (0..out_h_px).step_by(2) {
+        let row = y / 2;
+        if row >= rows {
+            break;
+        }
+        for x in 0..out_w {
+            let top = resized.get_pixel(x, y).0;
+            let bot = if y + 1 < out_h_px {
+                resized.get_pixel(x, y + 1).0
+            } else {
+                [0, 0, 0, 255]
+            };
+            if let Some(cell) = buf.cell_mut(Position {
+                x: x0 + x as u16,
+                y: y0 + row as u16,
+            }) {
+                cell.set_symbol("▀");
+                cell.set_style(
+                    Style::default()
+                        .fg(Color::Rgb(top[0], top[1], top[2]))
+                        .bg(Color::Rgb(bot[0], bot[1], bot[2])),
+                );
+            }
+        }
     }
 }
 
@@ -2987,6 +3135,10 @@ fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
             // chat transcript.
             vec![]
         }
+        SessionEvent::BrowserPreview(preview) => vec![Span::styled(
+            format!("   ◱ browser preview: {}", shorten(&preview.url, 120)),
+            Style::default().fg(theme.dim),
+        )],
         SessionEvent::ContextCompacted {
             dropped_turns,
             tokens_before,
@@ -3486,6 +3638,9 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
             } else {
                 "agent-status cleared".to_string()
             }
+        }
+        SessionEvent::BrowserPreview(preview) => {
+            format!("browser-preview {}", shorten(&preview.url, 60))
         }
         SessionEvent::Cost { usd, .. } => format!("cost ${:.4}", usd),
         SessionEvent::Diff { .. } => "diff".to_string(),

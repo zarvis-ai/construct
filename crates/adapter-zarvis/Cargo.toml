@@ -28,5 +28,6 @@ reqwest.workspace = true
 async-trait.workspace = true
 eventsource-stream.workspace = true
 tokio-tungstenite.workspace = true
+image.workspace = true
 base64.workspace = true
 unicode-width.workspace = true

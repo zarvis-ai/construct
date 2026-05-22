@@ -1667,6 +1667,7 @@ impl SessionManager {
                 | SessionEvent::TaskBackgrounded { .. }
                 | SessionEvent::TaskEnd { .. }
                 | SessionEvent::ContextCompacted { .. }
+                | SessionEvent::BrowserPreview(_)
                 | SessionEvent::EditorState { .. } => {
                     // Task-lifecycle, editor-state, and compaction
                     // events are recorded by other handlers — they

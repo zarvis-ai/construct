@@ -55,6 +55,7 @@ tokio-tungstenite = "0.24"
 qrcode = { version = "0.14", default-features = false }
 httparse = "1"
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 agentd-protocol = { path = "crates/protocol" }
 agentd-client = { path = "crates/client" }

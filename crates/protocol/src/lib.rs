@@ -183,6 +183,23 @@ pub struct AgentStatus {
     pub status: String,
 }
 
+/// Browser preview image for UI-only overlays. This is emitted by
+/// browser-aware tools so clients can show what the agent is viewing
+/// without stuffing screenshots into the textual tool result that the
+/// model consumes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowserPreview {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// PNG bytes encoded as base64.
+    pub image: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
 /// A structured event emitted by an adapter while running a session.
 ///
 /// Adapters whose underlying CLI is plain text can lean on
@@ -228,6 +245,9 @@ pub enum SessionEvent {
     /// above queued input while active and may render inactive statuses
     /// as display-only history rows.
     AgentStatus(AgentStatus),
+    /// UI-only browser preview. Clients may render this as an overlay;
+    /// it is not intended to be fed back to the model as tool output.
+    BrowserPreview(BrowserPreview),
     Cost {
         #[serde(default)]
         usd: f64,

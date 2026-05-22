@@ -355,6 +355,9 @@ pub struct App {
     /// Per-session live agent status, fed by `SessionEvent::AgentStatus`
     /// and rendered above queued input while a turn is active.
     pub agent_statuses: HashMap<String, agentd_protocol::AgentStatus>,
+    /// Latest browser preview per session, fed by `SessionEvent::BrowserPreview`
+    /// and rendered as a top-right overlay in the terminal view.
+    pub browser_previews: HashMap<String, BrowserPreviewState>,
     /// Short visual transition when the main view switches to a different
     /// session.
     pub session_transition: Option<SessionTransition>,
@@ -416,6 +419,7 @@ struct SessionHydration {
     history: Option<crate::pty_render::ItemHistory>,
     editor_state: Option<EditorState>,
     agent_status: Option<agentd_protocol::AgentStatus>,
+    browser_preview: Option<agentd_protocol::BrowserPreview>,
     status_messages: Vec<String>,
 }
 
@@ -445,6 +449,13 @@ pub struct EditorState {
     pub buf: String,
     pub cursor: usize,
     pub completions: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BrowserPreviewState {
+    pub preview: agentd_protocol::BrowserPreview,
+    pub hide_after: Instant,
+    pub hover_started: Option<Instant>,
 }
 
 fn agent_status_history_line(status: &agentd_protocol::AgentStatus) -> Option<Vec<u8>> {
@@ -515,6 +526,7 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
 
             let mut editor_state = None;
             let mut agent_status = None;
+            let mut browser_preview = None;
             if transcript
                 .events
                 .iter()
@@ -532,12 +544,13 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
                 &mut h,
                 &mut editor_state,
                 &mut agent_status,
+                &mut browser_preview,
             );
             let (cols, rows) = req.terminal_pane_size;
             let _ = h.replay(cols.max(1), rows.max(1), 0);
-            (Some(h), editor_state, agent_status)
+            (Some(h), editor_state, agent_status, browser_preview)
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
         Ok(SessionHydration {
@@ -546,6 +559,7 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
             history: history.0,
             editor_state: history.1,
             agent_status: history.2,
+            browser_preview: history.3,
             status_messages,
         })
     })
@@ -748,6 +762,10 @@ pub struct LayoutSnapshot {
     /// Mouse clicks outside this rect dismiss the modal instead of
     /// falling through to panes underneath it.
     pub modal_area: Option<ratatui::layout::Rect>,
+    /// Bounds of the browser preview overlay rendered in the terminal view.
+    pub browser_preview_area: Option<ratatui::layout::Rect>,
+    /// Top-right close button bounds for the browser preview overlay: `(x_start, x_end, y)`.
+    pub browser_preview_close: Option<(u16, u16, u16)>,
 }
 
 #[derive(Debug, Clone)]
@@ -939,6 +957,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
+        browser_previews: HashMap::new(),
         session_transition: None,
         pin_transitions: HashMap::new(),
         matrix_rain: crate::matrix_rain::MatrixRain::default(),
@@ -1262,6 +1281,7 @@ async fn run_loop(
                         app.status = None;
                     }
                 }
+                app.update_browser_preview_hover_and_expiry();
             }
         }
     }
@@ -1308,6 +1328,50 @@ impl App {
 
     pub fn set_status(&mut self, msg: String) {
         self.status = Some((msg, Instant::now()));
+    }
+
+    fn insert_browser_preview(
+        &mut self,
+        session_id: String,
+        preview: agentd_protocol::BrowserPreview,
+    ) {
+        self.browser_previews.insert(
+            session_id,
+            BrowserPreviewState {
+                preview,
+                hide_after: Instant::now() + Duration::from_secs(5),
+                hover_started: None,
+            },
+        );
+    }
+
+    fn update_browser_preview_hover_and_expiry(&mut self) {
+        let now = Instant::now();
+        let Some((mx, my)) = self.mouse_pos else {
+            self.browser_previews
+                .retain(|_, state| now < state.hide_after);
+            return;
+        };
+        let hovered_session = match self.layout.browser_preview_area {
+            Some(area)
+                if mx >= area.x
+                    && mx < area.x + area.width
+                    && my >= area.y
+                    && my < area.y + area.height => self.selected_id(),
+            _ => None,
+        };
+        let hovered_session = hovered_session.as_deref();
+        self.browser_previews.retain(|sid, state| {
+            if Some(sid.as_str()) == hovered_session {
+                state.hover_started.get_or_insert(now);
+                true
+            } else {
+                if state.hover_started.take().is_some() {
+                    state.hide_after = now + Duration::from_secs(5);
+                }
+                now < state.hide_after
+            }
+        });
     }
 
     fn queue_pty_input(&mut self, session_id: String, bytes: Vec<u8>, label: &'static str) {
@@ -1450,6 +1514,9 @@ impl App {
         if let Some(status) = hydration.agent_status {
             self.agent_statuses
                 .insert(hydration.session_id.clone(), status);
+        }
+        if let Some(preview) = hydration.browser_preview {
+            self.insert_browser_preview(hydration.session_id.clone(), preview);
         }
         if let Some(msg) = hydration.status_messages.last() {
             self.set_status(msg.clone());
@@ -1628,6 +1695,7 @@ impl App {
         // call_id and just fills `output` on the existing block.
         let mut replayed_editor_state: Option<EditorState> = None;
         let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
+        let mut replayed_browser_preview: Option<agentd_protocol::BrowserPreview> = None;
         match self.client.transcript(id, 0, None).await {
             Ok(t) => {
                 if t.events
@@ -1646,6 +1714,7 @@ impl App {
                     &mut history,
                     &mut replayed_editor_state,
                     &mut replayed_agent_status,
+                    &mut replayed_browser_preview,
                 );
             }
             Err(e) => {
@@ -1657,6 +1726,9 @@ impl App {
         }
         if let Some(status) = replayed_agent_status {
             self.agent_statuses.insert(id.to_string(), status);
+        }
+        if let Some(preview) = replayed_browser_preview {
+            self.insert_browser_preview(id.to_string(), preview);
         }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
@@ -1838,6 +1910,7 @@ impl App {
                             self.block_hits.remove(&payload.session_id);
                             self.editor_states.remove(&payload.session_id);
                             self.agent_statuses.remove(&payload.session_id);
+                            self.browser_previews.remove(&payload.session_id);
                             self.pty_activity.remove(&payload.session_id);
                             self.matrix_rain.forget_session(&payload.session_id);
                             if Some(payload.session_id.as_str())
@@ -1969,6 +2042,10 @@ impl App {
                                     completions: completions.clone(),
                                 },
                             );
+                        }
+                        if let SessionEvent::BrowserPreview(preview) = &payload.event {
+                            self.insert_browser_preview(payload.session_id.clone(), preview.clone());
+                            return;
                         }
                         if let SessionEvent::AgentStatus(status) = &payload.event {
                             if status.active {
@@ -2641,6 +2718,16 @@ impl App {
         }
         if let Some(view) = self.layout.view_area {
             if contains(view, col, row) {
+                if let Some((x_start, x_end, y)) = self.layout.browser_preview_close {
+                    if row == y && col >= x_start && col < x_end {
+                        if let Some(id) = self.selected_id() {
+                            self.browser_previews.remove(&id);
+                            self.layout.browser_preview_area = None;
+                            self.layout.browser_preview_close = None;
+                        }
+                        return;
+                    }
+                }
                 // Uncollapse handle: when the list is collapsed,
                 // the view's left border column acts as the
                 // "show list" button. Tested before other view
@@ -3709,6 +3796,7 @@ impl App {
                         Ok(()) => {
                             self.editor_states.remove(&session_id);
                             self.agent_statuses.remove(&session_id);
+                            self.browser_previews.remove(&session_id);
                             self.set_status(format!("restarted {}", short_id(&session_id)));
                         }
                         Err(e) => self.set_status(format!("restart failed: {e}")),
@@ -4050,6 +4138,7 @@ impl App {
                         // adapter's transcript).
                         self.editor_states.remove(&session_id);
                         self.agent_statuses.remove(&session_id);
+                        self.browser_previews.remove(&session_id);
                         self.set_status(format!("restarted {}", short_id(&session_id)));
                     }
                     Err(e) => self.set_status(format!("restart failed: {e}")),
@@ -4439,6 +4528,7 @@ pub fn apply_transcript_to_local_state(
     history: &mut crate::pty_render::ItemHistory,
     editor_state: &mut Option<EditorState>,
     agent_status: &mut Option<agentd_protocol::AgentStatus>,
+    browser_preview: &mut Option<agentd_protocol::BrowserPreview>,
 ) {
     for ev in events {
         match &ev.event {
@@ -4506,6 +4596,9 @@ pub fn apply_transcript_to_local_state(
             // event, so a fresh TUI must synthesize the same history
             // row during transcript replay or the completed-turn
             // message disappears after reconnect/restart.
+            SessionEvent::BrowserPreview(preview) => {
+                *browser_preview = Some(preview.clone());
+            }
             SessionEvent::AgentStatus(status) => {
                 if status.active {
                     *agent_status = Some(status.clone());
@@ -4775,6 +4868,8 @@ mod tests {
             minibuffer_hints: Vec::new(),
             minibuffer_harness_hits: Vec::new(),
             modal_area: None,
+            browser_preview_area: None,
+            browser_preview_close: None,
         }
     }
 
@@ -4832,6 +4927,7 @@ mod tests {
             remote_control_task: None,
             editor_states: HashMap::new(),
             agent_statuses: HashMap::new(),
+            browser_previews: HashMap::new(),
             session_transition: None,
             pin_transitions: HashMap::new(),
             matrix_rain: crate::matrix_rain::MatrixRain::default(),
@@ -5146,8 +5242,10 @@ mod tests {
             "line one\nline two\nline three\nline four\nline five\nline six",
         );
 
-        assert!(small.is_some() && small == big,
-            "editor growth resized the chat parser: {small:?} -> {big:?}");
+        assert!(
+            small.is_some() && small == big,
+            "editor growth resized the chat parser: {small:?} -> {big:?}"
+        );
 
         // And the shrunk chat must still show the MOST RECENT content
         // (the bottom slice), not stale/older lines.
@@ -5329,7 +5427,14 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status: Option<AgentStatus> = None;
-        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
+        let mut browser_preview = None;
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut browser_preview,
+        );
 
         // The render must include the synthesized header for the
         // block. Before the fix, no `ToolBlock` items existed and
@@ -5394,7 +5499,14 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status = None;
-        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
+        let mut browser_preview = None;
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut browser_preview,
+        );
 
         let screen_rows = 24u16;
         let screen_cols = 80u16;
@@ -5451,7 +5563,14 @@ mod tests {
             started_at_ms,
             status: "Working".into(),
         });
-        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
+        let mut browser_preview = None;
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut browser_preview,
+        );
 
         assert!(
             status.is_none(),
@@ -5583,11 +5702,13 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor_state: Option<EditorState> = None;
         let mut agent_status: Option<agentd_protocol::AgentStatus> = None;
+        let mut browser_preview = None;
         apply_transcript_to_local_state(
             &events,
             &mut history,
             &mut editor_state,
             &mut agent_status,
+            &mut browser_preview,
         );
 
         let state = editor_state

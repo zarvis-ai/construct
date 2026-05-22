@@ -91,6 +91,7 @@ pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
         cwd: src.cwd.clone(),
         session_id: src.session_id.clone(),
         client: tokio::sync::OnceCell::new(),
+        emit: src.emit.clone(),
     };
     if let Some(c) = src.client.get() {
         let _ = new_ctx.client.set(c.clone());
@@ -213,6 +214,7 @@ pub async fn run(
         cwd: cwd.clone(),
         session_id: session_id.clone(),
         client: tokio::sync::OnceCell::new(),
+        emit: Some(emit.clone()),
     };
 
     // Per-session message persistence (`zarvis.jsonl`). On resume,
@@ -693,6 +695,7 @@ async fn run_with_interrupt(
     let (tx, rx) = oneshot::channel::<()>();
     let cwd = ctx.cwd.clone();
     let session_id = ctx.session_id.clone();
+    let emit = ctx.emit.clone();
     let client_cell = std::sync::Mutex::new(None::<Arc<agentd_client::Client>>);
     if let Some(c) = ctx.client.get() {
         *client_cell.lock().unwrap() = Some(c.clone());
@@ -702,6 +705,7 @@ async fn run_with_interrupt(
             cwd,
             session_id,
             client: tokio::sync::OnceCell::new(),
+            emit,
         };
         if let Some(c) = client_cell.lock().unwrap().clone() {
             let _ = local_ctx.client.set(c);

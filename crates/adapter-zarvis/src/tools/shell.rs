@@ -153,6 +153,7 @@ mod tests {
             cwd,
             session_id: "test".to_string(),
             client: tokio::sync::OnceCell::new(),
+            emit: None,
         }
     }
 
@@ -169,7 +170,9 @@ mod tests {
 
         assert!(!outcome.ok);
         assert!(
-            outcome.output.contains("does not exist or is not a directory"),
+            outcome
+                .output
+                .contains("does not exist or is not a directory"),
             "unexpected output: {}",
             outcome.output
         );
