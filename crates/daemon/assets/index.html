@@ -1201,6 +1201,11 @@ const state = {
   // `session.pty_resize` on every paint when nothing actually
   // changed (ResizeObserver fires generously).
   lastReportedSize: { cols: 0, rows: 0 },
+  // Some PTY apps repaint after SIGWINCH by emitting a large redraw
+  // after the browser-side fit already returned. If the user was
+  // following bottom when we sent the resize, keep following briefly
+  // while that delayed repaint lands.
+  resizeFollowBottomUntil: 0,
   // PTY events that arrived during the `pty_replay` round-trip get
   // queued here, then drained after the snapshot is written. Keeps
   // history-before-live ordering correct without a race window.
@@ -1442,9 +1447,7 @@ function connect() {
     rpc("ping", null).catch(() => {});
     refreshSessions();
     rpc("subscribe.events", { session_id: null }).catch(() => {});
-    // If a session was already selected before the reconnect, re-
-    // fill its transcript.
-    if (state.currentId) loadTranscript(state.currentId);
+    refreshCurrentSessionAfterReconnect();
   });
 
   ws.addEventListener("close", () => {
@@ -1475,6 +1478,21 @@ function connect() {
       handleNotification(msg.method, msg.params || {});
     }
   });
+}
+
+function refreshCurrentSessionAfterReconnect() {
+  if (!state.currentId) return;
+  const s = state.sessions.find((x) => x.id === state.currentId);
+  if (state.mode === "terminal" || isTerminalSession(s)) {
+    // Keep the live xterm buffer exactly where the user left it. Replaying
+    // transcript or PTY history on reconnect appends old output into xterm,
+    // which looks like terminal history replaying from the beginning. Mobile
+    // keyboard show/hide can be enough to make browsers churn the websocket,
+    // so reconnect must not repaint the terminal view.
+    refitTerminal();
+    return;
+  }
+  loadTranscript(state.currentId);
 }
 
 function scheduleReconnect() {
@@ -1933,8 +1951,10 @@ function installTerminalScrollContainment() {
   // terminal buffer. CSS `overscroll-behavior` is not reliable for this case
   // on iOS, so keep terminal touch scrolling fully local and drive xterm's
   // scrollback ourselves with a small momentum scroller.
-  const stop = (ev) => ev.stopPropagation();
-  terminalEl.addEventListener("wheel", stop, { passive: true });
+  terminalEl.addEventListener("wheel", (ev) => {
+    cancelResizeFollowBottom();
+    ev.stopPropagation();
+  }, { passive: true });
 
   let active = false;
   let lastY = 0;
@@ -1956,6 +1976,7 @@ function installTerminalScrollContainment() {
     const lineH = pxPerLine();
     const lines = carryPx > 0 ? Math.floor(carryPx / lineH) : Math.ceil(carryPx / lineH);
     if (lines !== 0) {
+      cancelResizeFollowBottom();
       state.term.scrollLines(lines);
       carryPx -= lines * lineH;
     }
@@ -2024,6 +2045,7 @@ function initTerminalScrollButtons() {
   };
   terminalTopBtn.addEventListener("click", (ev) => {
     stop(ev);
+    cancelResizeFollowBottom();
     if (state.term) state.term.scrollToTop();
     state.term && state.term.focus();
   });
@@ -2086,15 +2108,30 @@ function initTerminal() {
 function refitTerminal() {
   if (!state.term || !state.fitAddon) return;
   if (state.mode !== "terminal") return;
-  if (!fitTerminalPreservingScroll()) return;
+  const wasAtBottom = terminalIsAtBottom();
+  if (!fitTerminalPreservingScroll(wasAtBottom)) return;
   const cols = state.term.cols;
   const rows = state.term.rows;
   if (!cols || !rows) return;
-  if (cols === state.lastReportedSize.cols && rows === state.lastReportedSize.rows) {
+  if (!wasAtBottom) state.resizeFollowBottomUntil = 0;
+  const colsChanged = cols !== state.lastReportedSize.cols;
+  const rowsChanged = rows !== state.lastReportedSize.rows;
+  if (!colsChanged && !rowsChanged) {
+    return;
+  }
+  if (!colsChanged) {
+    // Height-only changes are common when the phone's native keyboard or
+    // the web virtual keyboard appears. Resizing local xterm rows is enough
+    // for the browser viewport; sending SIGWINCH to codex/claude/zarvis here
+    // makes those full-screen PTY apps repaint their transcript, which looks
+    // like history replaying from the beginning and can leave scrollback at
+    // the top after repeated keyboard toggles.
+    state.resizeFollowBottomUntil = 0;
     return;
   }
   state.lastReportedSize = { cols, rows };
   if (state.currentId) {
+    if (wasAtBottom) state.resizeFollowBottomUntil = performance.now() + 1500;
     rpc("session.pty_resize", { session_id: state.currentId, cols, rows })
       .catch((e) => console.warn("pty_resize failed:", e));
   }
@@ -2107,7 +2144,11 @@ function terminalIsAtBottom() {
 
 function restoreTerminalBottom(wasAtBottom) {
   if (!wasAtBottom || !state.term) return;
-  const term = state.term;
+  restoreTerminalBottomFor(state.term);
+}
+
+function restoreTerminalBottomFor(term) {
+  if (!term) return;
   term.scrollToBottom();
   // xterm/addon-fit can finish DOM measurements after the current
   // call stack; repeat once on the next frame so sheet/menu reflows
@@ -2117,8 +2158,7 @@ function restoreTerminalBottom(wasAtBottom) {
   });
 }
 
-function fitTerminalPreservingScroll() {
-  const wasAtBottom = terminalIsAtBottom();
+function fitTerminalPreservingScroll(wasAtBottom = terminalIsAtBottom()) {
   try {
     state.fitAddon.fit();
   } catch (_) {
@@ -2126,6 +2166,28 @@ function fitTerminalPreservingScroll() {
   }
   restoreTerminalBottom(wasAtBottom);
   return true;
+}
+
+function shouldFollowResizeBottom() {
+  return performance.now() <= state.resizeFollowBottomUntil;
+}
+
+function cancelResizeFollowBottom() {
+  state.resizeFollowBottomUntil = 0;
+}
+
+function writeLivePtyToTerm(bytes) {
+  if (!state.term) return;
+  const term = state.term;
+  const followBottom = shouldFollowResizeBottom();
+  if (!followBottom) {
+    term.write(bytes);
+    return;
+  }
+  term.write(bytes, () => {
+    if (state.term === term) restoreTerminalBottomFor(term);
+  });
+  restoreTerminalBottomFor(term);
 }
 
 function encodeBase64Utf8(s) {
@@ -2537,7 +2599,7 @@ function renderEvent(event, at) {
       // Pty events, otherwise renders as "random chars".
       const bytes = decodeBase64ToBytes(event.data || "");
       if (state.ptyBuffering) state.ptyBuffer.push(bytes);
-      else state.term.write(bytes);
+      else writeLivePtyToTerm(bytes);
     } else {
       // Chat-mode fallback (non-PTY session that still emits Pty
       // events — uncommon but possible). One-shot decode with
@@ -2750,7 +2812,7 @@ function toolResultLines(ok, output) {
 // event that lands mid-replay stays ordered with the buffered PTY chunks.
 function writeToTerm(s) {
   if (state.ptyBuffering) state.ptyBuffer.push(s);
-  else if (state.term) state.term.write(s);
+  else writeLivePtyToTerm(s);
 }
 
 // Hydrate the terminal from a session's transcript (used for zarvis,
