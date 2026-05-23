@@ -74,6 +74,19 @@ fn load_restore_snapshot(path: &std::path::Path) -> Option<RemoteSnapshot> {
     Some(snap)
 }
 
+/// Boot-time helper for the `/agentd restart` resume path: is the
+/// persisted remote snapshot at `path` still adoptable (fresh, and its
+/// cloudflared PID — if any — still alive)? A negative verdict removes
+/// the snapshot file as a side effect.
+///
+/// Used by `main.rs` to decide whether to *resume* the remote transport
+/// across a restart or *switch it off*. A tunnel that can no longer be
+/// adopted must NOT be silently replaced by a brand-new one — a restart
+/// should never rotate the public URL/credentials behind the user's back.
+pub fn snapshot_restorable(path: &std::path::Path) -> bool {
+    load_restore_snapshot(path).is_some()
+}
+
 /// Supervisor command set. `Start` is the `/remote-control` /
 /// `/remote-control-debug` path; `Stop` is the `/remote-stop`
 /// path. Stop is dispatched serially with the other commands so
@@ -359,4 +372,95 @@ async fn bind_and_install(
     *ws_task = Some(handle);
 
     Ok((state, port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::remote::RemoteSnapshot;
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    fn snapshot(tunnel_pid: u32, generated_at: u64) -> RemoteSnapshot {
+        RemoteSnapshot {
+            version: RemoteSnapshot::CURRENT_VERSION,
+            token: "tok".into(),
+            password: "pw".into(),
+            port: 12345,
+            tunnel_url: Some("https://example.trycloudflare.com".into()),
+            tunnel_pid,
+            generated_at,
+        }
+    }
+
+    /// A PID that is guaranteed dead: spawn a trivial process, reap it,
+    /// then reuse its (now-freed) PID.
+    fn dead_pid() -> u32 {
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn throwaway process");
+        let pid = child.id();
+        child.wait().expect("reap throwaway process");
+        pid
+    }
+
+    #[test]
+    fn missing_snapshot_is_not_restorable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.json");
+        assert!(!snapshot_restorable(&path));
+    }
+
+    #[test]
+    fn fresh_local_only_snapshot_is_restorable_and_kept() {
+        // tunnel_pid == 0 → local-only (no tunnel to verify). Fresh → adoptable.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.json");
+        snapshot(0, now_secs()).write(&path).unwrap();
+        assert!(snapshot_restorable(&path));
+        assert!(path.exists(), "a restorable snapshot must be left in place");
+    }
+
+    #[test]
+    fn fresh_snapshot_with_live_tunnel_is_restorable() {
+        // The test process itself is a guaranteed-alive PID.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.json");
+        snapshot(std::process::id(), now_secs())
+            .write(&path)
+            .unwrap();
+        assert!(snapshot_restorable(&path));
+    }
+
+    #[test]
+    fn stale_snapshot_is_not_restorable_and_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.json");
+        let stale = now_secs().saturating_sub(SNAPSHOT_MAX_AGE_SECS + 60);
+        snapshot(0, stale).write(&path).unwrap();
+        assert!(!snapshot_restorable(&path));
+        assert!(!path.exists(), "a stale snapshot must be cleaned up");
+    }
+
+    #[test]
+    fn fresh_snapshot_with_dead_tunnel_is_not_restorable_and_removed() {
+        // This is the issue's case: the tunnel can no longer be adopted,
+        // so the daemon must stay off (and clean up) rather than create a
+        // new tunnel.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.json");
+        snapshot(dead_pid(), now_secs()).write(&path).unwrap();
+        assert!(!snapshot_restorable(&path));
+        assert!(
+            !path.exists(),
+            "a snapshot with a dead tunnel PID must be cleaned up"
+        );
+    }
 }

@@ -167,25 +167,37 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
         }
     } else if paths.runtime_dir.join("remote.json").exists() {
         // `/agentd restart` path: the prior daemon had the remote
-        // listener up and persisted a snapshot. Auto-start so the
-        // new daemon picks the port + token + password back up
-        // without waiting for the user to retype `/remote-control`.
-        // Supervisor's `bind_and_install` checks freshness + PID
-        // liveness before adopting; if anything's off it falls
-        // through to mint-fresh + the snapshot file is cleaned up.
-        let mgr = manager.clone();
-        tokio::spawn(async move {
-            let params = agentd_protocol::RemoteStartParams {
-                local_only: false,
-                password: None,
-                wait_for_tunnel: true,
-            };
-            // port_hint=None — the supervisor reads the snapshot
-            // and uses snapshot.port instead.
-            if let Err(e) = mgr.start_remote(None, params).await {
-                tracing::warn!(error = %e, "remote snapshot resume failed");
-            }
-        });
+        // listener up and persisted a snapshot. Resume ONLY if that
+        // snapshot is still adoptable (fresh, and its cloudflared
+        // tunnel PID — if any — still alive), picking the port +
+        // token + password back up without the user retyping
+        // `/remote-control`.
+        //
+        // If the tunnel can no longer be restored, switch
+        // remote-control OFF rather than spinning up a brand-new
+        // tunnel: a restart must never silently rotate the public
+        // URL/credentials. `snapshot_restorable` removes the dead
+        // snapshot as a side effect, so the next boot stays off too.
+        let snapshot_path = paths.runtime_dir.join("remote.json");
+        if crate::remote_supervisor::snapshot_restorable(&snapshot_path) {
+            let mgr = manager.clone();
+            tokio::spawn(async move {
+                let params = agentd_protocol::RemoteStartParams {
+                    local_only: false,
+                    password: None,
+                    wait_for_tunnel: true,
+                };
+                // port_hint=None — the supervisor reads the snapshot
+                // and uses snapshot.port instead.
+                if let Err(e) = mgr.start_remote(None, params).await {
+                    tracing::warn!(error = %e, "remote snapshot resume failed");
+                }
+            });
+        } else {
+            tracing::info!(
+                "remote: prior tunnel no longer restorable across restart; staying off"
+            );
+        }
     }
 
     // Race the IPC accept loop against shutdown signals + the
