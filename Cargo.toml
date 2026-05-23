@@ -19,7 +19,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["agentd contributors"]
-repository = "https://github.com/Leemoonsoo/agentd"
+repository = "https://github.com/zarvis-ai/agentd"
 description = "Cross-harness agent fleet TUI and daemon"
 rust-version = "1.75"
 

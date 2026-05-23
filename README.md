@@ -45,7 +45,21 @@ dense, high-signal engineering work:
 
 ## Getting started
 
-### 1. Build
+### 1. Install or build
+
+**Prebuilt binaries** (macOS, Linux) — the installer downloads the right build
+for your platform, verifies its SHA-256 checksum, and drops every binary into
+one directory on your PATH:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | sh
+```
+
+The binaries land on your PATH, so the `./target/debug/` commands below become
+just `agentd` / `agent`. Pin a version or change the directory with
+`AGENTD_VERSION=v0.2.0` / `AGENTD_BIN_DIR=/usr/local/bin`.
+
+**From source:**
 
 ```sh
 git clone https://github.com/zarvis-ai/agentd.git
@@ -97,6 +111,18 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ./target/debug/agent new zarvis "list the Rust crates and explain what each one does"
 ```
 
+### Upgrading
+
+Re-run the installer to move to the latest release — it atomically replaces the
+binaries in place:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | sh
+```
+
+A running daemon keeps the old code until it restarts; run `/agentd restart` in
+the TUI to pick up the upgrade without losing sessions.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md) — daemon/client split, crates, and the
@@ -109,6 +135,8 @@ export ANTHROPIC_API_KEY=sk-ant-...
   fleet control, browser automation, and agent coordination.
 - [Configuration](docs/configuration.md) — XDG paths, `AGENTD_*` overrides,
   remote-control setup, and TUI theme customization.
+- [Releasing](docs/RELEASING.md) — how the prebuilt binaries are built and
+  published, and how to cut a versioned release.
 - [Contributor workflow](AGENTS.md) — PR workflow, build expectations, and TUI
   recording guidance.
 

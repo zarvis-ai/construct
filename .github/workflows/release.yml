@@ -1,0 +1,145 @@
+name: Release
+
+# Cut a release by pushing a semver tag that matches the workspace version:
+#
+#   # bump [workspace.package].version in Cargo.toml to X.Y.Z first, commit, then:
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+#
+# The `verify` job refuses to build if the tag and Cargo.toml disagree, so a
+# mistyped tag can never publish a mislabelled binary. `workflow_dispatch`
+# runs the build matrix without publishing — handy for testing the matrix.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  # The binaries that make up a release. The daemon resolves adapters as
+  # siblings of its own path (see `locate_binary`), so all of these must
+  # ship together and land in the same directory.
+  BINS: "agent agentd agentd-mcp agentd-adapter-shell agentd-adapter-claude agentd-adapter-codex agentd-adapter-antigravity agentd-adapter-zarvis"
+
+jobs:
+  verify:
+    name: Verify tag matches version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag == Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cargo_ver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          tag_ver="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml: $cargo_ver   tag: $tag_ver"
+          if [ "$cargo_ver" != "$tag_ver" ]; then
+            echo "::error::tag '$GITHUB_REF_NAME' does not match [workspace.package].version '$cargo_ver' — bump Cargo.toml or retag."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            apt: musl-tools
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            apt: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+            cc: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross toolchain
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Build release binaries
+        env:
+          # Set the cross linker / C compiler for targets that need them
+          # (e.g. aarch64-linux from an x86_64 runner; ring compiles asm via CC).
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
+        run: |
+          cargo build --release --locked --target "${{ matrix.target }}" \
+            -p agentd -p agentd-cli -p agentd-mcp \
+            -p agentd-adapter-shell -p agentd-adapter-claude \
+            -p agentd-adapter-codex -p agentd-adapter-antigravity \
+            -p agentd-adapter-zarvis
+
+      - name: Package tarball + checksum
+        run: |
+          set -eu
+          stage="agentd-${{ matrix.target }}"
+          mkdir -p "$stage"
+          for b in $BINS; do
+            cp "target/${{ matrix.target }}/release/$b" "$stage/"
+          done
+          cp LICENSE README.md "$stage/" 2>/dev/null || true
+          tar -czf "$stage.tar.gz" "$stage"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          else
+            shasum -a 256 "$stage.tar.gz" > "$stage.tar.gz.sha256"
+          fi
+          cat "$stage.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentd-${{ matrix.target }}
+          path: |
+            agentd-${{ matrix.target }}.tar.gz
+            agentd-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          set -eu
+          cd dist
+          cat *.tar.gz.sha256 > SHA256SUMS
+          rm -f *.tar.gz.sha256
+          echo "=== SHA256SUMS ===" && cat SHA256SUMS
+          ls -la
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
