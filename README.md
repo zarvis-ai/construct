@@ -28,7 +28,22 @@ you. Remote control from your phone when you're in motion.
 
 ## Getting started
 
-### 1. Install
+### 1. Requirements
+
+Bring the agents you want to run. `agentd` wraps the CLIs already on your
+machine, so install whichever harnesses you use, keep them on `PATH`, and log in
+first:
+
+- **Codex** — install the `codex` CLI and complete its OAuth login.
+- **Claude Code** — install the `claude` CLI and complete its OAuth login.
+- **Antigravity** — install the `agy` CLI and complete its OAuth login.
+- **Zarvis** — built in to agentd. Today it uses Codex CLI OAuth for OpenAI GPT
+  models, or a local Ollama install for local models.
+
+Once those CLIs are available and authenticated, `agentd` can create and resume
+their sessions from the fleet TUI.
+
+### 2. Install
 
 The installer downloads the right prebuilt binary for your platform, verifies its
 SHA-256 checksum, and drops every binary into one directory on your PATH:
@@ -40,7 +55,7 @@ curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | 
 Pin a version or change the directory with `AGENTD_VERSION=v0.2.0` /
 `AGENTD_BIN_DIR=/usr/local/bin`.
 
-### 2. Start the daemon
+### 3. Start the daemon
 
 ```sh
 agentd
@@ -49,7 +64,7 @@ agentd
 Leave this running. It owns sessions, persists state, and exposes the local IPC
 socket used by clients.
 
-### 3. Open the fleet TUI
+### 4. Open the fleet TUI
 
 In a second shell:
 
@@ -61,7 +76,7 @@ Use `?` for help and `M-x` for the command palette. From the TUI you can create
 sessions, switch between agents, send input, inspect diffs, and interrupt or stop
 work without leaving the flow.
 
-### 4. Start crack the matrix
+### 5. Start crack the matrix
 
 Happy hacking. Chase the dream idea from your terminal: ask Codex, Claude Code,
 Antigravity, and [Zarvis](docs/zarvis.md) to dive into the hard parts, then keep
