@@ -4396,7 +4396,10 @@ impl App {
             "agentd" => {
                 // Subcommand dispatch:
                 //
-                //   /agentd restart   → daemon.restart (exec self)
+                //   /agentd restart [binary path]
+                //       → daemon.restart; exec the daemon's own binary,
+                //         or the given one (e.g. a freshly-built worktree
+                //         binary). The path is validated daemon-side.
                 //
                 // Other subcommands are reserved for future use
                 // (e.g. `/agentd info` to print build version). The
@@ -4405,10 +4408,13 @@ impl App {
                 // observes that as a "daemon disconnected" status
                 // and the user must re-run `agent` to reconnect
                 // (auto-reconnect is follow-up work, see issue #90).
-                let sub = arg.trim();
+                let mut parts = arg.trim().splitn(2, char::is_whitespace);
+                let sub = parts.next().unwrap_or("");
+                let rest = parts.next().unwrap_or("").trim();
                 match sub {
                     "restart" => {
-                        match self.client.daemon_restart().await {
+                        let exe = (!rest.is_empty()).then(|| rest.to_string());
+                        match self.client.daemon_restart(exe).await {
                             Ok(r) => self.set_status(format!(
                                 "agentd: restart requested (exe={}, pid={}) — reconnect when ready",
                                 r.exe, r.pid
