@@ -2179,6 +2179,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(block, area);
     clear_pane_side_borders(f, area, app);
 
+    if summary.is_none() && group.is_none() {
+        render_empty_session_state(f, inner, app);
+        return;
+    }
     if let Some(g) = app.selected_group() {
         render_group_overview(f, inner, app, g);
         render_main_transition(f, inner, app);
@@ -2189,6 +2193,61 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         ViewMode::Transcript => render_transcript(f, inner, app),
     }
     render_main_transition(f, inner, app);
+}
+
+fn render_empty_session_state(f: &mut Frame, area: Rect, app: &App) {
+    let lines = vec![
+        Line::from(Span::styled(
+            "Welcome to agentd",
+            Style::default()
+                .fg(app.theme.text)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "Start with a session. Sessions are the live terminals agentd tracks.",
+            Style::default().fg(app.theme.dim),
+        )),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  C-x C-f", Style::default().fg(app.theme.accent)),
+            Span::raw("  create a session"),
+        ]),
+        Line::from(vec![
+            Span::styled("  C-x x", Style::default().fg(app.theme.accent)),
+            Span::raw("    open the command palette"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ?", Style::default().fg(app.theme.accent)),
+            Span::raw("        show shortcuts and concepts"),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            "CLI examples:",
+            Style::default().fg(app.theme.text),
+        )),
+        Line::from(Span::styled(
+            "  agent new zarvis \"inspect this repo\"",
+            Style::default().fg(app.theme.dim),
+        )),
+        Line::from(Span::styled(
+            "  agent new shell",
+            Style::default().fg(app.theme.dim),
+        )),
+    ];
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(para, centered_rect(area, 72, 12));
+}
+
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 fn render_group_overview(
@@ -3025,8 +3084,14 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
+    let status = app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+    let empty_hint = if s.is_none() && app.list_items().is_empty() && status.is_empty() {
+        "new: C-x C-f  help: ?  palette: C-x x"
+    } else {
+        ""
+    };
     let modeline = format!(
-        " agentd  focus:{focus}  {sel}  {model}  {remote}{automode}{scrollback}{chord}{status}{conn} ",
+        " agentd  focus:{focus}  {sel}  {model}  {remote}{automode}{scrollback}{chord}{empty_hint}{status}{conn} ",
         focus = focus_label,
         scrollback = scrollback_label,
         automode = automode_badge,
@@ -3044,7 +3109,8 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
         } else {
             format!("({})  ", app.chord_label)
         },
-        status = app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or(""),
+        empty_hint = empty_hint,
+        status = status,
     );
     let para = Paragraph::new(modeline).style(
         Style::default()
@@ -3248,6 +3314,13 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
 
 const HELP_TEXT: &str = "
 emacs keymap (default; AGENTD_KEYMAP=vim for vim profile)
+
+  getting started
+    A session is one live task or terminal that agentd keeps in the list.
+    A harness is the runtime for a session: zarvis, codex, claude, or shell.
+    The left pane selects sessions; the right pane shows the selected session.
+    Use C-x C-f to create a session, then choose a harness.
+    Use C-x x for the command palette when you forget a shortcut.
 
   focus + view
     C-x o           switch focus (list ↔ view)

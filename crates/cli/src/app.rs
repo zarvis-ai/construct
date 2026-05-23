@@ -5337,6 +5337,87 @@ mod tests {
         (app, dir, server)
     }
 
+    async fn empty_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let app = test_app(client, Vec::new());
+        (app, dir, server)
+    }
+
+    fn rendered_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let mut text = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                text.push_str(buffer.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "));
+            }
+            text.push('\n');
+        }
+        text
+    }
+
+    #[tokio::test]
+    async fn empty_tui_renders_welcome_and_modeline_hint() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("Welcome to agentd"),
+            "missing welcome:\n{screen}"
+        );
+        assert!(
+            screen.contains("C-x C-f"),
+            "missing create shortcut:\n{screen}"
+        );
+        assert!(
+            screen.contains("new: C-x C-f  help: ?  palette: C-x x"),
+            "missing modeline hint:\n{screen}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn help_modal_includes_getting_started_concepts() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.help_visible = true;
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("getting started"),
+            "missing section:\n{screen}"
+        );
+        assert!(
+            screen.contains("A session is one live task"),
+            "missing session concept:\n{screen}"
+        );
+        assert!(
+            screen.contains("A harness is the runtime"),
+            "missing harness concept:\n{screen}"
+        );
+        server.abort();
+    }
+
     /// A plain keystroke forwarded to the PTY must set
     /// `skip_redraw_after_event` — its visible effect arrives later
     /// as PTY output, so the immediate top-of-loop draw would be a
