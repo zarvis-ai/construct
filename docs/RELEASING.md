@@ -3,7 +3,7 @@
 Releases are produced by [`.github/workflows/release.yml`](../.github/workflows/release.yml),
 triggered when a `v*` tag is pushed. The workflow builds every binary for all
 supported targets, bundles them into per-platform tarballs with SHA-256
-checksums, and publishes a GitHub Release.
+checksums, and publishes a GitHub Release with auto-generated release notes.
 
 ## Versioning
 
@@ -47,6 +47,25 @@ never publish a mislabelled binary.
 
    Each tarball contains all release binaries (`agent`, `agentd`,
    `agentd-mcp`, `agentd-adapter-*`) plus `README.md` and `LICENSE`.
+
+4. Review the release notes. The workflow passes `generate_release_notes: true`
+   to the release step, so GitHub fills the release body automatically from the
+   pull requests merged since the previous `v*` tag — a categorized changelog
+   with contributor credits and a "Full Changelog" compare link. Two
+   consequences worth knowing:
+
+   - **PR titles _are_ the changelog.** Each line comes from a merged PR's
+     title, so clear, conventional titles (`feat(cli): …`, `fix(daemon): …`)
+     produce clean notes. This is also why we squash-merge — one tidy line per
+     change.
+   - **You can edit after publishing.** Open the release on the
+     [releases page](https://github.com/zarvis-ai/agentd/releases), click
+     _Edit_, and add a summary, highlights, breaking-change callouts, or upgrade
+     notes on top of the generated list.
+
+   To group the auto-generated notes into sections (Features / Fixes / …) or
+   exclude certain labels, add a [`.github/release.yml`](https://docs.github.com/en/repositories/releasing-projects-on-github/automatically-generated-release-notes#configuring-automatically-generated-release-notes)
+   with category rules; the release step picks it up with no workflow change.
 
 ## What ships, and why together
 
