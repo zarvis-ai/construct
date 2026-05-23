@@ -2297,6 +2297,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.browser_preview_close = None;
     let row_offset = area.height.saturating_sub(chat_area.height);
     let out = history.replay(area.width, area.height, scroll);
+    app.view_scrollback = out.screen.scrollback();
     // Hide the chat pane's cursor block if we have our own editor pane
     // — otherwise the chat's vt100 cursor would render as a stray
     // block. For non-editor-pane sessions (claude / codex / shell)

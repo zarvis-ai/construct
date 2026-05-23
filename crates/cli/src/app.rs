@@ -1327,8 +1327,9 @@ async fn run_loop(
             ev = input_stream.next() => {
                 match ev {
                     Some(Ok(ev)) => {
-                        // Only enter the drag-coalesce drain when the
-                        // event we just handled was itself a left-drag.
+                        // Only enter the mouse-burst drain when the
+                        // event we just handled was itself a left-drag
+                        // or wheel event.
                         // Polling `input_stream.next().now_or_never()`
                         // poisons crossterm's `EventStream` wake task
                         // with a noop waker — subsequent real events
@@ -1340,20 +1341,15 @@ async fn run_loop(
                         // off that code path entirely; a sustained
                         // drag still coalesces because every drag
                         // event re-enters the drain.
-                        let was_drag = should_drain_after(&ev);
+                        let drain_mouse_burst = should_drain_after(&ev);
                         app.on_term_event(ev).await;
-                        if was_drag {
-                            const MAX_DRAG_DRAIN: usize = 64;
+                        if drain_mouse_burst {
+                            const MAX_MOUSE_DRAIN: usize = 64;
                             let mut drained = 0;
-                            while drained < MAX_DRAG_DRAIN {
+                            while drained < MAX_MOUSE_DRAIN {
                                 match input_stream.next().now_or_never() {
                                     Some(Some(Ok(CtEvent::Mouse(m))))
-                                        if matches!(
-                                            m.kind,
-                                            MouseEventKind::Drag(
-                                                crossterm::event::MouseButton::Left
-                                            )
-                                        ) =>
+                                        if drainable_mouse_burst_kind(&m.kind) =>
                                     {
                                         app.on_term_event(CtEvent::Mouse(m)).await;
                                         drained += 1;
@@ -2522,19 +2518,20 @@ impl App {
             return;
         }
         use crossterm::event::MouseButton;
-        const STEP: i32 = 3;
+        const LIST_STEP: i32 = 3;
+        let scrollback_step = self.mouse_scrollback_step();
         // Track every event's cell so hover-aware rendering (diamond
         // tooltip, etc.) has a current position to render against.
         self.mouse_pos = Some((ev.column, ev.row));
         match ev.kind {
             MouseEventKind::ScrollUp => {
-                if !self.adjust_mouse_list_scroll(ev.column, ev.row, -STEP) {
-                    self.adjust_mouse_scrollback(ev.column, ev.row, STEP);
+                if !self.adjust_mouse_list_scroll(ev.column, ev.row, -LIST_STEP) {
+                    self.adjust_mouse_scrollback(ev.column, ev.row, scrollback_step);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if !self.adjust_mouse_list_scroll(ev.column, ev.row, STEP) {
-                    self.adjust_mouse_scrollback(ev.column, ev.row, -STEP);
+                if !self.adjust_mouse_list_scroll(ev.column, ev.row, LIST_STEP) {
+                    self.adjust_mouse_scrollback(ev.column, ev.row, -scrollback_step);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
@@ -3389,6 +3386,11 @@ impl App {
             return;
         }
         self.view_scrollback = adjusted_scrollback(self.view_scrollback, delta);
+    }
+
+    fn mouse_scrollback_step(&self) -> i32 {
+        let rows = self.terminal_pane_size.1.max(1) as i32;
+        (rows / 4).clamp(6, 24)
     }
 
     fn adjust_mouse_list_scroll(&mut self, col: u16, row: u16, delta: i32) -> bool {
@@ -5383,6 +5385,7 @@ mod tests {
         let (mut app, _dir, _srv) = captured_app().await;
         app.sessions[0].harness = "codex".into();
         app.layout.list_items_area = Some(Rect::new(0, 0, 20, 20));
+        app.terminal_pane_size = (80, 40);
         app.view_scrollback = 0;
 
         app.on_mouse(MouseEvent {
@@ -5394,8 +5397,32 @@ mod tests {
         .await;
 
         assert_eq!(
-            app.view_scrollback, 3,
-            "mouse wheel outside the list should scroll codex PTY history"
+            app.view_scrollback, 10,
+            "mouse wheel outside the list should scroll codex PTY history by a partial page"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_render_clamps_scrollback_label_to_available_history() {
+        let (mut app, _dir, _srv) = captured_app().await;
+        app.sessions[0].harness = "codex".into();
+        app.view = ViewMode::Terminal;
+        app.focus = PaneFocus::View;
+        let id = app.sessions[0].id.clone();
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"only one visible line\r\n");
+        app.histories.insert(id, history);
+        app.view_scrollback = SCROLLBACK_MAX;
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        assert_eq!(
+            app.view_scrollback, 0,
+            "modeline scrollback value should be the effective rendered scrollback"
         );
     }
 
@@ -6632,20 +6659,22 @@ fn should_autofocus_view_from_list(
     matches!(key.code, KeyCode::Char(c) if c.is_ascii_alphabetic())
 }
 
-/// True when the just-handled input event should trigger the
-/// drag-coalesce drain (which calls `now_or_never` on the input
-/// stream, briefly poisoning crossterm's wake task). Only left-button
-/// drags qualify; gating like this keeps typing — and every other
-/// event — off the noop-waker path. See the comment at the drain
-/// call-site in `run_loop` for the full failure mode.
+/// True when the just-handled input event should trigger the mouse
+/// burst drain (which calls `now_or_never` on the input stream,
+/// briefly poisoning crossterm's wake task). Only high-volume mouse
+/// gestures qualify; gating like this keeps typing off the noop-waker
+/// path. See the comment at the drain call-site in `run_loop` for the
+/// full failure mode.
 fn should_drain_after(ev: &CtEvent) -> bool {
+    matches!(ev, CtEvent::Mouse(m) if drainable_mouse_burst_kind(&m.kind))
+}
+
+fn drainable_mouse_burst_kind(kind: &MouseEventKind) -> bool {
     matches!(
-        ev,
-        CtEvent::Mouse(m)
-            if matches!(
-                m.kind,
-                MouseEventKind::Drag(crossterm::event::MouseButton::Left)
-            )
+        kind,
+        MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
     )
 }
 
@@ -6788,14 +6817,18 @@ mod drain_gate_tests {
         ))));
     }
 
-    /// Other mouse events — including motion, scroll, clicks, and
-    /// non-left drags — should not trigger the drain. They go through
-    /// the normal one-event-per-render path.
+    /// Wheel events join left drags in the burst drain so a fast
+    /// wheel gesture coalesces before the next render instead of
+    /// replaying one queued row at a time after the user stops.
     #[test]
-    fn other_mouse_events_do_not_trigger_drain() {
+    fn wheel_events_trigger_drain() {
+        assert!(should_drain_after(&mouse(MouseEventKind::ScrollUp)));
+        assert!(should_drain_after(&mouse(MouseEventKind::ScrollDown)));
+    }
+
+    #[test]
+    fn low_volume_mouse_events_do_not_trigger_drain() {
         assert!(!should_drain_after(&mouse(MouseEventKind::Moved)));
-        assert!(!should_drain_after(&mouse(MouseEventKind::ScrollUp)));
-        assert!(!should_drain_after(&mouse(MouseEventKind::ScrollDown)));
         assert!(!should_drain_after(&mouse(MouseEventKind::Down(
             MouseButton::Left
         ))));
