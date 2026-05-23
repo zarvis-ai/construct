@@ -248,9 +248,17 @@ impl Client {
     /// the recv side with "broken pipe". Callers should treat any
     /// reply (Ok or `BrokenPipe`-style error) as "restart in flight"
     /// and re-attempt connect with backoff.
-    pub async fn daemon_restart(&self) -> Result<agentd_protocol::DaemonRestartResult> {
-        self.request(ipc_method::DAEMON_RESTART, &serde_json::Value::Null)
-            .await
+    /// `exe: Some(path)` execs that binary instead of the daemon's own
+    /// (e.g. a freshly-built one); `None` re-execs in place.
+    pub async fn daemon_restart(
+        &self,
+        exe: Option<String>,
+    ) -> Result<agentd_protocol::DaemonRestartResult> {
+        self.request(
+            ipc_method::DAEMON_RESTART,
+            &agentd_protocol::DaemonRestartParams { exe },
+        )
+        .await
     }
     /// Dev-only: point the daemon's web server at a directory of assets
     /// (or `None` to revert to embedded). No-op on release daemons.
