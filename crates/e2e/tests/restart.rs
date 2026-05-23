@@ -47,7 +47,7 @@ async fn restart_reloads_updated_binary() {
     // Trigger the restart. The reply races the exec() — either we
     // get it or the socket closes mid-flight; both mean "restart
     // in progress".
-    let _ = d.client.daemon_restart().await;
+    let _ = d.client.daemon_restart(None).await;
 
     // New daemon must come back up on the same socket.
     let client = d
@@ -109,7 +109,7 @@ async fn tui_auto_reconnects_after_restart() {
         .expect("modeline never rendered");
 
     // Restart the daemon out from under the TUI.
-    let _ = d.client.daemon_restart().await;
+    let _ = d.client.daemon_restart(None).await;
 
     // The TUI sets "reconnected to daemon" only from its
     // successful-reconnect path (crates/cli/src/app.rs). Seeing
@@ -179,7 +179,7 @@ async fn web_client_reconnects_to_same_url_after_restart() {
     // Restart the daemon. Token + port + password are persisted in
     // runtime/remote.json and adopted by the new daemon, so the
     // URL stays valid.
-    let _ = d.client.daemon_restart().await;
+    let _ = d.client.daemon_restart(None).await;
 
     // The WS drops on the daemon exec(). Best-effort confirm we
     // observed it leave "open" (it can recover fast, so don't fail

@@ -1085,6 +1085,17 @@ pub struct RemoteStopResult {
     pub was_running: bool,
 }
 
+/// Params for `daemon.restart`. `exe: None` re-execs the daemon's own
+/// binary (the upgrade-in-place case); `Some(path)` execs a different
+/// binary instead — e.g. a freshly-built one from a worktree. The path
+/// is validated (must exist + be executable) before the restart fires,
+/// so a typo returns an error rather than bricking the daemon.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonRestartParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+}
+
 /// Result of `daemon.restart`. Echoed back to the caller right
 /// before the daemon exec()s itself — clients see this reply, then
 /// observe the IPC socket close as the new process replaces the

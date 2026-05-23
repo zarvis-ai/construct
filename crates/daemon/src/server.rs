@@ -1219,12 +1219,17 @@ async fn dispatch(
         }
         m if m == ipc_method::DAEMON_RESTART => {
             // Hand off to main's `tokio::select!` arm which calls
-            // `exec()` on the resolved current_exe. The reply
-            // races the kernel: we send it back here, then the
-            // IPC socket closes when exec() replaces the process
-            // image. Clients detect that as a disconnect and
-            // reconnect.
-            match manager.request_daemon_restart() {
+            // `exec()` on the resolved exe (the daemon's own binary, or
+            // the caller-supplied `exe` path). The reply races the
+            // kernel: we send it back here, then the IPC socket closes
+            // when exec() replaces the process image. Clients detect
+            // that as a disconnect and reconnect.
+            // Params are optional; older clients send `null` (no exe
+            // override), which fails to deserialize — treat that as None.
+            let exe = parse_params::<agentd_protocol::DaemonRestartParams>(req.params.clone())
+                .ok()
+                .and_then(|p| p.exe);
+            match manager.request_daemon_restart(exe.map(std::path::PathBuf::from)) {
                 Ok(cmd) => {
                     // Cloudflared survives the daemon's exec()
                     // because it's spawned in a separate process

@@ -405,6 +405,29 @@ pub fn capture_startup_exe() {
     }
 }
 
+/// Validate a caller-supplied restart binary: resolve it to an absolute
+/// path (relative paths resolve against the *daemon's* cwd), confirm it
+/// exists, is a regular file, and is executable. Returns the canonical
+/// path to exec, or an error that's surfaced to the caller so a typo
+/// never leaves the daemon trying to exec() a missing binary.
+fn validate_restart_exe(path: &std::path::Path) -> Result<PathBuf> {
+    let abs = std::fs::canonicalize(path)
+        .with_context(|| format!("restart binary not found: {}", path.display()))?;
+    let meta = std::fs::metadata(&abs)
+        .with_context(|| format!("cannot stat restart binary: {}", abs.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("restart binary is not a file: {}", abs.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            anyhow::bail!("restart binary is not executable: {}", abs.display());
+        }
+    }
+    Ok(abs)
+}
+
 /// Best exe path for re-`exec()` on restart: the startup-captured
 /// path if available, else `current_exe()` with any trailing
 /// `" (deleted)"` marker stripped (defensive — the startup capture
@@ -588,8 +611,13 @@ impl SessionManager {
     /// the exe path can't be resolved or the receiver was dropped
     /// (which shouldn't happen — main holds it for the daemon's
     /// lifetime).
-    pub fn request_daemon_restart(&self) -> Result<RestartCommand> {
-        let exe = restart_exe_path().context("resolve restart exe")?;
+    pub fn request_daemon_restart(&self, exe_override: Option<PathBuf>) -> Result<RestartCommand> {
+        let exe = match exe_override {
+            // Validate a caller-supplied binary BEFORE tearing the
+            // daemon down — exec()ing a bad path would never come back.
+            Some(p) => validate_restart_exe(&p)?,
+            None => restart_exe_path().context("resolve restart exe")?,
+        };
         let args: Vec<String> = std::env::args().skip(1).collect();
         let cmd = RestartCommand { exe, args };
         self.restart_tx
@@ -2870,6 +2898,32 @@ fn force_redraw_size_on_resume(
 mod tests {
     use super::*;
     use agentd_protocol::{Capabilities, PtySize};
+
+    #[test]
+    fn validate_restart_exe_accepts_executable_rejects_bad_paths() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+
+        // An executable file → returns the canonical (absolute) path.
+        let good = dir.path().join("agentd");
+        std::fs::write(&good, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let resolved = validate_restart_exe(&good).expect("executable accepted");
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, std::fs::canonicalize(&good).unwrap());
+
+        // Missing path → error.
+        assert!(validate_restart_exe(&dir.path().join("nope")).is_err());
+
+        // A directory → error (not a regular file).
+        assert!(validate_restart_exe(dir.path()).is_err());
+
+        // A non-executable file → error.
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, b"data").unwrap();
+        std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_restart_exe(&plain).is_err());
+    }
 
     #[test]
     fn startup_resume_retries_errored_sessions() {
