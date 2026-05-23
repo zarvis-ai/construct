@@ -29,12 +29,8 @@ dense, high-signal engineering work:
 
 - **One cockpit for every agent** — attach to Claude Code, Codex, Antigravity,
   Zarvis, or a shell process from one focused workspace that rewards attention.
-- **Persistent sessions** — transcripts, PTY scrollback, status, cwd, and resume
-  metadata live in the daemon instead of disappearing when a client exits.
 - **Parallel work without losing control** — spawn helper sessions, pin important
   work, interrupt stuck runs, inspect diffs, and send follow-up input mid-turn.
-- **Native PTY mode** — interactive CLIs keep their real shape inside the right
-  pane, including slash commands and upstream TUIs.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
   output, spawn helpers, send input, inspect diffs, and drive Chrome.
 - **Remote control when you step away** — `/remote-control` opens a
@@ -45,21 +41,61 @@ dense, high-signal engineering work:
 
 ## Getting started
 
-### 1. Install or build
+### 1. Install
 
-**Prebuilt binaries** (macOS, Linux) — the installer downloads the right build
-for your platform, verifies its SHA-256 checksum, and drops every binary into
-one directory on your PATH:
+The installer downloads the right prebuilt binary for your platform, verifies its
+SHA-256 checksum, and drops every binary into one directory on your PATH:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | sh
 ```
 
-The binaries land on your PATH, so the `./target/debug/` commands below become
-just `agentd` / `agent`. Pin a version or change the directory with
-`AGENTD_VERSION=v0.2.0` / `AGENTD_BIN_DIR=/usr/local/bin`.
+Pin a version or change the directory with `AGENTD_VERSION=v0.2.0` /
+`AGENTD_BIN_DIR=/usr/local/bin`.
 
-**From source:**
+### 2. Start the daemon
+
+```sh
+agentd
+```
+
+Leave this running. It owns sessions, persists state, and exposes the local IPC
+socket used by clients.
+
+### 3. Open the fleet TUI
+
+In a second shell:
+
+```sh
+agent
+```
+
+Use `?` for help and `M-x` for the command palette. From the TUI you can create
+sessions, switch between agents, send input, inspect diffs, and interrupt or stop
+work without leaving the flow.
+
+### 4. Start your agent
+
+Happy hacking. Chase the dream idea from your terminal: ask Codex, Claude Code,
+Antigravity, and [Zarvis](docs/zarvis.md) to dive into the hard parts, then keep
+steering from your phone when you're in motion.
+
+## Upgrading
+
+```sh
+agent upgrade            # install the latest release (atomic in-place replace)
+agent upgrade --check    # just compare your version against the latest
+agent upgrade --restart  # upgrade, then restart a running daemon to apply
+```
+
+`agent upgrade` re-runs the installer for you (pin a release with
+`--version vX.Y.Z`); re-running the install one-liner does the same thing. A
+running daemon keeps the old code until it restarts — pass `--restart`, or run
+`/agentd restart` in the TUI, to pick up the upgrade without losing sessions.
+The TUI also surfaces a one-line notice when a newer release is available
+(disable with `AGENTD_NO_UPDATE_CHECK=1`).
+
+## Building from source
 
 ```sh
 git clone https://github.com/zarvis-ai/agentd.git
@@ -75,56 +111,7 @@ Debug binaries land in `target/debug/`:
 - `target/debug/agentd-adapter-*` — harness adapters
 
 For an optimized build, use `cargo build --workspace --release` and replace
-`target/debug` with `target/release` below.
-
-### 2. Start the daemon
-
-```sh
-./target/debug/agentd run
-```
-
-Leave this running. It owns sessions, persists state, and exposes the local IPC
-socket used by clients.
-
-### 3. Open the fleet TUI
-
-In a second shell:
-
-```sh
-./target/debug/agent
-```
-
-Use `?` for help and `M-x` for the command palette. From the TUI you can create
-sessions, switch between agents, send input, inspect diffs, and interrupt or stop
-work without leaving the flow.
-
-### 4. Try the built-in Zarvis agent
-
-Zarvis ships with agentd and talks directly to OpenAI, Anthropic, or local
-Ollama — no vendor CLI required.
-
-```sh
-# Pick one provider, or run local Ollama at http://localhost:11434
-export ANTHROPIC_API_KEY=sk-ant-...
-# export OPENAI_API_KEY=sk-...
-
-./target/debug/agent new zarvis "list the Rust crates and explain what each one does"
-```
-
-### Upgrading
-
-```sh
-agent upgrade            # install the latest release (atomic in-place replace)
-agent upgrade --check    # just compare your version against the latest
-agent upgrade --restart  # upgrade, then restart a running daemon to apply
-```
-
-`agent upgrade` re-runs the installer for you (pin a release with
-`--version vX.Y.Z`); re-running the install one-liner does the same thing. A
-running daemon keeps the old code until it restarts — pass `--restart`, or run
-`/agentd restart` in the TUI, to pick up the upgrade without losing sessions.
-The TUI also surfaces a one-line notice when a newer release is available
-(disable with `AGENTD_NO_UPDATE_CHECK=1`).
+`target/debug` with `target/release`.
 
 ## Documentation
 
