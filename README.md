@@ -6,19 +6,7 @@ Create Codex, Claude Code, Antigravity, and Zarvis sessions all in one place. Or
 let your agent coordinate them in a terminal crafted for hardcore hackers like
 you. Remote control from your phone when you're in motion.
 
-```
-┌─ sessions ────────────────┬─ session: s4f3...  shell  running ─────┐
-│ ● s4f3a...  shell   echo… │  [12:04:11] status running              │
-│ ◐ sa3944... shell   while │  [12:04:11]  agent: hello-from-shell    │
-│ ✓ sc4d20... shell   echo… │  [12:04:11]  agent: and-another-line    │
-│ ✗ s78b1... claude   migr… │  [12:04:11] ▢ done (exit 0)             │
-│                           │                                          │
-├───────────────────────────┴──────────────────────────────────────────┤
-│ M-x send-input ▸ confirm yes_                                        │
-├──────────────────────────────────────────────────────────────────────┤
-│ agentd  [emacs]  sc4d20bd24  done  -    ? for help                   │
-└──────────────────────────────────────────────────────────────────────┘
-```
+![agentd TUI demo](https://raw.githubusercontent.com/zarvis-ai/agentd/readme-assets/demos/browser-thumbnail.gif)
 
 ## Why agentd?
 
