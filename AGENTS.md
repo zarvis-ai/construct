@@ -88,6 +88,16 @@ Use [vhs](https://github.com/charmbracelet/vhs) to capture deterministic mp4 / g
 - **Verify before posting.** Extract a midpoint frame from each video (`ffmpeg -ss 00:00:15 -i out.mp4 -vframes 1 mid.png`) and confirm the TUI rendered the change you're trying to show. If the first attempt missed the moment (the rain panel was idle, a popup was open, etc.) re-record — don't ship a video that doesn't actually demo the diff.
 - **Attach to the PR.** Drop the file(s) into the PR with `gh pr comment <n> --body "..."` (or upload via the web UI). For a pair, label them `before` and `after` and link the commit each was recorded from.
 
+## Hot-reloading the web UI (dev only)
+
+`crates/daemon/assets/index.html` + `static/*` are `include_str!`/`include_bytes!`'d into the daemon, so a naive edit needs a recompile + restart + browser reconnect. To skip all that, point a **running** debug daemon at a worktree's assets directory and it serves them from disk, with a live-reload poller injected (browser auto-refreshes on save):
+
+- **From a dev session (any worktree):** call the `webui_hot_reload` MCP tool with `dir: "<worktree>/crates/daemon/assets"` (debug builds only). `dir: null` reverts to the embedded assets.
+- **At boot:** `AGENTD_ASSETS_DIR=<dir>` (honored in debug builds only).
+- **Programmatically:** the `dev.set_assets` IPC method / `client.dev_set_assets()`.
+
+Edit `index.html` → save → the browser reloads itself (the injected poller watches `/dev/version`, a combined mtime of the served files). No rebuild, no daemon restart. Release builds ignore all of this and always serve the embedded, tamper-proof assets.
+
 ## The minibuffer is just another session
 
 Most TUIs make the bottom command bar a special UI primitive. We don't — it's a regular zarvis session, persisted on disk like any other. Differences:

@@ -252,6 +252,18 @@ impl Client {
         self.request(ipc_method::DAEMON_RESTART, &serde_json::Value::Null)
             .await
     }
+    /// Dev-only: point the daemon's web server at a directory of assets
+    /// (or `None` to revert to embedded). No-op on release daemons.
+    pub async fn dev_set_assets(
+        &self,
+        dir: Option<String>,
+    ) -> Result<agentd_protocol::DevAssetsResult> {
+        self.request(
+            ipc_method::DEV_SET_ASSETS,
+            &agentd_protocol::DevSetAssetsParams { dir },
+        )
+        .await
+    }
     pub async fn list(&self) -> Result<Vec<SessionSummary>> {
         self.request(ipc_method::SESSION_LIST, &serde_json::Value::Null)
             .await

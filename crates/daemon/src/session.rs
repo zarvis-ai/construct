@@ -362,6 +362,13 @@ pub struct SessionManager {
     /// binary. `RestartCommand` carries the resolved exe path so
     /// the reply to the RPC caller can echo what's about to load.
     restart_tx: tokio::sync::mpsc::UnboundedSender<RestartCommand>,
+    /// Dev-only: when `Some`, the remote web server serves
+    /// `index.html` + `static/*` from this directory (with a live-reload
+    /// poller injected) instead of the binary's embedded assets. Set via
+    /// the `dev.set_assets` IPC method (debug builds only) or the
+    /// `AGENTD_ASSETS_DIR` env var at boot. Lets you iterate on the web
+    /// UI in a worktree against a running daemon without rebuilding.
+    dev_assets: std::sync::Mutex<Option<PathBuf>>,
 }
 
 /// Payload of a `daemon.restart` request, sent from the IPC
@@ -525,6 +532,13 @@ impl SessionManager {
         let (remote_tx, remote_rx) = tokio::sync::mpsc::unbounded_channel();
         let (restart_tx, restart_rx) = tokio::sync::mpsc::unbounded_channel();
         let remote_snapshot_path = runtime_dir.join("remote.json");
+        // Honor AGENTD_ASSETS_DIR at boot in debug builds only — release
+        // always serves the embedded, tamper-proof assets.
+        let dev_assets = if cfg!(debug_assertions) {
+            std::env::var_os("AGENTD_ASSETS_DIR").map(PathBuf::from)
+        } else {
+            None
+        };
         Ok((
             Self {
                 storage,
@@ -539,10 +553,25 @@ impl SessionManager {
                 remote_starter: remote_tx,
                 remote_snapshot_path,
                 restart_tx,
+                dev_assets: std::sync::Mutex::new(dev_assets),
             },
             remote_rx,
             restart_rx,
         ))
+    }
+
+    /// The dev-mode web-UI asset directory, if one is active. `None`
+    /// means serve the embedded assets.
+    pub fn dev_assets(&self) -> Option<PathBuf> {
+        self.dev_assets.lock().unwrap().clone()
+    }
+
+    /// Point the remote web server at `dir` (or revert to embedded with
+    /// `None`). No-op in release builds — the override is dev-only.
+    pub fn set_dev_assets(&self, dir: Option<PathBuf>) {
+        if cfg!(debug_assertions) {
+            *self.dev_assets.lock().unwrap() = dir;
+        }
     }
 
     /// Path where the supervisor reads / writes the remote
