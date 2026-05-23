@@ -9,6 +9,7 @@ mod pty_render;
 mod theme;
 mod tui_state;
 mod ui;
+mod upgrade;
 
 use agentd_client::Client;
 use agentd_protocol::paths::Paths;
@@ -90,6 +91,23 @@ enum Command {
     Diff { session_id: String },
     /// Show session detail + transcript.
     Show { session_id: String },
+    /// Download and install the latest release (or `--version TAG`),
+    /// atomically replacing the installed binaries in place.
+    Upgrade {
+        /// Install a specific release tag (e.g. v0.2.0). Default: latest.
+        #[arg(long)]
+        version: Option<String>,
+        /// Install directory. Default: the directory of the running `agent`.
+        #[arg(long)]
+        bin_dir: Option<PathBuf>,
+        /// After upgrading, ask the running daemon to restart so the new
+        /// binary takes effect immediately.
+        #[arg(long)]
+        restart: bool,
+        /// Don't install — just report the current and latest versions.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn init_tracing() {
@@ -264,6 +282,12 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Upgrade {
+            version,
+            bin_dir,
+            restart,
+            check,
+        } => upgrade::run(version, bin_dir, restart, check, &socket).await,
     }
 }
 

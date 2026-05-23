@@ -113,15 +113,18 @@ export ANTHROPIC_API_KEY=sk-ant-...
 
 ### Upgrading
 
-Re-run the installer to move to the latest release — it atomically replaces the
-binaries in place:
-
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | sh
+agent upgrade            # install the latest release (atomic in-place replace)
+agent upgrade --check    # just compare your version against the latest
+agent upgrade --restart  # upgrade, then restart a running daemon to apply
 ```
 
-A running daemon keeps the old code until it restarts; run `/agentd restart` in
-the TUI to pick up the upgrade without losing sessions.
+`agent upgrade` re-runs the installer for you (pin a release with
+`--version vX.Y.Z`); re-running the install one-liner does the same thing. A
+running daemon keeps the old code until it restarts — pass `--restart`, or run
+`/agentd restart` in the TUI, to pick up the upgrade without losing sessions.
+The TUI also surfaces a one-line notice when a newer release is available
+(disable with `AGENTD_NO_UPDATE_CHECK=1`).
 
 ## Documentation
 

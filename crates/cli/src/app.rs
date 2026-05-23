@@ -1126,6 +1126,13 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     // pulled via pty_replay.
     app.ensure_pinned_parsers().await;
 
+    // One-line "update available" notice, sourced from an on-disk cache so it
+    // never blocks startup (a stale cache refreshes in the background for the
+    // next launch). Opt out with AGENTD_NO_UPDATE_CHECK=1.
+    if let Some(notice) = crate::upgrade::cached_update_notice() {
+        app.set_status(notice);
+    }
+
     // Terminal setup.
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
