@@ -372,6 +372,36 @@
     white-space: pre-wrap;
     overflow-x: auto;
   }
+  .browser-preview {
+    flex: 0 0 auto;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    padding: 6px;
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+  }
+  .browser-preview[hidden] { display: none !important; }
+  .browser-preview img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: min(360px, 60vw);
+    max-height: min(180px, 28vh);
+    object-fit: contain;
+    border-radius: 4px;
+    background: #000;
+  }
+  @media (max-width: 720px) {
+    .browser-preview {
+      justify-content: center;
+      padding: 4px 6px;
+    }
+    .browser-preview img {
+      max-width: min(100%, 360px);
+      max-height: min(160px, 24vh);
+    }
+  }
 
   .editor-state {
     flex: 0 0 auto;
@@ -939,6 +969,9 @@
         </div>
         <div class="terminal-loading" id="terminalLoading">loading xterm…</div>
       </div>
+      <div class="browser-preview" id="browserPreview" hidden>
+        <img id="browserPreviewImg" alt="browser preview" />
+      </div>
       <!--
         Zarvis interactive emits structured editor_state events instead
         of echoing its live input buffer into PTY scrollback. Mirror that
@@ -1103,6 +1136,8 @@ const terminalLoadingEl = $("terminalLoading");
 const terminalScrollOverlayEl = $("terminalScrollOverlay");
 const terminalTopBtn = $("terminalTopBtn");
 const terminalBottomBtn = $("terminalBottomBtn");
+const browserPreviewEl = $("browserPreview");
+const browserPreviewImgEl = $("browserPreviewImg");
 const editorStateEl = $("editorState");
 const vkbdEl = $("vkbd");
 const vkbdSpecialEl = $("vkbdSpecial");
@@ -1135,6 +1170,10 @@ const state = {
   // Latest active Zarvis agent_status by session id, rendered in the
   // same fixed editor strip as the TUI's "* Working.." line.
   agentStatusById: new Map(),
+  // Latest browser thumbnail per session. Browser-aware tools emit
+  // base64 PNG previews as UI-only events; keep them out of the
+  // textual transcript and show only the selected session's image.
+  browserPreviewById: new Map(),
   // Current view mode — "chat" (headless transcript + composer)
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on `has_pty` plus the session mode.
@@ -1616,6 +1655,32 @@ function refreshListToolbar() {
   if (restartBtn) restartBtn.disabled = !sel || !terminal;
 }
 
+function setBrowserPreview(sessionId, preview) {
+  if (!sessionId || !preview || !preview.image) return;
+  state.browserPreviewById.set(sessionId, preview);
+  if (sessionId === state.currentId) renderBrowserPreviewForSession(sessionId);
+}
+
+function clearBrowserPreview(sessionId) {
+  if (!sessionId) return;
+  state.browserPreviewById.delete(sessionId);
+  if (sessionId === state.currentId) renderBrowserPreviewForSession(sessionId);
+}
+
+function renderBrowserPreviewForSession(sessionId) {
+  const preview = sessionId ? state.browserPreviewById.get(sessionId) : null;
+  if (!preview || !preview.image) {
+    browserPreviewEl.hidden = true;
+    browserPreviewImgEl.removeAttribute("src");
+    browserPreviewImgEl.removeAttribute("title");
+    return;
+  }
+  browserPreviewImgEl.src = `data:image/png;base64,${preview.image}`;
+  browserPreviewImgEl.alt = "browser preview";
+  browserPreviewImgEl.title = preview.title || preview.url || "browser preview";
+  browserPreviewEl.hidden = false;
+}
+
 /** Flip a group's collapsed bit on the daemon side. The
  *  `group/state` broadcast triggers a re-render. */
 async function toggleGroupCollapsed(groupId) {
@@ -1673,6 +1738,7 @@ async function selectSession(id) {
   renderSessions();
   const s = state.sessions.find((x) => x.id === id);
   sessionTitleEl.textContent = s ? sessionViewTitle(s) : "";
+  renderBrowserPreviewForSession(id);
   // Hide the session list on narrow screens after selection.
   if (window.matchMedia("(max-width: 720px)").matches) {
     sessionListEl.classList.add("collapsed");
@@ -2356,6 +2422,9 @@ function handleNotification(method, params) {
     if (event && event.type === "tool_approval_request" && event.call_id) {
       enqueueApproval(session_id, event);
     }
+    if (event && event.type === "browser_preview") {
+      setBrowserPreview(session_id, event);
+    }
     if (session_id !== state.currentId) return;
     renderEvent(event, params.at);
     scrollToBottom();
@@ -2376,10 +2445,12 @@ function handleNotification(method, params) {
     renderSessions();
     state.editorById.delete(params.session_id);
     state.agentStatusById.delete(params.session_id);
+    clearBrowserPreview(params.session_id);
     if (params.session_id === state.currentId) {
       state.currentId = null;
       transcriptEl.innerHTML = "";
       renderEditorState(null);
+      renderBrowserPreviewForSession(null);
       sessionTitleEl.textContent = "";
       refreshListToolbar();
     }
@@ -2398,6 +2469,10 @@ function handleNotification(method, params) {
 
 function renderEvent(event, at) {
   if (!event || !event.type) return;
+  if (event.type === "browser_preview") {
+    setBrowserPreview(state.currentId, event);
+    return;
+  }
   // PTY events go to xterm in terminal mode (decoded raw bytes →
   // term.write); fall through to the chat-style `appendPty`
   // otherwise so the user still sees something for non-PTY views.
@@ -2437,6 +2512,7 @@ function renderEvent(event, at) {
       if (state.term) state.term.reset();
       state.editorById.delete(state.currentId);
       state.agentStatusById.delete(state.currentId);
+      clearBrowserPreview(state.currentId);
       renderEditorState(null);
     }
     if (event.type === "error" && state.term) {
@@ -2483,6 +2559,7 @@ function renderEvent(event, at) {
       transcriptEl.innerHTML = "";
       state.editorById.delete(state.currentId);
       state.agentStatusById.delete(state.currentId);
+      clearBrowserPreview(state.currentId);
       renderEditorState(null);
       break;
     case "editor_state":
@@ -2651,6 +2728,9 @@ function replayTranscriptToTerm(events) {
       case "agent_status":
         if (e.active) state.agentStatusById.set(state.currentId, e);
         else state.agentStatusById.delete(state.currentId);
+        break;
+      case "browser_preview":
+        setBrowserPreview(state.currentId, e);
         break;
       // message / reasoning / status / cost / …: prose is already in
       // the PTY events; structured chrome isn't shown in terminal mode.

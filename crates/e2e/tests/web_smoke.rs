@@ -628,6 +628,46 @@ async fn web_client_loads_and_websocket_connects() {
         "message event was rendered in terminal mode — prose would double up:\n{replay}"
     );
 
+    // Browser previews are UI-only thumbnails. They should be stored
+    // per session and rendered as an image-only panel for the selected
+    // session, not as visible transcript text.
+    let browser_preview: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const png1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
+              state.currentId = 'sBrowser';
+              renderBrowserPreviewForSession('sBrowser');
+              renderEvent({
+                type: 'browser_preview',
+                url: 'https://example.test/page',
+                title: 'Example Preview',
+                image: png1x1,
+                width: 1,
+                height: 1
+              });
+              const panel = document.getElementById('browserPreview');
+              const img = document.getElementById('browserPreviewImg');
+              return {
+                hidden: panel.hidden,
+                srcPrefix: img.getAttribute('src').slice(0, 21),
+                title: img.getAttribute('title'),
+                text: panel.textContent.trim(),
+                stored: state.browserPreviewById.has('sBrowser')
+              };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate browser preview")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(browser_preview["hidden"], false);
+    assert_eq!(browser_preview["srcPrefix"], "data:image/png;base64");
+    assert_eq!(browser_preview["title"], "Example Preview");
+    assert_eq!(browser_preview["text"], "");
+    assert_eq!(browser_preview["stored"], true);
+
     // Pause briefly so the final rendered state lands in the
     // video before we stop the screencast — otherwise reviewers
     // see the page mid-load with no payoff frame.
