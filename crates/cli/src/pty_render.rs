@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// One element of the rendered session history.
 #[derive(Debug, Clone)]
@@ -1221,12 +1222,19 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     // one visible row, then the header.
     out.extend_from_slice(b"\r\n");
 
-    let tool = block.tool.as_deref().unwrap_or("?");
-    let args = block.args_summary.as_deref().unwrap_or("");
-    let header = format!("\x1b[1;32m→ {tool}\x1b[0m\x1b[2m({args})\x1b[0m\r\n");
-    out.extend_from_slice(header.as_bytes());
-    // After the leading `\r\n` + header, we've emitted 2 rows.
-    // status_row_offset will be 2 if we render a status row next.
+    append_tool_header(
+        &mut out,
+        block.tool.as_deref().unwrap_or("?"),
+        block.args_summary.as_deref().unwrap_or(""),
+        cols,
+    );
+    // After the leading `\r\n` + header, we've emitted at least 2 rows.
+    // status_row_offset accounts for wider, explicitly wrapped headers.
+    let header_rows = tool_header_rows(
+        block.tool.as_deref().unwrap_or("?"),
+        block.args_summary.as_deref().unwrap_or(""),
+        cols,
+    );
 
     // Classify by output content.
     let output_opt = block.output.as_deref();
@@ -1241,7 +1249,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     let mut kill_button_cols: Option<(u16, u16)> = None;
 
     if is_running || is_backgrounded {
-        status_row_offset = Some(2);
+        status_row_offset = Some(1 + header_rows as u16);
         let elapsed_secs = block.started_at.elapsed().as_secs();
         let buttons_ready = block.started_at.elapsed().as_millis() as u64 >= buttons_after_ms();
 
@@ -1349,6 +1357,120 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
         bg_button_cols,
         kill_button_cols,
     }
+}
+
+fn append_tool_header(out: &mut Vec<u8>, tool: &str, args: &str, cols: u16) {
+    let args = compact_tool_args(args);
+    let cols = cols.max(VT100_MIN_DIM) as usize;
+    let tool_width = UnicodeWidthStr::width(tool);
+    let prefix_width = 2 + tool_width + 1; // "→ " + tool + "("
+    let suffix_width = 1; // ")"
+
+    let arrow = "\x1b[2;32m→ \x1b[0m";
+    let tool_style = "\x1b[1;92m";
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+
+    if args.is_empty() {
+        out.extend_from_slice(
+            format!("{arrow}{tool_style}{tool}{reset}{dim}(){reset}\r\n").as_bytes(),
+        );
+        return;
+    }
+
+    if prefix_width + UnicodeWidthStr::width(args.as_str()) + suffix_width <= cols {
+        out.extend_from_slice(
+            format!("{arrow}{tool_style}{tool}{reset}{dim}({args}){reset}\r\n").as_bytes(),
+        );
+        return;
+    }
+
+    out.extend_from_slice(format!("{arrow}{tool_style}{tool}{reset}{dim}({reset}\r\n").as_bytes());
+    let body_width = cols.saturating_sub(2).max(8);
+    for line in wrap_display_width(&args, body_width) {
+        out.extend_from_slice(format!("  {dim}{line}{reset}\r\n").as_bytes());
+    }
+    out.extend_from_slice(format!("{dim}){reset}\r\n").as_bytes());
+}
+
+fn tool_header_rows(tool: &str, args: &str, cols: u16) -> usize {
+    let args = compact_tool_args(args);
+    let cols = cols.max(VT100_MIN_DIM) as usize;
+    let prefix_width = 2 + UnicodeWidthStr::width(tool) + 1;
+    if args.is_empty() || prefix_width + UnicodeWidthStr::width(args.as_str()) + 1 <= cols {
+        1
+    } else {
+        2 + wrap_display_width(&args, cols.saturating_sub(2).max(8)).len()
+    }
+}
+
+fn compact_tool_args(args: &str) -> String {
+    args.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn wrap_display_width(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let word_width = UnicodeWidthStr::width(word);
+        if current.is_empty() {
+            if word_width <= width {
+                current.push_str(word);
+                current_width = word_width;
+            } else {
+                lines.extend(split_word_display_width(word, width));
+                current_width = 0;
+            }
+        } else if current_width + 1 + word_width <= width {
+            current.push(' ');
+            current.push_str(word);
+            current_width += 1 + word_width;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+            if word_width <= width {
+                current.push_str(word);
+                current_width = word_width;
+            } else {
+                lines.extend(split_word_display_width(word, width));
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn split_word_display_width(word: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    for ch in word.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
+        if !current.is_empty() && current_width + ch_width > width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1469,6 +1591,42 @@ mod tests {
             .unwrap();
         assert_eq!(block_a.tool.as_deref(), Some("shell"));
         assert_eq!(block_b.tool.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn tool_header_compacts_and_wraps_multiline_args() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start(
+            "c1".into(),
+            "shell".into(),
+            "set -euo pipefail\n        branch=docs-readme-remote-control\n        wt=.claude/worktrees/$branch\n        git fetch origin main".into(),
+        );
+        let text = screen_text(h.replay(48, 12, 0).screen, 12, 48);
+
+        assert!(text.contains("→ shell("), "{text}");
+        assert!(text.contains("branch=docs-readme-remote-control"), "{text}");
+        assert!(
+            !text.contains("        branch="),
+            "header should compact inherited shell indentation:\n{text}"
+        );
+    }
+
+    #[test]
+    fn tool_header_uses_bright_tool_name_style() {
+        let block = ToolBlock {
+            call_id: "c1".into(),
+            tool: Some("read_file".into()),
+            args_summary: Some("/tmp/example".into()),
+            output: None,
+            ok: true,
+            expanded: false,
+            started_at: Instant::now(),
+        };
+        let rendered = String::from_utf8(synth_block(&block, 80).bytes).unwrap();
+        assert!(
+            rendered.contains("\x1b[1;92mread_file\x1b[0m"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
