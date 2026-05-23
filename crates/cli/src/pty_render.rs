@@ -145,6 +145,8 @@ pub struct ItemHistory {
     /// of the main parser.
     shadow_parser: vt100::Parser,
     shadow_in_alt_screen: bool,
+    shadow_last_snapshot: Vec<String>,
+    shadow_dirty_since_snapshot: bool,
     /// Last cols/rows the shadow was sized to, so we only call
     /// `set_size` when the dims actually changed (matches the
     /// main-parser caching idiom).
@@ -303,11 +305,12 @@ impl ItemHistory {
         // Shadow parser: start at 80x24, gets resized at render
         // time. Same scrollback cap as the main parser via
         // `super::app::SCROLLBACK_MAX`.
-        let shadow_parser =
-            vt100::Parser::new(24, 80, super::app::SCROLLBACK_MAX);
+        let shadow_parser = vt100::Parser::new(24, 80, super::app::SCROLLBACK_MAX);
         Self {
             shadow_parser,
             shadow_in_alt_screen: false,
+            shadow_last_snapshot: Vec::new(),
+            shadow_dirty_since_snapshot: false,
             shadow_cols: 80,
             shadow_rows: 24,
             items: Vec::new(),
@@ -425,9 +428,51 @@ impl ItemHistory {
                 continue;
             }
             if !self.shadow_in_alt_screen {
+                if shadow_byte_starts_destructive_redraw(&bytes[i..]) {
+                    self.snapshot_shadow_viewport();
+                }
+                if let Some(len) = csi_sequence_len(&bytes[i..]) {
+                    self.shadow_parser.process(&bytes[i..i + len]);
+                    i += len;
+                    continue;
+                }
                 self.shadow_parser.process(&bytes[i..i + 1]);
+                if shadow_byte_may_paint(bytes[i]) {
+                    self.shadow_dirty_since_snapshot = true;
+                }
             }
             i += 1;
+        }
+    }
+
+    fn snapshot_shadow_viewport(&mut self) {
+        if !self.shadow_dirty_since_snapshot {
+            return;
+        }
+        let screen = self.shadow_parser.screen();
+        let (rows, cols) = screen.size();
+        let mut lines = Vec::new();
+        for row in 0..rows {
+            let mut line = String::new();
+            for col in 0..cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    line.push_str(cell.contents());
+                }
+            }
+            let trimmed = line.trim_end().to_string();
+            if !trimmed.is_empty() {
+                lines.push(trimmed);
+            }
+        }
+        if lines.is_empty() || lines == self.shadow_last_snapshot {
+            self.shadow_dirty_since_snapshot = false;
+            return;
+        }
+        self.shadow_last_snapshot = lines.clone();
+        self.shadow_dirty_since_snapshot = false;
+        for line in lines {
+            self.shadow_parser.process(line.as_bytes());
+            self.shadow_parser.process(b"\r\n");
         }
     }
 
@@ -586,12 +631,7 @@ impl ItemHistory {
     /// for new zarvis sessions; the OSC-fence path remains as a
     /// backstop for byte streams loaded from older `pty.log`
     /// files that still contain inline fenced tool blocks.
-    pub fn feed_task_start(
-        &mut self,
-        call_id: String,
-        tool: String,
-        args_summary: String,
-    ) {
+    pub fn feed_task_start(&mut self, call_id: String, tool: String, args_summary: String) {
         // Idempotent: if a block already exists for this call_id
         // (e.g., the OSC backstop fired first on a legacy log),
         // just hydrate it.
@@ -683,10 +723,7 @@ impl ItemHistory {
         // user actually saw. This is a no-op when dims match.
         self.set_pty_size(cols, rows);
 
-        let has_blocks = self
-            .items
-            .iter()
-            .any(|i| matches!(i, Item::ToolBlock(_)));
+        let has_blocks = self.items.iter().any(|i| matches!(i, Item::ToolBlock(_)));
         // Mouse-wheel scrollback for non-tool-block sessions
         // (shell / claude / codex): divert to the shadow parser.
         // The shadow sees the same byte stream as main, with
@@ -741,7 +778,11 @@ impl ItemHistory {
         };
         if need_reset {
             self.cached = Some(CachedParser {
-                parser: vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX),
+                parser: vt100::Parser::new(
+                    rows.max(VT100_MIN_DIM),
+                    cols.max(VT100_MIN_DIM),
+                    super::app::SCROLLBACK_MAX,
+                ),
                 cols,
                 rows,
                 processed_count: 0,
@@ -777,15 +818,21 @@ impl ItemHistory {
         //     coalescing PTY-chunk bursts before draw, so the rebuild
         //     cost is paid once per resize instead of per chunk.)
         if cache.cols != cols {
-            cache.parser =
-                vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX);
+            cache.parser = vt100::Parser::new(
+                rows.max(VT100_MIN_DIM),
+                cols.max(VT100_MIN_DIM),
+                super::app::SCROLLBACK_MAX,
+            );
             cache.cols = cols;
             cache.rows = rows;
             cache.processed_count = 0;
             cache.pending_consumed = 0;
         } else if rows > cache.rows {
-            cache.parser =
-                vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX);
+            cache.parser = vt100::Parser::new(
+                rows.max(VT100_MIN_DIM),
+                cols.max(VT100_MIN_DIM),
+                super::app::SCROLLBACK_MAX,
+            );
             cache.rows = rows;
             cache.processed_count = 0;
             cache.pending_consumed = 0;
@@ -798,7 +845,10 @@ impl ItemHistory {
             cache.processed_count = self.items.len();
             cache.pending_consumed = self.pending_chunk.len();
         } else if cache.rows != rows {
-            cache.parser.screen_mut().set_size(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM));
+            cache
+                .parser
+                .screen_mut()
+                .set_size(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM));
             cache.rows = rows;
         }
 
@@ -828,7 +878,11 @@ impl ItemHistory {
             // pending_chunk was flushed or shrunk under us — rebuild
             // to stay consistent.
             *cache = CachedParser {
-                parser: vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX),
+                parser: vt100::Parser::new(
+                    rows.max(VT100_MIN_DIM),
+                    cols.max(VT100_MIN_DIM),
+                    super::app::SCROLLBACK_MAX,
+                ),
                 cols,
                 rows,
                 processed_count: 0,
@@ -884,7 +938,11 @@ impl ItemHistory {
 
         if needs_rebuild {
             self.cached = Some(CachedParser {
-                parser: vt100::Parser::new(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM), super::app::SCROLLBACK_MAX),
+                parser: vt100::Parser::new(
+                    rows.max(VT100_MIN_DIM),
+                    cols.max(VT100_MIN_DIM),
+                    super::app::SCROLLBACK_MAX,
+                ),
                 cols,
                 rows,
                 processed_count: 0,
@@ -914,7 +972,11 @@ impl ItemHistory {
         // and we no longer re-scan the whole history with
         // `count_visible_lines` / `synth_block` every frame. That
         // O(history)-per-frame re-scan was the zarvis typing lag.
-        let start_processing_at = if needs_rebuild { 0 } else { cache.processed_count };
+        let start_processing_at = if needs_rebuild {
+            0
+        } else {
+            cache.processed_count
+        };
         let reuse_upto = cache.item_layouts.len().min(self.items.len());
         for (idx, item) in self.items.iter().enumerate().skip(reuse_upto) {
             let layout = match item {
@@ -999,10 +1061,7 @@ impl ItemHistory {
                 .abs_start
                 .saturating_sub(visible_top)
                 .min(rows as usize) as u16;
-            let row_end = span
-                .abs_end
-                .saturating_sub(visible_top)
-                .min(rows as usize) as u16;
+            let row_end = span.abs_end.saturating_sub(visible_top).min(rows as usize) as u16;
             if row_end <= row_start {
                 continue;
             }
@@ -1038,6 +1097,29 @@ impl Default for ItemHistory {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn shadow_byte_starts_destructive_redraw(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x1b[H")
+        || bytes.starts_with(b"\x1b[1;1H")
+        || bytes.starts_with(b"\x1b[2J")
+        || bytes.starts_with(b"\x1b[J")
+}
+
+fn csi_sequence_len(bytes: &[u8]) -> Option<usize> {
+    if !bytes.starts_with(b"\x1b[") {
+        return None;
+    }
+    for (idx, b) in bytes.iter().enumerate().skip(2) {
+        if (0x40..=0x7e).contains(b) {
+            return Some(idx + 1);
+        }
+    }
+    None
+}
+
+fn shadow_byte_may_paint(b: u8) -> bool {
+    b == b'\n' || b == b'\r' || b >= 0x20
 }
 
 /// Approximate "visible row" count for a byte slice — counts `\n`
@@ -1131,8 +1213,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     /// `agentd_adapter_zarvis::tasks::BG_PLACEHOLDER_OUTPUT`
     /// constant — duplicated here only to avoid a cross-crate
     /// dep just for one string.
-    const BG_PLACEHOLDER_OUTPUT: &str =
-        "(running in background; will report when complete)";
+    const BG_PLACEHOLDER_OUTPUT: &str = "(running in background; will report when complete)";
 
     let mut out: Vec<u8> = Vec::with_capacity(128);
     // Leading blank — separates the block from prior chat content
@@ -1142,9 +1223,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
 
     let tool = block.tool.as_deref().unwrap_or("?");
     let args = block.args_summary.as_deref().unwrap_or("");
-    let header = format!(
-        "\x1b[1;32m→ {tool}\x1b[0m\x1b[2m({args})\x1b[0m\r\n"
-    );
+    let header = format!("\x1b[1;32m→ {tool}\x1b[0m\x1b[2m({args})\x1b[0m\r\n");
     out.extend_from_slice(header.as_bytes());
     // After the leading `\r\n` + header, we've emitted 2 rows.
     // status_row_offset will be 2 if we render a status row next.
@@ -1152,8 +1231,9 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     // Classify by output content.
     let output_opt = block.output.as_deref();
     let is_running = output_opt.is_none();
-    let is_backgrounded =
-        output_opt.map(|o| o == BG_PLACEHOLDER_OUTPUT).unwrap_or(false);
+    let is_backgrounded = output_opt
+        .map(|o| o == BG_PLACEHOLDER_OUTPUT)
+        .unwrap_or(false);
     let is_completed = !is_running && !is_backgrounded;
 
     let mut status_row_offset: Option<u16> = None;
@@ -1163,8 +1243,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     if is_running || is_backgrounded {
         status_row_offset = Some(2);
         let elapsed_secs = block.started_at.elapsed().as_secs();
-        let buttons_ready = block.started_at.elapsed().as_millis() as u64
-            >= buttons_after_ms();
+        let buttons_ready = block.started_at.elapsed().as_millis() as u64 >= buttons_after_ms();
 
         let show_bg_button = is_running && buttons_ready;
         let show_kill_button = (is_running || is_backgrounded) && buttons_ready;
@@ -1211,9 +1290,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
             // Hint that the queue is live during a tool run. Same
             // dim styling as the elapsed counter so it reads as
             // metadata, not active output.
-            line.push_str(
-                "  \x1b[2m· type to queue next prompt\x1b[0m",
-            );
+            line.push_str("  \x1b[2m· type to queue next prompt\x1b[0m");
         }
         line.push_str("\r\n");
         out.extend_from_slice(line.as_bytes());
@@ -1244,8 +1321,7 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
             for (i, line) in output.lines().take(visible).enumerate() {
                 let trimmed: String = line.chars().take(max_col).collect();
                 if i == 0 {
-                    let payload =
-                        format!("  {glyph}  \x1b[2m{trimmed}\x1b[0m\r\n");
+                    let payload = format!("  {glyph}  \x1b[2m{trimmed}\x1b[0m\r\n");
                     out.extend_from_slice(payload.as_bytes());
                 } else {
                     let payload = format!("     \x1b[2m{trimmed}\x1b[0m\r\n");
@@ -1256,14 +1332,12 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
 
         if total_lines > 0 {
             if block.expanded && total_lines > TOOL_BLOCK_COLLAPSED_LINES {
-                let footer =
-                    "     \x1b[2;36m[click to collapse]\x1b[0m\r\n".to_string();
+                let footer = "     \x1b[2;36m[click to collapse]\x1b[0m\r\n".to_string();
                 out.extend_from_slice(footer.as_bytes());
             } else if !block.expanded && total_lines > TOOL_BLOCK_COLLAPSED_LINES {
                 let remaining = total_lines - TOOL_BLOCK_COLLAPSED_LINES;
-                let footer = format!(
-                    "     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n"
-                );
+                let footer =
+                    format!("     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n");
                 out.extend_from_slice(footer.as_bytes());
             }
         }
@@ -1295,7 +1369,11 @@ mod tests {
         // No blocks parsed.
         assert_eq!(block_count(&h), 0);
         let out = h.replay(40, 10, 0);
-        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out
+            .screen
+            .cell(0, 0)
+            .map(|c| c.contents())
+            .unwrap_or_default();
         assert_eq!(cell, "h");
     }
 
@@ -1373,14 +1451,22 @@ mod tests {
         // Markers arrive in same order.
         h.feed_pty(b"\x1b]7700;open;call=A\x07x\x1b]7700;close;call=A\x07");
         h.feed_pty(b"\x1b]7700;open;call=B\x07y\x1b]7700;close;call=B\x07");
-        let block_a = h.items.iter().find_map(|i| match i {
-            Item::ToolBlock(b) if b.call_id == "A" => Some(b),
-            _ => None,
-        }).unwrap();
-        let block_b = h.items.iter().find_map(|i| match i {
-            Item::ToolBlock(b) if b.call_id == "B" => Some(b),
-            _ => None,
-        }).unwrap();
+        let block_a = h
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::ToolBlock(b) if b.call_id == "A" => Some(b),
+                _ => None,
+            })
+            .unwrap();
+        let block_b = h
+            .items
+            .iter()
+            .find_map(|i| match i {
+                Item::ToolBlock(b) if b.call_id == "B" => Some(b),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(block_a.tool.as_deref(), Some("shell"));
         assert_eq!(block_b.tool.as_deref(), Some("read_file"));
     }
@@ -1577,7 +1663,10 @@ mod tests {
             buckets.push((batch, t.elapsed().as_micros()));
         }
         for (i, us) in &buckets {
-            eprintln!("batch {i}: 1000 events in {us} µs ({} ns/event)", us * 1000 / 1000);
+            eprintln!(
+                "batch {i}: 1000 events in {us} µs ({} ns/event)",
+                us * 1000 / 1000
+            );
         }
         // Sanity: a later batch shouldn't be drastically slower than
         // the first batch — that would indicate per-event cost
@@ -1700,7 +1789,11 @@ mod tests {
         let mut h = ItemHistory::new();
         shell_feed_minimal(&mut h);
         let out = h.replay(80, 24, 0);
-        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out
+            .screen
+            .cell(0, 0)
+            .map(|c| c.contents())
+            .unwrap_or_default();
         assert_eq!(cell, "$", "shell prompt should be on row 0 col 0");
     }
 
@@ -1710,7 +1803,11 @@ mod tests {
         shell_feed_minimal(&mut h);
         let _ = h.replay(80, 24, 0);
         let out = h.replay(120, 30, 0);
-        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out
+            .screen
+            .cell(0, 0)
+            .map(|c| c.contents())
+            .unwrap_or_default();
         assert_eq!(cell, "$", "content survives shell session resize");
     }
 
@@ -1736,10 +1833,10 @@ mod tests {
         // but the *shape* (alt-screen + small bounded content) is
         // what matters for our parser.
         h.feed_pty(b"\x1b[?1049h"); // enter alt screen
-        h.feed_pty(b"\x1b[H");      // cursor home
+        h.feed_pty(b"\x1b[H"); // cursor home
         h.feed_pty(b"claude\r\n");
         h.feed_pty(b"> hello\r\n");
-        h.feed_pty(b"\x1b[2;1H");   // status row
+        h.feed_pty(b"\x1b[2;1H"); // status row
     }
 
     #[test]
@@ -1747,7 +1844,11 @@ mod tests {
         let mut h = ItemHistory::new();
         claude_feed_alt_screen(&mut h);
         let out = h.replay(80, 24, 0);
-        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out
+            .screen
+            .cell(0, 0)
+            .map(|c| c.contents())
+            .unwrap_or_default();
         assert_eq!(cell, "c", "claude banner present in alt-screen buffer");
     }
 
@@ -1757,7 +1858,11 @@ mod tests {
         claude_feed_alt_screen(&mut h);
         let _ = h.replay(80, 24, 0);
         let out = h.replay(120, 30, 0);
-        let cell = out.screen.cell(0, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out
+            .screen
+            .cell(0, 0)
+            .map(|c| c.contents())
+            .unwrap_or_default();
         assert_eq!(cell, "c", "claude content survives resize");
     }
 
@@ -1777,7 +1882,10 @@ mod tests {
         let t = Instant::now();
         let _ = h.replay(120, 30, 0);
         let us = t.elapsed().as_micros();
-        assert!(us < 5_000, "claude resize too slow: {us} µs (expected <5ms)");
+        assert!(
+            us < 5_000,
+            "claude resize too slow: {us} µs (expected <5ms)"
+        );
     }
 
     // ----- zarvis (chat text + occasional tool blocks) -----
@@ -1833,16 +1941,11 @@ mod tests {
         // OSC open for call "c1"
         live_bytes.extend_from_slice(b"\x1b]7700;open;call=c1\x07");
         // tool_use header (dim args)
-        live_bytes.extend_from_slice(
-            b"\r\n\x1b[1;32m\xe2\x86\x92 shell\x1b[0m\x1b[2m(ls)\x1b[0m\r\n",
-        );
+        live_bytes
+            .extend_from_slice(b"\r\n\x1b[1;32m\xe2\x86\x92 shell\x1b[0m\x1b[2m(ls)\x1b[0m\r\n");
         // tool_result_body (dim content + the `[+N lines]` footer)
-        live_bytes.extend_from_slice(
-            b"  \x1b[1;32m\xe2\x9c\x93\x1b[0m  \x1b[2mfile_a\x1b[0m\r\n",
-        );
-        live_bytes.extend_from_slice(
-            b"     \x1b[2mfile_b\x1b[0m\r\n",
-        );
+        live_bytes.extend_from_slice(b"  \x1b[1;32m\xe2\x9c\x93\x1b[0m  \x1b[2mfile_a\x1b[0m\r\n");
+        live_bytes.extend_from_slice(b"     \x1b[2mfile_b\x1b[0m\r\n");
         live_bytes.extend_from_slice(
             b"     \x1b[2;36m[+5 lines \xe2\x80\x94 click to expand]\x1b[0m\r\n",
         );
@@ -1866,9 +1969,7 @@ mod tests {
             .join("\n");
         h.feed_tool_result("c1", true, full_output.clone());
 
-        let has_tool_block = h.items.iter().any(|i| {
-            matches!(i, Item::ToolBlock(_))
-        });
+        let has_tool_block = h.items.iter().any(|i| matches!(i, Item::ToolBlock(_)));
         assert!(
             has_tool_block,
             "post-restore feed should reconstruct the ToolBlock from OSC fences"
@@ -1910,7 +2011,10 @@ mod tests {
         let out = h.replay(80, 24, 0);
         // Don't assert exact cells (tool-block synth shifts rows);
         // just confirm we have a block recorded.
-        assert!(!out.blocks.is_empty(), "zarvis tool block should be hit-testable");
+        assert!(
+            !out.blocks.is_empty(),
+            "zarvis tool block should be hit-testable"
+        );
     }
 
     #[test]
@@ -2012,12 +2116,8 @@ mod tests {
         // is "full" — exercises the scrollback path where the
         // cursor should be parked at the bottom row after history.
         for i in 0..30 {
-            h.feed_pty(
-                format!("\x1b[36muser\x1b[0m: history msg {i}\r\n").as_bytes(),
-            );
-            h.feed_pty(
-                format!("\x1b[35massistant\x1b[0m: reply {i}\r\n").as_bytes(),
-            );
+            h.feed_pty(format!("\x1b[36muser\x1b[0m: history msg {i}\r\n").as_bytes());
+            h.feed_pty(format!("\x1b[35massistant\x1b[0m: reply {i}\r\n").as_bytes());
         }
         // Initial render — what the user sees right after opening
         // the session.
@@ -2027,9 +2127,7 @@ mod tests {
         // emitted a follow-up message. These are exactly the bytes
         // the user reported as "overwriting the first row".
         const MARKER: &str = "ZARVIS_NEW_LINE_MARKER";
-        h.feed_pty(
-            format!("\x1b[36muser\x1b[0m: {MARKER}\r\n").as_bytes(),
-        );
+        h.feed_pty(format!("\x1b[36muser\x1b[0m: {MARKER}\r\n").as_bytes());
         let out = h.replay(80, 24, 0);
 
         // Read row 0 of the viewport. The marker MUST NOT appear
@@ -2108,14 +2206,19 @@ mod tests {
             let mut chat = Vec::with_capacity(1500);
             for j in 0..15 {
                 chat.extend_from_slice(
-                    format!("\x1b[33mline {i}.{j} of accumulated assistant chat content\x1b[0m\r\n")
-                        .as_bytes(),
+                    format!(
+                        "\x1b[33mline {i}.{j} of accumulated assistant chat content\x1b[0m\r\n"
+                    )
+                    .as_bytes(),
                 );
             }
             h.feed_pty(&chat);
             let call = format!("c{i}");
             h.feed_tool_use("shell".into(), format!("cmd {i}"));
-            h.feed_pty(format!("\x1b]7700;open;call={call}\x07out\x1b]7700;close;call={call}\x07").as_bytes());
+            h.feed_pty(
+                format!("\x1b]7700;open;call={call}\x07out\x1b]7700;close;call={call}\x07")
+                    .as_bytes(),
+            );
             h.feed_tool_result(&call, true, "ok".into());
         }
 
@@ -2162,7 +2265,11 @@ mod tests {
         let mut h = ItemHistory::new();
         orchestrator_feed(&mut h);
         let out = h.replay(60, 6, 0);
-        let cell = out.screen.cell(5, 0).map(|c| c.contents()).unwrap_or_default();
+        let cell = out
+            .screen
+            .cell(5, 0)
+            .map(|c| c.contents())
+            .unwrap_or_default();
         assert!(!cell.is_empty(), "orchestrator panel last row populated");
     }
 
@@ -2533,9 +2640,7 @@ mod tests {
             .map(|i| {
                 let mut h = ItemHistory::new();
                 for line in 0..200 {
-                    h.feed_pty(
-                        format!("session {i} line {line}\r\n").as_bytes(),
-                    );
+                    h.feed_pty(format!("session {i} line {line}\r\n").as_bytes());
                 }
                 h
             })
@@ -2577,9 +2682,7 @@ mod tests {
             .map(|i| {
                 let mut h = ItemHistory::new();
                 for line in 0..1_000 {
-                    h.feed_pty(
-                        format!("pinned-{i} chat line {line}\r\n").as_bytes(),
-                    );
+                    h.feed_pty(format!("pinned-{i} chat line {line}\r\n").as_bytes());
                 }
                 h
             })
@@ -2689,9 +2792,7 @@ mod tests {
         claude_feed_alt_screen(&mut claude);
         // Simulate a realistic chat session inside alt-screen.
         for i in 0..50 {
-            claude.feed_pty(
-                format!("\x1b[H\x1b[36mline {i}\x1b[0m message {i}\r\n").as_bytes(),
-            );
+            claude.feed_pty(format!("\x1b[H\x1b[36mline {i}\x1b[0m message {i}\r\n").as_bytes());
         }
         let _ = render_main_view_buffer(&mut claude, w_pre, h_pre);
         let claude_buf = render_main_view_buffer(&mut claude, w_post, h_post);
@@ -2702,12 +2803,8 @@ mod tests {
         zarvis_feed_chat(&mut zarvis);
         // Add more chat to make it comparable.
         for i in 0..50 {
-            zarvis.feed_pty(
-                format!("\x1b[1;36m> hi {i}\x1b[0m\r\n").as_bytes(),
-            );
-            zarvis.feed_pty(
-                format!("\x1b[1;35m* response {i}\x1b[0m\r\n").as_bytes(),
-            );
+            zarvis.feed_pty(format!("\x1b[1;36m> hi {i}\x1b[0m\r\n").as_bytes());
+            zarvis.feed_pty(format!("\x1b[1;35m* response {i}\x1b[0m\r\n").as_bytes());
         }
         let _ = render_main_view_buffer(&mut zarvis, w_pre, h_pre);
         let zarvis_buf = render_main_view_buffer(&mut zarvis, w_post, h_post);
@@ -2721,9 +2818,7 @@ mod tests {
         let (codex_p, codex_s) = populated_or_styled_cells(&codex_buf);
 
         let total_cells = (w_post as usize) * (h_post as usize);
-        eprintln!(
-            "buffer paint cost @ {w_post}x{h_post} ({total_cells} cells total):"
-        );
+        eprintln!("buffer paint cost @ {w_post}x{h_post} ({total_cells} cells total):");
         eprintln!(
             "  shell:   populated={shell_p:>5}  styled={shell_s:>5}  ({:.1}% populated)",
             100.0 * shell_p as f64 / total_cells as f64
@@ -2802,12 +2897,8 @@ mod tests {
         let mut zarvis = ItemHistory::new();
         zarvis_feed_chat(&mut zarvis);
         for i in 0..50 {
-            zarvis.feed_pty(
-                format!("\x1b[1;36m> hi {i}\x1b[0m\r\n").as_bytes(),
-            );
-            zarvis.feed_pty(
-                format!("\x1b[1;35m* resp {i}\x1b[0m\r\n").as_bytes(),
-            );
+            zarvis.feed_pty(format!("\x1b[1;36m> hi {i}\x1b[0m\r\n").as_bytes());
+            zarvis.feed_pty(format!("\x1b[1;35m* resp {i}\x1b[0m\r\n").as_bytes());
         }
         let _ = render_main_view_buffer(&mut zarvis, w_pre, h_pre);
         let zarvis_bytes =
@@ -2885,9 +2976,8 @@ mod tests {
                 format!("redrawn line {row:02} of codex transcript ").as_bytes(),
             );
             redraw_bytes.extend_from_slice(b"\x1b[35m(model)\x1b[0m ");
-            redraw_bytes.extend_from_slice(
-                b"some additional content to make the row realistic\r\n",
-            );
+            redraw_bytes
+                .extend_from_slice(b"some additional content to make the row realistic\r\n");
         }
 
         // --- (a) one-shot feed: feed all bytes at once, render once
@@ -3104,8 +3194,10 @@ mod tests {
         let scrolled = screen_text(h.replay(80, 24, 0).screen, 24, 80);
         let scrolled_back = screen_text(h.replay(80, 24, 100).screen, 24, 80);
         assert_ne!(scrolled, scrolled_back);
-        assert!(scrolled_back.contains("pre"),
-            "scrollback should still expose pre-clear lines");
+        assert!(
+            scrolled_back.contains("pre"),
+            "scrollback should still expose pre-clear lines"
+        );
     }
 
     /// codex-style normal-screen chat — natural `\r\n` lines flow
@@ -3118,9 +3210,7 @@ mod tests {
     fn codex_scrollback_shows_chat_history() {
         let mut h = ItemHistory::new();
         for i in 0..200u32 {
-            h.feed_pty(
-                format!("\x1b[36muser\x1b[0m: chat msg {i:04}\r\n").as_bytes(),
-            );
+            h.feed_pty(format!("\x1b[36muser\x1b[0m: chat msg {i:04}\r\n").as_bytes());
         }
         let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
         let scrolled = screen_text(h.replay(80, 24, 80).screen, 24, 80);
@@ -3239,15 +3329,13 @@ mod tests {
         );
     }
 
-    /// Edge case the shadow fix doesn't help: a true TUI-style
-    /// child that NEVER emits `\r\n` — every frame is pure cursor-
-    /// positioning + erase-line. Neither the main parser nor the
-    /// shadow accumulates scrollback (the shadow is fed the exact
-    /// same in-place redraw bytes the main one is). Documented so
-    /// the contract is explicit: scrollback shows the user what
-    /// "scrolled past", and nothing scrolled past in this case.
+    /// Codex can repaint as a true TUI-style child: every frame is
+    /// cursor positioning + erase-line, with no natural `\r\n` scroll.
+    /// The shadow parser snapshots each visible frame before the next
+    /// top-left redraw so mouse wheel / `C-x [` still expose older
+    /// frames.
     #[test]
-    fn pure_tui_redraw_still_has_empty_scrollback() {
+    fn codex_pure_tui_redraw_scrollback_exposes_older_frames() {
         let mut h = ItemHistory::new();
         for turn in 0..50u32 {
             h.feed_pty(b"\x1b[H");
@@ -3258,9 +3346,13 @@ mod tests {
         }
         let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);
         let scrolled = screen_text(h.replay(80, 24, 100).screen, 24, 80);
-        assert_eq!(
+        assert_ne!(
             live, scrolled,
-            "with no natural newlines, scrollback has nothing to expose"
+            "scrollback should expose earlier in-place redraw frames"
+        );
+        assert!(
+            scrolled.contains("turn 0") || scrolled.contains("turn 1"),
+            "scrolled view should include older redraw frames, got:\n{scrolled}"
         );
     }
 
@@ -3366,11 +3458,7 @@ mod tests {
         // Step 2: transcript replay — TaskStart carries the call_id
         // and is the canonical block-creation event for new zarvis
         // sessions. apply_transcript_to_local_state must forward it.
-        h.feed_task_start(
-            "t1".to_string(),
-            "shell".to_string(),
-            "ls".to_string(),
-        );
+        h.feed_task_start("t1".to_string(), "shell".to_string(), "ls".to_string());
         h.feed_tool_result("t1", true, "OUTPUT-LINE".to_string());
 
         let live = screen_text(h.replay(80, 24, 0).screen, 24, 80);

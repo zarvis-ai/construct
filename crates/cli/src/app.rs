@@ -5361,6 +5361,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn codex_pty_view_scrolls_with_keyboard_chord() {
+        let (mut app, _dir, _srv) = captured_app().await;
+        app.sessions[0].harness = "codex".into();
+        app.view_scrollback = 0;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(
+            app.view_scrollback, 10,
+            "C-x [ should page PTY scrollback up in a codex terminal view"
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_pty_view_scrolls_with_mouse_wheel() {
+        let (mut app, _dir, _srv) = captured_app().await;
+        app.sessions[0].harness = "codex".into();
+        app.layout.list_items_area = Some(Rect::new(0, 0, 20, 20));
+        app.view_scrollback = 0;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 50,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+
+        assert_eq!(
+            app.view_scrollback, 3,
+            "mouse wheel outside the list should scroll codex PTY history"
+        );
+    }
+
     /// Starting a `C-x` chord is not a passthrough — it must redraw
     /// (to surface the chord indicator), never skip.
     #[tokio::test]
@@ -6081,12 +6119,7 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status: Option<AgentStatus> = None;
-        apply_transcript_to_local_state(
-            &events,
-            &mut history,
-            &mut editor,
-            &mut status,
-        );
+        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
 
         // The render must include the synthesized header for the
         // block. Before the fix, no `ToolBlock` items existed and
@@ -6151,12 +6184,7 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status = None;
-        apply_transcript_to_local_state(
-            &events,
-            &mut history,
-            &mut editor,
-            &mut status,
-        );
+        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
 
         let screen_rows = 24u16;
         let screen_cols = 80u16;
@@ -6213,12 +6241,7 @@ mod tests {
             started_at_ms,
             status: "Working".into(),
         });
-        apply_transcript_to_local_state(
-            &events,
-            &mut history,
-            &mut editor,
-            &mut status,
-        );
+        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status);
 
         assert!(
             status.is_none(),
