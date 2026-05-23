@@ -20,7 +20,7 @@ you. Remote control from your phone when you're in motion.
   opens a browser-accessible web client with a QR code. Connect from your phone,
   no service signup, no setup required.
 
-  <img src="https://raw.githubusercontent.com/zarvis-ai/agentd/6991220ce6ceb39f7d6fca645e825ccc530fb666/demos/remote-control.gif" alt="agentd remote control demo" width="50%">
+  <img src="https://raw.githubusercontent.com/zarvis-ai/agentd/6991220ce6ceb39f7d6fca645e825ccc530fb666/demos/remote-control.gif" alt="agentd remote control demo" width="30%">
 - **Extensible harness protocol** — adapters are separate processes speaking
   JSON-RPC over stdio, so new tools can plug in without changing the daemon.
 
