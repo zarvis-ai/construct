@@ -19,6 +19,8 @@ you. Remote control from your phone when you're in motion.
 - **[Remote control](docs/remote-control.md) when you step away** — `/remote-control`
   opens a browser-accessible web client with a QR code. Connect from your phone,
   no service signup, no setup required.
+
+  ![agentd remote control demo](https://raw.githubusercontent.com/zarvis-ai/agentd/6991220ce6ceb39f7d6fca645e825ccc530fb666/demos/remote-control.gif)
 - **Extensible harness protocol** — adapters are separate processes speaking
   JSON-RPC over stdio, so new tools can plug in without changing the daemon.
 
