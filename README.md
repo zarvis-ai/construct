@@ -12,6 +12,8 @@ you. Remote control from your phone when you're in motion.
 
 - **One cockpit for every agent** — attach to Claude Code, Codex, Antigravity,
   Zarvis, or a shell process from one focused workspace that rewards attention.
+
+  <img src="https://raw.githubusercontent.com/zarvis-ai/agentd/353516f7a4179645106663adf157b91fc59ef286/demos/new-session.gif" alt="agentd new session demo" width="50%">
 - **Parallel work without losing control** — spawn helper sessions, pin important
   work, interrupt stuck runs, inspect diffs, and send follow-up input mid-turn.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
