@@ -18,6 +18,7 @@ use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::Result;
+use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -289,8 +290,22 @@ const DIM_LINE_PREFIXES: &[&str] = &["Summary:"];
 /// `agentd_loop_create` call. Keep this in lockstep with the
 /// after-submit match block + the TUI's `run_slash_command`.
 const SLASH_COMMANDS: &[&str] = &[
-    "/agentd", "/border", "/compact", "/help", "/loop", "/model", "/new", "/quit",
-    "/remote-control", "/reset", "/exit", "/refresh", "/rename", "/send", "/tasks", "/zoom",
+    "/agentd",
+    "/border",
+    "/compact",
+    "/help",
+    "/loop",
+    "/model",
+    "/new",
+    "/quit",
+    "/remote-control",
+    "/reset",
+    "/exit",
+    "/refresh",
+    "/rename",
+    "/send",
+    "/tasks",
+    "/zoom",
 ];
 
 /// Padding around the assistant's streamed response. The response is
@@ -1714,6 +1729,8 @@ pub async fn run(
     let mut model = spec.model.clone();
     let mut provider = spec.provider;
     let cwd = PathBuf::from(&params.cwd);
+    let hooks = crate::hooks::Hooks::load(&cwd, &emit);
+    let base_hook_payload = crate::hooks::base_payload(&session_id, &cwd, "interactive");
     let registry = std::sync::Arc::new(ToolRegistry::with_defaults());
     let specs = registry.specs();
     let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
@@ -1764,6 +1781,20 @@ pub async fn run(
         state: SessionState::Running,
         detail: Some(format!("{}:{}  [interactive]", provider_name, model)),
     });
+    hooks
+        .run(
+            "session_start",
+            &cwd,
+            &emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "provider": provider_name,
+                    "model": model,
+                }),
+            ),
+        )
+        .await;
     // The active `❯` lives in the TUI's fixed editor pane, fed by
     // `SessionEvent::EditorState`; no inline prompt write needed.
     let _ = resuming;
@@ -1773,8 +1804,8 @@ pub async fn run(
     let self_id_for_obs = session_id.clone();
     let session_id_for_slash = session_id.clone();
     let tool_ctx = ToolCtx {
-        cwd,
-        session_id,
+        cwd: cwd.clone(),
+        session_id: session_id.clone(),
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
     };
@@ -1843,7 +1874,7 @@ pub async fn run(
         // Wait for a user message — drain order: startup prompt
         // (`pending`), then anything queued during the previous turn,
         // then live typing.
-        let user_text = if let Some(t) = pending.pop_front() {
+        let mut user_text = if let Some(t) = pending.pop_front() {
             // Echo the pre-supplied prompt as if the user just sent it.
             term.echo_consumed_line(&t);
             emit_editor_state(&emit, &editor, &queue);
@@ -1931,7 +1962,12 @@ pub async fn run(
                     term.note(&text);
                     text
                 }
-                ReadOutcome::Stop => break 'outer,
+                ReadOutcome::Stop => {
+                    hooks
+                        .run("session_stop", &cwd, &emit, base_hook_payload.clone())
+                        .await;
+                    break 'outer;
+                }
                 ReadOutcome::Eof => {
                     term.note("(end of session)");
                     // Tell the daemon the session ended on its own so
@@ -1944,6 +1980,9 @@ pub async fn run(
                     // explicitly captures user intent — Ctrl-D meant
                     // "I'm done."
                     term.emit.emit(SessionEvent::Done { exit_code: 0 });
+                    hooks
+                        .run("session_stop", &cwd, &emit, base_hook_payload.clone())
+                        .await;
                     break 'outer;
                 }
             }
@@ -2108,6 +2147,37 @@ pub async fn run(
             emit_editor_state(&emit, &editor, &queue);
             continue;
         }
+
+        let prompt_payload = hooks
+            .mutate(
+                "user_prompt_mutate",
+                &cwd,
+                &emit,
+                crate::hooks::merge_payload(
+                    base_hook_payload.clone(),
+                    json!({ "prompt": user_text }),
+                ),
+            )
+            .await;
+        if let Some(prompt) = prompt_payload.get("prompt").and_then(|v| v.as_str()) {
+            user_text = prompt.to_string();
+        }
+        if user_text.trim().is_empty() {
+            emit_editor_state(&emit, &editor, &queue);
+            continue;
+        }
+
+        hooks
+            .run(
+                "user_prompt_submit",
+                &cwd,
+                &emit,
+                crate::hooks::merge_payload(
+                    base_hook_payload.clone(),
+                    json!({ "prompt": user_text }),
+                ),
+            )
+            .await;
 
         push_msg!(
             messages,
@@ -2430,6 +2500,8 @@ pub async fn run(
                     let tasks_c = tasks.clone();
                     let bg_tx_c = bg_completion_tx.clone();
                     let bg_after_c = bg_after;
+                    let hooks_c = hooks.clone();
+                    let hook_base = base_hook_payload.clone();
                     let call_id = call.id.clone();
                     let tool_name = call.name.clone();
                     let call_id_for_handle = call_id.clone();
@@ -2441,7 +2513,10 @@ pub async fn run(
                         // to Result<ToolOutcome, String> for the
                         // existing render pipeline.
                         let tool_runner = async move {
-                            run_safe_call_silent(call_clone, &reg, &ctx_c, &emit_c).await
+                            run_safe_call_silent(
+                                call_clone, &reg, &ctx_c, &emit_c, &hooks_c, &hook_base,
+                            )
+                            .await
                         };
                         let outcome = crate::tasks::supervise(
                             call_id,
@@ -2534,6 +2609,8 @@ pub async fn run(
                         tasks.clone(),
                         bg_completion_tx.clone(),
                         bg_after,
+                        &hooks,
+                        &base_hook_payload,
                     )
                     .await;
                     let stop_now = matches!(outcome.as_ref(), Err(r) if r == "stop");
@@ -2585,6 +2662,9 @@ pub async fn run(
             }
             if early_stop {
                 finish_agent_status(&emit, turn_started_at_ms, "Stopped");
+                hooks
+                    .run("session_stop", &cwd, &emit, base_hook_payload.clone())
+                    .await;
                 return Ok(());
             }
             if matches!(turn.stop_reason, StopReason::MaxTokens) {
@@ -2722,7 +2802,10 @@ async fn run_one_tool(
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     bg_completion_tx: crate::tasks::BgCompletionTx,
     bg_after: std::time::Duration,
+    hooks: &crate::hooks::Hooks,
+    base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
+    let mut call = call.clone();
     let tool = match registry.get(&call.name) {
         Some(t) => t,
         None => {
@@ -2743,6 +2826,26 @@ async fn run_one_tool(
         }
     };
 
+    let mutation = hooks
+        .mutate(
+            "pre_tool_use_mutate",
+            &tool_ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": tool.args_summary(&call.input),
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
+    if let Some(args) = mutation.get("args") {
+        call.input = args.clone();
+    }
     let args_summary = tool.args_summary(&call.input);
     // No inline PTY writes for the tool's header/body/result —
     // the items-model renderer synthesizes the whole block from
@@ -2754,6 +2857,23 @@ async fn run_one_tool(
         tool: call.name.clone(),
         args: call.input.clone(),
     });
+    hooks
+        .run(
+            "pre_tool_use",
+            &tool_ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": args_summary,
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
     // Task-lifecycle event for the daemon's per-session task
     // registry — surfaces in `/tasks` + MCP `agentd_get_tasks`.
     emit.emit(SessionEvent::TaskStart {
@@ -2771,6 +2891,23 @@ async fn run_one_tool(
             args_summary: args_summary.clone(),
             risk: tool.risk(),
         });
+        hooks
+            .run(
+                "tool_approval_request",
+                &tool_ctx.cwd,
+                emit,
+                crate::hooks::merge_payload(
+                    base_hook_payload.clone(),
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "args": call.input,
+                        "args_summary": args_summary,
+                        "risk": tool.risk(),
+                    }),
+                ),
+            )
+            .await;
         let decision = wait_for_approval(inbox, &call.id, automode).await;
         match decision {
             ApprovalOutcome::Stop => return Err("stop".into()),
@@ -2863,6 +3000,26 @@ async fn run_one_tool(
             });
         }
     }
+    let (ok, output) = match &outcome {
+        Ok(o) => (o.ok, o.output.clone()),
+        Err(reason) => (false, format!("({reason})")),
+    };
+    hooks
+        .run(
+            "post_tool_use",
+            &tool_ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "ok": ok,
+                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
+                }),
+            ),
+        )
+        .await;
     outcome
 }
 
@@ -2933,10 +3090,12 @@ async fn wait_for_approval(
 /// `→ name` immediately followed by the `✓ result` block for the
 /// same call, never interleaved with another in-flight tool.
 async fn run_safe_call_silent(
-    call: provider::ToolCall,
+    mut call: provider::ToolCall,
     registry: &ToolRegistry,
     ctx: &ToolCtx,
     emit: &EventEmitter,
+    hooks: &crate::hooks::Hooks,
+    base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
     let tool = match registry.get(&call.name) {
         Some(t) => t,
@@ -2957,11 +3116,48 @@ async fn run_safe_call_silent(
             });
         }
     };
+    let mutation = hooks
+        .mutate(
+            "pre_tool_use_mutate",
+            &ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": tool.args_summary(&call.input),
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
+    if let Some(args) = mutation.get("args") {
+        call.input = args.clone();
+    }
+    let args_summary_for_event = tool.args_summary(&call.input);
+    hooks
+        .run(
+            "pre_tool_use",
+            &ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": args_summary_for_event,
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
     emit.emit(SessionEvent::ToolUse {
         tool: call.name.clone(),
         args: call.input.clone(),
     });
-    let args_summary_for_event = tool.args_summary(&call.input);
     emit.emit(SessionEvent::TaskStart {
         call_id: call.id.clone(),
         tool: call.name.clone(),
@@ -3002,6 +3198,26 @@ async fn run_safe_call_silent(
             });
         }
     }
+    let (ok, output) = match &outcome {
+        Ok(o) => (o.ok, o.output.clone()),
+        Err(reason) => (false, format!("({reason})")),
+    };
+    hooks
+        .run(
+            "post_tool_use",
+            &ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "ok": ok,
+                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
+                }),
+            ),
+        )
+        .await;
     outcome
 }
 

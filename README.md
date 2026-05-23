@@ -372,6 +372,39 @@ for its harness:
   input, so the conversation history is intact across daemon
   restarts.
 
+  Zarvis also has opt-in command hooks, configured explicitly with
+  `AGENTD_ZARVIS_HOOKS_CONFIG=/path/to/hooks.json` or inline via
+  `AGENTD_ZARVIS_HOOKS_JSON`. Hooks are not auto-loaded from a
+  repository checkout because they execute local commands with the
+  user's permissions. Config shape:
+
+  ```json
+  {
+    "hooks": {
+      "session_start": [{ "command": "jq . >> /tmp/zarvis-hooks.log" }],
+      "user_prompt_mutate": [{ "command": "jq '.prompt += \"\\n\\nRemember to cite files.\"'" }],
+      "user_prompt_submit": [{ "command": "jq .prompt >> /tmp/zarvis-prompts.log" }],
+      "pre_tool_use_mutate": [{ "command": "jq .", "timeout_ms": 5000 }],
+      "pre_tool_use": [{ "command": "jq . >> /tmp/zarvis-tools.log", "timeout_ms": 5000 }],
+      "post_tool_use": [{ "command": "jq . >> /tmp/zarvis-tools.log" }],
+      "tool_approval_request": [{ "command": "jq . >> /tmp/zarvis-approvals.log" }],
+      "session_stop": [{ "command": "jq . >> /tmp/zarvis-hooks.log" }]
+    }
+  }
+  ```
+
+  Each hook command runs under `$AGENTD_SHELL_BIN -lc` (default
+  `/bin/sh -lc`) in the session cwd, receives one JSON payload on
+  stdin, and gets `AGENTD_ZARVIS_HOOK_EVENT` in its environment.
+  Notification hooks ignore stdout. Mutating hooks are separate:
+  `user_prompt_mutate` can return `{"prompt":"..."}` on stdout before
+  the user message is sent to the model, and `pre_tool_use_mutate` can
+  return `{"args":{...}}` before the tool is displayed, approved, or
+  executed. Mutating hooks run in config order and each returned JSON
+  object is merged into the next hook's payload. Hook failures,
+  timeouts, invalid JSON, or non-object stdout are logged and the
+  current payload continues unchanged.
+
 Sessions whose adapter binary is missing, whose start params can't
 be loaded, or whose harness rejects the respawn are marked `Errored`
 (transcript + scrollback remain readable).

@@ -12,6 +12,7 @@ use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{MessageRole, SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::Result;
+use serde_json::json;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -104,10 +105,12 @@ pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
 /// `run_one_tool` does so the transcript reads the same. Used by the
 /// parallel-safe batch path.
 pub(crate) async fn run_safe_call(
-    call: provider::ToolCall,
+    mut call: provider::ToolCall,
     registry: &ToolRegistry,
     ctx: &ToolCtx,
     emit: &EventEmitter,
+    hooks: &crate::hooks::Hooks,
+    base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
     let tool = match registry.get(&call.name) {
         Some(t) => t,
@@ -128,6 +131,44 @@ pub(crate) async fn run_safe_call(
             });
         }
     };
+    let mutation = hooks
+        .mutate(
+            "pre_tool_use_mutate",
+            &ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": tool.args_summary(&call.input),
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
+    if let Some(args) = mutation.get("args") {
+        call.input = args.clone();
+    }
+    let args_summary = tool.args_summary(&call.input);
+    hooks
+        .run(
+            "pre_tool_use",
+            &ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": args_summary,
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
     emit.emit(SessionEvent::ToolUse {
         tool: call.name.clone(),
         args: call.input.clone(),
@@ -148,6 +189,26 @@ pub(crate) async fn run_safe_call(
             output: format!("({reason})"),
         }),
     }
+    let (ok, output) = match &outcome {
+        Ok(o) => (o.ok, o.output.clone()),
+        Err(reason) => (false, format!("({reason})")),
+    };
+    hooks
+        .run(
+            "post_tool_use",
+            &ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "ok": ok,
+                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
+                }),
+            ),
+        )
+        .await;
     outcome
 }
 
@@ -175,6 +236,8 @@ pub async fn run(
         mut inbox,
     } = ctx;
     let cwd = PathBuf::from(&params.cwd);
+    let hooks = crate::hooks::Hooks::load(&cwd, &emit);
+    let base_hook_payload = crate::hooks::base_payload(&session_id, &cwd, "headless");
     let registry = Arc::new(ToolRegistry::with_defaults());
     let specs = registry.specs();
 
@@ -206,6 +269,20 @@ pub async fn run(
         state: SessionState::Running,
         detail: Some(format!("{}:{}", provider_name, model)),
     });
+    hooks
+        .run(
+            "session_start",
+            &cwd,
+            &emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "provider": provider_name,
+                    "model": model,
+                }),
+            ),
+        )
+        .await;
 
     // Per-session automode state. Defaults to env override if set.
     let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
@@ -243,7 +320,7 @@ pub async fn run(
 
     loop {
         // Pull next user input (queued, or wait on inbox).
-        let user_text = match pending.pop_front() {
+        let mut user_text = match pending.pop_front() {
             Some(t) => t,
             None => {
                 emit.emit(SessionEvent::Status {
@@ -253,7 +330,12 @@ pub async fn run(
                 match inbox.recv().await {
                     None => return Ok(()),
                     Some(AdapterInboxMsg::Input(t)) => t,
-                    Some(AdapterInboxMsg::Stop) => return Ok(()),
+                    Some(AdapterInboxMsg::Stop) => {
+                        hooks
+                            .run("session_stop", &cwd, &emit, base_hook_payload.clone())
+                            .await;
+                        return Ok(());
+                    }
                     Some(AdapterInboxMsg::Interrupt) => continue,
                     Some(AdapterInboxMsg::SetAutoMode(on)) => {
                         automode = on;
@@ -266,6 +348,34 @@ pub async fn run(
         if user_text.trim().is_empty() {
             continue;
         }
+        let prompt_payload = hooks
+            .mutate(
+                "user_prompt_mutate",
+                &cwd,
+                &emit,
+                crate::hooks::merge_payload(
+                    base_hook_payload.clone(),
+                    json!({ "prompt": user_text }),
+                ),
+            )
+            .await;
+        if let Some(prompt) = prompt_payload.get("prompt").and_then(|v| v.as_str()) {
+            user_text = prompt.to_string();
+        }
+        if user_text.trim().is_empty() {
+            continue;
+        }
+        hooks
+            .run(
+                "user_prompt_submit",
+                &cwd,
+                &emit,
+                crate::hooks::merge_payload(
+                    base_hook_payload.clone(),
+                    json!({ "prompt": user_text }),
+                ),
+            )
+            .await;
         push_msg!(
             messages,
             persist,
@@ -497,7 +607,15 @@ pub async fn run(
                         let reg = registry_arc.clone();
                         let emit_c = emit_for_safe.clone();
                         let ctx_c = clone_tool_ctx(tool_ctx_ref);
-                        async move { (i, run_safe_call(call, &reg, &ctx_c, &emit_c).await) }
+                        let hooks_c = hooks.clone();
+                        let hook_base = base_hook_payload.clone();
+                        async move {
+                            (
+                                i,
+                                run_safe_call(call, &reg, &ctx_c, &emit_c, &hooks_c, &hook_base)
+                                    .await,
+                            )
+                        }
                     })
                     .collect();
                 let join_fut = futures::future::join_all(tasks);
@@ -525,9 +643,17 @@ pub async fn run(
             if !early_stop {
                 for &i in &risky_idx {
                     let call = &turn.tool_calls[i];
-                    let outcome =
-                        run_one_tool(call, &registry, &tool_ctx, &emit, &mut inbox, &mut automode)
-                            .await;
+                    let outcome = run_one_tool(
+                        call,
+                        &registry,
+                        &tool_ctx,
+                        &emit,
+                        &mut inbox,
+                        &mut automode,
+                        &hooks,
+                        &base_hook_payload,
+                    )
+                    .await;
                     let stop_now = matches!(outcome.as_ref(), Err(r) if r == "stop");
                     outcomes.insert(i, outcome);
                     if stop_now {
@@ -582,6 +708,9 @@ pub async fn run(
                 }
             }
             if early_stop {
+                hooks
+                    .run("session_stop", &cwd, &emit, base_hook_payload.clone())
+                    .await;
                 return Ok(());
             }
 
@@ -603,7 +732,10 @@ async fn run_one_tool(
     emit: &EventEmitter,
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
     automode: &mut bool,
+    hooks: &crate::hooks::Hooks,
+    base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
+    let mut call = call.clone();
     let tool = match registry.get(&call.name) {
         Some(t) => t,
         None => {
@@ -623,19 +755,74 @@ async fn run_one_tool(
         }
     };
 
+    let mutation = hooks
+        .mutate(
+            "pre_tool_use_mutate",
+            &tool_ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": tool.args_summary(&call.input),
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
+    if let Some(args) = mutation.get("args") {
+        call.input = args.clone();
+    }
+    let args_summary = tool.args_summary(&call.input);
     emit.emit(SessionEvent::ToolUse {
         tool: call.name.clone(),
         args: call.input.clone(),
     });
+    hooks
+        .run(
+            "pre_tool_use",
+            &tool_ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.input,
+                    "args_summary": args_summary,
+                    "risk": tool.risk(),
+                }),
+            ),
+        )
+        .await;
 
     let needs_approval = !*automode && matches!(tool.risk(), ToolRisk::Risky);
     if needs_approval {
         emit.emit(SessionEvent::ToolApprovalRequest {
             call_id: call.id.clone(),
             tool: call.name.clone(),
-            args_summary: tool.args_summary(&call.input),
+            args_summary: args_summary.clone(),
             risk: tool.risk(),
         });
+        hooks
+            .run(
+                "tool_approval_request",
+                &tool_ctx.cwd,
+                emit,
+                crate::hooks::merge_payload(
+                    base_hook_payload.clone(),
+                    json!({
+                        "call_id": call.id,
+                        "tool": call.name,
+                        "args": call.input,
+                        "args_summary": args_summary,
+                        "risk": tool.risk(),
+                    }),
+                ),
+            )
+            .await;
         // Park on the inbox until we see a matching decision.
         loop {
             match inbox.recv().await {
@@ -695,6 +882,26 @@ async fn run_one_tool(
             output: format!("({reason})"),
         }),
     }
+    let (ok, output) = match &outcome {
+        Ok(o) => (o.ok, o.output.clone()),
+        Err(reason) => (false, format!("({reason})")),
+    };
+    hooks
+        .run(
+            "post_tool_use",
+            &tool_ctx.cwd,
+            emit,
+            crate::hooks::merge_payload(
+                base_hook_payload.clone(),
+                json!({
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "ok": ok,
+                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
+                }),
+            ),
+        )
+        .await;
     outcome
 }
 
