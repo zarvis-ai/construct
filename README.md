@@ -1,6 +1,6 @@
 # agentd
 
-**Command a fleet of agents, designed for hackers.**
+**Command a fleet of agents, designed for hackers cracking the matrix.**
 
 Create Codex, Claude Code, Antigravity, and Zarvis sessions all in one place. Or
 let your agent coordinate them in a terminal crafted for hardcore hackers like
@@ -61,7 +61,7 @@ Use `?` for help and `M-x` for the command palette. From the TUI you can create
 sessions, switch between agents, send input, inspect diffs, and interrupt or stop
 work without leaving the flow.
 
-### 4. Start your agent
+### 4. Start crack the matrix
 
 Happy hacking. Chase the dream idea from your terminal: ask Codex, Claude Code,
 Antigravity, and [Zarvis](docs/zarvis.md) to dive into the hard parts, then keep
