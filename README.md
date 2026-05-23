@@ -3,7 +3,7 @@
 **Command a fleet of agents, designed for hackers.**
 
 Create Codex, Claude Code, Antigravity, and Zarvis sessions all in one place. Or
-let your agent coordinate them in a workspace crafted for hardcore hackers like
+let your agent coordinate them in a terminal crafted for hardcore hackers like
 you. Remote control from your phone when you're in motion.
 
 ```
