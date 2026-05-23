@@ -1,10 +1,10 @@
 # zarvis built-in agent
 
-
-`zarvis` is a self-contained headless agent that ships with agentd. It
-talks to OpenAI, Anthropic, or a local Ollama directly and runs its own
-agent loop with shell + filesystem + agentd-control tools. No external
-CLI install required.
+`zarvis` is the built-in agent that ships with agentd. It talks to OpenAI,
+Anthropic, or a local Ollama directly and runs its own agent loop with shell +
+filesystem + agentd-control tools. No external CLI install required. Many PRs
+for the agentd repository have already been made from Zarvis sessions running
+inside agentd.
 
 ### Quick start
 

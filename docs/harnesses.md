@@ -1,24 +1,6 @@
 # Harnesses and session modes
 
-## Milestone 1 scope
-
-Implemented:
-
-- [x] Session lifecycle (create, list, get, send input, interrupt, stop, kill)
-- [x] Multi-harness adapters: `shell`, `claude`, `codex`, `antigravity`, `zarvis`
-- [x] **Multi-turn** for `claude` (via `--resume <session_id>`) and `codex`
-      (per-turn re-spawn; opt-in resume via `AGENTD_CODEX_RESUME_FLAG`)
-- [x] Live transcript view (streaming, structural rendering)
-- [x] Session list with status glyphs
-- [x] Send input to selected session; mid-turn inputs queue for the next turn
-- [x] Diff panel (uses `git diff` against the session cwd / worktree)
-- [x] Git worktree isolation (`--worktree`)
-- [x] Command palette (`M-x`)
-- [x] emacs + vim keymap profiles
-- [x] Config file (`~/.config/agentd/config.toml`)
-- [x] Daemon + client process split (Unix socket)
-
-### Per-adapter modes
+## Per-adapter modes
 
 Each session has a **mode**: `interactive` (PTY-attached, default when the
 TUI is creating sessions) or `headless` (structured stream, default for
@@ -137,10 +119,3 @@ for its harness:
 Sessions whose adapter binary is missing, whose start params can't
 be loaded, or whose harness rejects the respawn are marked `Errored`
 (transcript + scrollback remain readable).
-
-Deferred to later milestones:
-
-- Custom user keymap file (today: choose `AGENTD_KEYMAP=emacs|vim`)
-- Cost/token dashboards across sessions
-- Notifications (desktop / Slack)
-- Web UI on the same IPC

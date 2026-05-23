@@ -102,19 +102,12 @@ export ANTHROPIC_API_KEY=sk-ant-...
   interactive vs. headless modes, worktree isolation, and resume behavior.
 - [Zarvis built-in agent](docs/zarvis.md) — providers, model selection, tools,
   approvals, automode, and hooks.
-- [MCP bridge](docs/mcp.md) — how Claude/Codex sessions can control agentd and
-  use browser tools.
+- [Unified tool layer](docs/unified-tool-layer.md) — MCP servers and shared tools for
+  fleet control, browser automation, and agent coordination.
 - [Configuration](docs/configuration.md) — XDG paths, `AGENTD_*` overrides, and
   TUI theme customization.
 - [Contributor workflow](AGENTS.md) — PR workflow, build expectations, and TUI
   recording guidance.
-
-## Smoke test
-
-```sh
-cargo build --workspace
-scripts/smoke.sh
-```
 
 ## License
 
