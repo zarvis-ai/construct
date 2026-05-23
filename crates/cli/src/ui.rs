@@ -3919,11 +3919,23 @@ fn vt100_color(c: vt100::Color) -> Option<Color> {
 /// bytes within the quiescence window, otherwise the session's static
 /// lifecycle glyph.
 fn session_status_glyph(app: &App, s: &SessionSummary) -> &'static str {
-    if matches!(s.state, SessionState::Running) && app.pty_active(&s.id) {
+    if session_should_animate_status(s, app.pty_active(&s.id)) {
         app.spinner_frame()
     } else {
         s.state.glyph()
     }
+}
+
+fn session_should_animate_status(s: &SessionSummary, pty_active: bool) -> bool {
+    if !matches!(s.state, SessionState::Running) {
+        return false;
+    }
+    // Shell and PTY-only harnesses can remain in `Running` while idle,
+    // so they still need the short PTY-activity gate. Zarvis has an
+    // explicit Running/AwaitingInput turn boundary and often works via
+    // structured tool/status events without PTY bytes, so `Running`
+    // itself means the session should visibly animate.
+    pty_active || s.harness == "zarvis"
 }
 
 fn state_style(theme: &Theme, state: SessionState) -> Style {
@@ -5052,5 +5064,27 @@ mod tests {
             "zarvis"
         );
         assert_eq!(harness_label(&summary_with_mode("shell", None)), "shell");
+    }
+
+    #[test]
+    fn zarvis_running_status_animates_without_recent_pty() {
+        let mut s = summary_with_mode("zarvis", Some("interactive"));
+        s.state = SessionState::Running;
+        assert!(session_should_animate_status(&s, false));
+    }
+
+    #[test]
+    fn shell_running_status_stays_static_without_recent_pty() {
+        let mut s = summary_with_mode("shell", None);
+        s.state = SessionState::Running;
+        assert!(!session_should_animate_status(&s, false));
+        assert!(session_should_animate_status(&s, true));
+    }
+
+    #[test]
+    fn awaiting_input_status_stays_static_for_zarvis() {
+        let mut s = summary_with_mode("zarvis", Some("interactive"));
+        s.state = SessionState::AwaitingInput;
+        assert!(!session_should_animate_status(&s, true));
     }
 }
