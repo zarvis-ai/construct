@@ -559,6 +559,7 @@ async fn web_client_loads_and_websocket_connects() {
               const oldMode = state.mode;
               const oldCurrent = state.currentId;
               const oldSize = state.lastReportedSize;
+              const oldFollow = state.resizeFollowBottomUntil;
               const oldRpc = rpc;
               const calls = [];
               rpc = async (method, params) => {
@@ -578,6 +579,11 @@ async fn web_client_loads_and_websocket_connects() {
                   calls.push('bottom');
                   bottom.viewportY = bottom.baseY;
                 },
+                write: (_chunk, cb) => {
+                  calls.push('write-bottom');
+                  bottom.viewportY = 0;
+                  if (cb) cb();
+                },
               };
               state.fitAddon = {
                 fit: () => {
@@ -586,6 +592,7 @@ async fn web_client_loads_and_websocket_connects() {
                 },
               };
               refitTerminal();
+              renderEvent({ type: 'pty', data: btoa('resize repaint') });
               await new Promise((resolve) => requestAnimationFrame(resolve));
 
               const scrolledUp = { viewportY: 10, baseY: 80 };
@@ -598,11 +605,41 @@ async fn web_client_loads_and_websocket_connects() {
                   calls.push('unexpected-bottom');
                   scrolledUp.viewportY = scrolledUp.baseY;
                 },
+                write: (_chunk, cb) => {
+                  calls.push('write-scrolled-up');
+                  scrolledUp.viewportY = 10;
+                  if (cb) cb();
+                },
               };
               state.fitAddon = {
                 fit: () => {
                   calls.push('fit-scrolled-up');
                   scrolledUp.baseY = 90;
+                },
+              };
+              refitTerminal();
+              renderEvent({ type: 'pty', data: btoa('manual scroll repaint') });
+              await new Promise((resolve) => requestAnimationFrame(resolve));
+
+              const rowOnly = { viewportY: 20, baseY: 20 };
+              state.lastReportedSize = { cols: 100, rows: 40 };
+              state.resizeFollowBottomUntil = 0;
+              state.term = {
+                cols: 100,
+                rows: 25,
+                buffer: { active: rowOnly },
+                scrollToBottom: () => {
+                  calls.push('row-only-bottom');
+                  rowOnly.viewportY = rowOnly.baseY;
+                },
+                write: (_chunk, cb) => {
+                  calls.push('row-only-write');
+                  if (cb) cb();
+                },
+              };
+              state.fitAddon = {
+                fit: () => {
+                  calls.push('fit-row-only');
                 },
               };
               refitTerminal();
@@ -613,6 +650,7 @@ async fn web_client_loads_and_websocket_connects() {
               state.mode = oldMode;
               state.currentId = oldCurrent;
               state.lastReportedSize = oldSize;
+              state.resizeFollowBottomUntil = oldFollow;
               rpc = oldRpc;
               return { calls, bottom, scrolledUp };
             })()
@@ -632,10 +670,22 @@ async fn web_client_loads_and_websocket_connects() {
         "expected refit at bottom to call scrollToBottom, got {fit_scroll:?}"
     );
     assert!(
+        calls.iter().any(|v| v.as_str() == Some("write-bottom")),
+        "expected delayed PTY repaint after resize to reach xterm: {fit_scroll:?}"
+    );
+    assert!(
         !calls
             .iter()
             .any(|v| v.as_str() == Some("unexpected-bottom")),
         "refit incorrectly forced a manually-scrolled terminal to bottom: {fit_scroll:?}"
+    );
+    assert!(
+        !calls.iter().any(|v| {
+            v["method"].as_str() == Some("session.pty_resize")
+                && v["params"]["cols"].as_i64() == Some(100)
+                && v["params"]["rows"].as_i64() == Some(25)
+        }),
+        "row-only terminal fits should not send pty_resize/SIGWINCH: {fit_scroll:?}"
     );
     assert_eq!(
         fit_scroll["bottom"]["viewportY"],
@@ -644,6 +694,71 @@ async fn web_client_loads_and_websocket_connects() {
     assert_ne!(
         fit_scroll["scrolledUp"]["viewportY"], fit_scroll["scrolledUp"]["baseY"],
         "manual scroll position should not be forced to bottom: {fit_scroll:?}"
+    );
+
+    // Reconnect regression: mobile keyboard show/hide can churn the browser's
+    // viewport and, on some devices, the websocket. Reconnect must not hydrate
+    // the selected terminal session through transcript/PTY replay, because that
+    // appends old history into xterm and looks like the terminal replayed from
+    // the beginning.
+    let reconnect_terminal: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const oldTerm = state.term;
+              const oldFit = state.fitAddon;
+              const oldMode = state.mode;
+              const oldCurrent = state.currentId;
+              const oldSessions = state.sessions;
+              const oldSize = state.lastReportedSize;
+              const oldRpc = rpc;
+              const calls = [];
+              rpc = async (method, params) => {
+                calls.push({ method, params });
+                return method === 'session.transcript' ? { events: [] } : null;
+              };
+              state.mode = 'terminal';
+              state.currentId = 's-reconnect-terminal';
+              state.sessions = [{ id: 's-reconnect-terminal', has_pty: true, mode: 'interactive' }];
+              state.lastReportedSize = { cols: 100, rows: 40 };
+              state.term = {
+                cols: 100,
+                rows: 40,
+                buffer: { active: { viewportY: 50, baseY: 50 } },
+                scrollToBottom: () => calls.push('bottom'),
+              };
+              state.fitAddon = { fit: () => calls.push('fit') };
+
+              refreshCurrentSessionAfterReconnect();
+              await new Promise((resolve) => requestAnimationFrame(resolve));
+
+              state.term = oldTerm;
+              state.fitAddon = oldFit;
+              state.mode = oldMode;
+              state.currentId = oldCurrent;
+              state.sessions = oldSessions;
+              state.lastReportedSize = oldSize;
+              rpc = oldRpc;
+              return { calls };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate terminal reconnect")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    let reconnect_calls = reconnect_terminal["calls"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !reconnect_calls.iter().any(|v| {
+            matches!(
+                v["method"].as_str(),
+                Some("session.transcript") | Some("session.pty_replay")
+            )
+        }),
+        "terminal reconnect should not replay transcript/PTY history: {reconnect_terminal:?}"
     );
 
     // The remote client mirrors zarvis EditorState events in a
