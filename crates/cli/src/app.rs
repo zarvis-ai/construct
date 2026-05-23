@@ -455,7 +455,6 @@ struct SessionHydration {
     history: Option<crate::pty_render::ItemHistory>,
     editor_state: Option<EditorState>,
     agent_status: Option<agentd_protocol::AgentStatus>,
-    browser_preview: Option<agentd_protocol::BrowserPreview>,
     status_messages: Vec<String>,
 }
 
@@ -607,7 +606,6 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
 
             let mut editor_state = None;
             let mut agent_status = None;
-            let mut browser_preview = None;
             if transcript
                 .events
                 .iter()
@@ -625,13 +623,12 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
                 &mut h,
                 &mut editor_state,
                 &mut agent_status,
-                &mut browser_preview,
             );
             let (cols, rows) = req.terminal_pane_size;
             let _ = h.replay(cols.max(1), rows.max(1), 0);
-            (Some(h), editor_state, agent_status, browser_preview)
+            (Some(h), editor_state, agent_status)
         } else {
-            (None, None, None, None)
+            (None, None, None)
         };
 
         Ok(SessionHydration {
@@ -640,7 +637,6 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
             history: history.0,
             editor_state: history.1,
             agent_status: history.2,
-            browser_preview: history.3,
             status_messages,
         })
     })
@@ -1743,9 +1739,6 @@ impl App {
             self.agent_statuses
                 .insert(hydration.session_id.clone(), status);
         }
-        if let Some(preview) = hydration.browser_preview {
-            self.insert_browser_preview(hydration.session_id.clone(), preview);
-        }
         if let Some(msg) = hydration.status_messages.last() {
             self.set_status(msg.clone());
         }
@@ -1923,7 +1916,6 @@ impl App {
         // call_id and just fills `output` on the existing block.
         let mut replayed_editor_state: Option<EditorState> = None;
         let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
-        let mut replayed_browser_preview: Option<agentd_protocol::BrowserPreview> = None;
         match self.client.transcript(id, 0, None).await {
             Ok(t) => {
                 if t.events
@@ -1942,7 +1934,6 @@ impl App {
                     &mut history,
                     &mut replayed_editor_state,
                     &mut replayed_agent_status,
-                    &mut replayed_browser_preview,
                 );
             }
             Err(e) => {
@@ -1954,9 +1945,6 @@ impl App {
         }
         if let Some(status) = replayed_agent_status {
             self.agent_statuses.insert(id.to_string(), status);
-        }
-        if let Some(preview) = replayed_browser_preview {
-            self.insert_browser_preview(id.to_string(), preview);
         }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
@@ -4803,7 +4791,6 @@ pub fn apply_transcript_to_local_state(
     history: &mut crate::pty_render::ItemHistory,
     editor_state: &mut Option<EditorState>,
     agent_status: &mut Option<agentd_protocol::AgentStatus>,
-    browser_preview: &mut Option<agentd_protocol::BrowserPreview>,
 ) {
     for ev in events {
         match &ev.event {
@@ -4864,6 +4851,11 @@ pub fn apply_transcript_to_local_state(
                     completions: completions.clone(),
                 });
             }
+            // Browser previews are deliberately NOT reconstructed from
+            // the transcript — they're ephemeral, live-only UI: the
+            // overlay/wallpaper must never resurrect a stale thumbnail on
+            // reconnect/restart or session switch.
+
             // Mirror the live notification handler: `active=true`
             // sets the running status; `active=false` clears it and
             // appends the dim completion line into the local PTY
@@ -4871,9 +4863,6 @@ pub fn apply_transcript_to_local_state(
             // event, so a fresh TUI must synthesize the same history
             // row during transcript replay or the completed-turn
             // message disappears after reconnect/restart.
-            SessionEvent::BrowserPreview(preview) => {
-                *browser_preview = Some(preview.clone());
-            }
             SessionEvent::AgentStatus(status) => {
                 if status.active {
                     *agent_status = Some(status.clone());
@@ -5624,6 +5613,28 @@ mod tests {
             0,
             "wallpaper must vanish when the preview is gone"
         );
+
+        // Cross-session: the rain wallpaper is a fleet visualization, so a
+        // preview from a session that is NOT the selected one still paints
+        // the backdrop (the per-session overlay stays scoped, but the
+        // wallpaper tracks the latest preview from any session).
+        app.browser_previews.insert(
+            "s-other".into(),
+            BrowserPreviewState {
+                hide_after: Instant::now() + Duration::from_secs(60),
+                hover_started: None,
+                decoded: Some(std::sync::Arc::new(image::RgbaImage::from_pixel(
+                    32,
+                    24,
+                    image::Rgba([40, 180, 40, 255]),
+                ))),
+                revealed_at: Instant::now() - Duration::from_secs(10),
+            },
+        );
+        assert!(
+            count_wallpaper_cells(&mut app) > 0,
+            "a non-selected session's preview should still paint the rain wallpaper (cross-session)"
+        );
         server.abort();
     }
 
@@ -6070,13 +6081,11 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status: Option<AgentStatus> = None;
-        let mut browser_preview = None;
         apply_transcript_to_local_state(
             &events,
             &mut history,
             &mut editor,
             &mut status,
-            &mut browser_preview,
         );
 
         // The render must include the synthesized header for the
@@ -6142,13 +6151,11 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status = None;
-        let mut browser_preview = None;
         apply_transcript_to_local_state(
             &events,
             &mut history,
             &mut editor,
             &mut status,
-            &mut browser_preview,
         );
 
         let screen_rows = 24u16;
@@ -6206,13 +6213,11 @@ mod tests {
             started_at_ms,
             status: "Working".into(),
         });
-        let mut browser_preview = None;
         apply_transcript_to_local_state(
             &events,
             &mut history,
             &mut editor,
             &mut status,
-            &mut browser_preview,
         );
 
         assert!(
@@ -6345,13 +6350,11 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor_state: Option<EditorState> = None;
         let mut agent_status: Option<agentd_protocol::AgentStatus> = None;
-        let mut browser_preview = None;
         apply_transcript_to_local_state(
             &events,
             &mut history,
             &mut editor_state,
             &mut agent_status,
-            &mut browser_preview,
         );
 
         let state = editor_state

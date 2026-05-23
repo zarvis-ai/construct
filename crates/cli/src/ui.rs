@@ -1284,25 +1284,28 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
 
     let now = Instant::now();
 
-    // Wallpaper: if the selected session has a live browser preview (the
-    // same one shown as the terminal-view overlay — appears/disappears in
-    // lock-step since both read `browser_previews`), paint it dimmed and
-    // cropped-to-fill as a backdrop. The rain loop below draws over it:
-    // cells with a drop/letter overwrite the image, empty cells keep it,
-    // so the animation runs uninterrupted on top of the wallpaper.
+    // Wallpaper: paint the most recent browser preview from ANY session
+    // (cross-session — the matrix rain is a fleet visualization, so the
+    // backdrop reflects the whole fleet, not just the focused session,
+    // unlike the per-session terminal overlay) dimmed and cropped-to-fill
+    // as a backdrop. The rain loop below draws over it: cells with a
+    // drop/letter overwrite the image, empty cells keep it, so the
+    // animation runs uninterrupted on top of the wallpaper.
     //
     // Dial-up nostalgia: the image draws in top-to-bottom when the
     // preview arrives and erases top-to-bottom when it's about to hide,
     // like a JPEG over a slow modem. The matrix tick (~8fps) already
     // redraws each frame, so the animation advances on its own.
-    let wallpaper = app.selected_id().and_then(|id| app.browser_previews.get(&id)).and_then(
-        |state| {
+    let wallpaper = app
+        .browser_previews
+        .values()
+        .max_by_key(|state| state.revealed_at)
+        .and_then(|state| {
             state
                 .decoded
                 .clone()
                 .map(|img| (img, state.revealed_at, state.hide_after, state.hover_started.is_some()))
-        },
-    );
+        });
     if let Some((img, revealed_at, hide_after, hovered)) = &wallpaper {
         let row_frac = preview_reveal_range(*revealed_at, *hide_after, now, *hovered);
         if row_frac.1 > row_frac.0 {

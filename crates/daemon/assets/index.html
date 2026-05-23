@@ -387,35 +387,56 @@
     white-space: pre-wrap;
     overflow-x: auto;
   }
+  /* Top-right overlay over the terminal screen (anchored to
+     .terminal-wrap, above the scroll buttons). Mirrors the TUI. */
   .browser-preview {
-    flex: 0 0 auto;
-    display: flex;
-    justify-content: flex-end;
-    align-items: center;
-    padding: 6px;
+    position: absolute;
+    top: 8px;
+    right: calc(8px + env(safe-area-inset-right));
+    z-index: 6;
+    width: min(320px, 55vw);
+    padding: 4px;
     background: var(--bg);
-    border-top: 1px solid var(--border);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
   }
   .browser-preview[hidden] { display: none !important; }
   .browser-preview img {
     display: block;
-    width: auto;
+    width: 100%;
     height: auto;
-    max-width: min(360px, 60vw);
-    max-height: min(180px, 28vh);
+    max-height: min(180px, 26vh);
     object-fit: contain;
-    border-radius: 4px;
+    border-radius: 2px;
     background: #000;
   }
+  .browser-preview-caption {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .browser-preview-close {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 18px;
+    height: 18px;
+    line-height: 16px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: rgba(0, 0, 0, 0.55);
+    color: var(--fg);
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .browser-preview-close:hover { background: rgba(0, 0, 0, 0.8); }
   @media (max-width: 720px) {
-    .browser-preview {
-      justify-content: center;
-      padding: 4px 6px;
-    }
-    .browser-preview img {
-      max-width: min(100%, 360px);
-      max-height: min(160px, 24vh);
-    }
+    .browser-preview { width: min(70vw, 320px); }
   }
 
   .editor-state {
@@ -983,9 +1004,17 @@
           <button type="button" id="terminalBottomBtn" aria-label="scroll terminal to bottom">bottom</button>
         </div>
         <div class="terminal-loading" id="terminalLoading">loading xterm…</div>
-      </div>
-      <div class="browser-preview" id="browserPreview" hidden>
-        <img id="browserPreviewImg" alt="browser preview" />
+        <!--
+          Browser preview: a top-right overlay over the terminal screen,
+          mirroring the desktop TUI. Autohides after a few seconds; hover
+          pins it; the × dismisses it.
+        -->
+        <div class="browser-preview" id="browserPreview" hidden>
+          <button type="button" class="browser-preview-close" id="browserPreviewClose"
+                  aria-label="close browser preview" title="close">×</button>
+          <img id="browserPreviewImg" alt="browser preview" />
+          <div class="browser-preview-caption" id="browserPreviewCaption"></div>
+        </div>
       </div>
       <!--
         Zarvis interactive emits structured editor_state events instead
@@ -1153,6 +1182,12 @@ const terminalTopBtn = $("terminalTopBtn");
 const terminalBottomBtn = $("terminalBottomBtn");
 const browserPreviewEl = $("browserPreview");
 const browserPreviewImgEl = $("browserPreviewImg");
+const browserPreviewCaptionEl = $("browserPreviewCaption");
+const browserPreviewCloseEl = $("browserPreviewClose");
+/** Autohide timer for the browser-preview overlay (mirrors the TUI's
+ *  ~7s timeout). Hover pins it (clears the timer); the × dismisses. */
+let browserPreviewHideTimer = null;
+const BROWSER_PREVIEW_TTL_MS = 7000;
 const editorStateEl = $("editorState");
 const vkbdEl = $("vkbd");
 const vkbdSpecialEl = $("vkbdSpecial");
@@ -1804,19 +1839,43 @@ function clearBrowserPreview(sessionId) {
   if (sessionId === state.currentId) renderBrowserPreviewForSession(sessionId);
 }
 
+function scheduleBrowserPreviewHide() {
+  clearTimeout(browserPreviewHideTimer);
+  browserPreviewHideTimer = setTimeout(
+    () => clearBrowserPreview(state.currentId),
+    BROWSER_PREVIEW_TTL_MS
+  );
+}
+
 function renderBrowserPreviewForSession(sessionId) {
   const preview = sessionId ? state.browserPreviewById.get(sessionId) : null;
   if (!preview || !preview.image) {
+    clearTimeout(browserPreviewHideTimer);
     browserPreviewEl.hidden = true;
     browserPreviewImgEl.removeAttribute("src");
     browserPreviewImgEl.removeAttribute("title");
+    browserPreviewCaptionEl.textContent = "";
     return;
   }
   browserPreviewImgEl.src = `data:image/png;base64,${preview.image}`;
   browserPreviewImgEl.alt = "browser preview";
-  browserPreviewImgEl.title = preview.title || preview.url || "browser preview";
+  const caption = preview.title || preview.url || "browser preview";
+  browserPreviewImgEl.title = caption;
+  browserPreviewCaptionEl.textContent = caption;
   browserPreviewEl.hidden = false;
+  // Autohide unless the cursor is over the overlay (pinned).
+  if (!browserPreviewEl.matches(":hover")) scheduleBrowserPreviewHide();
 }
+
+// Wire the overlay's pin-on-hover + close affordances once.
+browserPreviewEl.addEventListener("mouseenter", () =>
+  clearTimeout(browserPreviewHideTimer)
+);
+browserPreviewEl.addEventListener("mouseleave", scheduleBrowserPreviewHide);
+browserPreviewCloseEl.addEventListener("click", () => {
+  clearTimeout(browserPreviewHideTimer);
+  clearBrowserPreview(state.currentId);
+});
 
 /** Flip a group's collapsed bit on the daemon side. The
  *  `group/state` broadcast triggers a re-render. */
@@ -2657,7 +2716,10 @@ function handleNotification(method, params) {
 function renderEvent(event, at) {
   if (!event || !event.type) return;
   if (event.type === "browser_preview") {
-    setBrowserPreview(state.currentId, event);
+    // Ephemeral, live-only: never resurrected from the transcript on
+    // (re)load. The live WS notification path (`handleNotification`) is
+    // the sole setter; here we just skip so a stale historical preview
+    // doesn't pop back up, and so it doesn't fall through to PTY.
     return;
   }
   // PTY events go to xterm in terminal mode (decoded raw bytes →
@@ -2916,9 +2978,9 @@ function replayTranscriptToTerm(events) {
         if (e.active) state.agentStatusById.set(state.currentId, e);
         else state.agentStatusById.delete(state.currentId);
         break;
-      case "browser_preview":
-        setBrowserPreview(state.currentId, e);
-        break;
+      // browser_preview: ephemeral, live-only — deliberately NOT replayed
+      // from the historical transcript (it would resurrect a stale
+      // thumbnail on reload). The live WS path is the sole setter.
       // message / reasoning / status / cost / …: prose is already in
       // the PTY events; structured chrome isn't shown in terminal mode.
     }

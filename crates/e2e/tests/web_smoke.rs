@@ -895,33 +895,55 @@ async fn web_client_loads_and_websocket_connects() {
         "message event was rendered in terminal mode — prose would double up:\n{replay}"
     );
 
-    // Browser previews are UI-only thumbnails. They should be stored
-    // per session and rendered as an image-only panel for the selected
-    // session, not as visible transcript text.
+    // Browser preview (issue: TUI parity). Delivered by the LIVE WS
+    // notification path (`handleNotification`), stored per session, and
+    // shown as a top-right overlay ANCHORED OVER THE TERMINAL (a child of
+    // #terminalWrap, position:absolute), with a caption + close button,
+    // not the old separate strip below the terminal. The × dismisses it
+    // and drops the stored entry. Previews are EPHEMERAL: replaying the
+    // transcript (`renderEvent`, as `loadTranscript` does on reload) must
+    // NOT resurrect a stale thumbnail.
     let browser_preview: serde_json::Value = page
         .evaluate(
             r#"
             (() => {
               const png1x1 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
               state.currentId = 'sBrowser';
-              renderBrowserPreviewForSession('sBrowser');
-              renderEvent({
+              const evt = {
                 type: 'browser_preview',
                 url: 'https://example.test/page',
                 title: 'Example Preview',
                 image: png1x1,
                 width: 1,
                 height: 1
+              };
+              // Live path: arrives as a session/event notification.
+              handleNotification('session/event', {
+                session_id: 'sBrowser', event: evt, at: 0,
               });
               const panel = document.getElementById('browserPreview');
               const img = document.getElementById('browserPreviewImg');
-              return {
-                hidden: panel.hidden,
+              const caption = document.getElementById('browserPreviewCaption');
+              const cs = getComputedStyle(panel);
+              const out = {
+                shown: !panel.hidden,
+                parentId: panel.parentElement.id,
+                position: cs.position,
+                top: cs.top,
                 srcPrefix: img.getAttribute('src').slice(0, 21),
-                title: img.getAttribute('title'),
-                text: panel.textContent.trim(),
-                stored: state.browserPreviewById.has('sBrowser')
+                caption: caption.textContent.trim(),
+                hasClose: !!document.getElementById('browserPreviewClose'),
               };
+              // Dismiss via the × and confirm it hides + forgets the entry.
+              document.getElementById('browserPreviewClose').click();
+              out.hiddenAfterClose = panel.hidden;
+              out.storedAfterClose = state.browserPreviewById.has('sBrowser');
+              // Ephemeral: replaying the same event through the transcript
+              // path must NOT bring the thumbnail back.
+              renderEvent(evt);
+              out.shownAfterReplay = !panel.hidden;
+              out.storedAfterReplay = state.browserPreviewById.has('sBrowser');
+              return out;
             })()
             "#,
         )
@@ -929,11 +951,23 @@ async fn web_client_loads_and_websocket_connects() {
         .expect("evaluate browser preview")
         .into_value::<serde_json::Value>()
         .expect("json object");
-    assert_eq!(browser_preview["hidden"], false);
+    assert_eq!(browser_preview["shown"], true);
+    assert_eq!(browser_preview["parentId"], "terminalWrap", "overlay anchored over the terminal");
+    assert_eq!(browser_preview["position"], "absolute");
+    assert_eq!(browser_preview["top"], "8px", "top-right corner");
     assert_eq!(browser_preview["srcPrefix"], "data:image/png;base64");
-    assert_eq!(browser_preview["title"], "Example Preview");
-    assert_eq!(browser_preview["text"], "");
-    assert_eq!(browser_preview["stored"], true);
+    assert_eq!(browser_preview["caption"], "Example Preview");
+    assert_eq!(browser_preview["hasClose"], true);
+    assert_eq!(browser_preview["hiddenAfterClose"], true, "× dismisses the overlay");
+    assert_eq!(browser_preview["storedAfterClose"], false, "× forgets the stored preview");
+    assert_eq!(
+        browser_preview["shownAfterReplay"], false,
+        "transcript replay must not resurrect a closed/ephemeral preview"
+    );
+    assert_eq!(
+        browser_preview["storedAfterReplay"], false,
+        "transcript replay must not re-store an ephemeral preview"
+    );
 
     // Pause briefly so the final rendered state lands in the
     // video before we stop the screencast — otherwise reviewers
