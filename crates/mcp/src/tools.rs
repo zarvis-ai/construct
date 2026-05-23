@@ -171,6 +171,21 @@ pub fn catalog() -> Vec<Value> {
         ),
     ];
     tools.extend(browser::catalog());
+    // Dev-only: hot-reload the daemon's web UI from a worktree's assets.
+    // Only advertised in debug builds so it never appears in production.
+    #[cfg(debug_assertions)]
+    tools.push(tool(
+        "webui_hot_reload",
+        "Dev-only. Point the running agentd daemon's web UI at a directory of assets \
+         (typically `<worktree>/crates/daemon/assets`) so edits to `index.html` / static files \
+         show up on browser refresh — a live-reload poller is injected so the page reloads on \
+         save. Pass `dir: null` (or omit) to revert to the embedded assets. Lets a dev session \
+         iterate on the web UI against an already-running daemon with no rebuild or restart.",
+        json!({
+            "type": "object",
+            "properties": { "dir": { "type": "string" } }
+        }),
+    ));
     tools
 }
 
@@ -390,6 +405,11 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             client.move_session(&sid, direction).await?;
             json!({ "ok": true })
         }
+        "webui_hot_reload" => {
+            let dir = args.get("dir").and_then(|v| v.as_str()).map(String::from);
+            let res = client.dev_set_assets(dir).await?;
+            json!({ "dir": res.dir, "embedded": res.dir.is_none() })
+        }
         other => return Err(anyhow!("unknown tool: {other}")),
     };
 
@@ -442,5 +462,16 @@ mod tests {
         ] {
             assert!(names.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn webui_hot_reload_tool_is_debug_only() {
+        let names: std::collections::HashSet<String> = catalog()
+            .into_iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        // Tests run in debug, so the dev-only tool is advertised here;
+        // it's `#[cfg(debug_assertions)]`-gated out of release builds.
+        assert_eq!(names.contains("webui_hot_reload"), cfg!(debug_assertions));
     }
 }

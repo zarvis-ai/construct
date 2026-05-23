@@ -602,6 +602,14 @@ pub mod ipc_method {
     /// connection is closed by the kernel during exec(), so clients
     /// detect the restart as a socket close and reconnect.
     pub const DAEMON_RESTART: &str = "daemon.restart";
+    /// Dev tooling: point the running daemon at a directory of web-UI
+    /// assets (`index.html`, `static/*`) to serve from disk instead of
+    /// the binary's embedded copies, and inject a live-reload poller so
+    /// edits show up on browser refresh / automatically. `dir: None`
+    /// reverts to the embedded assets. Lets you iterate on `index.html`
+    /// in a worktree against an already-running daemon — no rebuild or
+    /// restart.
+    pub const DEV_SET_ASSETS: &str = "dev.set_assets";
 }
 
 pub mod ipc_notif {
@@ -1012,6 +1020,22 @@ pub struct RemoteStartParams {
 
 fn default_true() -> bool {
     true
+}
+
+/// Params for `dev.set_assets`. `dir: None` reverts to the embedded
+/// web-UI assets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DevSetAssetsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
+}
+
+/// Result of `dev.set_assets`: the directory now in effect (`None` =
+/// embedded assets).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DevAssetsResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// Result of the `remote.start` IPC method. Always reflects what

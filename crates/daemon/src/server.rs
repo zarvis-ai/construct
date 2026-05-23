@@ -250,6 +250,69 @@ const REMOTE_XTERM_CSS: &[u8] = include_bytes!("../assets/static/xterm.css");
 const REMOTE_XTERM_ADDON_FIT_JS: &[u8] =
     include_bytes!("../assets/static/xterm-addon-fit.js");
 
+/// Read a web-UI asset by path relative to the assets root, preferring
+/// `dev_dir` (when set, debug-only) over the embedded copy. Returns the
+/// bytes plus whether they came from disk.
+fn web_asset(dev_dir: Option<&std::path::Path>, rel: &str, embedded: &[u8]) -> (Vec<u8>, bool) {
+    if let Some(dir) = dev_dir {
+        if let Ok(bytes) = std::fs::read(dir.join(rel)) {
+            return (bytes, true);
+        }
+    }
+    (embedded.to_vec(), false)
+}
+
+/// `index.html` bytes, with a live-reload poller injected when served
+/// from the dev-assets dir so browser edits show up on save.
+fn web_index_html(dev_dir: Option<&std::path::Path>) -> Vec<u8> {
+    let (bytes, from_disk) = web_asset(dev_dir, "index.html", REMOTE_INDEX_HTML.as_bytes());
+    #[cfg(debug_assertions)]
+    if from_disk {
+        if let Ok(html) = std::str::from_utf8(&bytes) {
+            // Poll the version endpoint; reload on any change. URL is
+            // relative to `/t/<token>/`.
+            const LIVERELOAD: &str = "<script>(function(){let last=null;async function t(){try{const r=await fetch('dev/version',{cache:'no-store'});if(r.ok){const v=await r.text();if(last!==null&&v!==last)location.reload();last=v;}}catch(e){}setTimeout(t,700);}t();})();</script>";
+            let mut out = String::with_capacity(html.len() + LIVERELOAD.len());
+            match html.rfind("</body>") {
+                Some(pos) => {
+                    out.push_str(&html[..pos]);
+                    out.push_str(LIVERELOAD);
+                    out.push_str(&html[pos..]);
+                }
+                None => {
+                    out.push_str(html);
+                    out.push_str(LIVERELOAD);
+                }
+            }
+            return out.into_bytes();
+        }
+    }
+    let _ = from_disk;
+    bytes
+}
+
+/// Combined mtime fingerprint of the dev assets for the live-reload
+/// poller — changes whenever any served file is edited.
+#[cfg(debug_assertions)]
+fn dev_assets_version(dir: &std::path::Path) -> String {
+    let mut parts = Vec::new();
+    for rel in [
+        "index.html",
+        "static/xterm.js",
+        "static/xterm.css",
+        "static/xterm-addon-fit.js",
+    ] {
+        let ms = std::fs::metadata(dir.join(rel))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        parts.push(format!("{rel}:{ms}"));
+    }
+    parts.join(",")
+}
+
 /// Cap on the HTTP request prelude (request-line + headers, up to
 /// `\r\n\r\n`). 16 KiB is generous enough for any real browser
 /// request and small enough that a malicious client can't grow our
@@ -583,7 +646,7 @@ async fn handle_ws_connection(
                     200,
                     "OK",
                     "text/html; charset=utf-8",
-                    REMOTE_INDEX_HTML.as_bytes(),
+                    &web_index_html(manager.dev_assets().as_deref()),
                 )
                 .await;
                 return Ok(());
@@ -594,7 +657,7 @@ async fn handle_ws_connection(
                     200,
                     "OK",
                     "application/javascript; charset=utf-8",
-                    REMOTE_XTERM_JS,
+                    &web_asset(manager.dev_assets().as_deref(), "static/xterm.js", REMOTE_XTERM_JS).0,
                 )
                 .await;
                 return Ok(());
@@ -605,7 +668,7 @@ async fn handle_ws_connection(
                     200,
                     "OK",
                     "text/css; charset=utf-8",
-                    REMOTE_XTERM_CSS,
+                    &web_asset(manager.dev_assets().as_deref(), "static/xterm.css", REMOTE_XTERM_CSS).0,
                 )
                 .await;
                 return Ok(());
@@ -616,7 +679,27 @@ async fn handle_ws_connection(
                     200,
                     "OK",
                     "application/javascript; charset=utf-8",
-                    REMOTE_XTERM_ADDON_FIT_JS,
+                    &web_asset(manager.dev_assets().as_deref(), "static/xterm-addon-fit.js", REMOTE_XTERM_ADDON_FIT_JS).0,
+                )
+                .await;
+                return Ok(());
+            }
+            // Dev hot-reload: the injected poller hits this to detect
+            // edits. Only meaningful when dev assets are active; 404
+            // otherwise (the poller is only injected in that case).
+            #[cfg(debug_assertions)]
+            "/dev/version" => {
+                let body = manager
+                    .dev_assets()
+                    .map(|dir| dev_assets_version(&dir))
+                    .unwrap_or_default();
+                let status = if body.is_empty() { 404 } else { 200 };
+                let _ = write_http_response(
+                    &mut wr,
+                    status,
+                    if status == 200 { "OK" } else { "Not Found" },
+                    "text/plain; charset=utf-8",
+                    body.as_bytes(),
                 )
                 .await;
                 return Ok(());
@@ -1163,6 +1246,17 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
+        m if m == ipc_method::DEV_SET_ASSETS => {
+            // Dev-only hot-reload of the web UI: point the running daemon
+            // at a worktree's `assets/` dir (or `None` to revert). A
+            // no-op in release builds (`set_dev_assets` ignores it), so
+            // production always serves the embedded assets.
+            let p = params!(agentd_protocol::DevSetAssetsParams);
+            manager.set_dev_assets(p.dir.map(std::path::PathBuf::from));
+            ok!(&agentd_protocol::DevAssetsResult {
+                dir: manager.dev_assets().map(|d| d.display().to_string()),
+            })
+        }
         other => Response::err(id.clone(), ErrorObject::method_not_found(other)),
     }
 }
@@ -1170,6 +1264,53 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_asset_prefers_dev_dir_then_embedded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"DISK").unwrap();
+        // Present on disk → served from disk.
+        let (bytes, from_disk) = web_asset(Some(dir.path()), "index.html", b"EMBEDDED");
+        assert!(from_disk);
+        assert_eq!(bytes, b"DISK");
+        // Missing on disk → embedded fallback.
+        let (bytes, from_disk) = web_asset(Some(dir.path()), "static/nope.js", b"EMBEDDED");
+        assert!(!from_disk);
+        assert_eq!(bytes, b"EMBEDDED");
+        // No dev dir → embedded.
+        let (bytes, from_disk) = web_asset(None, "index.html", b"EMBEDDED");
+        assert!(!from_disk);
+        assert_eq!(bytes, b"EMBEDDED");
+    }
+
+    #[test]
+    fn web_index_html_injects_livereload_only_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.html"), b"<html><body>hi</body></html>").unwrap();
+        let html = String::from_utf8(web_index_html(Some(dir.path()))).unwrap();
+        assert!(html.contains("hi"));
+        assert!(html.contains("dev/version"), "live-reload poller injected: {html}");
+        // Injected before the closing </body>.
+        assert!(html.find("dev/version").unwrap() < html.rfind("</body>").unwrap());
+        // Embedded (no dev dir) is served verbatim — no poller.
+        let embedded = String::from_utf8(web_index_html(None)).unwrap();
+        assert!(!embedded.contains("dev/version"));
+    }
+
+    #[test]
+    fn dev_assets_version_tracks_mtime() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.html");
+        std::fs::write(&path, b"x").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1000)).unwrap();
+        let v1 = dev_assets_version(dir.path());
+        assert!(v1.contains("index.html"));
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2000)).unwrap();
+        let v2 = dev_assets_version(dir.path());
+        assert_ne!(v1, v2, "version must change when an asset's mtime changes");
+    }
 
     /// `find_prelude_end` locates the `\r\n\r\n` separator that ends
     /// an HTTP/1.1 request prelude. Returns `None` while the buffer
