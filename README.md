@@ -10,20 +10,15 @@ you. Remote control from your phone when you're in motion.
 
 ## Why agentd?
 
-Modern development often means asking several agents to investigate, edit, test,
-review, or monitor the same project. `agentd` turns that from a pile of orphaned
-CLI windows into a managed fleet — fast to read, tactile to drive, and built for
-dense, high-signal engineering work:
-
 - **One cockpit for every agent** — attach to Claude Code, Codex, Antigravity,
   Zarvis, or a shell process from one focused workspace that rewards attention.
 - **Parallel work without losing control** — spawn helper sessions, pin important
   work, interrupt stuck runs, inspect diffs, and send follow-up input mid-turn.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
   output, spawn helpers, send input, inspect diffs, and drive Chrome.
-- **Remote control when you step away** — `/remote-control` opens a
-  browser-accessible web client with a QR code. Connect from your phone, no
-  service signup, no setup required.
+- **[Remote control](docs/remote-control.md) when you step away** — `/remote-control`
+  opens a browser-accessible web client with a QR code. Connect from your phone,
+  no service signup, no setup required.
 - **Extensible harness protocol** — adapters are separate processes speaking
   JSON-RPC over stdio, so new tools can plug in without changing the daemon.
 
@@ -111,8 +106,10 @@ For an optimized build, use `cargo build --workspace --release` and replace
   approvals, automode, and hooks.
 - [Unified tool layer](docs/unified-tool-layer.md) — MCP servers and shared tools for
   fleet control, browser automation, and agent coordination.
-- [Configuration](docs/configuration.md) — XDG paths, `AGENTD_*` overrides,
-  remote-control setup, and TUI theme customization.
+- [Configuration](docs/configuration.md) — XDG paths, `AGENTD_*` overrides, and
+  TUI theme customization.
+- [Remote control](docs/remote-control.md) — phone/browser access, QR setup,
+  credentials, and local debug mode.
 - [Releasing](docs/RELEASING.md) — how the prebuilt binaries are built and
   published, and how to cut a versioned release.
 - [Contributor workflow](AGENTS.md) — PR workflow, build expectations, and TUI
