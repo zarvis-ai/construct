@@ -6,7 +6,7 @@ Create Codex, Claude Code, Antigravity, and Zarvis sessions all in one place. Or
 let your agent coordinate them in a terminal crafted for hardcore hackers like
 you. Remote control from your phone when you're in motion.
 
-![agentd TUI demo](https://raw.githubusercontent.com/zarvis-ai/agentd/readme-assets/demos/browser-thumbnail.gif)
+![agentd TUI demo](https://raw.githubusercontent.com/zarvis-ai/agentd/73525a653d1969474f02f0ac699867a68565ac99/demos/browser-thumbnail.gif)
 
 ## Why agentd?
 
