@@ -2946,7 +2946,7 @@ async function loadTranscript(id) {
   }
   const events = (result && result.events) || [];
   for (const te of events) renderEvent(te.event, te.at);
-  scrollToBottom();
+  scrollToBottom({ force: true });
 }
 
 function handleNotification(method, params) {
@@ -3365,13 +3365,15 @@ function appendError(msg) {
   transcriptEl.appendChild(row);
 }
 
-function scrollToBottom() {
-  // Only auto-scroll if we're already near the bottom — otherwise a
-  // user reading earlier content keeps their place when new events
-  // arrive.
+function scrollToBottom(options = {}) {
+  // Initial transcript hydration should always land at the latest
+  // content. Live events only auto-scroll if we're already near the
+  // bottom — otherwise a user reading earlier content keeps their
+  // place when new events arrive.
+  const force = !!options.force;
   const nearBottom =
     transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 80;
-  if (nearBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  if (force || nearBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
 // --- Composer ------------------------------------------------------------
