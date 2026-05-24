@@ -2517,10 +2517,6 @@ fn render_terminal_scrollbar(
     };
     let track_color = blend_color(Color::Black, theme.text, 0.30);
     let thumb_color = blend_color(Color::Black, theme.text, 0.70);
-    let thumb_style = Style::default()
-        .fg(thumb_color)
-        .bg(thumb_color)
-        .add_modifier(Modifier::BOLD);
     for row in 0..track_h {
         let y = area.y + row as u16;
         for col in 0..bar_w {
@@ -2534,8 +2530,13 @@ fn render_terminal_scrollbar(
     }
     for row in 0..thumb_h {
         let y = area.y + (thumb_top + row) as u16;
-        f.buffer_mut()
-            .set_string(x0, y, " ".repeat(bar_w as usize), thumb_style);
+        for col in 0..bar_w {
+            if let Some(cell) = f.buffer_mut().cell_mut(Position { x: x0 + col, y }) {
+                // Same opacity approximation as the track: preserve the
+                // underlying glyph and foreground, only tint the background.
+                cell.set_bg(thumb_color);
+            }
+        }
     }
     Some(crate::app::TerminalScrollbarHit {
         area: scrollbar_area,
