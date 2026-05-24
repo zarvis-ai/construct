@@ -2648,6 +2648,12 @@ impl App {
         if self.orchestrator_id.as_deref() == Some(session_id.as_str()) {
             return;
         }
+        // Only surface the global minibuffer prompt for the session the
+        // user is currently looking at. Background sessions still render
+        // their approval request inline in their own terminal/transcript.
+        if self.selection.session_id() != Some(session_id.as_str()) {
+            return;
+        }
         // Otherwise: any non-orchestrator minibuffer is shorter-lived
         // and shouldn't be clobbered by an unrelated approval. Skip
         // when busy.
@@ -5610,6 +5616,48 @@ mod tests {
             automode: false,
             kind,
         }
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_opens_for_selected_session() {
+        let (mut app, _dir, server) = captured_app().await;
+
+        app.maybe_open_approval_prompt(
+            "s1".into(),
+            "call-1".into(),
+            "shell".into(),
+            "echo hi".into(),
+            agentd_protocol::ToolRisk::Risky,
+        );
+
+        assert!(matches!(
+            app.minibuffer.as_ref().map(|mb| &mb.intent),
+            Some(MinibufferIntent::ApproveTool { session_id, .. }) if session_id == "s1"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_ignores_unselected_session() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut background = summary_with_kind(agentd_protocol::SessionKind::User);
+        background.id = "background".into();
+        app.sessions.push(background);
+        app.selection = Selection::Session("s1".into());
+
+        app.maybe_open_approval_prompt(
+            "background".into(),
+            "call-1".into(),
+            "shell".into(),
+            "echo hi".into(),
+            agentd_protocol::ToolRisk::Risky,
+        );
+
+        assert!(
+            app.minibuffer.is_none(),
+            "background approval requests should not open the global minibuffer"
+        );
+        server.abort();
     }
 
     // --- repeated-key latency regression guards (see PR #157) ---
