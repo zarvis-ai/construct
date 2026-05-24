@@ -6,6 +6,7 @@ All code changes go through a branch, worktree, and PR — no exceptions.
 
 - **Branch + worktree + PR for every change.** Create a fresh branch off latest `main`, materialize it as a git worktree under `.claude/worktrees/<branch-name>`, make changes there, and open a PR. The top-level checkout at `~/agentd` stays on `main` — never edit files there directly.
 - **No direct push to `main`.** Changes land on `main` only via a merged PR.
+- **Release process lives in [`docs/RELEASING.md`](docs/RELEASING.md).** Use that guide for versioned releases and publishing prebuilt binaries.
 - **No `Co-Authored-By: Claude` trailer in commits.** Don't append model attribution to commit messages. `Co-authored-by:` for other humans is fine.
 - **Clean up after merge.** Remove the worktree (`git worktree remove <path>`), delete the local branch (`git branch -d <name>`), and delete the remote branch (e.g. via GitHub's "delete branch after merge", or `git push <remote> --delete <name>`).
 - **After merge, update and build the main worktree.** Once a PR is merged and the feature worktree is cleaned up, switch to the top-level checkout (`~/agentd`), pull latest `main`, and run `cargo build` there (debug profile). This keeps the user's main worktree binaries current so `/agents restart` can pick up the latest merged `agent` / `agentd` changes, especially when operating from a remote-control session. Report the updated main-worktree debug binary paths when relevant.
