@@ -19,39 +19,28 @@
 <script src="static/xterm-addon-fit.js" defer></script>
 <style>
   :root {
-    --bg: #0e1014;
-    --bg-elev: #161a20;
-    --bg-elev-2: #1f242c;
-    --border: #262c36;
-    --fg: #e5e7eb;
-    --fg-dim: #98a2b3;
-    --fg-faint: #6b7280;
-    --accent: #6ea8fe;
-    --ok: #5cd1a6;
-    --warn: #f4b860;
-    --err: #f47c7c;
-    --bubble-user: #1a2c4a;
-    --bubble-assistant: #1c2027;
-    --bubble-system: #1a1a1f;
-    --session-scrollbar-track: rgba(229, 231, 235, 0.30);
-    --session-scrollbar-thumb: rgba(229, 231, 235, 0.80);
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f7f8fa;
-      --bg-elev: #ffffff;
-      --bg-elev-2: #eef0f4;
-      --border: #dfe3ea;
-      --fg: #11161e;
-      --fg-dim: #4b5563;
-      --fg-faint: #8a93a4;
-      --accent: #2563eb;
-      --bubble-user: #dceaff;
-      --bubble-assistant: #f2f3f6;
-      --bubble-system: #ebecf0;
-      --session-scrollbar-track: rgba(17, 22, 30, 0.30);
-      --session-scrollbar-thumb: rgba(17, 22, 30, 0.80);
-    }
+    --bg: #020805;
+    --bg-elev: #06150c;
+    --bg-elev-2: #0a2112;
+    --border: #186030;
+    --border-faint: rgba(24, 96, 48, 0.46);
+    --fg: #beffcd;
+    --fg-dim: #4c965c;
+    --fg-faint: #20703a;
+    --accent: #39ff88;
+    --accent-alt: #5ce1ff;
+    --modeline-bg: #082e18;
+    --ok: #7dff73;
+    --warn: #ffd75c;
+    --err: #ff5f5a;
+    --bubble-user: rgba(8, 46, 24, 0.82);
+    --bubble-assistant: rgba(6, 21, 12, 0.86);
+    --bubble-system: rgba(4, 14, 8, 0.90);
+    --session-scrollbar-track: rgba(190, 255, 205, 0.30);
+    --session-scrollbar-thumb: rgba(190, 255, 205, 0.80);
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --glow-soft: 0 0 18px rgba(57, 255, 136, 0.12);
+    --glow-hard: 0 0 14px rgba(57, 255, 136, 0.28);
   }
   * { box-sizing: border-box; }
   html, body {
@@ -61,8 +50,9 @@
     overscroll-behavior: none;
     background: var(--bg);
     color: var(--fg);
-    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter",
-          system-ui, sans-serif;
+    font: 13px/1.45 var(--mono);
+    letter-spacing: 0.01em;
+    text-shadow: 0 0 10px rgba(57, 255, 136, 0.10);
     -webkit-text-size-adjust: 100%;
   }
   body {
@@ -73,31 +63,53 @@
     padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
   }
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 2000;
+    background:
+      linear-gradient(rgba(190, 255, 205, 0.025) 50%, rgba(0, 0, 0, 0.08) 50%),
+      radial-gradient(circle at 16% 8%, rgba(57, 255, 136, 0.10), transparent 30%),
+      radial-gradient(circle at 88% 14%, rgba(92, 225, 255, 0.07), transparent 34%);
+    background-size: 100% 4px, 100% 100%, 100% 100%;
+    mix-blend-mode: screen;
+    opacity: 0.70;
+  }
   header {
-    --header-h: 42px;
+    --header-h: 36px;
     flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 8px;
     min-height: var(--header-h);
-    padding: 0 0 0 14px;
-    background: var(--bg-elev);
+    padding: 0 0 0 10px;
+    background: linear-gradient(90deg, var(--modeline-bg, #082e18), #04140a 70%);
     border-bottom: 1px solid var(--border);
+    box-shadow: inset 0 -1px 0 rgba(57, 255, 136, 0.16), var(--glow-soft);
   }
   .mini-matrix {
     flex: 0 0 auto;
     align-self: stretch;
-    width: 96px;
+    width: 104px;
     height: auto;
     min-height: var(--header-h);
     display: block;
-    border-radius: 4px;
-    background: #050806;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+    background: #020805;
+    box-shadow: inset 0 0 18px rgba(57, 255, 136, 0.14);
   }
   @media (max-width: 720px) {
     .mini-matrix { width: 84px; }
   }
-  header .meta { color: var(--fg-dim); font-size: 12px; }
+  header .meta {
+    color: var(--fg);
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
   .conn {
     margin-left: auto;
     display: inline-flex;
@@ -123,10 +135,10 @@
       grid-template-rows: minmax(300px, 50vh) 1fr;
     }
     /* When the inner aside is collapsed via the `≡` toggle,
-       drop the track to `auto` so only the new-session button
-       remains (~40px) and the view pane gets the rest. */
+       collapse the whole list track so the terminal/view pane gets
+       the full remaining height. */
     main:has(.session-list.collapsed) {
-      grid-template-rows: auto 1fr;
+      grid-template-rows: 0 1fr;
     }
     .session-list.collapsed { max-height: 0; padding: 0; border-bottom: none; }
     /* Hide the shared reorder / restart toolbar when the list is
@@ -134,6 +146,13 @@
        there's no list visible to pick a session from. Leaving
        them visible just wastes vertical space and lets the user
        fire move-up / down on a row they can't see. */
+    .session-list-wrap:has(.session-list.collapsed) {
+      min-height: 0;
+      overflow: hidden;
+      border-right: none;
+      border-bottom: none;
+    }
+    .session-list-wrap:has(.session-list.collapsed) .new-session-btn,
     .session-list-wrap:has(.session-list.collapsed) .list-toolbar {
       display: none;
     }
@@ -142,22 +161,33 @@
   .session-list {
     overflow-y: auto;
     border-right: 1px solid var(--border);
-    background: var(--bg-elev);
-    padding: 6px 0;
+    background:
+      linear-gradient(90deg, rgba(57, 255, 136, 0.05), transparent 36%),
+      var(--bg-elev);
+    padding: 4px 0;
     border-bottom: 1px solid var(--border);
   }
   .session-list .item {
-    padding: 8px 14px;
+    margin: 1px 6px;
+    padding: 7px 9px;
     cursor: pointer;
+    border: 1px solid transparent;
     border-left: 3px solid transparent;
     display: flex;
     align-items: center;
     gap: 4px;
   }
-  .session-list .item:hover { background: var(--bg-elev-2); }
+  .session-list .item:hover {
+    background: rgba(57, 255, 136, 0.07);
+    border-color: var(--border-faint);
+  }
   .session-list .item.active {
-    background: var(--bg-elev-2);
-    border-left-color: var(--accent);
+    background: var(--accent);
+    color: #06160c;
+    border-color: var(--accent);
+    border-left-color: var(--accent-alt);
+    text-shadow: none;
+    box-shadow: var(--glow-hard);
   }
   .session-list .item .row-main {
     flex: 1;
@@ -190,12 +220,18 @@
   }
   .session-list .item .sub {
     color: var(--fg-faint);
-    font-size: 11px;
+    font-size: 10px;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.08em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .session-list .item.active .sub,
+  .session-list .item.active .state,
+  .session-list .item.active .pin-indicator,
+  .session-list .item.active .disclosure {
+    color: #06160c;
   }
   .session-list .item .state {
     flex: 0 0 14px;
@@ -321,6 +357,9 @@
     flex-direction: column;
     min-width: 0;
     min-height: 0;
+    background:
+      radial-gradient(circle at 70% 0%, rgba(57, 255, 136, 0.06), transparent 36%),
+      #020805;
   }
   .transcript {
     flex: 1 1 0;
@@ -360,28 +399,36 @@
     letter-spacing: 0.02em;
   }
   .bubble {
-    border-radius: 10px;
-    padding: 8px 12px;
+    border-radius: 0;
+    padding: 8px 10px;
     white-space: pre-wrap;
-    max-width: min(720px, 95%);
+    max-width: min(820px, 95%);
+    border: 1px solid var(--border-faint);
+    box-shadow: inset 0 0 18px rgba(57, 255, 136, 0.045);
   }
   .role-user .bubble {
     background: var(--bubble-user);
     align-self: flex-end;
+    border-color: rgba(92, 225, 255, 0.42);
+    color: #e1ffe6;
   }
   .role-user { align-items: flex-end; }
-  .role-assistant .bubble { background: var(--bubble-assistant); }
+  .role-assistant .bubble {
+    background: var(--bubble-assistant);
+    border-left: 3px solid var(--accent);
+  }
   .role-system .bubble {
     background: var(--bubble-system);
     color: var(--fg-dim);
     font-size: 13px;
+    border-style: dashed;
   }
   .tool {
     border-left: 3px solid var(--accent);
     background: var(--bg-elev);
     padding: 6px 10px;
-    border-radius: 4px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    border-radius: 0;
+    font-family: var(--mono);
     font-size: 12.5px;
     color: var(--fg-dim);
   }
@@ -428,7 +475,7 @@
     font-size: 13px;
   }
   .pty {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
     font-size: 12.5px;
     color: var(--fg);
     background: var(--bg-elev);
@@ -497,7 +544,7 @@
     padding: 6px 10px;
     border-top: 1px solid var(--border);
     background: var(--bg-elev);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
     font-size: 12.5px;
     color: var(--fg);
   }
@@ -537,10 +584,11 @@
     flex: 0 0 auto;
     display: flex;
     gap: 8px;
-    padding: 10px 12px;
+    padding: 8px 10px;
     border-top: 1px solid var(--border);
-    background: var(--bg-elev);
+    background: linear-gradient(90deg, var(--modeline-bg), #031006);
     align-items: end;
+    box-shadow: inset 0 1px 0 rgba(57, 255, 136, 0.12);
   }
   .composer textarea {
     flex: 1;
@@ -549,13 +597,19 @@
     max-height: 30vh;
     padding: 8px 10px;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg);
+    border-radius: 0;
+    background: #020805;
     color: var(--fg);
     font: inherit;
     line-height: 1.4;
+    box-shadow: inset 0 0 12px rgba(57, 255, 136, 0.08);
     /* iOS: keep font ≥16px to suppress auto-zoom on focus */
     font-size: 16px;
+  }
+  .composer textarea::placeholder {
+    color: var(--fg-faint);
+    opacity: 1;
+    text-shadow: 0 0 8px rgba(57, 255, 136, 0.18);
   }
   .composer textarea:focus {
     outline: 1px solid var(--accent);
@@ -564,13 +618,18 @@
   .composer button {
     flex: 0 0 auto;
     padding: 8px 14px;
-    border-radius: 8px;
-    border: none;
+    border-radius: 0;
+    border: 1px solid var(--accent);
     background: var(--accent);
-    color: white;
-    font-weight: 500;
-    font-size: 14px;
+    color: #06160c;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
     cursor: pointer;
+    text-shadow: none;
+    box-shadow: var(--glow-soft);
   }
   .composer button:disabled {
     opacity: 0.4;
@@ -580,7 +639,7 @@
      the "type but don't submit" path), so muted background to
      differentiate from the accent-colored Enter. */
   .composer #insertBtn {
-    background: var(--bg-elev-2);
+    background: transparent;
     color: var(--fg);
   }
 
@@ -602,12 +661,21 @@
   .terminal-wrap {
     flex: 1 1 0;
     min-height: 0;
-    background: #000;
+    background:
+      linear-gradient(rgba(190, 255, 205, 0.018) 50%, rgba(0, 0, 0, 0.055) 50%),
+      radial-gradient(ellipse at center, rgba(57, 255, 136, 0.10), rgba(57, 255, 136, 0.035) 42%, transparent 78%),
+      #020805;
+    background-size: 100% 4px, 100% 100%, 100% 100%;
     position: relative;
     overflow: hidden;
     overscroll-behavior: contain;
     touch-action: pan-y;
     padding: 6px 0 0 6px;
+    border: 1px solid var(--border);
+    box-shadow:
+      inset 0 0 28px rgba(57, 255, 136, 0.12),
+      inset 0 0 90px rgba(0, 0, 0, 0.52),
+      var(--glow-soft);
     /* iOS safe-area inset on the right edge for landscape with notch. */
     padding-right: env(safe-area-inset-right);
   }
@@ -617,6 +685,7 @@
     overflow: hidden;
     overscroll-behavior: contain;
     touch-action: pan-y;
+    mix-blend-mode: screen;
   }
   .terminal-host:focus,
   .terminal-host .xterm:focus { outline: none; }
@@ -624,6 +693,13 @@
   .terminal-host .xterm,
   .terminal-host .xterm .xterm-viewport,
   .terminal-host .xterm .xterm-screen { height: 100%; }
+  .terminal-host .xterm {
+    padding: 2px 0 0 2px;
+    text-shadow: 0 0 9px rgba(57, 255, 136, 0.28);
+  }
+  .terminal-host .xterm .xterm-screen canvas {
+    filter: saturate(1.18) contrast(1.08);
+  }
   .terminal-host .xterm,
   .terminal-host .xterm .xterm-viewport,
   .terminal-host .xterm .xterm-screen,
@@ -675,26 +751,37 @@
   .terminal-scroll-overlay button {
     pointer-events: auto;
     appearance: none;
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    border-radius: 999px;
-    padding: 2px 6px;
-    background: rgba(0, 0, 0, 0.28);
-    color: rgba(255, 255, 255, 0.76);
-    font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 0.01em;
+    border: 1px solid transparent;
+    border-radius: 0;
+    padding: 2px 7px;
+    background: rgba(2, 8, 5, 0.78);
+    color: var(--fg);
+    font: 11px/1.35 var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     backdrop-filter: blur(4px);
+    box-shadow:
+      inset 0 0 10px rgba(57, 255, 136, 0.12),
+      0 0 12px rgba(57, 255, 136, 0.14);
+    text-shadow: 0 0 8px rgba(57, 255, 136, 0.34);
   }
+  .terminal-scroll-overlay button::before { content: "["; color: var(--fg-faint); }
+  .terminal-scroll-overlay button::after { content: "]"; color: var(--fg-faint); }
   .terminal-scroll-overlay button:hover,
   .terminal-scroll-overlay button:focus-visible {
-    background: rgba(0, 0, 0, 0.48);
-    color: #fff;
+    background: rgba(57, 255, 136, 0.18);
+    border-color: transparent;
+    color: #e1ffe6;
     outline: none;
+    box-shadow: var(--glow-hard);
   }
   .terminal-scroll-overlay button:active {
-    background: rgba(110, 168, 254, 0.42);
-    border-color: rgba(110, 168, 254, 0.7);
+    background: var(--accent);
+    border-color: transparent;
+    color: #06160c;
+    text-shadow: none;
   }
 
   /* Virtual keyboard — sits below the terminal in PTY mode.
@@ -861,7 +948,7 @@
     background: var(--bg);
     border: 1px solid var(--border);
     border-radius: 6px;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
     font-size: 12.5px;
     color: var(--fg);
     white-space: pre-wrap;
@@ -918,18 +1005,29 @@
     min-height: 0;
     border-right: 1px solid var(--border);
     background: var(--bg-elev);
+    box-shadow: inset -1px 0 0 rgba(57, 255, 136, 0.10);
+  }
+  .session-list-sr-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
   }
   .new-session-btn {
     appearance: none;
     flex: 0 0 auto;
     margin: 6px 8px;
-    padding: 8px 12px;
-    border-radius: 6px;
+    padding: 7px 10px;
+    border-radius: 0;
     border: 1px dashed var(--border);
     background: transparent;
     color: var(--fg-dim);
     font: inherit;
-    font-size: 13px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
   }
@@ -955,7 +1053,7 @@
     gap: 6px;
     padding: 6px 8px;
     border-top: 1px solid var(--border);
-    background: var(--bg-elev);
+    background: var(--modeline-bg);
   }
   .list-toolbar .row-action {
     /* Override the per-row sizing — toolbar gets slightly larger
@@ -1026,6 +1124,7 @@
       -->
       <button type="button" class="new-session-btn" id="newSessionBtn"
               aria-label="new session">+ new session</button>
+      <span class="session-list-sr-label">sessions</span>
       <aside class="session-list" id="sessionList">
         <div class="empty">connecting…</div>
       </aside>
@@ -2324,10 +2423,32 @@ function initTerminal() {
     // Mobile-friendly defaults; the daemon controls actual PTY size
     // via `session.pty_resize` after we report the fit.
     scrollback: 4000,
-    // Match the surrounding dark theme — xterm's default xtermjs
-    // palette already does OK in dark mode; tweak background to
-    // pure black so the canvas blends with the wrap.
-    theme: { background: "#000000" },
+    // Match the TUI's Matrix-inspired palette so terminal-mode
+    // sessions feel like the desktop terminal rather than a native
+    // browser widget.
+    theme: {
+      background: "#020805",
+      foreground: "#beffcd",
+      cursor: "#39ff88",
+      cursorAccent: "#06160c",
+      selectionBackground: "#1c4e2a",
+      black: "#020805",
+      red: "#ff5f5a",
+      green: "#7dff73",
+      yellow: "#ffd75c",
+      blue: "#5ce1ff",
+      magenta: "#ff7ad9",
+      cyan: "#5ce1ff",
+      white: "#beffcd",
+      brightBlack: "#20703a",
+      brightRed: "#ff8b86",
+      brightGreen: "#39ff88",
+      brightYellow: "#ffe58a",
+      brightBlue: "#8aeaff",
+      brightMagenta: "#ffa6e4",
+      brightCyan: "#8aeaff",
+      brightWhite: "#e1ffe6",
+    },
   });
   state.fitAddon = new window.FitAddon.FitAddon();
   state.term.loadAddon(state.fitAddon);
