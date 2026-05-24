@@ -29,6 +29,17 @@ use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Kind of a structured chat [`Item::Message`], driving its styling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageKind {
+    /// A user prompt (gray `❯` prefix).
+    User,
+    /// Assistant prose (default style).
+    Assistant,
+    /// Model reasoning trace (dim).
+    Reasoning,
+}
+
 /// One element of the rendered session history.
 #[derive(Debug, Clone)]
 pub enum Item {
@@ -40,6 +51,16 @@ pub enum Item {
     /// events; PTY bytes between the corresponding OSC `7700`
     /// markers are discarded.
     ToolBlock(ToolBlock),
+    /// A structured chat message from a session that emits no PTY for
+    /// its conversation (headless harnesses). Rendered as synthesized,
+    /// role-styled text. Streaming deltas arrive as many consecutive
+    /// `Message` items of the same kind; only the first of a run sets
+    /// `break_before`, so a run renders as one continuous block.
+    Message {
+        kind: MessageKind,
+        text: String,
+        break_before: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -261,6 +282,14 @@ enum ItemSig {
         /// block has output — the synth bytes are stable.
         running_elapsed: Option<u64>,
     },
+    /// Message items are immutable once pushed (streaming appends new
+    /// items rather than growing one), so the text length + kind fully
+    /// identify the synthesized bytes.
+    Msg {
+        kind: MessageKind,
+        len: usize,
+        break_before: bool,
+    },
 }
 
 impl ItemSig {
@@ -277,6 +306,15 @@ impl ItemSig {
                 } else {
                     Some(b.started_at.elapsed().as_secs())
                 },
+            },
+            Item::Message {
+                kind,
+                text,
+                break_before,
+            } => ItemSig::Msg {
+                kind: *kind,
+                len: text.len(),
+                break_before: *break_before,
             },
         }
     }
@@ -680,6 +718,32 @@ impl ItemHistory {
         self.dirty = true;
     }
 
+    /// Append a structured chat message (from a headless session that
+    /// emits no PTY for its conversation). The adapter streams a
+    /// `Message`/`Reasoning` event per delta, so consecutive deltas of
+    /// the same kind are pushed as separate items that render
+    /// contiguously — only the first of a run gets a leading break.
+    /// Append-only keeps `replay` incremental (no full reparse).
+    pub fn feed_message(&mut self, kind: MessageKind, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let continues =
+            matches!(self.items.last(), Some(Item::Message { kind: k, .. }) if *k == kind);
+        let break_before = !continues && !self.items.is_empty();
+        if !continues {
+            // A new run starts here — close out any pending PTY bytes so
+            // the message lands at the right point in the sequence.
+            self.flush_chunk();
+        }
+        self.items.push(Item::Message {
+            kind,
+            text: text.to_string(),
+            break_before,
+        });
+        self.dirty = true;
+    }
+
     fn find_block_mut(&mut self, call_id: &str) -> Option<&mut ToolBlock> {
         self.items.iter_mut().rev().find_map(|it| match it {
             Item::ToolBlock(b) if b.call_id == call_id => Some(b),
@@ -724,7 +788,10 @@ impl ItemHistory {
         // user actually saw. This is a no-op when dims match.
         self.set_pty_size(cols, rows);
 
-        let has_blocks = self.items.iter().any(|i| matches!(i, Item::ToolBlock(_)));
+        // Any non-PTY item (a tool block, or a synthesized chat message
+        // from a headless session) needs the synth-aware interleaving
+        // path; the fast and shadow-scrollback paths handle raw PTY only.
+        let needs_synth = self.items.iter().any(|i| !matches!(i, Item::PtyChunk(_)));
         // Mouse-wheel scrollback for non-tool-block sessions
         // (shell / claude / codex): divert to the shadow parser.
         // The shadow sees the same byte stream as main, with
@@ -752,14 +819,14 @@ impl ItemHistory {
         //      disappeared". See
         //      `zarvis_tool_block_survives_one_row_of_scroll`
         //      for the regression repro.
-        if scrollback > 0 && !has_blocks {
+        if scrollback > 0 && !needs_synth {
             self.render_shadow(cols, rows, scrollback);
             return RenderOutput {
                 screen: self.shadow_parser.screen(),
                 blocks: Vec::new(),
             };
         }
-        if has_blocks {
+        if needs_synth {
             self.replay_full(cols, rows, scrollback)
         } else {
             self.replay_cached(cols, rows, scrollback)
@@ -840,8 +907,8 @@ impl ItemHistory {
                 if let Item::PtyChunk(b) = item {
                     cache.parser.process(b);
                 }
-                // ToolBlocks can't occur in this path (has_blocks is
-                // false), but be defensive.
+                // Non-PtyChunk items (tool blocks / messages) can't occur
+                // in this path (needs_synth is false), but be defensive.
             }
             cache.processed_count = self.items.len();
         }
@@ -990,6 +1057,20 @@ impl ItemHistory {
                             bg_cols: synth.bg_button_cols,
                             kill_cols: synth.kill_button_cols,
                         }),
+                    }
+                }
+                Item::Message {
+                    kind,
+                    text,
+                    break_before,
+                } => {
+                    let bytes = synth_message(*kind, text, *break_before);
+                    if idx >= start_processing_at {
+                        cache.parser.process(&bytes);
+                    }
+                    ItemLayout {
+                        lines: count_visible_lines(&bytes, cols),
+                        block: None,
                     }
                 }
             };
@@ -1195,6 +1276,47 @@ fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
 ///   status row with "in background"; `Esc` kill hint only.
 /// - **Completed** (`output != None` and non-placeholder): header
 ///   + glyph + truncated body + optional expand/collapse footer.
+/// Append `text` to `out`, normalizing newlines to CRLF so the vt100
+/// parser advances rows correctly (a bare `\n` would line-feed without a
+/// carriage return → staircase). Lone `\r` is dropped.
+fn push_text_crlf(out: &mut Vec<u8>, text: &str) {
+    let mut buf = [0u8; 4];
+    for ch in text.chars() {
+        match ch {
+            '\r' => {}
+            '\n' => out.extend_from_slice(b"\r\n"),
+            _ => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
+        }
+    }
+}
+
+/// Synthesize terminal bytes for a structured chat [`Item::Message`].
+/// vt100 handles column wrapping, so we only normalize newlines and add
+/// role styling. `break_before` (set on the first item of a run) starts
+/// the message on a fresh line, separating it from prior content.
+fn synth_message(kind: MessageKind, text: &str, break_before: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() + 16);
+    if break_before {
+        out.extend_from_slice(b"\r\n");
+    }
+    match kind {
+        MessageKind::Assistant => push_text_crlf(&mut out, text),
+        MessageKind::User => {
+            // Gray `❯ ` prompt glyph + gray body — mirrors how consumed
+            // user input reads elsewhere in the TUI.
+            out.extend_from_slice("\x1b[90m❯ ".as_bytes());
+            push_text_crlf(&mut out, text);
+            out.extend_from_slice(b"\x1b[0m");
+        }
+        MessageKind::Reasoning => {
+            out.extend_from_slice(b"\x1b[2m");
+            push_text_crlf(&mut out, text);
+            out.extend_from_slice(b"\x1b[0m");
+        }
+    }
+    out
+}
+
 fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
     /// Placeholder string the zarvis adapter writes into a tool's
     /// `output` when it auto-backgrounds. Kept in sync via the
@@ -1564,6 +1686,72 @@ mod tests {
             !text.contains("        branch="),
             "header should compact inherited shell indentation:\n{text}"
         );
+    }
+
+    #[test]
+    fn feed_message_coalesces_runs_and_marks_breaks() {
+        let mut h = ItemHistory::new();
+        // Streaming deltas of the same kind → one contiguous run; only the
+        // first item of a run sets `break_before` (and not the very first
+        // item in an empty history).
+        h.feed_message(MessageKind::Assistant, "Hel");
+        h.feed_message(MessageKind::Assistant, "lo");
+        h.feed_message(MessageKind::Reasoning, "thinking");
+        h.feed_message(MessageKind::Assistant, "done");
+        let breaks: Vec<(MessageKind, bool)> = h
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Message {
+                    kind, break_before, ..
+                } => Some((*kind, *break_before)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            breaks,
+            vec![
+                (MessageKind::Assistant, false), // first item ever
+                (MessageKind::Assistant, false), // continues the run
+                (MessageKind::Reasoning, true),  // kind change → new run
+                (MessageKind::Assistant, true),  // kind change → new run
+            ]
+        );
+        // Empty deltas are ignored.
+        let before = h.items.len();
+        h.feed_message(MessageKind::Assistant, "");
+        assert_eq!(h.items.len(), before);
+    }
+
+    #[test]
+    fn headless_message_history_renders_prose_and_tool_blocks() {
+        // A headless session emits structured Message/ToolUse/ToolResult
+        // with no PTY. The TUI must render the assistant prose (streamed as
+        // deltas) interleaved with tool blocks — none of which is in a PTY.
+        let mut h = ItemHistory::new();
+        h.feed_message(MessageKind::Assistant, "Looking ");
+        h.feed_message(MessageKind::Assistant, "into it.");
+        h.feed_task_start("c1".into(), "shell".into(), "ls".into());
+        h.feed_tool_result("c1", true, "file.txt".into());
+        h.feed_message(MessageKind::Assistant, "Found one file.");
+
+        let text = screen_text(h.replay(60, 16, 0).screen, 16, 60);
+        assert!(text.contains("Looking into it."), "assistant prose missing:\n{text}");
+        assert!(text.contains("→ shell("), "tool block missing:\n{text}");
+        assert!(text.contains("file.txt"), "tool output missing:\n{text}");
+        assert!(text.contains("Found one file."), "post-tool prose missing:\n{text}");
+    }
+
+    #[test]
+    fn reasoning_and_user_messages_render() {
+        let mut h = ItemHistory::new();
+        h.feed_message(MessageKind::User, "do the thing");
+        h.feed_message(MessageKind::Reasoning, "let me think");
+        h.feed_message(MessageKind::Assistant, "ok");
+        let text = screen_text(h.replay(60, 12, 0).screen, 12, 60);
+        assert!(text.contains("❯ do the thing"), "user prompt missing:\n{text}");
+        assert!(text.contains("let me think"), "reasoning missing:\n{text}");
+        assert!(text.contains("ok"), "assistant missing:\n{text}");
     }
 
     #[test]
