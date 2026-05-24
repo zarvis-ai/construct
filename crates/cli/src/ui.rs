@@ -2357,8 +2357,12 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let history = match app.histories.get_mut(&id) {
         Some(h) => h,
         None => {
-            let hint = Paragraph::new("(no PTY history yet — interact to populate)")
-                .style(Style::default().fg(app.theme.dim));
+            let label = if app.hydrating_sessions.contains(&id) {
+                "Loading terminal history…"
+            } else {
+                "(no PTY history yet — interact to populate)"
+            };
+            let hint = Paragraph::new(label).style(Style::default().fg(app.theme.dim));
             f.render_widget(hint, chat_area);
             if let Some(area) = editor_area {
                 render_editor_pane(
@@ -3695,7 +3699,12 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
             render_pty_tail(f, inner, out.screen, &app.theme);
         } else {
             // No PTY data yet — show a placeholder.
-            let p = Paragraph::new("(no data yet)").style(Style::default().fg(app.theme.dim));
+            let label = if app.hydrating_sessions.contains(id) {
+                "loading history…"
+            } else {
+                "(no data yet)"
+            };
+            let p = Paragraph::new(label).style(Style::default().fg(app.theme.dim));
             f.render_widget(p, inner);
         }
         render_pin_transition(f, inner, app, id);

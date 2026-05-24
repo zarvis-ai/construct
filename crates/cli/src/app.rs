@@ -316,6 +316,11 @@ pub struct App {
     /// tick is a safety net so nothing can stay stale for long.
     /// Reset to false every loop iteration.
     pub skip_redraw_after_event: bool,
+    /// Sessions whose selected/pinned terminal history is being rehydrated in
+    /// the background. Renderers use this to show a loading placeholder while
+    /// the TUI stays responsive instead of blocking startup on full transcript
+    /// replay.
+    pub hydrating_sessions: HashSet<String>,
     /// Scrollback offset for the daemon-owned orchestrator panel rendered in
     /// the minibuffer. Kept separate from `view_scrollback` so reading god
     /// history does not leave the main session view scrolled when the panel
@@ -1098,6 +1103,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         list_scroll_offset: 0,
         view_scrollback: 0,
         skip_redraw_after_event: false,
+        hydrating_sessions: HashSet::new(),
         orchestrator_scrollback: 0,
         orchestrator_panel_h: persisted.orchestrator_panel_h,
         resizing_orchestrator_panel: None,
@@ -1147,19 +1153,25 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     if let Err(e) = client.subscribe(None).await {
         app.status = Some((format!("subscribe failed: {e}"), Instant::now()));
     }
-    // Load transcript for the first session if any.
-    app.refresh_selected_transcript().await;
-    // Bootstrap parsers for every pinned PTY session so the pin strip has
-    // content from frame 0 — without this, tiles render "(no data yet)"
-    // until the user focuses each one and the daemon's ring buffer is
-    // pulled via pty_replay.
-    app.ensure_pinned_parsers().await;
+    // Do not hydrate the selected or pinned sessions here: full transcript
+    // replay can be hundreds of MB for long-lived sessions. The run loop paints
+    // the first frame immediately, then starts background hydration and renders
+    // loading placeholders until each history is ready.
 
     // One-line "update available" notice, sourced from an on-disk cache so it
     // never blocks startup (a stale cache refreshes in the background for the
     // next launch). Opt out with AGENTD_NO_UPDATE_CHECK=1.
     if let Some(notice) = crate::upgrade::cached_update_notice() {
         app.set_status(notice);
+    }
+
+    if app.selected_needs_hydration() {
+        if let Some(id) = app.selection.session_id() {
+            app.hydrating_sessions.insert(id.to_string());
+        }
+    }
+    for id in app.pinned_sessions_needing_hydration() {
+        app.hydrating_sessions.insert(id);
     }
 
     // Terminal setup.
@@ -1237,6 +1249,10 @@ async fn run_loop(
     let mut last_session_sent: Option<String> = None;
     let mut hydration_session: Option<String> = None;
     let mut hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
+    let mut pinned_hydration_queue: std::collections::VecDeque<String> =
+        std::collections::VecDeque::new();
+    let mut pinned_hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
+    let mut pinned_hydration_session: Option<String> = None;
     while !app.should_quit {
         while let Ok(msg) = app.pty_input_errors.try_recv() {
             app.set_status(msg);
@@ -1259,7 +1275,13 @@ async fn run_loop(
                         last_orch_sent = (0, 0);
                         last_session_sent = None;
                         hydration_session = None;
+                        pinned_hydration_session = None;
+                        pinned_hydration_queue.clear();
+                        app.hydrating_sessions.clear();
                         if let Some(task) = hydration_task.take() {
+                            task.abort();
+                        }
+                        if let Some(task) = pinned_hydration_task.take() {
                             task.abort();
                         }
                     }
@@ -1299,7 +1321,32 @@ async fn run_loop(
         if app.selected_needs_hydration() && hydration_task.is_none() {
             if let Some(req) = app.selected_hydration_request() {
                 hydration_session = Some(req.session_id.clone());
+                app.hydrating_sessions.insert(req.session_id.clone());
                 hydration_task = Some(tokio::spawn(load_session_hydration(req)));
+            }
+        }
+
+        let selected_hydrating = hydration_session.as_deref();
+        for id in app.pinned_sessions_needing_hydration() {
+            if Some(id.as_str()) == selected_hydrating
+                || pinned_hydration_session.as_deref() == Some(id.as_str())
+                || pinned_hydration_queue.iter().any(|queued| queued == &id)
+            {
+                continue;
+            }
+            app.hydrating_sessions.insert(id.clone());
+            pinned_hydration_queue.push_back(id);
+        }
+        if pinned_hydration_task.is_none() {
+            while let Some(id) = pinned_hydration_queue.pop_front() {
+                if Some(id.as_str()) == selected_hydrating || app.histories.contains_key(&id) {
+                    app.hydrating_sessions.remove(&id);
+                    continue;
+                }
+                let req = app.session_hydration_request(&id, true);
+                pinned_hydration_session = Some(id);
+                pinned_hydration_task = Some(tokio::spawn(load_session_hydration(req)));
+                break;
             }
         }
 
@@ -1352,12 +1399,55 @@ async fn run_loop(
                 }
             }, if hydration_task.is_some() => {
                 hydration_task = None;
-                hydration_session = None;
+                let completed_session = hydration_session.take();
                 match hydrated {
                     Ok(Ok(h)) => app.apply_session_hydration(h).await,
-                    Ok(Err(e)) => app.set_status(format!("load transcript: {e}")),
-                    Err(e) if e.is_cancelled() => {}
-                    Err(e) => app.set_status(format!("load transcript task failed: {e}")),
+                    Ok(Err(e)) => {
+                        if let Some(id) = completed_session.as_ref() {
+                            app.hydrating_sessions.remove(id);
+                        }
+                        app.set_status(format!("load transcript: {e}"));
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        if let Some(id) = completed_session.as_ref() {
+                            app.hydrating_sessions.remove(id);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(id) = completed_session.as_ref() {
+                            app.hydrating_sessions.remove(id);
+                        }
+                        app.set_status(format!("load transcript task failed: {e}"));
+                    }
+                }
+            }
+            pinned_hydrated = async {
+                match pinned_hydration_task.as_mut() {
+                    Some(task) => task.await,
+                    None => futures::future::pending().await,
+                }
+            }, if pinned_hydration_task.is_some() => {
+                pinned_hydration_task = None;
+                let completed_session = pinned_hydration_session.take();
+                match pinned_hydrated {
+                    Ok(Ok(h)) => app.apply_pinned_session_hydration(h).await,
+                    Ok(Err(e)) => {
+                        if let Some(id) = completed_session.as_ref() {
+                            app.hydrating_sessions.remove(id);
+                        }
+                        app.set_status(format!("load pinned transcript: {e}"));
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        if let Some(id) = completed_session.as_ref() {
+                            app.hydrating_sessions.remove(id);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(id) = completed_session.as_ref() {
+                            app.hydrating_sessions.remove(id);
+                        }
+                        app.set_status(format!("load pinned transcript task failed: {e}"));
+                    }
                 }
             }
             ev = input_stream.next() => {
@@ -1746,51 +1836,76 @@ impl App {
         // ends up true here (the fetch always inserts an entry, so the
         // re-trigger can't spin).
         let needs_history = self.view == ViewMode::Terminal && !self.histories.contains_key(&id);
+        Some(self.session_hydration_request(&id, needs_history))
+    }
+
+    fn session_hydration_request(&self, id: &str, needs_history: bool) -> SessionHydrationRequest {
         let is_headless = self
             .sessions
             .iter()
             .find(|s| s.id == id)
             .map(crate::ui::is_headless)
             .unwrap_or(false);
-        Some(SessionHydrationRequest {
+        SessionHydrationRequest {
             socket: self.client.socket_path().to_path_buf(),
-            session_id: id,
+            session_id: id.to_string(),
             needs_history,
             terminal_pane_size: self.terminal_pane_size,
             is_headless,
-        })
+        }
+    }
+
+    fn pinned_sessions_needing_hydration(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .filter(|s| s.pinned && s.has_pty && !self.histories.contains_key(&s.id))
+            .map(|s| s.id.clone())
+            .collect()
     }
 
     async fn apply_session_hydration(&mut self, hydration: SessionHydration) {
         if self.selection.session_id() != Some(hydration.session_id.as_str()) {
+            self.hydrating_sessions.remove(&hydration.session_id);
             return;
         }
 
-        self.transcript = hydration.transcript;
-        self.transcript_session = Some(hydration.session_id.clone());
-        self.transcript_scroll = u16::MAX;
+        let session_id = hydration.session_id.clone();
+        self.apply_hydration_state(hydration, true).await;
+        if self.selection.session_id() == Some(session_id.as_str()) {
+            self.start_session_transition();
+        }
+    }
+
+    async fn apply_pinned_session_hydration(&mut self, hydration: SessionHydration) {
+        self.apply_hydration_state(hydration, false).await;
+    }
+
+    async fn apply_hydration_state(
+        &mut self,
+        hydration: SessionHydration,
+        update_transcript: bool,
+    ) {
+        let session_id = hydration.session_id;
+        self.hydrating_sessions.remove(&session_id);
+        if update_transcript {
+            self.transcript = hydration.transcript;
+            self.transcript_session = Some(session_id.clone());
+            self.transcript_scroll = u16::MAX;
+        }
 
         if let Some(history) = hydration.history {
-            self.histories.insert(hydration.session_id.clone(), history);
+            self.histories.insert(session_id.clone(), history);
             let (cols, rows) = self.terminal_pane_size;
-            let _ = self
-                .client
-                .pty_resize(&hydration.session_id, cols, rows)
-                .await;
+            let _ = self.client.pty_resize(&session_id, cols, rows).await;
         }
         if let Some(state) = hydration.editor_state {
-            self.editor_states
-                .insert(hydration.session_id.clone(), state);
+            self.editor_states.insert(session_id.clone(), state);
         }
         if let Some(status) = hydration.agent_status {
-            self.agent_statuses
-                .insert(hydration.session_id.clone(), status);
+            self.agent_statuses.insert(session_id.clone(), status);
         }
         if let Some(msg) = hydration.status_messages.last() {
             self.set_status(msg.clone());
-        }
-        if self.selection.session_id() == Some(hydration.session_id.as_str()) {
-            self.start_session_transition();
         }
     }
 
@@ -5334,6 +5449,7 @@ mod tests {
             list_scroll_offset: 0,
             view_scrollback: 0,
             skip_redraw_after_event: false,
+            hydrating_sessions: HashSet::new(),
             orchestrator_scrollback: 0,
             orchestrator_panel_h: None,
             resizing_orchestrator_panel: None,
