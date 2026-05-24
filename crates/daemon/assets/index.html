@@ -1605,7 +1605,7 @@ function initMiniMatrix() {
         pinned: Array.from({ length: revealText.length }, () => 0),
       };
     }
-    const fontPx = Math.max(4 * dpr, Math.floor((grid ? grid.cellH : 4 * dpr) * 0.96));
+    const fontPx = Math.max(6 * dpr, Math.floor((grid ? grid.cellH : 4 * dpr) * 1.44));
     ctx.font = `700 ${fontPx}px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
