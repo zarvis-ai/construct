@@ -739,26 +739,37 @@
   .terminal-scroll-overlay button {
     pointer-events: auto;
     appearance: none;
-    border: 1px solid rgba(255, 255, 255, 0.22);
-    border-radius: 999px;
-    padding: 2px 6px;
-    background: rgba(0, 0, 0, 0.28);
-    color: rgba(255, 255, 255, 0.76);
-    font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 0.01em;
+    border: 1px solid rgba(57, 255, 136, 0.62);
+    border-radius: 0;
+    padding: 2px 7px;
+    background: rgba(2, 8, 5, 0.78);
+    color: var(--fg);
+    font: 11px/1.35 var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     backdrop-filter: blur(4px);
+    box-shadow:
+      inset 0 0 10px rgba(57, 255, 136, 0.12),
+      0 0 12px rgba(57, 255, 136, 0.14);
+    text-shadow: 0 0 8px rgba(57, 255, 136, 0.34);
   }
+  .terminal-scroll-overlay button::before { content: "["; color: var(--fg-faint); }
+  .terminal-scroll-overlay button::after { content: "]"; color: var(--fg-faint); }
   .terminal-scroll-overlay button:hover,
   .terminal-scroll-overlay button:focus-visible {
-    background: rgba(0, 0, 0, 0.48);
-    color: #fff;
+    background: rgba(57, 255, 136, 0.18);
+    border-color: var(--accent);
+    color: #e1ffe6;
     outline: none;
+    box-shadow: var(--glow-hard);
   }
   .terminal-scroll-overlay button:active {
-    background: rgba(110, 168, 254, 0.42);
-    border-color: rgba(110, 168, 254, 0.7);
+    background: var(--accent);
+    border-color: var(--accent-alt);
+    color: #06160c;
+    text-shadow: none;
   }
 
   /* Virtual keyboard — sits below the terminal in PTY mode.
