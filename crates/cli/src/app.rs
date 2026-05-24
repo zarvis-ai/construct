@@ -6736,6 +6736,161 @@ mod tests {
         server.abort();
     }
 
+    /// REGRESSION: a headless session's conversation must be reconstructed
+    /// when the TUI re-attaches (relaunch) or the daemon restarts. Headless
+    /// harnesses carry their prose as structured `Message` / `Reasoning`
+    /// events with no PTY, so `load_session_hydration` must replay them into
+    /// the history when the session `is_headless` — otherwise the session
+    /// renders blank after a restart. Exercises the full hydration path,
+    /// including the `SessionHydrationRequest.is_headless` plumbing, against
+    /// a mock daemon serving a PTY-less transcript.
+    #[tokio::test]
+    async fn headless_session_history_reconstructed_on_hydration() {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tempfile::tempdir;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let Ok(n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        let result = match method {
+                            ipc_method::SESSION_TRANSCRIPT => {
+                                // Headless transcript: assistant + reasoning
+                                // deltas, no PTY events at all.
+                                let ev = |seq: u64, event: Value| {
+                                    serde_json::json!({
+                                        "seq": seq, "at": "2026-05-21T00:00:00Z", "event": event
+                                    })
+                                };
+                                let events = vec![
+                                    ev(
+                                        1,
+                                        serde_json::json!({
+                                            "type": "reasoning", "text": "considering options"
+                                        }),
+                                    ),
+                                    ev(
+                                        2,
+                                        serde_json::json!({
+                                            "type": "message", "role": "assistant", "text": "Hello "
+                                        }),
+                                    ),
+                                    ev(
+                                        3,
+                                        serde_json::json!({
+                                            "type": "message", "role": "assistant",
+                                            "text": "from headless"
+                                        }),
+                                    ),
+                                ];
+                                serde_json::json!({"events": events, "total": 3})
+                            }
+                            ipc_method::SESSION_PTY_REPLAY => {
+                                serde_json::json!({"data": "", "size": {"cols": 80, "rows": 24}})
+                            }
+                            _ => Value::Null,
+                        };
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0", "id": id, "result": result,
+                        });
+                        if writer
+                            .write_all((resp.to_string() + "\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        fn screen_text(h: &mut crate::pty_render::ItemHistory) -> String {
+            let out = h.replay(80, 24, 0);
+            (0..24u16)
+                .flat_map(|r| {
+                    let mut row = String::new();
+                    for c in 0..80u16 {
+                        if let Some(cell) = out.screen.cell(r, c) {
+                            row.push_str(&cell.contents());
+                        }
+                    }
+                    row.push('\n');
+                    row.chars().collect::<Vec<_>>()
+                })
+                .collect()
+        }
+
+        // Headless → the prose is folded back into history on hydration.
+        let loaded = load_session_hydration(SessionHydrationRequest {
+            socket: sock.clone(),
+            session_id: "s-headless".to_string(),
+            needs_history: true,
+            terminal_pane_size: (80, 24),
+            is_headless: true,
+        })
+        .await
+        .expect("headless hydration should succeed");
+        let mut h = loaded
+            .history
+            .expect("headless hydration must produce a history");
+        let text = screen_text(&mut h);
+        assert!(
+            text.contains("Hello from headless"),
+            "headless prose must be reconstructed on hydration:\n{text}"
+        );
+        assert!(
+            text.contains("considering options"),
+            "headless reasoning must be reconstructed on hydration:\n{text}"
+        );
+
+        // Contrast: a PTY-backed session ignores the same Message/Reasoning
+        // events — that prose lives in the PTY stream, so re-rendering it
+        // from the transcript would double it up.
+        let loaded_pty = load_session_hydration(SessionHydrationRequest {
+            socket: sock.clone(),
+            session_id: "s-pty".to_string(),
+            needs_history: true,
+            terminal_pane_size: (80, 24),
+            is_headless: false,
+        })
+        .await
+        .expect("hydration should succeed");
+        if let Some(mut h) = loaded_pty.history {
+            let text = screen_text(&mut h);
+            assert!(
+                !text.contains("Hello from headless"),
+                "PTY-backed hydration must NOT re-render transcript Message prose:\n{text}"
+            );
+        }
+
+        server.abort();
+    }
+
     /// REGRESSION: a TUI re-attaching to an existing zarvis session
     /// shows the tool blocks again. Current zarvis interactive
     /// adapters never write OSC 7700 fences to the PTY (the helpers
