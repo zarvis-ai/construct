@@ -2399,9 +2399,13 @@ pub async fn run(
                             DriveExit::Done(Err(e2)) => {
                                 sink2.finalize();
                                 final_status = "Errored";
-                                term.note(&format!("(still over budget after retry: {e2})"));
+                                // `{:#}` renders the full anyhow cause chain
+                                // (context: source: root) so transport-level
+                                // failures are actually diagnosable, not just
+                                // the outermost label.
+                                term.note(&format!("(still over budget after retry: {e2:#})"));
                                 emit.emit(SessionEvent::Error {
-                                    message: format!("still over budget after retry: {e2}"),
+                                    message: format!("still over budget after retry: {e2:#}"),
                                 });
                                 break;
                             }
@@ -2419,9 +2423,14 @@ pub async fn run(
                         }
                     } else {
                         final_status = "Errored";
-                        term.note(&format!("(provider error: {e})"));
+                        // `{:#}` renders the full anyhow cause chain
+                        // (e.g. "codex-oauth SSE stream: error reading a body
+                        // from connection: connection reset") instead of just
+                        // the outermost context, so provider/transport
+                        // failures are diagnosable.
+                        term.note(&format!("(provider error: {e:#})"));
                         emit.emit(SessionEvent::Error {
-                            message: format!("{e}"),
+                            message: format!("{e:#}"),
                         });
                         break;
                     }

@@ -500,15 +500,20 @@ pub async fn run(
                         {
                             Ok(t) => t,
                             Err(e2) => {
+                                // `{:#}` renders the full anyhow cause chain
+                                // so the underlying failure is diagnosable.
                                 emit.emit(SessionEvent::Error {
-                                    message: format!("still over budget after retry: {e2}"),
+                                    message: format!("still over budget after retry: {e2:#}"),
                                 });
                                 break;
                             }
                         }
                     } else {
+                        // `{:#}` renders the full anyhow cause chain (e.g.
+                        // "codex-oauth SSE stream: <transport cause>") rather
+                        // than just the outermost context label.
                         emit.emit(SessionEvent::Error {
-                            message: format!("{e}"),
+                            message: format!("{e:#}"),
                         });
                         break;
                     }
