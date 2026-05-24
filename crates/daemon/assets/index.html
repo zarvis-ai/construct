@@ -606,6 +606,11 @@
     /* iOS: keep font ≥16px to suppress auto-zoom on focus */
     font-size: 16px;
   }
+  .composer textarea::placeholder {
+    color: var(--fg-faint);
+    opacity: 1;
+    text-shadow: 0 0 8px rgba(57, 255, 136, 0.18);
+  }
   .composer textarea:focus {
     outline: 1px solid var(--accent);
     outline-offset: -1px;
