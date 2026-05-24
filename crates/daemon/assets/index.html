@@ -33,6 +33,8 @@
     --bubble-user: #1a2c4a;
     --bubble-assistant: #1c2027;
     --bubble-system: #1a1a1f;
+    --session-scrollbar-track: rgba(229, 231, 235, 0.30);
+    --session-scrollbar-thumb: rgba(229, 231, 235, 0.80);
   }
   @media (prefers-color-scheme: light) {
     :root {
@@ -47,6 +49,8 @@
       --bubble-user: #dceaff;
       --bubble-assistant: #f2f3f6;
       --bubble-system: #ebecf0;
+      --session-scrollbar-track: rgba(17, 22, 30, 0.30);
+      --session-scrollbar-thumb: rgba(17, 22, 30, 0.80);
     }
   }
   * { box-sizing: border-box; }
@@ -323,6 +327,24 @@
     overflow-y: auto;
     padding: 12px 14px 16px;
     scroll-behavior: smooth;
+    scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
+    scrollbar-width: thin;
+  }
+  .transcript::-webkit-scrollbar {
+    width: 16px;
+  }
+  .transcript::-webkit-scrollbar-track {
+    background: var(--session-scrollbar-track);
+  }
+  .transcript::-webkit-scrollbar-thumb {
+    background: var(--session-scrollbar-thumb);
+    border: 4px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  .transcript::-webkit-scrollbar-thumb:hover {
+    background: var(--fg);
+    background-clip: content-box;
   }
   .row {
     margin: 8px 0;
@@ -608,6 +630,26 @@
   .terminal-host .xterm .xterm-helpers {
     overscroll-behavior: contain;
     touch-action: pan-y;
+  }
+  .terminal-host .xterm .xterm-viewport {
+    scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
+    scrollbar-width: thin;
+  }
+  .terminal-host .xterm .xterm-viewport::-webkit-scrollbar {
+    width: 16px;
+  }
+  .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-track {
+    background: var(--session-scrollbar-track);
+  }
+  .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+    background: var(--session-scrollbar-thumb);
+    border: 4px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
+    background: var(--fg);
+    background-clip: content-box;
   }
   .terminal-loading {
     position: absolute;
