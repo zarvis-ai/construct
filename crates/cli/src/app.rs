@@ -25,7 +25,10 @@ use std::io::{Stdout, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
 use tokio::sync::mpsc;
+
+pub const TERMINAL_SCROLLBAR_TTL: Duration = Duration::from_millis(1200);
 
 /// Which pane currently owns the keyboard. `View` covers both the transcript
 /// and the terminal renderer — when the view shows a PTY-backed session and
@@ -307,6 +310,10 @@ pub struct App {
     /// decreased by mouse-wheel down. Reset to 0 on user keystroke into
     /// the PTY or on session change.
     pub view_scrollback: usize,
+    /// Show the terminal scrollback overlay until this instant. Refreshed by
+    /// wheel/key scrollback input and hidden automatically after a short idle
+    /// delay, similar to editor overlay scrollbars.
+    pub terminal_scrollbar_visible_until: Option<Instant>,
     /// Set by an event handler when the just-handled event produced
     /// no local display change that needs an immediate repaint — the
     /// canonical case being a keystroke forwarded straight to a PTY,
@@ -332,6 +339,10 @@ pub struct App {
     /// `Some((anchor_row, anchor_height))` while the user drags the
     /// orchestrator panel's top border.
     pub resizing_orchestrator_panel: Option<(u16, u16)>,
+    /// `Some((thumb_grab_offset, max_scrollback))` while dragging the terminal
+    /// scrollbar thumb. `thumb_grab_offset` is the row delta from the thumb top
+    /// to the cursor at mouse-down, so dragging preserves where the user grabbed.
+    pub dragging_terminal_scrollbar: Option<(u16, usize)>,
     /// Per-session "last PTY byte" timestamp, updated locally from incoming
     /// Pty events. Used to drive the "session looks busy" spinner via a
     /// short quiescence window. Daemon's `SessionSummary.last_pty_at_ms`
@@ -889,6 +900,13 @@ pub struct UrlLineHit {
     pub end_col: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalScrollbarHit {
+    pub area: ratatui::layout::Rect,
+    pub thumb: ratatui::layout::Rect,
+    pub max_scrollback: usize,
+}
+
 /// Last-frame geometry for hit-testing mouse clicks.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutSnapshot {
@@ -927,6 +945,8 @@ pub struct LayoutSnapshot {
     pub browser_preview_area: Option<ratatui::layout::Rect>,
     /// Top-right close button bounds for the browser preview overlay: `(x_start, x_end, y)`.
     pub browser_preview_close: Option<(u16, u16, u16)>,
+    /// Terminal scrollback overlay hit geometry for the selected session.
+    pub terminal_scrollbar: Option<TerminalScrollbarHit>,
 }
 
 #[derive(Debug, Clone)]
@@ -1102,11 +1122,13 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         zoom: initial_zoom,
         list_scroll_offset: 0,
         view_scrollback: 0,
+        terminal_scrollbar_visible_until: None,
         skip_redraw_after_event: false,
         hydrating_sessions: HashSet::new(),
         orchestrator_scrollback: 0,
         orchestrator_panel_h: persisted.orchestrator_panel_h,
         resizing_orchestrator_panel: None,
+        dragging_terminal_scrollbar: None,
         pty_activity: HashMap::new(),
         start_instant: now,
         layout: LayoutSnapshot::default(),
@@ -2800,6 +2822,9 @@ impl App {
                     self.resizing_orchestrator_panel = Some((ev.row, cur_h));
                     return;
                 }
+                if self.begin_terminal_scrollbar_drag_or_jump(ev.column, ev.row) {
+                    return;
+                }
                 // Matrix-rain panel: the title bar doubles as a height
                 // handle. The panel is bottom-anchored, so dragging the top
                 // edge upward grows it and dragging downward shrinks it.
@@ -2864,6 +2889,9 @@ impl App {
                     let available = self.matrix_rain_available_height().unwrap_or(raw);
                     self.matrix_rain_h =
                         Some(crate::ui::matrix_rain_panel_height(Some(raw), available));
+                } else if let Some((grab_offset, max_scrollback)) = self.dragging_terminal_scrollbar
+                {
+                    self.drag_terminal_scrollbar_to_row(ev.row, grab_offset, max_scrollback);
                 } else if let Some(sel) = self.text_selection.as_mut() {
                     sel.head = ScreenPoint {
                         col: ev.column,
@@ -2877,10 +2905,12 @@ impl App {
                 let was_resizing = self.resizing_list.is_some()
                     || self.resizing_pin_strip.is_some()
                     || self.resizing_orchestrator_panel.is_some()
+                    || self.dragging_terminal_scrollbar.is_some()
                     || self.resizing_matrix_rain.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
                 self.resizing_orchestrator_panel = None;
+                self.dragging_terminal_scrollbar = None;
                 self.resizing_matrix_rain = None;
                 if was_resizing {
                     self.text_selection = None;
@@ -3628,11 +3658,62 @@ impl App {
             return;
         }
         self.view_scrollback = adjusted_scrollback(self.view_scrollback, delta);
+        self.show_terminal_scrollbar();
+    }
+
+    fn show_terminal_scrollbar(&mut self) {
+        self.terminal_scrollbar_visible_until = Some(Instant::now() + TERMINAL_SCROLLBAR_TTL);
     }
 
     fn mouse_scrollback_step(&self) -> i32 {
         let rows = self.terminal_pane_size.1.max(1) as i32;
         (rows / 4).clamp(6, 24)
+    }
+
+    fn rect_contains(r: ratatui::layout::Rect, col: u16, row: u16) -> bool {
+        col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+    }
+
+    fn begin_terminal_scrollbar_drag_or_jump(&mut self, col: u16, row: u16) -> bool {
+        let Some(hit) = self.layout.terminal_scrollbar else {
+            return false;
+        };
+        if !Self::rect_contains(hit.area, col, row) {
+            return false;
+        }
+        let grab_offset = if Self::rect_contains(hit.thumb, col, row) {
+            row.saturating_sub(hit.thumb.y)
+        } else {
+            hit.thumb.height / 2
+        };
+        self.dragging_terminal_scrollbar = Some((grab_offset, hit.max_scrollback));
+        self.drag_terminal_scrollbar_to_row(row, grab_offset, hit.max_scrollback);
+        true
+    }
+
+    fn drag_terminal_scrollbar_to_row(
+        &mut self,
+        row: u16,
+        grab_offset: u16,
+        max_scrollback: usize,
+    ) {
+        let Some(hit) = self.layout.terminal_scrollbar else {
+            return;
+        };
+        if hit.area.height == 0 || hit.thumb.height >= hit.area.height || max_scrollback == 0 {
+            return;
+        }
+        let max_thumb_top = hit.area.height.saturating_sub(hit.thumb.height) as usize;
+        if max_thumb_top == 0 {
+            return;
+        }
+        let thumb_top = row
+            .saturating_sub(grab_offset)
+            .saturating_sub(hit.area.y)
+            .min(hit.area.height.saturating_sub(hit.thumb.height)) as usize;
+        let from_top = (thumb_top * max_scrollback + max_thumb_top / 2) / max_thumb_top;
+        self.view_scrollback = max_scrollback.saturating_sub(from_top);
+        self.show_terminal_scrollbar();
     }
 
     fn adjust_mouse_list_scroll(&mut self, col: u16, row: u16, delta: i32) -> bool {
@@ -3677,6 +3758,7 @@ impl App {
         }
         if self.view == ViewMode::Terminal && self.in_pty_session() {
             self.view_scrollback = adjusted_scrollback(self.view_scrollback, delta);
+            self.show_terminal_scrollbar();
         }
     }
 
@@ -3800,6 +3882,9 @@ impl App {
                 // type "into the past" while reading scrollback.
                 let was_scrolled = self.view_scrollback != 0;
                 self.view_scrollback = 0;
+                if was_scrolled {
+                    self.show_terminal_scrollbar();
+                }
                 if let Some(bytes) = encode_key_to_bytes(key) {
                     if let Some(id) = self.selected_id() {
                         self.queue_pty_input(id, bytes, "pty_input");
@@ -4163,6 +4248,7 @@ impl App {
                         self.orchestrator_scrollback = SCROLLBACK_MAX;
                     } else {
                         self.view_scrollback = SCROLLBACK_MAX;
+                        self.show_terminal_scrollbar();
                     }
                 } else {
                     self.transcript_scroll = 0;
@@ -4174,6 +4260,7 @@ impl App {
                         self.orchestrator_scrollback = 0;
                     } else {
                         self.view_scrollback = 0;
+                        self.show_terminal_scrollbar();
                     }
                 } else {
                     self.transcript_scroll = u16::MAX;
@@ -5402,6 +5489,7 @@ mod tests {
             modal_area: None,
             browser_preview_area: None,
             browser_preview_close: None,
+            terminal_scrollbar: None,
         }
     }
 
@@ -5440,11 +5528,13 @@ mod tests {
             zoom: ZoomMode::None,
             list_scroll_offset: 0,
             view_scrollback: 0,
+            terminal_scrollbar_visible_until: None,
             skip_redraw_after_event: false,
             hydrating_sessions: HashSet::new(),
             orchestrator_scrollback: 0,
             orchestrator_panel_h: None,
             resizing_orchestrator_panel: None,
+            dragging_terminal_scrollbar: None,
             pty_activity: HashMap::new(),
             start_instant: now,
             layout: LayoutSnapshot::default(),
@@ -5749,6 +5839,10 @@ mod tests {
         assert_eq!(
             app.view_scrollback, 10,
             "mouse wheel outside the list should scroll codex PTY history by a partial page"
+        );
+        assert!(
+            app.terminal_scrollbar_visible_until.is_some(),
+            "mouse-wheel scroll should reveal the terminal scrollbar overlay"
         );
     }
 

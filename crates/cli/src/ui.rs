@@ -94,6 +94,7 @@ fn clear_pane_side_borders(f: &mut Frame, area: Rect, app: &App) {
 pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.browser_preview_area = None;
     app.layout.browser_preview_close = None;
+    app.layout.terminal_scrollbar = None;
     let area = f.area();
     match app.zoom {
         ZoomMode::View => {
@@ -2386,6 +2387,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let preview = app.browser_previews.get(&id).cloned();
     app.layout.browser_preview_area = None;
     app.layout.browser_preview_close = None;
+    app.layout.terminal_scrollbar = None;
     let row_offset = area.height.saturating_sub(chat_area.height);
     let out = history.replay(area.width, area.height, scroll);
     app.view_scrollback = out.screen.scrollback();
@@ -2432,6 +2434,14 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         id,
         translate_block_hits(out.blocks, row_offset, chat_area.height),
     );
+    app.layout.terminal_scrollbar = render_terminal_scrollbar(
+        f,
+        chat_area,
+        &app.theme,
+        app.terminal_scrollbar_visible_until,
+        out.screen.scrollback(),
+        out.max_scrollback,
+    );
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)
         f.render_widget(Clear, area);
@@ -2454,6 +2464,85 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
             true,
         );
     }
+}
+
+fn render_terminal_scrollbar(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    visible_until: Option<Instant>,
+    rendered_scrollback: usize,
+    max_scrollback: usize,
+) -> Option<crate::app::TerminalScrollbarHit> {
+    if area.height < 3 || area.width < 2 || max_scrollback == 0 {
+        return None;
+    }
+    let at_bottom = rendered_scrollback == 0;
+    if at_bottom {
+        let Some(visible_until) = visible_until else {
+            return None;
+        };
+        if Instant::now() >= visible_until {
+            return None;
+        }
+    }
+
+    let track_h = area.height as usize;
+    let viewport_h = area.height as usize;
+    let total_h = max_scrollback.saturating_add(viewport_h).max(1);
+    let thumb_h = ((viewport_h * track_h + total_h - 1) / total_h)
+        .clamp(1, track_h)
+        .max((track_h / 8).max(1));
+    let max_thumb_top = track_h.saturating_sub(thumb_h);
+    let thumb_top = if max_scrollback == 0 {
+        0
+    } else {
+        ((max_scrollback.saturating_sub(rendered_scrollback)) * max_thumb_top) / max_scrollback
+    };
+
+    const SCROLLBAR_W: u16 = 4;
+    let bar_w = area.width.min(SCROLLBAR_W);
+    let x0 = area.x + area.width.saturating_sub(bar_w);
+    let scrollbar_area = Rect {
+        x: x0,
+        y: area.y,
+        width: bar_w,
+        height: area.height,
+    };
+    let thumb = Rect {
+        x: x0,
+        y: area.y + thumb_top as u16,
+        width: bar_w,
+        height: thumb_h as u16,
+    };
+    let track_color = blend_color(Color::Black, theme.text, 0.30);
+    let thumb_color = blend_color(Color::Black, theme.text, 0.80);
+    for row in 0..track_h {
+        let y = area.y + row as u16;
+        for col in 0..bar_w {
+            if let Some(cell) = f.buffer_mut().cell_mut(Position { x: x0 + col, y }) {
+                // Keep the terminal glyph/foreground intact and tint only the
+                // cell background. This approximates opacity while preserving
+                // the text underneath the scrollbar track.
+                cell.set_bg(track_color);
+            }
+        }
+    }
+    for row in 0..thumb_h {
+        let y = area.y + (thumb_top + row) as u16;
+        for col in 0..bar_w {
+            if let Some(cell) = f.buffer_mut().cell_mut(Position { x: x0 + col, y }) {
+                // Same opacity approximation as the track: preserve the
+                // underlying glyph and foreground, only tint the background.
+                cell.set_bg(thumb_color);
+            }
+        }
+    }
+    Some(crate::app::TerminalScrollbarHit {
+        area: scrollbar_area,
+        thumb,
+        max_scrollback,
+    })
 }
 
 fn render_browser_preview_overlay(
