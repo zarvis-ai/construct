@@ -716,10 +716,7 @@ impl LlmProvider for CodexOauth {
                         }
                     }
                     if kind == "response.failed" {
-                        return Err(anyhow!(
-                            "codex-oauth response failed: {}",
-                            response_error_message(&chunk)
-                        ));
+                        return Err(failed_response_error(&chunk));
                     }
                     break;
                 }
@@ -787,6 +784,21 @@ fn response_error_message(chunk: &Value) -> String {
         })
         .unwrap_or("unknown error")
         .to_string()
+}
+
+/// Build the error for a `response.failed` SSE event. A context-window
+/// overflow can arrive this way (HTTP 200 + a streamed failure) rather
+/// than as an HTTP 400, so check the message for an overflow signature
+/// and surface the typed [`super::ContextOverflow`] when it matches —
+/// that's what routes the agent loop to relearn the cap, prune/compact,
+/// and retry, exactly like the HTTP-400 path. Anything else stays a plain
+/// provider error that ends the turn.
+fn failed_response_error(chunk: &Value) -> anyhow::Error {
+    let msg = response_error_message(chunk);
+    if let Some(extracted) = super::parse_overflow(&msg) {
+        return anyhow::Error::new(super::ContextOverflow { extracted, raw: msg });
+    }
+    anyhow!("codex-oauth response failed: {msg}")
 }
 
 fn short_hash(s: &str) -> String {
@@ -1153,5 +1165,42 @@ mod tests {
             }
         });
         assert_eq!(response_error_message(&chunk), "max_output_tokens");
+    }
+
+    #[test]
+    fn failed_response_overflow_surfaces_context_overflow() {
+        // The exact wording the codex backend streams on a context-window
+        // overflow (HTTP 200 + `response.failed`, not an HTTP 400). It must
+        // downcast to `ContextOverflow` so the agent loop relearns the cap,
+        // prunes/compacts, and retries — instead of just ending the turn.
+        let chunk = json!({
+            "response": {
+                "error": {
+                    "message": "Your input exceeds the context window of this \
+                                model. Please adjust your input and try again."
+                }
+            }
+        });
+        let err = failed_response_error(&chunk);
+        assert!(
+            err.downcast_ref::<crate::provider::ContextOverflow>().is_some(),
+            "context-window overflow via response.failed must be a ContextOverflow; got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn failed_response_non_overflow_stays_plain_error() {
+        let chunk = json!({
+            "response": { "error": { "message": "internal server error" } }
+        });
+        let err = failed_response_error(&chunk);
+        assert!(
+            err.downcast_ref::<crate::provider::ContextOverflow>().is_none(),
+            "a non-overflow failure must not be misclassified as ContextOverflow"
+        );
+        assert_eq!(
+            format!("{err}"),
+            "codex-oauth response failed: internal server error"
+        );
     }
 }
