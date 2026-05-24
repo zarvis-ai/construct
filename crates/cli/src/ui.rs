@@ -2437,8 +2437,8 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         chat_area,
         &app.theme,
         app.terminal_scrollbar_visible_until,
-        app.view_scrollback,
         out.screen.scrollback(),
+        out.max_scrollback,
     );
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)
@@ -2469,17 +2469,20 @@ fn render_terminal_scrollbar(
     area: Rect,
     theme: &Theme,
     visible_until: Option<Instant>,
-    current_scrollback: usize,
+    rendered_scrollback: usize,
     max_scrollback: usize,
 ) {
     if area.height < 3 || area.width < 2 || max_scrollback == 0 {
         return;
     }
-    let Some(visible_until) = visible_until else {
-        return;
-    };
-    if Instant::now() >= visible_until {
-        return;
+    let at_bottom = rendered_scrollback == 0;
+    if at_bottom {
+        let Some(visible_until) = visible_until else {
+            return;
+        };
+        if Instant::now() >= visible_until {
+            return;
+        }
     }
 
     let track_h = area.height as usize;
@@ -2492,7 +2495,7 @@ fn render_terminal_scrollbar(
     let thumb_top = if max_scrollback == 0 {
         0
     } else {
-        ((max_scrollback.saturating_sub(current_scrollback)) * max_thumb_top) / max_scrollback
+        ((max_scrollback.saturating_sub(rendered_scrollback)) * max_thumb_top) / max_scrollback
     };
 
     let x0 = area.x + area.width.saturating_sub(2);

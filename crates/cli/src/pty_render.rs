@@ -106,6 +106,10 @@ pub struct RenderOutput<'a> {
     /// directly); they never need to own a [`vt100::Parser`].
     pub screen: &'a vt100::Screen,
     pub blocks: Vec<BlockHitRect>,
+    /// Maximum scrollback offset accepted by the parser for this render.
+    /// The visible `screen.scrollback()` is the current viewport; this value
+    /// represents the full scrollable history extent for overlay scrollbars.
+    pub max_scrollback: usize,
 }
 
 /// Per-block synthesized output + optional control geometry. Returned by
@@ -519,9 +523,14 @@ impl ItemHistory {
     /// viewport dims to match what the caller wants and apply the
     /// scrollback offset. Cheap: just `set_size` (preserves grid +
     /// scrollback) and `set_scrollback`.
-    fn render_shadow(&mut self, cols: u16, rows: u16, scrollback: usize) {
+    fn render_shadow(&mut self, cols: u16, rows: u16, scrollback: usize) -> usize {
         self.set_pty_size(cols, rows);
+        self.shadow_parser
+            .screen_mut()
+            .set_scrollback(super::app::SCROLLBACK_MAX);
+        let max_scrollback = self.shadow_parser.screen().scrollback();
         self.shadow_parser.screen_mut().set_scrollback(scrollback);
+        max_scrollback
     }
 
     fn feed_byte(&mut self, b: u8) {
@@ -820,10 +829,11 @@ impl ItemHistory {
         //      `zarvis_tool_block_survives_one_row_of_scroll`
         //      for the regression repro.
         if scrollback > 0 && !needs_synth {
-            self.render_shadow(cols, rows, scrollback);
+            let max_scrollback = self.render_shadow(cols, rows, scrollback);
             return RenderOutput {
                 screen: self.shadow_parser.screen(),
                 blocks: Vec::new(),
+                max_scrollback,
             };
         }
         if needs_synth {
@@ -950,11 +960,17 @@ impl ItemHistory {
             cache.pending_consumed = self.pending_chunk.len();
         }
 
+        cache
+            .parser
+            .screen_mut()
+            .set_scrollback(super::app::SCROLLBACK_MAX);
+        let max_scrollback = cache.parser.screen().scrollback();
         cache.parser.screen_mut().set_scrollback(scrollback);
         self.dirty = false;
         RenderOutput {
             screen: cache.parser.screen(),
             blocks: Vec::new(),
+            max_scrollback,
         }
     }
 
@@ -1116,6 +1132,11 @@ impl ItemHistory {
         cache.pending_consumed = self.pending_chunk.len();
         cache.signatures = current_sigs;
 
+        cache
+            .parser
+            .screen_mut()
+            .set_scrollback(super::app::SCROLLBACK_MAX);
+        let max_scrollback = cache.parser.screen().scrollback();
         cache.parser.screen_mut().set_scrollback(scrollback);
 
         // Map absolute-line ranges to current-frame screen rows.
@@ -1158,6 +1179,7 @@ impl ItemHistory {
         RenderOutput {
             screen: cache.parser.screen(),
             blocks,
+            max_scrollback,
         }
     }
 }
@@ -1736,10 +1758,16 @@ mod tests {
         h.feed_message(MessageKind::Assistant, "Found one file.");
 
         let text = screen_text(h.replay(60, 16, 0).screen, 16, 60);
-        assert!(text.contains("Looking into it."), "assistant prose missing:\n{text}");
+        assert!(
+            text.contains("Looking into it."),
+            "assistant prose missing:\n{text}"
+        );
         assert!(text.contains("→ shell("), "tool block missing:\n{text}");
         assert!(text.contains("file.txt"), "tool output missing:\n{text}");
-        assert!(text.contains("Found one file."), "post-tool prose missing:\n{text}");
+        assert!(
+            text.contains("Found one file."),
+            "post-tool prose missing:\n{text}"
+        );
     }
 
     #[test]
@@ -1749,7 +1777,10 @@ mod tests {
         h.feed_message(MessageKind::Reasoning, "let me think");
         h.feed_message(MessageKind::Assistant, "ok");
         let text = screen_text(h.replay(60, 12, 0).screen, 12, 60);
-        assert!(text.contains("❯ do the thing"), "user prompt missing:\n{text}");
+        assert!(
+            text.contains("❯ do the thing"),
+            "user prompt missing:\n{text}"
+        );
         assert!(text.contains("let me think"), "reasoning missing:\n{text}");
         assert!(text.contains("ok"), "assistant missing:\n{text}");
     }
