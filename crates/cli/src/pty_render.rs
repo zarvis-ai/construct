@@ -797,17 +797,15 @@ impl ItemHistory {
 
         // Resize handling has two cases:
         //
-        //   - Rows shrink but cols don't: `set_size` is enough.
+        //   - Rows change but cols don't: `set_size` is enough.
         //     vt100 keeps the grid without replay and, importantly,
         //     avoids cursor-relocating reset escapes. The zarvis
         //     editor pane grows as the user types, shrinking
         //     `chat_area.height` and tripping this path on nearly
-        //     every keystroke.
-        //   - Rows grow but cols don't: rebuild. `set_size` appends
-        //     blank rows at the bottom instead of pulling newly
-        //     exposed lines from scrollback. That made content hidden
-        //     under the zarvis completion popup stay blank until a real
-        //     terminal resize forced a replay.
+        //     every keystroke; closing the minibuffer grows the main
+        //     pane and used to replay all accumulated PTY history on
+        //     the UI thread. Prefer a cheap local resize here and let
+        //     subsequent PTY output / SIGWINCH repaint exposed rows.
         //   - Cols changed: vt100 doesn't reflow soft-wrapped lines,
         //     so just `set_size` leaves prior content at the old
         //     wrap (looks narrow in a wider pane). Rebuild the parser
@@ -828,23 +826,6 @@ impl ItemHistory {
             cache.rows = rows;
             cache.processed_count = 0;
             cache.pending_consumed = 0;
-        } else if rows > cache.rows {
-            cache.parser = vt100::Parser::new(
-                rows.max(VT100_MIN_DIM),
-                cols.max(VT100_MIN_DIM),
-                super::app::SCROLLBACK_MAX,
-            );
-            cache.rows = rows;
-            cache.processed_count = 0;
-            cache.pending_consumed = 0;
-            for item in &self.items {
-                if let Item::PtyChunk(b) = item {
-                    cache.parser.process(b);
-                }
-            }
-            cache.parser.process(&self.pending_chunk);
-            cache.processed_count = self.items.len();
-            cache.pending_consumed = self.pending_chunk.len();
         } else if cache.rows != rows {
             cache
                 .parser
@@ -927,7 +908,6 @@ impl ItemHistory {
             None => true,
             Some(c) => {
                 c.cols != cols
-                    || c.rows != rows
                     || current_sigs.len() < c.signatures.len()
                     || self.pending_chunk.len() < c.pending_consumed
                     || c.signatures
@@ -954,6 +934,13 @@ impl ItemHistory {
             });
         }
         let cache = self.cached.as_mut().expect("just populated above");
+        if !needs_rebuild && cache.rows != rows {
+            cache
+                .parser
+                .screen_mut()
+                .set_size(rows.max(VT100_MIN_DIM), cols.max(VT100_MIN_DIM));
+            cache.rows = rows;
+        }
 
         struct BlockSpan {
             call_id: String,
@@ -2198,16 +2185,16 @@ mod tests {
         );
     }
 
-    /// Regression: when the zarvis completion popup disappears, the
-    /// fixed editor pane shrinks and `chat_area.height` grows. A bare
-    /// vt100 row-only `set_size` keeps the old grid and appends blank
-    /// rows at the bottom, so content hidden by the popup does not
-    /// reappear until a real terminal resize. Growing rows must replay
-    /// from history so the newly exposed rows are populated.
+    /// Regression: closing the minibuffer / remote-control dialog grows
+    /// the main PTY pane. That used to replay all accumulated PTY history
+    /// synchronously so newly exposed rows were immediately repopulated;
+    /// long codex sessions could freeze the TUI for seconds. Row-only
+    /// growth should be a cheap `set_size` that preserves the live parser
+    /// and lets subsequent PTY output / SIGWINCH repaint exposed rows.
     #[test]
-    fn replay_cached_rows_grow_repopulates_newly_exposed_rows() {
+    fn replay_cached_rows_grow_does_not_reprocess_history() {
         let mut h = ItemHistory::new();
-        for i in 0..30 {
+        for i in 0..3_000 {
             h.feed_pty(format!("history line {i:02}\r\n").as_bytes());
         }
         const MARKER: &str = "BOTTOM_MARKER";
@@ -2215,16 +2202,81 @@ mod tests {
 
         // Completion popup visible: chat area is shorter.
         let _ = h.replay(80, 5, 0);
+        let processed_before = h
+            .cached
+            .as_ref()
+            .map(|cache| (cache.processed_count, cache.pending_consumed))
+            .expect("cached parser should exist");
 
-        // Completion popup hidden: chat area grows. The bottom row
-        // should be repopulated by replaying history, not left blank.
+        // Completion popup hidden / minibuffer closed: chat area grows.
+        // This must not reset the cache and reprocess all prior bytes.
         let out = h.replay(80, 10, 0);
-        let bottom: String = (0..80)
-            .filter_map(|c| out.screen.cell(9, c).map(|x| x.contents()))
-            .collect();
+        assert_eq!(out.screen.size(), (10, 80));
+        let processed_after = h
+            .cached
+            .as_ref()
+            .map(|cache| (cache.processed_count, cache.pending_consumed))
+            .expect("cached parser should still exist");
+        assert_eq!(
+            processed_after, processed_before,
+            "row-only growth should resize the cached parser without replaying history"
+        );
+    }
+
+    /// Same row-growth regression as above, but for sessions with
+    /// tool blocks. Those use `replay_full`, which has separate
+    /// cache-invalidation rules for block hit-test layout and used to
+    /// force a full rebuild when only `rows` increased.
+    #[test]
+    fn replay_full_rows_grow_does_not_reprocess_history() {
+        let mut h = ItemHistory::new();
+        for i in 0..250 {
+            h.feed_pty(format!("prompt {i}\r\n").as_bytes());
+            h.feed_tool_use("shell".into(), format!("echo {i}"));
+            h.feed_pty(
+                format!("\x1b]7700;open;call=z{i}\x07x\x1b]7700;close;call=z{i}\x07").as_bytes(),
+            );
+            h.feed_tool_result(&format!("z{i}"), true, format!("result {i}"));
+            h.feed_pty(format!("done {i}\r\n").as_bytes());
+        }
+
+        // Popup visible: main pane is shorter.
+        let _ = h.replay(80, 5, 0);
+        let before = h
+            .cached
+            .as_ref()
+            .map(|cache| {
+                (
+                    cache.processed_count,
+                    cache.pending_consumed,
+                    cache.signatures.len(),
+                    cache.item_layouts.len(),
+                )
+            })
+            .expect("cached parser should exist");
+
+        // Popup hidden: rows grow, columns and history are unchanged.
+        let out = h.replay(80, 10, 0);
+        assert_eq!(out.screen.size(), (10, 80));
         assert!(
-            bottom.contains(MARKER),
-            "newly exposed bottom row was not repopulated after row grow: {bottom:?}"
+            !out.blocks.is_empty(),
+            "tool block hit rects survive row growth"
+        );
+        let after = h
+            .cached
+            .as_ref()
+            .map(|cache| {
+                (
+                    cache.processed_count,
+                    cache.pending_consumed,
+                    cache.signatures.len(),
+                    cache.item_layouts.len(),
+                )
+            })
+            .expect("cached parser should still exist");
+        assert_eq!(
+            after, before,
+            "row-only growth should resize replay_full's parser without rebuilding"
         );
     }
 
