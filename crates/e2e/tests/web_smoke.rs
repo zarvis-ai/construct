@@ -857,6 +857,7 @@ async fn web_client_loads_and_websocket_connects() {
               state.mode = 'chat';
               state.currentId = 's-chat-deltas';
               transcriptEl.innerHTML = '';
+              activeTranscriptEl = transcriptEl;
               renderEvent({ type: 'message', role: 'assistant', text: 'Hel' });
               renderEvent({ type: 'message', role: 'assistant', text: 'lo ' });
               renderEvent({ type: 'message', role: 'assistant', text: 'there' });

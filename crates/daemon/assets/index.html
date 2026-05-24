@@ -368,25 +368,33 @@
   }
   .transcript {
     flex: 1 1 0;
+    min-height: 0;
+    position: relative;
+    overflow: hidden;
+  }
+  .transcript-pane {
+    position: absolute;
+    inset: 0;
     overflow-y: auto;
     padding: 12px 14px 16px;
     scroll-behavior: smooth;
     scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
     scrollbar-width: thin;
   }
-  .transcript::-webkit-scrollbar {
+  .transcript-pane[hidden] { display: none; }
+  .transcript-pane::-webkit-scrollbar {
     width: 16px;
   }
-  .transcript::-webkit-scrollbar-track {
+  .transcript-pane::-webkit-scrollbar-track {
     background: var(--session-scrollbar-track);
   }
-  .transcript::-webkit-scrollbar-thumb {
+  .transcript-pane::-webkit-scrollbar-thumb {
     background: var(--session-scrollbar-thumb);
     border: 4px solid transparent;
     background-clip: content-box;
     border-radius: 999px;
   }
-  .transcript::-webkit-scrollbar-thumb:hover {
+  .transcript-pane::-webkit-scrollbar-thumb:hover {
     background: var(--fg);
     background-clip: content-box;
   }
@@ -1382,6 +1390,7 @@
 
 const $ = (id) => document.getElementById(id);
 const transcriptEl = $("transcript");
+let activeTranscriptEl = null;
 const mainEl = document.querySelector("main");
 const sessionListEl = $("sessionList");
 const sessionListResizerEl = $("sessionListResizer");
@@ -1434,6 +1443,10 @@ const state = {
   // session_id so switching sessions is just a re-render of cached
   // events. Cleared on explicit `Reset` events from the adapter.
   byId: new Map(),
+  // Offscreen rendered transcript panes keyed by session id. Keeping the DOM
+  // mounted avoids repainting long headless sessions from the beginning when
+  // the user switches away and back.
+  transcriptPaneById: new Map(),
   // Latest Zarvis editor_state by session id. Claude/Codex/shell do not
   // emit this and continue to rely on their PTY UI echoing input.
   editorById: new Map(),
@@ -1452,10 +1465,12 @@ const state = {
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on `has_pty` plus the session mode.
   mode: "chat",
-  // Lazily-initialized xterm.js handle + fit addon. Reused across
-  // PTY-session switches; `term.reset()` clears between sessions.
+  // Lazily-initialized xterm.js handles + fit addons keyed by session id.
+  // Keeping each xterm mounted offscreen avoids replaying long PTY history
+  // from the beginning when switching terminal sessions.
   term: null,
   fitAddon: null,
+  terminalById: new Map(),
   // Last cols/rows we reported to the daemon, to avoid spamming
   // `session.pty_resize` on every paint when nothing actually
   // changed (ResizeObserver fires generously).
@@ -2239,6 +2254,7 @@ async function selectSession(id) {
 
 function enterChatMode() {
   state.mode = "chat";
+  showTranscriptPane(state.currentId);
   transcriptEl.hidden = false;
   composerEl.hidden = false;
   terminalWrapEl.hidden = true;
@@ -2250,8 +2266,38 @@ function enterChatMode() {
   vkbdEl.hidden = true;
 }
 
+function terminalHandleForSession(id) {
+  return state.terminalById.get(id) || null;
+}
+
+function showTerminalForSession(id) {
+  const handle = terminalHandleForSession(id);
+  for (const [sessionId, h] of state.terminalById.entries()) {
+    h.host.hidden = sessionId !== id;
+  }
+  if (handle) {
+    state.term = handle.term;
+    state.fitAddon = handle.fitAddon;
+    state.ptyBuffer = handle.ptyBuffer;
+    state.ptyBuffering = handle.ptyBuffering;
+    state.lastReportedSize = handle.lastReportedSize || { cols: 0, rows: 0 };
+  }
+  return handle;
+}
+
+function rememberActiveTerminalState() {
+  const id = state.currentId;
+  const handle = id ? terminalHandleForSession(id) : null;
+  if (!handle) return;
+  handle.ptyBuffer = state.ptyBuffer;
+  handle.ptyBuffering = state.ptyBuffering;
+  handle.lastReportedSize = state.lastReportedSize;
+}
+
 async function enterTerminalMode(id) {
+  rememberActiveTerminalState();
   state.mode = "terminal";
+  activeTranscriptEl = null;
   transcriptEl.hidden = true;
   // Composer stays visible above the vkbd in terminal mode —
   // `session.input` is still meaningful for PTY-backed adapters
@@ -2283,46 +2329,53 @@ async function enterTerminalMode(id) {
   }
   terminalLoadingEl.classList.add("gone");
 
-  if (!state.term) initTerminal();
-  state.term.reset();
+  const handle = initTerminalForSession(id);
+  showTerminalForSession(id);
+  activateTerminalHandle(handle);
 
-  // Buffer PTY events that arrive while we're waiting on the
-  // snapshot RPC. Drained after the snapshot is written so
-  // history → live ordering stays correct.
-  state.ptyBuffer = [];
-  state.ptyBuffering = true;
+  if (!handle.loaded) {
+    // Buffer PTY events that arrive while we're waiting on the
+    // snapshot RPC. Drained after the snapshot is written so
+    // history → live ordering stays correct.
+    state.ptyBuffer = [];
+    state.ptyBuffering = true;
 
-  try {
-    const s = state.sessions.find((x) => x.id === id);
-    if (isStructuredToolSession(s)) {
-      // Zarvis: hydrate from the transcript so historical tool calls
-      // (which are never written to the PTY) appear, interleaved with
-      // prose. pty_replay alone would omit them.
-      const t = await rpc("session.transcript", { session_id: id, from: 0 });
-      replayTranscriptToTerm((t && t.events) || []);
-      renderEditorStateForSession(id);
-    } else {
-      const r = await rpc("session.pty_replay", { session_id: id });
-      if (r && r.size) {
-        // Daemon's last-known size wins as the initial geometry; we
-        // refit below in case the phone screen is narrower.
-        state.term.resize(r.size.cols, r.size.rows);
+    try {
+      const s = state.sessions.find((x) => x.id === id);
+      if (isStructuredToolSession(s)) {
+        // Zarvis: hydrate from the transcript so historical tool calls
+        // (which are never written to the PTY) appear, interleaved with
+        // prose. pty_replay alone would omit them.
+        const t = await rpc("session.transcript", { session_id: id, from: 0 });
+        replayTranscriptToTerm((t && t.events) || []);
+        renderEditorStateForSession(id);
+      } else {
+        const r = await rpc("session.pty_replay", { session_id: id });
+        if (r && r.size) {
+          // Daemon's last-known size wins as the initial geometry; we
+          // refit below in case the phone screen is narrower.
+          state.term.resize(r.size.cols, r.size.rows);
+        }
+        // Hand xterm the raw bytes (not a decoded string) so its
+        // built-in streaming UTF-8 decoder owns boundary handling
+        // across this and any subsequent `term.write` call. Passing a
+        // string forces a one-shot per-call decode and corrupts
+        // multi-byte glyphs that straddle PTY frame boundaries.
+        if (r && r.data) state.term.write(decodeBase64ToBytes(r.data));
       }
-      // Hand xterm the raw bytes (not a decoded string) so its
-      // built-in streaming UTF-8 decoder owns boundary handling
-      // across this and any subsequent `term.write` call. Passing a
-      // string forces a one-shot per-call decode and corrupts
-      // multi-byte glyphs that straddle PTY frame boundaries.
-      if (r && r.data) state.term.write(decodeBase64ToBytes(r.data));
+      handle.loaded = true;
+    } catch (e) {
+      state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
     }
-  } catch (e) {
-    state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
+
+    // Flush any live PTY events that buffered during the replay.
+    for (const chunk of state.ptyBuffer) state.term.write(chunk);
+    state.ptyBuffer = [];
+    state.ptyBuffering = false;
   }
 
-  // Flush any live PTY events that buffered during the replay.
-  for (const chunk of state.ptyBuffer) state.term.write(chunk);
-  state.ptyBuffer = [];
-  state.ptyBuffering = false;
+  handle.ptyBuffer = state.ptyBuffer;
+  handle.ptyBuffering = state.ptyBuffering;
 
   // Session-select must claim PTY ownership for the remote client
   // at the current xterm geometry — the TUI fires `pty_resize` on
@@ -2354,7 +2407,12 @@ function waitForXterm(timeoutMs) {
   });
 }
 
-function installTerminalScrollContainment() {
+function installTerminalScrollContainment(host = terminalEl, term = state.term, sessionId = state.currentId) {
+  if (!host) host = document.getElementById("terminal");
+  if (!host) {
+    window.__agentdTerminalMomentumScroll = true;
+    return;
+  }
   // Mobile browsers — especially iOS Safari while the native keyboard is
   // open — sometimes chain a touch scroll that starts on xterm's viewport
   // up to the page visual viewport. The page is a fixed app shell, so that
@@ -2362,11 +2420,6 @@ function installTerminalScrollContainment() {
   // terminal buffer. CSS `overscroll-behavior` is not reliable for this case
   // on iOS, so keep terminal touch scrolling fully local and drive xterm's
   // scrollback ourselves with a small momentum scroller.
-  terminalEl.addEventListener("wheel", (ev) => {
-    cancelResizeFollowBottom();
-    ev.stopPropagation();
-  }, { passive: true });
-
   let active = false;
   let lastY = 0;
   let lastT = 0;
@@ -2378,17 +2431,17 @@ function installTerminalScrollContainment() {
     inertiaFrame = 0;
   };
   const pxPerLine = () => {
-    if (!state.term || !state.term.rows) return 16;
-    return Math.max(8, terminalEl.clientHeight / state.term.rows);
+    if (!term || !term.rows) return 16;
+    return Math.max(8, host.clientHeight / term.rows);
   };
   const scrollPixels = (px) => {
-    if (!state.term) return;
+    if (!term || state.currentId !== sessionId) return;
     carryPx += px;
     const lineH = pxPerLine();
     const lines = carryPx > 0 ? Math.floor(carryPx / lineH) : Math.ceil(carryPx / lineH);
     if (lines !== 0) {
       cancelResizeFollowBottom();
-      state.term.scrollLines(lines);
+      term.scrollLines(lines);
       carryPx -= lines * lineH;
     }
   };
@@ -2408,7 +2461,7 @@ function installTerminalScrollContainment() {
     if (Math.abs(velocity) >= 0.02) inertiaFrame = requestAnimationFrame(tick);
   };
 
-  terminalEl.addEventListener("touchstart", (ev) => {
+  host.addEventListener("touchstart", (ev) => {
     if (ev.touches.length !== 1) return;
     stopInertia();
     active = true;
@@ -2419,7 +2472,7 @@ function installTerminalScrollContainment() {
     ev.stopPropagation();
   }, { passive: true });
 
-  terminalEl.addEventListener("touchmove", (ev) => {
+  host.addEventListener("touchmove", (ev) => {
     if (!active || ev.touches.length !== 1) return;
     const y = ev.touches[0].clientY;
     const now = performance.now();
@@ -2433,13 +2486,13 @@ function installTerminalScrollContainment() {
     ev.stopPropagation();
   }, { passive: false });
 
-  terminalEl.addEventListener("touchend", (ev) => {
+  host.addEventListener("touchend", (ev) => {
     if (!active) return;
     active = false;
     ev.stopPropagation();
     beginInertia();
   }, { passive: true });
-  terminalEl.addEventListener("touchcancel", () => {
+  host.addEventListener("touchcancel", () => {
     active = false;
     stopInertia();
   }, { passive: true });
@@ -2450,6 +2503,7 @@ function installTerminalScrollContainment() {
 }
 
 function initTerminalScrollButtons() {
+  if (window.__agentdTerminalScrollButtons) return;
   const stop = (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
@@ -2472,8 +2526,14 @@ function initTerminalScrollButtons() {
   window.__agentdTerminalScrollButtons = true;
 }
 
-function initTerminal() {
-  state.term = new window.Terminal({
+function createTerminalHandle(id) {
+  const host = document.createElement("div");
+  host.className = "terminal-host";
+  host.hidden = true;
+  host.dataset.sessionId = id;
+  terminalEl.appendChild(host);
+
+  const term = new window.Terminal({
     fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
     fontSize: 13,
     convertEol: false,
@@ -2508,40 +2568,78 @@ function initTerminal() {
       brightWhite: "#e1ffe6",
     },
   });
-  state.fitAddon = new window.FitAddon.FitAddon();
-  state.term.loadAddon(state.fitAddon);
-  state.term.open(terminalEl);
-  installTerminalScrollContainment();
-  initTerminalScrollButtons();
+  const fitAddon = new window.FitAddon.FitAddon();
+  term.loadAddon(fitAddon);
+  term.open(host);
+
+  const handle = {
+    id,
+    host,
+    term,
+    fitAddon,
+    loaded: false,
+    ptyBuffer: [],
+    ptyBuffering: false,
+    lastReportedSize: { cols: 0, rows: 0 },
+  };
+  state.terminalById.set(id, handle);
 
   // Forward user keystrokes (and pasted text) as base64-encoded
   // PTY input. xterm's onData yields a JS string of UTF-8
   // codepoints; we re-encode through TextEncoder so multi-byte
   // input round-trips cleanly.
-  state.term.onData((s) => {
-    if (state.mode !== "terminal" || !state.currentId) return;
+  term.onData((s) => {
+    if (state.mode !== "terminal" || state.currentId !== id) return;
     claimTerminalGeometryNow();
     const data = encodeBase64Utf8(s);
-    rpc("session.pty_input", { session_id: state.currentId, data })
+    rpc("session.pty_input", { session_id: id, data })
       .catch((e) => console.error("pty_input failed:", e));
   });
 
-  // Refit when the viewport changes (orientation, soft-keyboard
-  // showing, etc.). ResizeObserver covers the layout-changes case;
-  // visualViewport covers the soft-keyboard case on mobile.
-  new ResizeObserver(refitTerminal).observe(terminalEl);
-  if (window.visualViewport) {
-    window.visualViewport.addEventListener("resize", refitTerminal);
-  }
+  // Refit when the terminal host changes size. Only the active xterm
+  // claims daemon PTY geometry; hidden cached terminals just keep their
+  // local dimensions ready for instant reveal.
+  new ResizeObserver(() => {
+    if (state.currentId === id) refitTerminal();
+  }).observe(host);
+
+  host.addEventListener("wheel", (ev) => {
+    if (state.currentId !== id) return;
+    cancelResizeFollowBottom();
+    ev.stopPropagation();
+  }, { passive: true });
+
+  installTerminalScrollContainment(host, term, id);
 
   // Tapping the terminal area focuses xterm's helper textarea, which
   // is what summons the soft keyboard on iOS/Android.
-  terminalEl.addEventListener("click", () => {
+  host.addEventListener("click", () => {
+    if (state.currentId !== id) return;
     noteWebPtyEngagement();
     refitTerminal({ claim: true, immediate: true });
-    state.term && state.term.focus();
+    term.focus();
   });
+
+  return handle;
 }
+
+function activateTerminalHandle(handle) {
+  state.term = handle.term;
+  state.fitAddon = handle.fitAddon;
+  state.ptyBuffer = handle.ptyBuffer;
+  state.ptyBuffering = handle.ptyBuffering;
+  state.lastReportedSize = handle.lastReportedSize || { cols: 0, rows: 0 };
+}
+
+function initTerminalForSession(id) {
+  return terminalHandleForSession(id) || createTerminalHandle(id);
+}
+
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", refitTerminal);
+}
+
+initTerminalScrollButtons();
 
 function noteWebPtyEngagement() {
   state.webPtyEngagedUntil = performance.now() + WEB_PTY_ENGAGEMENT_MS;
@@ -3075,8 +3173,47 @@ window.addEventListener("resize", () => {
 
 // --- Transcript rendering -------------------------------------------------
 
+function transcriptPaneForSession(id) {
+  if (!id) return null;
+  let pane = state.transcriptPaneById.get(id);
+  if (!pane) {
+    pane = document.createElement("div");
+    pane.className = "transcript-pane";
+    pane.hidden = true;
+    pane.dataset.sessionId = id;
+    transcriptEl.appendChild(pane);
+    state.transcriptPaneById.set(id, pane);
+  }
+  return pane;
+}
+
+function showTranscriptPane(id) {
+  const next = transcriptPaneForSession(id);
+  for (const pane of state.transcriptPaneById.values()) {
+    pane.hidden = pane !== next;
+  }
+  activeTranscriptEl = next;
+  return next;
+}
+
+function clearTranscriptPane(id) {
+  const pane = state.transcriptPaneById.get(id);
+  if (pane) {
+    pane.innerHTML = "";
+    delete pane.dataset.loaded;
+  }
+}
+
+function transcriptTarget(sessionId = state.currentId) {
+  if (activeTranscriptEl) return activeTranscriptEl;
+  if (sessionId) return transcriptPaneForSession(sessionId);
+  return transcriptEl;
+}
+
 async function loadTranscript(id) {
-  transcriptEl.innerHTML = "";
+  const pane = showTranscriptPane(id);
+  if (pane.dataset.loaded === "true") return;
+  pane.innerHTML = "";
   state.byId.set(id, []);
   let result;
   try {
@@ -3087,6 +3224,7 @@ async function loadTranscript(id) {
   }
   const events = (result && result.events) || [];
   for (const te of events) renderEvent(te.event, te.at);
+  pane.dataset.loaded = "true";
   scrollToBottom({ force: true });
 }
 
@@ -3110,6 +3248,7 @@ function handleNotification(method, params) {
       else state.agentStatusById.delete(session_id);
     }
     if (session_id !== state.currentId) return;
+    if (state.mode === "chat") showTranscriptPane(session_id);
     renderEvent(event, params.at);
     scrollToBottom();
   } else if (method === "session/state") {
@@ -3133,7 +3272,7 @@ function handleNotification(method, params) {
     clearBrowserPreview(params.session_id);
     if (params.session_id === state.currentId) {
       state.currentId = null;
-      transcriptEl.innerHTML = "";
+      clearTranscriptPane(params.session_id);
       renderEditorState(null);
       renderBrowserPreviewForSession(null);
       sessionTitleEl.textContent = "";
@@ -3247,7 +3386,7 @@ function renderEvent(event, at) {
       // lines at the bottom of the transcript.
       break;
     case "reset":
-      transcriptEl.innerHTML = "";
+      clearTranscriptPane(state.currentId);
       state.editorById.delete(state.currentId);
       state.agentStatusById.delete(state.currentId);
       clearBrowserPreview(state.currentId);
@@ -3330,9 +3469,10 @@ function editorLineHtml(prompt, text, cursor, queued) {
 }
 
 function appendMessage(role, text) {
+  const target = transcriptTarget();
   const normalizedRole = role || "assistant";
   if (normalizedRole === "assistant") {
-    const last = transcriptEl.lastElementChild;
+    const last = target.lastElementChild;
     if (
       last &&
       last.classList.contains("row") &&
@@ -3351,7 +3491,7 @@ function appendMessage(role, text) {
     <div class="meta">${escape(normalizedRole)}</div>
     <div class="bubble"></div>`;
   row.querySelector(".bubble").textContent = text;
-  transcriptEl.appendChild(row);
+  target.appendChild(row);
 }
 
 // --- terminal-mode tool-call synthesis (issue #134) ----------------------
@@ -3445,6 +3585,7 @@ function replayTranscriptToTerm(events) {
 }
 
 function appendToolUse(tool, args) {
+  const target = transcriptTarget();
   const row = document.createElement("div");
   row.className = "row";
   const argStr = args === undefined ? "" : tryStringify(args);
@@ -3454,10 +3595,11 @@ function appendToolUse(tool, args) {
       ${argStr ? `<details><summary>args</summary><pre></pre></details>` : ""}
     </div>`;
   if (argStr) row.querySelector("pre").textContent = argStr;
-  transcriptEl.appendChild(row);
+  target.appendChild(row);
 }
 
 function appendToolResult(tool, ok, output) {
+  const target = transcriptTarget();
   const row = document.createElement("div");
   row.className = "row";
   const badge = ok ? '<span class="badge ok">ok</span>' : '<span class="badge err">err</span>';
@@ -3467,10 +3609,11 @@ function appendToolResult(tool, ok, output) {
       ${output ? `<details><summary>output</summary><pre></pre></details>` : ""}
     </div>`;
   if (output) row.querySelector("pre").textContent = output;
-  transcriptEl.appendChild(row);
+  target.appendChild(row);
 }
 
 function appendToolApproval(event) {
+  const target = transcriptTarget();
   const row = document.createElement("div");
   row.className = "row";
   row.innerHTML = `
@@ -3479,13 +3622,14 @@ function appendToolApproval(event) {
       <span class="badge">${escape(event.risk || "")}</span>
       <details open><summary>${escape(event.args_summary || "args")}</summary></details>
     </div>`;
-  transcriptEl.appendChild(row);
+  target.appendChild(row);
 }
 
 function appendPty(text) {
   // Coalesce consecutive PTY rows so each frame doesn't create a
   // new DOM block; matters for chatty interactive harnesses.
-  const last = transcriptEl.lastElementChild;
+  const target = transcriptTarget();
+  const last = target.lastElementChild;
   if (last && last.classList.contains("row") && last.dataset.kind === "pty") {
     last.querySelector("pre").textContent += text;
     return;
@@ -3495,15 +3639,16 @@ function appendPty(text) {
   row.dataset.kind = "pty";
   row.innerHTML = `<pre class="pty"></pre>`;
   row.querySelector("pre").textContent = text;
-  transcriptEl.appendChild(row);
+  target.appendChild(row);
 }
 
 function appendError(msg) {
+  const target = transcriptTarget();
   const row = document.createElement("div");
   row.className = "row";
   row.innerHTML = `<div class="error"></div>`;
   row.querySelector(".error").textContent = msg;
-  transcriptEl.appendChild(row);
+  target.appendChild(row);
 }
 
 function scrollToBottom(options = {}) {
@@ -3512,9 +3657,10 @@ function scrollToBottom(options = {}) {
   // bottom — otherwise a user reading earlier content keeps their
   // place when new events arrive.
   const force = !!options.force;
+  const target = transcriptTarget();
   const nearBottom =
-    transcriptEl.scrollHeight - transcriptEl.scrollTop - transcriptEl.clientHeight < 80;
-  if (force || nearBottom) transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    target.scrollHeight - target.scrollTop - target.clientHeight < 80;
+  if (force || nearBottom) target.scrollTop = target.scrollHeight;
 }
 
 // --- Composer ------------------------------------------------------------
