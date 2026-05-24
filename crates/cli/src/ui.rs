@@ -4123,7 +4123,7 @@ fn short_id(id: &str) -> &str {
     &id[..n]
 }
 
-fn is_headless(s: &agentd_protocol::SessionSummary) -> bool {
+pub fn is_headless(s: &agentd_protocol::SessionSummary) -> bool {
     matches!(s.mode.as_deref(), Some("headless"))
 }
 
