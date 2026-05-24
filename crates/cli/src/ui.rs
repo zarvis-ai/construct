@@ -2515,11 +2515,11 @@ fn render_terminal_scrollbar(
         width: bar_w,
         height: thumb_h as u16,
     };
-    let track_color = blend_color(Color::Black, theme.accent, 0.20);
+    let track_color = blend_color(Color::Black, theme.text, 0.20);
     let track_style = Style::default().fg(track_color).bg(track_color);
     let thumb_style = Style::default()
-        .fg(theme.accent)
-        .bg(theme.accent)
+        .fg(theme.text)
+        .bg(theme.text)
         .add_modifier(Modifier::BOLD);
     for row in 0..track_h {
         let y = area.y + row as u16;
