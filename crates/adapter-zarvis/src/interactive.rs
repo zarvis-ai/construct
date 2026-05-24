@@ -1621,6 +1621,22 @@ mod tests {
         assert!(!pty_input_requests_background(b"b"));
     }
 
+    #[test]
+    fn background_completion_observation_is_model_only_text() {
+        let text = background_completion_observation_text(
+            "call_0123456789abcdef",
+            "shell",
+            true,
+            std::time::Duration::from_millis(94_500),
+            "stdout:\nBuild & test pass\nexit_code: 0\n",
+        );
+
+        assert_eq!(
+            text,
+            "OBSERVATION: background tool call_01234 (shell) finished ok after 94.5s. Output: stdout:\nBuild & test pass\nexit_code: 0\n"
+        );
+    }
+
     #[tokio::test]
     async fn kill_supervisor_task_aborts_running_tool() {
         struct DropNotify(Option<tokio::sync::oneshot::Sender<()>>);
@@ -1993,18 +2009,19 @@ pub async fn run(
                     // the ToolResult event we emitted above.
                     // Synthesize an OBSERVATION: message so the
                     // agent's next turn knows about the completion.
-                    let short_call: String = bc.call_id.chars().take(10).collect();
-                    let preview: String = output_text.chars().take(160).collect();
-                    let label = if ok { "ok" } else { "failed" };
-                    let text = format!(
-                        "OBSERVATION: background tool {} ({}) finished {} after {:.1}s. Output: {}",
-                        short_call,
-                        bc.tool_name,
-                        label,
-                        bc.duration.as_secs_f64(),
-                        preview
+                    let text = background_completion_observation_text(
+                        &bc.call_id,
+                        &bc.tool_name,
+                        ok,
+                        bc.duration,
+                        &output_text,
                     );
-                    term.note(&text);
+                    // Keep the synthetic observation in the model's
+                    // input stream, but don't echo it to the visible
+                    // terminal. The real completion was already
+                    // emitted as ToolResult above, and printing the
+                    // raw OBSERVATION leaks model-control text into
+                    // web/TUI output.
                     text
                 }
                 ReadOutcome::Stop => {
@@ -2777,6 +2794,26 @@ enum ReadOutcome {
     BackgroundCompletion(crate::tasks::BackgroundCompletion),
     Stop,
     Eof,
+}
+
+fn background_completion_observation_text(
+    call_id: &str,
+    tool_name: &str,
+    ok: bool,
+    duration: std::time::Duration,
+    output_text: &str,
+) -> String {
+    let short_call: String = call_id.chars().take(10).collect();
+    let preview: String = output_text.chars().take(160).collect();
+    let label = if ok { "ok" } else { "failed" };
+    format!(
+        "OBSERVATION: background tool {} ({}) finished {} after {:.1}s. Output: {}",
+        short_call,
+        tool_name,
+        label,
+        duration.as_secs_f64(),
+        preview
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
