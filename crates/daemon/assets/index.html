@@ -3092,7 +3092,10 @@ function renderEvent(event, at) {
       appendError(event.message || "(error)");
       break;
     case "status":
-      appendStatus(event.state, event.detail);
+      // Lifecycle/status events drive list chrome and terminal/editor
+      // state. Rendering them as chat rows makes resumed headless
+      // sessions accumulate noisy "awaiting_input" / "running - model"
+      // lines at the bottom of the transcript.
       break;
     case "reset":
       transcriptEl.innerHTML = "";
@@ -3343,15 +3346,6 @@ function appendPty(text) {
   row.dataset.kind = "pty";
   row.innerHTML = `<pre class="pty"></pre>`;
   row.querySelector("pre").textContent = text;
-  transcriptEl.appendChild(row);
-}
-
-function appendStatus(stateStr, detail) {
-  const row = document.createElement("div");
-  row.className = "row";
-  row.innerHTML = `<div class="status"></div>`;
-  row.querySelector(".status").textContent =
-    `· ${stateStr || ""}${detail ? ` — ${detail}` : ""}`;
   transcriptEl.appendChild(row);
 }
 
