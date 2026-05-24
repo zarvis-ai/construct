@@ -800,6 +800,56 @@ async fn web_client_loads_and_websocket_connects() {
         "expected editor_state mirror content, got:\n{editor_text}"
     );
 
+    // Headless zarvis streams assistant prose as many Message deltas.
+    // Chat-mode rendering should aggregate adjacent assistant deltas
+    // into one bubble, while a structured event boundary starts a new
+    // assistant bubble for later prose.
+    let chat_deltas: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              state.mode = 'chat';
+              state.currentId = 's-chat-deltas';
+              transcriptEl.innerHTML = '';
+              renderEvent({ type: 'message', role: 'assistant', text: 'Hel' });
+              renderEvent({ type: 'message', role: 'assistant', text: 'lo ' });
+              renderEvent({ type: 'message', role: 'assistant', text: 'there' });
+              renderEvent({ type: 'tool_use', tool: 'shell', args: { command: 'true' } });
+              renderEvent({ type: 'message', role: 'assistant', text: 'Done' });
+              renderEvent({ type: 'message', role: 'assistant', text: '.' });
+              return Array.from(transcriptEl.children).map((row) => ({
+                kind: row.dataset.kind || '',
+                role: row.dataset.role || '',
+                text: row.textContent.trim(),
+              }));
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate chat delta aggregation")
+        .into_value::<serde_json::Value>()
+        .expect("json array");
+    let chat_rows = chat_deltas.as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        chat_rows.len(),
+        3,
+        "expected assistant deltas to coalesce around tool boundary: {chat_deltas:?}"
+    );
+    assert_eq!(chat_rows[0]["kind"].as_str(), Some("message"));
+    assert_eq!(chat_rows[0]["role"].as_str(), Some("assistant"));
+    assert!(
+        chat_rows[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Hello there"),
+        "first assistant bubble should contain concatenated deltas: {chat_deltas:?}"
+    );
+    let second_assistant = chat_rows[2]["text"].as_str().unwrap_or_default();
+    assert!(
+        second_assistant.contains("Done."),
+        "second assistant bubble should aggregate after boundary: {chat_deltas:?}"
+    );
+
     // Tool-call rendering in terminal mode (issue #134): zarvis emits
     // tool calls as structured events, not PTY bytes, so the xterm view
     // showed nothing for them. `renderEvent` now synthesizes an inline

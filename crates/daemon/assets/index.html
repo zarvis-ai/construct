@@ -2888,10 +2888,25 @@ function editorLineHtml(prompt, text, cursor, queued) {
 }
 
 function appendMessage(role, text) {
+  const normalizedRole = role || "assistant";
+  if (normalizedRole === "assistant") {
+    const last = transcriptEl.lastElementChild;
+    if (
+      last &&
+      last.classList.contains("row") &&
+      last.dataset.kind === "message" &&
+      last.dataset.role === normalizedRole
+    ) {
+      last.querySelector(".bubble").textContent += text;
+      return;
+    }
+  }
   const row = document.createElement("div");
-  row.className = `row role-${escape(role)}`;
+  row.className = `row role-${escape(normalizedRole)}`;
+  row.dataset.kind = "message";
+  row.dataset.role = normalizedRole;
   row.innerHTML = `
-    <div class="meta">${escape(role)}</div>
+    <div class="meta">${escape(normalizedRole)}</div>
     <div class="bubble"></div>`;
   row.querySelector(".bubble").textContent = text;
   transcriptEl.appendChild(row);
