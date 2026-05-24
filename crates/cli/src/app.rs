@@ -1247,8 +1247,9 @@ async fn run_loop(
     // without a SIGWINCH, so the focused session needs a fresh resize
     // every time it gains focus.
     let mut last_session_sent: Option<String> = None;
-    let mut hydration_session: Option<String> = None;
-    let mut hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
+    let mut hydration_tasks: tokio::task::JoinSet<(String, Result<SessionHydration>)> =
+        tokio::task::JoinSet::new();
+    let mut hydration_sessions: HashSet<String> = HashSet::new();
     let mut pinned_hydration_queue: std::collections::VecDeque<String> =
         std::collections::VecDeque::new();
     let mut pinned_hydration_task: Option<tokio::task::JoinHandle<Result<SessionHydration>>> = None;
@@ -1274,13 +1275,11 @@ async fn run_loop(
                         last_size_sent = (0, 0);
                         last_orch_sent = (0, 0);
                         last_session_sent = None;
-                        hydration_session = None;
+                        hydration_sessions.clear();
                         pinned_hydration_session = None;
                         pinned_hydration_queue.clear();
                         app.hydrating_sessions.clear();
-                        if let Some(task) = hydration_task.take() {
-                            task.abort();
-                        }
+                        hydration_tasks.abort_all();
                         if let Some(task) = pinned_hydration_task.take() {
                             task.abort();
                         }
@@ -1309,26 +1308,24 @@ async fn run_loop(
         // work runs. Selection handlers only mark the transcript as
         // stale; after the frame above has painted the new list highlight
         // / placeholder view, start transcript + PTY hydration in the
-        // background. If the user switches again, abort the old task and
-        // discard any stale result.
-        let desired_hydration_session = app.selection.session_id().map(|s| s.to_string());
-        if hydration_session != desired_hydration_session {
-            if let Some(task) = hydration_task.take() {
-                task.abort();
-            }
-            hydration_session = None;
-        }
-        if app.selected_needs_hydration() && hydration_task.is_none() {
+        // background. If the user switches again, keep the old hydration
+        // running so its history is warm if they switch back.
+        if app.selected_needs_hydration() {
             if let Some(req) = app.selected_hydration_request() {
-                hydration_session = Some(req.session_id.clone());
-                app.hydrating_sessions.insert(req.session_id.clone());
-                hydration_task = Some(tokio::spawn(load_session_hydration(req)));
+                if hydration_sessions.insert(req.session_id.clone()) {
+                    app.hydrating_sessions.insert(req.session_id.clone());
+                    hydration_tasks.spawn(async move {
+                        let session_id = req.session_id.clone();
+                        let loaded = load_session_hydration(req).await;
+                        (session_id, loaded)
+                    });
+                }
             }
         }
 
-        let selected_hydrating = hydration_session.as_deref();
+        let selected_hydrating = &hydration_sessions;
         for id in app.pinned_sessions_needing_hydration() {
-            if Some(id.as_str()) == selected_hydrating
+            if selected_hydrating.contains(&id)
                 || pinned_hydration_session.as_deref() == Some(id.as_str())
                 || pinned_hydration_queue.iter().any(|queued| queued == &id)
             {
@@ -1339,7 +1336,7 @@ async fn run_loop(
         }
         if pinned_hydration_task.is_none() {
             while let Some(id) = pinned_hydration_queue.pop_front() {
-                if Some(id.as_str()) == selected_hydrating || app.histories.contains_key(&id) {
+                if selected_hydrating.contains(&id) || app.histories.contains_key(&id) {
                     app.hydrating_sessions.remove(&id);
                     continue;
                 }
@@ -1392,33 +1389,25 @@ async fn run_loop(
             }
         }
         tokio::select! {
-            hydrated = async {
-                match hydration_task.as_mut() {
-                    Some(task) => task.await,
-                    None => futures::future::pending().await,
-                }
-            }, if hydration_task.is_some() => {
-                hydration_task = None;
-                let completed_session = hydration_session.take();
+            hydrated = hydration_tasks.join_next(), if !hydration_tasks.is_empty() => {
                 match hydrated {
-                    Ok(Ok(h)) => app.apply_session_hydration(h).await,
-                    Ok(Err(e)) => {
-                        if let Some(id) = completed_session.as_ref() {
-                            app.hydrating_sessions.remove(id);
-                        }
+                    Some(Ok((id, Ok(h)))) => {
+                        hydration_sessions.remove(&id);
+                        app.apply_session_hydration(h).await;
+                    }
+                    Some(Ok((id, Err(e)))) => {
+                        hydration_sessions.remove(&id);
+                        app.hydrating_sessions.remove(&id);
                         app.set_status(format!("load transcript: {e}"));
                     }
-                    Err(e) if e.is_cancelled() => {
-                        if let Some(id) = completed_session.as_ref() {
-                            app.hydrating_sessions.remove(id);
-                        }
+                    Some(Err(e)) if e.is_cancelled() => {
+                        // The JoinSet was explicitly aborted during reconnect or shutdown;
+                        // `hydration_sessions` is cleared alongside `abort_all`.
                     }
-                    Err(e) => {
-                        if let Some(id) = completed_session.as_ref() {
-                            app.hydrating_sessions.remove(id);
-                        }
+                    Some(Err(e)) => {
                         app.set_status(format!("load transcript task failed: {e}"));
                     }
+                    None => {}
                 }
             }
             pinned_hydrated = async {
@@ -1865,7 +1854,10 @@ impl App {
 
     async fn apply_session_hydration(&mut self, hydration: SessionHydration) {
         if self.selection.session_id() != Some(hydration.session_id.as_str()) {
-            self.hydrating_sessions.remove(&hydration.session_id);
+            // Selection changed while this background load was still running.
+            // Keep the expensive PTY/history work instead of throwing it away;
+            // just avoid replacing the currently-visible transcript.
+            self.apply_hydration_state(hydration, false).await;
             return;
         }
 
@@ -5952,6 +5944,101 @@ mod tests {
         assert!(
             !app.selected_needs_hydration(),
             "transcript view should not re-fetch PTY history"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn stale_selected_hydration_warms_history_without_replacing_transcript() {
+        use agentd_client::Client;
+        use serde_json::Value;
+        use tempfile::tempdir;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempdir().expect("tempdir");
+        let sock = dir.path().join("agentd.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let Ok(n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let resp = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": Value::Null,
+                        });
+                        if writer
+                            .write_all((resp.to_string() + "\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s1.has_pty = true;
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        s2.has_pty = true;
+        let mut app = test_app(client, vec![s1, s2]);
+        app.selection = Selection::Session("s2".into());
+        app.transcript_session = Some("s2".into());
+        app.hydrating_sessions.insert("s1".into());
+
+        app.apply_session_hydration(SessionHydration {
+            session_id: "s1".into(),
+            transcript: vec![TimestampedEvent {
+                seq: 1,
+                at: chrono::Utc::now(),
+                event: SessionEvent::Message {
+                    role: agentd_protocol::MessageRole::Assistant,
+                    text: "old selected transcript".into(),
+                },
+            }],
+            history: Some(crate::pty_render::ItemHistory::new()),
+            editor_state: None,
+            agent_status: None,
+            status_messages: Vec::new(),
+        })
+        .await;
+
+        assert!(
+            app.histories.contains_key("s1"),
+            "stale selected hydration should still warm the history cache"
+        );
+        assert_eq!(
+            app.transcript_session.as_deref(),
+            Some("s2"),
+            "stale selected hydration must not replace the visible transcript"
+        );
+        assert!(
+            !app.hydrating_sessions.contains("s1"),
+            "completed stale hydration should clear the loading marker"
         );
 
         server.abort();
