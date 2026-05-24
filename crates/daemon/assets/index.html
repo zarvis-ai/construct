@@ -3515,12 +3515,10 @@ async function submitComposer({ enter }) {
     }
   } else {
     // Non-PTY chat sessions: only `session.input` makes sense.
-    // Insert and Enter both submit. Show an optimistic bubble so
-    // the UX feels immediate; the adapter typically echoes back
-    // its own canonical "user" event a moment later.
+    // Insert and Enter both submit. The daemon persists and broadcasts
+    // the canonical user message; rendering an optimistic copy here
+    // duplicates that row in headless sessions.
     if (!text.trim()) return;
-    appendMessage("user", text);
-    scrollToBottom();
     try {
       await rpc("session.input", { session_id: state.currentId, text });
     } catch (e) {
