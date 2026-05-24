@@ -2516,15 +2516,20 @@ fn render_terminal_scrollbar(
         height: thumb_h as u16,
     };
     let track_color = blend_color(Color::Black, theme.text, 0.20);
-    let track_style = Style::default().fg(track_color).bg(track_color);
     let thumb_style = Style::default()
         .fg(theme.text)
         .bg(theme.text)
         .add_modifier(Modifier::BOLD);
     for row in 0..track_h {
         let y = area.y + row as u16;
-        f.buffer_mut()
-            .set_string(x0, y, " ".repeat(bar_w as usize), track_style);
+        for col in 0..bar_w {
+            if let Some(cell) = f.buffer_mut().cell_mut(Position { x: x0 + col, y }) {
+                // Keep the terminal glyph/foreground intact and tint only the
+                // cell background. This approximates opacity while preserving
+                // the text underneath the scrollbar track.
+                cell.set_bg(track_color);
+            }
+        }
     }
     for row in 0..thumb_h {
         let y = area.y + (thumb_top + row) as u16;
