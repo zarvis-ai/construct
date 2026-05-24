@@ -129,10 +129,6 @@ For an optimized build, use `cargo build --workspace --release` and replace
   TUI theme customization.
 - [Remote control](docs/remote-control.md) — phone/browser access, QR setup,
   credentials, and local debug mode.
-- [Releasing](docs/RELEASING.md) — how the prebuilt binaries are built and
-  published, and how to cut a versioned release.
-- [Contributor workflow](AGENTS.md) — PR workflow, build expectations, and TUI
-  recording guidance.
 
 ## License
 
