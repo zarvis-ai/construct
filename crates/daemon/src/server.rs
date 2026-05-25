@@ -1,17 +1,17 @@
 //! Unix-socket IPC server. Dispatches JSON-RPC requests to [`SessionManager`]
 //! and forwards subscribed broadcast events back to the client.
 
-use crate::remote::{token_from_uri_path, RemoteState};
+use crate::remote::{RemoteState, token_from_uri_path};
 use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
-    ipc_method, ipc_notif, transport, CreateSessionParams, ErrorObject, GroupCreateParams,
-    GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
-    GroupSetCollapsedParams, Notification, PingResult, Request, Response,
-    SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
-    SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams, SessionSetGroupParams,
-    SessionSetPinnedParams, SessionSetTitleParams, SessionToolActionParams,
-    SessionToolDecisionParams, SubscribeParams, TranscriptParams, IPC_VERSION,
+    CreateSessionParams, ErrorObject, GroupCreateParams, GroupCreateResult, GroupDeleteParams,
+    GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, IPC_VERSION, Notification,
+    PingResult, Request, Response, SessionAttachClipboardParams, SessionIdParams,
+    SessionInputParams, SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams,
+    SessionSetAutomodeParams, SessionSetGroupParams, SessionSetPinnedParams, SessionSetTitleParams,
+    SessionToolActionParams, SessionToolDecisionParams, SubscribeParams, TranscriptParams,
+    ipc_method, ipc_notif, transport,
 };
 use anyhow::{Context, Result};
 use futures::{SinkExt as _, StreamExt as _};
@@ -214,6 +214,24 @@ where
 /// Each connection runs through `run_session` over a chained
 /// stream that demuxes WS upgrade vs. plain HTTP at the TCP level;
 /// see `handle_ws_connection`.
+
+/// Run the local, localhost-only web UI listener. Unlike `/remote-control`,
+/// this path has no token and no Basic auth because it is bound only to
+/// 127.0.0.1 and intended as the always-on desktop browser surface.
+pub async fn serve_local_webui_on(
+    manager: Arc<SessionManager>,
+    listener: TcpListener,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let manager = manager.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_local_webui_connection(stream, manager).await {
+                tracing::debug!(?peer, error = ?e, "local webui connection closed with error");
+            }
+        });
+    }
+}
 pub async fn serve_ws_on(
     manager: Arc<SessionManager>,
     remote: RemoteState,
@@ -247,8 +265,7 @@ const REMOTE_XTERM_CSS: &[u8] = include_bytes!("../assets/static/xterm.css");
 /// addon-fit UMD bundle (pinned to `@xterm/addon-fit@0.10.0`).
 /// Sizes the terminal grid to the container, used on resize +
 /// soft-keyboard show/hide.
-const REMOTE_XTERM_ADDON_FIT_JS: &[u8] =
-    include_bytes!("../assets/static/xterm-addon-fit.js");
+const REMOTE_XTERM_ADDON_FIT_JS: &[u8] = include_bytes!("../assets/static/xterm-addon-fit.js");
 
 /// Read a web-UI asset by path relative to the assets root, preferring
 /// `dev_dir` (when set, debug-only) over the embedded copy. Returns the
@@ -445,11 +462,7 @@ where
 /// Write a 3xx redirect to `location`. Used to canonicalize the
 /// trailing slash on `/t/<token>` so relative URLs (static JS /
 /// CSS) resolve against `/t/<token>/` instead of `/t/`.
-async fn write_redirect_response<W>(
-    wr: &mut W,
-    status: u16,
-    location: &str,
-) -> std::io::Result<()>
+async fn write_redirect_response<W>(wr: &mut W, status: u16, location: &str) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
@@ -510,12 +523,191 @@ where
     wr.flush().await
 }
 
+async fn serve_web_asset_path<W>(
+    wr: &mut W,
+    manager: &Arc<SessionManager>,
+    path: &str,
+    canonical_root: Option<&str>,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match path {
+        "" if canonical_root.is_some() => {
+            write_redirect_response(wr, 301, canonical_root.unwrap()).await
+        }
+        "/" | "/index.html" => {
+            write_http_response(
+                wr,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                &web_index_html(manager.dev_assets().as_deref()),
+            )
+            .await
+        }
+        "/static/xterm.js" => {
+            write_http_response(
+                wr,
+                200,
+                "OK",
+                "application/javascript; charset=utf-8",
+                &web_asset(
+                    manager.dev_assets().as_deref(),
+                    "static/xterm.js",
+                    REMOTE_XTERM_JS,
+                )
+                .0,
+            )
+            .await
+        }
+        "/static/xterm.css" => {
+            write_http_response(
+                wr,
+                200,
+                "OK",
+                "text/css; charset=utf-8",
+                &web_asset(
+                    manager.dev_assets().as_deref(),
+                    "static/xterm.css",
+                    REMOTE_XTERM_CSS,
+                )
+                .0,
+            )
+            .await
+        }
+        "/static/xterm-addon-fit.js" => {
+            write_http_response(
+                wr,
+                200,
+                "OK",
+                "application/javascript; charset=utf-8",
+                &web_asset(
+                    manager.dev_assets().as_deref(),
+                    "static/xterm-addon-fit.js",
+                    REMOTE_XTERM_ADDON_FIT_JS,
+                )
+                .0,
+            )
+            .await
+        }
+        #[cfg(debug_assertions)]
+        "/dev/version" => {
+            let body = manager
+                .dev_assets()
+                .map(|dir| dev_assets_version(&dir))
+                .unwrap_or_default();
+            let status = if body.is_empty() { 404 } else { 200 };
+            write_http_response(
+                wr,
+                status,
+                if status == 200 { "OK" } else { "Not Found" },
+                "text/plain; charset=utf-8",
+                body.as_bytes(),
+            )
+            .await
+        }
+        _ => {
+            write_http_response(
+                wr,
+                404,
+                "Not Found",
+                "text/plain; charset=utf-8",
+                b"not found",
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_local_webui_connection(
+    stream: tokio::net::TcpStream,
+    manager: Arc<SessionManager>,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let (mut rd, mut wr) = stream.into_split();
+    let mut buf: Vec<u8> = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    let prelude_end = loop {
+        let n = match rd.read(&mut chunk).await {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(_) => return Ok(()),
+        };
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = find_prelude_end(&buf) {
+            break end;
+        }
+        if buf.len() > MAX_HTTP_PRELUDE_BYTES {
+            let _ = write_http_response(
+                &mut wr,
+                413,
+                "Payload Too Large",
+                "text/plain; charset=utf-8",
+                b"prelude too large",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    let info = match parse_http_prelude(&buf[..prelude_end]) {
+        Some(i) => i,
+        None => {
+            let _ = write_http_response(
+                &mut wr,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                b"bad request",
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    if !info.is_ws_upgrade {
+        serve_web_asset_path(&mut wr, &manager, &info.path, None).await?;
+        return Ok(());
+    }
+
+    let replay = std::io::Cursor::new(buf).chain(rd);
+    let joined = tokio::io::join(replay, wr);
+    let ws_stream = tokio_tungstenite::accept_async(joined)
+        .await
+        .context("local webui ws upgrade")?;
+
+    let (mut ws_tx, ws_rx) = ws_stream.split();
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let writer_task = tokio::spawn(async move {
+        while let Some(v) = out_rx.recv().await {
+            let s = match serde_json::to_string(&v) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if ws_tx
+                .send(tungstenite::Message::Text(s.into()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let inbound = ReadFromWs { rx: ws_rx };
+    run_session(inbound, out_tx, manager, ClientKind::Remote).await;
+    writer_task.abort();
+    Ok(())
+}
+
 async fn handle_ws_connection(
     stream: tokio::net::TcpStream,
     manager: Arc<SessionManager>,
     remote: RemoteState,
 ) -> Result<()> {
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::io::AsyncReadExt as _;
 
     // Token gate + transport demux. The same URL the QR code points
     // at serves two flows:
@@ -633,93 +825,9 @@ async fn handle_ws_connection(
         // first hand-test.
         let token_prefix = format!("/t/{candidate}");
         let suffix = info.path.strip_prefix(&token_prefix).unwrap_or("");
-        match suffix {
-            // Bare `/t/<token>` — relative paths in the HTML
-            // would resolve against `/t/` rather than
-            // `/t/<token>/`, so xterm.js etc. would 404. Redirect
-            // once to add the trailing slash; everything else
-            // routes to the same handlers either way.
-            "" => {
-                let location = format!("{token_prefix}/");
-                let _ = write_redirect_response(&mut wr, 301, &location).await;
-                return Ok(());
-            }
-            "/" | "/index.html" => {
-                let _ = write_http_response(
-                    &mut wr,
-                    200,
-                    "OK",
-                    "text/html; charset=utf-8",
-                    &web_index_html(manager.dev_assets().as_deref()),
-                )
-                .await;
-                return Ok(());
-            }
-            "/static/xterm.js" => {
-                let _ = write_http_response(
-                    &mut wr,
-                    200,
-                    "OK",
-                    "application/javascript; charset=utf-8",
-                    &web_asset(manager.dev_assets().as_deref(), "static/xterm.js", REMOTE_XTERM_JS).0,
-                )
-                .await;
-                return Ok(());
-            }
-            "/static/xterm.css" => {
-                let _ = write_http_response(
-                    &mut wr,
-                    200,
-                    "OK",
-                    "text/css; charset=utf-8",
-                    &web_asset(manager.dev_assets().as_deref(), "static/xterm.css", REMOTE_XTERM_CSS).0,
-                )
-                .await;
-                return Ok(());
-            }
-            "/static/xterm-addon-fit.js" => {
-                let _ = write_http_response(
-                    &mut wr,
-                    200,
-                    "OK",
-                    "application/javascript; charset=utf-8",
-                    &web_asset(manager.dev_assets().as_deref(), "static/xterm-addon-fit.js", REMOTE_XTERM_ADDON_FIT_JS).0,
-                )
-                .await;
-                return Ok(());
-            }
-            // Dev hot-reload: the injected poller hits this to detect
-            // edits. Only meaningful when dev assets are active; 404
-            // otherwise (the poller is only injected in that case).
-            #[cfg(debug_assertions)]
-            "/dev/version" => {
-                let body = manager
-                    .dev_assets()
-                    .map(|dir| dev_assets_version(&dir))
-                    .unwrap_or_default();
-                let status = if body.is_empty() { 404 } else { 200 };
-                let _ = write_http_response(
-                    &mut wr,
-                    status,
-                    if status == 200 { "OK" } else { "Not Found" },
-                    "text/plain; charset=utf-8",
-                    body.as_bytes(),
-                )
-                .await;
-                return Ok(());
-            }
-            _ => {
-                let _ = write_http_response(
-                    &mut wr,
-                    404,
-                    "Not Found",
-                    "text/plain; charset=utf-8",
-                    b"not found",
-                )
-                .await;
-                return Ok(());
-            }
-        }
+        let canonical = format!("{token_prefix}/");
+        serve_web_asset_path(&mut wr, &manager, suffix, Some(&canonical)).await?;
+        return Ok(());
     }
 
     // WS upgrade path. We've already consumed the prelude bytes from
@@ -752,7 +860,11 @@ async fn handle_ws_connection(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if ws_tx.send(tungstenite::Message::Text(s.into())).await.is_err() {
+            if ws_tx
+                .send(tungstenite::Message::Text(s.into()))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
@@ -957,7 +1069,9 @@ async fn dispatch(
             let p = params!(SessionPtyInputParams);
             let bytes = match p.decode() {
                 Ok(b) => b,
-                Err(e) => return Response::err(id.clone(), ErrorObject::invalid_params(e.to_string())),
+                Err(e) => {
+                    return Response::err(id.clone(), ErrorObject::invalid_params(e.to_string()));
+                }
             };
             // Mark this client kind as the active one for the
             // session and re-resize the PTY to its last-known
@@ -1205,7 +1319,8 @@ async fn dispatch(
             // `/remote-control` path). `local_only=true` is the
             // `/remote-control-debug` path — bind the local
             // listener only, never wait for cloudflared.
-            let params: agentd_protocol::RemoteStartParams = match parse_params(req.params.clone()) {
+            let params: agentd_protocol::RemoteStartParams = match parse_params(req.params.clone())
+            {
                 Ok(p) => p,
                 Err(e) => return Response::err(id.clone(), e),
             };
@@ -1318,8 +1433,14 @@ mod tests {
         let empty = String::from_utf8(web_index_html(Some(dir.path()))).unwrap();
         std::fs::remove_file(dir.path().join("index.html")).unwrap();
         let fallback = String::from_utf8(web_index_html(Some(dir.path()))).unwrap();
-        assert!(!fallback.contains("DEV_MARKER"), "served embedded, not the dev file");
-        assert!(fallback.contains("dev/version"), "poller kept for auto-recovery");
+        assert!(
+            !fallback.contains("DEV_MARKER"),
+            "served embedded, not the dev file"
+        );
+        assert!(
+            fallback.contains("dev/version"),
+            "poller kept for auto-recovery"
+        );
         assert_ne!(empty, fallback);
 
         // A nonexistent dir behaves the same (embedded + poller).
@@ -1342,10 +1463,12 @@ mod tests {
         let path = dir.path().join("index.html");
         std::fs::write(&path, b"x").unwrap();
         let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1000)).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1000))
+            .unwrap();
         let v1 = dev_assets_version(dir.path());
         assert!(v1.contains("index.html"));
-        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2000)).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2000))
+            .unwrap();
         let v2 = dev_assets_version(dir.path());
         assert_ne!(v1, v2, "version must change when an asset's mtime changes");
     }

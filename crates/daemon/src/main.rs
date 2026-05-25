@@ -128,6 +128,32 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
 
     let socket_path = socket_override.unwrap_or_else(|| paths.socket());
 
+    // Always expose the browser UI on localhost without remote-control
+    // credentials. This is intentionally local-only: `/remote-control`
+    // remains the opt-in public tunnel path and still layers token +
+    // Basic auth on top.
+    let local_webui_port = std::env::var("AGENTD_WEBUI_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(5746);
+    {
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            let addr = format!("127.0.0.1:{local_webui_port}");
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(listener) => {
+                    tracing::info!(url = %format!("http://{addr}/"), "local webui ready (localhost-only, no auth)");
+                    if let Err(e) = server::serve_local_webui_on(mgr, listener).await {
+                        tracing::error!(error = %e, "local webui listener failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(addr = %addr, error = %e, "local webui disabled; bind failed");
+                }
+            }
+        });
+    }
+
     // Auto-start the remote WS listener at boot when
     // `AGENTD_REMOTE_WS_PORT` is set — the headless / scripted
     // entry point. Interactive users get the same machinery via
