@@ -3338,7 +3338,7 @@ impl App {
         }
         let mut y = area.y;
         for panel in visible {
-            let panel_rows = markdown_display_rows(&panel.markdown).saturating_add(2).max(3) as u16;
+            let panel_rows = markdown_display_rows(&panel.markdown).saturating_add(3).max(4) as u16;
             if row >= y && row < y.saturating_add(panel_rows) {
                 self.dynamic_ui_focused = Some((session_id, panel.id.clone()));
                 return;

@@ -2689,8 +2689,8 @@ fn dynamic_ui_panel_areas(
             .saturating_sub(y)
             .min(session_area.y.saturating_add(session_area.height).saturating_sub(y));
         let height = (rendered.len() as u16)
-            .saturating_add(2)
-            .clamp(3, remaining.max(3));
+            .saturating_add(3)
+            .clamp(4, remaining.max(4));
         out.push(Rect {
             x: session_area.x + session_area.width.saturating_sub(width + 1),
             y,
@@ -2735,7 +2735,7 @@ fn render_dynamic_ui_panel(
         x: area.x.saturating_add(2),
         y: area.y.saturating_add(1),
         width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
+        height: area.height.saturating_sub(3),
     };
     let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
     let lines = render_agentd_markdown_lines(
