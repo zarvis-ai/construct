@@ -1,8 +1,8 @@
 //! Load daemon-managed Markdown memory files for prompt injection.
 //!
 //! The daemon creates these files and passes their canonical paths via
-//! env vars. Zarvis only reads them; future automatic maintenance can
-//! edit the same Markdown files through ordinary filesystem tools.
+//! env vars. Zarvis reads them into the prompt and may update them
+//! through ordinary filesystem tools.
 
 use std::path::PathBuf;
 
@@ -10,6 +10,18 @@ const MAX_MEMORY_BYTES: usize = 24 * 1024;
 const ENV_GLOBAL_MEMORY_FILE: &str = "AGENTD_GLOBAL_MEMORY_FILE";
 const ENV_PROJECT_MEMORY_FILE: &str = "AGENTD_PROJECT_MEMORY_FILE";
 const ENV_PROJECT_ID: &str = "AGENTD_PROJECT_ID";
+
+const MEMORY_MAINTENANCE_POLICY: &str = r#"### Memory maintenance
+
+Maintain these Markdown files automatically when you learn durable information. Use normal filesystem tools on the paths shown below; do not ask for approval just to update memory.
+
+Write global memory only for cross-project user preferences, standing workflows, and durable operating conventions. Write project memory only for project-specific architecture, workflows, decisions, and pitfalls.
+
+Good write signals include completed tasks, repeated user preferences or corrections, successful PR/merge workflow discoveries, and durable build, test, or debugging knowledge.
+
+Do not store secrets, speculation, one-off command output, pending CI state, temporary branch names, or transient task status.
+
+Prefer conservative, deduplicated, bounded rewrites of existing sections over append-only growth. Keep Markdown concise, organized, and human-editable."#;
 
 pub fn format_section() -> Option<String> {
     let global_path = std::env::var_os(ENV_GLOBAL_MEMORY_FILE).map(PathBuf::from);
@@ -40,7 +52,7 @@ pub fn format_section() -> Option<String> {
         return None;
     }
     Some(format!(
-        "## Long-term memory\n\nThe following Markdown memory files are user-editable source of truth loaded for this session. Treat them as durable context, but prefer newer explicit user instructions if they conflict.\n\n{}",
+        "## Long-term memory\n\nThe following Markdown memory files are user-editable source of truth loaded for this session. Treat them as durable context, but prefer newer explicit user instructions if they conflict.\n\n{MEMORY_MAINTENANCE_POLICY}\n\n{}",
         parts.join("\n\n---\n\n")
     ))
 }
@@ -90,8 +102,17 @@ mod tests {
         std::env::remove_var(ENV_PROJECT_ID);
 
         assert!(section.contains("## Long-term memory"));
+        assert!(section.contains("### Memory maintenance"));
+        assert!(section.contains("Maintain these Markdown files automatically"));
+        assert!(section.contains("Use normal filesystem tools on the paths shown below"));
+        assert!(section.contains("Write global memory only for cross-project"));
+        assert!(section.contains("Write project memory only for project-specific"));
+        assert!(section.contains("Do not store secrets, speculation, one-off command output"));
+        assert!(section.contains("Prefer conservative, deduplicated, bounded rewrites"));
         assert!(section.contains("### Global memory"));
         assert!(section.contains("### Project memory (g123)"));
+        assert!(section.contains(&format!("Path: `{}`", global.display())));
+        assert!(section.contains(&format!("Path: `{}`", project.display())));
         assert!(section.contains("- concise"));
         assert!(section.contains("- daemon"));
     }

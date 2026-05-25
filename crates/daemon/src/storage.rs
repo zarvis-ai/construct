@@ -7,6 +7,11 @@
 //!     meta.json          # SessionSummary (JSON)
 //!     transcript.jsonl   # one TimestampedEvent per line
 //!     worktree/          # optional git worktree
+//! global/
+//!     memory.md          # cross-project memory
+//! projects/<id>/
+//!     meta.json          # project metadata (GroupSummary JSON)
+//!     memory.md          # project-specific memory
 //! ```
 
 use agentd_protocol::{GroupSummary, SessionSummary, TimestampedEvent, TranscriptResult};

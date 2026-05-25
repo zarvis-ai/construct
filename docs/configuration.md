@@ -8,10 +8,29 @@
 |---|---|---|
 | Config | `~/.config/agentd` | `AGENTD_CONFIG_DIR` |
 | State (pid/log) | `~/.local/state/agentd` | `AGENTD_STATE_DIR` |
-| Data (sessions) | `~/.local/share/agentd` | `AGENTD_DATA_DIR` |
+| Data (sessions, projects, memory) | `~/.local/share/agentd` | `AGENTD_DATA_DIR` |
 | Socket | `$XDG_RUNTIME_DIR/agentd/agentd.sock` (falls back to state) | `AGENTD_RUNTIME_DIR` |
 
 `agentd paths` prints the resolved layout.
+
+The data directory stores durable, user-editable runtime data:
+
+```text
+sessions/<session-id>/
+    meta.json
+    transcript.jsonl
+    worktree/          # optional per-session git worktree
+
+global/
+    memory.md          # cross-project memory
+
+projects/<project-id>/
+    meta.json
+    memory.md          # project-specific memory
+```
+
+Legacy `groups/<project-id>.json` files are migrated to
+`projects/<project-id>/meta.json` when loaded.
 
 ## TUI Theme
 
