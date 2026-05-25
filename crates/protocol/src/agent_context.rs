@@ -31,11 +31,12 @@ pub const TOOL_DESCRIPTION: &str =
 
 const WIDGET_POLICY: &[&str] = &[
     "Use session widgets for compact task status, checklists, decision prompts, and action links that help the user monitor or steer the current session.",
+    "Widget creation, updates, and deletion should be mostly automated: use best judgment to decide what widget to create, when to refresh it, and when to remove it; ask the user first only when approval is absolutely required by normal safety/tool policy or the widget would make a significant product/user-facing decision.",
     "Create or update widgets as Markdown files in session_widgets.dir using normal file tools; the daemon auto-reloads `*.md` changes and the TUI updates the session popover live.",
     "Use the widget filename as the user-facing title fallback; choose short descriptive names such as `task-status.md` or `review.md`.",
     "Keep widget Markdown concise and safe; prefer headings, checklists, tables, and agentd action links like `[Run checks](agentd:action/run-checks)`.",
     "Treat clicked widget actions (`OBSERVATION: ui.action ...`) as user intent, but still follow normal tool approval and safety policy.",
-    "Update or delete widget files as task state changes; widgets are durable session UI state, not model transcript history.",
+    "Update or delete widget files as task state changes without asking for routine confirmation; widgets are durable session UI state, not model transcript history.",
 ];
 
 const MEMORY_POLICY: &[&str] = &[
