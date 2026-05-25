@@ -11,7 +11,6 @@ mod context;
 mod hooks;
 mod interactive;
 mod interval_suggest;
-mod memory;
 mod model_limits;
 mod observe;
 mod persist;
