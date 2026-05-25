@@ -429,6 +429,17 @@ pub struct App {
     /// Latest browser preview per session, fed by `SessionEvent::BrowserPreview`
     /// and rendered as a top-right overlay in the terminal view.
     pub browser_previews: HashMap<String, BrowserPreviewState>,
+    /// Adapter/file-backed dynamic UI panels, keyed by session id then panel id.
+    /// Actions route back as normal session input.
+    pub ui_panels: HashMap<String, HashMap<String, agentd_protocol::UiPanel>>,
+    /// Currently open widget selector dropdown session, if any.
+    pub dynamic_ui_popover_open: Option<String>,
+    /// Widgets explicitly selected by the user. Default state is hidden.
+    pub dynamic_ui_selected: HashSet<(String, String)>,
+    /// Widgets temporarily shown after create/update. Hover extends this deadline.
+    pub dynamic_ui_temporary_until: HashMap<(String, String), Instant>,
+    /// The one widget panel currently focused for keyboard handling.
+    pub dynamic_ui_focused: Option<(String, String)>,
     /// MRU cache of resized preview images shared by the terminal-view
     /// overlay and the matrix-rain wallpaper — avoids re-downscaling the
     /// screenshot every frame. See [`ImageResizeCache`].
@@ -494,6 +505,7 @@ struct SessionHydration {
     history: Option<crate::pty_render::ItemHistory>,
     editor_state: Option<EditorState>,
     agent_status: Option<agentd_protocol::AgentStatus>,
+    ui_panels: HashMap<String, agentd_protocol::UiPanel>,
     status_messages: Vec<String>,
 }
 
@@ -611,15 +623,17 @@ fn format_elapsed(started_at_ms: i64) -> String {
 async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionHydration> {
     tokio::task::spawn_blocking(move || {
         let mut status_messages = Vec::new();
-        let transcript: agentd_protocol::TranscriptResult = blocking_request(
+        let detail: agentd_protocol::SessionDetail = blocking_request(
             &req.socket,
-            agentd_protocol::ipc_method::SESSION_TRANSCRIPT,
-            &agentd_protocol::TranscriptParams {
+            agentd_protocol::ipc_method::SESSION_GET,
+            &agentd_protocol::SessionIdParams {
                 session_id: req.session_id.clone(),
-                from: 0,
-                limit: None,
             },
         )?;
+        let transcript = agentd_protocol::TranscriptResult {
+            total: detail.events.len() as u64,
+            events: detail.events,
+        };
 
         let history = if req.needs_history {
             let mut h = crate::pty_render::ItemHistory::new();
@@ -649,6 +663,12 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
 
             let mut editor_state = None;
             let mut agent_status = None;
+            let mut ui_panels: HashMap<String, agentd_protocol::UiPanel> = detail
+                .ui_panels
+                .iter()
+                .cloned()
+                .map(|panel| (panel.id.clone(), panel))
+                .collect();
             if transcript
                 .events
                 .iter()
@@ -666,13 +686,31 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
                 &mut h,
                 &mut editor_state,
                 &mut agent_status,
+                &mut ui_panels,
                 req.is_headless,
             );
             let (cols, rows) = req.terminal_pane_size;
             let _ = h.replay(cols.max(1), rows.max(1), 0);
-            (Some(h), editor_state, agent_status)
+            (Some(h), editor_state, agent_status, ui_panels)
         } else {
-            (None, None, None)
+            let mut ui_panels: HashMap<String, agentd_protocol::UiPanel> = detail
+                .ui_panels
+                .iter()
+                .cloned()
+                .map(|panel| (panel.id.clone(), panel))
+                .collect();
+            for ev in &transcript.events {
+                match &ev.event {
+                    SessionEvent::UiPanel(panel) => {
+                        ui_panels.insert(panel.id.clone(), panel.clone());
+                    }
+                    SessionEvent::UiDelete { id } => {
+                        ui_panels.remove(id);
+                    }
+                    _ => {}
+                }
+            }
+            (None, None, None, ui_panels)
         };
 
         Ok(SessionHydration {
@@ -681,6 +719,7 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
             history: history.0,
             editor_state: history.1,
             agent_status: history.2,
+            ui_panels: history.3,
             status_messages,
         })
     })
@@ -886,6 +925,53 @@ pub struct HintZone {
     pub action: KeyAction,
 }
 
+#[derive(Debug, Clone)]
+pub struct DynamicUiActionHit {
+    pub session_id: String,
+    pub panel_id: String,
+    pub action: agentd_protocol::UiAction,
+    pub row: u16,
+    pub start_col: u16,
+    /// Exclusive end column.
+    pub end_col: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicUiWidgetHit {
+    pub session_id: String,
+    pub panel_id: String,
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct DynamicUiPanelCloseHit {
+    pub session_id: String,
+    pub panel_id: String,
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+}
+
+impl DynamicUiActionHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.start_col && col < self.end_col
+    }
+}
+
+impl DynamicUiWidgetHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.start_col && col < self.end_col
+    }
+}
+
+impl DynamicUiPanelCloseHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.start_col && col < self.end_col
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlHit {
     pub url: String,
@@ -947,6 +1033,16 @@ pub struct LayoutSnapshot {
     pub browser_preview_close: Option<(u16, u16, u16)>,
     /// Terminal scrollback overlay hit geometry for the selected session.
     pub terminal_scrollbar: Option<TerminalScrollbarHit>,
+    /// Dynamic UI action hitboxes from the last frame.
+    pub dynamic_ui_action_hits: Vec<DynamicUiActionHit>,
+    pub dynamic_ui_widget_hits: Vec<DynamicUiWidgetHit>,
+    pub dynamic_ui_panel_close_hits: Vec<DynamicUiPanelCloseHit>,
+    /// Dynamic UI title-bar affordance bounds: `(x_start, x_end, y, session_id)`.
+    pub dynamic_ui_trigger: Option<(u16, u16, u16, String)>,
+    /// Dynamic UI widget panel bounds from the last frame.
+    pub dynamic_ui_popover_area: Option<ratatui::layout::Rect>,
+    /// Dynamic UI dropdown bounds from the last frame.
+    pub dynamic_ui_dropdown_area: Option<ratatui::layout::Rect>,
 }
 
 #[derive(Debug, Clone)]
@@ -1145,6 +1241,20 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
         browser_previews: HashMap::new(),
+        ui_panels: HashMap::new(),
+        dynamic_ui_popover_open: None,
+        dynamic_ui_selected: persisted
+            .widgets
+            .iter()
+            .flat_map(|(session_id, state)| {
+                state
+                    .visible
+                    .iter()
+                    .map(move |panel_id| (session_id.clone(), panel_id.clone()))
+            })
+            .collect(),
+        dynamic_ui_temporary_until: HashMap::new(),
+        dynamic_ui_focused: None,
         image_resize_cache: Vec::new(),
         session_transition: None,
         pin_transitions: HashMap::new(),
@@ -1221,6 +1331,18 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     );
     terminal.show_cursor().ok();
 
+    let mut widgets: HashMap<String, crate::tui_state::WidgetState> = HashMap::new();
+    for (session_id, panel_id) in &app.dynamic_ui_selected {
+        widgets
+            .entry(session_id.clone())
+            .or_default()
+            .visible
+            .push(panel_id.clone());
+    }
+    for state in widgets.values_mut() {
+        state.visible.sort();
+        state.visible.dedup();
+    }
     crate::tui_state::save(&crate::tui_state::TuiState {
         last_selected_session_id: app.selection.session_id().map(|s| s.to_string()),
         zoom: app.zoom,
@@ -1231,6 +1353,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         list_collapsed: app.list_collapsed,
         matrix_rain_hidden: app.matrix_rain_hidden,
         hide_pane_side_borders: app.hide_pane_side_borders,
+        widgets,
     });
 
     result
@@ -1929,6 +2052,8 @@ impl App {
         if let Some(status) = hydration.agent_status {
             self.agent_statuses.insert(session_id.clone(), status);
         }
+        self.ui_panels
+            .insert(session_id.clone(), hydration.ui_panels);
         if let Some(msg) = hydration.status_messages.last() {
             self.set_status(msg.clone());
         }
@@ -2136,6 +2261,7 @@ impl App {
         // call_id and just fills `output` on the existing block.
         let mut replayed_editor_state: Option<EditorState> = None;
         let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
+        let mut replayed_ui_panels: HashMap<String, agentd_protocol::UiPanel> = HashMap::new();
         let is_headless = self
             .sessions
             .iter()
@@ -2160,6 +2286,7 @@ impl App {
                     &mut history,
                     &mut replayed_editor_state,
                     &mut replayed_agent_status,
+                    &mut replayed_ui_panels,
                     is_headless,
                 );
             }
@@ -2172,6 +2299,9 @@ impl App {
         }
         if let Some(status) = replayed_agent_status {
             self.agent_statuses.insert(id.to_string(), status);
+        }
+        if !replayed_ui_panels.is_empty() {
+            self.ui_panels.insert(id.to_string(), replayed_ui_panels);
         }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
@@ -2357,6 +2487,7 @@ impl App {
                             self.editor_states.remove(&payload.session_id);
                             self.agent_statuses.remove(&payload.session_id);
                             self.browser_previews.remove(&payload.session_id);
+                            self.ui_panels.remove(&payload.session_id);
                             self.pty_activity.remove(&payload.session_id);
                             self.matrix_rain.forget_session(&payload.session_id);
                             if Some(payload.session_id.as_str())
@@ -2532,6 +2663,33 @@ impl App {
                                 preview.clone(),
                             );
                             return;
+                        }
+                        match &payload.event {
+                            SessionEvent::UiPanel(panel) => {
+                                self.ui_panels
+                                    .entry(payload.session_id.clone())
+                                    .or_default()
+                                    .insert(panel.id.clone(), panel.clone());
+                                self.dynamic_ui_temporary_until.insert(
+                                    (payload.session_id.clone(), panel.id.clone()),
+                                    Instant::now() + Duration::from_secs(10),
+                                );
+                            }
+                            SessionEvent::UiDelete { id } => {
+                                if let Some(panels) = self.ui_panels.get_mut(&payload.session_id) {
+                                    panels.remove(id);
+                                    if panels.is_empty() {
+                                        self.ui_panels.remove(&payload.session_id);
+                                    }
+                                }
+                                let key = (payload.session_id.clone(), id.clone());
+                                self.dynamic_ui_selected.remove(&key);
+                                self.dynamic_ui_temporary_until.remove(&key);
+                                if self.dynamic_ui_focused.as_ref() == Some(&key) {
+                                    self.dynamic_ui_focused = None;
+                                }
+                            }
+                            _ => {}
                         }
                         if let SessionEvent::AgentStatus(status) = &payload.event {
                             if status.active {
@@ -2739,6 +2897,7 @@ impl App {
         }
         self.histories.remove(id);
         self.block_hits.remove(id);
+        self.ui_panels.remove(id);
         self.pty_activity.remove(id);
         self.matrix_rain.forget_session(id);
         // Orchestrator session went away → palette fallback after the
@@ -2862,6 +3021,9 @@ impl App {
                 if self.begin_terminal_scrollbar_drag_or_jump(ev.column, ev.row) {
                     return;
                 }
+                if self.is_over_dynamic_ui_overlay(ev.column, ev.row) {
+                    return;
+                }
                 // Matrix-rain panel: the title bar doubles as a height
                 // handle. The panel is bottom-anchored, so dragging the top
                 // edge upward grows it and dragging downward shrinks it.
@@ -2929,6 +3091,8 @@ impl App {
                 } else if let Some((grab_offset, max_scrollback)) = self.dragging_terminal_scrollbar
                 {
                     self.drag_terminal_scrollbar_to_row(ev.row, grab_offset, max_scrollback);
+                } else if self.is_over_dynamic_ui_overlay(ev.column, ev.row) {
+                    self.text_selection = None;
                 } else if let Some(sel) = self.text_selection.as_mut() {
                     sel.head = ScreenPoint {
                         col: ev.column,
@@ -3160,6 +3324,125 @@ impl App {
         false
     }
 
+    fn is_over_dynamic_ui_overlay(&self, col: u16, row: u16) -> bool {
+        fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
+            c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
+        }
+        self.layout
+            .dynamic_ui_popover_area
+            .is_some_and(|area| contains(area, col, row))
+            || self
+                .layout
+                .dynamic_ui_dropdown_area
+                .is_some_and(|area| contains(area, col, row))
+    }
+
+    fn focus_dynamic_ui_panel_at(&mut self, col: u16, row: u16) {
+        let Some(session_id) = self.selected_id() else {
+            self.dynamic_ui_focused = None;
+            return;
+        };
+        let Some(panels) = self.ui_panels.get(&session_id) else {
+            self.dynamic_ui_focused = None;
+            return;
+        };
+        let mut visible: Vec<_> = panels
+            .values()
+            .filter(|panel| self.dynamic_ui_panel_visible(&session_id, &panel.id))
+            .collect();
+        visible.sort_by(|a, b| a.id.cmp(&b.id));
+        let Some(area) = self.layout.dynamic_ui_popover_area else {
+            self.dynamic_ui_focused = None;
+            return;
+        };
+        if col < area.x || col >= area.x.saturating_add(area.width) {
+            return;
+        }
+        let mut y = area.y;
+        for panel in visible {
+            let panel_rows = markdown_display_rows(&panel.markdown).saturating_add(3).max(4) as u16;
+            if row >= y && row < y.saturating_add(panel_rows) {
+                self.dynamic_ui_focused = Some((session_id, panel.id.clone()));
+                return;
+            }
+            y = y.saturating_add(panel_rows).saturating_add(1);
+        }
+    }
+
+    async fn handle_dynamic_ui_overlay_click(&mut self, col: u16, row: u16) -> bool {
+        fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
+            c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
+        }
+        if let Some(hit) = self
+            .layout
+            .dynamic_ui_panel_close_hits
+            .iter()
+            .find(|hit| hit.contains(col, row))
+            .cloned()
+        {
+            self.hide_dynamic_ui_panel(hit.session_id, hit.panel_id);
+            return true;
+        }
+        if let Some(hit) = self
+            .layout
+            .dynamic_ui_action_hits
+            .iter()
+            .find(|hit| hit.contains(col, row))
+            .cloned()
+        {
+            self.dynamic_ui_focused = Some((hit.session_id.clone(), hit.panel_id.clone()));
+            self.dispatch_dynamic_ui_action(hit.session_id, Some(hit.panel_id), hit.action)
+                .await;
+            return true;
+        }
+        if let Some((x_start, x_end, y, session_id)) = self.layout.dynamic_ui_trigger.clone() {
+            if row == y && col >= x_start && col < x_end {
+                self.dynamic_ui_popover_open =
+                    if self.dynamic_ui_popover_open.as_deref() == Some(session_id.as_str()) {
+                        None
+                    } else {
+                        Some(session_id)
+                    };
+                return true;
+            }
+        }
+        if self.dynamic_ui_popover_open.is_some() {
+            if let Some(hit) = self
+                .layout
+                .dynamic_ui_widget_hits
+                .iter()
+                .find(|hit| hit.contains(col, row))
+                .cloned()
+            {
+                let key = (hit.session_id, hit.panel_id);
+                if self.dynamic_ui_selected.contains(&key) {
+                    self.dynamic_ui_selected.remove(&key);
+                } else {
+                    self.dynamic_ui_selected.insert(key.clone());
+                    self.dynamic_ui_temporary_until.remove(&key);
+                }
+                return true;
+            }
+            if let Some(dropdown) = self.layout.dynamic_ui_dropdown_area {
+                if contains(dropdown, col, row) {
+                    return true;
+                }
+            }
+            if let Some(popover) = self.layout.dynamic_ui_popover_area {
+                if contains(popover, col, row) {
+                    self.focus_dynamic_ui_panel_at(col, row);
+                    return true;
+                }
+                self.dynamic_ui_popover_open = None;
+            }
+        }
+        if self.is_over_dynamic_ui_overlay(col, row) {
+            self.focus_dynamic_ui_panel_at(col, row);
+            return true;
+        }
+        false
+    }
+
     /// Hit-test a left-click against the last frame's pane geometry.
     /// - Inside the **minibuffer**: position the cursor within the
     ///   typed input when one is open, or open the command palette
@@ -3187,6 +3470,9 @@ impl App {
                 Ok(()) => self.set_status(format!("opened {}", hit.url)),
                 Err(e) => self.set_status(format!("open URL failed: {e}")),
             }
+            return;
+        }
+        if self.handle_dynamic_ui_overlay_click(col, row).await {
             return;
         }
         // Matrix-rain horizontal reveal word: jump to the session that
@@ -3261,6 +3547,7 @@ impl App {
         }
         if let Some(view) = self.layout.view_area {
             if contains(view, col, row) {
+                self.dynamic_ui_focused = None;
                 if let Some((x_start, x_end, y)) = self.layout.browser_preview_close {
                     if row == y && col >= x_start && col < x_end {
                         if let Some(id) = self.selected_id() {
@@ -3295,6 +3582,10 @@ impl App {
                         .await;
                     return;
                 }
+                if self.handle_dynamic_ui_overlay_click(col, row).await {
+                    return;
+                }
+                self.dynamic_ui_focused = None;
                 // Inner area: same Rect minus the 1-cell border on
                 // each side. The render path stores hit ranges
                 // relative to the inner area's top — translate
@@ -3893,6 +4184,10 @@ impl App {
             return;
         }
 
+        if self.try_dynamic_ui_action_key(key).await {
+            return;
+        }
+
         if self.should_autofocus_view_from_list(key) {
             self.collapse_orchestrator_panel_on_focus_change();
             self.focus = PaneFocus::View;
@@ -3954,6 +4249,120 @@ impl App {
 
     fn in_pty_session(&self) -> bool {
         self.selected_session().map(|s| s.has_pty).unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    fn ui_panels_for_test(
+        &self,
+        session_id: &str,
+    ) -> Option<&HashMap<String, agentd_protocol::UiPanel>> {
+        self.ui_panels.get(session_id)
+    }
+
+    async fn try_dynamic_ui_action_key(&mut self, key: KeyEvent) -> bool {
+        if self.focus != PaneFocus::View || !key.modifiers.is_empty() {
+            return false;
+        }
+        let KeyCode::Char(c) = key.code else {
+            return false;
+        };
+        if !c.is_ascii_digit() || c == '0' {
+            return false;
+        }
+        let Some(session_id) = self.selected_id() else {
+            return false;
+        };
+        let Some((focused_session, focused_panel)) = self.dynamic_ui_focused.clone() else {
+            return false;
+        };
+        if focused_session != session_id || !self.dynamic_ui_panel_visible(&session_id, &focused_panel) {
+            return false;
+        }
+        let Some(action) = self.dynamic_ui_action_for_key(&session_id, c) else {
+            return false;
+        };
+        self.dispatch_dynamic_ui_action(session_id, Some(focused_panel), action)
+            .await;
+        true
+    }
+
+    async fn dispatch_dynamic_ui_action(
+        &mut self,
+        session_id: String,
+        panel_id: Option<String>,
+        action: agentd_protocol::UiAction,
+    ) {
+        let label = action.label.clone();
+        let action_id = action.id.clone();
+        let text = if let Some(panel_id) = panel_id {
+            format!(
+                "OBSERVATION: ui.action {{\"panel_id\":\"{}\",\"action_id\":\"{}\",\"label\":\"{}\"}}",
+                json_escape(&panel_id),
+                json_escape(&action_id),
+                json_escape(&label)
+            )
+        } else {
+            format!(
+                "OBSERVATION: ui.action {{\"action_id\":\"{}\",\"label\":\"{}\"}}",
+                json_escape(&action_id),
+                json_escape(&label)
+            )
+        };
+        match self.client.send_input(&session_id, text).await {
+            Ok(()) => self.set_status(format!("ui action: {label}")),
+            Err(e) => self.set_status(format!("ui action failed: {e}")),
+        }
+    }
+
+    pub fn dynamic_ui_panel_visible(&self, session_id: &str, panel_id: &str) -> bool {
+        let key = (session_id.to_string(), panel_id.to_string());
+        self.dynamic_ui_selected.contains(&key)
+            || self
+                .dynamic_ui_temporary_until
+                .get(&key)
+                .is_some_and(|until| *until > Instant::now())
+    }
+
+    fn hide_dynamic_ui_panel(&mut self, session_id: String, panel_id: String) {
+        let key = (session_id, panel_id);
+        self.dynamic_ui_selected.remove(&key);
+        self.dynamic_ui_temporary_until.remove(&key);
+        if self.dynamic_ui_focused.as_ref() == Some(&key) {
+            self.dynamic_ui_focused = None;
+        }
+    }
+
+    fn dynamic_ui_action_for_key(
+        &self,
+        session_id: &str,
+        key: char,
+    ) -> Option<agentd_protocol::UiAction> {
+        let panels = self.ui_panels.get(session_id)?;
+        let focused_panel = self
+            .dynamic_ui_focused
+            .as_ref()
+            .filter(|(focused_session, _)| focused_session == session_id)
+            .map(|(_, panel_id)| panel_id.clone());
+        let mut panel_ids: Vec<_> = if let Some(focused_panel) = focused_panel.as_ref() {
+            vec![focused_panel]
+        } else {
+            panels.keys().collect()
+        };
+        panel_ids.sort();
+        let mut action_index = 1u32;
+        for panel_id in panel_ids {
+            let panel = panels.get(panel_id)?;
+            for action in markdown_actions(&panel.markdown) {
+                let implicit = char::from_digit(action_index, 10)
+                    .map(|v| v == key)
+                    .unwrap_or(false);
+                if implicit || action.key.as_deref() == Some(&key.to_string()) {
+                    return Some(action);
+                }
+                action_index += 1;
+            }
+        }
+        None
     }
 
     fn should_autofocus_view_from_list(&self, key: KeyEvent) -> bool {
@@ -5171,6 +5580,7 @@ pub fn apply_transcript_to_local_state(
     history: &mut crate::pty_render::ItemHistory,
     editor_state: &mut Option<EditorState>,
     agent_status: &mut Option<agentd_protocol::AgentStatus>,
+    ui_panels: &mut HashMap<String, agentd_protocol::UiPanel>,
     is_headless: bool,
 ) {
     for ev in events {
@@ -5253,6 +5663,12 @@ pub fn apply_transcript_to_local_state(
                         history.feed_pty(&bytes);
                     }
                 }
+            }
+            SessionEvent::UiPanel(panel) => {
+                ui_panels.insert(panel.id.clone(), panel.clone());
+            }
+            SessionEvent::UiDelete { id } => {
+                ui_panels.remove(id);
             }
             // Headless sessions carry their conversation as structured
             // Message / Reasoning events (no PTY), so fold the prose into
@@ -5571,6 +5987,12 @@ mod tests {
             browser_preview_area: None,
             browser_preview_close: None,
             terminal_scrollbar: None,
+            dynamic_ui_action_hits: Vec::new(),
+            dynamic_ui_widget_hits: Vec::new(),
+            dynamic_ui_panel_close_hits: Vec::new(),
+            dynamic_ui_trigger: None,
+            dynamic_ui_popover_area: None,
+            dynamic_ui_dropdown_area: None,
         }
     }
 
@@ -5635,6 +6057,11 @@ mod tests {
             editor_states: HashMap::new(),
             agent_statuses: HashMap::new(),
             browser_previews: HashMap::new(),
+            ui_panels: HashMap::new(),
+            dynamic_ui_popover_open: None,
+            dynamic_ui_selected: HashSet::new(),
+            dynamic_ui_temporary_until: HashMap::new(),
+            dynamic_ui_focused: None,
             image_resize_cache: Vec::new(),
             session_transition: None,
             pin_transitions: HashMap::new(),
@@ -6240,6 +6667,7 @@ mod tests {
             history: Some(crate::pty_render::ItemHistory::new()),
             editor_state: None,
             agent_status: None,
+            ui_panels: HashMap::new(),
             status_messages: Vec::new(),
         })
         .await;
@@ -6738,6 +7166,23 @@ mod tests {
         server.abort();
     }
 
+    fn session_detail_summary_json(id: &str, has_pty: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "harness": "shell",
+            "cwd": "/tmp",
+            "state": "running",
+            "created_at": "2026-05-21T00:00:00Z",
+            "pending_input": false,
+            "event_count": 0,
+            "has_pty": has_pty,
+            "pinned": false,
+            "position": 0,
+            "automode": false,
+            "kind": "user"
+        })
+    }
+
     #[tokio::test]
     async fn background_hydration_does_not_block_primary_client_rpc() {
         use agentd_client::Client;
@@ -6783,7 +7228,7 @@ mod tests {
                             ipc_method::PING => {
                                 serde_json::json!({"pong": true, "version": "test"})
                             }
-                            ipc_method::SESSION_TRANSCRIPT => {
+                            ipc_method::SESSION_GET => {
                                 let _ = transcript_seen_tx.send(());
                                 release.notified().await;
                                 let events: Vec<Value> = (0..2_000)
@@ -6801,7 +7246,11 @@ mod tests {
                                         })
                                     })
                                     .collect();
-                                serde_json::json!({"events": events, "total": 2_000})
+                                serde_json::json!({
+                                    "summary": session_detail_summary_json("s-big", false),
+                                    "events": events,
+                                    "ui_panels": []
+                                })
                             }
                             ipc_method::SESSION_PTY_REPLAY => {
                                 serde_json::json!({"data": "", "size": {"cols": 80, "rows": 24}})
@@ -6901,7 +7350,7 @@ mod tests {
                         let id = req.get("id").cloned().unwrap_or(Value::Null);
                         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         let result = match method {
-                            ipc_method::SESSION_TRANSCRIPT => {
+                            ipc_method::SESSION_GET => {
                                 // Headless transcript: assistant + reasoning
                                 // deltas, no PTY events at all.
                                 let ev = |seq: u64, event: Value| {
@@ -6930,7 +7379,11 @@ mod tests {
                                         }),
                                     ),
                                 ];
-                                serde_json::json!({"events": events, "total": 3})
+                                serde_json::json!({
+                                    "summary": session_detail_summary_json("s-headless", false),
+                                    "events": events,
+                                    "ui_panels": []
+                                })
                             }
                             ipc_method::SESSION_PTY_REPLAY => {
                                 serde_json::json!({"data": "", "size": {"cols": 80, "rows": 24}})
@@ -7057,7 +7510,15 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status: Option<AgentStatus> = None;
-        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status, false);
+        let mut ui_panels = HashMap::new();
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut ui_panels,
+            false,
+        );
 
         // The render must include the synthesized header for the
         // block. Before the fix, no `ToolBlock` items existed and
@@ -7125,6 +7586,7 @@ mod tests {
                 &mut history,
                 &mut editor,
                 &mut status,
+                &mut HashMap::new(),
                 is_headless,
             );
             let out = history.replay(80, 24, 0);
@@ -7196,7 +7658,15 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor: Option<EditorState> = None;
         let mut status = None;
-        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status, false);
+        let mut ui_panels = HashMap::new();
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut ui_panels,
+            false,
+        );
 
         let screen_rows = 24u16;
         let screen_cols = 80u16;
@@ -7253,7 +7723,15 @@ mod tests {
             started_at_ms,
             status: "Working".into(),
         });
-        apply_transcript_to_local_state(&events, &mut history, &mut editor, &mut status, false);
+        let mut ui_panels = HashMap::new();
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut ui_panels,
+            false,
+        );
 
         assert!(
             status.is_none(),
@@ -7278,6 +7756,69 @@ mod tests {
         assert!(
             text.contains("* Finished"),
             "bootstrap transcript replay must restore the completed-turn history line. got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn ui_panel_replay_tracks_create_patch_delete() {
+        use agentd_protocol::{SessionEvent, TimestampedEvent, UiPanel, UiPlacement};
+        use chrono::Utc;
+        fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
+            TimestampedEvent {
+                seq,
+                at: Utc::now(),
+                event,
+            }
+        }
+        let events = vec![
+            ev(
+                1,
+                SessionEvent::UiPanel(UiPanel {
+                    id: "task".into(),
+                    source: None,
+                    title: Some("Task".into()),
+                    placement: UiPlacement::Sticky,
+                    markdown: "old".into(),
+                }),
+            ),
+            ev(
+                2,
+                SessionEvent::UiPanel(UiPanel {
+                    id: "task".into(),
+                    source: None,
+                    title: Some("Task".into()),
+                    placement: UiPlacement::Sticky,
+                    markdown: "new".into(),
+                }),
+            ),
+            ev(
+                3,
+                SessionEvent::UiPanel(UiPanel {
+                    id: "other".into(),
+                    source: None,
+                    title: None,
+                    placement: UiPlacement::Sticky,
+                    markdown: "keep".into(),
+                }),
+            ),
+            ev(4, SessionEvent::UiDelete { id: "task".into() }),
+        ];
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor = None;
+        let mut status = None;
+        let mut panels = HashMap::new();
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut panels,
+            false,
+        );
+        assert!(!panels.contains_key("task"));
+        assert_eq!(
+            panels.get("other").map(|p| p.markdown.as_str()),
+            Some("keep")
         );
     }
 
@@ -7385,11 +7926,13 @@ mod tests {
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor_state: Option<EditorState> = None;
         let mut agent_status: Option<agentd_protocol::AgentStatus> = None;
+        let mut ui_panels = HashMap::new();
         apply_transcript_to_local_state(
             &events,
             &mut history,
             &mut editor_state,
             &mut agent_status,
+            &mut ui_panels,
             false,
         );
 
@@ -7433,6 +7976,62 @@ fn adjusted_list_scroll_offset(
 ) -> usize {
     let max_scroll = item_count.saturating_sub(visible_rows);
     adjusted_scrollback(current, delta).min(max_scroll)
+}
+
+fn json_escape(s: &str) -> String {
+    serde_json::to_string(s)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .trim_matches('"')
+        .to_string()
+}
+
+fn markdown_display_rows(markdown: &str) -> usize {
+    let mut rows = 0usize;
+    let mut pending_actions = false;
+    for raw in markdown.lines() {
+        let line = raw.trim_end();
+        if line.contains("](agentd:action/") {
+            if !pending_actions {
+                pending_actions = true;
+                rows = rows.saturating_add(1);
+            }
+            continue;
+        }
+        pending_actions = false;
+        rows = rows.saturating_add(1);
+    }
+    rows
+}
+
+fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
+    let mut out = Vec::new();
+    let mut rest = markdown;
+    while let Some(label_start) = rest.find('[') {
+        rest = &rest[label_start + 1..];
+        let Some(label_end) = rest.find(']') else {
+            break;
+        };
+        let label = &rest[..label_end];
+        let after_label = &rest[label_end + 1..];
+        let Some(after_open) = after_label.strip_prefix("(agentd:action/") else {
+            rest = after_label;
+            continue;
+        };
+        let Some(id_end) = after_open.find(')') else {
+            break;
+        };
+        let id = &after_open[..id_end];
+        if !label.is_empty() && !id.is_empty() {
+            out.push(agentd_protocol::UiAction {
+                id: id.to_string(),
+                label: label.to_string(),
+                key: None,
+                style: None,
+            });
+        }
+        rest = &after_open[id_end + 1..];
+    }
+    out
 }
 
 fn insert_minibuffer_text(mb: &mut Minibuffer, text: &str) {

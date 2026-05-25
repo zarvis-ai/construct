@@ -114,6 +114,7 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     // chosen harness missing or no API key); clients fall back to the
     // static palette in that case.
     manager.clone().ensure_orchestrator().await;
+    manager.spawn_widget_watcher();
     // Loop scheduler: wakes every second, fires due loops by
     // calling `SessionManager::send_input`. Persisted per-session
     // in `sessions/<id>/loops.json`; daemon restart picks them
@@ -220,9 +221,7 @@ async fn run(socket_override: Option<PathBuf>) -> Result<()> {
                 }
             });
         } else {
-            tracing::info!(
-                "remote: prior tunnel no longer restorable across restart; staying off"
-            );
+            tracing::info!("remote: prior tunnel no longer restorable across restart; staying off");
         }
     }
 

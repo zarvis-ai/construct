@@ -14,7 +14,9 @@
 //!     memory.md          # project-specific memory
 //! ```
 
-use agentd_protocol::{GroupSummary, SessionSummary, TimestampedEvent, TranscriptResult};
+use agentd_protocol::{
+    GroupSummary, SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
+};
 use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -62,7 +64,10 @@ impl Storage {
     }
 
     pub fn ensure_project_memory(&self, project_id: &str) -> Result<PathBuf> {
-        ensure_memory_file(&self.project_memory_path(project_id), PROJECT_MEMORY_TEMPLATE)
+        ensure_memory_file(
+            &self.project_memory_path(project_id),
+            PROJECT_MEMORY_TEMPLATE,
+        )
     }
 
     pub fn groups_root(&self) -> PathBuf {
@@ -147,7 +152,8 @@ impl Storage {
         }
         let legacy = self.group_path(id);
         if legacy.exists() {
-            std::fs::remove_file(&legacy).with_context(|| format!("remove {}", legacy.display()))?;
+            std::fs::remove_file(&legacy)
+                .with_context(|| format!("remove {}", legacy.display()))?;
         }
         Ok(())
     }
@@ -176,10 +182,53 @@ impl Storage {
         self.session_dir(id).join("worktree")
     }
 
+    pub fn widgets_dir(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("widgets")
+    }
+
+    pub fn ensure_widgets_dir(&self, id: &str) -> Result<PathBuf> {
+        self.ensure_session_dir(id)?;
+        let dir = self.widgets_dir(id);
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        Ok(dir)
+    }
+
+    pub fn read_widgets(&self, id: &str) -> Result<Vec<UiPanel>> {
+        let dir = self.widgets_dir(id);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut panels = Vec::new();
+        for entry in std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(markdown) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            panels.push(UiPanel {
+                id: stem.to_string(),
+                source: path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string),
+                title: Some(stem.replace(['-', '_'], " ")),
+                placement: UiPlacement::Sticky,
+                markdown,
+            });
+        }
+        panels.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(panels)
+    }
+
     pub fn ensure_session_dir(&self, id: &str) -> Result<()> {
         let dir = self.session_dir(id);
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create {}", dir.display()))
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))
     }
 
     pub fn save_summary(&self, s: &SessionSummary) -> Result<()> {
@@ -195,8 +244,8 @@ impl Storage {
     pub fn load_summary(&self, id: &str) -> Result<SessionSummary> {
         let path = self.meta_path(id);
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let s: SessionSummary = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let s: SessionSummary =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         Ok(s)
     }
 
@@ -220,14 +269,11 @@ impl Storage {
         Ok(())
     }
 
-    pub fn load_start_params(
-        &self,
-        id: &str,
-    ) -> Result<agentd_protocol::SessionStartParams> {
+    pub fn load_start_params(&self, id: &str) -> Result<agentd_protocol::SessionStartParams> {
         let path = self.start_params_path(id);
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let p: agentd_protocol::SessionStartParams = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let p: agentd_protocol::SessionStartParams =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         Ok(p)
     }
 
@@ -398,8 +444,8 @@ impl Storage {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let mut f = std::fs::File::open(&path)
-            .with_context(|| format!("open {}", path.display()))?;
+        let mut f =
+            std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let len = f.metadata()?.len() as usize;
         let offset = len.saturating_sub(max_bytes);
         if offset > 0 {
@@ -417,8 +463,7 @@ impl Storage {
     pub fn remove_session(&self, id: &str) -> Result<()> {
         let dir = self.session_dir(id);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("remove {}", dir.display()))?;
+            std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
         }
         Ok(())
     }
@@ -426,12 +471,10 @@ impl Storage {
 
 fn ensure_memory_file(path: &Path, template: &str) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     if !path.exists() {
-        std::fs::write(path, template)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::write(path, template).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(path.to_path_buf())
 }
@@ -465,10 +508,7 @@ mod memory_tests {
         let project = storage.ensure_project_memory("g123").unwrap();
 
         assert_eq!(global, tmp.path().join("data/global/memory.md"));
-        assert_eq!(
-            project,
-            tmp.path().join("data/projects/g123/memory.md")
-        );
+        assert_eq!(project, tmp.path().join("data/projects/g123/memory.md"));
         assert!(std::fs::read_to_string(global)
             .unwrap()
             .contains("## Preferences"));

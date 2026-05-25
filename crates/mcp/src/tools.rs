@@ -691,10 +691,8 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_tools_flow_through_mcp_with_parent_scope() {
-        let dir = std::env::temp_dir().join(format!(
-            "agentd-mcp-subagent-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentd-mcp-subagent-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("test dir");
         let sock = dir.join("agentd.sock");
@@ -718,7 +716,10 @@ mod tests {
                             serde_json::from_value(params).expect("create params");
                         assert_eq!(p.kind, SessionKind::Subagent);
                         assert_eq!(p.parent_session_id.as_deref(), Some("sparent"));
-                        assert_eq!(p.env.get("AGENTD_PARENT_SESSION_ID").map(String::as_str), Some("sparent"));
+                        assert_eq!(
+                            p.env.get("AGENTD_PARENT_SESSION_ID").map(String::as_str),
+                            Some("sparent")
+                        );
                         assert_eq!(p.mode.as_deref(), Some("headless"));
                         assert_eq!(p.harness, "codex");
                         json!({ "session_id": "ssub" })
@@ -753,16 +754,28 @@ mod tests {
                         })
                     }
                     ipc_method::SESSION_INPUT => {
-                        assert_eq!(params.get("session_id").and_then(|s| s.as_str()), Some("ssub"));
-                        assert_eq!(params.get("text").and_then(|s| s.as_str()), Some("continue"));
+                        assert_eq!(
+                            params.get("session_id").and_then(|s| s.as_str()),
+                            Some("ssub")
+                        );
+                        assert_eq!(
+                            params.get("text").and_then(|s| s.as_str()),
+                            Some("continue")
+                        );
                         json!(null)
                     }
                     ipc_method::SESSION_INTERRUPT => {
-                        assert_eq!(params.get("session_id").and_then(|s| s.as_str()), Some("ssub"));
+                        assert_eq!(
+                            params.get("session_id").and_then(|s| s.as_str()),
+                            Some("ssub")
+                        );
                         json!(null)
                     }
                     ipc_method::SESSION_DELETE => {
-                        assert_eq!(params.get("session_id").and_then(|s| s.as_str()), Some("ssub"));
+                        assert_eq!(
+                            params.get("session_id").and_then(|s| s.as_str()),
+                            Some("ssub")
+                        );
                         created.state = SessionState::Done;
                         json!(null)
                     }
@@ -847,11 +860,17 @@ mod tests {
         name: &str,
         arguments: Value,
     ) -> Value {
-        let response = call(client, session_id, json!({ "name": name, "arguments": arguments }))
-            .await
-            .expect("tool call");
+        let response = call(
+            client,
+            session_id,
+            json!({ "name": name, "arguments": arguments }),
+        )
+        .await
+        .expect("tool call");
         assert_eq!(response["isError"], false, "{response:?}");
-        let text = response["content"][0]["text"].as_str().expect("text result");
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("text result");
         serde_json::from_str(text).expect("json tool result")
     }
 

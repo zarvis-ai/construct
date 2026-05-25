@@ -320,7 +320,16 @@ impl MatrixRain {
         orientation: RevealOrientation,
         session_id: Option<String>,
     ) {
-        self.queue_at(text, tone, x, y, priority, orientation, Instant::now(), session_id);
+        self.queue_at(
+            text,
+            tone,
+            x,
+            y,
+            priority,
+            orientation,
+            Instant::now(),
+            session_id,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -559,6 +568,8 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
         | SessionEvent::Pty { .. }
         | SessionEvent::EditorState { .. }
         | SessionEvent::BrowserPreview(_)
+        | SessionEvent::UiPanel(_)
+        | SessionEvent::UiDelete { .. }
         | SessionEvent::AgentStatus(_) => None,
     }
 }
@@ -702,7 +713,15 @@ mod tests {
     #[test]
     fn queue_sets_target_position() {
         let mut rain = MatrixRain::default();
-        rain.queue("matrix", FlashTone::Work, 0.2, 0.8, 10, RevealOrientation::Horizontal, None);
+        rain.queue(
+            "matrix",
+            FlashTone::Work,
+            0.2,
+            0.8,
+            10,
+            RevealOrientation::Horizontal,
+            None,
+        );
         let reveal = rain.active_reveal(Instant::now()).expect("reveal word");
         assert_eq!(reveal.text, "matrix");
         assert_eq!(reveal.x, 0.2);
@@ -712,8 +731,24 @@ mod tests {
     #[test]
     fn multiple_reveals_can_be_active_together() {
         let mut rain = MatrixRain::default();
-        rain.queue("working", FlashTone::Work, 0.2, 0.4, 10, RevealOrientation::Horizontal, None);
-        rain.queue("worked", FlashTone::Good, 0.6, 0.7, 20, RevealOrientation::Horizontal, None);
+        rain.queue(
+            "working",
+            FlashTone::Work,
+            0.2,
+            0.4,
+            10,
+            RevealOrientation::Horizontal,
+            None,
+        );
+        rain.queue(
+            "worked",
+            FlashTone::Good,
+            0.6,
+            0.7,
+            20,
+            RevealOrientation::Horizontal,
+            None,
+        );
 
         let active: Vec<_> = rain
             .active_reveals(Instant::now())
@@ -725,8 +760,24 @@ mod tests {
     #[test]
     fn active_reveal_reports_highest_priority_word() {
         let mut rain = MatrixRain::default();
-        rain.queue("working", FlashTone::Work, 0.2, 0.4, 10, RevealOrientation::Horizontal, None);
-        rain.queue("failed", FlashTone::Bad, 0.6, 0.7, 100, RevealOrientation::Horizontal, None);
+        rain.queue(
+            "working",
+            FlashTone::Work,
+            0.2,
+            0.4,
+            10,
+            RevealOrientation::Horizontal,
+            None,
+        );
+        rain.queue(
+            "failed",
+            FlashTone::Bad,
+            0.6,
+            0.7,
+            100,
+            RevealOrientation::Horizontal,
+            None,
+        );
 
         assert_eq!(
             rain.active_reveal(Instant::now())
@@ -755,7 +806,9 @@ mod tests {
         rain.observe_pty_activity("sess-a", b"\x1b[31m\x1b[0m", now, 1.0);
         let word = rain.active_reveal(now).map(|w| w.text.clone());
         assert!(
-            word.as_deref().map(|w| PTY_ACTIVITY_WORDS.contains(&w)).unwrap_or(false),
+            word.as_deref()
+                .map(|w| PTY_ACTIVITY_WORDS.contains(&w))
+                .unwrap_or(false),
             "expected fallback rotation word, got {word:?}"
         );
     }
@@ -832,7 +885,9 @@ mod tests {
         rain.observe_pty_activity("sess-a", b"Reading", now, 1.0);
         rain.observe_pty_activity("sess-a", b"more", now + Duration::from_millis(100), 1.0);
         rain.observe_pty_activity("sess-a", b"bytes", now + Duration::from_millis(1000), 1.0);
-        let count = rain.active_reveals(now + Duration::from_millis(1100)).count();
+        let count = rain
+            .active_reveals(now + Duration::from_millis(1100))
+            .count();
         assert_eq!(count, 1);
     }
 
@@ -859,10 +914,7 @@ mod tests {
         );
         let later = now + PTY_REVEAL_GAP + Duration::from_millis(10);
         rain.observe_pty_activity("sess-a", b"", later, 1.0);
-        let texts: Vec<_> = rain
-            .active_reveals(later)
-            .map(|w| w.text.clone())
-            .collect();
+        let texts: Vec<_> = rain.active_reveals(later).map(|w| w.text.clone()).collect();
         assert_eq!(texts.len(), 2);
         assert_eq!(texts[1], "files"); // most recent word from the pool
     }
@@ -886,7 +938,10 @@ mod tests {
         rain.forget_session("sess-a");
         assert!(rain.pty_word_pool.get("sess-a").is_none());
         rain.observe_pty_activity("sess-a", b"Reading", now + Duration::from_millis(50), 1.0);
-        assert_eq!(rain.active_reveals(now + Duration::from_millis(50)).count(), 2);
+        assert_eq!(
+            rain.active_reveals(now + Duration::from_millis(50)).count(),
+            2
+        );
     }
 
     #[test]
@@ -958,7 +1013,10 @@ mod tests {
         for _ in 0..5 {
             extract_pty_words(b"Thinking ", &mut pool);
         }
-        assert_eq!(pool.iter().collect::<Vec<_>>(), vec![&"Thinking".to_string()]);
+        assert_eq!(
+            pool.iter().collect::<Vec<_>>(),
+            vec![&"Thinking".to_string()]
+        );
     }
 
     #[test]

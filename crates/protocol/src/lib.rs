@@ -226,6 +226,45 @@ pub struct BrowserPreview {
     pub height: u32,
 }
 
+/// Declarative, adapter-owned session UI panel. This is intentionally a
+/// small semantic vocabulary for the first dynamic-UI pass: renderers own
+/// layout/resize/focus while harnesses own the task state being displayed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiPanel {
+    pub id: String,
+    /// Source filename for file-backed widgets. Used as title fallback and
+    /// omitted for ephemeral event-backed panels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub placement: UiPlacement,
+    /// Safe agentd-markdown: normal markdown plus semantic links such as
+    /// `[Run checks](agentd:action/run-checks)`. Renderers parse the subset
+    /// they understand and degrade the rest as text.
+    #[serde(default)]
+    pub markdown: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UiPlacement {
+    Inline,
+    #[default]
+    Sticky,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+}
+
 /// A structured event emitted by an adapter while running a session.
 ///
 /// Adapters whose underlying CLI is plain text can lean on
@@ -274,6 +313,12 @@ pub enum SessionEvent {
     /// UI-only browser preview. Clients may render this as an overlay;
     /// it is not intended to be fed back to the model as tool output.
     BrowserPreview(BrowserPreview),
+    /// Declarative session UI panel created or replaced by an adapter.
+    UiPanel(UiPanel),
+    /// Delete a previously-created session UI panel by id.
+    UiDelete {
+        id: String,
+    },
     Cost {
         #[serde(default)]
         usd: f64,
@@ -936,6 +981,10 @@ pub struct PtyReplayResult {
 pub struct SessionDetail {
     pub summary: SessionSummary,
     pub events: Vec<TimestampedEvent>,
+    /// Current durable, file-backed UI widgets for this session. Kept separate
+    /// from `events` so widgets persist without entering model-facing history.
+    #[serde(default)]
+    pub ui_panels: Vec<UiPanel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

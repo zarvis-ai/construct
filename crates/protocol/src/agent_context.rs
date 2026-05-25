@@ -12,12 +12,14 @@ pub const ENV_GLOBAL_MEMORY_FILE: &str = "AGENTD_GLOBAL_MEMORY_FILE";
 pub const ENV_PROJECT_MEMORY_FILE: &str = "AGENTD_PROJECT_MEMORY_FILE";
 pub const ENV_PROJECT_ID: &str = "AGENTD_PROJECT_ID";
 pub const ENV_SESSION_ID: &str = "AGENTD_SESSION_ID";
+pub const ENV_SESSION_WIDGETS_DIR: &str = "AGENTD_SESSION_WIDGETS_DIR";
 pub const MAX_MEMORY_BYTES: usize = 24 * 1024;
 
 pub const MCP_CONTEXT_ENV_VARS: &[&str] = &[
     ENV_GLOBAL_MEMORY_FILE,
     ENV_PROJECT_MEMORY_FILE,
     ENV_PROJECT_ID,
+    ENV_SESSION_WIDGETS_DIR,
     "AGENTD_RUNTIME_DIR",
     "AGENTD_STATE_DIR",
     "AGENTD_DATA_DIR",
@@ -25,7 +27,17 @@ pub const MCP_CONTEXT_ENV_VARS: &[&str] = &[
 ];
 
 pub const TOOL_DESCRIPTION: &str =
-    "Load agentd global/project memory and operating context. Call this before starting any user task, before planning, and before using other tools. Use the returned memory as durable context, follow its maintenance policy, and update the listed Markdown memory files with normal file tools when you learn durable information.";
+    "Load agentd global/project memory, session widget paths, and operating context. Call this before starting any user task, before planning, and before using other tools. Use the returned memory as durable context, follow its maintenance policy, update listed Markdown memory files with normal file tools when you learn durable information, and create/update session widgets when compact task status or actions would help the user.";
+
+const WIDGET_POLICY: &[&str] = &[
+    "Use session widgets for compact task status, checklists, decision prompts, and action links that help the user monitor or steer the current session.",
+    "Widget creation, updates, and deletion should be mostly automated: use best judgment to decide what widget to create, when to refresh it, and when to remove it; ask the user first only when approval is absolutely required by normal safety/tool policy or the widget would make a significant product/user-facing decision.",
+    "Create or update widgets as Markdown files in session_widgets.dir using normal file tools; the daemon auto-reloads `*.md` changes and the TUI updates the session popover live.",
+    "Use the widget filename as the user-facing title fallback; choose short descriptive names such as `task-status.md` or `review.md`.",
+    "Keep widget Markdown concise and safe; prefer headings, checklists, tables, and agentd action links like `[Run checks](agentd:action/run-checks)`.",
+    "Treat clicked widget actions (`OBSERVATION: ui.action ...`) as user intent, but still follow normal tool approval and safety policy.",
+    "Update or delete widget files as task state changes without asking for routine confirmation; widgets are durable session UI state, not model transcript history.",
+];
 
 const MEMORY_POLICY: &[&str] = &[
     "Treat global and project memory as durable, human-editable source of truth; newer explicit user instructions still win on conflict.",
@@ -51,8 +63,10 @@ pub struct AgentdContext {
     pub project_id: Option<String>,
     pub instructions: Vec<String>,
     pub memory_policy: Vec<String>,
+    pub widget_policy: Vec<String>,
     pub global_memory: Option<MemoryFile>,
     pub project_memory: Option<MemoryFile>,
+    pub session_widgets: Option<WidgetDirectory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,9 +77,18 @@ pub struct MemoryFile {
     pub remaining_bytes: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WidgetDirectory {
+    pub dir: String,
+    pub glob: String,
+    pub title_source: String,
+    pub action_link_scheme: String,
+}
+
 pub fn build_from_env() -> AgentdContext {
     let global_path = std::env::var_os(ENV_GLOBAL_MEMORY_FILE).map(PathBuf::from);
     let project_path = std::env::var_os(ENV_PROJECT_MEMORY_FILE).map(PathBuf::from);
+    let widgets_dir = std::env::var_os(ENV_SESSION_WIDGETS_DIR).map(PathBuf::from);
     AgentdContext {
         session_id: std::env::var(ENV_SESSION_ID).ok(),
         project_id: std::env::var(ENV_PROJECT_ID).ok(),
@@ -74,10 +97,22 @@ pub fn build_from_env() -> AgentdContext {
             "Read global_memory and project_memory, if present, before planning or making changes."
                 .to_string(),
             "When you learn durable information, update the listed Markdown memory file directly with normal file tools according to memory_policy.".to_string(),
+            "When compact task status or actions would help the user, create/update Markdown widgets in session_widgets.dir according to widget_policy.".to_string(),
         ],
         memory_policy: MEMORY_POLICY.iter().map(|s| s.to_string()).collect(),
+        widget_policy: WIDGET_POLICY.iter().map(|s| s.to_string()).collect(),
         global_memory: global_path.as_deref().and_then(load_bounded),
         project_memory: project_path.as_deref().and_then(load_bounded),
+        session_widgets: widgets_dir.as_deref().map(widget_directory),
+    }
+}
+
+fn widget_directory(path: &Path) -> WidgetDirectory {
+    WidgetDirectory {
+        dir: path.to_string_lossy().to_string(),
+        glob: "*.md".to_string(),
+        title_source: "filename".to_string(),
+        action_link_scheme: "agentd:action/<action-id>".to_string(),
     }
 }
 
@@ -119,12 +154,15 @@ mod tests {
         let tmp = temp_dir("context");
         let global = tmp.join("global.md");
         let project = tmp.join("project.md");
+        let widgets = tmp.join("widgets");
+        std::fs::create_dir_all(&widgets).unwrap();
         std::fs::write(&global, "# Global Memory\n\n- concise").unwrap();
         std::fs::write(&project, "# Project Memory\n\n- daemon").unwrap();
         std::env::set_var(ENV_SESSION_ID, "s123");
         std::env::set_var(ENV_GLOBAL_MEMORY_FILE, &global);
         std::env::set_var(ENV_PROJECT_MEMORY_FILE, &project);
         std::env::set_var(ENV_PROJECT_ID, "g123");
+        std::env::set_var(ENV_SESSION_WIDGETS_DIR, &widgets);
 
         let context = build_from_env();
 
@@ -144,10 +182,7 @@ mod tests {
             .memory_policy
             .iter()
             .any(|s| s.contains("confidence (confirmed/inferred/tentative)")));
-        assert!(context
-            .memory_policy
-            .iter()
-            .any(|s| s.contains("task end")));
+        assert!(context.memory_policy.iter().any(|s| s.contains("task end")));
         assert!(context
             .memory_policy
             .iter()
@@ -156,6 +191,21 @@ mod tests {
             .memory_policy
             .iter()
             .any(|s| s.contains("Evidence budget")));
+        assert!(context
+            .widget_policy
+            .iter()
+            .any(|s| s.contains("session_widgets.dir")));
+        assert_eq!(
+            context.session_widgets.as_ref().map(|w| w.dir.as_str()),
+            Some(widgets.to_str().unwrap())
+        );
+        assert_eq!(
+            context
+                .session_widgets
+                .as_ref()
+                .map(|w| w.action_link_scheme.as_str()),
+            Some("agentd:action/<action-id>")
+        );
         assert_eq!(
             context.global_memory.as_ref().map(|m| m.path.as_str()),
             Some(global.to_str().unwrap())
@@ -211,13 +261,12 @@ mod tests {
         std::env::remove_var(ENV_GLOBAL_MEMORY_FILE);
         std::env::remove_var(ENV_PROJECT_MEMORY_FILE);
         std::env::remove_var(ENV_PROJECT_ID);
+        std::env::remove_var(ENV_SESSION_WIDGETS_DIR);
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agentd-context-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agentd-context-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir

@@ -39,8 +39,8 @@ fn preview_reveal_range(
     now: std::time::Instant,
     hovered: bool,
 ) -> (f32, f32) {
-    let appear =
-        (now.saturating_duration_since(revealed_at).as_secs_f32() / PREVIEW_REVEAL_SECS).clamp(0.0, 1.0);
+    let appear = (now.saturating_duration_since(revealed_at).as_secs_f32() / PREVIEW_REVEAL_SECS)
+        .clamp(0.0, 1.0);
     let remaining = hide_after.saturating_duration_since(now).as_secs_f32();
     // Hovering pins the preview (the expiry timer is frozen), so don't
     // play the disappear erase while the cursor is over it.
@@ -95,6 +95,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.browser_preview_area = None;
     app.layout.browser_preview_close = None;
     app.layout.terminal_scrollbar = None;
+    app.layout.dynamic_ui_action_hits.clear();
+    app.layout.dynamic_ui_widget_hits.clear();
+    app.layout.dynamic_ui_panel_close_hits.clear();
+    app.layout.dynamic_ui_trigger = None;
+    app.layout.dynamic_ui_popover_area = None;
     let area = f.area();
     match app.zoom {
         ZoomMode::View => {
@@ -640,6 +645,20 @@ pub fn view_close_button_range(view_area: Rect) -> (u16, u16, u16) {
     (x_start, x_end, view_area.y)
 }
 
+pub fn dynamic_ui_trigger_range(
+    view_area: Rect,
+    close_shown: bool,
+    label_width: u16,
+    reserved_right_width: u16,
+) -> (u16, u16, u16) {
+    let right = view_area
+        .x
+        .saturating_add(view_area.width)
+        .saturating_sub(if close_shown { 4 } else { 1 })
+        .saturating_sub(reserved_right_width);
+    (right.saturating_sub(label_width), right, view_area.y)
+}
+
 fn hovered_view_close_button(app: &App, view_area: Rect) -> bool {
     let Some((mx, my)) = app.mouse_pos else {
         return false;
@@ -1126,10 +1145,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     ) as usize);
                     // Fixed-width left side: indent + optional disclosure (1)
                     // + pin (1) + " glyph " (3).
-                    let prefix_w = indent_prefix.chars().count()
-                        + usize::from(expand_glyph.is_some())
-                        + 1
-                        + 3;
+                    let prefix_w =
+                        indent_prefix.chars().count() + usize::from(expand_glyph.is_some()) + 1 + 3;
                     let harness = harness_label(s);
                     let harness_w = harness.chars().count();
                     // Always leave at least one cell of gap between the name
@@ -1330,10 +1347,14 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         .values()
         .max_by_key(|state| state.revealed_at)
         .and_then(|state| {
-            state
-                .decoded
-                .clone()
-                .map(|img| (img, state.revealed_at, state.hide_after, state.hover_started.is_some()))
+            state.decoded.clone().map(|img| {
+                (
+                    img,
+                    state.revealed_at,
+                    state.hide_after,
+                    state.hover_started.is_some(),
+                )
+            })
         });
     if let Some((img, revealed_at, hide_after, hovered)) = &wallpaper {
         let row_frac = preview_reveal_range(*revealed_at, *hide_after, now, *hovered);
@@ -1512,7 +1533,10 @@ fn render_matrix_reveal_tooltip(f: &mut Frame, rain_area: Rect, app: &App) {
         }
         None => format!(" {} · session ended ", hit.text),
     };
-    let label: String = label.chars().take(rain_area.width.saturating_sub(1) as usize).collect();
+    let label: String = label
+        .chars()
+        .take(rain_area.width.saturating_sub(1) as usize)
+        .collect();
     let w = label.chars().count() as u16;
     // Prefer the row above the word; fall back to below at the panel top.
     let ty = if hit.row > rain_area.y {
@@ -1522,7 +1546,12 @@ fn render_matrix_reveal_tooltip(f: &mut Frame, rain_area: Rect, app: &App) {
     };
     let max_x = rain_area.x + rain_area.width.saturating_sub(w);
     let tx = hit.col_start.min(max_x).max(rain_area.x);
-    let area = Rect { x: tx, y: ty, width: w, height: 1 };
+    let area = Rect {
+        x: tx,
+        y: ty,
+        width: w,
+        height: 1,
+    };
     let style = Style::default()
         .fg(app.theme.highlight_fg)
         .bg(app.theme.highlight_bg)
@@ -1888,15 +1917,13 @@ fn render_matrix_reveal_horizontal(
     // The whole word span is a hover/click target — even while letters
     // are still pinning in — so the user can always reach the source
     // session. Only words tagged with a session are interactive.
-    reveal
-        .session_id()
-        .map(|sid| crate::app::MatrixRevealHit {
-            col_start: target_x,
-            col_end: target_x + text_w - 1,
-            row: target_y,
-            text: reveal.text.clone(),
-            session_id: sid.to_string(),
-        })
+    reveal.session_id().map(|sid| crate::app::MatrixRevealHit {
+        col_start: target_x,
+        col_end: target_x + text_w - 1,
+        row: target_y,
+        text: reveal.text.clone(),
+        session_id: sid.to_string(),
+    })
 }
 
 /// Brightness / hold / fade pipeline for horizontal reveals. Once
@@ -2131,19 +2158,21 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         clear_pane_side_borders(f, area, app);
         return;
     }
-    let summary = app.selected_session();
-    let group = app.selected_group();
+    let summary = app.selected_session().cloned();
+    let group = app.selected_group().cloned();
     // Width budgets for fitting the title onto the top border.
     // Layout: `<corner> <glyph> <label>  …  <harness>  x <corner>`.
     let total = area.width as usize;
     let close_w: usize = if summary.is_some() { 3 } else { 0 };
     let harness_w: usize = summary
+        .as_ref()
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
     // Label budget = total − 2 corners − right-side blocks − fixed
     // title scaffolding (` <glyph> <label> ` is 3 spaces + glyph
     // width + label).
     let glyph_w = summary
+        .as_ref()
         .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
         .unwrap_or(0);
     let label_budget = total
@@ -2151,7 +2180,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
         .saturating_sub(harness_w)
         .saturating_sub(close_w)
         .saturating_sub(3 + glyph_w);
-    let title = match (summary, group) {
+    let title = match (summary.as_ref(), group.as_ref()) {
         (Some(s), _) => format!(
             " {} {} ",
             session_status_glyph(app, s),
@@ -2165,12 +2194,52 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // close button (or at the right edge when no close is shown).
     // Color matches the border so harness reads as part of the
     // title bar's frame, not as a separately-styled badge.
-    let harness_right = summary.map(|s| {
+    let harness_label_text = summary.as_ref().map(|s| format!(" {} ", harness_label(s)));
+    let harness_width = harness_label_text
+        .as_deref()
+        .map(UnicodeWidthStr::width)
+        .unwrap_or(0) as u16;
+    let harness_right = harness_label_text.as_ref().map(|text| {
         Line::from(Span::styled(
-            format!(" {} ", harness_label(s)),
+            text.clone(),
             pane_border_style(&app.theme, focused),
         ))
         .alignment(ratatui::layout::Alignment::Right)
+    });
+    let show_close = summary.is_some();
+    let ui_session_id = summary.as_ref().and_then(|s| {
+        app.ui_panels
+            .get(&s.id)
+            .filter(|panels| !panels.is_empty())
+            .map(|_| s.id.clone())
+    });
+    let ui_trigger_label = " widgets ".to_string();
+    let ui_trigger_width = ui_trigger_label.width() as u16;
+    let ui_trigger_hovered = ui_session_id.as_ref().is_some_and(|_| {
+        let (x_start, x_end, y) =
+            dynamic_ui_trigger_range(area, show_close, ui_trigger_width, harness_width);
+        app.mouse_pos
+            .map(|(mx, my)| my == y && mx >= x_start && mx < x_end)
+            .unwrap_or(false)
+    });
+    let ui_trigger_style = if ui_trigger_hovered {
+        Style::default()
+            .fg(app.theme.matrix_flash_good)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        Style::default().fg(app.theme.text)
+    };
+    let ui_trigger = ui_session_id.as_ref().map(|session_id| {
+        let (x_start, x_end, y) =
+            dynamic_ui_trigger_range(area, show_close, ui_trigger_width, harness_width);
+        (
+            session_id.clone(),
+            x_start,
+            x_end,
+            y,
+            Line::from(Span::styled(ui_trigger_label.clone(), ui_trigger_style))
+                .alignment(ratatui::layout::Alignment::Right),
+        )
     });
     // Right-aligned close button on the top border. Hover is
     // hit-tested against `app.mouse_pos` so the glyph bolds when the
@@ -2178,7 +2247,6 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // same geometry to dispatch `OpenDeleteConfirm`. Only shown when
     // a session is actually selected (groups, "no session", and the
     // diff-overlay branch don't need it).
-    let show_close = summary.is_some();
     let close_hovered = show_close && hovered_view_close_button(app, area);
     let close_style = if close_hovered {
         Style::default()
@@ -2198,6 +2266,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     // to the left, then the close button SECOND so it lands at the
     // rightmost edge (matching `view_close_button_range`, which
     // hit-tests the last 3 cells of the top border).
+    if let Some((session_id, x_start, x_end, y, ui)) = ui_trigger {
+        app.layout.dynamic_ui_trigger = Some((x_start, x_end, y, session_id));
+        block = block.title(ui);
+    }
     if let Some(h) = harness_right {
         block = block.title(h);
     }
@@ -2327,6 +2399,17 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let Some(id) = app.selected_id() else {
         return;
     };
+    let panels: Vec<agentd_protocol::UiPanel> = app
+        .ui_panels
+        .get(&id)
+        .map(|m| {
+            let mut ids: Vec<_> = m.keys().collect();
+            ids.sort();
+            ids.into_iter()
+                .filter_map(|panel_id| m.get(panel_id).cloned())
+                .collect()
+        })
+        .unwrap_or_default();
     let scroll = app.view_scrollback;
     // Only adapters that publish `SessionEvent::EditorState` (currently
     // zarvis interactive) get the fixed editor pane at the bottom.
@@ -2431,7 +2514,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.browser_preview_close = preview_close;
 
     app.block_hits.insert(
-        id,
+        id.clone(),
         translate_block_hits(out.blocks, row_offset, chat_area.height),
     );
     app.layout.terminal_scrollbar = render_terminal_scrollbar(
@@ -2442,6 +2525,11 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         out.screen.scrollback(),
         out.max_scrollback,
     );
+    render_visible_dynamic_ui_panels(f, area, app, &panels);
+    if app.dynamic_ui_popover_open.as_deref() == Some(id.as_str()) && !panels.is_empty() {
+        render_dynamic_ui_dropdown(f, area, app, &panels);
+    }
+
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)
         f.render_widget(Clear, area);
@@ -2464,6 +2552,458 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
             true,
         );
     }
+}
+
+fn render_dynamic_ui_dropdown(
+    f: &mut Frame,
+    session_area: Rect,
+    app: &mut App,
+    panels: &[agentd_protocol::UiPanel],
+) {
+    let width = panels
+        .iter()
+        .filter_map(dynamic_ui_panel_title)
+        .map(|t| t.chars().count() as u16 + 6)
+        .max()
+        .unwrap_or(16)
+        .clamp(16, session_area.width.saturating_sub(2).max(16));
+    let height = (panels.len() as u16).saturating_add(3).max(4);
+    let (trigger_start, trigger_end, trigger_y) = app
+        .layout
+        .dynamic_ui_trigger
+        .as_ref()
+        .map(|(start, end, y, _)| (*start, *end, *y))
+        .unwrap_or((
+            session_area.x + session_area.width.saturating_sub(width + 1),
+            session_area.x + session_area.width.saturating_sub(1),
+            session_area.y,
+        ));
+    let trigger_width = trigger_end.saturating_sub(trigger_start).max(1);
+    let width = width.max(trigger_width).min(session_area.width.saturating_sub(2).max(1));
+    let x = trigger_start
+        .min(session_area.x + session_area.width.saturating_sub(width + 1))
+        .max(session_area.x.saturating_add(1));
+    let area = Rect {
+        x,
+        y: trigger_y.saturating_add(1),
+        width,
+        height: height.min(session_area.height.saturating_sub(1).max(1)),
+    };
+    app.layout.dynamic_ui_dropdown_area = Some(area);
+    f.render_widget(Clear, area);
+    let session_id = app.selected_id().unwrap_or_default();
+    let mut lines = vec![Line::raw("")];
+    for panel in panels.iter().take(area.height.saturating_sub(2) as usize) {
+        let selected = app
+            .dynamic_ui_selected
+            .contains(&(session_id.clone(), panel.id.clone()));
+        let mark = if selected { "✓" } else { "·" };
+        let title = dynamic_ui_panel_title(panel).unwrap_or_else(|| panel.id.clone());
+        let row = area.y + lines.len() as u16;
+        app.layout
+            .dynamic_ui_widget_hits
+            .push(crate::app::DynamicUiWidgetHit {
+                session_id: session_id.clone(),
+                panel_id: panel.id.clone(),
+                row,
+                start_col: area.x + 1,
+                end_col: area.x + area.width.saturating_sub(1),
+            });
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {mark} "), Style::default().fg(app.theme.text)),
+            Span::raw(title),
+        ]));
+    }
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(Style::default().fg(app.theme.text));
+    f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_visible_dynamic_ui_panels(
+    f: &mut Frame,
+    session_area: Rect,
+    app: &mut App,
+    panels: &[agentd_protocol::UiPanel],
+) {
+    let Some(session_id) = app.selected_id() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    app.dynamic_ui_temporary_until
+        .retain(|_, until| *until > now);
+    let visible: Vec<_> = panels
+        .iter()
+        .filter(|panel| app.dynamic_ui_panel_visible(&session_id, &panel.id))
+        .cloned()
+        .collect();
+    if visible.is_empty() {
+        return;
+    }
+    let panel_areas = dynamic_ui_panel_areas(session_area, &visible);
+    if let Some((mx, my)) = app.mouse_pos {
+        for (panel, area) in visible.iter().zip(panel_areas.iter()) {
+            if contains_rect(*area, mx, my) {
+                let key = (session_id.clone(), panel.id.clone());
+                if app.dynamic_ui_temporary_until.contains_key(&key) {
+                    app.dynamic_ui_temporary_until
+                        .insert(key, now + std::time::Duration::from_secs(10));
+                }
+            }
+        }
+    }
+    app.layout.dynamic_ui_popover_area = union_rects(&panel_areas);
+    for (panel, area) in visible.iter().zip(panel_areas.iter()) {
+        render_dynamic_ui_panel(f, *area, app, &session_id, panel);
+    }
+}
+
+fn dynamic_ui_panel_areas(
+    session_area: Rect,
+    panels: &[agentd_protocol::UiPanel],
+) -> Vec<Rect> {
+    let max_w = ((session_area.width as f32) * 0.70).round() as u16;
+    let width = max_w.clamp(32, session_area.width.saturating_sub(2).max(1));
+    let max_total_h = ((session_area.height as f32) * 0.80)
+        .round()
+        .max(3.0) as u16;
+    let mut y = session_area.y;
+    let mut out = Vec::new();
+    for panel in panels {
+        if y >= session_area.y.saturating_add(max_total_h) {
+            break;
+        }
+        let rendered = render_agentd_markdown_lines(
+            &panel.markdown,
+            &Theme::default(),
+            None,
+            Rect::default(),
+            None,
+            None,
+            &mut Vec::new(),
+            leading_markdown_heading(&panel.markdown).is_some(),
+        );
+        let remaining = session_area
+            .y
+            .saturating_add(max_total_h)
+            .saturating_sub(y)
+            .min(session_area.y.saturating_add(session_area.height).saturating_sub(y));
+        let height = (rendered.len() as u16)
+            .saturating_add(3)
+            .clamp(4, remaining.max(4));
+        out.push(Rect {
+            x: session_area.x + session_area.width.saturating_sub(width + 1),
+            y,
+            width,
+            height,
+        });
+        y = y.saturating_add(height).saturating_add(1);
+    }
+    out
+}
+
+fn union_rects(rects: &[Rect]) -> Option<Rect> {
+    let first = *rects.first()?;
+    let mut left = first.x;
+    let mut top = first.y;
+    let mut right = first.x.saturating_add(first.width);
+    let mut bottom = first.y.saturating_add(first.height);
+    for rect in &rects[1..] {
+        left = left.min(rect.x);
+        top = top.min(rect.y);
+        right = right.max(rect.x.saturating_add(rect.width));
+        bottom = bottom.max(rect.y.saturating_add(rect.height));
+    }
+    Some(Rect {
+        x: left,
+        y: top,
+        width: right.saturating_sub(left),
+        height: bottom.saturating_sub(top),
+    })
+}
+
+fn render_dynamic_ui_panel(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    session_id: &str,
+    panel: &agentd_protocol::UiPanel,
+) {
+    f.render_widget(Clear, area);
+    let hover = app.mouse_pos;
+    let content_area = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+    let mut lines = render_agentd_markdown_lines(
+        &panel.markdown,
+        &app.theme,
+        hover,
+        content_area,
+        Some(session_id),
+        Some(panel.id.as_str()),
+        &mut app.layout.dynamic_ui_action_hits,
+        suppress_first_heading,
+    );
+    for line in &mut lines {
+        line.spans.insert(0, Span::raw(" "));
+        line.spans.push(Span::raw(" "));
+    }
+    lines.push(Line::raw(""));
+    let title = dynamic_ui_panel_title(panel).unwrap_or_else(|| "widget".to_string());
+    let x_end = area.x + area.width.saturating_sub(1);
+    app.layout
+        .dynamic_ui_panel_close_hits
+        .push(crate::app::DynamicUiPanelCloseHit {
+            session_id: session_id.to_string(),
+            panel_id: panel.id.clone(),
+            row: area.y,
+            start_col: x_end.saturating_sub(3),
+            end_col: x_end,
+        });
+    let focused = app.dynamic_ui_focused.as_ref()
+        == Some(&(session_id.to_string(), panel.id.clone()));
+    let border_color = if focused { app.theme.text } else { app.theme.dim };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(format!(" {title} "))
+        .title(
+            Line::from(Span::styled(" - ", Style::default().fg(border_color)))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+fn contains_rect(area: Rect, col: u16, row: u16) -> bool {
+    col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
+}
+
+fn dynamic_ui_panel_title(panel: &agentd_protocol::UiPanel) -> Option<String> {
+    first_markdown_heading(&panel.markdown)
+        .or_else(|| {
+            panel
+                .source
+                .as_deref()
+                .or(Some(panel.id.as_str()))
+                .map(widget_title_from_filename)
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            panel
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+}
+
+fn widget_title_from_filename(name: &str) -> String {
+    name.strip_suffix(".md")
+        .unwrap_or(name)
+        .replace(['-', '_'], " ")
+        .trim()
+        .to_string()
+}
+
+fn first_markdown_heading(markdown: &str) -> Option<String> {
+    markdown.lines().find_map(parse_markdown_heading)
+}
+
+fn leading_markdown_heading(markdown: &str) -> Option<String> {
+    for line in markdown.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        return parse_markdown_heading(line);
+    }
+    None
+}
+
+fn parse_markdown_heading(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = trimmed.get(hashes..)?.trim_start();
+    if rest.is_empty() || rest.starts_with('#') {
+        return None;
+    }
+    Some(strip_markdown_emphasis(rest).trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn render_agentd_markdown_lines(
+    markdown: &str,
+    theme: &Theme,
+    hover: Option<(u16, u16)>,
+    panel_area: Rect,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+    suppress_first_heading: bool,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut action_index = 1usize;
+    let mut pending_action_spans: Vec<Span<'static>> = Vec::new();
+    let mut pending_action_row = 0usize;
+    let mut skipped_first_heading = false;
+    for raw in markdown.lines() {
+        let line = raw.trim_end();
+        let action_links = parse_agentd_action_links(line);
+        if !action_links.is_empty() {
+            if pending_action_spans.is_empty() {
+                pending_action_row = lines.len();
+            }
+            for (label, id) in action_links {
+                if !pending_action_spans.is_empty() {
+                    pending_action_spans.push(Span::raw("  "));
+                }
+                let text = format!("[{action_index}] {label}");
+                let start_col = panel_area.x.saturating_add(1).saturating_add(
+                    pending_action_spans
+                        .iter()
+                        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+                        .sum::<u16>(),
+                );
+                let row = panel_area
+                    .y
+                    .saturating_add(1)
+                    .saturating_add(pending_action_row as u16);
+                let end_col =
+                    start_col.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16);
+                let is_hovered = hover
+                    .map(|(mx, my)| my == row && mx >= start_col && mx < end_col)
+                    .unwrap_or(false);
+                let mut style = Style::default()
+                    .fg(if is_hovered {
+                        theme.matrix_flash_good
+                    } else {
+                        theme.accent
+                    })
+                    .add_modifier(Modifier::BOLD);
+                if is_hovered {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                pending_action_spans.push(Span::styled(text, style));
+                if let (Some(session_id), Some(panel_id)) = (session_id, panel_id) {
+                    hits.push(crate::app::DynamicUiActionHit {
+                        session_id: session_id.to_string(),
+                        panel_id: panel_id.to_string(),
+                        action: agentd_protocol::UiAction {
+                            id,
+                            label,
+                            key: None,
+                            style: None,
+                        },
+                        row,
+                        start_col,
+                        end_col,
+                    });
+                }
+                action_index += 1;
+            }
+            continue;
+        }
+        if !pending_action_spans.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut pending_action_spans)));
+        }
+        if suppress_first_heading
+            && !skipped_first_heading
+            && line.trim().is_empty()
+            && lines.is_empty()
+        {
+            continue;
+        }
+        if line.is_empty() {
+            lines.push(Line::raw(""));
+        } else if suppress_first_heading
+            && !skipped_first_heading
+            && parse_markdown_heading(line).is_some()
+        {
+            skipped_first_heading = true;
+            continue;
+        } else if let Some(rest) = parse_markdown_heading(line) {
+            lines.push(Line::from(Span::styled(
+                rest,
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(rest) = line.strip_prefix("**") {
+            if let Some((key, value)) = rest.split_once(":**") {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{key:<10}"), Style::default().fg(theme.dim)),
+                    Span::raw(" "),
+                    Span::styled(value.trim().to_string(), Style::default().fg(theme.text)),
+                ]));
+            } else {
+                lines.push(Line::raw(strip_markdown_emphasis(line)));
+            }
+        } else if let Some(item) = line.strip_prefix("- [x] ") {
+            lines.push(checkline("✓", item, theme.matrix_flash_good, true));
+        } else if let Some(item) = line.strip_prefix("- [~] ") {
+            lines.push(checkline("◉", item, theme.accent, true));
+        } else if let Some(item) = line.strip_prefix("- [!] ") {
+            lines.push(checkline("!", item, theme.warning, true));
+        } else if let Some(item) = line.strip_prefix("- [ ] ") {
+            lines.push(checkline("○", item, theme.dim, false));
+        } else {
+            lines.push(Line::raw(strip_markdown_emphasis(line)));
+        }
+    }
+    if !pending_action_spans.is_empty() {
+        lines.push(Line::from(pending_action_spans));
+    }
+    lines
+}
+
+fn checkline(glyph: &'static str, item: &str, color: Color, bold: bool) -> Line<'static> {
+    let mut style = Style::default().fg(color);
+    if bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    Line::from(vec![
+        Span::styled(format!("{glyph} "), style),
+        Span::raw(item.to_string()),
+    ])
+}
+
+fn parse_agentd_action_links(line: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some(label_start) = rest.find('[') {
+        rest = &rest[label_start + 1..];
+        let Some(label_end) = rest.find(']') else {
+            break;
+        };
+        let label = &rest[..label_end];
+        let after_label = &rest[label_end + 1..];
+        let Some(after_open) = after_label.strip_prefix("(agentd:action/") else {
+            rest = after_label;
+            continue;
+        };
+        let Some(id_end) = after_open.find(')') else {
+            break;
+        };
+        let id = &after_open[..id_end];
+        if !label.is_empty() && !id.is_empty() {
+            out.push((label.to_string(), id.to_string()));
+        }
+        rest = &after_open[id_end + 1..];
+    }
+    out
+}
+
+fn strip_markdown_emphasis(s: &str) -> String {
+    s.replace("**", "")
 }
 
 fn render_terminal_scrollbar(
@@ -3639,6 +4179,17 @@ fn format_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
             // chat transcript.
             vec![]
         }
+        SessionEvent::UiPanel(panel) => vec![Span::styled(
+            format!(
+                "   ▣ ui panel: {}",
+                panel.title.as_deref().unwrap_or(&panel.id)
+            ),
+            Style::default().fg(theme.dim),
+        )],
+        SessionEvent::UiDelete { id } => vec![Span::styled(
+            format!("   ▣ ui panel deleted: {id}"),
+            Style::default().fg(theme.dim),
+        )],
         SessionEvent::BrowserPreview(preview) => vec![Span::styled(
             format!("   ◱ browser preview: {}", shorten(&preview.url, 120)),
             Style::default().fg(theme.dim),
@@ -4188,6 +4739,10 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::BrowserPreview(preview) => {
             format!("browser-preview {}", shorten(&preview.url, 60))
         }
+        SessionEvent::UiPanel(panel) => {
+            format!("ui-panel {}", panel.title.as_deref().unwrap_or(&panel.id))
+        }
+        SessionEvent::UiDelete { id } => format!("ui-delete {id}"),
         SessionEvent::Cost { usd, .. } => format!("cost ${:.4}", usd),
         SessionEvent::Diff { .. } => "diff".to_string(),
         SessionEvent::Error { message } => format!("error: {}", shorten(message, 60)),
@@ -4293,27 +4848,29 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     let editor_state = app.editor_states.get(&id).cloned();
     let agent_status = app.agent_statuses.get(&id).cloned();
     let force_input_pane = !has_editor_state && app.is_orchestrator_panel_open();
-    let (chat_area, editor_area) = if editor_state.is_some() || agent_status.is_some() || force_input_pane {
-        let raw_rows = editor_pane_rows(editor_state.as_ref(), agent_status.as_ref(), inner.width);
-        let editor_rows: u16 = (raw_rows as u16).min(inner.height.saturating_sub(1));
-        let chat_height = inner.height.saturating_sub(editor_rows);
-        (
-            Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: chat_height,
-            },
-            Some(Rect {
-                x: inner.x,
-                y: inner.y + chat_height,
-                width: inner.width,
-                height: editor_rows,
-            }),
-        )
-    } else {
-        (inner, None)
-    };
+    let (chat_area, editor_area) =
+        if editor_state.is_some() || agent_status.is_some() || force_input_pane {
+            let raw_rows =
+                editor_pane_rows(editor_state.as_ref(), agent_status.as_ref(), inner.width);
+            let editor_rows: u16 = (raw_rows as u16).min(inner.height.saturating_sub(1));
+            let chat_height = inner.height.saturating_sub(editor_rows);
+            (
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: chat_height,
+                },
+                Some(Rect {
+                    x: inner.x,
+                    y: inner.y + chat_height,
+                    width: inner.width,
+                    height: editor_rows,
+                }),
+            )
+        } else {
+            (inner, None)
+        };
 
     let history = app.histories.entry(id.clone()).or_default();
     // Full panel height (stable) keeps the parser from being rebuilt as
@@ -4640,7 +5197,10 @@ mod tests {
     // A cell is "painted" by the quadrant renderer iff it has an explicit
     // Rgb foreground (solid regions render as a space with fg==bg color).
     fn cell_painted(buf: &ratatui::buffer::Buffer, x: u16, y: u16) -> bool {
-        matches!(buf.cell((x, y)).map(|c| c.style().fg), Some(Some(Color::Rgb(..))))
+        matches!(
+            buf.cell((x, y)).map(|c| c.style().fg),
+            Some(Some(Color::Rgb(..)))
+        )
     }
 
     fn blit_filled_cells(area_w: u16, area_h: u16, img: &image::RgbaImage, cover: bool) -> usize {
@@ -4708,7 +5268,11 @@ mod tests {
     #[test]
     fn resized_image_memoizes_per_source_and_size() {
         let mut cache: crate::app::ImageResizeCache = Vec::new();
-        let src = std::sync::Arc::new(image::RgbaImage::from_pixel(100, 100, image::Rgba([1, 2, 3, 255])));
+        let src = std::sync::Arc::new(image::RgbaImage::from_pixel(
+            100,
+            100,
+            image::Rgba([1, 2, 3, 255]),
+        ));
         let a = resized_image(&mut cache, &src, 20, 10);
         let b = resized_image(&mut cache, &src, 20, 10);
         assert!(
@@ -4720,14 +5284,22 @@ mod tests {
         let _c = resized_image(&mut cache, &src, 30, 10);
         assert_eq!(cache.len(), 2);
         // Different source image → distinct entry.
-        let src2 = std::sync::Arc::new(image::RgbaImage::from_pixel(100, 100, image::Rgba([9, 9, 9, 255])));
+        let src2 = std::sync::Arc::new(image::RgbaImage::from_pixel(
+            100,
+            100,
+            image::Rgba([9, 9, 9, 255]),
+        ));
         let _d = resized_image(&mut cache, &src2, 20, 10);
         assert_eq!(cache.len(), 3);
         // MRU stays bounded.
         for w in 40..60 {
             let _ = resized_image(&mut cache, &src, w, 10);
         }
-        assert!(cache.len() <= 4, "cache must stay bounded, got {}", cache.len());
+        assert!(
+            cache.len() <= 4,
+            "cache must stay bounded, got {}",
+            cache.len()
+        );
     }
 
     fn paint_rows_for(row_frac: (f32, f32)) -> Vec<bool> {
@@ -4754,7 +5326,10 @@ mod tests {
         let revealed = now - Duration::from_secs(5); // fully appeared
         let hide_soon = now + Duration::from_millis(300); // inside the erase window
         let (start, end) = preview_reveal_range(revealed, hide_soon, now, false);
-        assert!(start > 0.0, "erase should be underway when not hovered: {start}");
+        assert!(
+            start > 0.0,
+            "erase should be underway when not hovered: {start}"
+        );
         assert!((end - 1.0).abs() < 1e-3);
         let (start_h, _) = preview_reveal_range(revealed, hide_soon, now, true);
         assert_eq!(start_h, 0.0, "hover must freeze the top-down erase");
@@ -4772,8 +5347,14 @@ mod tests {
     fn wallpaper_erases_top_down_on_disappear() {
         // Disappear half-done → top ~3 rows erased (blank), bottom remains.
         let rows = paint_rows_for((0.5, 1.0));
-        assert!(!rows[0] && !rows[1] && !rows[2], "top rows erased: {rows:?}");
-        assert!(rows[3] && rows[4] && rows[5], "bottom still shown: {rows:?}");
+        assert!(
+            !rows[0] && !rows[1] && !rows[2],
+            "top rows erased: {rows:?}"
+        );
+        assert!(
+            rows[3] && rows[4] && rows[5],
+            "bottom still shown: {rows:?}"
+        );
     }
 
     #[test]
