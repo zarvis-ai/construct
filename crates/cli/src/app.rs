@@ -7166,6 +7166,23 @@ mod tests {
         server.abort();
     }
 
+    fn session_detail_summary_json(id: &str, has_pty: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "harness": "shell",
+            "cwd": "/tmp",
+            "state": "running",
+            "created_at": "2026-05-21T00:00:00Z",
+            "pending_input": false,
+            "event_count": 0,
+            "has_pty": has_pty,
+            "pinned": false,
+            "position": 0,
+            "automode": false,
+            "kind": "user"
+        })
+    }
+
     #[tokio::test]
     async fn background_hydration_does_not_block_primary_client_rpc() {
         use agentd_client::Client;
@@ -7211,7 +7228,7 @@ mod tests {
                             ipc_method::PING => {
                                 serde_json::json!({"pong": true, "version": "test"})
                             }
-                            ipc_method::SESSION_TRANSCRIPT => {
+                            ipc_method::SESSION_GET => {
                                 let _ = transcript_seen_tx.send(());
                                 release.notified().await;
                                 let events: Vec<Value> = (0..2_000)
@@ -7229,7 +7246,11 @@ mod tests {
                                         })
                                     })
                                     .collect();
-                                serde_json::json!({"events": events, "total": 2_000})
+                                serde_json::json!({
+                                    "summary": session_detail_summary_json("s-big", false),
+                                    "events": events,
+                                    "ui_panels": []
+                                })
                             }
                             ipc_method::SESSION_PTY_REPLAY => {
                                 serde_json::json!({"data": "", "size": {"cols": 80, "rows": 24}})
@@ -7329,7 +7350,7 @@ mod tests {
                         let id = req.get("id").cloned().unwrap_or(Value::Null);
                         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
                         let result = match method {
-                            ipc_method::SESSION_TRANSCRIPT => {
+                            ipc_method::SESSION_GET => {
                                 // Headless transcript: assistant + reasoning
                                 // deltas, no PTY events at all.
                                 let ev = |seq: u64, event: Value| {
@@ -7358,7 +7379,11 @@ mod tests {
                                         }),
                                     ),
                                 ];
-                                serde_json::json!({"events": events, "total": 3})
+                                serde_json::json!({
+                                    "summary": session_detail_summary_json("s-headless", false),
+                                    "events": events,
+                                    "ui_panels": []
+                                })
                             }
                             ipc_method::SESSION_PTY_REPLAY => {
                                 serde_json::json!({"data": "", "size": {"cols": 80, "rows": 24}})
