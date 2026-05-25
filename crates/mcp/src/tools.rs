@@ -2,9 +2,7 @@
 //! on `agentd_client::Client`.
 
 use agentd_client::Client;
-use agentd_protocol::{
-    agent_context, CreateSessionParams, PtySize, SessionEvent, UiPanel, UiPlacement,
-};
+use agentd_protocol::{agent_context, CreateSessionParams, PtySize};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -102,50 +100,6 @@ pub fn catalog() -> Vec<Value> {
                 ("session_id", "string", true),
                 ("bytes_b64",  "string", true),
             ]),
-        ),
-        tool(
-            "agentd_ui_create",
-            "Create or replace a dynamic session UI panel. The panel body is safe agentd-markdown: normal markdown plus action links like `[Run checks](agentd:action/run-checks)`. Use for compact task status, checklists, decisions, and command decks when it materially helps the user.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Target session. Defaults to the caller's AGENTD_SESSION_ID when omitted." },
-                    "id": { "type": "string" },
-                    "title": { "type": "string" },
-                    "placement": { "type": "string", "enum": ["sticky", "inline"] },
-                    "markdown": { "type": "string" }
-                },
-                "required": ["id", "markdown"]
-            }),
-        ),
-        tool(
-            "agentd_ui_patch",
-            "Patch a dynamic session UI panel. For the MVP this replaces `markdown` and/or `title` on an existing panel id while preserving other fields.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string", "description": "Target session. Defaults to the caller's AGENTD_SESSION_ID when omitted." },
-                    "id": { "type": "string" },
-                    "title": { "type": "string" },
-                    "placement": { "type": "string", "enum": ["sticky", "inline"] },
-                    "markdown": { "type": "string", "description": "Optional full markdown replacement." },
-                    "find": { "type": "string", "description": "Optional exact substring to replace in the current/new markdown. Must occur exactly once." },
-                    "replace": { "type": "string", "description": "Replacement text for `find`; defaults to empty string when `find` is set." }
-                },
-                "required": ["id"]
-            }),
-        ),
-        tool(
-            "agentd_ui_delete",
-            "Delete a dynamic session UI panel by id. Defaults to the caller's session when `session_id` is omitted.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "session_id": { "type": "string" },
-                    "id": { "type": "string" }
-                },
-                "required": ["id"]
-            }),
         ),
         tool(
             "agentd_interrupt_session",
@@ -442,30 +396,6 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             client.pty_input(&sid, bytes).await?;
             json!({ "ok": true })
         }
-        "agentd_ui_create" => {
-            let sid = target_session_id(session_id, &args)?;
-            let panel = ui_panel_from_args(&args, None)?;
-            client
-                .emit_event(&sid, SessionEvent::UiPanel(panel.clone()))
-                .await?;
-            json!({ "ok": true, "session_id": sid, "panel": panel })
-        }
-        "agentd_ui_patch" => {
-            let sid = target_session_id(session_id, &args)?;
-            let panel = ui_panel_from_args(&args, Some(client.get(&sid).await?))?;
-            client
-                .emit_event(&sid, SessionEvent::UiPanel(panel.clone()))
-                .await?;
-            json!({ "ok": true, "session_id": sid, "panel": panel })
-        }
-        "agentd_ui_delete" => {
-            let sid = target_session_id(session_id, &args)?;
-            let id = arg_str(&args, "id")?;
-            client
-                .emit_event(&sid, SessionEvent::UiDelete { id: id.clone() })
-                .await?;
-            json!({ "ok": true, "session_id": sid, "id": id })
-        }
         "agentd_interrupt_session" => {
             client.interrupt(&arg_str(&args, "session_id")?).await?;
             json!({ "ok": true })
@@ -660,76 +590,6 @@ fn arg_usize(args: &Value, name: &str) -> Option<usize> {
     args.get(name).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
-fn target_session_id(session_id: Option<&str>, args: &Value) -> Result<String> {
-    arg_str(args, "session_id").or_else(|_| {
-        session_id
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| anyhow!("missing `session_id` and AGENTD_SESSION_ID is unset"))
-    })
-}
-
-fn parse_ui_placement(args: &Value, default: UiPlacement) -> UiPlacement {
-    match args.get("placement").and_then(|v| v.as_str()).unwrap_or("") {
-        "inline" => UiPlacement::Inline,
-        "sticky" => UiPlacement::Sticky,
-        _ => default,
-    }
-}
-
-fn ui_panel_from_args(
-    args: &Value,
-    existing_detail: Option<agentd_protocol::SessionDetail>,
-) -> Result<UiPanel> {
-    let id = arg_str(args, "id")?;
-    let existing = existing_detail.and_then(|detail| {
-        detail
-            .events
-            .into_iter()
-            .fold(None, |current, ev| match ev.event {
-                SessionEvent::UiPanel(panel) if panel.id == id => Some(panel),
-                SessionEvent::UiDelete { id: deleted } if deleted == id => None,
-                _ => current,
-            })
-    });
-    let title = arg_str(args, "title")
-        .ok()
-        .or_else(|| existing.as_ref().and_then(|p| p.title.clone()));
-    let placement = parse_ui_placement(
-        args,
-        existing.as_ref().map(|p| p.placement).unwrap_or_default(),
-    );
-    let mut markdown = arg_str(args, "markdown")
-        .ok()
-        .or_else(|| existing.as_ref().map(|p| p.markdown.clone()))
-        .ok_or_else(|| anyhow!("missing `markdown` and no existing panel `{id}` to patch"))?;
-    apply_search_replace_patch(args, &mut markdown)?;
-    Ok(UiPanel {
-        id,
-        source: None,
-        title,
-        placement,
-        markdown,
-    })
-}
-
-fn apply_search_replace_patch(args: &Value, markdown: &mut String) -> Result<()> {
-    let Some(find) = args.get("find").and_then(|v| v.as_str()) else {
-        return Ok(());
-    };
-    let replace = args.get("replace").and_then(|v| v.as_str()).unwrap_or("");
-    let count = markdown.matches(find).count();
-    match count {
-        0 => Err(anyhow!("`find` did not match panel markdown")),
-        1 => {
-            *markdown = markdown.replacen(find, replace, 1);
-            Ok(())
-        }
-        _ => Err(anyhow!(
-            "`find` matched panel markdown {count} times; refine the search text"
-        )),
-    }
-}
-
 fn require_session_id(session_id: Option<&str>) -> Result<String> {
     session_id
         .map(ToOwned::to_owned)
@@ -796,22 +656,6 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_ui_tools() {
-        let names: std::collections::HashSet<String> = catalog()
-            .into_iter()
-            .filter_map(|tool| {
-                tool.get("name")
-                    .and_then(|name| name.as_str())
-                    .map(|name| name.to_string())
-            })
-            .collect();
-
-        for expected in ["agentd_ui_create", "agentd_ui_patch", "agentd_ui_delete"] {
-            assert!(names.contains(expected), "missing {expected}");
-        }
-    }
-
-    #[test]
     fn catalog_includes_subagent_tools() {
         let names: std::collections::HashSet<String> = catalog()
             .into_iter()
@@ -843,59 +687,6 @@ mod tests {
         // Tests run in debug, so the dev-only tool is advertised here;
         // it's `#[cfg(debug_assertions)]`-gated out of release builds.
         assert_eq!(names.contains("webui_hot_reload"), cfg!(debug_assertions));
-    }
-
-    #[test]
-    fn ui_panel_from_args_applies_search_replace_patch() {
-        let detail = agentd_protocol::SessionDetail {
-            summary: subagent_summary("s1", "parent", false),
-            events: vec![agentd_protocol::TimestampedEvent {
-                seq: 1,
-                at: "2026-05-24T00:00:00Z".parse().expect("timestamp"),
-                event: SessionEvent::UiPanel(UiPanel {
-                    id: "task".into(),
-                    source: None,
-                    title: Some("Task".into()),
-                    placement: UiPlacement::Sticky,
-                    markdown: "- [~] Implement\n- [ ] Test".into(),
-                }),
-            }],
-            ui_panels: Vec::new(),
-        };
-        let panel = ui_panel_from_args(
-            &json!({
-                "id": "task",
-                "find": "- [~] Implement\n- [ ] Test",
-                "replace": "- [x] Implement\n- [~] Test"
-            }),
-            Some(detail),
-        )
-        .expect("patch panel");
-        assert_eq!(panel.markdown, "- [x] Implement\n- [~] Test");
-    }
-
-    #[test]
-    fn ui_panel_from_args_patches_existing_markdown() {
-        let detail = agentd_protocol::SessionDetail {
-            summary: subagent_summary("s1", "parent", false),
-            events: vec![agentd_protocol::TimestampedEvent {
-                seq: 1,
-                at: "2026-05-24T00:00:00Z".parse().expect("timestamp"),
-                event: SessionEvent::UiPanel(UiPanel {
-                    id: "task".into(),
-                    source: None,
-                    title: Some("Old".into()),
-                    placement: UiPlacement::Sticky,
-                    markdown: "old".into(),
-                }),
-            }],
-            ui_panels: Vec::new(),
-        };
-        let panel = ui_panel_from_args(&json!({ "id": "task", "markdown": "new" }), Some(detail))
-            .expect("patch panel");
-        assert_eq!(panel.id, "task");
-        assert_eq!(panel.title.as_deref(), Some("Old"));
-        assert_eq!(panel.markdown, "new");
     }
 
     #[tokio::test]

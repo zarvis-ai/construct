@@ -4171,46 +4171,6 @@ impl App {
         should_autofocus_view_from_list(self.focus, self.zoom, self.chord_state.is_empty(), key)
     }
 
-    fn emit_dynamic_ui_demo(&mut self) {
-        let Some(session_id) = self.selected_id() else {
-            self.set_status("dynamic-ui-demo: no session selected".into());
-            return;
-        };
-        let panel = agentd_protocol::UiPanel {
-            id: "dynamic-ui-demo".to_string(),
-            source: None,
-            title: Some("Zarvis Task".to_string()),
-            placement: agentd_protocol::UiPlacement::Sticky,
-            markdown: r#"# Zarvis Task
-
-**Goal:** Demo agent-controlled dynamic session UI
-**Status:** Ready for action
-**Surface:** Agentd Markdown + action links
-
-- [x] Define declarative UI schema
-- [x] Render markdown panel in session view
-- [~] Route action links to session input
-- [ ] Generalize for harness-authored UI
-
-[View diff](agentd:action/view-diff)
-[Run check](agentd:action/run-check)
-[Stop](agentd:action/stop)
-"#
-            .to_string(),
-        };
-        self.ui_panels
-            .entry(session_id.clone())
-            .or_default()
-            .insert(panel.id.clone(), panel.clone());
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let _ = client
-                .emit_event(&session_id, SessionEvent::UiPanel(panel))
-                .await;
-        });
-        self.set_status("dynamic-ui-demo: press 1/2/3 in the view pane".into());
-    }
-
     /// True when keystrokes should be forwarded to the session's PTY by
     /// default (view focused, terminal mode, session has a *live* PTY).
     /// Once the session reaches a terminal state the PTY is gone, so the
@@ -5129,9 +5089,6 @@ impl App {
             "help" | "?" => self.help_visible = true,
             "tasks" => {
                 self.open_tasks_popup().await;
-            }
-            "dynamic-ui-demo" | "ui-demo" => {
-                self.emit_dynamic_ui_demo();
             }
             "remote-control" | "remote" => {
                 // Subcommand dispatch: `stop` and `debug` are
