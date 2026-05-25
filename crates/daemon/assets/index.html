@@ -2240,6 +2240,7 @@ async function handleRowAction(action, sessionId) {
 
 async function selectSession(id) {
   if (state.currentId === id) return;
+  const focusTerminalAfterSwitch = shouldFocusTerminalAfterSessionSwitch();
   state.currentId = id;
   renderSessions();
   const s = state.sessions.find((x) => x.id === id);
@@ -2250,7 +2251,7 @@ async function selectSession(id) {
     setSessionListVisible(false, false);
   }
   if (isTerminalSession(s)) {
-    await enterTerminalMode(id);
+    await enterTerminalMode(id, { focusTerminal: focusTerminalAfterSwitch });
   } else {
     enterChatMode();
     await loadTranscript(id);
@@ -2263,6 +2264,31 @@ async function selectSession(id) {
 }
 
 // --- PTY / xterm.js mode -------------------------------------------------
+
+function isLikelyTouchDevice() {
+  if (navigator.maxTouchPoints && navigator.maxTouchPoints > 0) return true;
+  return !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
+}
+
+function isNativeKeyboardVisible() {
+  if (!window.visualViewport) return false;
+  const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+  if (!layoutHeight) return false;
+  const hiddenHeight = layoutHeight - window.visualViewport.height;
+  return hiddenHeight > Math.max(80, layoutHeight * 0.15);
+}
+
+function shouldFocusTerminalAfterSessionSwitch() {
+  if (!isLikelyTouchDevice()) return true;
+  return isNativeKeyboardVisible();
+}
+
+function blurActiveTerminalInput() {
+  const active = document.activeElement;
+  if (active && terminalEl.contains(active) && typeof active.blur === "function") {
+    active.blur();
+  }
+}
 
 function enterChatMode() {
   state.mode = "chat";
@@ -2306,7 +2332,7 @@ function rememberActiveTerminalState() {
   handle.lastReportedSize = state.lastReportedSize;
 }
 
-async function enterTerminalMode(id) {
+async function enterTerminalMode(id, options = {}) {
   rememberActiveTerminalState();
   state.mode = "terminal";
   activeTranscriptEl = null;
@@ -2399,7 +2425,11 @@ async function enterTerminalMode(id) {
   // refit always fires `pty_resize`.
   state.lastReportedSize = { cols: 0, rows: 0 };
   refitTerminal({ claim: true, immediate: true });
-  state.term.focus();
+  if (options.focusTerminal) {
+    state.term.focus();
+  } else {
+    blurActiveTerminalInput();
+  }
 }
 
 /**
