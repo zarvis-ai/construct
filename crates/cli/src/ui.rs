@@ -2867,14 +2867,11 @@ fn render_agentd_markdown_lines(
             }
             continue;
         }
-        if let Some(title) = parse_timeline_open(line) {
+        if is_timeline_open(line) {
             if !pending_action_spans.is_empty() {
                 lines.push(Line::from(std::mem::take(&mut pending_action_spans)));
             }
-            in_timeline = Some(TimelineBlock {
-                title,
-                items: Vec::new(),
-            });
+            in_timeline = Some(TimelineBlock { items: Vec::new() });
             continue;
         }
         let action_links = parse_agentd_action_links(line);
@@ -2990,82 +2987,43 @@ fn render_agentd_markdown_lines(
 
 #[derive(Debug, Clone)]
 struct TimelineBlock {
-    title: Option<String>,
     items: Vec<String>,
 }
 
-fn parse_timeline_open(line: &str) -> Option<Option<String>> {
-    let trimmed = line.trim();
-    let rest = trimmed
-        .strip_prefix(":::timeline")
-        .or_else(|| trimmed.strip_prefix(":::agentd-timeline"))?;
-    let title = rest.trim();
-    if title.is_empty() {
-        return Some(None);
-    }
-    Some(Some(
-        title
-            .trim_matches(|c| c == '"' || c == '\u{201c}' || c == '\u{201d}')
-            .trim()
-            .to_string(),
-    ))
+fn is_timeline_open(line: &str) -> bool {
+    line.trim() == ":::timeline" || line.trim() == ":::agentd-timeline"
 }
 
 fn render_timeline_block(block: &TimelineBlock, theme: &Theme) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let content_width = block
+    let items: Vec<_> = block
         .items
         .iter()
-        .map(|item| timeline_item_text(item).width())
-        .chain(block.title.as_ref().map(|t| t.width()))
-        .max()
-        .unwrap_or(0)
-        .max(12)
-        .min(72);
-    if let Some(title) = block.title.as_ref().filter(|t| !t.is_empty()) {
-        let label = format!(" {title} ");
-        let fill = content_width.saturating_sub(label.width()).max(1);
-        lines.push(Line::from(vec![
-            Span::styled("╭─", Style::default().fg(theme.dim)),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("─".repeat(fill), Style::default().fg(theme.dim)),
-            Span::styled("╮", Style::default().fg(theme.dim)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("╭", Style::default().fg(theme.dim)),
-            Span::styled("─".repeat(content_width + 2), Style::default().fg(theme.dim)),
-            Span::styled("╮", Style::default().fg(theme.dim)),
-        ]));
-    }
-    for (idx, item) in block.items.iter().enumerate() {
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
+        .collect();
+    let mut lines = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
         let (glyph, text, color, bold) = timeline_item_parts(item, theme);
-        let connector = if idx + 1 == block.items.len() { "╰" } else { "├" };
+        let prefix = if items.len() == 1 {
+            "• "
+        } else if idx == 0 {
+            "╷ "
+        } else if idx + 1 == items.len() {
+            "╰ "
+        } else {
+            "│ "
+        };
         let mut style = Style::default().fg(color);
         if bold {
             style = style.add_modifier(Modifier::BOLD);
         }
         lines.push(Line::from(vec![
-            Span::styled(format!("{connector}─"), Style::default().fg(theme.dim)),
+            Span::styled(prefix, Style::default().fg(theme.dim)),
             Span::styled(format!("{glyph} "), style),
             Span::styled(text, Style::default().fg(theme.text)),
         ]));
     }
-    lines.push(Line::from(vec![
-        Span::styled("╰", Style::default().fg(theme.dim)),
-        Span::styled("─".repeat(content_width + 2), Style::default().fg(theme.dim)),
-        Span::styled("╯", Style::default().fg(theme.dim)),
-    ]));
     lines
-}
-
-fn timeline_item_text(item: &str) -> String {
-    timeline_item_parts(item, &Theme::default()).1
 }
 
 fn timeline_item_parts(item: &str, theme: &Theme) -> (&'static str, String, Color, bool) {

@@ -121,11 +121,11 @@ pub fn build_from_env() -> AgentdContext {
 fn widget_markdown_extensions() -> Vec<WidgetMarkdownExtension> {
     vec![WidgetMarkdownExtension {
         name: "timeline".to_string(),
-        description: "Render a compact vertical mission/status timeline in a session widget. Supports [x] done, [~] active/current, [ ] todo, [!] blocked/warning, and plain bullet items."
+        description: "Render top-level bullet/checklist items as a compact vertical timeline connected by a line. Supports [x] done, [~] active/current, [ ] todo, [!] blocked/warning, and plain bullet items."
             .to_string(),
-        syntax: ":::timeline \"Title\"\n[x] Done\n[~] Active/current\n[ ] Todo\n[!] Blocked\nPlain milestone\n:::"
+        syntax: ":::timeline\n[x] Done\n[~] Active/current\n[ ] Todo\n[!] Blocked\nPlain milestone\n:::"
             .to_string(),
-        use_when: "Use for multi-step task progress, mission plans, status history, and review/check workflows."
+        use_when: "Use for multi-step task progress, mission plans, status history, and review/check workflows where connected bullets read better than a plain list."
             .to_string(),
     }]
 }
