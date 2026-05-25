@@ -35,9 +35,9 @@
 
 use crate::jsonrpc::{self, MessageKind, Response};
 use crate::{
-    ahp_method, ahp_notif, transport, ErrorObject, EventEnvelope, InitializeResult, Notification,
-    Request, SessionEvent, SessionInputParams, SessionPtyInputParams, SessionPtyResizeParams,
-    SessionStartParams,
+    agent_context, ahp_method, ahp_notif, transport, ErrorObject, EventEnvelope, InitializeResult,
+    Notification, Request, SessionEvent, SessionInputParams, SessionPtyInputParams,
+    SessionPtyResizeParams, SessionStartParams,
 };
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
@@ -81,9 +81,8 @@ pub fn maybe_inject_codex_mcp_args(session_id: &str) -> Vec<String> {
         return Vec::new();
     };
     let bin_lit = toml_quote(&bin.to_string_lossy());
-    let sid_lit = toml_quote(session_id);
-    let inline =
-        format!("{{ command = {bin_lit}, args = [], env = {{ AGENTD_SESSION_ID = {sid_lit} }} }}");
+    let env_lit = mcp_env_toml(session_id);
+    let inline = format!("{{ command = {bin_lit}, args = [], env = {env_lit} }}");
     vec!["-c".into(), format!("mcp_servers.agentd={inline}")]
 }
 
@@ -99,6 +98,27 @@ fn toml_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+fn mcp_env_toml(session_id: &str) -> String {
+    mcp_env_toml_from(session_id, |name| std::env::var(name).ok())
+}
+
+fn mcp_env_toml_from(
+    session_id: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut pairs = vec![format!(
+        "{} = {}",
+        agent_context::ENV_SESSION_ID,
+        toml_quote(session_id)
+    )];
+    for name in agent_context::MCP_CONTEXT_ENV_VARS {
+        if let Some(value) = lookup(name) {
+            pairs.push(format!("{name} = {}", toml_quote(&value)));
+        }
+    }
+    format!("{{ {} }}", pairs.join(", "))
 }
 
 /// If `AGENTD_INJECT_MCP` is not set to `"0"`, attempt to write a per-session
@@ -120,12 +140,22 @@ pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
         return None;
     }
     let cfg_path = dir.join(format!("{session_id}.json"));
+    let mut env = serde_json::Map::new();
+    env.insert(
+        agent_context::ENV_SESSION_ID.to_string(),
+        serde_json::json!(session_id),
+    );
+    for name in agent_context::MCP_CONTEXT_ENV_VARS {
+        if let Ok(value) = std::env::var(name) {
+            env.insert(name.to_string(), serde_json::json!(value));
+        }
+    }
     let config = serde_json::json!({
         "mcpServers": {
             "agentd": {
                 "command": mcp_bin.to_string_lossy(),
                 "args": [],
-                "env": { "AGENTD_SESSION_ID": session_id },
+                "env": env,
             }
         }
     });
@@ -900,6 +930,21 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn mcp_env_toml_includes_memory_context_env() {
+        let got = mcp_env_toml_from("s123", |name| match name {
+            agent_context::ENV_GLOBAL_MEMORY_FILE => Some("/tmp/global.md".to_string()),
+            agent_context::ENV_PROJECT_MEMORY_FILE => Some("/tmp/project.md".to_string()),
+            agent_context::ENV_PROJECT_ID => Some("g123".to_string()),
+            _ => None,
+        });
+
+        assert!(got.contains("AGENTD_SESSION_ID = \"s123\""));
+        assert!(got.contains("AGENTD_GLOBAL_MEMORY_FILE = \"/tmp/global.md\""));
+        assert!(got.contains("AGENTD_PROJECT_MEMORY_FILE = \"/tmp/project.md\""));
+        assert!(got.contains("AGENTD_PROJECT_ID = \"g123\""));
     }
 
     /// Symptom-level repro for the stuck-zarvis-prompt bug. The user

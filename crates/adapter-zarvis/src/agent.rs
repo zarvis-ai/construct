@@ -249,10 +249,6 @@ pub async fn run(
             prompt.push_str("\n\n");
             prompt.push_str(&section);
         }
-        if let Some(section) = crate::memory::format_section() {
-            prompt.push_str("\n\n");
-            prompt.push_str(&section);
-        }
         if let Some(section) = crate::skills::format_section(&cwd) {
             prompt.push_str("\n\n");
             prompt.push_str(&section);

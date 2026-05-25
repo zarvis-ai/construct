@@ -73,6 +73,7 @@ impl ToolRegistry {
             Box::new(browser::BrowserScreenshot),
             Box::new(browser::BrowserEval),
             // agentd-control tools
+            Box::new(agentd::Context),
             Box::new(agentd::Whoami),
             Box::new(agentd::ListSessions),
             Box::new(agentd::GetSession),
@@ -199,6 +200,10 @@ mod tests {
     #[test]
     fn registry_includes_subagent_tools() {
         let registry = ToolRegistry::with_defaults();
+        assert!(
+            registry.get("agentd_context").is_some(),
+            "missing tool agentd_context"
+        );
         for name in [
             "agentd_subagent_create",
             "agentd_subagent_list",
