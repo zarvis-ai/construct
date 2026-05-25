@@ -2219,7 +2219,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Style::default().fg(app.theme.text)
     };
-    let ui_trigger_label = "widgets".to_string();
+    let ui_trigger_label = " widgets ".to_string();
     let ui_trigger = ui_session_id.as_ref().map(|session_id| {
         let (x_start, x_end, y) =
             dynamic_ui_trigger_range(area, show_close, ui_trigger_label.len() as u16);
