@@ -4266,7 +4266,7 @@ impl App {
         let KeyCode::Char(c) = key.code else {
             return false;
         };
-        if !c.is_ascii_digit() || c == '0' {
+        if c.is_control() || c == '0' {
             return false;
         }
         let Some(session_id) = self.selected_id() else {
@@ -4349,17 +4349,12 @@ impl App {
             panels.keys().collect()
         };
         panel_ids.sort();
-        let mut action_index = 1u32;
         for panel_id in panel_ids {
             let panel = panels.get(panel_id)?;
             for action in markdown_actions(&panel.markdown) {
-                let implicit = char::from_digit(action_index, 10)
-                    .map(|v| v == key)
-                    .unwrap_or(false);
-                if implicit || action.key.as_deref() == Some(&key.to_string()) {
+                if action.key.as_deref() == Some(&key.to_string()) {
                     return Some(action);
                 }
-                action_index += 1;
             }
         }
         None
@@ -8003,6 +7998,17 @@ fn markdown_display_rows(markdown: &str) -> usize {
     rows
 }
 
+fn parse_markdown_action_target(target: &str) -> (String, Option<String>) {
+    let Some((id, query)) = target.split_once('?') else {
+        return (target.to_string(), None);
+    };
+    let key = query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == "key" && !value.is_empty()).then(|| value.to_string())
+    });
+    (id.to_string(), key)
+}
+
 fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
     let mut out = Vec::new();
     let mut rest = markdown;
@@ -8020,18 +8026,35 @@ fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
         let Some(id_end) = after_open.find(')') else {
             break;
         };
-        let id = &after_open[..id_end];
+        let (id, key) = parse_markdown_action_target(&after_open[..id_end]);
         if !label.is_empty() && !id.is_empty() {
             out.push(agentd_protocol::UiAction {
-                id: id.to_string(),
+                id,
                 label: label.to_string(),
-                key: None,
+                key,
                 style: None,
             });
         }
         rest = &after_open[id_end + 1..];
     }
     out
+}
+
+#[cfg(test)]
+mod widget_action_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_actions_parse_explicit_keys_only() {
+        let actions = markdown_actions(
+            "[Run checks](agentd:action/run-checks?key=r) [Start demo](agentd:action/start-demo)",
+        );
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].id, "run-checks");
+        assert_eq!(actions[0].key.as_deref(), Some("r"));
+        assert_eq!(actions[1].id, "start-demo");
+        assert_eq!(actions[1].key, None);
+    }
 }
 
 fn insert_minibuffer_text(mb: &mut Minibuffer, text: &str) {

@@ -2851,22 +2851,55 @@ fn render_agentd_markdown_lines(
     suppress_first_heading: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let mut action_index = 1usize;
     let mut pending_action_spans: Vec<Span<'static>> = Vec::new();
     let mut pending_action_row = 0usize;
+    let mut rendered_rows = 0usize;
     let mut skipped_first_heading = false;
+    let mut in_timeline: Option<TimelineBlock> = None;
     for raw in markdown.lines() {
         let line = raw.trim_end();
-        let action_links = parse_agentd_action_links(line);
-        if !action_links.is_empty() {
-            if pending_action_spans.is_empty() {
-                pending_action_row = lines.len();
+        if let Some(timeline) = in_timeline.as_mut() {
+            if line.trim() == ":::" {
+                let rendered = render_timeline_block(
+                    timeline,
+                    theme,
+                    hover,
+                    panel_area,
+                    rendered_rows,
+                    session_id,
+                    panel_id,
+                    hits,
+                );
+                rendered_rows += visual_line_count(rendered.iter(), panel_area.width);
+                lines.extend(rendered);
+                in_timeline = None;
+            } else {
+                timeline.items.push(line.to_string());
             }
-            for (label, id) in action_links {
+            continue;
+        }
+        if is_timeline_open(line) {
+            if !pending_action_spans.is_empty() {
+                let line = Line::from(std::mem::take(&mut pending_action_spans));
+                rendered_rows += visual_line_count(std::iter::once(&line), panel_area.width);
+                lines.push(line);
+            }
+            in_timeline = Some(TimelineBlock { items: Vec::new() });
+            continue;
+        }
+        let action_links = parse_agentd_action_links(line);
+        if !action_links.is_empty() && !is_checkline(line) {
+            if pending_action_spans.is_empty() {
+                pending_action_row = rendered_rows;
+            }
+            for (label, id, key) in action_links {
                 if !pending_action_spans.is_empty() {
                     pending_action_spans.push(Span::raw("  "));
                 }
-                let text = format!("[{action_index}] {label}");
+                let text = key
+                    .as_ref()
+                    .map(|key| format!("[{key}] {label}"))
+                    .unwrap_or_else(|| label.clone());
                 let start_col = panel_area.x.saturating_add(1).saturating_add(
                     pending_action_spans
                         .iter()
@@ -2900,7 +2933,7 @@ fn render_agentd_markdown_lines(
                         action: agentd_protocol::UiAction {
                             id,
                             label,
-                            key: None,
+                            key,
                             style: None,
                         },
                         row,
@@ -2908,12 +2941,13 @@ fn render_agentd_markdown_lines(
                         end_col,
                     });
                 }
-                action_index += 1;
             }
             continue;
         }
         if !pending_action_spans.is_empty() {
-            lines.push(Line::from(std::mem::take(&mut pending_action_spans)));
+            let line = Line::from(std::mem::take(&mut pending_action_spans));
+            rendered_rows += visual_line_count(std::iter::once(&line), panel_area.width);
+            lines.push(line);
         }
         if suppress_first_heading
             && !skipped_first_heading
@@ -2922,6 +2956,7 @@ fn render_agentd_markdown_lines(
         {
             continue;
         }
+        let before_normal_lines = lines.len();
         if line.is_empty() {
             lines.push(Line::raw(""));
         } else if suppress_first_heading
@@ -2947,36 +2982,415 @@ fn render_agentd_markdown_lines(
             } else {
                 lines.push(Line::raw(strip_markdown_emphasis(line)));
             }
-        } else if let Some(item) = line.strip_prefix("- [x] ") {
-            lines.push(checkline("✓", item, theme.matrix_flash_good, true));
-        } else if let Some(item) = line.strip_prefix("- [~] ") {
-            lines.push(checkline("◉", item, theme.accent, true));
-        } else if let Some(item) = line.strip_prefix("- [!] ") {
-            lines.push(checkline("!", item, theme.warning, true));
-        } else if let Some(item) = line.strip_prefix("- [ ] ") {
-            lines.push(checkline("○", item, theme.dim, false));
+        } else if let Some(line) = parse_checkline(
+            line,
+            theme,
+            hover,
+            panel_area,
+            rendered_rows,
+            session_id,
+            panel_id,
+            hits,
+        ) {
+            lines.push(line);
         } else {
             lines.push(Line::raw(strip_markdown_emphasis(line)));
+        }
+        if before_normal_lines < lines.len() {
+            rendered_rows += visual_line_count(lines[before_normal_lines..].iter(), panel_area.width);
         }
     }
     if !pending_action_spans.is_empty() {
         lines.push(Line::from(pending_action_spans));
     }
+    if let Some(timeline) = in_timeline.as_ref() {
+        lines.extend(render_timeline_block(
+            timeline,
+            theme,
+            hover,
+            panel_area,
+            rendered_rows,
+            session_id,
+            panel_id,
+            hits,
+        ));
+    }
     lines
 }
 
-fn checkline(glyph: &'static str, item: &str, color: Color, bold: bool) -> Line<'static> {
+#[derive(Debug, Clone)]
+struct TimelineBlock {
+    items: Vec<String>,
+}
+
+#[derive(Debug)]
+struct TimelineItem<'a> {
+    text: &'a str,
+    nested: Vec<&'a str>,
+}
+
+fn is_timeline_open(line: &str) -> bool {
+    line.trim() == ":::timeline" || line.trim() == ":::agentd-timeline"
+}
+
+fn visual_line_count<'a>(lines: impl IntoIterator<Item = &'a Line<'static>>, width: u16) -> usize {
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    lines
+        .into_iter()
+        .map(|line| {
+            let width = line
+                .spans
+                .iter()
+                .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                .sum::<usize>();
+            width.div_ceil(content_width).max(1)
+        })
+        .sum()
+}
+
+fn render_timeline_block(
+    block: &TimelineBlock,
+    theme: &Theme,
+    hover: Option<(u16, u16)>,
+    panel_area: Rect,
+    rendered_rows_start: usize,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+) -> Vec<Line<'static>> {
+    let items = timeline_items(&block.items);
+    let mut lines = Vec::new();
+    for (idx, item) in items.iter().enumerate() {
+        let is_last = idx + 1 == items.len();
+        let (glyph, text, color, bold) = timeline_item_parts(item.text, theme);
+        let mut style = Style::default().fg(color);
+        if bold {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        let row = panel_area
+            .y
+            .saturating_add(1)
+            .saturating_add(rendered_rows_start as u16)
+            .saturating_add(lines.len() as u16);
+        let item_start_col = panel_area
+            .x
+            .saturating_add(1)
+            .saturating_add(UnicodeWidthStr::width("  ") as u16)
+            .saturating_add(UnicodeWidthStr::width(format!("{glyph} ").as_str()) as u16);
+        let mut spans = vec![Span::raw("  "), Span::styled(format!("{glyph} "), style)];
+        spans.extend(render_inline_action_spans(
+            &text,
+            theme,
+            hover,
+            row,
+            item_start_col,
+            session_id,
+            panel_id,
+            hits,
+        ));
+        lines.push(Line::from(spans));
+        for nested in &item.nested {
+            render_timeline_nested_line(
+                &mut lines,
+                nested,
+                theme,
+                !is_last,
+                hover,
+                panel_area,
+                rendered_rows_start,
+                session_id,
+                panel_id,
+                hits,
+            );
+        }
+        if is_last {
+            lines.push(Line::raw(""));
+        } else {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("│", Style::default().fg(theme.dim)),
+            ]));
+        }
+    }
+    lines
+}
+
+fn timeline_items(raw_items: &[String]) -> Vec<TimelineItem<'_>> {
+    let mut items: Vec<TimelineItem<'_>> = Vec::new();
+    for raw in raw_items {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if is_indented(raw) {
+            if let Some(item) = items.last_mut() {
+                item.nested.push(raw.as_str());
+            } else {
+                items.push(TimelineItem {
+                    text: raw.trim(),
+                    nested: Vec::new(),
+                });
+            }
+        } else {
+            items.push(TimelineItem {
+                text: raw.trim(),
+                nested: Vec::new(),
+            });
+        }
+    }
+    items
+}
+
+fn is_indented(line: &str) -> bool {
+    line.starts_with(' ') || line.starts_with('\t')
+}
+
+fn render_timeline_nested_line(
+    lines: &mut Vec<Line<'static>>,
+    nested: &str,
+    theme: &Theme,
+    continue_line: bool,
+    hover: Option<(u16, u16)>,
+    panel_area: Rect,
+    rendered_rows_start: usize,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+) {
+    let connector = if continue_line { "│  " } else { "   " };
+    let indent_cols = nested_indent_cols(nested).saturating_sub(2);
+    let (glyph, text, color, bold) = timeline_item_parts(nested.trim(), theme);
     let mut style = Style::default().fg(color);
     if bold {
         style = style.add_modifier(Modifier::BOLD);
     }
-    Line::from(vec![
+    let row = panel_area
+        .y
+        .saturating_add(1)
+        .saturating_add(rendered_rows_start as u16)
+        .saturating_add(lines.len() as u16);
+    let item_start_col = panel_area
+        .x
+        .saturating_add(1)
+        .saturating_add(UnicodeWidthStr::width("  ") as u16)
+        .saturating_add(UnicodeWidthStr::width(connector) as u16)
+        .saturating_add(indent_cols as u16)
+        .saturating_add(UnicodeWidthStr::width(format!("{glyph} ").as_str()) as u16);
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(connector, Style::default().fg(theme.dim)),
+        Span::raw(" ".repeat(indent_cols)),
         Span::styled(format!("{glyph} "), style),
-        Span::raw(item.to_string()),
-    ])
+    ];
+    spans.extend(render_inline_action_spans(
+        &text,
+        theme,
+        hover,
+        row,
+        item_start_col,
+        session_id,
+        panel_id,
+        hits,
+    ));
+    lines.push(Line::from(spans));
 }
 
-fn parse_agentd_action_links(line: &str) -> Vec<(String, String)> {
+fn nested_indent_cols(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| *ch == ' ' || *ch == '\t')
+        .map(|ch| if ch == '\t' { 4 } else { 1 })
+        .sum()
+}
+
+fn timeline_item_parts(item: &str, theme: &Theme) -> (&'static str, String, Color, bool) {
+    let trimmed = item.trim();
+    if let Some(text) = trimmed
+        .strip_prefix("[x] ")
+        .or_else(|| trimmed.strip_prefix("- [x] "))
+    {
+        ("✓", strip_markdown_emphasis(text), theme.matrix_flash_good, true)
+    } else if let Some(text) = trimmed
+        .strip_prefix("[~] ")
+        .or_else(|| trimmed.strip_prefix("- [~] "))
+    {
+        ("◉", strip_markdown_emphasis(text), theme.accent, true)
+    } else if let Some(text) = trimmed
+        .strip_prefix("[!] ")
+        .or_else(|| trimmed.strip_prefix("- [!] "))
+    {
+        ("!", strip_markdown_emphasis(text), theme.warning, true)
+    } else if let Some(text) = trimmed
+        .strip_prefix("[ ] ")
+        .or_else(|| trimmed.strip_prefix("- [ ] "))
+    {
+        ("○", strip_markdown_emphasis(text), theme.dim, false)
+    } else {
+        let text = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+            .or_else(|| trimmed.strip_prefix("+ "))
+            .unwrap_or(trimmed);
+        ("•", strip_markdown_emphasis(text), theme.accent_alt, false)
+    }
+}
+
+fn is_checkline(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- [x] ")
+        || trimmed.starts_with("- [~] ")
+        || trimmed.starts_with("- [!] ")
+        || trimmed.starts_with("- [ ] ")
+}
+
+fn parse_checkline(
+    line: &str,
+    theme: &Theme,
+    hover: Option<(u16, u16)>,
+    panel_area: Rect,
+    rendered_rows: usize,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+) -> Option<Line<'static>> {
+    let indent = line
+        .chars()
+        .take_while(|ch| *ch == ' ' || *ch == '\t')
+        .collect::<String>()
+        .replace('\t', "    ");
+    let trimmed = line.trim_start();
+    let (glyph, item, color, bold) = if let Some(item) = trimmed.strip_prefix("- [x] ") {
+        ("✓", item, theme.matrix_flash_good, true)
+    } else if let Some(item) = trimmed.strip_prefix("- [~] ") {
+        ("◉", item, theme.accent, true)
+    } else if let Some(item) = trimmed.strip_prefix("- [!] ") {
+        ("!", item, theme.warning, true)
+    } else if let Some(item) = trimmed.strip_prefix("- [ ] ") {
+        ("○", item, theme.dim, false)
+    } else {
+        return None;
+    };
+    let mut style = Style::default().fg(color);
+    if bold {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    let row = panel_area
+        .y
+        .saturating_add(1)
+        .saturating_add(rendered_rows as u16);
+    let item_start_col = panel_area
+        .x
+        .saturating_add(1)
+        .saturating_add(UnicodeWidthStr::width(indent.as_str()) as u16)
+        .saturating_add(UnicodeWidthStr::width(format!("{glyph} ").as_str()) as u16);
+    let mut spans = vec![Span::raw(indent), Span::styled(format!("{glyph} "), style)];
+    spans.extend(render_inline_action_spans(
+        item,
+        theme,
+        hover,
+        row,
+        item_start_col,
+        session_id,
+        panel_id,
+        hits,
+    ));
+    Some(Line::from(spans))
+}
+
+fn render_inline_action_spans(
+    text: &str,
+    theme: &Theme,
+    hover: Option<(u16, u16)>,
+    row: u16,
+    start_col: u16,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    let mut col = start_col;
+    while let Some(label_start) = rest.find('[') {
+        let before = &rest[..label_start];
+        if !before.is_empty() {
+            let rendered = strip_markdown_emphasis(before);
+            col = col.saturating_add(UnicodeWidthStr::width(rendered.as_str()) as u16);
+            spans.push(Span::styled(rendered, Style::default().fg(theme.text)));
+        }
+        let after_open = &rest[label_start + 1..];
+        let Some(label_end) = after_open.find(']') else {
+            let rendered = strip_markdown_emphasis(&rest[label_start..]);
+            spans.push(Span::styled(rendered, Style::default().fg(theme.text)));
+            return spans;
+        };
+        let label = &after_open[..label_end];
+        let after_label = &after_open[label_end + 1..];
+        let Some(after_action_open) = after_label.strip_prefix("(agentd:action/") else {
+            let literal = &rest[label_start..label_start + label_end + 2];
+            let rendered = strip_markdown_emphasis(literal);
+            col = col.saturating_add(UnicodeWidthStr::width(rendered.as_str()) as u16);
+            spans.push(Span::styled(rendered, Style::default().fg(theme.text)));
+            rest = after_label;
+            continue;
+        };
+        let Some(action_end) = after_action_open.find(')') else {
+            let rendered = strip_markdown_emphasis(&rest[label_start..]);
+            spans.push(Span::styled(rendered, Style::default().fg(theme.text)));
+            return spans;
+        };
+        let (action_id, key) = parse_action_target(&after_action_open[..action_end]);
+        let prefix = key.as_ref().map(|key| format!("[{key}] ")).unwrap_or_default();
+        let display = format!("{prefix}{label}");
+        let end_col = col.saturating_add(UnicodeWidthStr::width(display.as_str()) as u16);
+        let is_hovered = hover
+            .map(|(mx, my)| my == row && mx >= col && mx < end_col)
+            .unwrap_or(false);
+        let mut style = Style::default().fg(if is_hovered {
+            theme.matrix_flash_good
+        } else {
+            theme.accent
+        });
+        if is_hovered {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        if let (Some(session_id), Some(panel_id)) = (session_id, panel_id) {
+            hits.push(crate::app::DynamicUiActionHit {
+                session_id: session_id.to_string(),
+                panel_id: panel_id.to_string(),
+                action: agentd_protocol::UiAction {
+                    id: action_id,
+                    label: label.to_string(),
+                    key,
+                    style: None,
+                },
+                row,
+                start_col: col,
+                end_col,
+            });
+        }
+        spans.push(Span::styled(display, style));
+        col = end_col;
+        rest = &after_action_open[action_end + 1..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(
+            strip_markdown_emphasis(rest),
+            Style::default().fg(theme.text),
+        ));
+    }
+    spans
+}
+
+fn parse_action_target(target: &str) -> (String, Option<String>) {
+    let Some((id, query)) = target.split_once('?') else {
+        return (target.to_string(), None);
+    };
+    let key = query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        (name == "key" && !value.is_empty()).then(|| value.to_string())
+    });
+    (id.to_string(), key)
+}
+
+fn parse_agentd_action_links(line: &str) -> Vec<(String, String, Option<String>)> {
     let mut out = Vec::new();
     let mut rest = line;
     while let Some(label_start) = rest.find('[') {
@@ -2993,9 +3407,9 @@ fn parse_agentd_action_links(line: &str) -> Vec<(String, String)> {
         let Some(id_end) = after_open.find(')') else {
             break;
         };
-        let id = &after_open[..id_end];
+        let (id, key) = parse_action_target(&after_open[..id_end]);
         if !label.is_empty() && !id.is_empty() {
-            out.push((label.to_string(), id.to_string()));
+            out.push((label.to_string(), id, key));
         }
         rest = &after_open[id_end + 1..];
     }
@@ -5220,6 +5634,57 @@ mod tests {
             }
         }
         n
+    }
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans.iter().map(|span| span.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn timeline_renders_nested_actions_and_depth() {
+        let mut hits = Vec::new();
+        let markdown = "# Timeline demo\n\n:::timeline\n- [~] [Start demo](agentd:action/start-demo?key=d)\n  - [x] Prepare demo workspace\n    - [ ] Record demo\n- [ ] [Run checks](agentd:action/run-checks?key=r)\n- Plain milestone\n:::";
+        let lines = render_agentd_markdown_lines(
+            markdown,
+            &Theme::default(),
+            None,
+            Rect::new(10, 20, 80, 20),
+            Some("session"),
+            Some("panel"),
+            &mut hits,
+            true,
+        );
+        let rendered: Vec<_> = lines.iter().map(line_text).collect();
+        assert!(rendered.iter().any(|line| line.contains("◉ [d] Start demo")));
+        assert!(rendered.iter().any(|line| line.contains("│  ✓ Prepare demo workspace")));
+        assert!(rendered.iter().any(|line| line.contains("│    ○ Record demo")));
+        assert!(rendered.iter().any(|line| line.contains("○ [r] Run checks")));
+        assert!(rendered.iter().any(|line| line.contains("• Plain milestone")));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].action.id, "start-demo");
+        assert_eq!(hits[0].action.key.as_deref(), Some("d"));
+        assert_eq!(hits[1].action.id, "run-checks");
+        assert_eq!(hits[1].action.key.as_deref(), Some("r"));
+    }
+
+    #[test]
+    fn checklist_action_links_keep_list_layout_and_optional_keys() {
+        let mut hits = Vec::new();
+        let markdown = "- [x] [Run checks](agentd:action/run-checks?key=r) and [Start demo](agentd:action/start-demo)";
+        let lines = render_agentd_markdown_lines(
+            markdown,
+            &Theme::default(),
+            None,
+            Rect::new(0, 0, 80, 10),
+            Some("session"),
+            Some("panel"),
+            &mut hits,
+            false,
+        );
+        assert_eq!(line_text(&lines[0]), "✓ [r] Run checks and Start demo");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].action.key.as_deref(), Some("r"));
+        assert_eq!(hits[1].action.key, None);
     }
 
     #[test]
