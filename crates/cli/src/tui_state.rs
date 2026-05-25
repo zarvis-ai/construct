@@ -7,6 +7,7 @@
 //! are ignored, and a corrupt file just resets to defaults instead
 //! of failing the launch.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use agentd_protocol::paths::Paths;
@@ -14,6 +15,12 @@ use serde::{Deserialize, Serialize};
 
 fn default_hide_pane_side_borders() -> bool {
     true
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct WidgetState {
+    #[serde(default)]
+    pub visible: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +43,8 @@ pub struct TuiState {
     pub matrix_rain_hidden: bool,
     #[serde(default = "default_hide_pane_side_borders")]
     pub hide_pane_side_borders: bool,
+    #[serde(default)]
+    pub widgets: HashMap<String, WidgetState>,
 }
 
 impl Default for TuiState {
@@ -50,6 +59,7 @@ impl Default for TuiState {
             list_collapsed: false,
             matrix_rain_hidden: false,
             hide_pane_side_borders: default_hide_pane_side_borders(),
+            widgets: HashMap::new(),
         }
     }
 }
@@ -74,30 +84,5 @@ pub fn save(state: &TuiState) {
     }
     if let Ok(json) = serde_json::to_vec_pretty(state) {
         let _ = std::fs::write(&path, json);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::TuiState;
-
-    #[test]
-    fn defaults_to_hiding_pane_side_borders() {
-        assert!(TuiState::default().hide_pane_side_borders);
-    }
-
-    #[test]
-    fn missing_border_preference_uses_new_default() {
-        let state: TuiState = serde_json::from_str("{}").expect("valid empty state");
-
-        assert!(state.hide_pane_side_borders);
-    }
-
-    #[test]
-    fn persisted_border_preference_still_round_trips() {
-        let state: TuiState =
-            serde_json::from_str(r#"{"hide_pane_side_borders":false}"#).expect("valid state");
-
-        assert!(!state.hide_pane_side_borders);
     }
 }

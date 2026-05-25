@@ -1243,7 +1243,16 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         browser_previews: HashMap::new(),
         ui_panels: HashMap::new(),
         dynamic_ui_popover_open: None,
-        dynamic_ui_selected: HashSet::new(),
+        dynamic_ui_selected: persisted
+            .widgets
+            .iter()
+            .flat_map(|(session_id, state)| {
+                state
+                    .visible
+                    .iter()
+                    .map(move |panel_id| (session_id.clone(), panel_id.clone()))
+            })
+            .collect(),
         dynamic_ui_temporary_until: HashMap::new(),
         dynamic_ui_focused: None,
         image_resize_cache: Vec::new(),
@@ -1322,6 +1331,18 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     );
     terminal.show_cursor().ok();
 
+    let mut widgets: HashMap<String, crate::tui_state::WidgetState> = HashMap::new();
+    for (session_id, panel_id) in &app.dynamic_ui_selected {
+        widgets
+            .entry(session_id.clone())
+            .or_default()
+            .visible
+            .push(panel_id.clone());
+    }
+    for state in widgets.values_mut() {
+        state.visible.sort();
+        state.visible.dedup();
+    }
     crate::tui_state::save(&crate::tui_state::TuiState {
         last_selected_session_id: app.selection.session_id().map(|s| s.to_string()),
         zoom: app.zoom,
@@ -1332,6 +1353,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         list_collapsed: app.list_collapsed,
         matrix_rain_hidden: app.matrix_rain_hidden,
         hide_pane_side_borders: app.hide_pane_side_borders,
+        widgets,
     });
 
     result
