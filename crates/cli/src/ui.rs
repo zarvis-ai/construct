@@ -2838,7 +2838,7 @@ fn blit_image_quadrants(f: &mut Frame, area: Rect, img: &image::RgbaImage, cover
 }
 
 /// Paint the fixed bottom input pane:
-/// - zero or more queued lines (gray `❯`), then
+/// - zero or more queued lines (gray `↑`), then
 /// - one blank spacer row, then
 /// - the active editor — one row per `\n`-separated buf line, cyan `❯`
 ///   on the first row, two-space indent on continuation rows.
@@ -2909,7 +2909,7 @@ fn render_editor_pane(
 
     let text_width = area.width.saturating_sub(prompt_w).max(1) as usize;
 
-    // Queued entries — one `❯` per entry; wrapped/continuation rows
+    // Queued entries — one `↑` per entry; wrapped/continuation rows
     // align under the prompt's text column with a two-space indent.
     'queued: for entry in &state.queued {
         let mut first = true;
@@ -2928,7 +2928,7 @@ fn render_editor_pane(
                 let spans = if first {
                     first = false;
                     vec![
-                        Span::styled("❯ ", queued_glyph_style),
+                        Span::styled("↑ ", queued_glyph_style),
                         Span::styled(visual.text, queued_style),
                     ]
                 } else {
