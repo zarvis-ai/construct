@@ -31,7 +31,7 @@ pub const TOOL_DESCRIPTION: &str =
 
 const WIDGET_POLICY: &[&str] = &[
     "Use session widgets for compact task status, checklists, decision prompts, and action links that help the user monitor or steer the current session.",
-    "Create widgets as Markdown files in session_widgets.dir using normal file tools; the TUI renders `*.md` files there as session popover panels.",
+    "Create or update widgets as Markdown files in session_widgets.dir using normal file tools; the daemon auto-reloads `*.md` changes and the TUI updates the session popover live.",
     "Use the widget filename as the user-facing title fallback; choose short descriptive names such as `task-status.md` or `review.md`.",
     "Keep widget Markdown concise and safe; prefer headings, checklists, tables, and agentd action links like `[Run checks](agentd:action/run-checks)`.",
     "Treat clicked widget actions (`OBSERVATION: ui.action ...`) as user intent, but still follow normal tool approval and safety policy.",
