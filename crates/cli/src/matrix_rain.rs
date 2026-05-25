@@ -38,6 +38,14 @@ const PTY_WORD_MAX_LEN: usize = 12;
 /// without unbounded growth.
 const PTY_WORD_POOL_MAX: usize = 32;
 
+/// Only the tail of each PTY chunk is scanned for words. The reveal
+/// surfaces the most-recent word, so the words near the end of a
+/// chunk are the only ones that can matter; scanning a whole
+/// (possibly multi-KB) flood chunk on every notification was wasted
+/// work that competed with focused-session input handling. 512 bytes
+/// comfortably covers several `PTY_WORD_MAX_LEN`-capped words.
+const PTY_HARVEST_TAIL_BYTES: usize = 512;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashTone {
     Work,
@@ -208,7 +216,12 @@ impl MatrixRain {
                 .pty_word_pool
                 .entry(session_id.to_string())
                 .or_default();
-            extract_pty_words(bytes, pool);
+            // Scan only the tail — the reveal uses the most-recent
+            // word, so earlier bytes can't surface anyway, and a
+            // flooding background session would otherwise make this an
+            // O(chunk) scan on the main loop for every notification.
+            let tail = &bytes[bytes.len().saturating_sub(PTY_HARVEST_TAIL_BYTES)..];
+            extract_pty_words(tail, pool);
         }
         if let Some(prev) = self.pty_throttle.get(session_id) {
             if now.duration_since(*prev) < PTY_REVEAL_GAP {
