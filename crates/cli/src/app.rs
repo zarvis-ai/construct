@@ -4251,15 +4251,16 @@ impl App {
         let Some(session_id) = self.selected_id() else {
             return false;
         };
+        let Some((focused_session, focused_panel)) = self.dynamic_ui_focused.clone() else {
+            return false;
+        };
+        if focused_session != session_id || !self.dynamic_ui_panel_visible(&session_id, &focused_panel) {
+            return false;
+        }
         let Some(action) = self.dynamic_ui_action_for_key(&session_id, c) else {
             return false;
         };
-        let panel_id = self
-            .dynamic_ui_focused
-            .as_ref()
-            .filter(|(focused_session, _)| focused_session == &session_id)
-            .map(|(_, panel_id)| panel_id.clone());
-        self.dispatch_dynamic_ui_action(session_id, panel_id, action)
+        self.dispatch_dynamic_ui_action(session_id, Some(focused_panel), action)
             .await;
         true
     }
