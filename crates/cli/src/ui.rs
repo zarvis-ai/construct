@@ -2732,13 +2732,13 @@ fn render_dynamic_ui_panel(
     f.render_widget(Clear, area);
     let hover = app.mouse_pos;
     let content_area = Rect {
-        x: area.x.saturating_add(2),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(3),
+        x: area.x.saturating_add(1),
+        y: area.y,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
     };
     let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
-    let lines = render_agentd_markdown_lines(
+    let mut lines = render_agentd_markdown_lines(
         &panel.markdown,
         &app.theme,
         hover,
@@ -2748,6 +2748,11 @@ fn render_dynamic_ui_panel(
         &mut app.layout.dynamic_ui_action_hits,
         suppress_first_heading,
     );
+    for line in &mut lines {
+        line.spans.insert(0, Span::raw(" "));
+        line.spans.push(Span::raw(" "));
+    }
+    lines.push(Line::raw(""));
     let title = dynamic_ui_panel_title(panel).unwrap_or_else(|| "widget".to_string());
     let x_end = area.x + area.width.saturating_sub(1);
     app.layout
