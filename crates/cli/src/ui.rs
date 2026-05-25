@@ -649,9 +649,9 @@ fn hovered_view_close_button(app: &App, view_area: Rect) -> bool {
 }
 
 /// Hit zone for the pin-tile unpin diamond: 4 cells on the top
-/// border, starting after the corner. Title shape is ` ⬩ <status>
+/// border, starting after the corner. Title shape is ` ★ <status>
 /// <label> <harness> `, so cells `tile.x + 1 ..= tile.x + 4`
-/// (inclusive) cover `[ ][⬩][ ][status]` — the same 4-cell zone
+/// (inclusive) cover `[ ][★][ ][status]` — the same 4-cell zone
 /// idiom as the list-view diamond. Returns `(diamond_x,
 /// tile_top_y)` so the tooltip can anchor on the diamond cell.
 fn pin_tile_diamond_zone(tile: Rect) -> (u16, u16) {
@@ -691,7 +691,7 @@ fn render_pin_diamond_tooltip(f: &mut Frame, app: &App, pinned_ids: &[String]) {
     let overlay_style = Style::default()
         .fg(app.theme.danger)
         .add_modifier(Modifier::BOLD);
-    f.buffer_mut().set_string(dx, dy, "⬩", overlay_style);
+    f.buffer_mut().set_string(dx, dy, "★", overlay_style);
 
     let label = " Unpin session ";
     let total = f.area();
@@ -918,7 +918,7 @@ fn render_diamond_tooltip(f: &mut Frame, app: &App) {
             .fg(app.theme.warning)
             .add_modifier(Modifier::DIM)
     };
-    f.buffer_mut().set_string(dx, dy, "⬩", overlay_style);
+    f.buffer_mut().set_string(dx, dy, "★", overlay_style);
 
     let label = if summary.pinned {
         " Unpin session "
@@ -1118,7 +1118,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         None
                     };
-                    let pin_glyph = if s.pinned { "⬩" } else { " " };
+                    let pin_glyph = if s.pinned { "★" } else { " " };
                     let indent_prefix = " ".repeat(crate::app::list_session_indent_cells(
                         s,
                         *indented,
@@ -1154,7 +1154,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         ));
                     }
                     spans.extend([
-                        Span::styled(pin_glyph.to_string(), Style::default().fg(app.theme.accent)),
+                        Span::styled(pin_glyph.to_string(), Style::default().fg(app.theme.info)),
                         Span::styled(
                             format!(" {} ", session_status_glyph(app, s)),
                             state_style(&app.theme, s.state),
@@ -3716,7 +3716,7 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
     for (tile_area, id) in tiles.iter().zip(pinned_ids.iter()) {
         let summary = app.sessions.iter().find(|s| &s.id == id);
         let is_selected = selected_id.as_deref() == Some(id.as_str());
-        // Title: ` ⬩ <status> <label> `. The diamond on the top
+        // Title: ` ★ <status> <label> `. The star on the top
         // border is the unpin affordance — same gesture as the
         // diamond in the list view. Click anywhere in the 4-cell
         // gutter that holds the diamond + status glyph to unpin;
@@ -3733,21 +3733,29 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         let glyph_w = summary
             .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
             .unwrap_or(0);
-        // Title shape ` ⬩ <glyph> <label> ` = 5 cells of scaffolding
+        // Title shape ` ★ <glyph> <label> ` = 5 cells of scaffolding
         // (1 leading + diamond + 1 + glyph + 1 + label + 1 trailing
         // = label + 4 + diamond + glyph; diamond is 1 cell).
         let pin_label_budget = total_pin
             .saturating_sub(2) // corners
             .saturating_sub(harness_w)
             .saturating_sub(5 + glyph_w);
-        let title = match summary {
+        // ` ★ <status> <label> ` — the star is the pinned marker (same
+        // shape + bluish `info` color as the list-view pin); the rest of
+        // the title stays in the border style.
+        let title_rest = match summary {
             Some(s) => format!(
-                " ⬩ {} {} ",
+                " {} {} ",
                 session_status_glyph(app, s),
                 truncate_to_width(&primary_label(s), pin_label_budget),
             ),
-            None => format!(" ⬩ {} ", short_id(id)),
+            None => format!(" {} ", short_id(id)),
         };
+        let title = Line::from(vec![
+            Span::raw(" "),
+            Span::styled("★", Style::default().fg(app.theme.info)),
+            Span::raw(title_rest),
+        ]);
         let harness_right = summary.map(|s| {
             Line::from(Span::styled(
                 format!(" {} ", harness_label(s)),
