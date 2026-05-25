@@ -3315,7 +3315,7 @@ impl App {
                 .is_some_and(|area| contains(area, col, row))
     }
 
-    fn focus_dynamic_ui_panel_at(&mut self, _col: u16, row: u16) {
+    fn focus_dynamic_ui_panel_at(&mut self, col: u16, row: u16) {
         let Some(session_id) = self.selected_id() else {
             self.dynamic_ui_focused = None;
             return;
@@ -3333,18 +3333,17 @@ impl App {
             self.dynamic_ui_focused = None;
             return;
         };
-        if row <= area.y || row >= area.y.saturating_add(area.height).saturating_sub(1) {
+        if col < area.x || col >= area.x.saturating_add(area.width) {
             return;
         }
-        let rel_row = row.saturating_sub(area.y + 1) as usize;
-        let mut offset = 0usize;
+        let mut y = area.y;
         for panel in visible {
-            let panel_rows = markdown_display_rows(&panel.markdown).saturating_add(1);
-            if rel_row < offset.saturating_add(panel_rows) {
+            let panel_rows = markdown_display_rows(&panel.markdown).saturating_add(2).max(3) as u16;
+            if row >= y && row < y.saturating_add(panel_rows) {
                 self.dynamic_ui_focused = Some((session_id, panel.id.clone()));
                 return;
             }
-            offset = offset.saturating_add(panel_rows);
+            y = y.saturating_add(panel_rows).saturating_add(1);
         }
     }
 
