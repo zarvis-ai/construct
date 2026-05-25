@@ -2,7 +2,7 @@
 //! on `agentd_client::Client`.
 
 use agentd_client::Client;
-use agentd_protocol::{CreateSessionParams, PtySize};
+use agentd_protocol::{agent_context, CreateSessionParams, PtySize};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -15,6 +15,11 @@ mod browser;
 pub fn catalog() -> Vec<Value> {
     let mut tools = vec![
         // ----- Read -----
+        tool(
+            agent_context::TOOL_NAME,
+            agent_context::TOOL_DESCRIPTION,
+            schema_empty(),
+        ),
         tool(
             "agentd_whoami",
             "Returns the AGENTD_SESSION_ID env var visible to this MCP server, which is the agentd session id that the calling agent is running inside. Returns null if unset (the MCP server is running outside an agentd-managed session).",
@@ -291,6 +296,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
 
     let result_json: Value = match name.as_str() {
         // ----- Read -----
+        agent_context::TOOL_NAME => serde_json::to_value(agent_context::build_from_env())?,
         "agentd_whoami" => json!({ "session_id": session_id }),
         "agentd_list_sessions" => {
             // Enrich each summary with its group name so callers don't need
@@ -632,6 +638,21 @@ mod tests {
         ] {
             assert!(names.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn catalog_includes_agentd_context_tool() {
+        let tools = catalog();
+        let context = tools
+            .iter()
+            .find(|tool| tool.get("name").and_then(|name| name.as_str()) == Some("agentd_context"))
+            .expect("missing agentd_context");
+
+        assert!(context
+            .get("description")
+            .and_then(|description| description.as_str())
+            .unwrap_or_default()
+            .contains("Call this before starting any user task"));
     }
 
     #[test]

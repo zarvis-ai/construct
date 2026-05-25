@@ -8,6 +8,7 @@
 //! Both reuse the envelope types in [`jsonrpc`] and the same [`transport`] helpers.
 
 pub mod adapter;
+pub mod agent_context;
 pub mod jsonrpc;
 pub mod paths;
 pub mod transport;

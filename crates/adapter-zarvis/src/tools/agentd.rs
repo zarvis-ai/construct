@@ -5,7 +5,7 @@
 
 use super::{Tool, ToolCtx, ToolOutcome};
 use agentd_client::Client;
-use agentd_protocol::{paths::Paths, CreateSessionParams, PtySize, ToolRisk};
+use agentd_protocol::{agent_context, paths::Paths, CreateSessionParams, PtySize, ToolRisk};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -32,6 +32,21 @@ fn need_str(input: &Value, k: &str) -> Result<String> {
 }
 
 // ---------- read ----------
+
+pub struct Context;
+#[async_trait]
+impl Tool for Context {
+    fn name(&self) -> &str { agent_context::TOOL_NAME }
+    fn description(&self) -> &str { agent_context::TOOL_DESCRIPTION }
+    fn schema(&self) -> Value { json!({ "type": "object", "properties": {} }) }
+    fn risk(&self) -> ToolRisk { ToolRisk::Safe }
+    async fn run(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+        Ok(ToolOutcome {
+            ok: true,
+            output: serde_json::to_string_pretty(&agent_context::build_from_env())?,
+        })
+    }
+}
 
 pub struct Whoami;
 #[async_trait]
