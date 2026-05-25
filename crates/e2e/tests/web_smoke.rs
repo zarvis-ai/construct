@@ -192,6 +192,153 @@ async fn web_client_loads_and_websocket_connects() {
         "bundled xterm.js never loaded (window.Terminal !== 'function')"
     );
 
+    // Mobile regression: selecting a PTY-backed session from the list must not
+    // focus xterm when the native keyboard is hidden, or iOS/Android pop the
+    // keyboard just because the user changed selection. If the keyboard was
+    // already visible, selection should preserve terminal focus.
+    let switch_focus: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const saved = {
+                currentId: state.currentId,
+                sessions: state.sessions,
+                mode: state.mode,
+                term: state.term,
+                fitAddon: state.fitAddon,
+                ptyBuffer: state.ptyBuffer,
+                ptyBuffering: state.ptyBuffering,
+                lastReportedSize: state.lastReportedSize,
+                waitForXterm,
+                initTerminalForSession,
+                showTerminalForSession,
+                activateTerminalHandle,
+                refitTerminal,
+                blurActiveTerminalInput,
+                renderSessions,
+                renderBrowserPreviewForSession,
+                setSessionListVisible,
+                isNarrowLayout,
+                setComposerEnabled,
+                renderEditorStateForSession,
+                renderVirtualKeyboard,
+                shouldFocusTerminalAfterSessionSwitch,
+              };
+              const focusCalls = [];
+              const blurCalls = [];
+              const refitCalls = [];
+              const handles = new Map();
+
+              try {
+                waitForXterm = async () => true;
+                initTerminalForSession = (id) => {
+                  const handle = {
+                    id,
+                    host: document.createElement('div'),
+                    loaded: true,
+                    ptyBuffer: [],
+                    ptyBuffering: false,
+                    lastReportedSize: { cols: 0, rows: 0 },
+                    term: {
+                      cols: 80,
+                      rows: 24,
+                      focus: () => focusCalls.push(id),
+                      resize: () => {},
+                      write: () => {},
+                    },
+                    fitAddon: { fit: () => {} },
+                  };
+                  handles.set(id, handle);
+                  return handle;
+                };
+                showTerminalForSession = (id) => handles.get(id);
+                activateTerminalHandle = (handle) => {
+                  state.term = handle.term;
+                  state.fitAddon = handle.fitAddon;
+                  state.ptyBuffer = handle.ptyBuffer;
+                  state.ptyBuffering = handle.ptyBuffering;
+                  state.lastReportedSize = handle.lastReportedSize;
+                };
+                refitTerminal = (options) => refitCalls.push(options || {});
+                blurActiveTerminalInput = () => blurCalls.push(state.currentId);
+                renderSessions = () => {};
+                renderBrowserPreviewForSession = () => {};
+                setSessionListVisible = () => {};
+                isNarrowLayout = () => true;
+                setComposerEnabled = () => {};
+                renderEditorStateForSession = () => {};
+                renderVirtualKeyboard = () => {};
+
+                state.sessions = [
+                  { id: 's-keyboard-hidden', has_pty: true, mode: 'interactive' },
+                  { id: 's-keyboard-open', has_pty: true, mode: 'interactive' },
+                ];
+                state.currentId = 's-before-hidden';
+                shouldFocusTerminalAfterSessionSwitch = () => false;
+                await selectSession('s-keyboard-hidden');
+                const hiddenFocusCount = focusCalls.length;
+                const hiddenBlurCount = blurCalls.length;
+
+                shouldFocusTerminalAfterSessionSwitch = () => true;
+                await selectSession('s-keyboard-open');
+
+                return {
+                  hiddenFocusCount,
+                  hiddenBlurCount,
+                  focusCalls,
+                  blurCalls,
+                  refitCalls,
+                };
+              } finally {
+                state.currentId = saved.currentId;
+                state.sessions = saved.sessions;
+                state.mode = saved.mode;
+                state.term = saved.term;
+                state.fitAddon = saved.fitAddon;
+                state.ptyBuffer = saved.ptyBuffer;
+                state.ptyBuffering = saved.ptyBuffering;
+                state.lastReportedSize = saved.lastReportedSize;
+                waitForXterm = saved.waitForXterm;
+                initTerminalForSession = saved.initTerminalForSession;
+                showTerminalForSession = saved.showTerminalForSession;
+                activateTerminalHandle = saved.activateTerminalHandle;
+                refitTerminal = saved.refitTerminal;
+                blurActiveTerminalInput = saved.blurActiveTerminalInput;
+                renderSessions = saved.renderSessions;
+                renderBrowserPreviewForSession = saved.renderBrowserPreviewForSession;
+                setSessionListVisible = saved.setSessionListVisible;
+                isNarrowLayout = saved.isNarrowLayout;
+                setComposerEnabled = saved.setComposerEnabled;
+                renderEditorStateForSession = saved.renderEditorStateForSession;
+                renderVirtualKeyboard = saved.renderVirtualKeyboard;
+                shouldFocusTerminalAfterSessionSwitch = saved.shouldFocusTerminalAfterSessionSwitch;
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate session switch focus")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(
+        switch_focus["hiddenFocusCount"].as_u64(),
+        Some(0),
+        "hidden keyboard switch should not focus xterm: {switch_focus:?}"
+    );
+    assert_eq!(
+        switch_focus["hiddenBlurCount"].as_u64(),
+        Some(1),
+        "hidden keyboard switch should blur terminal input: {switch_focus:?}"
+    );
+    assert_eq!(
+        switch_focus["focusCalls"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+        vec![serde_json::Value::String("s-keyboard-open".into())],
+        "visible keyboard switch should preserve terminal focus: {switch_focus:?}"
+    );
+
     // Issue #132: the web session list exposes pin/unpin in the
     // selected-session toolbar and marks pinned rows visibly.
     let pin_ui: serde_json::Value = page
