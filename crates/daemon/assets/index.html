@@ -173,7 +173,7 @@
     border-bottom: 1px solid var(--border);
   }
   .session-list .item {
-    margin: 1px 6px;
+    margin: 1px 6px 1px 3px;
     padding: 7px 9px;
     cursor: pointer;
     border: 1px solid transparent;
@@ -233,10 +233,12 @@
     white-space: nowrap;
   }
   .session-list .item.active .sub,
-  .session-list .item.active .state,
   .session-list .item.active .pin-indicator,
   .session-list .item.active .disclosure {
     color: #06160c;
+  }
+  .session-list .item.active .state {
+    color: #020805;
   }
   .session-list .item .state {
     flex: 0 0 14px;
@@ -252,6 +254,12 @@
   .session-list .item .state.state-paused { color: var(--warn); }
   .session-list .item .state.state-done { color: var(--accent); }
   .session-list .item .state.state-errored { color: var(--err); }
+  .session-list .item.active .state.state-pending,
+  .session-list .item.active .state.state-done { color: #06160c; }
+  .session-list .item.active .state.state-running,
+  .session-list .item.active .state.state-awaiting_input { color: #005320; }
+  .session-list .item.active .state.state-paused { color: #5a3600; }
+  .session-list .item.active .state.state-errored { color: #6d0000; }
   .session-list .item .state.is-active {
     animation: statusPulse 900ms ease-in-out infinite;
   }
