@@ -32,6 +32,9 @@ pub const TOOL_DESCRIPTION: &str =
 const WIDGET_POLICY: &[&str] = &[
     "Use session widgets for compact task status, checklists, decision prompts, and action links that help the user monitor or steer the current session.",
     "Widget creation, updates, and deletion should be mostly automated: use best judgment to decide what widget to create, when to refresh it, and when to remove it; ask the user first only when approval is absolutely required by normal safety/tool policy or the widget would make a significant product/user-facing decision.",
+    "Prefer updating one widget per active task or PR instead of creating multiple overlapping widgets; split widgets only when they represent distinct decisions or independently useful status surfaces.",
+    "When a widget is superseded by later work, stale, or no longer useful, rewrite it to the latest truth, collapse it into a final summary widget, or delete it; do not leave conflicting completed widgets visible.",
+    "At task completion, keep at most one concise final status widget when it helps the user, otherwise remove task widgets after reporting the outcome in chat.",
     "Create or update widgets as Markdown files in session_widgets.dir using normal file tools; the daemon auto-reloads `*.md` changes and the TUI updates the session popover live.",
     "Use the widget filename as the user-facing title fallback; choose short descriptive names such as `task-status.md` or `review.md`.",
     "Consult widget_markdown_extensions for supported custom widget syntax; use extensions such as timeline blocks when they communicate task state better than plain Markdown.",
