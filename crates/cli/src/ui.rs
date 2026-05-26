@@ -2755,7 +2755,6 @@ fn render_dynamic_ui_stack_lines(
     let hover = app.mouse_pos;
     let mut rows = Vec::new();
     let row_w = area.width.saturating_sub(1);
-    let content_w = row_w.saturating_sub(2);
     for (idx, panel) in panels.iter().enumerate() {
         if idx > 0 {
             rows.push(Line::from(Span::styled(
@@ -2784,20 +2783,14 @@ fn render_dynamic_ui_stack_lines(
         } else {
             Style::default().fg(app.theme.dim)
         };
-        let edge_style = Style::default().fg(if focused {
-            app.theme.border_focused
-        } else {
-            app.theme.dim
-        });
         let title_w = UnicodeWidthStr::width(title.as_str()) as u16;
         let close_w = UnicodeWidthStr::width("[-]") as u16;
-        let title_pad = content_w.saturating_sub(title_w + close_w + 1) as usize;
+        let title_pad = row_w.saturating_sub(title_w + close_w + 1) as usize;
+        let close_start_col = area.x.saturating_add(row_w.saturating_sub(close_w));
         rows.push(Line::from(vec![
-            Span::styled("│", edge_style),
             Span::styled(title, title_style),
             Span::styled(" ".repeat(title_pad.saturating_add(1)), title_style),
             Span::styled("[-]", close_style),
-            Span::styled("│", edge_style),
         ]));
         app.layout
             .dynamic_ui_panel_close_hits
@@ -2805,17 +2798,17 @@ fn render_dynamic_ui_stack_lines(
                 session_id: session_id.to_string(),
                 panel_id: panel.id.clone(),
                 row: area.y.saturating_add(rows.len().saturating_sub(1) as u16),
-                start_col: area.x.saturating_add(content_w.saturating_sub(5)),
-                end_col: area.x.saturating_add(content_w.saturating_sub(2)),
+                start_col: close_start_col,
+                end_col: close_start_col.saturating_add(close_w),
             });
         let content_area = Rect {
-            x: area.x.saturating_add(1),
+            x: area.x,
             y: area.y.saturating_add(rows.len() as u16),
-            width: content_w.saturating_sub(1),
+            width: row_w,
             height: area.height,
         };
         let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
-        let mut lines = render_agentd_markdown_lines(
+        let lines = render_agentd_markdown_lines(
             &panel.markdown,
             &app.theme,
             hover,
@@ -2825,10 +2818,6 @@ fn render_dynamic_ui_stack_lines(
             &mut app.layout.dynamic_ui_action_hits,
             suppress_first_heading,
         );
-        for line in &mut lines {
-            line.spans.insert(0, Span::styled("│", edge_style));
-            line.spans.push(Span::styled("│", edge_style));
-        }
         rows.extend(lines);
         rows.push(Line::raw(""));
     }
