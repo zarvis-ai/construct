@@ -16,6 +16,7 @@ use std::sync::{
 use std::time::Duration;
 
 const ENV_PROVIDER_IDLE_TIMEOUT_SECS: &str = "AGENTD_ZARVIS_PROVIDER_IDLE_TIMEOUT_SECS";
+const ENV_PROVIDER_RETRY_ATTEMPTS: &str = "AGENTD_ZARVIS_PROVIDER_RETRY_ATTEMPTS";
 /// Idle = no stream activity from upstream (see `WatchdogSink`: any
 /// `delta` / `reasoning_delta` / `progress` ping resets it). 90s leaves
 /// headroom for the gap between the first event and the first content on
@@ -23,6 +24,9 @@ const ENV_PROVIDER_IDLE_TIMEOUT_SECS: &str = "AGENTD_ZARVIS_PROVIDER_IDLE_TIMEOU
 /// surfacing a stalled connection in ~1.5 min instead of freezing the
 /// turn for minutes. Override with the env var (`0` disables).
 const DEFAULT_PROVIDER_IDLE_TIMEOUT_SECS: u64 = 90;
+const DEFAULT_PROVIDER_RETRY_ATTEMPTS: usize = 3;
+const PROVIDER_RETRY_BASE_DELAY_MS: u64 = 500;
+const PROVIDER_RETRY_MAX_DELAY_MS: u64 = 4_000;
 
 pub async fn complete(
     provider: &dyn LlmProvider,
@@ -33,7 +37,76 @@ pub async fn complete(
     sink: &mut dyn TextSink,
 ) -> Result<ProviderTurn> {
     let timeout = provider_idle_timeout();
-    complete_with_idle_timeout(provider, model, system, messages, tools, sink, timeout).await
+    let retry = RetryConfig {
+        max_attempts: provider_retry_attempts(),
+        base_delay: Duration::from_millis(PROVIDER_RETRY_BASE_DELAY_MS),
+        max_delay: Duration::from_millis(PROVIDER_RETRY_MAX_DELAY_MS),
+    };
+    complete_with_retries(
+        provider, model, system, messages, tools, sink, timeout, retry,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+struct RetryConfig {
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+async fn complete_with_retries(
+    provider: &dyn LlmProvider,
+    model: &str,
+    system: &str,
+    messages: &[Message],
+    tools: &[ToolSpec],
+    sink: &mut dyn TextSink,
+    timeout: Option<Duration>,
+    retry: RetryConfig,
+) -> Result<ProviderTurn> {
+    let max_attempts = retry.max_attempts.max(1);
+    let mut attempt = 1usize;
+    loop {
+        let (result, visible_output) = {
+            let mut retry_sink = RetryTrackingSink {
+                inner: sink,
+                visible_output: false,
+            };
+            let result = complete_with_idle_timeout(
+                provider,
+                model,
+                system,
+                messages,
+                tools,
+                &mut retry_sink,
+                timeout,
+            )
+            .await;
+            (result, retry_sink.visible_output)
+        };
+
+        match result {
+            Ok(turn) => return Ok(turn),
+            Err(err) => {
+                if attempt >= max_attempts || visible_output || !is_retryable_provider_error(&err) {
+                    return Err(err);
+                }
+                let delay = retry_delay(retry, attempt);
+                tracing::warn!(
+                    provider = provider.name(),
+                    model,
+                    attempt,
+                    max_attempts,
+                    delay_ms = delay.as_millis() as u64,
+                    error = %format!("{err:#}"),
+                    "retrying transient provider error"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+        }
+    }
 }
 
 async fn complete_with_idle_timeout(
@@ -82,6 +155,96 @@ fn provider_idle_timeout() -> Option<Duration> {
             Err(_) => Some(Duration::from_secs(DEFAULT_PROVIDER_IDLE_TIMEOUT_SECS)),
         },
         None => Some(Duration::from_secs(DEFAULT_PROVIDER_IDLE_TIMEOUT_SECS)),
+    }
+}
+
+fn provider_retry_attempts() -> usize {
+    match std::env::var(ENV_PROVIDER_RETRY_ATTEMPTS).ok() {
+        Some(raw) => match raw.trim().parse::<usize>() {
+            Ok(0 | 1) => 1,
+            Ok(n) => n.min(8),
+            Err(_) => DEFAULT_PROVIDER_RETRY_ATTEMPTS,
+        },
+        None => DEFAULT_PROVIDER_RETRY_ATTEMPTS,
+    }
+}
+
+fn retry_delay(retry: RetryConfig, failed_attempt: usize) -> Duration {
+    let multiplier = 1u32 << failed_attempt.saturating_sub(1).min(10);
+    retry
+        .base_delay
+        .saturating_mul(multiplier)
+        .min(retry.max_delay)
+}
+
+fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
+    if err
+        .downcast_ref::<crate::provider::ContextOverflow>()
+        .is_some()
+    {
+        return false;
+    }
+    let msg = format!("{err:#}").to_ascii_lowercase();
+    if msg.contains("context window")
+        || msg.contains("context overflow")
+        || msg.contains("context length")
+        || msg.contains("input exceeds")
+        || msg.contains("input is too long")
+        || msg.contains("prompt is too long")
+        || msg.contains("too many tokens")
+        || msg.contains("401")
+        || msg.contains("unauthorized")
+        || msg.contains("access token")
+        || msg.contains("authentication")
+    {
+        return false;
+    }
+    msg.contains("provider turn idle timed out")
+        || msg.contains("sse stream")
+        || msg.contains("stream ended before")
+        || msg.contains("transport error")
+        || msg.contains("error decoding response body")
+        || msg.contains("connection refused")
+        || msg.contains("connection reset")
+        || msg.contains("connection timeout")
+        || msg.contains("timed out")
+        || msg.contains("timeout")
+        || msg.contains("too many requests")
+        || msg.contains("rate limit")
+        || msg.contains("rate_limit")
+        || msg.contains("429")
+        || msg.contains("500")
+        || msg.contains("502")
+        || msg.contains("503")
+        || msg.contains("504")
+        || msg.contains("service unavailable")
+        || msg.contains("temporarily unavailable")
+        || msg.contains("overloaded")
+        || msg.contains("overload")
+}
+
+struct RetryTrackingSink<'a> {
+    inner: &'a mut dyn TextSink,
+    visible_output: bool,
+}
+
+impl TextSink for RetryTrackingSink<'_> {
+    fn delta(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.visible_output = true;
+        }
+        self.inner.delta(text);
+    }
+
+    fn reasoning_delta(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.visible_output = true;
+        }
+        self.inner.reasoning_delta(text);
+    }
+
+    fn progress(&mut self) {
+        self.inner.progress();
     }
 }
 
@@ -160,6 +323,49 @@ mod tests {
             _tools: &[ToolSpec],
             _sink: &mut dyn TextSink,
         ) -> Result<ProviderTurn> {
+            Ok(ProviderTurn {
+                text: Some("ok".into()),
+                tool_calls: Vec::new(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    struct FlakyProvider {
+        failures_left: std::sync::atomic::AtomicUsize,
+        message: &'static str,
+        emits_before_failure: bool,
+    }
+
+    #[async_trait]
+    impl LlmProvider for FlakyProvider {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        async fn complete(
+            &self,
+            _model: &str,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            sink: &mut dyn TextSink,
+        ) -> Result<ProviderTurn> {
+            if self
+                .failures_left
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok()
+            {
+                if self.emits_before_failure {
+                    sink.delta("partial");
+                }
+                return Err(anyhow!(self.message));
+            }
             Ok(ProviderTurn {
                 text: Some("ok".into()),
                 tool_calls: Vec::new(),
@@ -278,5 +484,98 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(turn.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn retries_transient_error_before_visible_output() {
+        let provider = FlakyProvider {
+            failures_left: std::sync::atomic::AtomicUsize::new(2),
+            message: "codex-oauth: 503 Service Unavailable from chatgpt.com",
+            emits_before_failure: false,
+        };
+        let mut sink = NullSink;
+        let turn = complete_with_retries(
+            &provider,
+            "model",
+            "system",
+            &messages(),
+            &[],
+            &mut sink,
+            Some(Duration::from_secs(1)),
+            RetryConfig {
+                max_attempts: 3,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_context_overflow() {
+        let provider = FlakyProvider {
+            failures_left: std::sync::atomic::AtomicUsize::new(1),
+            message: "Your input exceeds the context window of this model",
+            emits_before_failure: false,
+        };
+        let mut sink = NullSink;
+        let err = complete_with_retries(
+            &provider,
+            "model",
+            "system",
+            &messages(),
+            &[],
+            &mut sink,
+            Some(Duration::from_secs(1)),
+            RetryConfig {
+                max_attempts: 3,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("context window"));
+        assert_eq!(
+            provider
+                .failures_left
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_after_visible_output() {
+        let provider = FlakyProvider {
+            failures_left: std::sync::atomic::AtomicUsize::new(1),
+            message: "codex-oauth SSE stream: Transport error",
+            emits_before_failure: true,
+        };
+        let mut sink = NullSink;
+        let err = complete_with_retries(
+            &provider,
+            "model",
+            "system",
+            &messages(),
+            &[],
+            &mut sink,
+            Some(Duration::from_secs(1)),
+            RetryConfig {
+                max_attempts: 3,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("SSE stream"));
+        assert_eq!(
+            provider
+                .failures_left
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 }
