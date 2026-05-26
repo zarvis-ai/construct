@@ -2502,17 +2502,6 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         editor_area.is_none(),
         row_offset,
     );
-    let (preview_area, preview_close) = render_browser_preview_overlay(
-        f,
-        chat_area,
-        &app.theme,
-        app.mouse_pos,
-        preview.as_ref(),
-        &mut app.image_resize_cache,
-    );
-    app.layout.browser_preview_area = preview_area;
-    app.layout.browser_preview_close = preview_close;
-
     app.block_hits.insert(
         id.clone(),
         translate_block_hits(out.blocks, row_offset, chat_area.height),
@@ -2529,6 +2518,16 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     if app.dynamic_ui_popover_open.as_deref() == Some(id.as_str()) && !panels.is_empty() {
         render_dynamic_ui_dropdown(f, area, app, &panels);
     }
+    let (preview_area, preview_close) = render_browser_preview_overlay(
+        f,
+        chat_area,
+        &app.theme,
+        app.mouse_pos,
+        preview.as_ref(),
+        &mut app.image_resize_cache,
+    );
+    app.layout.browser_preview_area = preview_area;
+    app.layout.browser_preview_close = preview_close;
 
     if let Some(area) = editor_area {
         // Also clear the editor area (defensive)

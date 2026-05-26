@@ -366,6 +366,7 @@
   }
 
   .view {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -456,23 +457,24 @@
   .tool .tool-name { color: var(--fg); font-weight: 500; }
   .tool details { margin-top: 4px; }
   .session-widgets {
-    flex: 0 0 auto;
-    margin: 8px 12px 0;
-    max-height: min(42vh, 420px);
+    position: absolute;
+    top: 40px;
+    right: calc(86px + env(safe-area-inset-right));
+    z-index: 20;
+    width: min(420px, calc(100% - 24px));
+    max-height: min(64vh, 520px);
     overflow: auto;
     border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg-elev) 86%, transparent);
+    background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
     border-radius: 10px;
     padding: 8px;
+    box-shadow: 0 12px 32px rgba(0,0,0,.42);
     scrollbar-width: thin;
     scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
   }
   .session-widgets[hidden] { display: none; }
-  .widgets-toolbar { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 8px; padding-bottom: 8px; background: color-mix(in srgb, var(--bg-elev) 92%, transparent); }
-  .widgets-trigger { border: 1px solid var(--border); border-radius: 999px; background: var(--bg-elev-2); color: var(--fg); padding: 4px 10px; font: inherit; cursor: pointer; }
-  .widgets-trigger:hover, .widgets-trigger:focus { border-color: var(--accent); outline: none; }
-  .widgets-menu { position: absolute; top: 32px; left: 0; min-width: 180px; max-width: min(360px, 80vw); border: 1px solid var(--border); border-radius: 8px; background: var(--bg-elev-2); box-shadow: 0 12px 32px rgba(0,0,0,.35); padding: 6px; }
-  .widgets-menu[hidden] { display: none; }
+  .widgets-toolbar { display: none; }
+  .widgets-menu { display: none; }
   .widgets-menu-item { width: 100%; display: flex; gap: 8px; align-items: center; border: 0; background: transparent; color: var(--fg); text-align: left; padding: 5px 7px; border-radius: 6px; font: inherit; cursor: pointer; }
   .widgets-menu-item:hover, .widgets-menu-item:focus { background: var(--bg-elev); outline: none; }
   .widgets-menu-mark { color: var(--accent); width: 1em; }
@@ -558,7 +560,7 @@
     position: absolute;
     top: 8px;
     right: calc(8px + env(safe-area-inset-right));
-    z-index: 6;
+    z-index: 30;
     width: min(320px, 55vw);
     padding: 4px;
     background: var(--bg);
@@ -819,7 +821,18 @@
     pointer-events: none;
   }
   .terminal-scroll-overlay[hidden] { display: none; }
-  .terminal-scroll-overlay button {
+  .terminal-widget-controls {
+    position: absolute;
+    top: 8px;
+    right: calc(86px + env(safe-area-inset-right));
+    z-index: 5;
+    display: flex;
+    gap: 4px;
+    pointer-events: none;
+  }
+  .terminal-widget-controls[hidden] { display: none; }
+  .terminal-scroll-overlay button,
+  .terminal-widget-controls button {
     pointer-events: auto;
     appearance: none;
     border: 1px solid transparent;
@@ -838,17 +851,24 @@
       0 0 12px rgba(57, 255, 136, 0.14);
     text-shadow: 0 0 8px rgba(57, 255, 136, 0.34);
   }
-  .terminal-scroll-overlay button::before { content: "["; color: var(--fg-faint); }
-  .terminal-scroll-overlay button::after { content: "]"; color: var(--fg-faint); }
+  .terminal-scroll-overlay button[hidden],
+  .terminal-widget-controls button[hidden] { display: none; }
+  .terminal-scroll-overlay button::before,
+  .terminal-widget-controls button::before { content: "["; color: var(--fg-faint); }
+  .terminal-scroll-overlay button::after,
+  .terminal-widget-controls button::after { content: "]"; color: var(--fg-faint); }
   .terminal-scroll-overlay button:hover,
-  .terminal-scroll-overlay button:focus-visible {
+  .terminal-scroll-overlay button:focus-visible,
+  .terminal-widget-controls button:hover,
+  .terminal-widget-controls button:focus-visible {
     background: rgba(57, 255, 136, 0.18);
     border-color: transparent;
     color: #e1ffe6;
     outline: none;
     box-shadow: var(--glow-hard);
   }
-  .terminal-scroll-overlay button:active {
+  .terminal-scroll-overlay button:active,
+  .terminal-widget-controls button:active {
     background: var(--accent);
     border-color: transparent;
     color: #06160c;
@@ -1305,8 +1325,11 @@
         state here so remote-control users can see virtual-keyboard and
         composer-insert typing while terminal mode keeps transcript hidden.
       -->
-      <div class="editor-state" id="editorState" hidden></div>
+      <div class="terminal-widget-controls" id="terminalWidgetControls" hidden>
+        <button type="button" id="widgetsTrigger" aria-label="toggle widgets" hidden>widgets</button>
+      </div>
       <section class="session-widgets" id="sessionWidgets" hidden></section>
+      <div class="editor-state" id="editorState" hidden></div>
       <!--
         Composer: two submit-style buttons. "Insert" writes the
         textarea contents into the session as keystrokes — for
@@ -1465,6 +1488,8 @@ const terminalWrapEl = $("terminalWrap");
 const terminalEl = $("terminal");
 const terminalLoadingEl = $("terminalLoading");
 const terminalScrollOverlayEl = $("terminalScrollOverlay");
+const terminalWidgetControlsEl = $("terminalWidgetControls");
+const widgetsTriggerBtn = $("widgetsTrigger");
 const terminalTopBtn = $("terminalTopBtn");
 const terminalBottomBtn = $("terminalBottomBtn");
 const browserPreviewEl = $("browserPreview");
@@ -3845,23 +3870,26 @@ function renderWidgets() {
   const sessionId = state.currentId;
   const panels = sessionId ? (state.widgetsById.get(sessionId) || []) : [];
   if (!sessionId || panels.length === 0) {
+    widgetsTriggerBtn.hidden = true;
+    terminalWidgetControlsEl.hidden = true;
+    state.widgetsDropdownOpen = false;
     sessionWidgetsEl.hidden = true;
     sessionWidgetsEl.innerHTML = "";
     return;
   }
   const visible = visibleWidgetIds(sessionId, panels);
   const visiblePanels = panels.filter((panel) => visible.has(normalizePanelId(panel)));
-  sessionWidgetsEl.hidden = false;
+  widgetsTriggerBtn.hidden = false;
+  widgetsTriggerBtn.setAttribute("aria-expanded", state.widgetsDropdownOpen ? "true" : "false");
+  terminalWidgetControlsEl.hidden = false;
+  sessionWidgetsEl.hidden = !state.widgetsDropdownOpen;
   sessionWidgetsEl.innerHTML = `
-    <div class="widgets-toolbar">
-      <button type="button" class="widgets-trigger" id="widgetsTrigger" aria-expanded="${state.widgetsDropdownOpen ? "true" : "false"}"> widgets </button>
-      <div class="widgets-menu" id="widgetsMenu" role="menu" ${state.widgetsDropdownOpen ? "" : "hidden"}>
-        ${panels.map((panel) => {
-          const id = normalizePanelId(panel);
-          const checked = visible.has(id);
-          return `<button type="button" class="widgets-menu-item" role="menuitemcheckbox" aria-checked="${checked ? "true" : "false"}" data-widget-id="${attr(id)}"><span class="widgets-menu-mark">${checked ? "✓" : "·"}</span><span>${escape(widgetTitle(panel))}</span></button>`;
-        }).join("")}
-      </div>
+    <div class="widgets-menu" role="menu">
+      ${panels.map((panel) => {
+        const id = normalizePanelId(panel);
+        const checked = visible.has(id);
+        return `<button type="button" class="widgets-menu-item" role="menuitemcheckbox" aria-checked="${checked ? "true" : "false"}" data-widget-id="${attr(id)}"><span class="widgets-menu-mark">${checked ? "✓" : "·"}</span><span>${escape(widgetTitle(panel))}</span></button>`;
+      }).join("")}
     </div>
     <div class="widget-stack">
       ${visiblePanels.map((panel) => renderWidgetCard(sessionId, panel)).join("")}
@@ -4053,13 +4081,13 @@ insertBtn.addEventListener("click", (ev) => {
   submitComposer({ enter: false });
 });
 
+widgetsTriggerBtn.addEventListener("click", (ev) => {
+  ev.preventDefault();
+  state.widgetsDropdownOpen = !state.widgetsDropdownOpen;
+  renderWidgets();
+});
+
 sessionWidgetsEl.addEventListener("click", (ev) => {
-  const trigger = ev.target.closest && ev.target.closest("#widgetsTrigger");
-  if (trigger) {
-    state.widgetsDropdownOpen = !state.widgetsDropdownOpen;
-    renderWidgets();
-    return;
-  }
   const item = ev.target.closest && ev.target.closest(".widgets-menu-item");
   if (item && state.currentId) {
     const panels = state.widgetsById.get(state.currentId) || [];
@@ -4104,7 +4132,7 @@ sessionWidgetsEl.addEventListener("keydown", (ev) => {
 
 document.addEventListener("click", (ev) => {
   if (!state.widgetsDropdownOpen) return;
-  if (sessionWidgetsEl.contains(ev.target)) return;
+  if (sessionWidgetsEl.contains(ev.target) || widgetsTriggerBtn.contains(ev.target)) return;
   state.widgetsDropdownOpen = false;
   renderWidgets();
 });
