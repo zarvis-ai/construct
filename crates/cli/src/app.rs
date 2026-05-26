@@ -440,6 +440,9 @@ pub struct App {
     pub dynamic_ui_temporary_until: HashMap<(String, String), Instant>,
     /// The one widget panel currently focused for keyboard handling.
     pub dynamic_ui_focused: Option<(String, String)>,
+    /// Per-session scroll offset for the stacked dynamic UI widget panel.
+    /// This scrolls the whole widget stack independently from terminal scrollback.
+    pub dynamic_ui_scroll_offsets: HashMap<String, usize>,
     /// MRU cache of resized preview images shared by the terminal-view
     /// overlay and the matrix-rain wallpaper — avoids re-downscaling the
     /// screenshot every frame. See [`ImageResizeCache`].
@@ -1043,6 +1046,8 @@ pub struct LayoutSnapshot {
     pub dynamic_ui_popover_area: Option<ratatui::layout::Rect>,
     /// Dynamic UI dropdown bounds from the last frame.
     pub dynamic_ui_dropdown_area: Option<ratatui::layout::Rect>,
+    /// Last rendered dynamic UI stack dimensions: `(session_id, content_rows, viewport_rows)`.
+    pub dynamic_ui_scroll_metrics: Option<(String, usize, usize)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1255,6 +1260,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
             .collect(),
         dynamic_ui_temporary_until: HashMap::new(),
         dynamic_ui_focused: None,
+        dynamic_ui_scroll_offsets: HashMap::new(),
         image_resize_cache: Vec::new(),
         session_transition: None,
         pin_transitions: HashMap::new(),
@@ -2978,12 +2984,16 @@ impl App {
         self.mouse_pos = Some((ev.column, ev.row));
         match ev.kind {
             MouseEventKind::ScrollUp => {
-                if !self.adjust_mouse_list_scroll(ev.column, ev.row, -LIST_STEP) {
+                if !self.adjust_mouse_dynamic_ui_scroll(ev.column, ev.row, -LIST_STEP)
+                    && !self.adjust_mouse_list_scroll(ev.column, ev.row, -LIST_STEP)
+                {
                     self.adjust_mouse_scrollback(ev.column, ev.row, scrollback_step);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if !self.adjust_mouse_list_scroll(ev.column, ev.row, LIST_STEP) {
+                if !self.adjust_mouse_dynamic_ui_scroll(ev.column, ev.row, LIST_STEP)
+                    && !self.adjust_mouse_list_scroll(ev.column, ev.row, LIST_STEP)
+                {
                     self.adjust_mouse_scrollback(ev.column, ev.row, -scrollback_step);
                 }
             }
@@ -3346,26 +3356,36 @@ impl App {
             self.dynamic_ui_focused = None;
             return;
         };
+        let Some(area) = self.layout.dynamic_ui_popover_area else {
+            self.dynamic_ui_focused = None;
+            return;
+        };
+        if !Self::rect_contains(area, col, row) {
+            return;
+        }
+        let scroll = self
+            .dynamic_ui_scroll_offsets
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let content_row = row.saturating_sub(area.y) as usize + scroll;
         let mut visible: Vec<_> = panels
             .values()
             .filter(|panel| self.dynamic_ui_panel_visible(&session_id, &panel.id))
             .collect();
         visible.sort_by(|a, b| a.id.cmp(&b.id));
-        let Some(area) = self.layout.dynamic_ui_popover_area else {
-            self.dynamic_ui_focused = None;
-            return;
-        };
-        if col < area.x || col >= area.x.saturating_add(area.width) {
-            return;
-        }
-        let mut y = area.y;
-        for panel in visible {
-            let panel_rows = markdown_display_rows(&panel.markdown).saturating_add(3).max(4) as u16;
-            if row >= y && row < y.saturating_add(panel_rows) {
+        let mut cursor = 0usize;
+        for (idx, panel) in visible.iter().enumerate() {
+            if idx > 0 {
+                cursor += 1;
+            }
+            let body_rows = markdown_display_rows(&panel.markdown);
+            let panel_rows = 1usize.saturating_add(body_rows).saturating_add(1);
+            if content_row >= cursor && content_row < cursor.saturating_add(panel_rows) {
                 self.dynamic_ui_focused = Some((session_id, panel.id.clone()));
                 return;
             }
-            y = y.saturating_add(panel_rows).saturating_add(1);
+            cursor = cursor.saturating_add(panel_rows);
         }
     }
 
@@ -4044,6 +4064,33 @@ impl App {
         self.show_terminal_scrollbar();
     }
 
+    fn adjust_mouse_dynamic_ui_scroll(&mut self, col: u16, row: u16, delta: i32) -> bool {
+        let Some(area) = self.layout.dynamic_ui_popover_area else {
+            return false;
+        };
+        if !Self::rect_contains(area, col, row) {
+            return false;
+        }
+        self.adjust_dynamic_ui_scroll(delta);
+        true
+    }
+
+    fn adjust_dynamic_ui_scroll(&mut self, delta: i32) {
+        let Some((session_id, content_rows, viewport_rows)) =
+            self.layout.dynamic_ui_scroll_metrics.clone()
+        else {
+            return;
+        };
+        let max_scroll = content_rows.saturating_sub(viewport_rows);
+        let current = self
+            .dynamic_ui_scroll_offsets
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0);
+        let next = adjusted_scroll_offset(current, delta, max_scroll);
+        self.dynamic_ui_scroll_offsets.insert(session_id, next);
+    }
+
     fn adjust_mouse_list_scroll(&mut self, col: u16, row: u16, delta: i32) -> bool {
         let Some(area) = self.layout.list_items_area else {
             return false;
@@ -4187,6 +4234,9 @@ impl App {
         if self.try_dynamic_ui_action_key(key).await {
             return;
         }
+        if self.try_dynamic_ui_scroll_key(key) {
+            return;
+        }
 
         if self.should_autofocus_view_from_list(key) {
             self.collapse_orchestrator_panel_on_focus_change();
@@ -4275,7 +4325,9 @@ impl App {
         let Some((focused_session, focused_panel)) = self.dynamic_ui_focused.clone() else {
             return false;
         };
-        if focused_session != session_id || !self.dynamic_ui_panel_visible(&session_id, &focused_panel) {
+        if focused_session != session_id
+            || !self.dynamic_ui_panel_visible(&session_id, &focused_panel)
+        {
             return false;
         }
         let Some(action) = self.dynamic_ui_action_for_key(&session_id, c) else {
@@ -4283,6 +4335,21 @@ impl App {
         };
         self.dispatch_dynamic_ui_action(session_id, Some(focused_panel), action)
             .await;
+        true
+    }
+
+    fn try_dynamic_ui_scroll_key(&mut self, key: KeyEvent) -> bool {
+        if self.focus != PaneFocus::View || self.dynamic_ui_focused.is_none() {
+            return false;
+        }
+        let delta = match key.code {
+            KeyCode::Up if key.modifiers.is_empty() => -1,
+            KeyCode::Down if key.modifiers.is_empty() => 1,
+            KeyCode::PageUp if key.modifiers.is_empty() => -10,
+            KeyCode::PageDown if key.modifiers.is_empty() => 10,
+            _ => return false,
+        };
+        self.adjust_dynamic_ui_scroll(delta);
         true
     }
 
@@ -5988,6 +6055,7 @@ mod tests {
             dynamic_ui_trigger: None,
             dynamic_ui_popover_area: None,
             dynamic_ui_dropdown_area: None,
+            dynamic_ui_scroll_metrics: None,
         }
     }
 
@@ -6057,6 +6125,7 @@ mod tests {
             dynamic_ui_selected: HashSet::new(),
             dynamic_ui_temporary_until: HashMap::new(),
             dynamic_ui_focused: None,
+            dynamic_ui_scroll_offsets: HashMap::new(),
             image_resize_cache: Vec::new(),
             session_transition: None,
             pin_transitions: HashMap::new(),
@@ -7959,8 +8028,12 @@ mod tests {
 }
 
 fn adjusted_scrollback(current: usize, delta: i32) -> usize {
+    adjusted_scroll_offset(current, delta, SCROLLBACK_MAX)
+}
+
+fn adjusted_scroll_offset(current: usize, delta: i32, max_scroll: usize) -> usize {
     let next = current as i32 + delta;
-    next.max(0).min(SCROLLBACK_MAX as i32) as usize
+    next.max(0).min(max_scroll as i32) as usize
 }
 
 fn adjusted_list_scroll_offset(
