@@ -118,6 +118,10 @@ fn sanitize_extension(ext: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn is_user_session_kind(s: &SessionSummary) -> bool {
+    matches!(s.kind, agentd_protocol::SessionKind::User)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionEdge {
     Top,
@@ -2523,10 +2527,16 @@ impl SessionManager {
             .cloned()
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
 
-        // Find neighbors in `me`'s region (same group_id), sorted by position.
+        // Find neighbors in `me`'s visible reorder region (same group_id,
+        // user sessions only), sorted by position. The daemon list includes
+        // hidden orchestrator/subagent records so clients can render them in
+        // specialized places, but the TUI's session list filters those out. If
+        // reorder considers hidden records, a visible session surrounded by
+        // subagents can appear stuck or jump unpredictably because it swaps
+        // with rows the user cannot see.
         let region: Vec<&SessionSummary> = all_sessions
             .iter()
-            .filter(|s| s.group_id == me.group_id)
+            .filter(|s| s.group_id == me.group_id && is_user_session_kind(s))
             .collect();
         let pos_in_region = region.iter().position(|s| s.id == id).unwrap();
 
@@ -3379,6 +3389,15 @@ mod tests {
         kind: agentd_protocol::SessionKind,
         position: i64,
     ) -> Arc<SessionEntry> {
+        synthetic_entry_with_group(id, kind, position, None)
+    }
+
+    fn synthetic_entry_with_group(
+        id: &str,
+        kind: agentd_protocol::SessionKind,
+        position: i64,
+        group_id: Option<String>,
+    ) -> Arc<SessionEntry> {
         use chrono::Utc;
         use std::sync::atomic::AtomicU64;
         use tokio::sync::RwLock;
@@ -3403,7 +3422,7 @@ mod tests {
                 mode: None,
                 pinned: false,
                 position,
-                group_id: None,
+                group_id,
                 parent_session_id: None,
                 last_pty_at_ms: None,
                 automode: false,
@@ -3421,6 +3440,48 @@ mod tests {
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
         })
+    }
+
+    #[tokio::test]
+    async fn move_session_ignores_hidden_subagents_in_reorder_region() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // Hidden subagents can share the same ungrouped/group region as visible
+        // user sessions. Reordering must use visible user-session neighbors,
+        // not these hidden records, otherwise a TUI row can appear not to move.
+        for (id, kind, position) in [
+            ("ssub-before", agentd_protocol::SessionKind::Subagent, 0),
+            ("suser-a", agentd_protocol::SessionKind::User, 10),
+            ("ssub-between", agentd_protocol::SessionKind::Subagent, 20),
+            ("suser-b", agentd_protocol::SessionKind::User, 30),
+            ("ssub-after", agentd_protocol::SessionKind::Subagent, 40),
+        ] {
+            mgr.sessions
+                .write()
+                .await
+                .insert(id.into(), synthetic_entry(id, kind, position));
+        }
+
+        mgr.move_session("suser-b", agentd_protocol::MoveDirection::Up)
+            .await
+            .expect("move up");
+
+        let sessions = mgr.list().await;
+        let a = sessions.iter().find(|s| s.id == "suser-a").unwrap();
+        let b = sessions.iter().find(|s| s.id == "suser-b").unwrap();
+        let hidden = sessions.iter().find(|s| s.id == "ssub-between").unwrap();
+        assert_eq!(b.position, 10);
+        assert_eq!(a.position, 30);
+        assert_eq!(hidden.position, 20);
     }
 
     #[tokio::test]
