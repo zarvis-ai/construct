@@ -157,6 +157,53 @@ fn region_below(region: Option<&str>, groups: &[GroupSummary]) -> Option<Option<
     }
 }
 
+/// True if the group `id` exists and is currently collapsed.
+fn group_collapsed(id: &str, groups: &[GroupSummary]) -> bool {
+    groups
+        .iter()
+        .find(|g| g.id == id)
+        .map(|g| g.collapsed)
+        .unwrap_or(false)
+}
+
+/// Like [`region_above`], but skips over collapsed groups. A collapsed
+/// project hides its member sessions, so reordering a visible session past it
+/// should jump the entire project in one step rather than swapping with each
+/// hidden member. Returns the first non-collapsed region above (the ungrouped
+/// region is never collapsed), or `None` if there is nothing above.
+fn region_above_skipping_collapsed(
+    region: Option<&str>,
+    groups: &[GroupSummary],
+) -> Option<Option<String>> {
+    let mut target = region_above(region, groups);
+    loop {
+        match target {
+            Some(Some(gid)) if group_collapsed(&gid, groups) => {
+                target = region_above(Some(gid.as_str()), groups);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Like [`region_below`], but skips over collapsed groups so a reorder jumps
+/// the whole collapsed project in one step. See
+/// [`region_above_skipping_collapsed`].
+fn region_below_skipping_collapsed(
+    region: Option<&str>,
+    groups: &[GroupSummary],
+) -> Option<Option<String>> {
+    let mut target = region_below(region, groups);
+    loop {
+        match target {
+            Some(Some(gid)) if group_collapsed(&gid, groups) => {
+                target = region_below(Some(gid.as_str()), groups);
+            }
+            other => return other,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum BroadcastMsg {
     Event(EventNotificationPayload),
@@ -2516,8 +2563,13 @@ impl SessionManager {
     /// - Move-up past the top of a region → enter the previous region as
     ///   its last child (bottom of previous group, or end of ungrouped).
     ///
+    /// Collapsed groups are skipped at boundaries: their members are hidden,
+    /// so the session jumps the whole project in one step instead of swapping
+    /// with each hidden member.
+    ///
     /// No-op at the absolute top (ungrouped session #0) or bottom (last
-    /// member of last group).
+    /// member of last group), or when the only regions in the move direction
+    /// are collapsed groups.
     pub async fn move_session(&self, id: &str, dir: MoveDirection) -> Result<()> {
         let all_sessions: Vec<SessionSummary> = self.list().await;
         let all_groups: Vec<GroupSummary> = self.list_groups().await;
@@ -2547,8 +2599,9 @@ impl SessionManager {
                     let other = region[pos_in_region - 1];
                     return self.swap_session_positions(&me.id, &other.id).await;
                 }
-                // At top of region — try to exit into the previous region.
-                let prev = region_above(me.group_id.as_deref(), &all_groups);
+                // At top of region — try to exit into the previous region,
+                // skipping collapsed projects.
+                let prev = region_above_skipping_collapsed(me.group_id.as_deref(), &all_groups);
                 let Some(prev_region) = prev else {
                     return Ok(());
                 };
@@ -2565,8 +2618,9 @@ impl SessionManager {
                     let other = region[pos_in_region + 1];
                     return self.swap_session_positions(&me.id, &other.id).await;
                 }
-                // At bottom of region — try to enter the next region.
-                let next = region_below(me.group_id.as_deref(), &all_groups);
+                // At bottom of region — try to enter the next region,
+                // skipping collapsed projects.
+                let next = region_below_skipping_collapsed(me.group_id.as_deref(), &all_groups);
                 let Some(next_region) = next else {
                     return Ok(());
                 };
@@ -3482,6 +3536,84 @@ mod tests {
         assert_eq!(b.position, 10);
         assert_eq!(a.position, 30);
         assert_eq!(hidden.position, 20);
+    }
+
+    async fn insert_group(mgr: &SessionManager, id: &str, position: i64, collapsed: bool) {
+        use chrono::Utc;
+        use tokio::sync::RwLock;
+        mgr.groups.write().await.insert(
+            id.into(),
+            Arc::new(GroupEntry {
+                summary: RwLock::new(GroupSummary {
+                    id: id.into(),
+                    name: id.into(),
+                    created_at: Utc::now(),
+                    position,
+                    collapsed,
+                }),
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn move_session_jumps_over_collapsed_project() {
+        use agentd_protocol::{MoveDirection, SessionKind};
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // Display order: ungrouped (su-top, su-mover), then collapsed group
+        // `gcol` (members hidden), then expanded group `gexp`.
+        insert_group(&mgr, "gcol", 0, true).await;
+        insert_group(&mgr, "gexp", 1, false).await;
+        for (id, position, group) in [
+            ("su-top", 0, None),
+            ("su-mover", 10, None),
+            ("gc-1", 0, Some("gcol".to_string())),
+            ("gc-2", 1, Some("gcol".to_string())),
+            ("ge-1", 0, Some("gexp".to_string())),
+        ] {
+            mgr.sessions.write().await.insert(
+                id.into(),
+                synthetic_entry_with_group(id, SessionKind::User, position, group),
+            );
+        }
+
+        // Moving down past the collapsed group jumps the whole project in one
+        // step: the session skips `gcol`'s hidden members and lands at the top
+        // of the next visible region (`gexp`) without interleaving with them.
+        mgr.move_session("su-mover", MoveDirection::Down)
+            .await
+            .expect("move down");
+
+        let sessions = mgr.list().await;
+        let mover = sessions.iter().find(|s| s.id == "su-mover").unwrap();
+        assert_eq!(mover.group_id.as_deref(), Some("gexp"));
+        assert!(mover.position < 0, "should land above ge-1 (pos 0)");
+        // The collapsed project's members are untouched.
+        let gc1 = sessions.iter().find(|s| s.id == "gc-1").unwrap();
+        let gc2 = sessions.iter().find(|s| s.id == "gc-2").unwrap();
+        assert_eq!(gc1.group_id.as_deref(), Some("gcol"));
+        assert_eq!(gc2.group_id.as_deref(), Some("gcol"));
+        assert_eq!(gc1.position, 0);
+        assert_eq!(gc2.position, 1);
+
+        // Moving back up jumps the collapsed group the other way, returning the
+        // session to the bottom of the ungrouped region.
+        mgr.move_session("su-mover", MoveDirection::Up)
+            .await
+            .expect("move up");
+        let sessions = mgr.list().await;
+        let mover = sessions.iter().find(|s| s.id == "su-mover").unwrap();
+        assert_eq!(mover.group_id, None);
+        assert!(mover.position > 0, "should land below su-top (pos 0)");
     }
 
     #[tokio::test]
