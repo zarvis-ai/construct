@@ -30,6 +30,25 @@ id, and the file stem becomes the title fallback (`task-status.md` renders as
 `task status`). Updating the file updates the widget; deleting the file removes
 it.
 
+Optional frontmatter can configure widget metadata:
+
+```markdown
+---
+placement: inline
+title: Confirm action
+---
+
+# Continue?
+
+[OK](agentd:action/ok?close=1)
+```
+
+`placement: sticky` is the default. `placement: inline` renders the widget as a
+single-use full-width dialog at the bottom of the session. Only one inline
+widget is shown at a time, it auto-focuses, blocks normal terminal/prompt focus,
+and closing it deletes the backing Markdown file so it will not reappear after a
+client or daemon restart.
+
 Widgets are **UI state**, not transcript history. Clients can restore current
 widgets after reconnect without replaying the model conversation.
 
@@ -98,8 +117,10 @@ OBSERVATION: ui.action {"panel_id":"task-status","action_id":"run-checks","label
 ```
 
 Keyboard shortcuts are opt-in with `?key=<key>`. They are only active while the
-widget/card is focused. Action links are intent signals only; they do not bypass
-normal tool approvals, safety policy, or user confirmation requirements.
+widget/card is focused. Add `close=1` to dispatch the action and then close the
+containing widget; for inline widgets this also deletes the backing Markdown
+file. Action links are intent signals only; they do not bypass normal tool
+approvals, safety policy, or user confirmation requirements.
 
 ## Example
 
