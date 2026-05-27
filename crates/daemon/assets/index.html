@@ -483,7 +483,10 @@
   .widget-card { border: 0; border-radius: 0; background: transparent; overflow: hidden; }
   .widget-card + .widget-card { border-top: 1px solid var(--border); padding-top: 8px; }
   .widget-card:focus { outline: 1px solid var(--accent); outline-offset: 2px; }
-  .widget-title { padding: 2px 0 6px; border-bottom: 1px solid var(--border); color: var(--accent); font-weight: 600; }
+  .widget-title { display: flex; align-items: center; gap: 8px; padding: 2px 0 6px; border-bottom: 1px solid var(--border); color: var(--accent); font-weight: 600; }
+  .widget-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .widget-hide { margin-left: auto; border: 0; background: transparent; color: var(--fg-dim); padding: 0 2px; font: inherit; cursor: pointer; }
+  .widget-hide:hover, .widget-hide:focus { color: var(--accent); outline: none; background: color-mix(in srgb, var(--accent) 14%, transparent); }
   .widget-body { padding: 8px; font-size: 13px; line-height: 1.35; }
   .widget-body p { margin: 0 0 8px; }
   .widget-body h1, .widget-body h2, .widget-body h3 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
@@ -3971,8 +3974,9 @@ function renderWidgets() {
 
 function renderWidgetCard(sessionId, panel) {
   const id = normalizePanelId(panel);
+  const title = widgetTitle(panel);
   return `<article class="widget-card" tabindex="0" data-widget-id="${attr(id)}">
-    <div class="widget-title">${escape(widgetTitle(panel))}</div>
+    <div class="widget-title"><span class="widget-title-text">${escape(title)}</span><button type="button" class="widget-hide" data-widget-id="${attr(id)}" aria-label="hide ${attr(title)}" title="hide widget">[-]</button></div>
     <div class="widget-body">${renderWidgetMarkdown(panel.markdown || "", sessionId, id, { skipFirstHeading: true })}</div>
   </article>`;
 }
@@ -4170,6 +4174,13 @@ widgetsTriggerBtn.addEventListener("click", toggleWidgetsPopover);
 terminalWidgetsProxyBtn.addEventListener("click", toggleWidgetsPopover);
 
 sessionWidgetsEl.addEventListener("click", (ev) => {
+  const hide = ev.target.closest && ev.target.closest(".widget-hide");
+  if (hide && state.currentId) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    hideWidgetPanel(state.currentId, hide.dataset.widgetId);
+    return;
+  }
   const item = ev.target.closest && ev.target.closest(".widgets-menu-item");
   if (item && state.currentId) {
     const panels = state.widgetsById.get(state.currentId) || [];
@@ -4191,6 +4202,15 @@ sessionWidgetsEl.addEventListener("click", (ev) => {
     );
   }
 });
+
+function hideWidgetPanel(sessionId, panelId) {
+  if (!sessionId || !panelId) return;
+  const panels = state.widgetsById.get(sessionId) || [];
+  const visible = visibleWidgetIds(sessionId, panels);
+  visible.delete(panelId);
+  saveVisibleWidgetIds(sessionId, visible);
+  renderWidgets();
+}
 
 sessionWidgetsEl.addEventListener("focusin", (ev) => {
   const card = ev.target.closest && ev.target.closest(".widget-card");
