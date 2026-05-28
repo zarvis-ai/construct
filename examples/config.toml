@@ -14,6 +14,17 @@
 # binary = "/opt/agentd/agentd-adapter-claude"
 # description = "Claude Code"
 
+# Override the child command a built-in adapter launches without writing a
+# wrapper script. `AGENTD_*_CMD` is split shell-style (quotes/backslashes only;
+# no shell expansion) and prepended before the adapter's generated arguments.
+# This wins over the older binary-only `AGENTD_*_BIN` env var.
+#
+# [adapters.codex]
+# env = { AGENTD_CODEX_CMD = "exec codex" }
+#
+# Other built-ins use AGENTD_CLAUDE_CMD, AGENTD_ANTIGRAVITY_CMD, and
+# AGENTD_SHELL_CMD.
+
 # Add a custom adapter — just point to any binary that speaks the AHP
 # protocol. See `crates/protocol/src/adapter.rs` for the SDK helper.
 #

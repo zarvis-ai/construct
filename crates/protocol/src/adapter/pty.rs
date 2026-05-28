@@ -73,7 +73,10 @@ pub async fn run_session(spec: PtySpec, ctx: AdapterContext) -> i32 {
         Err(e) => {
             let io_err = std::io::Error::other(e.to_string());
             emit.emit(SessionEvent::Error {
-                message: super::missing_bin_hint(&spec.bin, &io_err),
+                message: super::missing_bin_hint(
+                    &spec.status_detail.as_deref().unwrap_or(&spec.bin),
+                    &io_err,
+                ),
             });
             emit.emit(SessionEvent::Done { exit_code: 127 });
             return 127;

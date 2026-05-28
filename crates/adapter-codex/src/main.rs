@@ -12,8 +12,8 @@
 //!   `session_id` back in for subsequent turns.
 //!
 //! Pick mode via `--mode interactive|headless` on `agent new`, or via
-//! `AGENTD_CODEX_MODE=interactive|headless`. Honors `AGENTD_CODEX_BIN` for
-//! the binary path.
+//! `AGENTD_CODEX_MODE=interactive|headless`. Honors `AGENTD_CODEX_CMD` for a
+//! full command prefix, falling back to `AGENTD_CODEX_BIN` for a binary path.
 
 use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
 use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
@@ -75,8 +75,13 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
-    let bin = std::env::var("AGENTD_CODEX_BIN").unwrap_or_else(|_| "codex".into());
-    let mut args = params.args.clone();
+    let command = agentd_protocol::adapter::resolve_command_override(
+        "AGENTD_CODEX_CMD",
+        "AGENTD_CODEX_BIN",
+        "codex",
+    );
+    let mut args = command.args.clone();
+    args.extend(params.args.clone());
     // Resume support: codex doesn't let the client assign a session id, so
     // we tag each spawn with a unique `originator` (via codex's internal
     // env override) and watch its rollouts dir for one bearing that tag.
@@ -92,9 +97,9 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // identical PTY content. Starting a fresh codex loses one session's
     // conversation but never conflates two of them.
     let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
-    let sid_file = std::env::var("AGENTD_SESSION_DATA_DIR").ok().map(|d| {
-        std::path::PathBuf::from(d).join("codex_session_id.txt")
-    });
+    let sid_file = std::env::var("AGENTD_SESSION_DATA_DIR")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join("codex_session_id.txt"));
     let mut captured_id: Option<String> = None;
     if resuming {
         let explicit = std::env::var("AGENTD_CODEX_RESUME_ID").ok();
@@ -169,13 +174,17 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             );
         }
     }
-    let label = bin.clone();
+    let label = command.argv_preview();
+    let bin = command.bin;
     let spec = PtySpec {
         bin,
         args,
         cwd: std::path::PathBuf::from(&params.cwd),
         env,
-        size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
+        size: params.pty_size.unwrap_or(PtySize {
+            cols: 100,
+            rows: 30,
+        }),
         status_detail: Some(format!("{label} (interactive)")),
     };
     let _ = run_pty(spec, ctx).await;
@@ -207,9 +216,7 @@ fn spawn_session_id_watcher(
         }
     }
     let Some(sessions_root) = codex_sessions_root(&session_env) else {
-        emit.log(
-            "codex: no CODEX_HOME or HOME — cannot watch sessions dir for session-id capture",
-        );
+        emit.log("codex: no CODEX_HOME or HOME — cannot watch sessions dir for session-id capture");
         return;
     };
     tokio::spawn(async move {
@@ -234,11 +241,7 @@ fn spawn_session_id_watcher(
                     not_ours.insert(name);
                     continue;
                 }
-                let uuid = match meta
-                    .id
-                    .clone()
-                    .or_else(|| uuid_from_rollout_name(&name))
-                {
+                let uuid = match meta.id.clone().or_else(|| uuid_from_rollout_name(&name)) {
                     Some(u) => u,
                     None => {
                         emit.log(format!(
@@ -363,7 +366,11 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         mut inbox,
     } = ctx;
 
-    let bin = std::env::var("AGENTD_CODEX_BIN").unwrap_or_else(|_| "codex".into());
+    let command_override = agentd_protocol::adapter::resolve_command_override(
+        "AGENTD_CODEX_CMD",
+        "AGENTD_CODEX_BIN",
+        "codex",
+    );
     let resume_flag = std::env::var("AGENTD_CODEX_RESUME_FLAG").ok();
     let cwd = PathBuf::from(&params.cwd);
     let model = params.model.clone();
@@ -408,7 +415,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             detail: None,
         });
 
-        let mut child_args: Vec<String> = Vec::new();
+        let mut child_args: Vec<String> = command_override.args.clone();
         child_args.push("exec".into());
         if let (Some(flag), Some(sid)) = (resume_flag.as_ref(), codex_session_id.as_ref()) {
             child_args.push(flag.clone());
@@ -425,7 +432,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             child_args.push(a.clone());
         }
         child_args.push(user_text.clone());
-        let mut command = Command::new(&bin);
+        let mut command = Command::new(&command_override.bin);
         for a in &child_args {
             command.arg(a);
         }
@@ -444,7 +451,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(&bin, &e),
+                    message: agentd_protocol::adapter::missing_bin_hint(
+                        &command_override.argv_preview(),
+                        &e,
+                    ),
                 });
                 break 127;
             }
@@ -621,10 +631,7 @@ fn try_emit_structured(emit: &EventEmitter, v: &Value) -> bool {
                 .and_then(|n| n.as_str())
                 .unwrap_or("?")
                 .to_string();
-            let ok = !v
-                .get("is_error")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false);
+            let ok = !v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
             let output = match v.get("output").or_else(|| v.get("content")) {
                 Some(Value::String(s)) => s.clone(),
                 Some(other) => serde_json::to_string(other).unwrap_or_default(),
@@ -685,18 +692,16 @@ mod tests {
         )
         .is_none());
         // Right length, non-hex characters.
-        assert!(uuid_from_rollout_name(
-            "rollout-zzz-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.jsonl"
-        )
-        .is_none());
+        assert!(
+            uuid_from_rollout_name("rollout-zzz-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.jsonl")
+                .is_none()
+        );
     }
 
     #[test]
     fn read_session_meta_extracts_id_and_originator() {
-        let tmp = std::env::temp_dir().join(format!(
-            "agentd-codex-meta-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("agentd-codex-meta-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
@@ -709,7 +714,10 @@ mod tests {
         )
         .unwrap();
         let meta = read_session_meta(&mine).unwrap();
-        assert_eq!(meta.id.as_deref(), Some("019e32aa-014a-7ff0-9a3f-7ae773961a37"));
+        assert_eq!(
+            meta.id.as_deref(),
+            Some("019e32aa-014a-7ff0-9a3f-7ae773961a37")
+        );
         assert_eq!(meta.originator.as_deref(), Some("agentd:sess-abc"));
 
         // Default codex originator stays distinct.

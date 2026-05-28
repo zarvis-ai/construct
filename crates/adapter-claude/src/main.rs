@@ -16,7 +16,8 @@
 //! `AGENTD_CLAUDE_MODE=interactive|headless`. Default is interactive when the
 //! client supplies a PTY size (the TUI always does); otherwise headless.
 //!
-//! Honors `AGENTD_CLAUDE_BIN` for the binary path.
+//! Honors `AGENTD_CLAUDE_CMD` for a full command prefix, falling back to
+//! `AGENTD_CLAUDE_BIN` for a binary path.
 
 use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
 use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
@@ -78,8 +79,13 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
-    let bin = std::env::var("AGENTD_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
-    let mut args = params.args.clone();
+    let command = agentd_protocol::adapter::resolve_command_override(
+        "AGENTD_CLAUDE_CMD",
+        "AGENTD_CLAUDE_BIN",
+        "claude",
+    );
+    let mut args = command.args.clone();
+    args.extend(params.args.clone());
     if let Some(m) = params.model.as_ref() {
         args.push("--model".into());
         args.push(m.clone());
@@ -97,10 +103,9 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // daemon respawns us after a restart. claude's own session-persistence
     // makes the conversation pick up where it left off.
     let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
-    let sid_file =
-        std::env::var("AGENTD_SESSION_DATA_DIR").ok().map(|d| {
-            std::path::PathBuf::from(d).join("claude_session_id.txt")
-        });
+    let sid_file = std::env::var("AGENTD_SESSION_DATA_DIR")
+        .ok()
+        .map(|d| std::path::PathBuf::from(d).join("claude_session_id.txt"));
     let claude_session_id = match (resuming, sid_file.as_ref()) {
         (true, Some(p)) if p.exists() => std::fs::read_to_string(p)
             .ok()
@@ -133,13 +138,17 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
-    let label = bin.clone();
+    let label = command.argv_preview();
+    let bin = command.bin;
     let spec = PtySpec {
         bin,
         args,
         cwd: std::path::PathBuf::from(&params.cwd),
         env,
-        size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
+        size: params.pty_size.unwrap_or(PtySize {
+            cols: 100,
+            rows: 30,
+        }),
         status_detail: Some(format!("{label} (interactive)")),
     };
     let _ = run_pty(spec, ctx).await;
@@ -152,7 +161,11 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         mut inbox,
     } = ctx;
 
-    let bin = std::env::var("AGENTD_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    let command_override = agentd_protocol::adapter::resolve_command_override(
+        "AGENTD_CLAUDE_CMD",
+        "AGENTD_CLAUDE_BIN",
+        "claude",
+    );
     let cwd = PathBuf::from(&params.cwd);
     let model = params.model.clone();
     let extra_args = params.args.clone();
@@ -198,7 +211,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         });
 
         // Build the per-turn child command args.
-        let mut child_args: Vec<String> = Vec::new();
+        let mut child_args: Vec<String> = command_override.args.clone();
         child_args.push("-p".into());
         child_args.push("--input-format".into());
         child_args.push("stream-json".into());
@@ -220,7 +233,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         for a in &extra_args {
             child_args.push(a.clone());
         }
-        let mut command = Command::new(&bin);
+        let mut command = Command::new(&command_override.bin);
         for a in &child_args {
             command.arg(a);
         }
@@ -239,7 +252,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(&bin, &e),
+                    message: agentd_protocol::adapter::missing_bin_hint(
+                        &command_override.argv_preview(),
+                        &e,
+                    ),
                 });
                 break 127;
             }
@@ -253,8 +269,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         let writer_task = spawn_writer(child_stdin, user_text.clone());
         let stderr_task = spawn_stderr_log(child_stderr, emit.clone());
         let captured_sid = Arc::new(StdMutex::new(None::<String>));
-        let parser_task =
-            spawn_parser(child_stdout, emit.clone(), captured_sid.clone());
+        let parser_task = spawn_parser(child_stdout, emit.clone(), captured_sid.clone());
 
         // Drive the child: queue mid-turn inputs, honor stop/interrupt.
         let outcome = drive_turn(&mut child, &mut inbox, &emit, &mut pending).await;
@@ -333,7 +348,10 @@ async fn drive_turn(
     }
 }
 
-fn spawn_writer(mut stdin: tokio::process::ChildStdin, user_text: String) -> tokio::task::JoinHandle<()> {
+fn spawn_writer(
+    mut stdin: tokio::process::ChildStdin,
+    user_text: String,
+) -> tokio::task::JoinHandle<()> {
     let msg = serde_json::json!({
         "type": "user",
         "message": {
@@ -486,7 +504,10 @@ fn extract_message_text(msg: Option<&Value>) -> String {
 }
 
 fn forward_tool_uses(emit: &EventEmitter, msg: Option<&Value>) {
-    let Some(arr) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+    let Some(arr) = msg
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
         return;
     };
     for block in arr {
@@ -506,7 +527,10 @@ fn forward_tool_uses(emit: &EventEmitter, msg: Option<&Value>) {
 }
 
 fn forward_tool_results(emit: &EventEmitter, msg: Option<&Value>) {
-    let Some(arr) = msg.and_then(|m| m.get("content")).and_then(|c| c.as_array()) else {
+    let Some(arr) = msg
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    else {
         return;
     };
     for block in arr {
