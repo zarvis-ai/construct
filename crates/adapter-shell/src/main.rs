@@ -7,7 +7,8 @@
 //! - Empty prompt → `$SHELL -il` (interactive login shell).
 //! - Non-empty prompt → `$SHELL -lc <prompt>` (one-shot login shell).
 //!
-//! Honors `AGENTD_SHELL_BIN`, then `$SHELL`, falling back to `/bin/bash`.
+//! Honors `AGENTD_SHELL_CMD` for a full command prefix, falling back to
+//! `AGENTD_SHELL_BIN`, then `$SHELL`, then `/bin/bash`.
 
 use agentd_protocol::adapter::pty::{run_session, PtySpec};
 use agentd_protocol::adapter::run;
@@ -27,30 +28,42 @@ async fn main() -> anyhow::Result<()> {
         },
     };
     run(metadata, |params, ctx| async move {
-        let shell = std::env::var("AGENTD_SHELL_BIN")
-            .ok()
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/bash".to_string());
+        let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        let command = agentd_protocol::adapter::resolve_command_override(
+            "AGENTD_SHELL_CMD",
+            "AGENTD_SHELL_BIN",
+            &default_shell,
+        );
 
         // On daemon-restart resume: ignore the original one-shot prompt
         // (it already ran in the previous incarnation). Re-spawn a fresh
         // interactive login shell in the same cwd so the user can keep
         // working.
         let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
-        let args: Vec<String> = match params.prompt.as_deref() {
+        let mut args: Vec<String> = command.args.clone();
+        match params.prompt.as_deref() {
             Some(p) if !p.trim().is_empty() && !resuming => {
-                vec!["-lc".to_string(), p.to_string()]
+                args.extend(["-lc".to_string(), p.to_string()]);
             }
-            _ => vec!["-il".to_string()],
-        };
+            _ => args.push("-il".to_string()),
+        }
 
+        let label = command.argv_preview();
+        let bin = command.bin;
         let spec = PtySpec {
-            bin: shell.clone(),
+            bin,
             args,
             cwd: PathBuf::from(&params.cwd),
-            env: params.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-            size: params.pty_size.unwrap_or(PtySize { cols: 100, rows: 30 }),
-            status_detail: Some(shell),
+            env: params
+                .env
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            size: params.pty_size.unwrap_or(PtySize {
+                cols: 100,
+                rows: 30,
+            }),
+            status_detail: Some(label),
         };
         let _ = SessionState::Running; // silence dead-import lint if any
         let _ = run_session(spec, ctx).await;

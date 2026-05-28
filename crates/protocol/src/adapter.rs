@@ -51,6 +51,125 @@ use tokio::sync::mpsc;
 pub mod pty;
 
 use crate::paths;
+
+/// A command prefix supplied through an adapter's `AGENTD_*_CMD` override.
+///
+/// The first token is the executable to spawn; remaining tokens are prepended
+/// before the adapter's generated CLI arguments. This lets users configure
+/// commands such as `exec codex` or `mise exec -- codex` without writing a
+/// wrapper script.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOverride {
+    pub bin: String,
+    pub args: Vec<String>,
+}
+
+impl CommandOverride {
+    pub fn argv_preview(&self) -> String {
+        std::iter::once(self.bin.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Resolve a child CLI command from either a full command override env var
+/// (for example `AGENTD_CODEX_CMD=exec codex`) or a binary-only fallback env
+/// var (for example `AGENTD_CODEX_BIN=/opt/bin/codex`).
+///
+/// The parser intentionally implements simple shell-like quoting for spaces,
+/// single quotes, double quotes, and backslash escapes without evaluating a
+/// shell. Invalid command overrides are ignored and the binary fallback is
+/// used instead.
+pub fn resolve_command_override(
+    command_env: &str,
+    binary_env: &str,
+    default_bin: &str,
+) -> CommandOverride {
+    if let Ok(raw) = std::env::var(command_env) {
+        if let Some(cmd) = parse_command_words(&raw) {
+            return cmd;
+        }
+        eprintln!(
+            "agentd adapter: ignoring invalid {command_env}; falling back to {binary_env}/{default_bin}"
+        );
+    }
+    CommandOverride {
+        bin: std::env::var(binary_env).unwrap_or_else(|_| default_bin.to_string()),
+        args: Vec::new(),
+    }
+}
+
+fn parse_command_words(raw: &str) -> Option<CommandOverride> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut chars = raw.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut in_word = false;
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+                in_word = true;
+            }
+            Some('\'') => {
+                cur.push(c);
+                in_word = true;
+            }
+            Some(_) if c == '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                } else {
+                    cur.push(c);
+                }
+                in_word = true;
+            }
+            Some(_) => {
+                cur.push(c);
+                in_word = true;
+            }
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                in_word = true;
+            }
+            None if c == '\\' => {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                } else {
+                    cur.push(c);
+                }
+                in_word = true;
+            }
+            None if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            None => {
+                cur.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if in_word {
+        words.push(cur);
+    }
+    let mut iter = words.into_iter();
+    let bin = iter.next()?;
+    if bin.is_empty() {
+        return None;
+    }
+    Some(CommandOverride {
+        bin,
+        args: iter.collect(),
+    })
+}
+
 /// Build a friendly "failed to start binary" message for adapters to emit
 /// when spawning the agent CLI fails (e.g. binary not on PATH). Adapters
 /// trust the user's shell to provide PATH; if that doesn't work, this
@@ -104,10 +223,7 @@ fn mcp_env_toml(session_id: &str) -> String {
     mcp_env_toml_from(session_id, |name| std::env::var(name).ok())
 }
 
-fn mcp_env_toml_from(
-    session_id: &str,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> String {
+fn mcp_env_toml_from(session_id: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut pairs = vec![format!(
         "{} = {}",
         agent_context::ENV_SESSION_ID,
@@ -930,6 +1046,28 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn parse_command_words_handles_shell_like_quotes() {
+        let cmd = parse_command_words(r#"mise exec -- "codex beta" --flag='two words'"#)
+            .expect("valid command");
+
+        assert_eq!(cmd.bin, "mise");
+        assert_eq!(
+            cmd.args,
+            vec!["exec", "--", "codex beta", "--flag=two words"]
+        );
+        assert_eq!(
+            cmd.argv_preview(),
+            "mise exec -- codex beta --flag=two words"
+        );
+    }
+
+    #[test]
+    fn parse_command_words_rejects_unclosed_quotes() {
+        assert!(parse_command_words("exec 'codex").is_none());
+        assert!(parse_command_words("   ").is_none());
     }
 
     #[test]
