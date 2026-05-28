@@ -941,6 +941,13 @@ pub struct DynamicUiActionHit {
 }
 
 #[derive(Debug, Clone)]
+pub struct DynamicUiInlineHit {
+    pub session_id: String,
+    pub panel_id: String,
+    pub area: ratatui::layout::Rect,
+}
+
+#[derive(Debug, Clone)]
 pub struct DynamicUiWidgetHit {
     pub session_id: String,
     pub panel_id: String,
@@ -1041,6 +1048,7 @@ pub struct LayoutSnapshot {
     pub dynamic_ui_action_hits: Vec<DynamicUiActionHit>,
     pub dynamic_ui_widget_hits: Vec<DynamicUiWidgetHit>,
     pub dynamic_ui_panel_close_hits: Vec<DynamicUiPanelCloseHit>,
+    pub dynamic_ui_inline_hit: Option<DynamicUiInlineHit>,
     /// Dynamic UI title-bar affordance bounds: `(x_start, x_end, y, session_id)`.
     pub dynamic_ui_trigger: Option<(u16, u16, u16, String)>,
     /// Dynamic UI widget panel bounds from the last frame.
@@ -2677,10 +2685,16 @@ impl App {
                                     .entry(payload.session_id.clone())
                                     .or_default()
                                     .insert(panel.id.clone(), panel.clone());
-                                self.dynamic_ui_temporary_until.insert(
-                                    (payload.session_id.clone(), panel.id.clone()),
-                                    Instant::now() + Duration::from_secs(DYNAMIC_UI_AUTOHIDE_SECS),
-                                );
+                                if panel.placement == agentd_protocol::UiPlacement::Inline {
+                                    self.dynamic_ui_focused =
+                                        Some((payload.session_id.clone(), panel.id.clone()));
+                                } else {
+                                    self.dynamic_ui_temporary_until.insert(
+                                        (payload.session_id.clone(), panel.id.clone()),
+                                        Instant::now()
+                                            + Duration::from_secs(DYNAMIC_UI_AUTOHIDE_SECS),
+                                    );
+                                }
                             }
                             SessionEvent::UiDelete { id } => {
                                 if let Some(panels) = self.ui_panels.get_mut(&payload.session_id) {
@@ -3339,6 +3353,9 @@ impl App {
         fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
         }
+        if let Some(inline) = self.layout.dynamic_ui_inline_hit.as_ref() {
+            return Self::rect_contains(inline.area, col, row);
+        }
         self.layout
             .dynamic_ui_popover_area
             .is_some_and(|area| contains(area, col, row))
@@ -3394,6 +3411,43 @@ impl App {
         fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
         }
+        if let Some(inline) = self.layout.dynamic_ui_inline_hit.clone() {
+            if let Some(hit) = self
+                .layout
+                .dynamic_ui_panel_close_hits
+                .iter()
+                .find(|hit| hit.contains(col, row))
+                .cloned()
+            {
+                self.delete_dynamic_ui_panel(hit.session_id, hit.panel_id)
+                    .await;
+                return true;
+            }
+            if let Some(hit) = self
+                .layout
+                .dynamic_ui_action_hits
+                .iter()
+                .find(|hit| hit.contains(col, row))
+                .cloned()
+            {
+                self.dynamic_ui_focused = Some((hit.session_id.clone(), hit.panel_id.clone()));
+                self.dispatch_dynamic_ui_action(
+                    hit.session_id.clone(),
+                    Some(hit.panel_id.clone()),
+                    hit.action.clone(),
+                )
+                .await;
+                if hit.action.close {
+                    self.delete_dynamic_ui_panel(hit.session_id, hit.panel_id)
+                        .await;
+                }
+                return true;
+            }
+            if Self::rect_contains(inline.area, col, row) {
+                return true;
+            }
+            return false;
+        }
         if let Some(hit) = self
             .layout
             .dynamic_ui_panel_close_hits
@@ -3412,8 +3466,16 @@ impl App {
             .cloned()
         {
             self.dynamic_ui_focused = Some((hit.session_id.clone(), hit.panel_id.clone()));
-            self.dispatch_dynamic_ui_action(hit.session_id, Some(hit.panel_id), hit.action)
-                .await;
+            self.dispatch_dynamic_ui_action(
+                hit.session_id.clone(),
+                Some(hit.panel_id.clone()),
+                hit.action.clone(),
+            )
+            .await;
+            if hit.action.close {
+                self.delete_dynamic_ui_panel(hit.session_id, hit.panel_id)
+                    .await;
+            }
             return true;
         }
         if let Some((x_start, x_end, y, session_id)) = self.layout.dynamic_ui_trigger.clone() {
@@ -3475,6 +3537,11 @@ impl App {
     async fn handle_left_click(&mut self, col: u16, row: u16) {
         fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
+        }
+        if self.is_over_dynamic_ui_overlay(col, row)
+            && self.handle_dynamic_ui_overlay_click(col, row).await
+        {
+            return;
         }
         if let Some(modal) = self.layout.modal_area {
             if !contains(modal, col, row) {
@@ -4232,6 +4299,14 @@ impl App {
             return;
         }
 
+        if self.handle_inline_dynamic_ui_key(key).await {
+            return;
+        }
+
+        if self.layout.dynamic_ui_inline_hit.is_some() {
+            return;
+        }
+
         if self.try_dynamic_ui_action_key(key).await {
             return;
         }
@@ -4310,6 +4385,58 @@ impl App {
         self.ui_panels.get(session_id)
     }
 
+    async fn handle_inline_dynamic_ui_key(&mut self, key: KeyEvent) -> bool {
+        let Some(inline) = self.layout.dynamic_ui_inline_hit.clone() else {
+            return false;
+        };
+        if matches!(key.code, KeyCode::Esc) {
+            self.delete_dynamic_ui_panel(inline.session_id, inline.panel_id)
+                .await;
+            return true;
+        }
+        if self.try_dynamic_ui_action_key(key).await {
+            return true;
+        }
+        if let Some(action) = self.global_action_while_inline(key) {
+            self.run_action(action).await;
+            return true;
+        }
+        false
+    }
+
+    fn global_action_while_inline(&mut self, key: KeyEvent) -> Option<KeyAction> {
+        match self.chord_state.handle(key, &self.keymap) {
+            KeymapResult::Action(
+                action @ (KeyAction::NextSession
+                | KeyAction::PrevSession
+                | KeyAction::SwitchFocus
+                | KeyAction::FocusView
+                | KeyAction::ToggleView
+                | KeyAction::ToggleZoom
+                | KeyAction::ToggleHelp
+                | KeyAction::OpenCommandPalette
+                | KeyAction::OpenNewSession
+                | KeyAction::Refresh
+                | KeyAction::Quit),
+            ) => {
+                self.chord_label.clear();
+                Some(action)
+            }
+            KeymapResult::Action(_) => {
+                self.chord_label.clear();
+                None
+            }
+            KeymapResult::Pending(label) => {
+                self.chord_label = label;
+                None
+            }
+            KeymapResult::Unhandled => {
+                self.chord_label.clear();
+                None
+            }
+        }
+    }
+
     async fn try_dynamic_ui_action_key(&mut self, key: KeyEvent) -> bool {
         if self.focus != PaneFocus::View || !key.modifiers.is_empty() {
             return false;
@@ -4326,16 +4453,30 @@ impl App {
         let Some((focused_session, focused_panel)) = self.dynamic_ui_focused.clone() else {
             return false;
         };
-        if focused_session != session_id
-            || !self.dynamic_ui_panel_visible(&session_id, &focused_panel)
-        {
+        if focused_session != session_id {
+            return false;
+        }
+        let inline_focused = self
+            .layout
+            .dynamic_ui_inline_hit
+            .as_ref()
+            .is_some_and(|hit| hit.session_id == session_id && hit.panel_id == focused_panel);
+        if !inline_focused && !self.dynamic_ui_panel_visible(&session_id, &focused_panel) {
             return false;
         }
         let Some(action) = self.dynamic_ui_action_for_key(&session_id, c) else {
             return false;
         };
-        self.dispatch_dynamic_ui_action(session_id, Some(focused_panel), action)
-            .await;
+        self.dispatch_dynamic_ui_action(
+            session_id.clone(),
+            Some(focused_panel.clone()),
+            action.clone(),
+        )
+        .await;
+        if action.close {
+            self.delete_dynamic_ui_panel(session_id, focused_panel)
+                .await;
+        }
         true
     }
 
@@ -4397,6 +4538,19 @@ impl App {
         self.dynamic_ui_temporary_until.remove(&key);
         if self.dynamic_ui_focused.as_ref() == Some(&key) {
             self.dynamic_ui_focused = None;
+        }
+    }
+
+    async fn delete_dynamic_ui_panel(&mut self, session_id: String, panel_id: String) {
+        self.hide_dynamic_ui_panel(session_id.clone(), panel_id.clone());
+        if let Some(panels) = self.ui_panels.get_mut(&session_id) {
+            panels.remove(&panel_id);
+            if panels.is_empty() {
+                self.ui_panels.remove(&session_id);
+            }
+        }
+        if let Err(e) = self.client.delete_widget(&session_id, &panel_id).await {
+            self.set_status(format!("widget close failed: {e}"));
         }
     }
 
@@ -6053,6 +6207,7 @@ mod tests {
             dynamic_ui_action_hits: Vec::new(),
             dynamic_ui_widget_hits: Vec::new(),
             dynamic_ui_panel_close_hits: Vec::new(),
+            dynamic_ui_inline_hit: None,
             dynamic_ui_trigger: None,
             dynamic_ui_popover_area: None,
             dynamic_ui_dropdown_area: None,
@@ -8072,15 +8227,23 @@ fn markdown_display_rows(markdown: &str) -> usize {
     rows
 }
 
-fn parse_markdown_action_target(target: &str) -> (String, Option<String>) {
+fn parse_markdown_action_target(target: &str) -> (String, Option<String>, bool) {
     let Some((id, query)) = target.split_once('?') else {
-        return (target.to_string(), None);
+        return (target.to_string(), None, false);
     };
-    let key = query.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "key" && !value.is_empty()).then(|| value.to_string())
-    });
-    (id.to_string(), key)
+    let mut key = None;
+    let mut close = false;
+    for part in query.split('&') {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        if name == "key" && !value.is_empty() {
+            key = Some(value.to_string());
+        } else if name == "close" && matches!(value, "1" | "true" | "yes") {
+            close = true;
+        }
+    }
+    (id.to_string(), key, close)
 }
 
 fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
@@ -8100,13 +8263,14 @@ fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
         let Some(id_end) = after_open.find(')') else {
             break;
         };
-        let (id, key) = parse_markdown_action_target(&after_open[..id_end]);
+        let (id, key, close) = parse_markdown_action_target(&after_open[..id_end]);
         if !label.is_empty() && !id.is_empty() {
             out.push(agentd_protocol::UiAction {
                 id,
                 label: label.to_string(),
                 key,
                 style: None,
+                close,
             });
         }
         rest = &after_open[id_end + 1..];
@@ -8128,6 +8292,17 @@ mod widget_action_tests {
         assert_eq!(actions[0].key.as_deref(), Some("r"));
         assert_eq!(actions[1].id, "start-demo");
         assert_eq!(actions[1].key, None);
+        assert!(!actions[1].close);
+    }
+
+    #[test]
+    fn markdown_actions_parse_close_flag() {
+        let actions = markdown_actions("[OK](agentd:action/ok?close=1&key=o)");
+
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].id, "ok");
+        assert_eq!(actions[0].key.as_deref(), Some("o"));
+        assert!(actions[0].close);
     }
 }
 

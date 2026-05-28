@@ -401,6 +401,18 @@ impl Client {
             .await?;
         Ok(())
     }
+    pub async fn delete_widget(&self, session_id: &str, panel_id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_WIDGET_DELETE,
+                &agentd_protocol::SessionWidgetDeleteParams {
+                    session_id: session_id.to_string(),
+                    panel_id: panel_id.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
     /// Respawn a session's adapter (TUI restart-confirm flow). Used
     /// on a `Done` session to bring it back to life so the user can
     /// keep typing. The daemon launches the new adapter with

@@ -99,6 +99,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_action_hits.clear();
     app.layout.dynamic_ui_widget_hits.clear();
     app.layout.dynamic_ui_panel_close_hits.clear();
+    app.layout.dynamic_ui_inline_hit = None;
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_popover_area = None;
     app.layout.dynamic_ui_scroll_metrics = None;
@@ -2412,6 +2413,15 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
                 .collect()
         })
         .unwrap_or_default();
+    let inline_panel = latest_inline_panel(&panels);
+    let sticky_panels: Vec<_> = panels
+        .iter()
+        .filter(|panel| panel.placement != agentd_protocol::UiPlacement::Inline)
+        .cloned()
+        .collect();
+    if let Some(panel) = inline_panel.as_ref() {
+        app.dynamic_ui_focused = Some((id.clone(), panel.id.clone()));
+    }
     let scroll = app.view_scrollback;
     // Only adapters that publish `SessionEvent::EditorState` (currently
     // zarvis interactive) get the fixed editor pane at the bottom.
@@ -2419,26 +2429,44 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     // PTY, so a second editor pane would just look like a duplicate.
     let editor_state = app.editor_states.get(&id).cloned();
     let agent_status = app.agent_statuses.get(&id).cloned();
-    let (chat_area, editor_area) = if editor_state.is_some() || agent_status.is_some() {
+    let inline_rows = inline_panel
+        .as_ref()
+        .map(|panel| inline_widget_rows(panel, area.width, area.height))
+        .unwrap_or(0);
+    let base_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height.saturating_sub(inline_rows),
+    };
+    let inline_area = inline_panel.as_ref().map(|_| Rect {
+        x: area.x,
+        y: area.y.saturating_add(base_area.height),
+        width: area.width,
+        height: inline_rows,
+    });
+    let (chat_area, editor_area) = if inline_panel.is_some() {
+        (base_area, None)
+    } else if editor_state.is_some() || agent_status.is_some() {
         let raw_rows = editor_pane_rows(editor_state.as_ref(), agent_status.as_ref(), area.width);
-        let editor_rows: u16 = (raw_rows as u16).min(area.height.saturating_sub(1));
-        let chat_height = area.height.saturating_sub(editor_rows);
+        let editor_rows: u16 = (raw_rows as u16).min(base_area.height.saturating_sub(1));
+        let chat_height = base_area.height.saturating_sub(editor_rows);
         (
             Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
+                x: base_area.x,
+                y: base_area.y,
+                width: base_area.width,
                 height: chat_height,
             },
             Some(Rect {
-                x: area.x,
-                y: area.y + chat_height,
-                width: area.width,
+                x: base_area.x,
+                y: base_area.y + chat_height,
+                width: base_area.width,
                 height: editor_rows,
             }),
         )
     } else {
-        (area, None)
+        (base_area, None)
     };
     let history = match app.histories.get_mut(&id) {
         Some(h) => h,
@@ -2459,6 +2487,9 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
                     &app.theme,
                     true,
                 );
+            }
+            if let (Some(area), Some(panel)) = (inline_area, inline_panel.as_ref()) {
+                render_inline_dynamic_ui_panel(f, area, app, &id, panel);
             }
             return;
         }
@@ -2516,9 +2547,9 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
         out.screen.scrollback(),
         out.max_scrollback,
     );
-    render_visible_dynamic_ui_panels(f, area, app, &panels);
-    if app.dynamic_ui_popover_open.as_deref() == Some(id.as_str()) && !panels.is_empty() {
-        render_dynamic_ui_dropdown(f, area, app, &panels);
+    render_visible_dynamic_ui_panels(f, area, app, &sticky_panels);
+    if app.dynamic_ui_popover_open.as_deref() == Some(id.as_str()) && !sticky_panels.is_empty() {
+        render_dynamic_ui_dropdown(f, area, app, &sticky_panels);
     }
     let (preview_area, preview_close) = render_browser_preview_overlay(
         f,
@@ -2553,6 +2584,122 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
             true,
         );
     }
+    if let (Some(area), Some(panel)) = (inline_area, inline_panel.as_ref()) {
+        render_inline_dynamic_ui_panel(f, area, app, &id, panel);
+    }
+}
+
+fn latest_inline_panel(panels: &[agentd_protocol::UiPanel]) -> Option<agentd_protocol::UiPanel> {
+    panels
+        .iter()
+        .filter(|panel| panel.placement == agentd_protocol::UiPlacement::Inline)
+        .max_by(|a, b| a.id.cmp(&b.id))
+        .cloned()
+}
+
+fn inline_widget_rows(panel: &agentd_protocol::UiPanel, width: u16, available_height: u16) -> u16 {
+    if width == 0 || available_height == 0 {
+        return 0;
+    }
+    let body_rows = panel
+        .markdown
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count() as u16;
+    let wanted = body_rows.saturating_add(2).max(3);
+    wanted.min(available_height)
+}
+
+fn render_inline_dynamic_ui_panel(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    session_id: &str,
+    panel: &agentd_protocol::UiPanel,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    app.layout.dynamic_ui_inline_hit = Some(crate::app::DynamicUiInlineHit {
+        session_id: session_id.to_string(),
+        panel_id: panel.id.clone(),
+        area,
+    });
+    let title = dynamic_ui_panel_title(panel).unwrap_or_else(|| panel.id.clone());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::styled(
+            title.clone(),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .border_style(Style::default().fg(app.theme.border_focused));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    render_inline_widget_header_affordances(f, area, app, session_id, &panel.id);
+    let content_area = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
+    let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+    let lines = render_agentd_markdown_lines(
+        &panel.markdown,
+        &app.theme,
+        app.mouse_pos,
+        content_area,
+        Some(session_id),
+        Some(panel.id.as_str()),
+        &mut app.layout.dynamic_ui_action_hits,
+        suppress_first_heading,
+    );
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        content_area,
+    );
+}
+
+fn render_inline_widget_header_affordances(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    session_id: &str,
+    panel_id: &str,
+) {
+    if area.width < 16 || area.height == 0 {
+        return;
+    }
+    let hint = " Esc closes ";
+    let close = " x ";
+    let close_w = UnicodeWidthStr::width(close) as u16;
+    let hint_w = UnicodeWidthStr::width(hint) as u16;
+    let close_x = area
+        .x
+        .saturating_add(area.width.saturating_sub(close_w + 1));
+    let hint_x = close_x.saturating_sub(hint_w);
+    let y = area.y;
+    f.buffer_mut()
+        .set_string(hint_x, y, hint, Style::default().fg(app.theme.dim));
+    f.buffer_mut().set_string(
+        close_x,
+        y,
+        close,
+        Style::default()
+            .fg(app.theme.matrix_close)
+            .add_modifier(Modifier::BOLD),
+    );
+    app.layout
+        .dynamic_ui_panel_close_hits
+        .push(crate::app::DynamicUiPanelCloseHit {
+            session_id: session_id.to_string(),
+            panel_id: panel_id.to_string(),
+            row: y,
+            start_col: close_x,
+            end_col: close_x.saturating_add(close_w),
+        });
 }
 
 fn render_dynamic_ui_dropdown(
@@ -2959,7 +3106,7 @@ fn render_agentd_markdown_lines(
             if pending_action_spans.is_empty() {
                 pending_action_row = rendered_rows;
             }
-            for (label, id, key) in action_links {
+            for (label, id, key, close) in action_links {
                 if !pending_action_spans.is_empty() {
                     pending_action_spans.push(Span::raw("  "));
                 }
@@ -2973,10 +3120,7 @@ fn render_agentd_markdown_lines(
                         .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
                         .sum::<u16>(),
                 );
-                let row = panel_area
-                    .y
-                    .saturating_add(1)
-                    .saturating_add(pending_action_row as u16);
+                let row = panel_area.y.saturating_add(pending_action_row as u16);
                 let end_col =
                     start_col.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16);
                 let is_hovered = hover
@@ -3002,6 +3146,7 @@ fn render_agentd_markdown_lines(
                             label,
                             key,
                             style: None,
+                            close,
                         },
                         row,
                         start_col,
@@ -3409,7 +3554,7 @@ fn render_inline_action_spans(
             spans.push(Span::styled(rendered, Style::default().fg(theme.text)));
             return spans;
         };
-        let (action_id, key) = parse_action_target(&after_action_open[..action_end]);
+        let (action_id, key, close) = parse_action_target(&after_action_open[..action_end]);
         let prefix = key
             .as_ref()
             .map(|key| format!("[{key}] "))
@@ -3436,6 +3581,7 @@ fn render_inline_action_spans(
                     label: label.to_string(),
                     key,
                     style: None,
+                    close,
                 },
                 row,
                 start_col: col,
@@ -3455,18 +3601,26 @@ fn render_inline_action_spans(
     spans
 }
 
-fn parse_action_target(target: &str) -> (String, Option<String>) {
+fn parse_action_target(target: &str) -> (String, Option<String>, bool) {
     let Some((id, query)) = target.split_once('?') else {
-        return (target.to_string(), None);
+        return (target.to_string(), None, false);
     };
-    let key = query.split('&').find_map(|part| {
-        let (name, value) = part.split_once('=')?;
-        (name == "key" && !value.is_empty()).then(|| value.to_string())
-    });
-    (id.to_string(), key)
+    let mut key = None;
+    let mut close = false;
+    for part in query.split('&') {
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        if name == "key" && !value.is_empty() {
+            key = Some(value.to_string());
+        } else if name == "close" && matches!(value, "1" | "true" | "yes") {
+            close = true;
+        }
+    }
+    (id.to_string(), key, close)
 }
 
-fn parse_agentd_action_links(line: &str) -> Vec<(String, String, Option<String>)> {
+fn parse_agentd_action_links(line: &str) -> Vec<(String, String, Option<String>, bool)> {
     let mut out = Vec::new();
     let mut rest = line;
     while let Some(label_start) = rest.find('[') {
@@ -3483,9 +3637,9 @@ fn parse_agentd_action_links(line: &str) -> Vec<(String, String, Option<String>)
         let Some(id_end) = after_open.find(')') else {
             break;
         };
-        let (id, key) = parse_action_target(&after_open[..id_end]);
+        let (id, key, close) = parse_action_target(&after_open[..id_end]);
         if !label.is_empty() && !id.is_empty() {
-            out.push((label.to_string(), id, key));
+            out.push((label.to_string(), id, key, close));
         }
         rest = &after_open[id_end + 1..];
     }

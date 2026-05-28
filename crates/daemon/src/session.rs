@@ -9,14 +9,14 @@ use agentd_protocol::{
     GroupDeletedNotificationPayload, GroupStateNotificationPayload, GroupSummary, HarnessInfo,
     MessageRole, MoveDirection, PtyReplayResult, PtySize, SessionAttachClipboardParams,
     SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionEvent,
-    SessionStartParams, SessionState, SessionSummary, StateNotificationPayload, TimestampedEvent,
-    TranscriptResult,
+    SessionStartParams, SessionState, SessionSummary, SessionWidgetDeleteParams,
+    StateNotificationPayload, TimestampedEvent, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -447,15 +447,35 @@ impl GroupEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct WidgetSnapshot {
-    files: HashMap<String, String>,
+    files: HashMap<String, agentd_protocol::UiPanel>,
+}
+
+fn ui_panel_changed(
+    previous: Option<&agentd_protocol::UiPanel>,
+    next: &agentd_protocol::UiPanel,
+) -> bool {
+    let Some(previous) = previous else {
+        return true;
+    };
+    previous.source != next.source
+        || previous.title != next.title
+        || previous.placement != next.placement
+        || previous.markdown != next.markdown
 }
 
 impl WidgetSnapshot {
     fn read(storage: &Storage, session_id: &str) -> Self {
-        let dir = storage.widgets_dir(session_id);
-        let files = read_widget_files(&dir);
+        let files = storage
+            .read_widgets(session_id)
+            .unwrap_or_else(|e| {
+                tracing::warn!(session = %session_id, error = ?e, "read widgets failed");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|panel| (panel.id.clone(), panel))
+            .collect();
         Self { files }
     }
 }
@@ -558,27 +578,6 @@ pub fn capture_startup_exe() {
 /// exists, is a regular file, and is executable. Returns the canonical
 /// path to exec, or an error that's surfaced to the caller so a typo
 /// never leaves the daemon trying to exec() a missing binary.
-fn read_widget_files(dir: &Path) -> HashMap<String, String> {
-    let mut files = HashMap::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        let Ok(markdown) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        files.insert(stem.to_string(), markdown);
-    }
-    files
-}
-
 fn validate_restart_exe(path: &std::path::Path) -> Result<PathBuf> {
     let abs = std::fs::canonicalize(path)
         .with_context(|| format!("restart binary not found: {}", path.display()))?;
@@ -872,21 +871,11 @@ impl SessionManager {
                 .unwrap_or_else(|| WidgetSnapshot {
                     files: HashMap::new(),
                 });
-            if previous == next {
-                continue;
-            }
-            for (id, markdown) in &next.files {
-                if previous.files.get(id) == Some(markdown) {
+            for (id, panel) in &next.files {
+                if !ui_panel_changed(previous.files.get(id), panel) {
                     continue;
                 }
-                let panel = agentd_protocol::UiPanel {
-                    id: id.clone(),
-                    source: Some(format!("{id}.md")),
-                    title: Some(id.replace(['-', '_'], " ")),
-                    placement: agentd_protocol::UiPlacement::Sticky,
-                    markdown: markdown.clone(),
-                };
-                self.broadcast_widget_event(&session_id, SessionEvent::UiPanel(panel));
+                self.broadcast_widget_event(&session_id, SessionEvent::UiPanel(panel.clone()));
             }
             for id in previous.files.keys() {
                 if !next.files.contains_key(id) {
@@ -2126,6 +2115,15 @@ impl SessionManager {
             .await
             .ok_or_else(|| anyhow!("session not found: {}", p.session_id))?;
         self.handle_event(&entry, p.event).await;
+        Ok(())
+    }
+
+    pub async fn delete_widget(&self, p: SessionWidgetDeleteParams) -> Result<()> {
+        self.get_entry(&p.session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", p.session_id))?;
+        self.storage.delete_widget(&p.session_id, &p.panel_id)?;
+        self.broadcast_widget_event(&p.session_id, SessionEvent::UiDelete { id: p.panel_id });
         Ok(())
     }
 

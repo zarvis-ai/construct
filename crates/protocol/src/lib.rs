@@ -190,6 +190,12 @@ pub struct SessionEmitEventParams {
     pub event: SessionEvent,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionWidgetDeleteParams {
+    pub session_id: String,
+    pub panel_id: String,
+}
+
 /// Payload carried by the [`ahp_notif::EVENT`] notification from adapter → daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
@@ -263,6 +269,10 @@ pub struct UiAction {
     pub key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub style: Option<String>,
+    /// Close the containing widget after dispatch. Parsed from action links
+    /// such as `[OK](agentd:action/ok?close=1)`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub close: bool,
 }
 
 /// A structured event emitted by an adapter while running a session.
@@ -611,6 +621,7 @@ pub mod ipc_method {
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_KILL: &str = "session.kill";
     pub const SESSION_DELETE: &str = "session.delete";
+    pub const SESSION_WIDGET_DELETE: &str = "session.widget.delete";
     /// Respawn a session's adapter — typically used to bring a `Done`
     /// session back to life so the user can continue typing. The
     /// adapter is launched with `AGENTD_RESUME=1` so harnesses that

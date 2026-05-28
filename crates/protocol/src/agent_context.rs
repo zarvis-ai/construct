@@ -139,7 +139,7 @@ fn widget_directory(path: &Path) -> WidgetDirectory {
         dir: path.to_string_lossy().to_string(),
         glob: "*.md".to_string(),
         title_source: "filename".to_string(),
-        action_link_scheme: "agentd:action/<action-id>[?key=<key>]".to_string(),
+        action_link_scheme: "agentd:action/<action-id>[?key=<key>&close=1]".to_string(),
     }
 }
 
@@ -235,7 +235,7 @@ mod tests {
                 .session_widgets
                 .as_ref()
                 .map(|w| w.action_link_scheme.as_str()),
-            Some("agentd:action/<action-id>[?key=<key>]")
+            Some("agentd:action/<action-id>[?key=<key>&close=1]")
         );
         assert_eq!(
             context.global_memory.as_ref().map(|m| m.path.as_str()),

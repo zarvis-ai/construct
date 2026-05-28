@@ -474,6 +474,31 @@
     scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
   }
   .session-widgets[hidden] { display: none; }
+  .session-widgets.inline-open {
+    top: auto;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    width: auto;
+    max-width: none;
+    max-height: min(45vh, 280px);
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 10px 10px 0 0;
+    z-index: 45;
+  }
+  .session-widgets.inline-open .widget-body { padding-left: 16px; padding-right: 16px; }
+  .session-widgets.inline-open .widget-hide { margin-left: 0; }
+  .session-widgets.inline-open .widget-hide::before { content: none; }
+  .session-widgets.inline-open .widget-hide::after { content: none; }
+  .inline-widget-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 44;
+    background: transparent;
+  }
+  .inline-widget-backdrop[hidden] { display: none; }
   .widgets-toolbar { display: none; }
   .widgets-menu { display: grid; gap: 2px; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
   .widgets-menu-item { width: 100%; display: flex; gap: 8px; align-items: center; border: 0; background: transparent; color: var(--fg); text-align: left; padding: 5px 7px; border-radius: 6px; font: inherit; cursor: pointer; }
@@ -485,6 +510,7 @@
   .widget-card:focus { outline: 1px solid var(--accent); outline-offset: 2px; }
   .widget-title { display: flex; align-items: center; gap: 8px; padding: 2px 0 6px; border-bottom: 1px solid var(--border); color: var(--accent); font-weight: 600; }
   .widget-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .widget-title-hint { margin-left: auto; color: var(--fg-dim); font-weight: 400; }
   .widget-hide { margin-left: auto; border: 0; background: transparent; color: var(--fg-dim); padding: 0 2px; font: inherit; cursor: pointer; }
   .widget-hide:hover, .widget-hide:focus { color: var(--accent); outline: none; background: color-mix(in srgb, var(--accent) 14%, transparent); }
   .widget-body { padding: 8px; font-size: 13px; line-height: 1.35; }
@@ -1335,6 +1361,7 @@
       <div class="terminal-widget-controls" id="terminalWidgetControls" hidden>
         <button type="button" id="widgetsTrigger" aria-label="toggle widgets" hidden>widgets</button>
       </div>
+      <div class="inline-widget-backdrop" id="inlineWidgetBackdrop" hidden></div>
       <section class="session-widgets" id="sessionWidgets" hidden></section>
       <div class="editor-state" id="editorState" hidden></div>
       <!--
@@ -1509,6 +1536,7 @@ const browserPreviewCloseEl = $("browserPreviewClose");
 let browserPreviewHideTimer = null;
 const BROWSER_PREVIEW_TTL_MS = 7000;
 const editorStateEl = $("editorState");
+const inlineWidgetBackdropEl = $("inlineWidgetBackdrop");
 const sessionWidgetsEl = $("sessionWidgets");
 const vkbdEl = $("vkbd");
 const vkbdSpecialEl = $("vkbdSpecial");
@@ -1879,8 +1907,10 @@ function setConnState(s, label) {
 }
 
 function setComposerEnabled(on) {
-  insertBtn.disabled = !on;
-  enterBtn.disabled = !on;
+  const blocked = !!(state.currentId && state.widgetsById && currentInlineWidget(state.currentId));
+  inputEl.disabled = blocked;
+  insertBtn.disabled = !on || blocked;
+  enterBtn.disabled = !on || blocked;
 }
 
 function connect() {
@@ -2731,7 +2761,7 @@ function createTerminalHandle(id) {
   // codepoints; we re-encode through TextEncoder so multi-byte
   // input round-trips cleanly.
   term.onData((s) => {
-    if (state.mode !== "terminal" || state.currentId !== id) return;
+    if (state.mode !== "terminal" || state.currentId !== id || currentInlineWidget(id)) return;
     claimTerminalGeometryNow();
     const data = encodeBase64Utf8(s);
     rpc("session.pty_input", { session_id: id, data })
@@ -3100,7 +3130,7 @@ function cycleModifierState(s) {
  *  `term.onData`, used by the virtual keyboard to fire bytes
  *  the user typed on-screen. */
 function sendPtyBytes(s) {
-  if (!state.currentId || state.mode !== "terminal") return;
+  if (!state.currentId || state.mode !== "terminal" || currentInlineWidget(state.currentId)) return;
   claimTerminalGeometryNow();
   const data = encodeBase64Utf8(s);
   rpc("session.pty_input", { session_id: state.currentId, data })
@@ -3882,6 +3912,19 @@ function widgetTitleFromFilename(name) {
     .trim();
 }
 
+function isInlineWidget(panel) {
+  return String(panel && panel.placement || "sticky") === "inline";
+}
+
+function currentInlineWidget(sessionId) {
+  const panels = state.widgetsById.get(sessionId) || [];
+  return panels.filter(isInlineWidget).sort((a, b) => normalizePanelId(b).localeCompare(normalizePanelId(a)))[0] || null;
+}
+
+function stickyWidgets(panels) {
+  return panels.filter((panel) => !isInlineWidget(panel));
+}
+
 function applyWidgetPanel(sessionId, panel) {
   if (!sessionId || !panel) return;
   const panels = state.widgetsById.get(sessionId) || [];
@@ -3889,7 +3932,11 @@ function applyWidgetPanel(sessionId, panel) {
   const next = panels.filter((p) => normalizePanelId(p) !== id);
   next.push(panel);
   state.widgetsById.set(sessionId, next.sort((a, b) => normalizePanelId(a).localeCompare(normalizePanelId(b))));
-  showWidgetsTemporarily(sessionId);
+  if (isInlineWidget(panel)) {
+    state.focusedWidgetPanelId = id;
+  } else {
+    showWidgetsTemporarily(sessionId);
+  }
   if (sessionId === state.currentId) renderWidgets();
 }
 
@@ -3952,7 +3999,16 @@ function isWidgetPopoverPinned() {
 function renderWidgets() {
   const sessionId = state.currentId;
   const panels = sessionId ? (state.widgetsById.get(sessionId) || []) : [];
-  if (!sessionId || panels.length === 0) {
+  const inlinePanel = sessionId ? currentInlineWidget(sessionId) : null;
+  if (inlinePanel) {
+    renderInlineWidget(sessionId, inlinePanel);
+    return;
+  }
+  inlineWidgetBackdropEl.hidden = true;
+  sessionWidgetsEl.classList.remove("inline-open");
+  setComposerEnabled(!!(state.ws && state.ws.readyState === 1 && state.currentId));
+  const stickyPanels = stickyWidgets(panels);
+  if (!sessionId || stickyPanels.length === 0) {
     widgetsTriggerBtn.hidden = true;
     terminalWidgetsProxyBtn.hidden = true;
     terminalWidgetControlsEl.hidden = true;
@@ -3969,8 +4025,8 @@ function renderWidgets() {
   } else if (temporaryUntil) {
     state.widgetTemporaryUntilById.delete(sessionId);
   }
-  const visible = visibleWidgetIds(sessionId, panels);
-  const visiblePanels = panels.filter((panel) => visible.has(normalizePanelId(panel)));
+  const visible = visibleWidgetIds(sessionId, stickyPanels);
+  const visiblePanels = stickyPanels.filter((panel) => visible.has(normalizePanelId(panel)));
   const terminalMode = state.mode === "terminal" && !terminalWrapEl.hidden;
   widgetsTriggerBtn.hidden = terminalMode;
   terminalWidgetControlsEl.hidden = terminalMode;
@@ -3981,7 +4037,7 @@ function renderWidgets() {
   scheduleWidgetAutohide();
   sessionWidgetsEl.innerHTML = `
     <div class="widgets-menu" role="menu">
-      ${panels.map((panel) => {
+      ${stickyPanels.map((panel) => {
         const id = normalizePanelId(panel);
         const checked = visible.has(id);
         return `<button type="button" class="widgets-menu-item" role="menuitemcheckbox" aria-checked="${checked ? "true" : "false"}" data-widget-id="${attr(id)}"><span class="widgets-menu-mark">${checked ? "✓" : "·"}</span><span>${escape(widgetTitle(panel))}</span></button>`;
@@ -3992,11 +4048,30 @@ function renderWidgets() {
     </div>`;
 }
 
+function renderInlineWidget(sessionId, panel) {
+  const id = normalizePanelId(panel);
+  widgetsTriggerBtn.hidden = true;
+  terminalWidgetsProxyBtn.hidden = true;
+  terminalWidgetControlsEl.hidden = true;
+  state.widgetsDropdownOpen = true;
+  state.widgetTemporaryUntilById.delete(sessionId);
+  inlineWidgetBackdropEl.hidden = false;
+  sessionWidgetsEl.hidden = false;
+  sessionWidgetsEl.classList.add("inline-open");
+  setComposerEnabled(false);
+  sessionWidgetsEl.innerHTML = `<div class="widget-stack">${renderWidgetCard(sessionId, panel)}</div>`;
+  const card = sessionWidgetsEl.querySelector(`.widget-card[data-widget-id="${cssEscape(id)}"]`);
+  if (card && document.activeElement !== card && !card.contains(document.activeElement)) card.focus();
+}
+
 function renderWidgetCard(sessionId, panel) {
   const id = normalizePanelId(panel);
   const title = widgetTitle(panel);
+  const inline = isInlineWidget(panel);
+  const hint = inline ? `<span class="widget-title-hint">Esc closes</span>` : "";
+  const closeLabel = inline ? "x" : "[-]";
   return `<article class="widget-card" tabindex="0" data-widget-id="${attr(id)}">
-    <div class="widget-title"><span class="widget-title-text">${escape(title)}</span><button type="button" class="widget-hide" data-widget-id="${attr(id)}" aria-label="hide ${attr(title)}" title="hide widget">[-]</button></div>
+    <div class="widget-title"><span class="widget-title-text">${escape(title)}</span>${hint}<button type="button" class="widget-hide" data-widget-id="${attr(id)}" aria-label="hide ${attr(title)}" title="hide widget">${closeLabel}</button></div>
     <div class="widget-body">${renderWidgetMarkdown(panel.markdown || "", sessionId, id, { skipFirstHeading: true })}</div>
   </article>`;
 }
@@ -4114,7 +4189,7 @@ function renderInlineActions(text, sessionId, panelId) {
     const target = afterLabel.slice("(agentd:action/".length, close);
     const action = parseWidgetActionTarget(target);
     const display = action.key ? `[${action.key}] ${label}` : label;
-    out += `<button type="button" class="widget-action" data-session-id="${attr(sessionId)}" data-panel-id="${attr(panelId)}" data-action-id="${attr(action.id)}" data-action-label="${attr(label)}" data-action-key="${attr(action.key || "")}">${escape(display)}</button>`;
+    out += `<button type="button" class="widget-action" data-session-id="${attr(sessionId)}" data-panel-id="${attr(panelId)}" data-action-id="${attr(action.id)}" data-action-label="${attr(label)}" data-action-key="${attr(action.key || "")}" data-action-close="${action.close ? "1" : ""}">${escape(display)}</button>`;
     rest = afterLabel.slice(close + 1);
   }
   out += escape(stripMarkdownEmphasis(rest));
@@ -4124,18 +4199,30 @@ function renderInlineActions(text, sessionId, panelId) {
 function parseWidgetActionTarget(target) {
   const [id, query = ""] = String(target || "").split("?");
   const params = new URLSearchParams(query);
-  return { id, key: params.get("key") || null };
+  const close = ["1", "true", "yes"].includes(String(params.get("close") || ""));
+  return { id, key: params.get("key") || null, close };
 }
 
 function stripMarkdownEmphasis(text) {
   return String(text || "").replace(/[*_`]/g, "");
 }
 
-async function dispatchWidgetAction(sessionId, panelId, actionId, label) {
+async function deleteWidgetPanel(sessionId, panelId) {
+  if (!sessionId || !panelId) return;
+  removeWidgetPanel(sessionId, panelId);
+  try {
+    await rpc("session.widget.delete", { session_id: sessionId, panel_id: panelId });
+  } catch (e) {
+    appendError(`widget close failed: ${e.message}`);
+  }
+}
+
+async function dispatchWidgetAction(sessionId, panelId, actionId, label, close) {
   if (!sessionId || !actionId) return;
   const payload = { panel_id: panelId, action_id: actionId, label };
   try {
     await rpc("session.input", { session_id: sessionId, text: `OBSERVATION: ui.action ${JSON.stringify(payload)}` });
+    if (close) await deleteWidgetPanel(sessionId, panelId);
   } catch (e) {
     appendError(`widget action failed: ${e.message}`);
   }
@@ -4198,14 +4285,16 @@ sessionWidgetsEl.addEventListener("click", (ev) => {
   if (hide && state.currentId) {
     ev.preventDefault();
     ev.stopPropagation();
-    hideWidgetPanel(state.currentId, hide.dataset.widgetId);
+    const panel = (state.widgetsById.get(state.currentId) || []).find((p) => normalizePanelId(p) === hide.dataset.widgetId);
+    if (isInlineWidget(panel)) deleteWidgetPanel(state.currentId, hide.dataset.widgetId);
+    else hideWidgetPanel(state.currentId, hide.dataset.widgetId);
     return;
   }
   const item = ev.target.closest && ev.target.closest(".widgets-menu-item");
   if (item && state.currentId) {
     ev.preventDefault();
     ev.stopPropagation();
-    const panels = state.widgetsById.get(state.currentId) || [];
+    const panels = stickyWidgets(state.widgetsById.get(state.currentId) || []);
     const visible = visibleWidgetIds(state.currentId, panels);
     const id = item.dataset.widgetId;
     if (visible.has(id)) visible.delete(id);
@@ -4221,6 +4310,7 @@ sessionWidgetsEl.addEventListener("click", (ev) => {
       action.dataset.panelId,
       action.dataset.actionId,
       action.dataset.actionLabel,
+      action.dataset.actionClose === "1",
     );
   }
 });
@@ -4249,6 +4339,12 @@ terminalWidgetsProxyBtn.addEventListener("mouseleave", scheduleWidgetAutohide);
 
 sessionWidgetsEl.addEventListener("keydown", (ev) => {
   if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.isComposing) return;
+  const inlinePanel = state.currentId ? currentInlineWidget(state.currentId) : null;
+  if (inlinePanel && ev.key === "Escape") {
+    ev.preventDefault();
+    deleteWidgetPanel(state.currentId, normalizePanelId(inlinePanel));
+    return;
+  }
   if (!state.currentId || !state.focusedWidgetPanelId || ev.key.length !== 1) return;
   const selector = `.widget-card[data-widget-id="${cssEscape(state.focusedWidgetPanelId)}"] .widget-action[data-action-key="${cssEscape(ev.key)}"]`;
   const action = sessionWidgetsEl.querySelector(selector);
@@ -4259,12 +4355,24 @@ sessionWidgetsEl.addEventListener("keydown", (ev) => {
     action.dataset.panelId,
     action.dataset.actionId,
     action.dataset.actionLabel,
+    action.dataset.actionClose === "1",
   );
+});
+
+inlineWidgetBackdropEl.addEventListener("click", (ev) => {
+  ev.preventDefault();
+  const inlinePanel = state.currentId ? currentInlineWidget(state.currentId) : null;
+  if (inlinePanel) deleteWidgetPanel(state.currentId, normalizePanelId(inlinePanel));
 });
 
 document.addEventListener("click", (ev) => {
   if (!state.widgetsDropdownOpen) return;
-  if (sessionWidgetsEl.contains(ev.target) || widgetsTriggerBtn.contains(ev.target) || terminalWidgetsProxyBtn.contains(ev.target)) return;
+  if (
+    sessionWidgetsEl.contains(ev.target)
+    || inlineWidgetBackdropEl.contains(ev.target)
+    || widgetsTriggerBtn.contains(ev.target)
+    || terminalWidgetsProxyBtn.contains(ev.target)
+  ) return;
   state.widgetsDropdownOpen = false;
   stopWidgetTemporaryVisibility(state.currentId);
   renderWidgets();
@@ -4378,7 +4486,7 @@ function currentSessionHasPty() {
 /** Insert vs Enter — see the comment on the Composer section. */
 async function submitComposer({ enter }) {
   const text = inputEl.value;
-  if (!state.currentId) return;
+  if (!state.currentId || currentInlineWidget(state.currentId)) return;
   // Empty Insert is a no-op. Empty Enter on a PTY session is
   // meaningful (sends a bare `\r`), so allow it there.
   if (!text && !(enter && currentSessionHasPty())) return;

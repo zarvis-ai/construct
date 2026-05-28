@@ -26,6 +26,12 @@ const GLOBAL_MEMORY_TEMPLATE: &str =
 const PROJECT_MEMORY_TEMPLATE: &str =
     "# Project Memory\n\n## Overview\n\n## Architecture\n\n## Workflows\n\n## Decisions\n\n## Pitfalls\n";
 
+#[derive(Debug, Default)]
+struct WidgetFrontmatter {
+    placement: Option<UiPlacement>,
+    title: Option<String>,
+}
+
 pub struct Storage {
     data_dir: PathBuf,
 }
@@ -208,22 +214,37 @@ impl Storage {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let Ok(markdown) = std::fs::read_to_string(&path) else {
+            let Ok(raw_markdown) = std::fs::read_to_string(&path) else {
                 continue;
             };
+            let (frontmatter, markdown) = parse_widget_frontmatter(&raw_markdown);
             panels.push(UiPanel {
                 id: stem.to_string(),
                 source: path
                     .file_name()
                     .and_then(|s| s.to_str())
                     .map(str::to_string),
-                title: Some(stem.replace(['-', '_'], " ")),
-                placement: UiPlacement::Sticky,
+                title: frontmatter
+                    .title
+                    .or_else(|| Some(stem.replace(['-', '_'], " "))),
+                placement: frontmatter.placement.unwrap_or(UiPlacement::Sticky),
                 markdown,
             });
         }
         panels.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(panels)
+    }
+
+    pub fn delete_widget(&self, session_id: &str, panel_id: &str) -> Result<()> {
+        if !is_safe_widget_id(panel_id) {
+            anyhow::bail!("invalid widget id: {panel_id}");
+        }
+        let dir = self.widgets_dir(session_id);
+        let path = dir.join(format!("{panel_id}.md"));
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        }
+        Ok(())
     }
 
     pub fn ensure_session_dir(&self, id: &str) -> Result<()> {
@@ -469,6 +490,59 @@ impl Storage {
     }
 }
 
+fn is_safe_widget_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn parse_widget_frontmatter(raw: &str) -> (WidgetFrontmatter, String) {
+    let Some(rest) = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    else {
+        return (WidgetFrontmatter::default(), raw.to_string());
+    };
+    let mut byte_offset = raw.len().saturating_sub(rest.len());
+    let mut frontmatter = String::new();
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        byte_offset += line.len();
+        if trimmed == "---" {
+            let parsed = parse_widget_frontmatter_fields(&frontmatter);
+            return (parsed, raw[byte_offset..].to_string());
+        }
+        frontmatter.push_str(line);
+    }
+    (WidgetFrontmatter::default(), raw.to_string())
+}
+
+fn parse_widget_frontmatter_fields(frontmatter: &str) -> WidgetFrontmatter {
+    let mut parsed = WidgetFrontmatter::default();
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        match key.trim() {
+            "placement" if value.eq_ignore_ascii_case("inline") => {
+                parsed.placement = Some(UiPlacement::Inline);
+            }
+            "placement" if value.eq_ignore_ascii_case("sticky") => {
+                parsed.placement = Some(UiPlacement::Sticky);
+            }
+            "title" if !value.is_empty() => parsed.title = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    parsed
+}
+
 fn ensure_memory_file(path: &Path, template: &str) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -492,6 +566,42 @@ fn safe_memory_segment(raw: &str) -> String {
         "unknown".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod widget_tests {
+    use super::*;
+
+    #[test]
+    fn delete_widget_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+
+        let err = storage.delete_widget("s1", "../memory").unwrap_err();
+
+        assert!(err.to_string().contains("invalid widget id"));
+    }
+
+    #[test]
+    fn read_widgets_parses_inline_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let dir = storage.ensure_widgets_dir("s1").unwrap();
+        std::fs::write(
+            dir.join("confirm.md"),
+            "---\nplacement: inline\ntitle: Confirm action\n---\n# Confirm\n\n[OK](agentd:action/ok?close=1)\n",
+        )
+        .unwrap();
+
+        let widgets = storage.read_widgets("s1").unwrap();
+
+        assert_eq!(widgets.len(), 1);
+        assert_eq!(widgets[0].id, "confirm");
+        assert_eq!(widgets[0].title.as_deref(), Some("Confirm action"));
+        assert_eq!(widgets[0].placement, UiPlacement::Inline);
+        assert!(widgets[0].markdown.starts_with("# Confirm"));
+        assert!(!widgets[0].markdown.contains("placement:"));
     }
 }
 
