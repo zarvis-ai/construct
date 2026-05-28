@@ -19,9 +19,9 @@ you. Remote control from your phone when you're in motion.
   observe all your sessions across different harnesses.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
   output, spawn helpers, send input, inspect diffs, and drive Chrome.
-- **Generative widgets for live agent status** — sessions can render compact
-  checklists, progress timelines, and action buttons right inside the TUI or
-  web client.
+- **Generative widgets** — agentd generates and updates widgets for your task,
+  so you can track progress, review outputs, and take action without leaving
+  the TUI or web client.
 
   <img src="https://raw.githubusercontent.com/zarvis-ai/agentd/0b9df04fb1fb40b2cea5f7e42b2e249a649b0ec2/demos/generative-widgets.gif" alt="agentd generative widgets demo" width="50%">
 - **[Remote control](docs/remote-control.md) when you step away** — `/remote-control`
