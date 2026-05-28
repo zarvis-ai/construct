@@ -14,10 +14,16 @@ you. Remote control from your phone when you're in motion.
   Zarvis, or a shell process from one focused workspace that rewards attention.
 
   <img src="https://raw.githubusercontent.com/zarvis-ai/agentd/f8fae6e5227ccd0b2140c35ce6e2ad16349da848/demos/new-session.gif" alt="agentd new session demo" width="50%">
-- **Parallel work without losing control** — spawn helper sessions, pin important
-  work, interrupt stuck runs, inspect diffs, and send follow-up input mid-turn.
+- **A delightful way to manage multiple Claude Code and Codex sessions** —
+  switch sessions instantly, pin multiple sessions to monitor, or let an agent
+  observe all your sessions across different harnesses.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
   output, spawn helpers, send input, inspect diffs, and drive Chrome.
+- **Generative widgets** — agentd generates and updates widgets for your task,
+  so you can track progress, review outputs, and take action without leaving
+  the TUI or web client.
+
+  <img src="https://raw.githubusercontent.com/zarvis-ai/agentd/0b9df04fb1fb40b2cea5f7e42b2e249a649b0ec2/demos/generative-widgets.gif" alt="agentd generative widgets demo" width="50%">
 - **[Remote control](docs/remote-control.md) when you step away** — `/remote-control`
   opens a browser-accessible web client with a QR code. Connect from your phone,
   no service signup, no setup required.
