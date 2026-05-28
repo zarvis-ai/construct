@@ -44,7 +44,8 @@
 //! (antigravity currently nests under the gemini dir); override with
 //! `AGENTD_ANTIGRAVITY_HOME`.
 //!
-//! Env overrides: `AGENTD_ANTIGRAVITY_BIN` (binary, default `agy`),
+//! Env overrides: `AGENTD_ANTIGRAVITY_CMD` (full command prefix),
+//! `AGENTD_ANTIGRAVITY_BIN` (binary, default `agy`),
 //! `AGENTD_ANTIGRAVITY_MODE` (`interactive`|`headless`).
 
 use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
@@ -106,8 +107,12 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
     }
 }
 
-fn bin() -> String {
-    std::env::var("AGENTD_ANTIGRAVITY_BIN").unwrap_or_else(|_| "agy".into())
+fn command_override() -> agentd_protocol::adapter::CommandOverride {
+    agentd_protocol::adapter::resolve_command_override(
+        "AGENTD_ANTIGRAVITY_CMD",
+        "AGENTD_ANTIGRAVITY_BIN",
+        "agy",
+    )
 }
 
 fn session_data_dir() -> Option<PathBuf> {
@@ -181,8 +186,9 @@ fn parse_conversation_id(log_text: &str) -> Option<String> {
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
-    let bin = bin();
-    let mut args = params.args.clone();
+    let command = command_override();
+    let mut args = command.args.clone();
+    args.extend(params.args.clone());
 
     let resuming = std::env::var("AGENTD_RESUME").as_deref() == Ok("1");
     let log_path = session_data_dir().map(|d| d.join("agy.log"));
@@ -226,7 +232,8 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         .collect();
     env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
 
-    let label = bin.clone();
+    let label = command.argv_preview();
+    let bin = command.bin;
     let spec = PtySpec {
         bin,
         args,
@@ -262,7 +269,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         mut inbox,
     } = ctx;
 
-    let bin = bin();
+    let command_override = command_override();
     let cwd = PathBuf::from(&params.cwd);
     let extra_args = params.args.clone();
     let mut env: Vec<(String, String)> = params
@@ -325,7 +332,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             .map(|d| d.join("agy-headless.log"))
             .unwrap_or_else(|| PathBuf::from("agy-headless.log"));
 
-        let mut child_args: Vec<String> = Vec::new();
+        let mut child_args: Vec<String> = command_override.args.clone();
         child_args.push("-p".into());
         child_args.push(user_text.clone());
         child_args.push("--dangerously-skip-permissions".into());
@@ -339,7 +346,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             child_args.push(a.clone());
         }
 
-        let mut command = Command::new(&bin);
+        let mut command = Command::new(&command_override.bin);
         for a in &child_args {
             command.arg(a);
         }
@@ -357,7 +364,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(&bin, &e),
+                    message: agentd_protocol::adapter::missing_bin_hint(
+                        &command_override.argv_preview(),
+                        &e,
+                    ),
                 });
                 break 127;
             }
