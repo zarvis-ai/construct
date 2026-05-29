@@ -1630,6 +1630,10 @@ const state = {
   // prompts (codex with tool-heavy turns) don't lose any.
   approvalQueue: [],
   approvalShown: null,
+  // Logical session-list visibility. Keep this separate from the
+  // responsive CSS classes because narrow-screen auto-hide after
+  // selecting a session is intentionally not persisted to storage.
+  sessionListVisible: true,
 };
 
 const LARGE_TEXT_PASTE_CHARS = 16 * 1024;
@@ -3287,6 +3291,7 @@ function setSessionListWidth(width, persist = true) {
 }
 
 function setSessionListVisible(visible, persist = true) {
+  state.sessionListVisible = !!visible;
   if (isNarrowLayout()) {
     sessionListEl.classList.toggle("collapsed", !visible);
   } else {
@@ -3301,9 +3306,7 @@ function setSessionListVisible(visible, persist = true) {
 }
 
 function isSessionListVisible() {
-  return isNarrowLayout()
-    ? !sessionListEl.classList.contains("collapsed")
-    : !mainEl.classList.contains("session-list-hidden");
+  return state.sessionListVisible;
 }
 
 function currentSessionListWidth() {
@@ -3353,8 +3356,7 @@ if (sessionListResizerEl) {
 
 window.addEventListener("resize", () => {
   setSessionListWidth(currentSessionListWidth(), false);
-  const storedVisible = localStorage.getItem(SESSION_LIST_VISIBLE_KEY);
-  setSessionListVisible(storedVisible !== "0", false);
+  setSessionListVisible(state.sessionListVisible, false);
 });
 
 // --- Transcript rendering -------------------------------------------------

@@ -339,6 +339,59 @@ async fn web_client_loads_and_websocket_connects() {
         "visible keyboard switch should preserve terminal focus: {switch_focus:?}"
     );
 
+    // Mobile regression: selecting a session auto-hides the narrow session
+    // list without changing the stored preference. Keyboard/viewport resizes
+    // must preserve that current hidden state instead of re-reading the older
+    // stored "visible" preference and expanding the list from the top.
+    let list_resize: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const saved = {
+                isNarrowLayout,
+                sessionListVisible: state.sessionListVisible,
+                storage: localStorage.getItem(SESSION_LIST_VISIBLE_KEY),
+                mode: state.mode,
+              };
+              try {
+                isNarrowLayout = () => true;
+                state.mode = 'chat';
+                localStorage.setItem(SESSION_LIST_VISIBLE_KEY, '1');
+                setSessionListVisible(false, false);
+                const before = {
+                  visible: isSessionListVisible(),
+                  collapsed: document.getElementById('sessionList').classList.contains('collapsed'),
+                  stored: localStorage.getItem(SESSION_LIST_VISIBLE_KEY),
+                };
+                window.dispatchEvent(new Event('resize'));
+                const after = {
+                  visible: isSessionListVisible(),
+                  collapsed: document.getElementById('sessionList').classList.contains('collapsed'),
+                  stored: localStorage.getItem(SESSION_LIST_VISIBLE_KEY),
+                };
+                return { before, after };
+              } finally {
+                isNarrowLayout = saved.isNarrowLayout;
+                state.sessionListVisible = saved.sessionListVisible;
+                state.mode = saved.mode;
+                if (saved.storage === null) localStorage.removeItem(SESSION_LIST_VISIBLE_KEY);
+                else localStorage.setItem(SESSION_LIST_VISIBLE_KEY, saved.storage);
+                setSessionListVisible(saved.sessionListVisible, false);
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate session list resize")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(list_resize["before"]["visible"], false);
+    assert_eq!(list_resize["before"]["collapsed"], true);
+    assert_eq!(list_resize["before"]["stored"], "1");
+    assert_eq!(list_resize["after"]["visible"], false);
+    assert_eq!(list_resize["after"]["collapsed"], true);
+    assert_eq!(list_resize["after"]["stored"], "1");
+
     // Issue #132: the web session list exposes pin/unpin in the
     // selected-session toolbar and marks pinned rows visibly.
     let pin_ui: serde_json::Value = page
