@@ -114,7 +114,7 @@ impl Daemon {
         }
         // Disable the orchestrator session in e2e. Without this,
         // CI runners (which have the zarvis adapter binary built
-        // and discoverable) auto-spawn a "god" session whose
+        // and discoverable) auto-spawn an "operator" session whose
         // panel grabs initial keyboard focus — keys then route
         // to the orchestrator's editor instead of the global
         // keymap, and chords like `Ctrl-x x` (palette) silently

@@ -330,7 +330,7 @@ pub struct App {
     /// replay.
     pub hydrating_sessions: HashSet<String>,
     /// Scrollback offset for the daemon-owned orchestrator panel rendered in
-    /// the minibuffer. Kept separate from `view_scrollback` so reading god
+    /// the minibuffer. Kept separate from `view_scrollback` so reading operator
     /// history does not leave the main session view scrolled when the panel
     /// closes.
     pub orchestrator_scrollback: usize,
@@ -3033,7 +3033,7 @@ impl App {
                     self.resizing_pin_strip = Some((ev.row, cur_h));
                     return;
                 }
-                // God/minibuffer panel: the top border is the panel's title
+                // Operator/minibuffer panel: the top border is the panel's title
                 // area and acts as a vertical resize handle.
                 if self.is_on_orchestrator_panel_divider(ev.column, ev.row) {
                     let cur_h = self.layout.minibuffer_area.map(|a| a.height).unwrap_or(
@@ -3266,8 +3266,8 @@ impl App {
         row == view_bottom && col >= strip.x && col < strip.x + strip.width
     }
 
-    /// True if `(col, row)` sits on the orchestrator/god panel's top border.
-    /// That border is the visible horizontal title line when god is focused
+    /// True if `(col, row)` sits on the orchestrator/operator panel's top border.
+    /// That border is the visible horizontal title line when operator is focused
     /// and is used as a vertical resize handle.
     fn is_on_orchestrator_panel_divider(&self, col: u16, row: u16) -> bool {
         if !self.is_orchestrator_panel_open() {
@@ -4261,13 +4261,13 @@ impl App {
         // returns the user to whichever session they had focused
         // before typing the slash. Without the orchestrator-close
         // step, the panel keeps routing every subsequent keystroke
-        // to god's PTY — the user reported "couldn't type prompt
+        // to operator's PTY — the user reported "couldn't type prompt
         // from tui after enabling remote control" because of this.
         //
         // Non-Esc keys are *eaten* while the popup is visible — the
         // popup body is informational only (URL + QR), and falling
         // through to the underlying handler would silently route
-        // typing into god / a session under the modal.
+        // typing into operator / a session under the modal.
         if self.remote_control_popup.is_some() {
             if matches!(key.code, KeyCode::Esc) {
                 self.remote_control_popup = None;
@@ -5003,7 +5003,7 @@ impl App {
         }
         // Everything else goes to the orchestrator's PTY.
         if let Some(bytes) = encode_key_to_bytes(key) {
-            // Typing into god snaps back to live output, matching the main
+            // Typing into operator snaps back to live output, matching the main
             // PTY pane's behavior.
             self.orchestrator_scrollback = 0;
             self.queue_pty_input(orch_id, bytes, "orchestrator pty_input");
@@ -8065,7 +8065,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_bounds_use_minibuffer_line_for_god_area() {
+    fn selection_bounds_use_minibuffer_line_for_operator_area() {
         let bounds = selection_bounds_for_layout(&test_layout(), 0, false, 0, 29);
 
         assert_eq!(bounds, Some(Rect::new(0, 29, 100, 4)));

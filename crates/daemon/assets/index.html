@@ -313,15 +313,15 @@
     cursor: pointer;
     color: var(--fg-dim);
   }
-  /* God / orchestrator row — pinned at the top, name in the
-     accent color so it stands out as the special "fleet
-     dispatcher" session. */
-  .session-list .item.is-god .name {
+  /* Operator / orchestrator row — pinned at the top, name in
+     the accent color so it stands out as the special fleet
+     dispatcher session. */
+  .session-list .item.is-operator .name {
     color: var(--accent);
     font-weight: 600;
     letter-spacing: 0.02em;
   }
-  .session-list .item.is-god {
+  .session-list .item.is-operator {
     border-bottom: 1px solid var(--border);
     margin-bottom: 4px;
   }
@@ -2018,17 +2018,17 @@ async function refreshSessions() {
       rpc("project.list", null).catch(() => []),
     ]);
     state.sessions = Array.isArray(list) ? list : [];
-    // The orchestrator session ("god") used to be filtered out
+    // The orchestrator session ("operator") used to be filtered out
     // to mirror the TUI, which surfaces it via a special
     // minibuffer panel instead of the list. The web client
-    // doesn't have that panel, so include god in the list at the
+    // doesn't have that panel, so include operator in the list at the
     // top — `orderedItems` pins it ahead of everything else.
     state.groups = Array.isArray(groups) ? groups : [];
     renderSessions();
-    // Auto-select the first *user* session; god is shown but
+    // Auto-select the first *user* session; operator is shown but
     // shouldn't be the default landing — most phone visits are
     // to look at a real workload, not the dispatcher. Fall back
-    // to god only when there are no user sessions yet.
+    // to operator only when there are no user sessions yet.
     if (!state.currentId) {
       const ordered = orderedSessions();
       const firstUser = ordered.find((s) => s.kind !== "orchestrator");
@@ -2053,10 +2053,10 @@ async function refreshSessions() {
  * differently.
  */
 function orderedItems() {
-  // God session (orchestrator) goes at the very top, distinct
+  // Operator session (orchestrator) goes at the very top, distinct
   // from the position-sorted user sessions. No reorder or
   // restart actions on this row — the daemon owns its lifecycle.
-  const god = state.sessions.find((s) => s.kind === "orchestrator");
+  const operator = state.sessions.find((s) => s.kind === "orchestrator");
   const userSessions = state.sessions.filter((s) => s.kind === "user" || !s.kind);
   const subagentsByParent = new Map();
   for (const s of state.sessions.filter((s) => s.kind === "subagent")) {
@@ -2096,7 +2096,7 @@ function orderedItems() {
     .slice()
     .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   const items = [];
-  if (god) items.push({ kind: "session", session: god, isGod: true });
+  if (operator) items.push({ kind: "session", session: operator, isOperator: true });
   for (const s of ungrouped) pushSession(items, s);
   for (const g of groups) {
     items.push({ kind: "group", group: g });
@@ -2182,14 +2182,14 @@ function renderSessions() {
       const disclosure = item.hasChildren
         ? `<span class="disclosure can-toggle" data-parent-id="${attr(s.id)}">${item.childrenExpanded ? "▾" : "▸"}</span>`
         : `<span class="disclosure"></span>`;
-      // God / orchestrator session is rendered with a fixed
-      // "god" label. Lifecycle is daemon-owned so no action
+      // Operator / orchestrator session is rendered with a fixed
+      // "operator" label. Lifecycle is daemon-owned so no action
       // affordances ever apply.
-      if (item.isGod) {
+      if (item.isOperator) {
         return `
-          <div class="item is-god ${active}" data-id="${attr(s.id)}">
+          <div class="item is-operator ${active}" data-id="${attr(s.id)}">
             ${sessionStatusHtml(s)}
-            <div class="name">god</div>
+            <div class="name">operator</div>
           </div>`;
       }
       // Two-line row: title on top, dim harness sub-line below.
@@ -2233,7 +2233,7 @@ function renderSessions() {
 /** Recompute enable/disable state of the shared toolbar buttons
  *  against the currently-selected session. Restart only enables
  *  on terminal-state sessions; move-up/down enable as long as
- *  there's a non-god selection. */
+ *  there's a non-operator selection. */
 function refreshListToolbar() {
   const sel = state.sessions.find((s) => s.id === state.currentId);
   const isUserSession = sel && sel.kind !== "orchestrator";
@@ -2255,7 +2255,7 @@ function refreshListToolbar() {
     pinBtn.setAttribute("aria-label", pinned ? "unpin selected" : "pin selected");
     pinBtn.title = pinned ? "Unpin selected" : "Pin selected";
   }
-  // Rename/delete user sessions only — god's label/lifecycle is daemon-owned.
+  // Rename/delete user sessions only — operator's label/lifecycle is daemon-owned.
   if (renameBtn) renameBtn.disabled = !isUserSession;
   if (deleteBtn) deleteBtn.disabled = !isUserSession;
   if (restartBtn) restartBtn.disabled = !sel || !terminal;
