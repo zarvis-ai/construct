@@ -392,6 +392,75 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(list_resize["after"]["collapsed"], true);
     assert_eq!(list_resize["after"]["stored"], "1");
 
+    // The daemon-owned orchestrator session is user-facing as "operator" in
+    // the web list, matching the Matrix-inspired command surface language.
+    let operator_label: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const saved = {
+                currentId: state.currentId,
+                sessions: state.sessions,
+                groups: state.groups,
+              };
+              try {
+                state.currentId = 's-operator';
+                state.sessions = [
+                  {
+                    id: 's-user',
+                    title: 'Worker',
+                    harness: 'shell',
+                    state: 'running',
+                    kind: 'user',
+                    position: 0,
+                  },
+                  {
+                    id: 's-operator',
+                    title: 'orchestrator',
+                    harness: 'zarvis',
+                    state: 'running',
+                    kind: 'orchestrator',
+                    position: 99,
+                  },
+                ];
+                state.groups = [];
+                renderSessions();
+                const row = document.querySelector('.item.is-operator');
+                return {
+                  text: row ? row.innerText : '',
+                  firstId: document.querySelector('.session-list .item')?.dataset.id || '',
+                  hasOldGodClass: !!document.querySelector('.item.is-god'),
+                };
+              } finally {
+                state.currentId = saved.currentId;
+                state.sessions = saved.sessions;
+                state.groups = saved.groups;
+                renderSessions();
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate operator label")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert!(
+        operator_label["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("operator"),
+        "orchestrator row should render as operator: {operator_label:?}"
+    );
+    assert!(
+        !operator_label["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("god"),
+        "orchestrator row should not render old god label: {operator_label:?}"
+    );
+    assert_eq!(operator_label["firstId"], "s-operator");
+    assert_eq!(operator_label["hasOldGodClass"], false);
+
     // Issue #132: the web session list exposes pin/unpin in the
     // selected-session toolbar and marks pinned rows visibly.
     let pin_ui: serde_json::Value = page

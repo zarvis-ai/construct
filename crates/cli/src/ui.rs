@@ -4510,7 +4510,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         ZoomMode::View => (
             "zoomed: view — ",
             vec![
-                ("C-x x god", KeyAction::OpenCommandPalette),
+                ("C-x x operator", KeyAction::OpenCommandPalette),
                 ("C-x z unzoom", KeyAction::ToggleZoom),
                 ("C-x o list", KeyAction::SwitchFocus),
             ],
@@ -4518,7 +4518,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         ZoomMode::List => (
             "zoomed: list — ",
             vec![
-                ("C-x x god", KeyAction::OpenCommandPalette),
+                ("C-x x operator", KeyAction::OpenCommandPalette),
                 ("C-x z unzoom", KeyAction::ToggleZoom),
                 ("C-x o view", KeyAction::SwitchFocus),
             ],
@@ -4526,7 +4526,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         ZoomMode::None => (
             "",
             vec![
-                ("C-x x god", KeyAction::OpenCommandPalette),
+                ("C-x x operator", KeyAction::OpenCommandPalette),
                 ("C-x z zoom", KeyAction::ToggleZoom),
             ],
         ),
