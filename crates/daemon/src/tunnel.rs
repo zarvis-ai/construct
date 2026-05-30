@@ -146,7 +146,11 @@ async fn run_once(remote: &RemoteState, local_port: u16) -> Result<()> {
                     // test.
                     let browser_url = format!("https://{host_path}/t/{token}");
                     let ws_url = format!("wss://{host_path}/t/{token}");
-                    print_qr(&browser_url);
+                    // The QR + URL render in the TUI's `/remote-control` modal
+                    // and the webui — no need to dump them to the daemon's
+                    // stdout where every restart re-paints a full-screen QR
+                    // into the user's scrollback. The structured log line below
+                    // keeps both URLs discoverable for `tail -f` / journalctl.
                     tracing::info!(
                         browser = %browser_url,
                         wss = %ws_url,
@@ -192,15 +196,6 @@ fn extract_trycloudflare_url(line: &str) -> Option<String> {
     }
 }
 
-fn print_qr(content: &str) {
-    let rendered = match crate::remote::render_qr_dense1x2(content) {
-        Some(r) => r,
-        None => return,
-    };
-    // Use println! rather than tracing so the QR code lands on a
-    // human-readable terminal without log-format adornment.
-    println!("\n{rendered}\n  scan to open in a mobile client:\n  {content}\n");
-}
 
 #[cfg(test)]
 mod tests {
