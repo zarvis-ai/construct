@@ -3,7 +3,7 @@
 use crate::app::{
     App, HarnessHit, HintZone, ListItem as AppListItem, MainWindowTree, Minibuffer,
     MinibufferIntent, PaneFocus, ScreenPoint, Selection, TextSelectionRange, ViewMode,
-    WindowPaneHit, WindowSplitDirection, ZoomMode,
+    WindowDividerHit, WindowPaneHit, WindowSplitDirection, ZoomMode,
 };
 use crate::keymap::KeyAction;
 use crate::theme::Theme;
@@ -104,6 +104,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_triggers.clear();
     app.layout.main_window_areas.clear();
+    app.layout.main_window_dividers.clear();
     app.window_pane_sizes.clear();
     app.layout.dynamic_ui_popover_area = None;
     app.layout.dynamic_ui_scroll_metrics = None;
@@ -2155,7 +2156,13 @@ fn render_pin_transition(f: &mut Frame, area: Rect, app: &App, session_id: &str)
 }
 
 fn render_main_windows(f: &mut Frame, area: Rect, app: &mut App) {
-    fn render_node(f: &mut Frame, area: Rect, app: &mut App, node: &MainWindowTree) {
+    fn render_node(
+        f: &mut Frame,
+        area: Rect,
+        app: &mut App,
+        node: &MainWindowTree,
+        next_split_id: &mut u64,
+    ) {
         match node {
             MainWindowTree::Leaf { id, selection } => {
                 let old_selection = app.selection.clone();
@@ -2183,6 +2190,8 @@ fn render_main_windows(f: &mut Frame, area: Rect, app: &mut App) {
                 first,
                 second,
             } => {
+                let split_id = *next_split_id;
+                *next_split_id += 1;
                 let first_pct = (*ratio_percent).clamp(10, 90);
                 let chunks = Layout::default()
                     .direction(match direction {
@@ -2194,13 +2203,41 @@ fn render_main_windows(f: &mut Frame, area: Rect, app: &mut App) {
                         Constraint::Percentage(100 - first_pct),
                     ])
                     .split(area);
-                render_node(f, chunks[0], app, first);
-                render_node(f, chunks[1], app, second);
+                let divider = match direction {
+                    WindowSplitDirection::Right => Rect::new(
+                        chunks[0]
+                            .x
+                            .saturating_add(chunks[0].width)
+                            .saturating_sub(1),
+                        area.y,
+                        2.min(area.width),
+                        area.height,
+                    ),
+                    WindowSplitDirection::Below => Rect::new(
+                        area.x,
+                        chunks[0]
+                            .y
+                            .saturating_add(chunks[0].height)
+                            .saturating_sub(1),
+                        area.width,
+                        2.min(area.height),
+                    ),
+                };
+                app.layout.main_window_dividers.push(WindowDividerHit {
+                    parent: split_id,
+                    direction: *direction,
+                    area: divider,
+                    parent_area: area,
+                    ratio_percent: first_pct,
+                });
+                render_node(f, chunks[0], app, first, next_split_id);
+                render_node(f, chunks[1], app, second, next_split_id);
             }
         }
     }
     let tree = app.main_windows.clone();
-    render_node(f, area, app, &tree);
+    let mut next_split_id = 1;
+    render_node(f, area, app, &tree, &mut next_split_id);
 }
 
 fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64>) {
