@@ -99,6 +99,47 @@ Use [vhs](https://github.com/charmbracelet/vhs) to capture deterministic mp4 / g
 
 Edit `index.html` → save → the browser reloads itself (the injected poller watches `/dev/version`, a combined mtime of the served files). No rebuild, no daemon restart. Release builds ignore all of this and always serve the embedded, tamper-proof assets.
 
+## Design specs
+
+Use `specs/` for durable design decisions that future agents must preserve while changing agentd. These are normative records of intent and constraints, not code navigation notes.
+
+- **Add or update a spec when a change creates, changes, or depends on a key design decision.** This includes architecture, abstraction boundaries, UX semantics, persistence behavior, protocols/events, harness contracts, operational conventions, and cross-client behavior. Do not add a spec for routine implementation details or one-off bug fixes unless the fix establishes a reusable rule.
+- **Keep each spec focused on one decision.** Prefer many small files over a broad document that mixes unrelated rules.
+- **Name specs with a stable sequence and slug.** Use `specs/NNNN-title-kebab-case.md`. If `specs/` does not exist yet, create it in the same PR as the first spec.
+- **Document intent, not current code.** Avoid file paths, function names, line numbers, or implementation anchors that will go stale. Agents should inspect the current codebase separately after reading the spec.
+- **Update existing specs when behavior changes.** Do not leave conflicting design records in place. Mark old decisions as `superseded` or edit them when the decision itself has evolved.
+
+Use this format:
+
+```md
+# NNNN-title-kebab-case
+
+Status: accepted | proposed | superseded | deprecated
+Date: YYYY-MM-DD
+Area: architecture | protocol | ux | persistence | harness | cli | tui | webui | convention
+Scope: one sentence
+
+## Decision
+
+The rule or design choice that should remain true.
+
+## Reason
+
+Why this decision exists: user need, system constraint, failure mode, tradeoff, or product intent.
+
+## Consequences
+
+What future changes must preserve, what tradeoffs are accepted, and what this decision makes harder.
+
+## Non-Goals
+
+Optional. Boundaries that prevent overgeneralizing the decision.
+
+## Examples
+
+Optional. Concrete behavior examples without relying on current file names or function names.
+```
+
 ## The minibuffer is just another session
 
 Most TUIs make the bottom command bar a special UI primitive. We don't — it's a regular zarvis session, persisted on disk like any other. Differences:
