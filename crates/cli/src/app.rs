@@ -5048,7 +5048,13 @@ impl App {
                         self.focus = PaneFocus::List;
                     }
                     ZoomMode::None => match self.focus {
-                        PaneFocus::List => self.focus = PaneFocus::View,
+                        PaneFocus::List => {
+                            if let Some(id) = self.leaf_window_ids().first().copied() {
+                                self.focus_main_window(id);
+                            } else {
+                                self.focus = PaneFocus::View;
+                            }
+                        }
                         PaneFocus::View => {
                             let ids = self.leaf_window_ids();
                             if let Some(pos) =
@@ -6620,6 +6626,31 @@ mod tests {
             automode: false,
             kind,
         }
+    }
+
+    #[tokio::test]
+    async fn switch_focus_cycles_list_then_first_split_window() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        app.active_window_id = 2;
+        app.focus = PaneFocus::List;
+
+        app.run_action(KeyAction::SwitchFocus).await;
+
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.active_window_id, 1);
+        server.abort();
     }
 
     #[tokio::test]
