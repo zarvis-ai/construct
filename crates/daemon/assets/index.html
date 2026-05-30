@@ -2512,6 +2512,24 @@ async function handleRowAction(action, sessionId) {
     openRenameDialog(sessionId);
     return;
   }
+  if (action === "pin") {
+    // Optimistic: flip the star + toolbar instantly instead of waiting on
+    // the round-trip. The session/state echo reconciles the authoritative
+    // value (idempotent); roll back if the RPC fails.
+    const s = state.sessions.find((x) => x.id === sessionId);
+    if (!s) return;
+    const prev = !!s.pinned;
+    s.pinned = !prev;
+    scheduleRenderSessions();
+    try {
+      await rpc("session.set_pinned", { session_id: sessionId, pinned: !prev });
+    } catch (e) {
+      s.pinned = prev;
+      scheduleRenderSessions();
+      appendError(`pin failed: ${e.message}`);
+    }
+    return;
+  }
   if (action === "delete") {
     const s = state.sessions.find((x) => x.id === sessionId);
     const label = (s && sessionDisplayTitle(s)) || sessionId.slice(0, 8);
@@ -2524,12 +2542,6 @@ async function handleRowAction(action, sessionId) {
       await rpc("session.move", { session_id: sessionId, direction: "up" });
     } else if (action === "move-down") {
       await rpc("session.move", { session_id: sessionId, direction: "down" });
-    } else if (action === "pin") {
-      const s = state.sessions.find((x) => x.id === sessionId);
-      await rpc("session.set_pinned", {
-        session_id: sessionId,
-        pinned: !(s && s.pinned),
-      });
     } else if (action === "delete") {
       await rpc("session.delete", { session_id: sessionId });
     }
@@ -5082,15 +5094,26 @@ async function submitRename(ev) {
   // (it's an `Option<String>` server-side).
   const params = { session_id: sessionId };
   if (raw) params.title = raw;
-  renameSaveBtn.disabled = true;
-  renameErrorEl.hidden = true;
+  // Optimistic: apply the new title locally and close the dialog
+  // immediately, so the rename feels instant and doesn't depend on the
+  // session/state echo (which can lag — see #272). Roll back if it fails.
+  const s = state.sessions.find((x) => x.id === sessionId);
+  const prevTitle = s ? s.title : undefined;
+  if (s) {
+    s.title = raw || null;
+    scheduleRenderSessions();
+    if (sessionId === state.currentId) sessionTitleEl.textContent = sessionViewTitle(s);
+  }
+  closeRenameDialog();
   try {
     await rpc("session.set_title", params);
-    closeRenameDialog();
   } catch (e) {
-    renameSaveBtn.disabled = false;
-    renameErrorEl.textContent = `rename failed: ${e.message}`;
-    renameErrorEl.hidden = false;
+    if (s) {
+      s.title = prevTitle;
+      scheduleRenderSessions();
+      if (sessionId === state.currentId) sessionTitleEl.textContent = sessionViewTitle(s);
+    }
+    appendError(`rename failed: ${e.message}`);
   }
 }
 
