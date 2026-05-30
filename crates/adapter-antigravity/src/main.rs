@@ -115,6 +115,14 @@ fn command_override() -> agentd_protocol::adapter::CommandOverride {
     )
 }
 
+// The daemon's auto-approval policy (`AGENTD_AUTO_APPROVE_PATHS`, see
+// `agentd_protocol::adapter::policy`) is set, but `agy` only exposes a
+// global `--dangerously-skip-permissions` and no path-scoped allow-list, so
+// there's no native translation to apply in interactive mode. Headless mode
+// already auto-approves via that global flag, which is why widget writes
+// don't prompt there. A finer-grained translation would need an upstream
+// agy feature or for agentd to intercept its tool calls.
+
 fn session_data_dir() -> Option<PathBuf> {
     std::env::var("AGENTD_SESSION_DATA_DIR")
         .ok()

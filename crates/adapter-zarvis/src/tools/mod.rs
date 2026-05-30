@@ -44,6 +44,40 @@ pub trait Tool: Send + Sync {
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome>;
 }
 
+/// Effective risk for a single tool call, after applying the daemon-defined
+/// auto-approval policy. A tool whose intrinsic risk is [`ToolRisk::Risky`]
+/// is downgraded to [`ToolRisk::Safe`] when its target path is covered by
+/// [`agentd_protocol::adapter::policy::AutoApprovePolicy`] — that's how the
+/// "agentd defines the policy once, harnesses honor it" abstraction lands on
+/// zarvis. Other Risky calls keep their gate.
+pub fn effective_risk(tool: &dyn Tool, input: &Value, cwd: &std::path::Path) -> ToolRisk {
+    if matches!(tool.risk(), ToolRisk::Safe) {
+        return ToolRisk::Safe;
+    }
+    if auto_approve_covers(tool.name(), input, cwd) {
+        return ToolRisk::Safe;
+    }
+    tool.risk()
+}
+
+fn auto_approve_covers(tool_name: &str, input: &Value, cwd: &std::path::Path) -> bool {
+    // Only path-targeted file writes are eligible. Shell, browser, subagent,
+    // and agentd-control tools are Risky for reasons unrelated to a file
+    // path and must keep their gate.
+    if !matches!(tool_name, "write_file" | "edit_file") {
+        return false;
+    }
+    let Some(rel) = input.get("path").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let policy = agentd_protocol::adapter::policy::AutoApprovePolicy::from_env();
+    if policy.is_empty() {
+        return false;
+    }
+    let abs = fs::resolve(cwd, rel);
+    policy.allows_path_write(&abs)
+}
+
 /// Context shared with every tool invocation. `cwd` is the session's
 /// working directory; the daemon `Client` is opened lazily on first
 /// agentd-control tool call.
@@ -195,6 +229,52 @@ mod tests {
         let out = truncate_for_model(&s, 100);
         // Should be valid UTF-8 (just by virtue of String existing).
         assert!(out.contains("[… "));
+    }
+
+    #[test]
+    fn effective_risk_downgrades_widget_dir_writes() {
+        use agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS;
+        use serde_json::json;
+
+        let widgets = std::env::temp_dir().join("agentd-policy-test-widgets");
+        // SAFETY: rust 1.86+ marks env mutation unsafe; tests are
+        // single-threaded for this module so the unsafe block is acceptable.
+        std::env::set_var(ENV_AUTO_APPROVE_PATHS, &widgets);
+
+        let cwd = std::path::PathBuf::from("/some/proj");
+        let write = fs::WriteFile;
+        let edit = fs::EditFile;
+        let shell = shell::Shell;
+
+        // Write into the widget dir → downgraded to Safe (no approval gate).
+        let widget_path = widgets.join("status.md");
+        assert!(matches!(
+            effective_risk(&write, &json!({ "path": widget_path.to_string_lossy() }), &cwd),
+            ToolRisk::Safe
+        ));
+        assert!(matches!(
+            effective_risk(
+                &edit,
+                &json!({ "path": widget_path.to_string_lossy(), "find": "a", "replace": "b" }),
+                &cwd,
+            ),
+            ToolRisk::Safe
+        ));
+
+        // Write outside the widget dir → keeps its Risky gate.
+        assert!(matches!(
+            effective_risk(&write, &json!({ "path": "/some/proj/other.md" }), &cwd),
+            ToolRisk::Risky
+        ));
+
+        // Shell stays Risky regardless — auto-approve is path-scoped, not a
+        // blanket waiver for every Risky tool.
+        assert!(matches!(
+            effective_risk(&shell, &json!({ "cmd": "ls" }), &cwd),
+            ToolRisk::Risky
+        ));
+
+        std::env::remove_var(ENV_AUTO_APPROVE_PATHS);
     }
 
     #[test]

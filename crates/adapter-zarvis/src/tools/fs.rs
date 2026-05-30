@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-fn resolve(cwd: &std::path::Path, p: &str) -> PathBuf {
+pub(crate) fn resolve(cwd: &std::path::Path, p: &str) -> PathBuf {
     let pb = PathBuf::from(p);
     if pb.is_absolute() {
         pb

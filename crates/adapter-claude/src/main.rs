@@ -97,6 +97,13 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         args.push("--mcp-config".into());
         args.push(cfg.to_string_lossy().to_string());
     }
+    // Translate the daemon-defined auto-approval policy into Claude's native
+    // `--allowed-tools` patterns. Single policy in agentd; each adapter
+    // applies it in its harness's native mechanism.
+    args.extend(
+        agentd_protocol::adapter::policy::AutoApprovePolicy::from_env()
+            .claude_allowed_tools_args(),
+    );
     // Resume support: stash our own UUID under
     // $AGENTD_SESSION_DATA_DIR/claude_session_id.txt at first spawn (passed
     // to claude as --session-id), then pass it back as --resume when the
@@ -222,6 +229,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             child_args.push("--mcp-config".into());
             child_args.push(cfg.to_string_lossy().to_string());
         }
+        child_args.extend(
+            agentd_protocol::adapter::policy::AutoApprovePolicy::from_env()
+                .claude_allowed_tools_args(),
+        );
         if let Some(sid) = &session_id {
             child_args.push("--resume".into());
             child_args.push(sid.clone());

@@ -33,6 +33,40 @@ the per-adapter env var (`AGENTD_CLAUDE_MODE`, `AGENTD_CODEX_MODE`, `AGENTD_ANTI
   - Override with `--mode interactive|headless` or
     `AGENTD_ZARVIS_MODE`.
 
+## Auto-approval policy
+
+agentd defines a single auto-approval policy per session and exposes it
+to adapters via the `AGENTD_AUTO_APPROVE_PATHS` env var (colon-separated
+absolute directories). A file-mutating tool whose target path is under
+any of those directories may run without prompting the user. The daemon
+currently seeds it with the per-session widgets dir
+(`$AGENTD_SESSION_WIDGETS_DIR`) so harnesses can refresh widgets without
+a permission prompt each time. The abstraction lives in
+`agentd_protocol::adapter::policy::AutoApprovePolicy`.
+
+Each adapter translates the policy into its harness's native mechanism.
+agentd doesn't sit in the tool-call loop for the wrapper harnesses
+(Claude / Codex / Antigravity make tool calls inside their own
+processes), so the only lever is what each upstream CLI accepts at
+spawn time:
+
+- **zarvis (native)** — `tools::effective_risk` downgrades a Risky
+  `write_file` / `edit_file` to Safe when the target path is covered.
+  Used both at the approval gate and the Safe/Risky partition, so
+  auto-approved calls also batch in the parallel group.
+- **claude (wrapper)** — translates to repeated `--allowed-tools
+  "Write(<dir>/**)" / "Edit(...)" / "MultiEdit(...)"` patterns appended
+  at spawn (interactive + headless).
+- **codex (wrapper)** — **gap**: upstream `codex` exposes only
+  mode-based (`approval_policy`) and sandbox-based knobs, no
+  path-scoped allow-list. The adapter reads the policy but has nothing
+  to translate it into, so widget writes still prompt. Tracked
+  separately for upstream/workaround follow-up.
+- **antigravity (wrapper)** — **gap**: `agy` exposes only a global
+  `--dangerously-skip-permissions` (already used by the headless mode,
+  which is why headless doesn't prompt); no path-scoped knob for
+  interactive. Same upstream gap as codex.
+
 ## Session resume across daemon restarts
 
 When the daemon restarts, sessions that were alive at the time of the

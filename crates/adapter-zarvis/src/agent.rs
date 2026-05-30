@@ -584,13 +584,15 @@ pub async fn run(
             // (serialize through the approval gate). Results are merged
             // by original index before being appended so the
             // tool_call_id ↔ tool_result pairing the model expects is
-            // preserved.
+            // preserved. `effective_risk` applies the daemon-defined
+            // auto-approval policy so a write into the widgets dir batches
+            // with Safe instead of stalling on a gate it would skip.
             let mut safe_idx: Vec<usize> = Vec::new();
             let mut risky_idx: Vec<usize> = Vec::new();
             for (i, c) in turn.tool_calls.iter().enumerate() {
                 let r = registry
                     .get(&c.name)
-                    .map(|t| t.risk())
+                    .map(|t| crate::tools::effective_risk(t, &c.input, &tool_ctx.cwd))
                     .unwrap_or(ToolRisk::Risky);
                 if matches!(r, ToolRisk::Safe) {
                     safe_idx.push(i);
@@ -807,7 +809,11 @@ async fn run_one_tool(
         )
         .await;
 
-    let needs_approval = !*automode && matches!(tool.risk(), ToolRisk::Risky);
+    let needs_approval = !*automode
+        && matches!(
+            crate::tools::effective_risk(tool, &call.input, &tool_ctx.cwd),
+            ToolRisk::Risky
+        );
     if needs_approval {
         emit.emit(SessionEvent::ToolApprovalRequest {
             call_id: call.id.clone(),

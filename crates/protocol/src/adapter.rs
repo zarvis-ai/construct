@@ -50,6 +50,8 @@ use tokio::sync::mpsc;
 #[cfg(feature = "pty")]
 pub mod pty;
 
+pub mod policy;
+
 use crate::paths;
 
 /// A command prefix supplied through an adapter's `AGENTD_*_CMD` override.

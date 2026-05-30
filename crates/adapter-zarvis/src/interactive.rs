@@ -2517,13 +2517,16 @@ pub async fn run(
                 }
             );
             // Partition by risk: Safe in parallel, Risky serial through
-            // the approval gate. See agent::run for the matching logic.
+            // the approval gate. See agent::run for the matching logic. We
+            // use `effective_risk` so auto-approved file writes (e.g. into
+            // the widgets dir) batch with the Safe parallel group instead of
+            // serializing through a gate they'll skip anyway.
             let mut safe_idx: Vec<usize> = Vec::new();
             let mut risky_idx: Vec<usize> = Vec::new();
             for (i, c) in turn.tool_calls.iter().enumerate() {
                 let r = registry
                     .get(&c.name)
-                    .map(|t| t.risk())
+                    .map(|t| crate::tools::effective_risk(t, &c.input, &tool_ctx.cwd))
                     .unwrap_or(ToolRisk::Risky);
                 if matches!(r, ToolRisk::Safe) {
                     safe_idx.push(i);
@@ -3004,7 +3007,11 @@ async fn run_one_tool(
         args_summary: args_summary.clone(),
     });
 
-    let needs_approval = !*automode && matches!(tool.risk(), ToolRisk::Risky);
+    let needs_approval = !*automode
+        && matches!(
+            crate::tools::effective_risk(tool, &call.input, &tool_ctx.cwd),
+            ToolRisk::Risky
+        );
     if needs_approval {
         term.approval(&call.name, &args_summary, tool.risk());
         emit.emit(SessionEvent::ToolApprovalRequest {

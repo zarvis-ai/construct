@@ -82,6 +82,11 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     );
     let mut args = command.args.clone();
     args.extend(params.args.clone());
+    // The daemon's auto-approval policy (`AGENTD_AUTO_APPROVE_PATHS`, see
+    // `agentd_protocol::adapter::policy`) is set, but the upstream codex CLI
+    // does not currently expose a path-scoped allow-list flag, so there's no
+    // native translation to apply here. Either upstream gains the knob or we
+    // wrap codex's IO to intercept tool calls.
     // Resume support: codex doesn't let the client assign a session id, so
     // we tag each spawn with a unique `originator` (via codex's internal
     // env override) and watch its rollouts dir for one bearing that tag.

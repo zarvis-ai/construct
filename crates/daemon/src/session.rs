@@ -1282,6 +1282,13 @@ impl SessionManager {
             "AGENTD_SESSION_WIDGETS_DIR".to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
+        // Single auto-approval policy the daemon defines once; each adapter
+        // translates it into its harness's native permission mechanism. See
+        // `agentd_protocol::adapter::policy`.
+        env_with_meta.insert(
+            agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
+            widgets_dir.to_string_lossy().to_string(),
+        );
         env_with_meta.insert(
             "AGENTD_SESSION_KIND".to_string(),
             match params.kind {
@@ -1538,6 +1545,10 @@ impl SessionManager {
         });
         start_params.env.insert(
             "AGENTD_SESSION_WIDGETS_DIR".to_string(),
+            widgets_dir.to_string_lossy().to_string(),
+        );
+        start_params.env.insert(
+            agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
         // Use the last-known PTY size so the resumed adapter (which
