@@ -2003,10 +2003,14 @@ function setConnState(s, label) {
 function setComposerEnabled(on) {
   const blocked = !!(state.currentId && state.widgetsById && currentInlineWidget(state.currentId));
   inputEl.disabled = blocked;
-  // "Type" (insert without Enter) only differs from "Send" on
-  // PTY-backed sessions; for chat/headless sessions both submit
-  // identically, so a single primary "Send" button is shown there.
-  insertBtn.hidden = !currentSessionHasPty();
+  const terminal = currentSessionHasPty();
+  // Mobile terminal controls are only useful on touch browsers:
+  // desktop xterm users can type directly into the terminal. Chat
+  // sessions still use the composer on every browser.
+  const showComposerControls = !terminal || shouldShowMobileTerminalControls();
+  inputEl.hidden = !showComposerControls;
+  insertBtn.hidden = !showComposerControls || !terminal;
+  enterBtn.hidden = !showComposerControls;
   insertBtn.disabled = !on || blocked;
   enterBtn.disabled = !on || blocked;
 }
@@ -2583,6 +2587,10 @@ function isLikelyTouchDevice() {
   return !!(window.matchMedia && window.matchMedia("(pointer: coarse)").matches);
 }
 
+function shouldShowMobileTerminalControls() {
+  return isLikelyTouchDevice();
+}
+
 function isNativeKeyboardVisible() {
   if (!window.visualViewport) return false;
   const layoutHeight = window.innerHeight || document.documentElement.clientHeight || 0;
@@ -2651,24 +2659,21 @@ async function enterTerminalMode(id, options = {}) {
   state.mode = "terminal";
   activeTranscriptEl = null;
   transcriptEl.hidden = true;
-  // Composer stays visible above the vkbd in terminal mode —
-  // `session.input` is still meaningful for PTY-backed adapters
-  // (it's how the high-level "send this prompt to the agent"
-  // verb reaches codex / claude / zarvis interactive). The
-  // per-keystroke editing path is the vkbd + xterm; composer is
-  // for committing a whole prompt at once.
-  composerEl.hidden = false;
+  // Composer + virtual keyboard are mobile helpers. Desktop browsers
+  // have a physical keyboard and can type directly into xterm, so leave
+  // the extra Type/Send controls hidden there.
+  const showMobileControls = shouldShowMobileTerminalControls();
+  composerEl.hidden = !showMobileControls;
   terminalWrapEl.hidden = false;
   terminalScrollOverlayEl.hidden = false;
   renderWidgets();
-  vkbdEl.hidden = false;
+  vkbdEl.hidden = !showMobileControls;
   const session = state.sessions.find((x) => x.id === id);
   terminalEl.classList.toggle("hide-xterm-cursor", isStructuredToolSession(session));
   renderEditorStateForSession(id);
-  // Build the keyboard markup once per session-switch; cheap, and
-  // makes future per-session layout customization easy if it ever
-  // becomes a thing.
-  renderVirtualKeyboard();
+  // Build the keyboard markup only when visible; desktop browsers
+  // don't need the touch keyboard DOM at all.
+  if (showMobileControls) renderVirtualKeyboard();
 
   // Wait for xterm.js (CDN-loaded). If the phone has no public
   // internet but reached the cloudflared tunnel, we never resolve
