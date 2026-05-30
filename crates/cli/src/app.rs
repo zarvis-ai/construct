@@ -395,6 +395,10 @@ pub struct App {
     /// `RESIZE_DEBOUNCE_MS`, a single `pty_resize` IPC fires.
     pub orchestrator_desired_size: Option<(u16, u16)>,
     pub terminal_pane_size: (u16, u16), // (cols, rows) of the right pane.
+    /// Desired PTY size per split window, keyed by main-window id. Split panes
+    /// can have different widths/heights, so adapters like claude need the
+    /// focused split's actual inner area rather than the whole right pane.
+    pub window_pane_sizes: HashMap<u64, (u16, u16)>,
     /// Zoom: hide list / pin strip / modeline; the session view fills the
     /// screen except for the minibuffer line at the bottom. Toggled with
     /// `C-x z` (emacs) / `z` (vim), matching tmux's prefix-z.
@@ -1354,6 +1358,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         remote_control_popup: None,
         remote_control_task: None,
         terminal_pane_size: (100, 30),
+        window_pane_sizes: HashMap::new(),
         zoom: initial_zoom,
         list_scroll_offset: 0,
         view_scrollback: 0,
@@ -1645,7 +1650,8 @@ async fn run_loop(
 
         // Right pane (main session) resize — debounced fire. Also
         // refires if the *selected* session changed since last sent.
-        let cur = app.terminal_pane_size;
+        let cur = app.active_pane_size();
+        let split_sizes = app.window_session_pane_sizes();
         let cur_session = app.selected_id();
         let session_changed = cur_session != last_session_sent;
         if cur.0 > 0 && cur.1 > 0 && (cur != last_size_sent || session_changed) {
@@ -1658,7 +1664,19 @@ async fn run_loop(
         }
         if let Some((size, at)) = pending_size {
             if at.elapsed() >= resize_debounce || session_changed {
-                app.notify_pane_size(size.0, size.1).await;
+                if split_sizes.is_empty() {
+                    app.notify_pane_size(size.0, size.1).await;
+                } else {
+                    let sessions = app.sessions.clone();
+                    for (id, (cols, rows)) in &split_sizes {
+                        if sessions
+                            .iter()
+                            .any(|s| s.id == *id && s.has_pty && !s.state.is_terminal())
+                        {
+                            let _ = app.client.pty_resize(id, *cols, *rows).await;
+                        }
+                    }
+                }
                 last_size_sent = size;
                 last_session_sent = cur_session;
                 pending_size = None;
@@ -2150,7 +2168,7 @@ impl App {
             socket: self.client.socket_path().to_path_buf(),
             session_id: id.to_string(),
             needs_history,
-            terminal_pane_size: self.terminal_pane_size,
+            terminal_pane_size: self.active_pane_size(),
             is_headless,
         }
     }
@@ -2492,7 +2510,7 @@ impl App {
         }
         self.histories.insert(id.to_string(), history);
         // Tell the daemon what size we'd like.
-        let (cols, rows) = self.terminal_pane_size;
+        let (cols, rows) = self.active_pane_size();
         let _ = self.client.pty_resize(id, cols, rows).await;
     }
 
@@ -4498,7 +4516,7 @@ impl App {
     }
 
     fn mouse_scrollback_step(&self) -> i32 {
-        let rows = self.terminal_pane_size.1.max(1) as i32;
+        let rows = self.active_pane_size().1.max(1) as i32;
         (rows / 4).clamp(6, 24)
     }
 
@@ -4650,6 +4668,39 @@ impl App {
     /// frame the parser's screen size matches the area we draw into);
     /// this method only sends the SIGWINCH-equivalent down to the adapter
     /// children.
+    pub fn active_pane_size(&self) -> (u16, u16) {
+        self.window_pane_sizes
+            .get(&self.active_window_id)
+            .copied()
+            .unwrap_or(self.terminal_pane_size)
+    }
+
+    pub fn window_session_pane_sizes(&self) -> Vec<(String, (u16, u16))> {
+        fn collect(
+            node: &MainWindowTree,
+            sizes: &HashMap<u64, (u16, u16)>,
+            out: &mut Vec<(String, (u16, u16))>,
+        ) {
+            match node {
+                MainWindowTree::Leaf { id, selection } => {
+                    if let (Some(session_id), Some(size)) = (selection.session_id(), sizes.get(id))
+                    {
+                        if !out.iter().any(|(existing, _)| existing == session_id) {
+                            out.push((session_id.to_string(), *size));
+                        }
+                    }
+                }
+                MainWindowTree::Split { first, second, .. } => {
+                    collect(first, sizes, out);
+                    collect(second, sizes, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        collect(&self.main_windows, &self.window_pane_sizes, &mut out);
+        out
+    }
+
     pub async fn notify_pane_size(&mut self, cols: u16, rows: u16) {
         let targets: Vec<String> = self
             .sessions
@@ -5763,8 +5814,8 @@ impl App {
                     title: None,
                     mode: None,
                     pty_size: Some(agentd_protocol::PtySize {
-                        cols: self.terminal_pane_size.0.max(20),
-                        rows: self.terminal_pane_size.1.max(5),
+                        cols: self.active_pane_size().0.max(20),
+                        rows: self.active_pane_size().1.max(5),
                     }),
                     worktree: false,
                     env: HashMap::new(),
@@ -6873,6 +6924,7 @@ mod tests {
             matrix_reveal_hits: Vec::new(),
             orchestrator_desired_size: None,
             terminal_pane_size: (80, 24),
+            window_pane_sizes: HashMap::new(),
             zoom: ZoomMode::None,
             list_scroll_offset: 0,
             view_scrollback: 0,
@@ -7032,6 +7084,36 @@ mod tests {
             .insert("s1".into(), crate::pty_render::ItemHistory::new());
 
         assert_eq!(app.main_window_sessions_needing_hydration(), vec!["s2"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn split_windows_track_individual_pty_sizes() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.window_pane_sizes.insert(1, (38, 18));
+        app.window_pane_sizes.insert(2, (28, 18));
+        app.active_window_id = 2;
+
+        assert_eq!(app.active_pane_size(), (28, 18));
+        assert_eq!(
+            app.window_session_pane_sizes(),
+            vec![("s1".to_string(), (38, 18)), ("s2".to_string(), (28, 18))]
+        );
         server.abort();
     }
 
