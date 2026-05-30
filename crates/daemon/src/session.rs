@@ -15,7 +15,7 @@ use agentd_protocol::{
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use chrono::Utc;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,8 +24,15 @@ use tokio::sync::{broadcast, mpsc, RwLock};
 
 const BROADCAST_CAP: usize = 4096;
 const ADAPTER_DRAIN_CAP: usize = 256;
-/// Per-session PTY history kept in memory for late-attach replay.
-const PTY_RING_CAP: usize = 256 * 1024;
+/// Tail size (in bytes) of each session's `pty.log` returned to a TUI
+/// client on attach. The client feeds these bytes through a vt100 parser
+/// that retains only `SCROLLBACK_MAX` rows of formatted scrollback
+/// (`crates/cli/src/app.rs`), so the practical scrollback ceiling is the
+/// row cap, not this byte cap — this number just needs to be generous
+/// enough that the row cap is the binding constraint on typical
+/// codex/claude/antigravity sessions. 8 MiB covers ~40-80k rows of dense
+/// PTY content, well above the vt100 row budget.
+const PTY_REPLAY_CAP: usize = 8 * 1024 * 1024;
 /// Delay between session.start succeeding on respawn and the
 /// force-redraw bump+restore that nudges the child into a full
 /// SIGWINCH redraw. Long enough for the child to finish its initial
@@ -403,32 +410,14 @@ impl SessionEntry {
     }
 }
 
+/// Per-session PTY metadata. Used to hold the last known PTY dimensions
+/// (so a fresh TUI attach can size its parsers correctly) and previously
+/// also a 256 KiB in-memory ring of bytes for replay. Scrollback is now
+/// served from the on-disk `pty.log` tail (see `pty_replay`), so the
+/// in-memory ring is gone and this is just the size.
 #[derive(Default)]
 struct PtyState {
-    ring: VecDeque<u8>,
     size: Option<PtySize>,
-}
-
-impl PtyState {
-    fn push(&mut self, bytes: &[u8]) {
-        if bytes.len() >= PTY_RING_CAP {
-            self.ring.clear();
-            self.ring.extend(&bytes[bytes.len() - PTY_RING_CAP..]);
-            return;
-        }
-        while self.ring.len() + bytes.len() > PTY_RING_CAP {
-            self.ring.pop_front();
-        }
-        self.ring.extend(bytes);
-    }
-
-    fn snapshot(&self) -> Vec<u8> {
-        let (a, b) = self.ring.as_slices();
-        let mut out = Vec::with_capacity(a.len() + b.len());
-        out.extend_from_slice(a);
-        out.extend_from_slice(b);
-        out
-    }
 }
 
 impl SessionEntry {
@@ -667,14 +656,10 @@ impl SessionManager {
             } else {
                 0
             };
-            // Rehydrate the in-memory PTY ring from the on-disk tail so
-            // scrollback survives daemon restarts.
-            let mut pty_state = PtyState::default();
-            match storage.read_pty_tail(&s.id, PTY_RING_CAP) {
-                Ok(bytes) if !bytes.is_empty() => pty_state.push(&bytes),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(id = %s.id, error = ?e, "pty_log tail read failed"),
-            }
+            // Scrollback survives daemon restarts because `pty_replay`
+            // serves it from the on-disk `pty.log` directly; no in-memory
+            // rehydration needed.
+            let pty_state = PtyState::default();
             let entry = SessionEntry {
                 id: s.id.clone(),
                 summary: RwLock::new(s.clone()),
@@ -1339,7 +1324,6 @@ impl SessionManager {
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(Some(adapter.clone())),
             pty: tokio::sync::Mutex::new(PtyState {
-                ring: VecDeque::new(),
                 size: params.pty_size,
             }),
             deleted: AtomicBool::new(false),
@@ -1670,9 +1654,6 @@ impl SessionManager {
         // prior PTY history visible after a daemon restart instead of
         // wiping it.
         if !info.capabilities.supports_silent_resume {
-            let mut pty = entry.pty.lock().await;
-            pty.ring.clear();
-            drop(pty);
             if let Err(e) = self.storage.truncate_pty_log(id) {
                 tracing::warn!(session = %id, error = ?e, "truncate_pty_log on respawn failed");
             }
@@ -1876,7 +1857,6 @@ impl SessionManager {
                 tracing::warn!(session = %entry.id, error = ?e, "truncate_pty_log on reset failed");
             }
             entry.transcript_count.store(0, Ordering::Relaxed);
-            entry.pty.lock().await.ring.clear();
             entry.tasks.lock().await.clear();
             let now = Utc::now();
             let snapshot = {
@@ -1957,12 +1937,13 @@ impl SessionManager {
                 }));
             return;
         }
-        // PTY events take a fast path: they go to the in-memory ring +
-        // append to the on-disk pty.log + a live broadcast. A copy was
-        // also appended to the transcript above as an ordering marker.
+        // PTY events take a fast path: append to the on-disk pty.log + a
+        // live broadcast. A copy was also appended to the transcript above
+        // as an ordering marker. Replay reads back from `pty.log` directly
+        // when a TUI attaches, so we no longer keep a parallel in-memory
+        // ring of bytes.
         if let SessionEvent::Pty { .. } = &event {
             if let Some(bytes) = event.pty_bytes() {
-                entry.pty.lock().await.push(&bytes);
                 if let Err(e) = self.storage.append_pty_bytes(&entry.id, &bytes) {
                     tracing::warn!(
                         session = %entry.id,
@@ -2448,10 +2429,21 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let pty = entry.pty.lock().await;
+        let size = entry.pty.lock().await.size;
+        // Pull scrollback from the on-disk `pty.log`, not the (now-removed)
+        // in-memory ring. Bounded by `PTY_REPLAY_CAP`; the TUI feeds the
+        // bytes through a vt100 parser whose `SCROLLBACK_MAX` row budget is
+        // the real ceiling on what survives in scrollback.
+        let bytes = self
+            .storage
+            .read_pty_tail(id, PTY_REPLAY_CAP)
+            .unwrap_or_else(|e| {
+                tracing::warn!(session = %id, error = ?e, "pty_log tail read failed");
+                Vec::new()
+            });
         Ok(PtyReplayResult {
-            data: base64::engine::general_purpose::STANDARD.encode(pty.snapshot()),
-            size: pty.size,
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            size,
         })
     }
 
@@ -3493,10 +3485,7 @@ mod tests {
             }),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
-            pty: tokio::sync::Mutex::new(PtyState {
-                ring: Default::default(),
-                size: None,
-            }),
+            pty: tokio::sync::Mutex::new(PtyState::default()),
             deleted: AtomicBool::new(false),
             title_gen_attempted: AtomicBool::new(false),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
@@ -3877,10 +3866,7 @@ mod tests {
             summary: RwLock::new(summary),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
-            pty: tokio::sync::Mutex::new(PtyState {
-                ring: Default::default(),
-                size: None,
-            }),
+            pty: tokio::sync::Mutex::new(PtyState::default()),
             deleted: AtomicBool::new(false),
             title_gen_attempted: AtomicBool::new(false),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
@@ -3994,5 +3980,147 @@ mod tests {
     #[test]
     fn effective_mode_defaults_to_headless_without_pty() {
         assert_eq!(effective_mode(&create_params(None, None)), "headless");
+    }
+
+    #[tokio::test]
+    async fn pty_replay_returns_full_disk_tail_not_just_old_ring() {
+        use base64::Engine;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage_handle = storage.clone();
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "sreplay";
+        mgr.sessions.write().await.insert(
+            id.into(),
+            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+        );
+
+        // Write 1 MiB to pty.log — that's 4× the size of the old in-memory
+        // ring. Previously pty_replay would have returned only the tail
+        // 256 KiB; now it must return the whole file.
+        let bytes: Vec<u8> = (0..1024u32 * 1024).map(|i| (i % 251) as u8).collect();
+        storage_handle
+            .append_pty_bytes(id, &bytes)
+            .expect("append pty bytes");
+
+        let result = mgr.pty_replay(id).await.expect("pty_replay");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.data)
+            .expect("base64 decode");
+        assert_eq!(
+            decoded, bytes,
+            "pty_replay must return the full on-disk tail, not a truncated window"
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_replay_returns_empty_when_pty_log_missing() {
+        use base64::Engine;
+        use tempfile::tempdir;
+
+        // No bytes have ever been written for this session. pty_replay must
+        // return an empty body (not error) and surface the stored PTY size
+        // so the TUI can still size its parsers on attach.
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "snopty";
+        mgr.sessions.write().await.insert(
+            id.into(),
+            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+        );
+
+        let result = mgr.pty_replay(id).await.expect("pty_replay");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.data)
+            .expect("base64 decode");
+        assert!(
+            decoded.is_empty(),
+            "no pty.log → empty replay, got {} bytes",
+            decoded.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn pty_replay_preserves_pty_size_through_round_trip() {
+        use tempfile::tempdir;
+
+        // Refactor moved pty_replay off `PtyState` for the bytes but it
+        // still reads `size` from the same lock. Lock that the change
+        // didn't accidentally start returning None.
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "ssize";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+        entry.pty.lock().await.size = Some(PtySize { cols: 132, rows: 50 });
+
+        let result = mgr.pty_replay(id).await.expect("pty_replay");
+        assert_eq!(result.size, Some(PtySize { cols: 132, rows: 50 }));
+    }
+
+    #[tokio::test]
+    async fn pty_replay_caps_at_replay_max_for_huge_logs() {
+        use base64::Engine;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage_handle = storage.clone();
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "sreplaybig";
+        mgr.sessions.write().await.insert(
+            id.into(),
+            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+        );
+
+        // Write PTY_REPLAY_CAP + 1 MiB. Replay must return at most
+        // PTY_REPLAY_CAP, and the bytes returned must be the *tail* (most
+        // recent) of the file — older content is what we're willing to
+        // drop, not newer.
+        let extra: usize = 1024 * 1024;
+        let total: usize = PTY_REPLAY_CAP + extra;
+        let bytes: Vec<u8> = (0..total as u32).map(|i| (i % 251) as u8).collect();
+        storage_handle
+            .append_pty_bytes(id, &bytes)
+            .expect("append pty bytes");
+
+        let result = mgr.pty_replay(id).await.expect("pty_replay");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&result.data)
+            .expect("base64 decode");
+        assert_eq!(decoded.len(), PTY_REPLAY_CAP, "replay must cap at PTY_REPLAY_CAP");
+        assert_eq!(
+            decoded,
+            bytes[extra..],
+            "replay must be the tail of the file (most recent bytes), not the head"
+        );
     }
 }

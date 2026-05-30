@@ -457,9 +457,9 @@ impl Storage {
     }
 
     /// Read the last `max_bytes` of the session's `pty.log`. Returns an
-    /// empty buffer if the file doesn't exist. Used to rehydrate the
-    /// in-memory ring buffer on daemon startup so scrollback survives
-    /// restarts.
+    /// empty buffer if the file doesn't exist. Used by `pty_replay` to feed
+    /// a TUI's vt100 parser on attach so scrollback covers the on-disk log,
+    /// not just a small in-memory window.
     pub fn read_pty_tail(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>> {
         let path = self.pty_log_path(id);
         if !path.exists() {
