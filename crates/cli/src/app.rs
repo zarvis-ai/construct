@@ -507,6 +507,9 @@ pub struct App {
     /// `Some((anchor_row, anchor_height))` while the user drags the
     /// Matrix-rain title bar to resize the panel.
     pub resizing_matrix_rain: Option<(u16, u16)>,
+    /// Split-window divider drag: parent split id, direction, drag-start
+    /// coordinate, drag-start ratio, and parent split area.
+    pub resizing_main_window: Option<(u64, WindowSplitDirection, u16, u16, ratatui::layout::Rect)>,
     /// User has collapsed the session list pane via the `−` button
     /// on its title bar. Effective only when the list pane doesn't
     /// have focus — when focus is on the list (e.g. via `C-x o`),
@@ -1115,12 +1118,22 @@ pub struct WindowPaneHit {
     pub inner_area: ratatui::layout::Rect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowDividerHit {
+    pub parent: u64,
+    pub direction: WindowSplitDirection,
+    pub area: ratatui::layout::Rect,
+    pub parent_area: ratatui::layout::Rect,
+    pub ratio_percent: u16,
+}
+
 /// Last-frame geometry for hit-testing mouse clicks.
 #[derive(Debug, Clone, Default)]
 pub struct LayoutSnapshot {
     pub list_area: Option<ratatui::layout::Rect>,
     pub view_area: Option<ratatui::layout::Rect>,
     pub main_window_areas: Vec<WindowPaneHit>,
+    pub main_window_dividers: Vec<WindowDividerHit>,
     pub pin_strip_area: Option<ratatui::layout::Rect>,
     pub matrix_rain_area: Option<ratatui::layout::Rect>,
     pub minibuffer_area: Option<ratatui::layout::Rect>,
@@ -1382,6 +1395,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         resizing_pin_strip: None,
         matrix_rain_h: persisted.matrix_rain_h,
         resizing_matrix_rain: None,
+        resizing_main_window: None,
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
@@ -2813,6 +2827,32 @@ impl App {
         self.set_status("only current window".into());
     }
 
+    fn set_split_ratio_by_order(&mut self, target_parent: u64, ratio: u16) -> bool {
+        fn set(node: &mut MainWindowTree, target_parent: u64, next: &mut u64, ratio: u16) -> bool {
+            match node {
+                MainWindowTree::Leaf { .. } => false,
+                MainWindowTree::Split {
+                    ratio_percent,
+                    first,
+                    second,
+                    ..
+                } => {
+                    let current = *next;
+                    *next += 1;
+                    if current == target_parent {
+                        *ratio_percent = ratio.clamp(10, 90);
+                        true
+                    } else {
+                        set(first, target_parent, next, ratio)
+                            || set(second, target_parent, next, ratio)
+                    }
+                }
+            }
+        }
+        let mut next = 1;
+        set(&mut self.main_windows, target_parent, &mut next, ratio)
+    }
+
     fn resize_active_window(&mut self, delta: i16, direction: WindowSplitDirection) {
         fn resize(
             node: &mut MainWindowTree,
@@ -3446,6 +3486,26 @@ impl App {
                     self.resizing_list = Some((ev.column, self.list_panel_w));
                     return;
                 }
+                if let Some(hit) = self
+                    .layout
+                    .main_window_dividers
+                    .iter()
+                    .find(|hit| Self::rect_contains(hit.area, ev.column, ev.row))
+                    .copied()
+                {
+                    let anchor = match hit.direction {
+                        WindowSplitDirection::Right => ev.column,
+                        WindowSplitDirection::Below => ev.row,
+                    };
+                    self.resizing_main_window = Some((
+                        hit.parent,
+                        hit.direction,
+                        anchor,
+                        hit.ratio_percent,
+                        hit.parent_area,
+                    ));
+                    return;
+                }
                 // View ↔ pin-strip horizontal divider: clicking the
                 // view's bottom border (or equivalently the pin
                 // strip's top border, the same row) starts a
@@ -3535,6 +3595,22 @@ impl App {
                     let available = self.matrix_rain_available_height().unwrap_or(raw);
                     self.matrix_rain_h =
                         Some(crate::ui::matrix_rain_panel_height(Some(raw), available));
+                } else if let Some((parent, direction, anchor, ratio, parent_area)) =
+                    self.resizing_main_window
+                {
+                    let (delta, span) = match direction {
+                        WindowSplitDirection::Right => (
+                            ev.column as i32 - anchor as i32,
+                            parent_area.width.max(1) as i32,
+                        ),
+                        WindowSplitDirection::Below => (
+                            ev.row as i32 - anchor as i32,
+                            parent_area.height.max(1) as i32,
+                        ),
+                    };
+                    let delta_pct = (delta * 100) / span;
+                    let next = (ratio as i32 + delta_pct).clamp(10, 90) as u16;
+                    self.set_split_ratio_by_order(parent, next);
                 } else if let Some((grab_offset, max_scrollback)) = self.dragging_terminal_scrollbar
                 {
                     self.drag_terminal_scrollbar_to_row(ev.row, grab_offset, max_scrollback);
@@ -3554,12 +3630,14 @@ impl App {
                     || self.resizing_pin_strip.is_some()
                     || self.resizing_orchestrator_panel.is_some()
                     || self.dragging_terminal_scrollbar.is_some()
-                    || self.resizing_matrix_rain.is_some();
+                    || self.resizing_matrix_rain.is_some()
+                    || self.resizing_main_window.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
                 self.resizing_orchestrator_panel = None;
                 self.dragging_terminal_scrollbar = None;
                 self.resizing_matrix_rain = None;
+                self.resizing_main_window = None;
                 if was_resizing {
                     self.text_selection = None;
                     return;
@@ -6865,6 +6943,7 @@ mod tests {
                 area: Rect::new(20, 0, 80, 20),
                 inner_area: Rect::new(21, 1, 78, 18),
             }],
+            main_window_dividers: Vec::new(),
             pin_strip_area: Some(Rect::new(20, 20, 80, 8)),
             matrix_rain_area: None,
             minibuffer_area: Some(Rect::new(0, 29, 100, 4)),
@@ -6948,6 +7027,7 @@ mod tests {
             resizing_pin_strip: None,
             matrix_rain_h: None,
             resizing_matrix_rain: None,
+            resizing_main_window: None,
             list_collapsed: false,
             tasks_popup: None,
             remote_control_popup: None,
@@ -7084,6 +7164,49 @@ mod tests {
             .insert("s1".into(), crate::pty_render::ItemHistory::new());
 
         assert_eq!(app.main_window_sessions_needing_hydration(), vec!["s2"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn set_split_ratio_by_render_order_updates_nested_split() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Below,
+                ratio_percent: 40,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 2,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 3,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+        };
+
+        assert!(app.set_split_ratio_by_order(2, 65));
+
+        match &app.main_windows {
+            MainWindowTree::Split {
+                ratio_percent,
+                second,
+                ..
+            } => {
+                assert_eq!(*ratio_percent, 50);
+                match second.as_ref() {
+                    MainWindowTree::Split { ratio_percent, .. } => assert_eq!(*ratio_percent, 65),
+                    MainWindowTree::Leaf { .. } => panic!("expected nested split"),
+                }
+            }
+            MainWindowTree::Leaf { .. } => panic!("expected root split"),
+        }
         server.abort();
     }
 
