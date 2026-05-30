@@ -2192,11 +2192,7 @@ impl App {
             return;
         }
 
-        let session_id = hydration.session_id.clone();
         self.apply_hydration_state(hydration, true).await;
-        if self.selection.session_id() == Some(session_id.as_str()) {
-            self.start_session_transition();
-        }
     }
 
     async fn apply_pinned_session_hydration(&mut self, hydration: SessionHydration) {
@@ -7048,6 +7044,28 @@ mod tests {
             app.session_transitions.is_empty(),
             "window focus changes must not glitch"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn applying_selected_hydration_does_not_start_transition() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.selection = Selection::Session("s1".into());
+        app.session_transitions.clear();
+        let hydration = SessionHydration {
+            session_id: "s1".into(),
+            transcript: Vec::new(),
+            history: Some(crate::pty_render::ItemHistory::new()),
+            editor_state: None,
+            agent_status: None,
+            ui_panels: HashMap::new(),
+            status_messages: Vec::new(),
+        };
+
+        app.apply_session_hydration(hydration).await;
+
+        assert!(app.session_transitions.is_empty());
+        assert!(app.histories.contains_key("s1"));
         server.abort();
     }
 
