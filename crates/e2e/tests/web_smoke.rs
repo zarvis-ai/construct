@@ -758,7 +758,10 @@ async fn web_client_loads_and_websocket_connects() {
     // Overlay buttons are compact terminal-only controls for jumping
     // scrollback to the top or bottom without dragging through a long
     // transcript. Verify they are present, styled as small overlays,
-    // and wired to terminal scroll APIs.
+    // and wired to terminal scroll APIs. They must scroll *without*
+    // focusing xterm — focusing the helper textarea summons the mobile
+    // soft keyboard, so tapping a scroll button to read scrollback
+    // should never raise the keyboard.
     let scroll_buttons: serde_json::Value = page
         .evaluate(
             r#"
@@ -809,9 +812,11 @@ async fn web_client_loads_and_websocket_connects() {
             .contains("rgba"),
         "expected transparent overlay background, got {scroll_buttons:?}"
     );
+    // Scroll only — no `focus` calls. Focusing xterm would summon the
+    // mobile soft keyboard when the user merely jumps scrollback.
     assert_eq!(
         scroll_buttons["calls"],
-        serde_json::json!(["top", "focus", "bottom", "focus"])
+        serde_json::json!(["top", "bottom"])
     );
 
     // Regression coverage for bottom-following terminal scrollback:
