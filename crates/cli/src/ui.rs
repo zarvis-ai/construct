@@ -2479,7 +2479,7 @@ fn render_terminal(f: &mut Frame, area: Rect, app: &mut App) {
     let agent_status = app.agent_statuses.get(&id).cloned();
     let inline_rows = inline_panel
         .as_ref()
-        .map(|panel| inline_widget_rows(panel, area.width, area.height))
+        .map(|panel| inline_widget_rows(panel, area.width, area.height, &app.theme))
         .unwrap_or(0);
     let base_area = Rect {
         x: area.x,
@@ -2645,15 +2645,50 @@ fn latest_inline_panel(panels: &[agentd_protocol::UiPanel]) -> Option<agentd_pro
         .cloned()
 }
 
-fn inline_widget_rows(panel: &agentd_protocol::UiPanel, width: u16, available_height: u16) -> u16 {
+/// Height (in terminal rows) the inline widget panel needs to display
+/// `panel`'s markdown without truncation, capped at `available_height`.
+///
+/// We measure the *rendered* lines (after markdown parse and wrapping at the
+/// panel's content width) rather than the raw source line count. The source
+/// heuristic this replaced under-counted any line long enough to wrap, so
+/// wide widgets used to clip. To keep the function pure we route hit
+/// registrations into a throwaway buffer; the real render later does the
+/// same parse against the real panel area and pushes hits into
+/// `app.layout.dynamic_ui_action_hits`.
+fn inline_widget_rows(
+    panel: &agentd_protocol::UiPanel,
+    width: u16,
+    available_height: u16,
+    theme: &Theme,
+) -> u16 {
     if width == 0 || available_height == 0 {
         return 0;
     }
-    let body_rows = panel
-        .markdown
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count() as u16;
+    // Mirror render_inline_dynamic_ui_panel's content_area: block borders
+    // consume 2 cols (left+right) and the inner pad another 2.
+    let content_width = width.saturating_sub(4);
+    if content_width == 0 {
+        return 3.min(available_height);
+    }
+    let measure_area = Rect {
+        x: 0,
+        y: 0,
+        width: content_width,
+        height: u16::MAX,
+    };
+    let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+    let mut throwaway_hits = Vec::new();
+    let lines = render_agentd_markdown_lines(
+        &panel.markdown,
+        theme,
+        None,
+        measure_area,
+        None,
+        None,
+        &mut throwaway_hits,
+        suppress_first_heading,
+    );
+    let body_rows = visual_line_count(lines.iter(), content_width) as u16;
     let wanted = body_rows.saturating_add(2).max(3);
     wanted.min(available_height)
 }
@@ -6600,5 +6635,50 @@ mod tests {
         s.state = SessionState::AwaitingInput;
         // Not Running → never animates, regardless of activity signals.
         assert!(!session_should_animate_status(&s, true, true));
+    }
+
+    fn widget(markdown: &str) -> agentd_protocol::UiPanel {
+        agentd_protocol::UiPanel {
+            id: "w".into(),
+            source: None,
+            title: None,
+            placement: agentd_protocol::UiPlacement::Inline,
+            markdown: markdown.into(),
+        }
+    }
+
+    #[test]
+    fn inline_widget_rows_floors_at_three() {
+        // Empty markdown still gets the minimum row budget (room for the
+        // top + bottom borders plus at least one content line, so an empty
+        // widget doesn't render as just a single fused border).
+        let panel = widget("");
+        let h = inline_widget_rows(&panel, 40, 50, &Theme::default());
+        assert_eq!(h, 3);
+    }
+
+    #[test]
+    fn inline_widget_rows_accounts_for_wrapping_long_lines() {
+        // A single source line that wraps to multiple terminal rows must
+        // grow the panel: the old source-line count returned the floor (3)
+        // here and the wrapped content got clipped.
+        let long = "x".repeat(200);
+        let panel = widget(&long);
+        let theme = Theme::default();
+        let narrow = inline_widget_rows(&panel, 40, 50, &theme);
+        let wide = inline_widget_rows(&panel, 220, 50, &theme);
+        assert!(
+            narrow > wide,
+            "narrow panel should need more rows (wrapping): narrow={narrow} wide={wide}"
+        );
+        assert!(narrow > 3, "200-char line at width 40 should exceed floor");
+    }
+
+    #[test]
+    fn inline_widget_rows_caps_at_available_height() {
+        let huge = "line\n".repeat(500);
+        let panel = widget(&huge);
+        let h = inline_widget_rows(&panel, 40, 12, &Theme::default());
+        assert_eq!(h, 12, "must never exceed available_height");
     }
 }
