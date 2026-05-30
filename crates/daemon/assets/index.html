@@ -2764,14 +2764,18 @@ function initTerminalScrollButtons() {
     stop(ev);
     cancelResizeFollowBottom();
     if (state.term) state.term.scrollToTop();
-    state.term && state.term.focus();
   });
   terminalBottomBtn.addEventListener("click", (ev) => {
     stop(ev);
     if (state.term) state.term.scrollToBottom();
-    state.term && state.term.focus();
   });
   for (const btn of [terminalTopBtn, terminalBottomBtn]) {
+    // Scroll only — never change xterm focus. Focusing xterm (either via
+    // an explicit term.focus() or by the button stealing focus on press)
+    // focuses the helper textarea, which summons the mobile soft keyboard.
+    // preventDefault on mousedown keeps focus exactly where it was so a
+    // user reading scrollback isn't interrupted by the keyboard popping up.
+    btn.addEventListener("mousedown", (ev) => ev.preventDefault());
     btn.addEventListener("touchstart", (ev) => ev.stopPropagation(), { passive: true });
     btn.addEventListener("touchmove", stop, { passive: false });
   }
