@@ -394,6 +394,34 @@
     scrollbar-width: thin;
   }
   .transcript-pane[hidden] { display: none; }
+  /* Loading skeleton shown only if a transcript fetch is slow (see
+     loadTranscript) — shimmer bars approximating message rows so the
+     pane is never a blank void while waiting on the round-trip. */
+  .transcript-skeleton {
+    padding: 16px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .transcript-skeleton .sk-row { display: flex; gap: 8px; }
+  .transcript-skeleton .sk-bar {
+    height: 10px;
+    border-radius: 3px;
+    background: linear-gradient(90deg,
+      rgba(57, 255, 136, 0.05), rgba(57, 255, 136, 0.14), rgba(57, 255, 136, 0.05));
+    background-size: 200% 100%;
+    animation: sk-shimmer 1.2s ease-in-out infinite;
+  }
+  .transcript-skeleton .w30 { width: 30%; }
+  .transcript-skeleton .w40 { width: 40%; }
+  .transcript-skeleton .w50 { width: 50%; }
+  .transcript-skeleton .w60 { width: 60%; }
+  .transcript-skeleton .w70 { width: 70%; }
+  .transcript-skeleton .w80 { width: 80%; }
+  @keyframes sk-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
   .transcript-pane::-webkit-scrollbar {
     width: 16px;
   }
@@ -3554,22 +3582,64 @@ function transcriptTarget(sessionId = state.currentId) {
   return transcriptEl;
 }
 
+function transcriptSkeletonEl() {
+  const el = document.createElement("div");
+  el.className = "transcript-skeleton";
+  el.setAttribute("aria-hidden", "true");
+  el.innerHTML =
+    `<div class="sk-row"><span class="sk-bar w40"></span></div>` +
+    `<div class="sk-row"><span class="sk-bar w80"></span><span class="sk-bar w50"></span></div>` +
+    `<div class="sk-row"><span class="sk-bar w30"></span></div>` +
+    `<div class="sk-row"><span class="sk-bar w70"></span><span class="sk-bar w60"></span></div>`;
+  return el;
+}
+
 async function loadTranscript(id) {
   const pane = showTranscriptPane(id);
-  if (pane.dataset.loaded === "true") return;
-  pane.innerHTML = "";
+  if (pane.dataset.loaded === "true") return; // already built — instant re-select
+  // Delayed skeleton: only show it if the fetch is slow enough to notice
+  // (avoids a skeleton flash on fast local loads). The pane is otherwise
+  // left as-is for the first ~150ms.
+  const skeletonTimer = setTimeout(() => {
+    if (state.currentId === id && pane.dataset.loaded !== "true") {
+      pane.replaceChildren(transcriptSkeletonEl());
+    }
+  }, 150);
   state.byId.set(id, []);
   let result;
   try {
     result = await rpc("session.transcript", { session_id: id, from: 0 });
   } catch (e) {
-    appendError(`failed to load transcript: ${e.message}`);
+    clearTimeout(skeletonTimer);
+    if (state.currentId === id) {
+      pane.replaceChildren();
+      appendError(`failed to load transcript: ${e.message}`);
+    }
     return;
   }
+  clearTimeout(skeletonTimer);
+  // A rapid re-selection may have moved on while we awaited the round-trip;
+  // don't clobber whatever the user is now looking at.
+  if (state.currentId !== id) return;
   const events = (result && result.events) || [];
-  for (const te of events) renderEvent(te.event, te.at);
+  // Build the whole transcript off-DOM, then swap it in and pin to the
+  // bottom in one synchronous step — the user only ever sees the finished
+  // transcript already scrolled to the latest, never a blank pane (the
+  // skeleton covers the wait) nor a top-anchored flash that then jumps.
+  // renderEvent / append* target `activeTranscriptEl`, so point it at the
+  // detached builder for the duration of the render.
+  const build = document.createElement("div");
+  const prevActive = activeTranscriptEl;
+  activeTranscriptEl = build;
+  try {
+    for (const te of events) renderEvent(te.event, te.at);
+  } finally {
+    activeTranscriptEl = prevActive;
+  }
+  pane.replaceChildren(...build.childNodes);
   pane.dataset.loaded = "true";
-  scrollToBottom({ force: true });
+  pane.scrollTop = pane.scrollHeight;
+  pane._atBottom = true;
 }
 
 function handleNotification(method, params) {
