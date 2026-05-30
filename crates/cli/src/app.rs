@@ -1439,7 +1439,11 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
             app.hydrating_sessions.insert(id.to_string());
         }
     }
-    for id in app.pinned_sessions_needing_hydration() {
+    for id in app
+        .main_window_sessions_needing_hydration()
+        .into_iter()
+        .chain(app.pinned_sessions_needing_hydration())
+    {
         app.hydrating_sessions.insert(id);
     }
 
@@ -1608,7 +1612,11 @@ async fn run_loop(
         }
 
         let selected_hydrating = &hydration_sessions;
-        for id in app.pinned_sessions_needing_hydration() {
+        for id in app
+            .main_window_sessions_needing_hydration()
+            .into_iter()
+            .chain(app.pinned_sessions_needing_hydration())
+        {
             if selected_hydrating.contains(&id)
                 || pinned_hydration_session.as_deref() == Some(id.as_str())
                 || pinned_hydration_queue.iter().any(|queued| queued == &id)
@@ -2138,6 +2146,33 @@ impl App {
             terminal_pane_size: self.terminal_pane_size,
             is_headless,
         }
+    }
+
+    fn main_window_sessions_needing_hydration(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        fn collect(node: &MainWindowTree, out: &mut Vec<String>) {
+            match node {
+                MainWindowTree::Leaf { selection, .. } => {
+                    if let Some(id) = selection.session_id() {
+                        if !out.iter().any(|existing| existing == id) {
+                            out.push(id.to_string());
+                        }
+                    }
+                }
+                MainWindowTree::Split { first, second, .. } => {
+                    collect(first, out);
+                    collect(second, out);
+                }
+            }
+        }
+        collect(&self.main_windows, &mut ids);
+        ids.into_iter()
+            .filter(|id| {
+                self.sessions
+                    .iter()
+                    .any(|s| s.id == *id && s.has_pty && !self.histories.contains_key(&s.id))
+            })
+            .collect()
     }
 
     fn pinned_sessions_needing_hydration(&self) -> Vec<String> {
@@ -6919,6 +6954,33 @@ mod tests {
             }
             MainWindowTree::Leaf { .. } => panic!("split layout should be preserved"),
         }
+    }
+
+    #[tokio::test]
+    async fn main_window_sessions_needing_hydration_includes_inactive_splits() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.has_pty = true;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.histories
+            .insert("s1".into(), crate::pty_render::ItemHistory::new());
+
+        assert_eq!(app.main_window_sessions_needing_hydration(), vec!["s2"]);
+        server.abort();
     }
 
     #[tokio::test]
