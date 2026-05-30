@@ -2225,84 +2225,149 @@ function sessionStatusHtml(s) {
   return `<div class="${attr(classes)}" title="${attr(status)}" aria-label="${attr(status)}">${escape(sessionStatusGlyph(s))}</div>`;
 }
 
+let renderSessionsScheduled = false;
+/** Coalesce bursty re-renders (e.g. a flurry of background session/state
+ *  notifications) into a single render per animation frame. */
+function scheduleRenderSessions() {
+  if (renderSessionsScheduled) return;
+  renderSessionsScheduled = true;
+  requestAnimationFrame(() => {
+    renderSessionsScheduled = false;
+    renderSessions();
+  });
+}
+
+/** One delegated click listener for the whole list, bound once — never
+ *  re-bound per render, so reconciled rows keep working without rewiring. */
+function bindSessionListClicks() {
+  if (sessionListEl.__clickBound) return;
+  sessionListEl.__clickBound = true;
+  sessionListEl.addEventListener("click", (ev) => {
+    const t = ev.target;
+    if (!t || !t.closest) return;
+    const disclosure = t.closest(".disclosure.can-toggle");
+    if (disclosure) {
+      ev.stopPropagation();
+      toggleSubagentCollapsed(disclosure.dataset.parentId);
+      return;
+    }
+    const group = t.closest(".group-header");
+    if (group) {
+      toggleGroupCollapsed(group.dataset.groupId);
+      return;
+    }
+    const item = t.closest(".item");
+    if (item) selectSession(item.dataset.id);
+  });
+}
+
+/** Build a row descriptor: a stable key plus the outer class and inner
+ *  HTML. renderSessions() diffs class and inner separately so a pure
+ *  selection change (class only) never rebuilds a row's status element
+ *  (which would restart its statusPulse animation). */
+function sessionRowDescriptor(item) {
+  if (item.kind === "group") {
+    const g = item.group;
+    const glyph = g.collapsed ? "▸" : "▾";
+    return {
+      key: "g:" + g.id,
+      datasetKey: "groupId",
+      datasetVal: g.id,
+      className: "group-header",
+      inner:
+        `<span class="group-glyph">${glyph}</span>` +
+        `<span class="group-name">${escape(g.name || "(unnamed)")}</span>`,
+    };
+  }
+  const s = item.session;
+  const active = s.id === state.currentId ? " active" : "";
+  // Operator / orchestrator row: fixed label, daemon-owned lifecycle, no
+  // action affordances — empty disclosure/pin spacers keep the grid aligned.
+  if (item.isOperator) {
+    return {
+      key: "s:" + s.id,
+      datasetKey: "id",
+      datasetVal: s.id,
+      className: "item is-operator" + active,
+      inner:
+        `<span class="disclosure"></span>` +
+        `<span class="pin-indicator is-empty" aria-hidden="true"></span>` +
+        sessionStatusHtml(s) +
+        `<div class="name">operator</div>`,
+    };
+  }
+  const disclosure = item.hasChildren
+    ? `<span class="disclosure can-toggle" data-parent-id="${attr(s.id)}">${item.childrenExpanded ? "▾" : "▸"}</span>`
+    : `<span class="disclosure"></span>`;
+  const pin = s.pinned
+    ? `<span class="pin-indicator" title="pinned" aria-label="pinned">★</span>`
+    : `<span class="pin-indicator is-empty" aria-hidden="true"></span>`;
+  const harness = s.harness ? `<div class="sub">${escape(sessionHarnessLabel(s))}</div>` : "";
+  return {
+    key: "s:" + s.id,
+    datasetKey: "id",
+    datasetVal: s.id,
+    className:
+      "item" + active +
+      (item.indented ? " indent" : "") +
+      (item.isSubagent ? " is-subagent" : "") +
+      (s.pinned ? " is-pinned" : ""),
+    inner:
+      disclosure + pin + sessionStatusHtml(s) +
+      `<div class="row-main"><div class="name-line"><div class="name">${escape(sessionDisplayTitle(s))}</div></div>${harness}</div>`,
+  };
+}
+
 function renderSessions() {
+  bindSessionListClicks();
   const items = orderedItems();
   if (!items.length) {
-    sessionListEl.innerHTML = `<div class="empty">no sessions</div>`;
+    const only = sessionListEl.firstElementChild;
+    if (!only || sessionListEl.children.length !== 1 || !only.classList.contains("empty")) {
+      sessionListEl.replaceChildren();
+      const empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "no sessions";
+      sessionListEl.appendChild(empty);
+    }
+    refreshListToolbar();
     return;
   }
-  const html = items
-    .map((item) => {
-      if (item.kind === "group") {
-        const g = item.group;
-        const glyph = g.collapsed ? "▸" : "▾";
-        return `
-          <div class="group-header" data-group-id="${attr(g.id)}">
-            <span class="group-glyph">${glyph}</span>
-            <span class="group-name">${escape(g.name || "(unnamed)")}</span>
-          </div>`;
-      }
-      const s = item.session;
-      const active = s.id === state.currentId ? "active" : "";
-      const indent = item.indented ? "indent" : "";
-      const subagentClass = item.isSubagent ? "is-subagent" : "";
-      const disclosure = item.hasChildren
-        ? `<span class="disclosure can-toggle" data-parent-id="${attr(s.id)}">${item.childrenExpanded ? "▾" : "▸"}</span>`
-        : `<span class="disclosure"></span>`;
-      // Operator / orchestrator session is rendered with a fixed
-      // "operator" label. Lifecycle is daemon-owned so no action
-      // affordances ever apply.
-      if (item.isOperator) {
-        return `
-          <div class="item is-operator ${active}" data-id="${attr(s.id)}">
-            <span class="disclosure"></span>
-            <span class="pin-indicator is-empty" aria-hidden="true"></span>
-            ${sessionStatusHtml(s)}
-            <div class="name">operator</div>
-          </div>`;
-      }
-      // Two-line row: title on top, dim harness sub-line below.
-      // The shared toolbar below the list handles
-      // restart / move actions, so each row is just a tappable
-      // surface that selects the session.
-      const title = sessionDisplayTitle(s);
-      const harness = s.harness ? `<div class="sub">${escape(sessionHarnessLabel(s))}</div>` : "";
-      const pin = s.pinned
-        ? `<span class="pin-indicator" title="pinned" aria-label="pinned">★</span>`
-        : `<span class="pin-indicator is-empty" aria-hidden="true"></span>`;
-      const pinnedClass = s.pinned ? "is-pinned" : "";
-      return `
-        <div class="item ${active} ${indent} ${subagentClass} ${pinnedClass}" data-id="${attr(s.id)}">
-          ${disclosure}
-          ${pin}
-          ${sessionStatusHtml(s)}
-          <div class="row-main">
-            <div class="name-line"><div class="name">${escape(title)}</div></div>
-            ${harness}
-          </div>
-        </div>`;
-    })
-    .join("");
-  // Replacing children of a scrolled `overflow-y:auto` container snaps
-  // scrollTop to 0. renderSessions() fires on selection AND on every
-  // background session/state notification, so without this the list
-  // teleports to the top mid-scroll. Capture/restore until the list is
-  // reconciled in place (Phase 2).
-  const prevScrollTop = sessionListEl.scrollTop;
-  sessionListEl.innerHTML = html;
-  sessionListEl.scrollTop = prevScrollTop;
-  sessionListEl.querySelectorAll(".group-header").forEach((el) => {
-    el.addEventListener("click", () => toggleGroupCollapsed(el.dataset.groupId));
-  });
-  sessionListEl.querySelectorAll(".disclosure.can-toggle").forEach((el) => {
-    el.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      toggleSubagentCollapsed(el.dataset.parentId);
-    });
-  });
-  sessionListEl.querySelectorAll(".item").forEach((el) => {
-    el.addEventListener("click", () => selectSession(el.dataset.id));
-  });
+  // Keyed in-place reconcile. Only rows whose output actually changed are
+  // touched, so unchanged rows keep their scroll position, hover/focus,
+  // and CSS animation (statusPulse) state — no more innerHTML blast that
+  // reset scrollTop and restarted every row's animation on each event.
+  const existing = new Map();
+  for (const node of Array.from(sessionListEl.children)) {
+    if (node.__key) existing.set(node.__key, node);
+    else node.remove(); // e.g. a leftover "no sessions" placeholder
+  }
+  let prev = null;
+  for (const item of items) {
+    const d = sessionRowDescriptor(item);
+    let node = existing.get(d.key);
+    if (node) {
+      existing.delete(d.key);
+    } else {
+      node = document.createElement("div");
+      node.__key = d.key;
+      node.dataset[d.datasetKey] = d.datasetVal;
+    }
+    // Diff class and inner independently: a selection change touches only
+    // the class, leaving the status element (and its pulse) intact.
+    if (node.__csig !== d.className) {
+      node.className = d.className;
+      node.__csig = d.className;
+    }
+    if (node.__isig !== d.inner) {
+      node.innerHTML = d.inner;
+      node.__isig = d.inner;
+    }
+    const ref = prev ? prev.nextSibling : sessionListEl.firstChild;
+    if (ref !== node) sessionListEl.insertBefore(node, ref);
+    prev = node;
+  }
+  for (const node of existing.values()) node.remove();
   refreshListToolbar();
 }
 
@@ -3546,14 +3611,14 @@ function handleNotification(method, params) {
     const i = state.sessions.findIndex((s) => s.id === session.id);
     if (i >= 0) state.sessions[i] = session;
     else state.sessions.push(session);
-    renderSessions();
+    scheduleRenderSessions();
     if (session.id === state.currentId) {
       sessionTitleEl.textContent = sessionViewTitle(session);
       hydrateWidgets(session.id);
     }
   } else if (method === "session/deleted") {
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
-    renderSessions();
+    scheduleRenderSessions();
     state.editorById.delete(params.session_id);
     state.agentStatusById.delete(params.session_id);
     state.ptyActivityById.delete(params.session_id);
@@ -3573,11 +3638,11 @@ function handleNotification(method, params) {
     const i = state.groups.findIndex((g) => g.id === group.id);
     if (i >= 0) state.groups[i] = group;
     else state.groups.push(group);
-    renderSessions();
+    scheduleRenderSessions();
   } else if (method === "group/deleted" || method === "project/deleted") {
     const deletedId = params.group_id || params.project_id;
     state.groups = state.groups.filter((g) => g.id !== deletedId);
-    renderSessions();
+    scheduleRenderSessions();
   }
 }
 
