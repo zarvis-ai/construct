@@ -6799,6 +6799,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mouse_list_click_updates_active_split_selection() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.position = 1;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        app.active_window_id = 2;
+        app.layout = test_layout();
+        app.layout.list_row_count = app.list_items().len();
+        app.layout.list_items_area = Some(Rect::new(1, 1, 18, 8));
+
+        app.click_list(Rect::new(0, 0, 20, 10), 5, 2).await;
+
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        assert_eq!(
+            app.selection_for_window(2),
+            Some(Selection::Session("s2".into()))
+        );
+        assert_eq!(
+            app.selection_for_window(1),
+            Some(Selection::Session("s1".into()))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn switch_focus_cycles_list_then_first_split_window() {
         let (mut app, _dir, server) = captured_app().await;
         app.main_windows = MainWindowTree::Split {
@@ -6825,6 +6863,30 @@ mod tests {
             app.session_transitions.is_empty(),
             "window focus changes must not glitch"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_transition_is_scoped_to_active_split() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        app.active_window_id = 2;
+
+        app.start_session_transition();
+
+        assert!(!app.session_transitions.contains_key(&1));
+        assert!(app.session_transitions.contains_key(&2));
         server.abort();
     }
 
