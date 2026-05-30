@@ -104,6 +104,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_triggers.clear();
     app.layout.main_window_areas.clear();
+    app.window_pane_sizes.clear();
     app.layout.dynamic_ui_popover_area = None;
     app.layout.dynamic_ui_scroll_metrics = None;
     let area = f.area();
@@ -2159,6 +2160,12 @@ fn render_main_windows(f: &mut Frame, area: Rect, app: &mut App) {
             MainWindowTree::Leaf { id, selection } => {
                 let old_selection = app.selection.clone();
                 app.selection = selection.clone();
+                let inner = area.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                });
+                app.window_pane_sizes
+                    .insert(*id, (inner.width, inner.height));
                 app.layout.main_window_areas.push(WindowPaneHit {
                     id: *id,
                     area,
