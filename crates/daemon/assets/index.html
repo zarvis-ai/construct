@@ -1973,6 +1973,7 @@ function connect() {
 function refreshCurrentSessionAfterReconnect() {
   if (!state.currentId) return;
   const s = state.sessions.find((x) => x.id === state.currentId);
+  hydrateWidgets(state.currentId, { force: true });
   if (state.mode === "terminal" || isTerminalSession(s)) {
     // Keep the live xterm buffer exactly where the user left it. Replaying
     // transcript or PTY history on reconnect appends old output into xterm,
@@ -3851,8 +3852,8 @@ function appendError(msg) {
   target.appendChild(row);
 }
 
-async function hydrateWidgets(id) {
-  if (!id || state.widgetsById.has(id)) {
+async function hydrateWidgets(id, opts = {}) {
+  if (!id || (!opts.force && state.widgetsById.has(id))) {
     renderWidgets();
     return;
   }

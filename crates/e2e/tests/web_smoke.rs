@@ -1120,15 +1120,32 @@ async fn web_client_loads_and_websocket_connects() {
               const oldCurrent = state.currentId;
               const oldSessions = state.sessions;
               const oldSize = state.lastReportedSize;
+              const oldWidgets = state.widgetsById;
               const oldRpc = rpc;
               const calls = [];
               rpc = async (method, params) => {
                 calls.push({ method, params });
+                if (method === 'session.get') {
+                  return {
+                    ui_panels: [{
+                      id: 'status',
+                      title: 'Status',
+                      markdown: '# Status\nupdated while offline',
+                    }],
+                  };
+                }
                 return method === 'session.transcript' ? { events: [] } : null;
               };
               state.mode = 'terminal';
               state.currentId = 's-reconnect-terminal';
               state.sessions = [{ id: 's-reconnect-terminal', has_pty: true, mode: 'interactive' }];
+              state.widgetsById = new Map([
+                ['s-reconnect-terminal', [{
+                  id: 'status',
+                  title: 'Status',
+                  markdown: '# Status\nstale',
+                }]],
+              ]);
               state.lastReportedSize = { cols: 100, rows: 40 };
               state.term = {
                 cols: 100,
@@ -1139,7 +1156,10 @@ async fn web_client_loads_and_websocket_connects() {
               state.fitAddon = { fit: () => calls.push('fit') };
 
               refreshCurrentSessionAfterReconnect();
+              await new Promise((resolve) => setTimeout(resolve, 0));
               await new Promise((resolve) => requestAnimationFrame(resolve));
+              const widgets = state.widgetsById.get('s-reconnect-terminal') || [];
+              const widgetMarkdown = widgets[0]?.markdown || '';
 
               state.term = oldTerm;
               state.fitAddon = oldFit;
@@ -1147,8 +1167,9 @@ async fn web_client_loads_and_websocket_connects() {
               state.currentId = oldCurrent;
               state.sessions = oldSessions;
               state.lastReportedSize = oldSize;
+              state.widgetsById = oldWidgets;
               rpc = oldRpc;
-              return { calls };
+              return { calls, widgetMarkdown };
             })()
             "#,
         )
@@ -1168,6 +1189,18 @@ async fn web_client_loads_and_websocket_connects() {
             )
         }),
         "terminal reconnect should not replay transcript/PTY history: {reconnect_terminal:?}"
+    );
+    assert!(
+        reconnect_calls
+            .iter()
+            .any(|v| v["method"].as_str() == Some("session.get")),
+        "terminal reconnect should refresh widget panels: {reconnect_terminal:?}"
+    );
+    assert!(
+        reconnect_terminal["widgetMarkdown"]
+            .as_str()
+            .is_some_and(|markdown| markdown.contains("updated while offline")),
+        "terminal reconnect should replace stale widget cache: {reconnect_terminal:?}"
     );
 
     // The remote client mirrors zarvis EditorState events in a
