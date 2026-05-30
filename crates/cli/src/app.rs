@@ -2061,7 +2061,7 @@ impl App {
                 }
             }
             None if self.is_pty_captured() => {
-                let active_window = self.is_split_layout().then_some(self.active_window_id);
+                let active_window = Some(self.active_window_id);
                 self.set_scrollback_for_window(active_window, 0);
                 if let Some(id) = self.selected_id() {
                     self.queue_pty_input(id, text.into_bytes(), "pty_input");
@@ -2097,7 +2097,7 @@ impl App {
         self.transcript.clear();
         self.transcript_session = None;
         self.transcript_scroll = u16::MAX;
-        let active_window = self.is_split_layout().then_some(self.active_window_id);
+        let active_window = Some(self.active_window_id);
         self.set_scrollback_for_window(active_window, 0);
         self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
             ViewMode::Terminal
@@ -2114,7 +2114,7 @@ impl App {
         self.transcript.clear();
         self.transcript_session = None;
         self.transcript_scroll = u16::MAX;
-        let active_window = self.is_split_layout().then_some(self.active_window_id);
+        let active_window = Some(self.active_window_id);
         self.set_scrollback_for_window(active_window, 0);
     }
 
@@ -4591,7 +4591,7 @@ impl App {
         if self.view != ViewMode::Terminal || !self.in_pty_session() {
             return;
         }
-        let active_window = self.is_split_layout().then_some(self.active_window_id);
+        let active_window = Some(self.active_window_id);
         let next = adjusted_scrollback(self.scrollback_for_window(active_window), delta);
         self.set_scrollback_for_window(active_window, next);
         self.show_terminal_scrollbar();
@@ -4648,7 +4648,7 @@ impl App {
             .saturating_sub(hit.area.y)
             .min(hit.area.height.saturating_sub(hit.thumb.height)) as usize;
         let from_top = (thumb_top * max_scrollback + max_thumb_top / 2) / max_thumb_top;
-        let active_window = self.is_split_layout().then_some(self.active_window_id);
+        let active_window = Some(self.active_window_id);
         self.set_scrollback_for_window(active_window, max_scrollback.saturating_sub(from_top));
         self.show_terminal_scrollbar();
     }
@@ -4730,7 +4730,7 @@ impl App {
             self.focus_main_window(window_id);
         }
         if self.view == ViewMode::Terminal && self.in_pty_session() {
-            let scroll_window = self.is_split_layout().then_some(self.active_window_id);
+            let scroll_window = Some(self.active_window_id);
             let next = adjusted_scrollback(self.scrollback_for_window(scroll_window), delta);
             self.set_scrollback_for_window(scroll_window, next);
             self.show_terminal_scrollbar();
@@ -4903,7 +4903,7 @@ impl App {
             if self.chord_state.is_empty() && !is_ctrl_x {
                 // Typing snaps the view back to live: it's confusing to
                 // type "into the past" while reading scrollback.
-                let active_window = self.is_split_layout().then_some(self.active_window_id);
+                let active_window = Some(self.active_window_id);
                 let was_scrolled = self.scrollback_for_window(active_window) != 0;
                 self.set_scrollback_for_window(active_window, 0);
                 if was_scrolled {
@@ -5512,7 +5512,7 @@ impl App {
                     if self.is_orchestrator_panel_open() {
                         self.orchestrator_scrollback = SCROLLBACK_MAX;
                     } else {
-                        let active_window = self.is_split_layout().then_some(self.active_window_id);
+                        let active_window = Some(self.active_window_id);
                         self.set_scrollback_for_window(active_window, SCROLLBACK_MAX);
                         self.show_terminal_scrollbar();
                     }
@@ -5525,7 +5525,7 @@ impl App {
                     if self.is_orchestrator_panel_open() {
                         self.orchestrator_scrollback = 0;
                     } else {
-                        let active_window = self.is_split_layout().then_some(self.active_window_id);
+                        let active_window = Some(self.active_window_id);
                         self.set_scrollback_for_window(active_window, 0);
                         self.show_terminal_scrollbar();
                     }
@@ -7248,6 +7248,35 @@ mod tests {
         server.abort();
     }
 
+    /// Regression: in a single-pane (non-split) layout the render path still
+    /// goes through `render_main_windows`, which always passes
+    /// `Some(window_id)` to `render_terminal_for_window`. The scroll handlers
+    /// must therefore key on `Some(active_window_id)` too — keying on `None`
+    /// when not split (the previous behaviour) wrote to `view_scrollback` but
+    /// the render read `window_scrollback[active_window_id]`, so the
+    /// scrollbar appeared but the viewport never moved.
+    #[tokio::test]
+    async fn scroll_in_single_pane_updates_what_render_reads() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.selection = Selection::Session("s1".into());
+        app.view = ViewMode::Terminal;
+        assert!(
+            !app.is_split_layout(),
+            "captured_app must start non-split for this regression"
+        );
+        let win = app.active_window_id;
+
+        app.adjust_scrollback(10);
+
+        // Both views of the offset must agree, since the render path passes
+        // `Some(active_window_id)` even in single-pane mode while the zoomed
+        // render path reads `view_scrollback` directly.
+        assert_eq!(app.scrollback_for_window(Some(win)), 10);
+        assert_eq!(app.view_scrollback, 10);
+        assert_eq!(app.scrollback_for_window(None), 10);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn mouse_scrollback_targets_only_hovered_split() {
         let (mut app, _dir, server) = captured_app().await;
@@ -7690,11 +7719,20 @@ mod tests {
     #[tokio::test]
     async fn pty_keystroke_snapping_scrollback_still_redraws() {
         let (mut app, _dir, _srv) = captured_app().await;
-        app.view_scrollback = 5;
+        // Use the proper setter so the per-window store stays the canonical
+        // source: a bare `view_scrollback = 5` only updates the mirror and
+        // the keystroke path now reads the per-window store.
+        let win = Some(app.active_window_id);
+        app.set_scrollback_for_window(win, 5);
         app.skip_redraw_after_event = false;
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
         assert_eq!(app.view_scrollback, 0, "typing snaps the view to live");
+        assert_eq!(
+            app.scrollback_for_window(win),
+            0,
+            "per-window store must also snap to live, not just the mirror"
+        );
         assert!(
             !app.skip_redraw_after_event,
             "snapping scrollback to live has no PTY output, so it must redraw"
