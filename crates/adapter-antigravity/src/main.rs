@@ -576,13 +576,20 @@ fn emit_new_transcript_steps(path: &Path, after: i64, emit: &EventEmitter) -> i6
 
 /// Map one transcript step to a `SessionEvent`.
 fn emit_step(v: &Value, emit: &EventEmitter) {
+    for event in antigravity_events_from_step(v) {
+        emit.emit(event);
+    }
+}
+
+fn antigravity_events_from_step(v: &Value) -> Vec<SessionEvent> {
     let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
     match ty {
         // Structural / already-known-to-daemon — skip.
-        "USER_INPUT" | "CONVERSATION_HISTORY" => {}
+        "USER_INPUT" | "CONVERSATION_HISTORY" => Vec::new(),
         "PLANNER_RESPONSE" => {
             // Either a tool-call decision or assistant prose.
             if let Some(calls) = v.get("tool_calls").and_then(|c| c.as_array()) {
+                let mut out = Vec::new();
                 for c in calls {
                     let name = c
                         .get("name")
@@ -590,15 +597,20 @@ fn emit_step(v: &Value, emit: &EventEmitter) {
                         .unwrap_or("?")
                         .to_string();
                     let args = c.get("args").cloned().unwrap_or(Value::Null);
-                    emit.emit(SessionEvent::ToolUse { tool: name, args });
+                    out.push(SessionEvent::ToolUse { tool: name, args });
                 }
+                out
             } else if let Some(content) = v.get("content").and_then(|s| s.as_str()) {
                 if !content.is_empty() {
-                    emit.emit(SessionEvent::Message {
+                    vec![SessionEvent::Message {
                         role: MessageRole::Assistant,
                         text: content.to_string(),
-                    });
+                    }]
+                } else {
+                    Vec::new()
                 }
+            } else {
+                Vec::new()
             }
         }
         // Any other step type is a tool-result step named after the tool
@@ -612,11 +624,11 @@ fn emit_step(v: &Value, emit: &EventEmitter) {
                 .and_then(|s| s.as_str())
                 .unwrap_or("")
                 .to_string();
-            emit.emit(SessionEvent::ToolResult {
+            vec![SessionEvent::ToolResult {
                 tool: ty.to_string(),
                 ok,
                 output,
-            });
+            }]
         }
     }
 }
@@ -671,43 +683,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Verifies the step→event classification without a live emitter, by
-    // re-implementing the branch decision the way `emit_step` does. Keeps
-    // the schema assumptions pinned: tool_calls→ToolUse, content→Message,
-    // unknown type→ToolResult.
     #[test]
-    fn step_classification_matches_schema() {
-        fn classify(line: &str) -> &'static str {
-            let v: Value = serde_json::from_str(line).unwrap();
-            let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("");
-            match ty {
-                "USER_INPUT" | "CONVERSATION_HISTORY" => "skip",
-                "PLANNER_RESPONSE" => {
-                    if v.get("tool_calls").and_then(|c| c.as_array()).is_some() {
-                        "tool_use"
-                    } else if v.get("content").is_some() {
-                        "message"
-                    } else {
-                        "skip"
-                    }
-                }
-                _ => "tool_result",
+    fn structural_steps_do_not_emit_chat_events() {
+        let v: Value = serde_json::from_str(r#"{"type":"USER_INPUT","content":"x"}"#).unwrap();
+        assert!(antigravity_events_from_step(&v).is_empty());
+    }
+
+    #[test]
+    fn planner_response_content_emits_assistant_message() {
+        let v: Value =
+            serde_json::from_str(r#"{"type":"PLANNER_RESPONSE","content":"final"}"#).unwrap();
+        match antigravity_events_from_step(&v).as_slice() {
+            [SessionEvent::Message { role, text }] => {
+                assert!(matches!(role, MessageRole::Assistant));
+                assert_eq!(text, "final");
             }
+            other => panic!("unexpected message events: {other:?}"),
         }
-        assert_eq!(classify(r#"{"type":"USER_INPUT","content":"x"}"#), "skip");
-        assert_eq!(
-            classify(
-                r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{}}]}"#
-            ),
-            "tool_use"
-        );
-        assert_eq!(
-            classify(r#"{"type":"PLANNER_RESPONSE","content":"final"}"#),
-            "message"
-        );
-        assert_eq!(
-            classify(r#"{"type":"RUN_COMMAND","status":"DONE","content":"out"}"#),
-            "tool_result"
-        );
+    }
+
+    #[test]
+    fn planner_response_tool_calls_emit_tool_uses() {
+        let v: Value = serde_json::from_str(
+            r#"{"type":"PLANNER_RESPONSE","tool_calls":[{"name":"run_command","args":{"cmd":"ls"}}]}"#,
+        )
+        .unwrap();
+        match antigravity_events_from_step(&v).as_slice() {
+            [SessionEvent::ToolUse { tool, args }] => {
+                assert_eq!(tool, "run_command");
+                assert_eq!(args["cmd"], "ls");
+            }
+            other => panic!("unexpected tool-use events: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_step_emits_tool_result() {
+        let v: Value =
+            serde_json::from_str(r#"{"type":"RUN_COMMAND","status":"DONE","content":"out"}"#)
+                .unwrap();
+        match antigravity_events_from_step(&v).as_slice() {
+            [SessionEvent::ToolResult { tool, ok, output }] => {
+                assert_eq!(tool, "RUN_COMMAND");
+                assert!(*ok);
+                assert_eq!(output, "out");
+            }
+            other => panic!("unexpected tool-result events: {other:?}"),
+        }
     }
 }

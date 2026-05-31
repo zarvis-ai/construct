@@ -325,11 +325,17 @@ fn emit_new_codex_rollout_lines(path: &Path, next_line: &mut usize, emit: &Event
 }
 
 fn emit_codex_rollout_event(emit: &EventEmitter, v: &Value) {
+    for event in codex_rollout_events(v) {
+        emit.emit(event);
+    }
+}
+
+fn codex_rollout_events(v: &Value) -> Vec<SessionEvent> {
     if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
-        return;
+        return Vec::new();
     }
     let Some(payload) = v.get("payload") else {
-        return;
+        return Vec::new();
     };
     match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
         "message" => {
@@ -339,9 +345,10 @@ fn emit_codex_rollout_event(emit: &EventEmitter, v: &Value) {
             };
             if let Some(text) = extract_text_from_blocks(payload.get("content")) {
                 if !text.trim().is_empty() {
-                    emit.emit(SessionEvent::Message { role, text });
+                    return vec![SessionEvent::Message { role, text }];
                 }
             }
+            Vec::new()
         }
         "function_call" => {
             let tool = payload
@@ -355,7 +362,7 @@ fn emit_codex_rollout_event(emit: &EventEmitter, v: &Value) {
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .or_else(|| payload.get("arguments").cloned())
                 .unwrap_or(Value::Null);
-            emit.emit(SessionEvent::ToolUse { tool, args });
+            vec![SessionEvent::ToolUse { tool, args }]
         }
         "function_call_output" => {
             let tool = payload
@@ -368,13 +375,13 @@ fn emit_codex_rollout_event(emit: &EventEmitter, v: &Value) {
                 Some(v) => serde_json::to_string(v).unwrap_or_default(),
                 None => String::new(),
             };
-            emit.emit(SessionEvent::ToolResult {
+            vec![SessionEvent::ToolResult {
                 tool,
                 ok: true,
                 output,
-            });
+            }]
         }
-        _ => {}
+        _ => Vec::new(),
     }
 }
 
@@ -862,6 +869,81 @@ mod tests {
         // an empty session-env value doesn't masquerade as a real one.
         if let Some(p) = got {
             assert_ne!(p, PathBuf::from("/sessions"));
+        }
+    }
+
+    #[test]
+    fn rollout_message_records_become_chat_messages() {
+        let user = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "hello" }]
+            }
+        });
+        let assistant = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "one" },
+                    { "type": "output_text", "text": "two" }
+                ]
+            }
+        });
+
+        match codex_rollout_events(&user).as_slice() {
+            [SessionEvent::Message { role, text }] => {
+                assert!(matches!(role, MessageRole::User));
+                assert_eq!(text, "hello");
+            }
+            other => panic!("unexpected user events: {other:?}"),
+        }
+        match codex_rollout_events(&assistant).as_slice() {
+            [SessionEvent::Message { role, text }] => {
+                assert!(matches!(role, MessageRole::Assistant));
+                assert_eq!(text, "one\ntwo");
+            }
+            other => panic!("unexpected assistant events: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollout_function_records_become_tool_events() {
+        let call = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"cargo test\"}",
+                "call_id": "call_1"
+            }
+        });
+        let output = serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok"
+            }
+        });
+
+        match codex_rollout_events(&call).as_slice() {
+            [SessionEvent::ToolUse { tool, args }] => {
+                assert_eq!(tool, "exec_command");
+                assert_eq!(args["cmd"], "cargo test");
+            }
+            other => panic!("unexpected tool-use events: {other:?}"),
+        }
+        match codex_rollout_events(&output).as_slice() {
+            [SessionEvent::ToolResult { tool, ok, output }] => {
+                assert_eq!(tool, "call_1");
+                assert!(*ok);
+                assert_eq!(output, "ok");
+            }
+            other => panic!("unexpected tool-result events: {other:?}"),
         }
     }
 }
