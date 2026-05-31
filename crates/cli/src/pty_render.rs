@@ -1903,6 +1903,14 @@ mod tests {
             .count()
     }
 
+    fn tool_block_ids(item: &Item) -> Vec<String> {
+        match item {
+            Item::ToolBlock(b) => vec![b.call_id.clone()],
+            Item::ToolGroup(g) => g.blocks.iter().map(|b| b.call_id.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     #[test]
     fn no_osc_yields_one_chunk_on_replay() {
         let mut h = ItemHistory::new();
@@ -2115,6 +2123,67 @@ mod tests {
             .unwrap();
         assert_eq!(block_a.tool.as_deref(), Some("shell"));
         assert_eq!(block_b.tool.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn adjacent_same_tool_task_starts_group() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "read_file".into(), r#"{"path":"a.rs"}"#.into());
+        h.feed_task_start("B".into(), "read_file".into(), r#"{"path":"b.rs"}"#.into());
+        h.feed_tool_result("A", true, "a".into());
+        h.feed_tool_result("B", false, "missing".into());
+
+        assert_eq!(h.items.len(), 1);
+        match &h.items[0] {
+            Item::ToolGroup(g) => {
+                assert_eq!(g.tool, "read_file");
+                assert_eq!(tool_block_ids(&h.items[0]), vec!["A", "B"]);
+                assert_eq!(g.blocks[0].output.as_deref(), Some("a"));
+                assert!(!g.blocks[1].ok);
+            }
+            other => panic!("expected tool group, got {other:?}"),
+        }
+
+        let text = screen_text(h.replay(100, 20, 0).screen, 20, 100);
+        assert!(text.contains("→ read_file × 2"), "{text}");
+        assert!(text.contains("a.rs, b.rs"), "{text}");
+        assert!(text.contains("2 completed"), "{text}");
+        assert!(text.contains("1 failed"), "{text}");
+    }
+
+    #[test]
+    fn grouping_does_not_cross_different_tool_or_pty() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "read_file".into(), r#"{"path":"a.rs"}"#.into());
+        h.feed_task_start("B".into(), "list_dir".into(), r#"{"path":"src"}"#.into());
+        h.feed_pty(b"assistant prose\r\n");
+        h.feed_task_start("C".into(), "read_file".into(), r#"{"path":"c.rs"}"#.into());
+
+        assert!(matches!(h.items[0], Item::ToolBlock(_)));
+        assert!(matches!(h.items[1], Item::ToolBlock(_)));
+        assert!(matches!(h.items[2], Item::PtyChunk(_)));
+        assert!(matches!(h.items[3], Item::ToolBlock(_)));
+    }
+
+    #[test]
+    fn late_tool_use_hydration_can_group_with_previous_block() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "echo a".into());
+        h.feed_pty(b"\x1b]7700;open;call=B\x07inline");
+        h.feed_tool_use("shell".into(), "echo b".into());
+        h.feed_tool_result("B", true, "b".into());
+        h.feed_pty(b"\x1b]7700;close;call=B\x07");
+
+        assert_eq!(h.items.len(), 1);
+        match &h.items[0] {
+            Item::ToolGroup(g) => {
+                assert_eq!(g.tool, "shell");
+                assert_eq!(tool_block_ids(&h.items[0]), vec!["A", "B"]);
+                assert_eq!(g.blocks[1].args_summary.as_deref(), Some("echo b"));
+                assert_eq!(g.blocks[1].output.as_deref(), Some("b"));
+            }
+            other => panic!("expected tool group, got {other:?}"),
+        }
     }
 
     #[test]
