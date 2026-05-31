@@ -1601,7 +1601,13 @@ fn group_block_layouts(group: &ToolGroup, synth: &SynthOutput, cols: u16) -> Vec
     let lines = count_visible_lines(&synth.bytes, cols);
     let mut layouts = vec![BlockLayout {
         call_id: group.call_id(),
-        row_start_offset: 1,
+        // The synthesized group starts with a separator CRLF before
+        // the header. vt100/counting disagree by one row depending
+        // on whether the prior item ended at column 0, so accept
+        // both the separator row and the header row as the group
+        // toggle target. Child block hit rects still start after
+        // the header, so expanded child footers remain independent.
+        row_start_offset: 0,
         row_end_offset: 2.min(lines),
         status_row_offset: None,
         bg_cols: None,
@@ -2219,7 +2225,10 @@ mod tests {
         assert!(ids.contains(&"A"), "{ids:?}");
         assert!(ids.contains(&"B"), "{ids:?}");
         let group_hit = out.blocks.iter().find(|b| b.call_id == group_id).unwrap();
-        assert_eq!(group_hit.row_end - group_hit.row_start, 1);
+        assert!(
+            group_hit.row_end - group_hit.row_start <= 2,
+            "{group_hit:?}"
+        );
 
         assert!(h.toggle_block("A"));
         match &h.items[0] {
