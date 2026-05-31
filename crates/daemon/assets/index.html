@@ -2166,6 +2166,25 @@ function scheduleReconnect() {
   state.reconnectDelay = Math.min(state.reconnectDelay * 2, 15000);
 }
 
+/**
+ * User-initiated refresh: close the current socket so the existing reconnect
+ * machinery (close handler -> scheduleReconnect -> connect -> subscribe +
+ * refreshSessions + refreshCurrentSessionAfterReconnect) re-runs end to end.
+ * No `location.reload()` — that would clear xterm buffers, scroll position,
+ * widgets, and ongoing PTY input on mobile, which is the wrong UX for a
+ * pull-to-refresh gesture. The reconnect-delay backoff is short-circuited
+ * here so the user sees an immediate "connecting…" → "connected" flash
+ * rather than waiting on the current backoff window.
+ */
+function softRefresh() {
+  state.reconnectDelay = 50;
+  if (state.ws) {
+    try { state.ws.close(); } catch (_) { /* already-closed sockets are fine */ }
+  } else {
+    connect();
+  }
+}
+
 function rpc(method, params) {
   return new Promise((resolve, reject) => {
     if (!state.ws || state.ws.readyState !== 1) {
@@ -5444,13 +5463,24 @@ function initPullToRefresh() {
       return;
     }
     if (armed) {
-      // Brief visual confirm so the user sees the gesture register before
-      // the page goes white during reload.
+      // Brief visual confirm before the soft refresh kicks in. We don't
+      // call `location.reload()` here — see `softRefresh()`. Instead we
+      // tear down the WebSocket; the close handler re-runs the same path
+      // a network hiccup would, which re-fetches the session list and
+      // re-hydrates the active session without losing xterm buffers,
+      // scroll position, or widgets.
       indicator.classList.remove("dragging");
       indicator.classList.add("armed");
       indicator.style.height = `${MAX_HEIGHT}px`;
       setLabel("↻ refreshing…");
-      setTimeout(() => location.reload(), 200);
+      setTimeout(() => {
+        softRefresh();
+        // Snap the indicator out of the way; the conn pill in the header
+        // already shows "connecting…" → "connected" so the user gets
+        // ongoing feedback after the banner disappears.
+        indicator.style.height = "0";
+        setTimeout(reset, 220);
+      }, 200);
       return;
     }
     indicator.classList.remove("dragging");
