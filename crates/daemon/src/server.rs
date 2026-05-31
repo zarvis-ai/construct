@@ -1378,7 +1378,10 @@ async fn dispatch(
         }
         m if m == ipc_method::SESSION_TRANSCRIPT => {
             let p = params!(TranscriptParams);
-            match manager.transcript(&p.session_id, p.from, p.limit).await {
+            match manager
+                .transcript(&p.session_id, p.from, p.limit, p.tail)
+                .await
+            {
                 Ok(r) => ok!(&r),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

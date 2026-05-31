@@ -1063,6 +1063,12 @@ pub struct TranscriptParams {
     pub from: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Return the most-recent `tail` events instead of paginating forward
+    /// from `from`. When set, `from` and `limit` are ignored. Used by the
+    /// webui to render the live tail of long histories immediately while it
+    /// background-loads older pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -422,6 +422,22 @@
     0% { background-position: 200% 0; }
     100% { background-position: -200% 0; }
   }
+  /* Sticky progress banner while older transcript pages stream in. The
+     pane is `position: relative` (default for scrollers), so `position:
+     sticky; top: 0` keeps the banner pinned to the top of the viewport
+     whether the user is at the tail or has scrolled up into history. */
+  .transcript-progress {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: var(--dim);
+    background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(4px);
+    pointer-events: none;
+  }
   .transcript-pane::-webkit-scrollbar {
     width: 16px;
   }
@@ -3631,6 +3647,36 @@ function transcriptSkeletonEl() {
   return el;
 }
 
+// Tail page = the most recent N events the user wants to see immediately on
+// session open. Older page = each background batch that fills history above
+// the tail. Both sized for ~1 frame of render budget at typical event size.
+const TRANSCRIPT_TAIL_PAGE = 500;
+const TRANSCRIPT_OLDER_PAGE = 500;
+
+function renderEventsInto(targetEl, events) {
+  const prevActive = activeTranscriptEl;
+  activeTranscriptEl = targetEl;
+  try {
+    for (const te of events) renderEvent(te.event, te.at);
+  } finally {
+    activeTranscriptEl = prevActive;
+  }
+}
+
+function transcriptProgressBanner(loaded, total) {
+  const el = document.createElement("div");
+  el.className = "transcript-progress";
+  el.setAttribute("aria-live", "polite");
+  updateTranscriptProgressBanner(el, loaded, total);
+  return el;
+}
+
+function updateTranscriptProgressBanner(el, loaded, total) {
+  if (!el) return;
+  const pct = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+  el.textContent = `Loading older history… ${loaded.toLocaleString()} / ${total.toLocaleString()} (${pct}%)`;
+}
+
 async function loadTranscript(id) {
   const pane = showTranscriptPane(id);
   if (pane.dataset.loaded === "true") return; // already built — instant re-select
@@ -3643,9 +3689,16 @@ async function loadTranscript(id) {
     }
   }, 150);
   state.byId.set(id, []);
+  // Fetch the tail page first: a multi-GB transcript would otherwise stall
+  // the wire + main thread for many seconds; the tail is what the user
+  // expects to see on open anyway (most-recent activity). Older pages then
+  // fill in upward without blocking the UI.
   let result;
   try {
-    result = await rpc("session.transcript", { session_id: id, from: 0 });
+    result = await rpc("session.transcript", {
+      session_id: id,
+      tail: TRANSCRIPT_TAIL_PAGE,
+    });
   } catch (e) {
     clearTimeout(skeletonTimer);
     if (state.currentId === id) {
@@ -3658,25 +3711,81 @@ async function loadTranscript(id) {
   // A rapid re-selection may have moved on while we awaited the round-trip;
   // don't clobber whatever the user is now looking at.
   if (state.currentId !== id) return;
-  const events = (result && result.events) || [];
-  // Build the whole transcript off-DOM, then swap it in and pin to the
-  // bottom in one synchronous step — the user only ever sees the finished
-  // transcript already scrolled to the latest, never a blank pane (the
-  // skeleton covers the wait) nor a top-anchored flash that then jumps.
-  // renderEvent / append* target `activeTranscriptEl`, so point it at the
-  // detached builder for the duration of the render.
+  const tailEvents = (result && result.events) || [];
+  const total = (result && typeof result.total === "number") ? result.total : tailEvents.length;
+  // Build the tail off-DOM, then swap it in and pin to the bottom in one
+  // synchronous step — the user only ever sees a finished transcript already
+  // scrolled to the latest, never a blank pane (the skeleton covers the
+  // wait) nor a top-anchored flash that then jumps.
   const build = document.createElement("div");
-  const prevActive = activeTranscriptEl;
-  activeTranscriptEl = build;
-  try {
-    for (const te of events) renderEvent(te.event, te.at);
-  } finally {
-    activeTranscriptEl = prevActive;
-  }
+  renderEventsInto(build, tailEvents);
   pane.replaceChildren(...build.childNodes);
   pane.dataset.loaded = "true";
   pane.scrollTop = pane.scrollHeight;
   pane._atBottom = true;
+
+  // Background-load older pages if there's more history above the tail.
+  const minTailSeq = tailEvents.length > 0 ? tailEvents[0].seq : 0;
+  if (total > tailEvents.length && minTailSeq > 0) {
+    backgroundLoadOlderTranscript(id, pane, minTailSeq, tailEvents.length, total);
+  }
+}
+
+async function backgroundLoadOlderTranscript(id, pane, minTailSeq, alreadyLoaded, total) {
+  // Sticky banner pinned to the top of the pane so the user sees progress
+  // whether they're sitting on the latest tail or scrolling up through
+  // history. New older events are inserted just below it.
+  const banner = transcriptProgressBanner(alreadyLoaded, total);
+  pane.insertBefore(banner, pane.firstChild);
+
+  let from = 0;
+  let loaded = alreadyLoaded;
+  try {
+    while (loaded < total && state.currentId === id) {
+      let result;
+      try {
+        result = await rpc("session.transcript", {
+          session_id: id,
+          from,
+          limit: TRANSCRIPT_OLDER_PAGE,
+        });
+      } catch (e) {
+        // Older-page fetch failed: the tail is still visible, so just
+        // silently stop trying to fill history rather than tearing down
+        // what the user is reading.
+        return;
+      }
+      if (state.currentId !== id) return;
+      const chunk = (result && result.events) || [];
+      if (chunk.length === 0) return;
+      // Drop anything that overlaps the tail page we already rendered.
+      // (Strictly older = seq < minTailSeq.)
+      const older = chunk.filter((te) => te.seq < minTailSeq);
+      if (older.length > 0) {
+        const build = document.createElement("div");
+        renderEventsInto(build, older);
+        // Preserve the user's scroll position relative to the BOTTOM so
+        // newly-prepended history doesn't feel like the view is jumping.
+        const fromBottom = pane.scrollHeight - pane.scrollTop;
+        const insertionPoint = banner.nextSibling;
+        while (build.firstChild) {
+          pane.insertBefore(build.firstChild, insertionPoint);
+        }
+        pane.scrollTop = pane.scrollHeight - fromBottom;
+        loaded += older.length;
+        updateTranscriptProgressBanner(banner, loaded, total);
+      }
+      const lastSeq = chunk[chunk.length - 1].seq;
+      // We've walked into the tail's range — no more older events exist.
+      if (lastSeq >= minTailSeq) return;
+      from = lastSeq + 1;
+      // Yield to the event loop so the page stays responsive and the
+      // browser can paint partial progress.
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+    }
+  } finally {
+    banner.remove();
+  }
 }
 
 function handleNotification(method, params) {

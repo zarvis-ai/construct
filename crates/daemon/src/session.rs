@@ -1133,9 +1133,18 @@ impl SessionManager {
         id: &str,
         from: u64,
         limit: Option<usize>,
+        tail: Option<usize>,
     ) -> Result<TranscriptResult> {
-        if self.get_entry(id).await.is_none() {
-            return Err(anyhow!("session not found: {}", id));
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        if let Some(n) = tail {
+            // Tail mode: take `total` from the live counter (cheap, no file
+            // scan) and read only the last `n` events from disk.
+            let total = entry.transcript_count.load(Ordering::Relaxed);
+            let events = self.storage.read_transcript_tail(id, n)?;
+            return Ok(TranscriptResult { events, total });
         }
         self.storage.read_transcript(id, from, limit)
     }
@@ -3980,6 +3989,55 @@ mod tests {
     #[test]
     fn effective_mode_defaults_to_headless_without_pty() {
         assert_eq!(effective_mode(&create_params(None, None)), "headless");
+    }
+
+    #[tokio::test]
+    async fn transcript_tail_returns_last_n_with_live_total() {
+        use chrono::Utc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage_handle = storage.clone();
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "stail";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+
+        // Simulate 1234 persisted events. The live transcript_count is what
+        // `transcript(.., tail: …)` must surface as `total` — that's the
+        // signal the webui uses to decide whether to background-load older
+        // pages above the tail.
+        for seq in 1..=1234u64 {
+            let ev = agentd_protocol::TimestampedEvent {
+                seq,
+                at: Utc::now(),
+                event: agentd_protocol::SessionEvent::Message {
+                    role: agentd_protocol::MessageRole::Assistant,
+                    text: format!("e{seq}"),
+                },
+            };
+            storage_handle.append_event(id, &ev).expect("append event");
+            entry
+                .transcript_count
+                .store(seq, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let result = mgr
+            .transcript(id, 0, None, Some(50))
+            .await
+            .expect("transcript tail");
+
+        assert_eq!(result.total, 1234, "total must come from the live counter");
+        assert_eq!(result.events.len(), 50);
+        assert_eq!(result.events.first().unwrap().seq, 1185);
+        assert_eq!(result.events.last().unwrap().seq, 1234);
     }
 
     #[tokio::test]
