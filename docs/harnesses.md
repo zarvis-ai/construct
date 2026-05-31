@@ -82,13 +82,13 @@ Examples:
 The adapter is the translation layer between this shared contract and a specific
 harness.
 
-## Common abstraction layer
+## Fleet-wide capabilities
 
-agentd's common abstraction layer is the set of features you define once at the
+agentd's fleet-wide capabilities are features you define once at the
 agentd/session level and then reuse across harnesses where possible.
 
-Use it when you want a fleet-wide behavior instead of configuring each harness by
-hand. For example: "make these skills available," "allow writes under this
+Use them when you want a fleet-wide behavior instead of configuring each harness
+by hand. For example: "make these skills available," "allow writes under this
 session widget directory," or "show this status widget in every client."
 
 | Abstraction | How to use it | Support |
