@@ -2029,8 +2029,11 @@ function connect() {
     // notifications for every session (we filter to currentId
     // when rendering).
     rpc("ping", null).catch(() => {});
-    refreshSessions();
+    // Subscribe BEFORE fetching the list so a session/state that lands
+    // between the snapshot and the subscription (e.g. a rename from the
+    // TUI) isn't lost in the gap (#272).
     rpc("subscribe.events", { session_id: null }).catch(() => {});
+    refreshSessions();
     refreshCurrentSessionAfterReconnect();
   });
 
@@ -2063,6 +2066,23 @@ function connect() {
     }
   });
 }
+
+// Real-time session/state broadcasts update renames etc. instantly, but a
+// broadcast can be missed while the tab is backgrounded or if a busy fleet
+// lags the subscription (the daemon drops, without resyncing — #272). So
+// reconcile the list (cheap and in-place, no flicker) when the page regains
+// visibility/focus, and on a slow safety interval while visible, so a rename
+// done elsewhere (e.g. the TUI) self-heals instead of staying stale.
+function reconcileSessionsIfConnected() {
+  if (state.ws && state.ws.readyState === 1) refreshSessions();
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) reconcileSessionsIfConnected();
+});
+window.addEventListener("focus", reconcileSessionsIfConnected);
+setInterval(() => {
+  if (!document.hidden) reconcileSessionsIfConnected();
+}, 30000);
 
 function refreshCurrentSessionAfterReconnect() {
   if (!state.currentId) return;
