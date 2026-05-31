@@ -519,44 +519,10 @@ where
 fn emit_event_from_json(emit: &EventEmitter, v: Value) {
     let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
-        "assistant" => {
-            let text = extract_message_text(v.get("message"));
-            if !text.is_empty() {
-                emit.emit(SessionEvent::Message {
-                    role: MessageRole::Assistant,
-                    text,
-                });
+        "assistant" | "user" | "result" => {
+            for event in claude_events_from_json(&v) {
+                emit.emit(event);
             }
-            forward_tool_uses(emit, v.get("message"));
-        }
-        "user" => {
-            // The CLI echoes tool_result blocks here. The actual user text is
-            // already in the transcript (daemon emits it when sending input).
-            forward_tool_results(emit, v.get("message"));
-        }
-        "result" => {
-            let usd = v
-                .get("total_cost_usd")
-                .and_then(|n| n.as_f64())
-                .unwrap_or(0.0);
-            let tin = v
-                .get("usage")
-                .and_then(|u| u.get("input_tokens"))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            let tout = v
-                .get("usage")
-                .and_then(|u| u.get("output_tokens"))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(0);
-            if usd > 0.0 || tin > 0 || tout > 0 {
-                emit.emit(SessionEvent::Cost {
-                    usd,
-                    tokens_in: tin,
-                    tokens_out: tout,
-                });
-            }
-            // The `result` text duplicates the assistant's final message; skip it.
         }
         "system" => {
             emit.log(format!(
@@ -576,6 +542,55 @@ fn emit_event_from_json(emit: &EventEmitter, v: Value) {
                 serde_json::to_string(&v).unwrap_or_default()
             ));
         }
+    }
+}
+
+fn claude_events_from_json(v: &Value) -> Vec<SessionEvent> {
+    match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "assistant" => {
+            let mut out = Vec::new();
+            let text = extract_message_text(v.get("message"));
+            if !text.is_empty() {
+                out.push(SessionEvent::Message {
+                    role: MessageRole::Assistant,
+                    text,
+                });
+            }
+            out.extend(tool_uses_from_message(v.get("message")));
+            out
+        }
+        "user" => {
+            // The CLI echoes tool_result blocks here. The actual user text is
+            // already in the transcript (daemon emits it when sending input).
+            tool_results_from_message(v.get("message"))
+        }
+        "result" => {
+            let usd = v
+                .get("total_cost_usd")
+                .and_then(|n| n.as_f64())
+                .unwrap_or(0.0);
+            let tin = v
+                .get("usage")
+                .and_then(|u| u.get("input_tokens"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            let tout = v
+                .get("usage")
+                .and_then(|u| u.get("output_tokens"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            if usd > 0.0 || tin > 0 || tout > 0 {
+                vec![SessionEvent::Cost {
+                    usd,
+                    tokens_in: tin,
+                    tokens_out: tout,
+                }]
+            } else {
+                Vec::new()
+            }
+            // The `result` text duplicates the assistant's final message; skip it.
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -603,13 +618,14 @@ fn extract_message_text(msg: Option<&Value>) -> String {
     String::new()
 }
 
-fn forward_tool_uses(emit: &EventEmitter, msg: Option<&Value>) {
+fn tool_uses_from_message(msg: Option<&Value>) -> Vec<SessionEvent> {
     let Some(arr) = msg
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
     else {
-        return;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for block in arr {
         if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
             let name = block
@@ -618,21 +634,23 @@ fn forward_tool_uses(emit: &EventEmitter, msg: Option<&Value>) {
                 .unwrap_or("?")
                 .to_string();
             let input = block.get("input").cloned().unwrap_or(Value::Null);
-            emit.emit(SessionEvent::ToolUse {
+            out.push(SessionEvent::ToolUse {
                 tool: name,
                 args: input,
             });
         }
     }
+    out
 }
 
-fn forward_tool_results(emit: &EventEmitter, msg: Option<&Value>) {
+fn tool_results_from_message(msg: Option<&Value>) -> Vec<SessionEvent> {
     let Some(arr) = msg
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_array())
     else {
-        return;
+        return Vec::new();
     };
+    let mut out = Vec::new();
     for block in arr {
         if block.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
             let tool = block
@@ -649,9 +667,10 @@ fn forward_tool_results(emit: &EventEmitter, msg: Option<&Value>) {
                 Some(v) => serde_json::to_string(v).unwrap_or_default(),
                 None => String::new(),
             };
-            emit.emit(SessionEvent::ToolResult { tool, ok, output });
+            out.push(SessionEvent::ToolResult { tool, ok, output });
         }
     }
+    out
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -659,5 +678,109 @@ fn short(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max).collect::<String>() + "..."
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_project_slug_matches_project_dir_encoding() {
+        assert_eq!(
+            claude_project_slug(Path::new("/Users/moon/agentd/.claude/worktrees/test")),
+            "-Users-moon-agentd--claude-worktrees-test"
+        );
+    }
+
+    #[test]
+    fn assistant_transcript_record_emits_message_and_tool_use() {
+        let v = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": "I will inspect it." },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "Bash",
+                        "input": { "command": "cargo test" }
+                    }
+                ]
+            }
+        });
+
+        let events = claude_events_from_json(&v);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            SessionEvent::Message { role, text } => {
+                assert!(matches!(role, MessageRole::Assistant));
+                assert_eq!(text, "I will inspect it.");
+            }
+            other => panic!("unexpected message event: {other:?}"),
+        }
+        match &events[1] {
+            SessionEvent::ToolUse { tool, args } => {
+                assert_eq!(tool, "Bash");
+                assert_eq!(args["command"], "cargo test");
+            }
+            other => panic!("unexpected tool-use event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_tool_result_record_emits_tool_result() {
+        let v = serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "finished",
+                        "is_error": false
+                    }
+                ]
+            }
+        });
+
+        match claude_events_from_json(&v).as_slice() {
+            [SessionEvent::ToolResult { tool, ok, output }] => {
+                assert_eq!(tool, "toolu_1");
+                assert!(*ok);
+                assert_eq!(output, "finished");
+            }
+            other => panic!("unexpected tool-result events: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn result_record_emits_cost_without_duplicate_message() {
+        let v = serde_json::json!({
+            "type": "result",
+            "result": "final text that should not become another message",
+            "total_cost_usd": 0.25,
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 20
+            }
+        });
+
+        match claude_events_from_json(&v).as_slice() {
+            [
+                SessionEvent::Cost {
+                    usd,
+                    tokens_in,
+                    tokens_out,
+                },
+            ] => {
+                assert_eq!(*usd, 0.25);
+                assert_eq!(*tokens_in, 10);
+                assert_eq!(*tokens_out, 20);
+            }
+            other => panic!("unexpected cost events: {other:?}"),
+        }
     }
 }
