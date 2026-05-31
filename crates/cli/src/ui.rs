@@ -103,6 +103,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_inline_hit = None;
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_triggers.clear();
+    app.layout.shortcut_hints.clear();
     app.layout.main_window_areas.clear();
     app.layout.main_window_dividers.clear();
     app.window_pane_sizes.clear();
@@ -2396,7 +2397,33 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     render_main_transition(f, inner, app, window_id);
 }
 
-fn render_empty_session_state(f: &mut Frame, area: Rect, app: &App) {
+fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
+    let card = centered_rect(area, 72, 9);
+    let label_style = Style::default().fg(app.theme.accent);
+    let hover_style = label_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mouse = app.mouse_pos;
+    let shortcut_rows = [
+        (4_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
+        (5_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
+        (6_u16, 2_u16, "?", KeyAction::ToggleHelp),
+    ];
+    let mut hovered = [false; 3];
+    for (i, (row, col, label, action)) in shortcut_rows.iter().enumerate() {
+        let x_start = card.x + *col;
+        let y = card.y + *row;
+        let w = UnicodeWidthStr::width(*label) as u16;
+        let x_end = x_start + w;
+        hovered[i] = mouse
+            .map(|(mx, my)| my == y && mx >= x_start && mx < x_end)
+            .unwrap_or(false);
+        app.layout.shortcut_hints.push(HintZone {
+            x_start,
+            x_end,
+            y,
+            action: *action,
+        });
+    }
+
     let lines = vec![
         Line::from(Span::styled(
             "Welcome to agentd",
@@ -2411,33 +2438,26 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &App) {
         )),
         Line::raw(""),
         Line::from(vec![
-            Span::styled("  C-x C-f", Style::default().fg(app.theme.accent)),
+            Span::raw("  "),
+            Span::styled(
+                "C-x C-f",
+                if hovered[0] { hover_style } else { label_style },
+            ),
             Span::raw("  create a session"),
         ]),
         Line::from(vec![
-            Span::styled("  C-x x", Style::default().fg(app.theme.accent)),
-            Span::raw("    open the command palette"),
+            Span::raw("  "),
+            Span::styled("C-x x", if hovered[1] { hover_style } else { label_style }),
+            Span::raw("    open the Operator"),
         ]),
         Line::from(vec![
-            Span::styled("  ?", Style::default().fg(app.theme.accent)),
+            Span::raw("  "),
+            Span::styled("?", if hovered[2] { hover_style } else { label_style }),
             Span::raw("        show shortcuts and concepts"),
         ]),
-        Line::raw(""),
-        Line::from(Span::styled(
-            "CLI examples:",
-            Style::default().fg(app.theme.text),
-        )),
-        Line::from(Span::styled(
-            "  agent new zarvis \"inspect this repo\"",
-            Style::default().fg(app.theme.dim),
-        )),
-        Line::from(Span::styled(
-            "  agent new shell",
-            Style::default().fg(app.theme.dim),
-        )),
     ];
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-    f.render_widget(para, centered_rect(area, 72, 12));
+    f.render_widget(para, card);
 }
 
 fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
@@ -4597,8 +4617,6 @@ fn minibuffer_panel_height(preferred: Option<u16>, total_h: u16) -> u16 {
 }
 
 fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
-    // Hint zones from the previous frame are stale once we re-render.
-    app.layout.minibuffer_hints.clear();
     app.layout.minibuffer_harness_hits.clear();
 
     // Orchestrator panel: events above, input row at the bottom.
@@ -4694,7 +4712,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         };
         let style = if hovered { hover_style } else { base_style };
         spans.push(Span::styled(label.to_string(), style));
-        app.layout.minibuffer_hints.push(HintZone {
+        app.layout.shortcut_hints.push(HintZone {
             x_start,
             x_end,
             y: area.y,

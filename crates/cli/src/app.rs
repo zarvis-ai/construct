@@ -1152,9 +1152,11 @@ pub struct LayoutSnapshot {
     /// last render so click-to-row mapping stays correct when the
     /// list overflows its visible area.
     pub list_scroll_offset: usize,
-    /// Clickable segments in the minibuffer hint line. Empty when a
-    /// minibuffer prompt (palette / send-input / etc.) is open.
-    pub minibuffer_hints: Vec<HintZone>,
+    /// Clickable shortcut labels in the last frame (minibuffer hints,
+    /// empty-state onboarding shortcuts). Empty when a minibuffer prompt
+    /// (palette / send-input / etc.) is open for minibuffer hints, but may
+    /// still contain main-view shortcut affordances.
+    pub shortcut_hints: Vec<HintZone>,
     /// Clickable harness names in the new-session picker prompt
     /// (`MinibufferIntent::NewSessionHarness`). Click → submit the
     /// matching name as if the user typed it and hit Enter.
@@ -4096,20 +4098,18 @@ impl App {
             }
             return;
         }
+        // Clickable shortcut affordances (minibuffer hints, empty-state
+        // onboarding shortcuts) dispatch their bound key action before
+        // pane-level click handling.
+        for hint in &self.layout.shortcut_hints {
+            if row == hint.y && col >= hint.x_start && col < hint.x_end {
+                let action = hint.action;
+                self.run_action(action).await;
+                return;
+            }
+        }
         if let Some(mb_area) = self.layout.minibuffer_area {
             if contains(mb_area, col, row) {
-                // First check the inline-hint zones ("C-x z unzoom" /
-                // "? help" / etc.). They sit on the same row as the
-                // minibuffer area when no prompt is open and dispatch
-                // their bound action directly instead of opening the
-                // palette.
-                for hint in &self.layout.minibuffer_hints {
-                    if row == hint.y && col >= hint.x_start && col < hint.x_end {
-                        let action = hint.action;
-                        self.run_action(action).await;
-                        return;
-                    }
-                }
                 // Orchestrator panel: click on a tool block toggles
                 // its expand state. The orchestrator's render area
                 // is the minibuffer rect minus the 1-row top border.
@@ -6962,7 +6962,7 @@ mod tests {
             list_row_count: 0,
             list_items_area: None,
             list_scroll_offset: 0,
-            minibuffer_hints: Vec::new(),
+            shortcut_hints: Vec::new(),
             minibuffer_harness_hits: Vec::new(),
             modal_area: None,
             browser_preview_area: None,
@@ -7712,6 +7712,80 @@ mod tests {
             screen.contains("new: C-x C-f  help: ?  palette: C-x x"),
             "missing modeline hint:\n{screen}"
         );
+        assert!(
+            !screen.contains("CLI examples:"),
+            "empty state should not include CLI examples:\n{screen}"
+        );
+        assert!(
+            app.layout.shortcut_hints.len() >= 3,
+            "expected clickable shortcuts, got {:?}",
+            app.layout.shortcut_hints
+        );
+        assert!(app
+            .layout
+            .shortcut_hints
+            .iter()
+            .any(|h| h.action == KeyAction::OpenNewSession));
+        assert!(app
+            .layout
+            .shortcut_hints
+            .iter()
+            .any(|h| h.action == KeyAction::OpenCommandPalette));
+        assert!(app
+            .layout
+            .shortcut_hints
+            .iter()
+            .any(|h| h.action == KeyAction::ToggleHelp));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_state_shortcut_clicks_dispatch_actions() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.harnesses = vec![agentd_protocol::HarnessInfo {
+            name: "shell".to_string(),
+            available: true,
+            binary: None,
+            description: None,
+            capabilities: Default::default(),
+        }];
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let click = |app: &App, action: KeyAction| {
+            let h = app
+                .layout
+                .shortcut_hints
+                .iter()
+                .find(|h| h.action == action)
+                .expect("shortcut hit")
+                .clone();
+            (h.x_start, h.y)
+        };
+
+        let (x, y) = click(&app, KeyAction::OpenCommandPalette);
+        app.handle_left_click(x, y).await;
+        assert!(matches!(
+            app.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::CommandPalette)
+        ));
+        app.minibuffer = None;
+
+        let (x, y) = click(&app, KeyAction::ToggleHelp);
+        app.handle_left_click(x, y).await;
+        assert!(app.help_visible);
+        app.help_visible = false;
+
+        let (x, y) = click(&app, KeyAction::OpenNewSession);
+        app.handle_left_click(x, y).await;
+        assert!(matches!(
+            app.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::NewSessionHarness)
+        ));
         server.abort();
     }
 
