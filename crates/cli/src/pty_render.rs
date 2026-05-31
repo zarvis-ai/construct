@@ -51,6 +51,11 @@ pub enum Item {
     /// events; PTY bytes between the corresponding OSC `7700`
     /// markers are discarded.
     ToolBlock(ToolBlock),
+    /// Adjacent tool calls with the same tool name, rendered as one
+    /// collapsible presentation group. This is derived client-side
+    /// from the normal event stream; individual blocks are still kept
+    /// so results, status, and expansion remain inspectable.
+    ToolGroup(ToolGroup),
     /// A structured chat message from a session that emits no PTY for
     /// its conversation (headless harnesses). Rendered as synthesized,
     /// role-styled text. Streaming deltas arrive as many consecutive
@@ -61,6 +66,13 @@ pub enum Item {
         text: String,
         break_before: bool,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolGroup {
+    pub tool: String,
+    pub blocks: Vec<ToolBlock>,
+    pub expanded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -259,13 +271,20 @@ struct CachedParser {
 struct ItemLayout {
     /// Visible row count this item contributes (incl. soft wraps).
     lines: usize,
-    /// Tool-block hit-rect metadata, `None` for plain PTY chunks.
-    block: Option<BlockLayout>,
+    /// Cursor column after this item renders. Line counting needs this
+    /// because a later item may start on a partially-filled row.
+    end_col: usize,
+    /// Tool-block hit-rect metadata, empty for plain PTY chunks.
+    blocks: Vec<BlockLayout>,
 }
 
 #[derive(Clone)]
 struct BlockLayout {
     call_id: String,
+    /// First visible row of the clickable region relative to the item.
+    row_start_offset: usize,
+    /// Exclusive end row of the clickable region relative to the item.
+    row_end_offset: usize,
     /// Offset (in visible rows) of the block's status row from the
     /// block's first row; `None` if the block has no status row.
     status_row_offset: Option<usize>,
@@ -286,6 +305,12 @@ enum ItemSig {
         /// block has output — the synth bytes are stable.
         running_elapsed: Option<u64>,
     },
+    Group {
+        tool: String,
+        count: usize,
+        expanded: bool,
+        blocks: Vec<ItemSig>,
+    },
     /// Message items are immutable once pushed (streaming appends new
     /// items rather than growing one), so the text length + kind fully
     /// identify the synthesized bytes.
@@ -294,6 +319,15 @@ enum ItemSig {
         len: usize,
         break_before: bool,
     },
+}
+
+impl ToolGroup {
+    fn call_id(&self) -> String {
+        self.blocks
+            .first()
+            .map(|b| format!("group:{}", b.call_id))
+            .unwrap_or_else(|| format!("group:{}", self.tool))
+    }
 }
 
 impl ItemSig {
@@ -310,6 +344,26 @@ impl ItemSig {
                 } else {
                     Some(b.started_at.elapsed().as_secs())
                 },
+            },
+            Item::ToolGroup(g) => ItemSig::Group {
+                tool: g.tool.clone(),
+                count: g.blocks.len(),
+                expanded: g.expanded,
+                blocks: g
+                    .blocks
+                    .iter()
+                    .map(|b| ItemSig::Block {
+                        call_id: b.call_id.clone(),
+                        has_output: b.output.is_some(),
+                        ok: b.ok,
+                        expanded: b.expanded,
+                        running_elapsed: if b.output.is_some() {
+                            None
+                        } else {
+                            Some(b.started_at.elapsed().as_secs())
+                        },
+                    })
+                    .collect(),
             },
             Item::Message {
                 kind,
@@ -637,7 +691,11 @@ impl ItemHistory {
             block.output = Some(output);
             block.ok = ok;
         }
-        self.items.push(Item::ToolBlock(block));
+        if block.tool.is_some() {
+            self.push_tool_block_grouped(block);
+        } else {
+            self.items.push(Item::ToolBlock(block));
+        }
         self.in_block = true;
     }
 
@@ -655,6 +713,62 @@ impl ItemHistory {
         }
     }
 
+    fn push_tool_block_grouped(&mut self, block: ToolBlock) {
+        let tool = block.tool.clone().unwrap_or_else(|| "?".to_string());
+        if let Some(last) = self.items.last_mut() {
+            match last {
+                Item::ToolBlock(prev) if prev.tool.as_deref() == Some(tool.as_str()) => {
+                    let prev = prev.clone();
+                    *last = Item::ToolGroup(ToolGroup {
+                        tool,
+                        blocks: vec![prev, block],
+                        expanded: false,
+                    });
+                    return;
+                }
+                Item::ToolGroup(group) if group.tool == tool => {
+                    group.blocks.push(block);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.items.push(Item::ToolBlock(block));
+    }
+
+    fn regroup_tool_block_at(&mut self, idx: usize) {
+        if idx >= self.items.len() {
+            return;
+        }
+        let Item::ToolBlock(block) = &self.items[idx] else {
+            return;
+        };
+        let Some(tool) = block.tool.clone() else {
+            return;
+        };
+        if idx == 0 {
+            return;
+        }
+        let block = match self.items.remove(idx) {
+            Item::ToolBlock(block) => block,
+            _ => return,
+        };
+        match self.items.get_mut(idx - 1) {
+            Some(Item::ToolBlock(prev)) if prev.tool.as_deref() == Some(tool.as_str()) => {
+                let prev = prev.clone();
+                self.items[idx - 1] = Item::ToolGroup(ToolGroup {
+                    tool,
+                    blocks: vec![prev, block],
+                    expanded: false,
+                });
+            }
+            Some(Item::ToolGroup(group)) if group.tool == tool => {
+                group.blocks.push(block);
+            }
+            _ => self.items.insert(idx, Item::ToolBlock(block)),
+        }
+    }
+
     /// Apply a `ToolUse` event. The protocol's `ToolUse` carries no
     /// `call_id`, so pairing is FIFO. If an earlier OSC-open or
     /// `TaskStart` already created a block awaiting hydration,
@@ -663,8 +777,9 @@ impl ItemHistory {
     pub fn feed_tool_use(&mut self, tool: String, args_summary: String) {
         if let Some(idx) = self.pending_block_hydrations.pop_front() {
             if let Some(Item::ToolBlock(b)) = self.items.get_mut(idx) {
-                b.tool = Some(tool);
-                b.args_summary = Some(args_summary);
+                b.tool = Some(tool.clone());
+                b.args_summary = Some(args_summary.clone());
+                self.regroup_tool_block_at(idx);
                 self.dirty = true;
                 return;
             }
@@ -709,7 +824,7 @@ impl ItemHistory {
             block.output = Some(output);
             block.ok = ok;
         }
-        self.items.push(Item::ToolBlock(block));
+        self.push_tool_block_grouped(block);
         self.dirty = true;
     }
 
@@ -756,6 +871,7 @@ impl ItemHistory {
     fn find_block_mut(&mut self, call_id: &str) -> Option<&mut ToolBlock> {
         self.items.iter_mut().rev().find_map(|it| match it {
             Item::ToolBlock(b) if b.call_id == call_id => Some(b),
+            Item::ToolGroup(g) => g.blocks.iter_mut().rev().find(|b| b.call_id == call_id),
             _ => None,
         })
     }
@@ -763,6 +879,19 @@ impl ItemHistory {
     /// Toggle the expand state of a block. Returns true when a
     /// matching block was found (and toggled), false otherwise.
     pub fn toggle_block(&mut self, call_id: &str) -> bool {
+        if let Some(group) = self.items.iter_mut().rev().find_map(|it| match it {
+            Item::ToolGroup(g) if g.call_id() == call_id => Some(g),
+            _ => None,
+        }) {
+            group.expanded = !group.expanded;
+            if group.expanded {
+                for block in &mut group.blocks {
+                    block.expanded = false;
+                }
+            }
+            self.dirty = true;
+            return true;
+        }
         if let Some(block) = self.find_block_mut(call_id) {
             block.expanded = !block.expanded;
             self.dirty = true;
@@ -925,8 +1054,7 @@ impl ItemHistory {
             // width change — the zoom/resize freeze (#230). When the
             // pending tail alone covers the retained window, skip the
             // (older) items entirely and re-feed only that tail.
-            let pending_offset =
-                reflow_tail_offset(&self.pending_chunk, reflow_budget_lines(rows));
+            let pending_offset = reflow_tail_offset(&self.pending_chunk, reflow_budget_lines(rows));
             if pending_offset > 0 {
                 cache.processed_count = self.items.len();
                 cache.pending_consumed = pending_offset;
@@ -984,8 +1112,7 @@ impl ItemHistory {
             };
             // Same scrollback-tail bound as the width-change rebuild:
             // only re-feed the pending tail that survives the ring.
-            let pending_offset =
-                reflow_tail_offset(&self.pending_chunk, reflow_budget_lines(rows));
+            let pending_offset = reflow_tail_offset(&self.pending_chunk, reflow_budget_lines(rows));
             if pending_offset > 0 {
                 cache.processed_count = self.items.len();
             } else {
@@ -1089,15 +1216,23 @@ impl ItemHistory {
             cache.processed_count
         };
         let reuse_upto = cache.item_layouts.len().min(self.items.len());
+        let mut cursor_col = cache
+            .item_layouts
+            .last()
+            .map(|layout| layout.end_col)
+            .unwrap_or(0);
         for (idx, item) in self.items.iter().enumerate().skip(reuse_upto) {
             let layout = match item {
                 Item::PtyChunk(b) => {
                     if idx >= start_processing_at {
                         cache.parser.process(b);
                     }
+                    let metrics = visible_metrics_from_col(b, cols, cursor_col);
+                    cursor_col = metrics.end_col;
                     ItemLayout {
-                        lines: count_visible_lines(b, cols),
-                        block: None,
+                        lines: metrics.lines,
+                        end_col: metrics.end_col,
+                        blocks: Vec::new(),
                     }
                 }
                 Item::ToolBlock(block) => {
@@ -1105,14 +1240,52 @@ impl ItemHistory {
                     if idx >= start_processing_at {
                         cache.parser.process(&synth.bytes);
                     }
+                    let metrics = visible_metrics_from_col(&synth.bytes, cols, cursor_col);
+                    cursor_col = metrics.end_col;
                     ItemLayout {
-                        lines: count_visible_lines(&synth.bytes, cols),
-                        block: Some(BlockLayout {
+                        lines: metrics.lines,
+                        end_col: metrics.end_col,
+                        blocks: vec![BlockLayout {
                             call_id: block.call_id.clone(),
+                            row_start_offset: 0,
+                            row_end_offset: metrics.lines,
                             status_row_offset: synth.status_row_offset.map(|off| off as usize),
                             bg_cols: synth.bg_button_cols,
                             kill_cols: synth.kill_button_cols,
-                        }),
+                        }],
+                    }
+                }
+                Item::ToolGroup(group) => {
+                    let header = synth_group_header(group);
+                    let body = synth_group_body(group, cols);
+                    if idx >= start_processing_at {
+                        cache.parser.process(&header);
+                    }
+                    let header_metrics = visible_metrics_from_col(&header, cols, cursor_col);
+                    let group_row_start = 0;
+                    let group_row_end = header_metrics.lines;
+                    cursor_col = header_metrics.end_col;
+
+                    if idx >= start_processing_at {
+                        cache.parser.process(&body);
+                    }
+                    let body_metrics = visible_metrics_from_col(&body, cols, cursor_col);
+                    let child_layouts =
+                        group_child_block_layouts(group, cols, cursor_col, group_row_end);
+                    cursor_col = body_metrics.end_col;
+                    let mut blocks = vec![BlockLayout {
+                        call_id: group.call_id(),
+                        row_start_offset: group_row_start,
+                        row_end_offset: group_row_end,
+                        status_row_offset: None,
+                        bg_cols: None,
+                        kill_cols: None,
+                    }];
+                    blocks.extend(child_layouts);
+                    ItemLayout {
+                        lines: header_metrics.lines + body_metrics.lines,
+                        end_col: body_metrics.end_col,
+                        blocks,
                     }
                 }
                 Item::Message {
@@ -1124,9 +1297,12 @@ impl ItemHistory {
                     if idx >= start_processing_at {
                         cache.parser.process(&bytes);
                     }
+                    let metrics = visible_metrics_from_col(&bytes, cols, cursor_col);
+                    cursor_col = metrics.end_col;
                     ItemLayout {
-                        lines: count_visible_lines(&bytes, cols),
-                        block: None,
+                        lines: metrics.lines,
+                        end_col: metrics.end_col,
+                        blocks: Vec::new(),
                     }
                 }
             };
@@ -1140,11 +1316,11 @@ impl ItemHistory {
         for layout in &cache.item_layouts {
             let start = abs_line;
             abs_line += layout.lines;
-            if let Some(bl) = &layout.block {
+            for bl in &layout.blocks {
                 block_spans.push(BlockSpan {
                     call_id: bl.call_id.clone(),
-                    abs_start: start,
-                    abs_end: abs_line,
+                    abs_start: start + bl.row_start_offset,
+                    abs_end: start + bl.row_end_offset,
                     status_abs_row: bl.status_row_offset.map(|off| start + off),
                     bg_cols: bl.bg_cols,
                     kill_cols: bl.kill_cols,
@@ -1309,22 +1485,26 @@ fn reflow_tail_offset(buf: &[u8], budget_lines: usize) -> usize {
     0
 }
 
-fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibleMetrics {
+    lines: usize,
+    end_col: usize,
+}
+
+fn visible_metrics_from_col(bytes: &[u8], cols: u16, start_col: usize) -> VisibleMetrics {
     let mut lines = 0usize;
-    let mut col = 0usize;
+    let mut col = start_col;
     let cols = cols.max(VT100_MIN_DIM) as usize;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        i += 1;
         if b == 0x1b {
-            // Skip CSI / OSC / SS3 / single-char ESC sequences.
+            i += 1;
             if i >= bytes.len() {
                 break;
             }
             match bytes[i] {
                 b'[' => {
-                    // CSI: digits / ; / ? / final byte in 0x40..=0x7e.
                     i += 1;
                     while i < bytes.len() {
                         let c = bytes[i];
@@ -1335,20 +1515,21 @@ fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
                     }
                 }
                 b']' => {
-                    // OSC: until BEL (0x07) or ST (\x1b\\).
                     i += 1;
                     while i < bytes.len() {
                         if bytes[i] == 0x07 {
                             i += 1;
                             break;
                         }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
                         i += 1;
                     }
                 }
-                b'O' => {
-                    i += 2; // SS3 + one final byte
-                }
-                _ => i += 1,
+                b'O' => i = (i + 2).min(bytes.len()),
+                _ => i = (i + 1).min(bytes.len()),
             }
             continue;
         }
@@ -1356,12 +1537,32 @@ fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
             b'\n' => {
                 lines += 1;
                 col = 0;
+                i += 1;
             }
-            b'\r' => col = 0,
-            // Other control chars: ignore for width.
-            0x00..=0x08 | 0x0b..=0x1f | 0x7f => {}
+            b'\r' => {
+                col = 0;
+                i += 1;
+            }
+            0x00..=0x08 | 0x0b..=0x1f | 0x7f => {
+                i += 1;
+            }
             _ => {
-                col += 1;
+                let Ok(s) = std::str::from_utf8(&bytes[i..]) else {
+                    break;
+                };
+                let Some(ch) = s.chars().next() else {
+                    break;
+                };
+                i += ch.len_utf8();
+                let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                if width == 0 {
+                    continue;
+                }
+                if col + width > cols {
+                    lines += 1;
+                    col = 0;
+                }
+                col += width;
                 if col >= cols {
                     lines += 1;
                     col = 0;
@@ -1369,7 +1570,18 @@ fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
             }
         }
     }
-    lines
+    VisibleMetrics {
+        lines,
+        end_col: col,
+    }
+}
+
+fn count_visible_lines_from_col(bytes: &[u8], cols: u16, start_col: usize) -> usize {
+    visible_metrics_from_col(bytes, cols, start_col).lines
+}
+
+fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
+    count_visible_lines_from_col(bytes, cols, 0)
 }
 
 /// Build the byte sequence representing a tool block at its current
@@ -1421,6 +1633,148 @@ fn synth_message(kind: MessageKind, text: &str, break_before: bool) -> Vec<u8> {
             push_text_crlf(&mut out, text);
             out.extend_from_slice(b"\x1b[0m");
         }
+    }
+    out
+}
+
+fn synth_group_header(group: &ToolGroup) -> Vec<u8> {
+    let summary = summarize_group(group);
+    let chevron = if group.expanded { "▾" } else { "▸" };
+    format!(
+        "\r\n\x1b[2;32m{chevron} \x1b[0m\x1b[1;92m{}\x1b[0m\x1b[2m × {} · {}\x1b[0m\r\n",
+        group.tool,
+        group.blocks.len(),
+        summary
+    )
+    .into_bytes()
+}
+
+fn synth_group_body(group: &ToolGroup, cols: u16) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    if group.expanded {
+        for block in &group.blocks {
+            let synth = synth_block(block, cols.saturating_sub(2));
+            out.extend_from_slice(&indent_synth_bytes(&synth.bytes, 2));
+        }
+    } else {
+        let status = group_status(group);
+        if !status.is_empty() {
+            out.extend_from_slice(format!("  \x1b[2m{}\x1b[0m\r\n", status).as_bytes());
+        }
+    }
+    out
+}
+
+fn indent_synth_bytes(bytes: &[u8], spaces: usize) -> Vec<u8> {
+    let indent = vec![b' '; spaces];
+    let mut out = Vec::with_capacity(bytes.len() + spaces * 4);
+    let mut at_line_start = true;
+    for &b in bytes {
+        if at_line_start && b != b'\r' && b != b'\n' {
+            out.extend_from_slice(&indent);
+            at_line_start = false;
+        }
+        out.push(b);
+        if b == b'\n' {
+            at_line_start = true;
+        }
+    }
+    out
+}
+
+fn group_child_block_layouts(
+    group: &ToolGroup,
+    cols: u16,
+    start_col: usize,
+    row_offset: usize,
+) -> Vec<BlockLayout> {
+    let mut layouts = Vec::new();
+    if group.expanded {
+        let mut offset = row_offset;
+        let mut cursor_col = start_col;
+        for block in &group.blocks {
+            let child = synth_block(block, cols.saturating_sub(2));
+            let indented = indent_synth_bytes(&child.bytes, 2);
+            let metrics = visible_metrics_from_col(&indented, cols, cursor_col);
+            layouts.push(BlockLayout {
+                call_id: block.call_id.clone(),
+                row_start_offset: offset,
+                row_end_offset: offset + metrics.lines,
+                status_row_offset: child.status_row_offset.map(|off| offset + off as usize),
+                bg_cols: child.bg_button_cols,
+                kill_cols: child.kill_button_cols,
+            });
+            offset += metrics.lines;
+            cursor_col = metrics.end_col;
+        }
+    }
+    layouts
+}
+
+fn summarize_group(group: &ToolGroup) -> String {
+    let items: Vec<String> = group
+        .blocks
+        .iter()
+        .filter_map(|b| b.args_summary.as_deref())
+        .filter_map(primary_arg_summary)
+        .take(4)
+        .collect();
+    if items.is_empty() {
+        format!("{} calls", group.blocks.len())
+    } else {
+        let more = group.blocks.len().saturating_sub(items.len());
+        if more > 0 {
+            format!("{}{}", items.join(", "), format!(", +{more} more"))
+        } else {
+            items.join(", ")
+        }
+    }
+}
+
+fn group_status(group: &ToolGroup) -> String {
+    let running = group.blocks.iter().filter(|b| b.output.is_none()).count();
+    let failed = group
+        .blocks
+        .iter()
+        .filter(|b| b.output.is_some() && !b.ok)
+        .count();
+    let completed = group.blocks.iter().filter(|b| b.output.is_some()).count();
+    let mut parts = Vec::new();
+    if completed > 0 {
+        parts.push(format!("{completed} completed"));
+    }
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    parts.join(", ")
+}
+
+fn primary_arg_summary(args: &str) -> Option<String> {
+    let compact = compact_tool_args(args);
+    if compact.is_empty() {
+        return None;
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&compact) {
+        for key in ["path", "cwd", "url", "session_id", "command"] {
+            if let Some(value) = value.get(key).and_then(|v| v.as_str()) {
+                return Some(truncate_summary(value, 48));
+            }
+        }
+    }
+    Some(truncate_summary(&compact, 48))
+}
+
+fn truncate_summary(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
     }
     out
 }
@@ -1669,6 +2023,14 @@ mod tests {
             .count()
     }
 
+    fn tool_block_ids(item: &Item) -> Vec<String> {
+        match item {
+            Item::ToolBlock(b) => vec![b.call_id.clone()],
+            Item::ToolGroup(g) => g.blocks.iter().map(|b| b.call_id.clone()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     #[test]
     fn no_osc_yields_one_chunk_on_replay() {
         let mut h = ItemHistory::new();
@@ -1881,6 +2243,106 @@ mod tests {
             .unwrap();
         assert_eq!(block_a.tool.as_deref(), Some("shell"));
         assert_eq!(block_b.tool.as_deref(), Some("read_file"));
+    }
+
+    #[test]
+    fn adjacent_same_tool_task_starts_group() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "read_file".into(), r#"{"path":"a.rs"}"#.into());
+        h.feed_task_start("B".into(), "read_file".into(), r#"{"path":"b.rs"}"#.into());
+        h.feed_tool_result("A", true, "a".into());
+        h.feed_tool_result("B", false, "missing".into());
+
+        assert_eq!(h.items.len(), 1);
+        match &h.items[0] {
+            Item::ToolGroup(g) => {
+                assert_eq!(g.tool, "read_file");
+                assert_eq!(tool_block_ids(&h.items[0]), vec!["A", "B"]);
+                assert_eq!(g.blocks[0].output.as_deref(), Some("a"));
+                assert!(!g.blocks[1].ok);
+            }
+            other => panic!("expected tool group, got {other:?}"),
+        }
+
+        let text = screen_text(h.replay(100, 20, 0).screen, 20, 100);
+        assert!(text.contains("▸ read_file × 2"), "{text}");
+        assert!(text.contains("a.rs, b.rs"), "{text}");
+        assert!(text.contains("2 completed"), "{text}");
+        assert!(text.contains("1 failed"), "{text}");
+    }
+
+    #[test]
+    fn grouping_does_not_cross_different_tool_or_pty() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "read_file".into(), r#"{"path":"a.rs"}"#.into());
+        h.feed_task_start("B".into(), "list_dir".into(), r#"{"path":"src"}"#.into());
+        h.feed_pty(b"assistant prose\r\n");
+        h.feed_task_start("C".into(), "read_file".into(), r#"{"path":"c.rs"}"#.into());
+
+        assert!(matches!(h.items[0], Item::ToolBlock(_)));
+        assert!(matches!(h.items[1], Item::ToolBlock(_)));
+        assert!(matches!(h.items[2], Item::PtyChunk(_)));
+        assert!(matches!(h.items[3], Item::ToolBlock(_)));
+    }
+
+    #[test]
+    fn expanded_group_exposes_child_hit_rects() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "echo a".into());
+        h.feed_task_start("B".into(), "shell".into(), "echo b".into());
+        h.feed_tool_result("A", true, "a\nmore a\nstill a".into());
+        h.feed_tool_result("B", true, "b\nmore b\nstill b".into());
+
+        let group_id = match &h.items[0] {
+            Item::ToolGroup(g) => g.call_id(),
+            other => panic!("expected tool group, got {other:?}"),
+        };
+        assert!(h.toggle_block(&group_id));
+        let out = h.replay(100, 40, 0);
+        let text = screen_text(out.screen, 40, 100);
+        assert!(
+            text.contains("  → shell"),
+            "expanded children should be indented:\n{text}"
+        );
+        let ids: Vec<&str> = out.blocks.iter().map(|b| b.call_id.as_str()).collect();
+        assert!(ids.contains(&group_id.as_str()), "{ids:?}");
+        assert!(ids.contains(&"A"), "{ids:?}");
+        assert!(ids.contains(&"B"), "{ids:?}");
+        let group_hit = out.blocks.iter().find(|b| b.call_id == group_id).unwrap();
+        assert!(
+            group_hit.row_end - group_hit.row_start <= 2,
+            "{group_hit:?}"
+        );
+
+        assert!(h.toggle_block("A"));
+        match &h.items[0] {
+            Item::ToolGroup(g) => {
+                assert!(g.expanded, "child toggle should not collapse the group");
+                assert!(g.blocks[0].expanded, "child output should expand");
+            }
+            other => panic!("expected tool group, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn late_tool_use_hydration_can_group_with_previous_block() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "echo a".into());
+        h.feed_pty(b"\x1b]7700;open;call=B\x07inline");
+        h.feed_tool_use("shell".into(), "echo b".into());
+        h.feed_tool_result("B", true, "b".into());
+        h.feed_pty(b"\x1b]7700;close;call=B\x07");
+
+        assert_eq!(h.items.len(), 1);
+        match &h.items[0] {
+            Item::ToolGroup(g) => {
+                assert_eq!(g.tool, "shell");
+                assert_eq!(tool_block_ids(&h.items[0]), vec!["A", "B"]);
+                assert_eq!(g.blocks[1].args_summary.as_deref(), Some("echo b"));
+                assert_eq!(g.blocks[1].output.as_deref(), Some("b"));
+            }
+            other => panic!("expected tool group, got {other:?}"),
+        }
     }
 
     #[test]

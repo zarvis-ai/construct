@@ -4074,6 +4074,7 @@ function renderEvent(event, at) {
   // term.write); fall through to the chat-style `appendPty`
   // otherwise so the user still sees something for non-PTY views.
   if (event.type === "pty") {
+    resetTermToolGroup();
     if (state.mode === "terminal" && state.term) {
       // Bytes (not a pre-decoded string) so xterm's streaming
       // UTF-8 decoder owns multi-byte boundaries — critical at
@@ -4122,10 +4123,10 @@ function renderEvent(event, at) {
     // inline rendering here, in event order with the surrounding PTY
     // prose. (issue #134)
     if (event.type === "tool_use") {
-      writeToTerm(toolUseLine(event.tool, event.args));
+      writeToolUseToTerm(event.tool, event.args);
     }
     if (event.type === "tool_result") {
-      writeToTerm(toolResultLines(event.ok, event.output));
+      writeToolResultToTerm(event.ok, event.output);
     }
     if (event.type === "tool_approval_request") {
       const risk = event.risk ? ` [${sanitizeForTerm(event.risk)}]` : "";
@@ -4239,6 +4240,7 @@ function editorLineHtml(prompt, text, cursor, queued) {
 }
 
 function appendMessage(role, text) {
+  resetTermToolGroup();
   const target = transcriptTarget();
   const normalizedRole = role || "assistant";
   if (normalizedRole === "assistant") {
@@ -4297,6 +4299,47 @@ function toolUseLine(tool, args) {
   return `\r\n\x1b[1;32m→ ${sanitizeForTerm(tool || "tool")}\x1b[0m${argPart}\r\n`;
 }
 
+const termToolGroup = { tool: null, count: 0, summaries: [], results: [] };
+
+function resetTermToolGroup() {
+  termToolGroup.tool = null;
+  termToolGroup.count = 0;
+  termToolGroup.summaries = [];
+  termToolGroup.results = [];
+}
+
+function writeToolUseToTerm(tool, args, opts = {}) {
+  const name = String(tool || "tool");
+  if (termToolGroup.tool && termToolGroup.tool === name) {
+    termToolGroup.count += 1;
+    const summary = summarizeToolArgs(args);
+    if (summary) termToolGroup.summaries.push(summary);
+    const note = summarizeToolGroupForTerm(termToolGroup);
+    const line = `\r\n\x1b[1;32m→ ${sanitizeForTerm(name)}\x1b[0m\x1b[2m × ${termToolGroup.count}${note ? ` · ${note}` : ""}\x1b[0m\r\n`;
+    return opts.direct ? state.term.write(line) : writeToTerm(line);
+  }
+  resetTermToolGroup();
+  termToolGroup.tool = name;
+  termToolGroup.count = 1;
+  const summary = summarizeToolArgs(args);
+  if (summary) termToolGroup.summaries.push(summary);
+  const line = toolUseLine(tool, args);
+  return opts.direct ? state.term.write(line) : writeToTerm(line);
+}
+
+function writeToolResultToTerm(ok, output, opts = {}) {
+  if (termToolGroup.tool) termToolGroup.results.push({ ok, output });
+  const line = toolResultLines(ok, output);
+  return opts.direct ? state.term.write(line) : writeToTerm(line);
+}
+
+function summarizeToolGroupForTerm(group) {
+  const items = group.summaries.slice(0, 3).map((s) => s.length > 40 ? s.slice(0, 37) + "…" : s);
+  const more = group.count - items.length;
+  if (!items.length) return `${group.count} calls`;
+  return `${items.join(", ")}${more > 0 ? `, +${more} more` : ""}`;
+}
+
 function toolResultLines(ok, output) {
   const glyph = ok === false ? "\x1b[1;31m✗\x1b[0m" : "\x1b[1;32m✓\x1b[0m";
   const lines = String(output ?? "").split("\n");
@@ -4330,13 +4373,14 @@ function replayTranscriptToTerm(events) {
     if (!e || !e.type) continue;
     switch (e.type) {
       case "pty":
+        resetTermToolGroup();
         state.term.write(decodeBase64ToBytes(e.data || ""));
         break;
       case "tool_use":
-        state.term.write(toolUseLine(e.tool, e.args));
+        writeToolUseToTerm(e.tool, e.args, { direct: true });
         break;
       case "tool_result":
-        state.term.write(toolResultLines(e.ok, e.output));
+        writeToolResultToTerm(e.ok, e.output, { direct: true });
         break;
       case "editor_state":
         state.editorById.set(state.currentId, e);
@@ -4396,6 +4440,7 @@ function appendToolApproval(event) {
 }
 
 function appendPty(text) {
+  resetTermToolGroup();
   // Coalesce consecutive PTY rows so each frame doesn't create a
   // new DOM block; matters for chatty interactive harnesses.
   const target = transcriptTarget();
