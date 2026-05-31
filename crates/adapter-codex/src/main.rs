@@ -15,8 +15,8 @@
 //! `AGENTD_CODEX_MODE=interactive|headless`. Honors `AGENTD_CODEX_CMD` for a
 //! full command prefix, falling back to `AGENTD_CODEX_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use agentd_protocol::adapter::pty::{PtySpec, run_session as run_pty};
+use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter, run};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
@@ -161,23 +161,19 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".into(),
         originator_tag.clone(),
     ));
-    // If we're starting (or fresh-respawning) a codex without a captured
-    // id, kick off a watcher that scans codex's rollouts for one tagged
-    // with our originator. As soon as it appears, we extract the UUID and
-    // write it to `<session-dir>/codex_session_id.txt` so the next daemon
-    // restart can `codex resume <uuid>`. The watcher polls for the
-    // session's full lifetime — codex sometimes flushes its rollout file
-    // many minutes after spawn (it's lazy until the first turn completes)
-    // so a short timeout would just miss it.
-    if !resuming_existing {
-        if let Some(sid_path) = sid_file.clone() {
-            spawn_session_id_watcher(
-                sid_path,
-                originator_tag,
-                params.env.clone(),
-                ctx.emit.clone(),
-            );
-        }
+    // Watch the native rollout JSONL for this interactive Codex TUI and
+    // mirror its semantic messages/tool events into agentd's transcript.
+    // The PTY remains the interactive surface; these events make web chat
+    // mode readable without scraping terminal escape sequences.
+    if let Some(sid_path) = sid_file.clone() {
+        spawn_interactive_transcript_watcher(
+            sid_path,
+            originator_tag,
+            params.env.clone(),
+            ctx.emit.clone(),
+            resuming_existing,
+            captured_id.clone(),
+        );
     }
     let label = command.argv_preview();
     let bin = command.bin;
@@ -205,23 +201,16 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
 /// lazily — sometimes within a second, sometimes only after the first
 /// turn completes minutes later. To keep the work cheap, files that
 /// don't bear our originator are remembered and not re-read.
-fn spawn_session_id_watcher(
+fn spawn_interactive_transcript_watcher(
     sid_file: PathBuf,
     expected_originator: String,
     session_env: HashMap<String, String>,
     emit: EventEmitter,
+    skip_existing: bool,
+    expected_uuid: Option<String>,
 ) {
-    // If we already have an id captured (e.g. the user blew away the
-    // session dir but the file came back), don't clobber it.
-    if sid_file.exists() {
-        if let Ok(s) = std::fs::read_to_string(&sid_file) {
-            if !s.trim().is_empty() {
-                return;
-            }
-        }
-    }
     let Some(sessions_root) = codex_sessions_root(&session_env) else {
-        emit.log("codex: no CODEX_HOME or HOME — cannot watch sessions dir for session-id capture");
+        emit.log("codex: no CODEX_HOME or HOME — cannot watch native transcript");
         return;
     };
     tokio::spawn(async move {
@@ -229,48 +218,164 @@ fn spawn_session_id_watcher(
         // skip them on later ticks so a deep `~/.codex/sessions/` tree
         // stays cheap to poll.
         let mut not_ours: HashSet<String> = HashSet::new();
+        let mut selected: Option<(String, PathBuf)> = None;
+        let mut next_line: usize = 0;
+        let mut initialized = false;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            for (name, path) in list_rollouts(&sessions_root) {
-                if not_ours.contains(&name) {
-                    continue;
-                }
-                let Some(meta) = read_session_meta(&path) else {
-                    // File exists but session_meta isn't readable yet.
-                    // Don't blacklist — codex may still be writing.
-                    continue;
-                };
-                if meta.originator.as_deref() != Some(expected_originator.as_str()) {
-                    not_ours.insert(name);
-                    continue;
-                }
-                let uuid = match meta.id.clone().or_else(|| uuid_from_rollout_name(&name)) {
-                    Some(u) => u,
-                    None => {
-                        emit.log(format!(
-                            "codex: rollout {name} matched originator but had no id; skipping"
-                        ));
+
+            if selected.is_none() {
+                for (name, path) in list_rollouts(&sessions_root) {
+                    if not_ours.contains(&name) {
+                        continue;
+                    }
+                    let Some(meta) = read_session_meta(&path) else {
+                        // File exists but session_meta isn't readable yet.
+                        // Don't blacklist — codex may still be writing.
+                        continue;
+                    };
+                    let uuid = meta.id.clone().or_else(|| uuid_from_rollout_name(&name));
+                    let originator_matches =
+                        meta.originator.as_deref() == Some(expected_originator.as_str());
+                    let uuid_matches = expected_uuid
+                        .as_deref()
+                        .is_some_and(|want| uuid.as_deref() == Some(want));
+                    if !originator_matches && !uuid_matches {
                         not_ours.insert(name);
                         continue;
                     }
-                };
-                if let Err(e) = std::fs::write(&sid_file, &uuid) {
-                    emit.log(format!(
-                        "codex: failed to write {}: {e}",
-                        sid_file.display()
-                    ));
-                    return;
+                    let Some(uuid) = uuid else {
+                        emit.log(format!(
+                            "codex: rollout {name} matched but had no id; skipping"
+                        ));
+                        not_ours.insert(name);
+                        continue;
+                    };
+                    let should_write = std::fs::read_to_string(&sid_file)
+                        .ok()
+                        .map(|s| s.trim() != uuid)
+                        .unwrap_or(true);
+                    if should_write {
+                        if let Err(e) = std::fs::write(&sid_file, &uuid) {
+                            emit.log(format!(
+                                "codex: failed to write {}: {e}",
+                                sid_file.display()
+                            ));
+                        } else {
+                            emit.log(format!(
+                                "codex: captured session id {uuid} (from {})",
+                                path.display()
+                            ));
+                        }
+                    }
+                    if skip_existing {
+                        next_line = count_jsonl_lines(&path);
+                    }
+                    initialized = true;
+                    selected = Some((name, path));
+                    break;
                 }
-                emit.log(format!(
-                    "codex: captured session id {uuid} (from {})",
-                    path.display()
-                ));
-                return;
             }
+
+            let Some((_, path)) = selected.as_ref() else {
+                continue;
+            };
+            if !initialized {
+                if skip_existing {
+                    next_line = count_jsonl_lines(path);
+                }
+                initialized = true;
+            }
+            emit_new_codex_rollout_lines(path, &mut next_line, &emit);
         }
     });
+}
+
+fn count_jsonl_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+fn emit_new_codex_rollout_lines(path: &Path, next_line: &mut usize, emit: &EventEmitter) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut seen = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        seen = idx + 1;
+        if idx < *next_line {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => emit_codex_rollout_event(emit, &v),
+            Err(e) => emit.log(format!(
+                "codex transcript: failed to parse {} line {}: {e}",
+                path.display(),
+                idx + 1
+            )),
+        }
+    }
+    *next_line = seen;
+}
+
+fn emit_codex_rollout_event(emit: &EventEmitter, v: &Value) {
+    if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return;
+    }
+    let Some(payload) = v.get("payload") else {
+        return;
+    };
+    match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "message" => {
+            let role = match payload.get("role").and_then(|r| r.as_str()) {
+                Some("user") => MessageRole::User,
+                _ => MessageRole::Assistant,
+            };
+            if let Some(text) = extract_text_from_blocks(payload.get("content")) {
+                if !text.trim().is_empty() {
+                    emit.emit(SessionEvent::Message { role, text });
+                }
+            }
+        }
+        "function_call" => {
+            let tool = payload
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let args = payload
+                .get("arguments")
+                .and_then(|a| a.as_str())
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .or_else(|| payload.get("arguments").cloned())
+                .unwrap_or(Value::Null);
+            emit.emit(SessionEvent::ToolUse { tool, args });
+        }
+        "function_call_output" => {
+            let tool = payload
+                .get("call_id")
+                .and_then(|n| n.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let output = match payload.get("output") {
+                Some(Value::String(s)) => s.clone(),
+                Some(v) => serde_json::to_string(v).unwrap_or_default(),
+                None => String::new(),
+            };
+            emit.emit(SessionEvent::ToolResult {
+                tool,
+                ok: true,
+                output,
+            });
+        }
+        _ => {}
+    }
 }
 
 /// Where codex stores its rollout files. Honors `$CODEX_HOME` (checked
@@ -660,11 +765,7 @@ fn extract_text_from_blocks(v: Option<&Value>) -> Option<String> {
             out.push_str(t);
         }
     }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -692,10 +793,12 @@ mod tests {
     fn uuid_from_rollout_name_rejects_garbage() {
         assert!(uuid_from_rollout_name("rollout-foo.jsonl").is_none());
         assert!(uuid_from_rollout_name("not-a-rollout.jsonl").is_none());
-        assert!(uuid_from_rollout_name(
-            "rollout-2026-05-16T14-21-02-019e32aa-014a-7ff0-9a3f-7ae773961a37.txt"
-        )
-        .is_none());
+        assert!(
+            uuid_from_rollout_name(
+                "rollout-2026-05-16T14-21-02-019e32aa-014a-7ff0-9a3f-7ae773961a37.txt"
+            )
+            .is_none()
+        );
         // Right length, non-hex characters.
         assert!(
             uuid_from_rollout_name("rollout-zzz-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.jsonl")

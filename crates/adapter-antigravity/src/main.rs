@@ -48,8 +48,8 @@
 //! `AGENTD_ANTIGRAVITY_BIN` (binary, default `agy`),
 //! `AGENTD_ANTIGRAVITY_MODE` (`interactive`|`headless`).
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use agentd_protocol::adapter::pty::{PtySpec, run_session as run_pty};
+use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter, run};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
@@ -221,17 +221,14 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         }
     }
 
-    // If we don't yet know the conversation id, capture it in the
-    // background by tailing the freshly-written log for the
-    // "Created conversation <id>" line, then persist it for the next
-    // respawn. Runs concurrently with the PTY session.
-    if existing.is_none() {
-        if let Some(lp) = log_path.clone() {
-            tokio::spawn(async move {
-                capture_conversation_id_from_log(&lp).await;
-            });
-        }
-    }
+    // Mirror Antigravity's native transcript into agentd semantic events
+    // while keeping the PTY as the interactive surface.
+    spawn_interactive_transcript_watcher(
+        existing.clone(),
+        log_path.clone(),
+        ctx.emit.clone(),
+        existing.is_some(),
+    );
 
     let mut env: Vec<(String, String)> = params
         .env
@@ -256,18 +253,47 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let _ = run_pty(spec, ctx).await;
 }
 
-/// Poll `log_path` for up to ~15s looking for the conversation id agy
-/// logs early in startup; persist it once found. Best-effort.
-async fn capture_conversation_id_from_log(log_path: &Path) {
-    for _ in 0..75 {
-        if let Ok(text) = std::fs::read_to_string(log_path) {
-            if let Some(id) = parse_conversation_id(&text) {
-                write_conv_id(&id);
-                return;
+fn spawn_interactive_transcript_watcher(
+    existing_id: Option<String>,
+    log_path: Option<PathBuf>,
+    emit: EventEmitter,
+    skip_existing: bool,
+) {
+    tokio::spawn(async move {
+        let mut conv_id = existing_id;
+        let mut last_step = -1;
+        let mut initialized = false;
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+
+            if conv_id.is_none() {
+                if let Some(lp) = &log_path {
+                    if let Ok(text) = std::fs::read_to_string(lp) {
+                        if let Some(id) = parse_conversation_id(&text) {
+                            write_conv_id(&id);
+                            conv_id = Some(id);
+                        }
+                    }
+                }
             }
+
+            let Some(id) = conv_id.as_ref() else {
+                continue;
+            };
+            let Some(tp) = transcript_path(id) else {
+                continue;
+            };
+            if !initialized {
+                if skip_existing {
+                    last_step = max_step_index(&tp);
+                }
+                initialized = true;
+            }
+            last_step = emit_new_transcript_steps(&tp, last_step, &emit);
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    });
 }
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {

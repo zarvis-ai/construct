@@ -150,6 +150,46 @@
     font-size: 12px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .view-mode-toggle {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    margin-left: 4px;
+    border: 1px solid var(--border);
+    background: rgba(2, 8, 5, 0.44);
+  }
+  .view-mode-toggle[hidden] { display: none; }
+  .view-mode-toggle button {
+    appearance: none;
+    border: 0;
+    border-radius: 0;
+    padding: 5px 7px;
+    background: transparent;
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .view-mode-toggle button + button {
+    border-left: 1px solid var(--border-faint);
+  }
+  .view-mode-toggle button[aria-pressed="true"] {
+    background: var(--accent);
+    color: #06160c;
+    text-shadow: none;
+  }
+  .view-mode-toggle button:not([aria-pressed="true"]):hover {
+    background: var(--bg-elev-2);
+    color: var(--fg);
   }
   .conn {
     margin-left: auto;
@@ -1410,6 +1450,13 @@
   <header>
     <button class="toggle-list" id="toggleList" type="button">≡</button>
     <div class="meta" id="sessionTitle"></div>
+    <div class="view-mode-toggle" id="viewModeToggle" hidden
+         role="group" aria-label="session view mode">
+      <button type="button" id="viewModeTerminal" data-view-mode="terminal"
+              aria-pressed="false">Terminal</button>
+      <button type="button" id="viewModeChat" data-view-mode="chat"
+              aria-pressed="false">Chat</button>
+    </div>
     <div class="conn" id="conn" data-state="connecting" aria-label="connecting">
       <canvas class="mini-matrix" id="miniMatrix" width="192" height="84"
               aria-label="agentd connecting" role="img"></canvas>
@@ -1655,6 +1702,9 @@ const mainEl = document.querySelector("main");
 const sessionListEl = $("sessionList");
 const sessionListResizerEl = $("sessionListResizer");
 const sessionTitleEl = $("sessionTitle");
+const viewModeToggleEl = $("viewModeToggle");
+const viewModeTerminalBtn = $("viewModeTerminal");
+const viewModeChatBtn = $("viewModeChat");
 const connEl = $("conn");
 const miniMatrixEl = $("miniMatrix");
 const composerEl = $("composer");
@@ -1693,6 +1743,7 @@ const approvalQueueHintEl = $("approvalQueueHint");
 const approvalDenyBtn = $("approvalDeny");
 const approvalApproveBtn = $("approvalApprove");
 const approvalAutomodeBtn = $("approvalAutomode");
+const VIEW_MODE_PREFS_KEY = "agentd.web.viewModePrefs";
 
 const state = {
   ws: null,
@@ -1730,6 +1781,9 @@ const state = {
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on `has_pty` plus the session mode.
   mode: "chat",
+  // Explicit per-session view preference for PTY-capable sessions.
+  // Absent means "terminal", preserving the existing default.
+  viewModeById: loadViewModePrefs(),
   // Lazily-initialized xterm.js handles + fit addons keyed by session id.
   // Keeping each xterm mounted offscreen avoids replaying long PTY history
   // from the beginning when switching terminal sessions.
@@ -1798,6 +1852,28 @@ const PTY_REPLAY_INITIAL_BYTES = 1024 * 1024;
 const PTY_REPLAY_MAX_BYTES = 8 * 1024 * 1024;
 const PTY_REPLAY_TOP_THRESHOLD_ROWS = 20;
 let widgetAutohideTimer = null;
+
+function loadViewModePrefs() {
+  try {
+    const raw = localStorage.getItem(VIEW_MODE_PREFS_KEY);
+    if (!raw) return new Map();
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return new Map();
+    return new Map(
+      Object.entries(parsed).filter(([, mode]) => mode === "chat" || mode === "terminal"),
+    );
+  } catch {
+    return new Map();
+  }
+}
+
+function saveViewModePrefs() {
+  const obj = {};
+  for (const [id, mode] of state.viewModeById.entries()) {
+    if (mode === "chat" || mode === "terminal") obj[id] = mode;
+  }
+  localStorage.setItem(VIEW_MODE_PREFS_KEY, JSON.stringify(obj));
+}
 
 const miniMatrixActivity = {
   intensity: 0,
@@ -2073,7 +2149,7 @@ function setConnState(s, label) {
 function setComposerEnabled(on) {
   const blocked = !!(state.currentId && state.widgetsById && currentInlineWidget(state.currentId));
   inputEl.disabled = blocked;
-  const terminal = currentSessionHasPty();
+  const terminal = state.mode === "terminal" && currentSessionHasPty();
   // Mobile terminal controls are only useful on touch browsers:
   // desktop xterm users can type directly into the terminal. Chat
   // sessions still use the composer on every browser.
@@ -2162,7 +2238,8 @@ function refreshCurrentSessionAfterReconnect() {
   if (!state.currentId) return;
   const s = state.sessions.find((x) => x.id === state.currentId);
   hydrateWidgets(state.currentId, { force: true });
-  if (state.mode === "terminal" || isTerminalSession(s)) {
+  renderViewModeToggle(s);
+  if (state.mode === "terminal") {
     // Keep the live xterm buffer exactly where the user left it. Replaying
     // transcript or PTY history on reconnect appends old output into xterm,
     // which looks like terminal history replaying from the beginning. Mobile
@@ -2644,6 +2721,49 @@ async function handleRowAction(action, sessionId) {
   }
 }
 
+function preferredViewModeForSession(s) {
+  if (!isTerminalSession(s)) return "chat";
+  if (!hasSemanticChatView(s)) return "terminal";
+  return state.viewModeById.get(s.id) === "chat" ? "chat" : "terminal";
+}
+
+function renderViewModeToggle(s) {
+  const show = isTerminalSession(s) && hasSemanticChatView(s);
+  viewModeToggleEl.hidden = !show;
+  if (!show) return;
+  const mode = preferredViewModeForSession(s);
+  viewModeTerminalBtn.setAttribute("aria-pressed", mode === "terminal" ? "true" : "false");
+  viewModeChatBtn.setAttribute("aria-pressed", mode === "chat" ? "true" : "false");
+}
+
+async function switchCurrentViewMode(mode) {
+  if (mode !== "terminal" && mode !== "chat") return;
+  const id = state.currentId;
+  const s = state.sessions.find((x) => x.id === id);
+  if (
+    !id ||
+    !isTerminalSession(s) ||
+    !hasSemanticChatView(s) ||
+    preferredViewModeForSession(s) === mode
+  ) return;
+
+  state.viewModeById.set(id, mode);
+  saveViewModePrefs();
+  renderViewModeToggle(s);
+
+  if (mode === "terminal") {
+    await enterTerminalMode(id, {
+      focusTerminal: shouldFocusTerminalAfterSessionSwitch(),
+      forceReload: true,
+    });
+  } else {
+    rememberActiveTerminalState();
+    enterChatMode();
+    await loadTranscript(id);
+  }
+  setComposerEnabled(!!(state.ws && state.ws.readyState === 1 && state.currentId));
+}
+
 async function selectSession(id) {
   if (state.currentId === id) return;
   const focusTerminalAfterSwitch = shouldFocusTerminalAfterSessionSwitch();
@@ -2651,13 +2771,14 @@ async function selectSession(id) {
   renderSessions();
   const s = state.sessions.find((x) => x.id === id);
   sessionTitleEl.textContent = s ? sessionViewTitle(s) : "";
+  renderViewModeToggle(s);
   renderBrowserPreviewForSession(id);
   // Hide the session list on narrow screens after selection.
   if (isNarrowLayout()) {
     setSessionListVisible(false, false);
   }
   hydrateWidgets(id);
-  if (isTerminalSession(s)) {
+  if (preferredViewModeForSession(s) === "terminal") {
     await enterTerminalMode(id, { focusTerminal: focusTerminalAfterSwitch });
   } else {
     enterChatMode();
@@ -2744,6 +2865,20 @@ function rememberActiveTerminalState() {
   handle.lastReportedSize = state.lastReportedSize;
 }
 
+function resetTerminalReplay(handle) {
+  if (!handle) return;
+  handle.loaded = false;
+  handle.ptyBuffer = [];
+  handle.ptyBuffering = false;
+  handle.ptyReplayChunks = [];
+  handle.ptyReplayStartOffset = 0;
+  handle.ptyReplayEndOffset = 0;
+  handle.ptyReplayTotalBytes = 0;
+  handle.ptyReplayNextBytes = PTY_REPLAY_INITIAL_BYTES;
+  handle.ptyReplayLoadingOlder = false;
+  if (handle.term) handle.term.reset();
+}
+
 async function enterTerminalMode(id, options = {}) {
   rememberActiveTerminalState();
   state.mode = "terminal";
@@ -2780,6 +2915,7 @@ async function enterTerminalMode(id, options = {}) {
   const handle = initTerminalForSession(id);
   showTerminalForSession(id);
   activateTerminalHandle(handle);
+  if (options.forceReload) resetTerminalReplay(handle);
 
   if (!handle.loaded) {
     // Buffer PTY events that arrive while we're waiting on the
@@ -4028,6 +4164,7 @@ function handleNotification(method, params) {
     scheduleRenderSessions();
     if (session.id === state.currentId) {
       sessionTitleEl.textContent = sessionViewTitle(session);
+      renderViewModeToggle(session);
       hydrateWidgets(session.id);
     }
   } else if (method === "session/deleted") {
@@ -4037,6 +4174,7 @@ function handleNotification(method, params) {
     state.agentStatusById.delete(params.session_id);
     state.ptyActivityById.delete(params.session_id);
     state.widgetsById.delete(params.session_id);
+    if (state.viewModeById.delete(params.session_id)) saveViewModePrefs();
     clearBrowserPreview(params.session_id);
     if (params.session_id === state.currentId) {
       state.currentId = null;
@@ -4044,6 +4182,7 @@ function handleNotification(method, params) {
       renderEditorState(null);
       renderBrowserPreviewForSession(null);
       sessionTitleEl.textContent = "";
+      viewModeToggleEl.hidden = true;
       refreshListToolbar();
     }
   } else if (method === "group/state" || method === "project/state") {
@@ -4070,9 +4209,10 @@ function renderEvent(event, at) {
     // doesn't pop back up, and so it doesn't fall through to PTY.
     return;
   }
-  // PTY events go to xterm in terminal mode (decoded raw bytes →
-  // term.write); fall through to the chat-style `appendPty`
-  // otherwise so the user still sees something for non-PTY views.
+  // PTY events are terminal-delta bytes, not chat transcript content.
+  // Terminal mode sends them to xterm; chat mode deliberately skips
+  // them and renders only semantic transcript events so cursor
+  // repaint/spinner frames do not become duplicated text.
   if (event.type === "pty") {
     resetTermToolGroup();
     if (state.mode === "terminal" && state.term) {
@@ -4083,12 +4223,6 @@ function renderEvent(event, at) {
       const bytes = decodeBase64ToBytes(event.data || "");
       if (state.ptyBuffering) state.ptyBuffer.push(bytes);
       else writeLivePtyToTerm(bytes);
-    } else {
-      // Chat-mode fallback (non-PTY session that still emits Pty
-      // events — uncommon but possible). One-shot decode with
-      // TextDecoder + fatal:false; cross-chunk split sequences
-      // get a single U+FFFD instead of dumping the base64 string.
-      appendPty(decodeBase64(event.data || ""));
     }
     return;
   }
@@ -4436,24 +4570,6 @@ function appendToolApproval(event) {
       <span class="badge">${escape(event.risk || "")}</span>
       <details open><summary>${escape(event.args_summary || "args")}</summary></details>
     </div>`;
-  target.appendChild(row);
-}
-
-function appendPty(text) {
-  resetTermToolGroup();
-  // Coalesce consecutive PTY rows so each frame doesn't create a
-  // new DOM block; matters for chatty interactive harnesses.
-  const target = transcriptTarget();
-  const last = target.lastElementChild;
-  if (last && last.classList.contains("row") && last.dataset.kind === "pty") {
-    last.querySelector("pre").textContent += text;
-    return;
-  }
-  const row = document.createElement("div");
-  row.className = "row";
-  row.dataset.kind = "pty";
-  row.innerHTML = `<pre class="pty"></pre>`;
-  row.querySelector("pre").textContent = text;
   target.appendChild(row);
 }
 
@@ -5169,6 +5285,16 @@ function isTerminalSession(s) {
   return !!(s && s.has_pty && !isHeadlessSession(s));
 }
 
+function hasSemanticChatView(s) {
+  const harness = (s && s.harness) || "";
+  return (
+    harness === "zarvis" ||
+    harness === "codex" ||
+    harness === "claude" ||
+    harness === "antigravity"
+  );
+}
+
 // Zarvis renders tool calls as structured events, not PTY bytes (codex /
 // claude / shell paint their own tool UI into the PTY). For those
 // sessions the xterm view is hydrated from the transcript — which
@@ -5226,16 +5352,6 @@ function decodeBase64ToBytes(s) {
   } catch {
     return new Uint8Array(0);
   }
-}
-
-/** Decode a base64 string to a UTF-8 `String`. Uses `TextDecoder`
- *  with `fatal:false` so split multi-byte sequences (the
- *  narrow-PTY case) produce a single U+FFFD replacement character
- *  instead of throwing — the old `decodeURIComponent` pipeline
- *  threw and dumped the raw base64 as fallback, which is what
- *  showed as "random chars" in the narrow-width screenshots. */
-function decodeBase64(s) {
-  return new TextDecoder("utf-8", { fatal: false }).decode(decodeBase64ToBytes(s));
 }
 
 // --- Tool approval sheet ------------------------------------------------
@@ -5510,6 +5626,12 @@ $("listToolbar").addEventListener("click", (ev) => {
   const btn = ev.target.closest("[data-action]");
   if (!btn || btn.disabled) return;
   handleRowAction(btn.dataset.action, state.currentId);
+});
+
+viewModeToggleEl.addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-view-mode]");
+  if (!btn) return;
+  switchCurrentViewMode(btn.dataset.viewMode);
 });
 
 // --- Mobile keyboard awareness ------------------------------------------

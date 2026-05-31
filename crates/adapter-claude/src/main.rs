@@ -19,17 +19,18 @@
 //! Honors `AGENTD_CLAUDE_CMD` for a full command prefix, falling back to
 //! `AGENTD_CLAUDE_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use agentd_protocol::adapter::pty::{PtySpec, run_session as run_pty};
+use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter, run};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -101,8 +102,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // `--allowed-tools` patterns. Single policy in agentd; each adapter
     // applies it in its harness's native mechanism.
     args.extend(
-        agentd_protocol::adapter::policy::AutoApprovePolicy::from_env()
-            .claude_allowed_tools_args(),
+        agentd_protocol::adapter::policy::AutoApprovePolicy::from_env().claude_allowed_tools_args(),
     );
     // Resume support: stash our own UUID under
     // $AGENTD_SESSION_DATA_DIR/claude_session_id.txt at first spawn (passed
@@ -120,16 +120,20 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             .filter(|s| !s.is_empty()),
         _ => None,
     };
-    if let Some(sid) = &claude_session_id {
+    let watch_session_id = if let Some(sid) = &claude_session_id {
         args.push("--resume".into());
         args.push(sid.clone());
+        Some(sid.clone())
     } else if let Some(p) = &sid_file {
         // First spawn (or no prior id): mint our own and pass --session-id.
         let new_id = uuid::Uuid::new_v4().to_string();
         let _ = std::fs::write(p, &new_id);
         args.push("--session-id".into());
-        args.push(new_id);
-    }
+        args.push(new_id.clone());
+        Some(new_id)
+    } else {
+        None
+    };
     // Skip the initial prompt on resume — it's already in the claude
     // conversation we're rejoining.
     if !resuming {
@@ -145,6 +149,14 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     env.push(("AGENTD_SESSION_ID".into(), ctx.session_id.clone()));
+    if let Some(session_id) = watch_session_id {
+        spawn_interactive_transcript_watcher(
+            session_id,
+            PathBuf::from(&params.cwd),
+            ctx.emit.clone(),
+            resuming,
+        );
+    }
     let label = command.argv_preview();
     let bin = command.bin;
     let spec = PtySpec {
@@ -159,6 +171,83 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         status_detail: Some(format!("{label} (interactive)")),
     };
     let _ = run_pty(spec, ctx).await;
+}
+
+fn spawn_interactive_transcript_watcher(
+    session_id: String,
+    cwd: PathBuf,
+    emit: EventEmitter,
+    skip_existing: bool,
+) {
+    let Some(path) = claude_transcript_path(&cwd, &session_id) else {
+        emit.log("claude: no CLAUDE_HOME or HOME — cannot watch native transcript");
+        return;
+    };
+    tokio::spawn(async move {
+        let mut next_line = if skip_existing {
+            count_jsonl_lines(&path)
+        } else {
+            0
+        };
+        let mut tick = tokio::time::interval(Duration::from_millis(500));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            emit_new_claude_transcript_lines(&path, &mut next_line, &emit);
+        }
+    });
+}
+
+fn claude_transcript_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
+    let home = std::env::var("AGENTD_CLAUDE_HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("CLAUDE_HOME").ok().filter(|s| !s.is_empty()))
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.claude")))?;
+    Some(
+        PathBuf::from(home)
+            .join("projects")
+            .join(claude_project_slug(cwd))
+            .join(format!("{session_id}.jsonl")),
+    )
+}
+
+fn claude_project_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn count_jsonl_lines(path: &Path) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
+}
+
+fn emit_new_claude_transcript_lines(path: &Path, next_line: &mut usize, emit: &EventEmitter) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut seen = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        seen = idx + 1;
+        if idx < *next_line {
+            continue;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(v) => emit_event_from_json(emit, v),
+            Err(e) => emit.log(format!(
+                "claude transcript: failed to parse {} line {}: {e}",
+                path.display(),
+                idx + 1
+            )),
+        }
+    }
+    *next_line = seen;
 }
 
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
