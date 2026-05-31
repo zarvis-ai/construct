@@ -271,13 +271,17 @@ struct CachedParser {
 struct ItemLayout {
     /// Visible row count this item contributes (incl. soft wraps).
     lines: usize,
-    /// Tool-block hit-rect metadata, `None` for plain PTY chunks.
-    block: Option<BlockLayout>,
+    /// Tool-block hit-rect metadata, empty for plain PTY chunks.
+    blocks: Vec<BlockLayout>,
 }
 
 #[derive(Clone)]
 struct BlockLayout {
     call_id: String,
+    /// First visible row of the clickable region relative to the item.
+    row_start_offset: usize,
+    /// Exclusive end row of the clickable region relative to the item.
+    row_end_offset: usize,
     /// Offset (in visible rows) of the block's status row from the
     /// block's first row; `None` if the block has no status row.
     status_row_offset: Option<usize>,
@@ -877,6 +881,11 @@ impl ItemHistory {
             _ => None,
         }) {
             group.expanded = !group.expanded;
+            if group.expanded {
+                for block in &mut group.blocks {
+                    block.expanded = false;
+                }
+            }
             self.dirty = true;
             return true;
         }
@@ -1212,7 +1221,7 @@ impl ItemHistory {
                     }
                     ItemLayout {
                         lines: count_visible_lines(b, cols),
-                        block: None,
+                        blocks: Vec::new(),
                     }
                 }
                 Item::ToolBlock(block) => {
@@ -1220,14 +1229,17 @@ impl ItemHistory {
                     if idx >= start_processing_at {
                         cache.parser.process(&synth.bytes);
                     }
+                    let lines = count_visible_lines(&synth.bytes, cols);
                     ItemLayout {
-                        lines: count_visible_lines(&synth.bytes, cols),
-                        block: Some(BlockLayout {
+                        lines,
+                        blocks: vec![BlockLayout {
                             call_id: block.call_id.clone(),
+                            row_start_offset: 0,
+                            row_end_offset: lines,
                             status_row_offset: synth.status_row_offset.map(|off| off as usize),
                             bg_cols: synth.bg_button_cols,
                             kill_cols: synth.kill_button_cols,
-                        }),
+                        }],
                     }
                 }
                 Item::ToolGroup(group) => {
@@ -1237,12 +1249,7 @@ impl ItemHistory {
                     }
                     ItemLayout {
                         lines: count_visible_lines(&synth.bytes, cols),
-                        block: Some(BlockLayout {
-                            call_id: group.call_id(),
-                            status_row_offset: synth.status_row_offset.map(|off| off as usize),
-                            bg_cols: synth.bg_button_cols,
-                            kill_cols: synth.kill_button_cols,
-                        }),
+                        blocks: group_block_layouts(group, &synth, cols),
                     }
                 }
                 Item::Message {
@@ -1256,7 +1263,7 @@ impl ItemHistory {
                     }
                     ItemLayout {
                         lines: count_visible_lines(&bytes, cols),
-                        block: None,
+                        blocks: Vec::new(),
                     }
                 }
             };
@@ -1270,11 +1277,11 @@ impl ItemHistory {
         for layout in &cache.item_layouts {
             let start = abs_line;
             abs_line += layout.lines;
-            if let Some(bl) = &layout.block {
+            for bl in &layout.blocks {
                 block_spans.push(BlockSpan {
                     call_id: bl.call_id.clone(),
-                    abs_start: start,
-                    abs_end: abs_line,
+                    abs_start: start + bl.row_start_offset,
+                    abs_end: start + bl.row_end_offset,
                     status_abs_row: bl.status_row_offset.map(|off| start + off),
                     bg_cols: bl.bg_cols,
                     kill_cols: bl.kill_cols,
@@ -1559,9 +1566,10 @@ fn synth_group(group: &ToolGroup, cols: u16) -> SynthOutput {
     let mut out: Vec<u8> = Vec::with_capacity(256);
     out.extend_from_slice(b"\r\n");
     let summary = summarize_group(group);
+    let chevron = if group.expanded { "▾" } else { "▸" };
     out.extend_from_slice(
         format!(
-            "\x1b[2;32m→ \x1b[0m\x1b[1;92m{}\x1b[0m\x1b[2m × {} · {}\x1b[0m\r\n",
+            "\x1b[2;32m{chevron} \x1b[0m\x1b[1;92m{}\x1b[0m\x1b[2m × {} · {}\x1b[0m\r\n",
             group.tool,
             group.blocks.len(),
             summary
@@ -1574,13 +1582,11 @@ fn synth_group(group: &ToolGroup, cols: u16) -> SynthOutput {
             let synth = synth_block(block, cols);
             out.extend_from_slice(&synth.bytes);
         }
-        out.extend_from_slice(b"     \x1b[2;36m[click to collapse group]\x1b[0m\r\n");
     } else {
         let status = group_status(group);
         if !status.is_empty() {
             out.extend_from_slice(format!("  \x1b[2m{}\x1b[0m\r\n", status).as_bytes());
         }
-        out.extend_from_slice(b"     \x1b[2;36m[click to expand group]\x1b[0m\r\n");
     }
 
     SynthOutput {
@@ -1589,6 +1595,35 @@ fn synth_group(group: &ToolGroup, cols: u16) -> SynthOutput {
         bg_button_cols: None,
         kill_button_cols: None,
     }
+}
+
+fn group_block_layouts(group: &ToolGroup, synth: &SynthOutput, cols: u16) -> Vec<BlockLayout> {
+    let lines = count_visible_lines(&synth.bytes, cols);
+    let mut layouts = vec![BlockLayout {
+        call_id: group.call_id(),
+        row_start_offset: 1,
+        row_end_offset: 2.min(lines),
+        status_row_offset: None,
+        bg_cols: None,
+        kill_cols: None,
+    }];
+    if group.expanded {
+        let mut offset = 2;
+        for block in &group.blocks {
+            let child = synth_block(block, cols);
+            let child_lines = count_visible_lines(&child.bytes, cols);
+            layouts.push(BlockLayout {
+                call_id: block.call_id.clone(),
+                row_start_offset: offset,
+                row_end_offset: offset + child_lines,
+                status_row_offset: child.status_row_offset.map(|off| offset + off as usize),
+                bg_cols: child.bg_button_cols,
+                kill_cols: child.kill_button_cols,
+            });
+            offset += child_lines;
+        }
+    }
+    layouts
 }
 
 fn summarize_group(group: &ToolGroup) -> String {
@@ -2145,7 +2180,7 @@ mod tests {
         }
 
         let text = screen_text(h.replay(100, 20, 0).screen, 20, 100);
-        assert!(text.contains("→ read_file × 2"), "{text}");
+        assert!(text.contains("▸ read_file × 2"), "{text}");
         assert!(text.contains("a.rs, b.rs"), "{text}");
         assert!(text.contains("2 completed"), "{text}");
         assert!(text.contains("1 failed"), "{text}");
@@ -2163,6 +2198,37 @@ mod tests {
         assert!(matches!(h.items[1], Item::ToolBlock(_)));
         assert!(matches!(h.items[2], Item::PtyChunk(_)));
         assert!(matches!(h.items[3], Item::ToolBlock(_)));
+    }
+
+    #[test]
+    fn expanded_group_exposes_child_hit_rects() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "echo a".into());
+        h.feed_task_start("B".into(), "shell".into(), "echo b".into());
+        h.feed_tool_result("A", true, "a\nmore a\nstill a".into());
+        h.feed_tool_result("B", true, "b\nmore b\nstill b".into());
+
+        let group_id = match &h.items[0] {
+            Item::ToolGroup(g) => g.call_id(),
+            other => panic!("expected tool group, got {other:?}"),
+        };
+        assert!(h.toggle_block(&group_id));
+        let out = h.replay(100, 40, 0);
+        let ids: Vec<&str> = out.blocks.iter().map(|b| b.call_id.as_str()).collect();
+        assert!(ids.contains(&group_id.as_str()), "{ids:?}");
+        assert!(ids.contains(&"A"), "{ids:?}");
+        assert!(ids.contains(&"B"), "{ids:?}");
+        let group_hit = out.blocks.iter().find(|b| b.call_id == group_id).unwrap();
+        assert_eq!(group_hit.row_end - group_hit.row_start, 1);
+
+        assert!(h.toggle_block("A"));
+        match &h.items[0] {
+            Item::ToolGroup(g) => {
+                assert!(g.expanded, "child toggle should not collapse the group");
+                assert!(g.blocks[0].expanded, "child output should expand");
+            }
+            other => panic!("expected tool group, got {other:?}"),
+        }
     }
 
     #[test]
