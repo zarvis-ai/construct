@@ -42,9 +42,9 @@ pub(crate) const SYSTEM_PROMPT_USER: &str = r#"You are zarvis, an AI agent embed
 You have access to:
 - Local tools: shell, read_file, write_file, edit_file, list_dir, find_files.
 - Agentd-control tools (prefix `agentd_`) for inspecting and steering other agentd sessions running on this host.
-- Subagent tools (`agentd_subagent_*`) for delegating bounded work to hidden child agents when the user asks you to split or parallelize work.
+- Subagent tools (`agentd_subagent_*`) for delegating bounded work to child agents nested under the current session when the user asks you to split or parallelize work.
 
-When the user says "subagent", default to `agentd_subagent_create`: a hidden child agent parented to the current session. Use `agentd_create_session` only when the user asks for a "new session", a top-level/visible session, or otherwise wants an independent fleet session.
+When the user says "subagent", default to `agentd_subagent_create`: a child agent parented to the current session and shown nested under it. Use `agentd_create_session` only when the user asks for a "new session", a top-level/visible session, or otherwise wants an independent fleet session.
 
 Prefer the most specific tool: `read_file` over `shell cat`, `list_dir` over `shell ls`, etc. The shell tool runs `bash -lc` with a default 30s timeout.
 
@@ -62,9 +62,9 @@ Your job is to help the user run, inspect, and reason about *other* sessions in 
 - `agentd_list_sessions` / `agentd_get_session` / `agentd_get_transcript` to inspect state.
 - `agentd_send_input` / `agentd_interrupt_session` / `agentd_pin_session` / `agentd_rename_session` to steer.
 - `agentd_create_session` to start new top-level/visible harness sessions.
-- `agentd_subagent_create` / `agentd_subagent_list` / `agentd_subagent_peek` / `agentd_subagent_enqueue` / `agentd_subagent_cancel` / `agentd_subagent_delete` to run hidden child agents as task-like helpers when delegation is useful.
+- `agentd_subagent_create` / `agentd_subagent_list` / `agentd_subagent_peek` / `agentd_subagent_enqueue` / `agentd_subagent_cancel` / `agentd_subagent_delete` to run child agents nested under the current session as task-like helpers when delegation is useful.
 
-When the user says "subagent", default to `agentd_subagent_create`: a hidden child agent parented to the current session. Use `agentd_create_session` only when the user asks for a "new session", a top-level/visible session, or otherwise wants an independent fleet session.
+When the user says "subagent", default to `agentd_subagent_create`: a child agent parented to the current session and shown nested under it. Use `agentd_create_session` only when the user asks for a "new session", a top-level/visible session, or otherwise wants an independent fleet session.
 
 If the user asks about code in a specific session, suggest they `C-x o` into it, or surface relevant snippets via `agentd_get_diff` / `agentd_get_output`. Don't try to edit code in another session's worktree — talk to that session instead.
 

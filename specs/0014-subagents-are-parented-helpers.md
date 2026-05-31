@@ -9,8 +9,8 @@ Scope: How agents should interpret requests for subagents versus new sessions.
 
 When a user asks for a "subagent", the default behavior is to create a child
 agent parented to the current session. The child may be backed by any harness,
-but it remains scoped to the parent session and is managed through subagent
-operations.
+appears nested under the parent in clients, and remains managed through
+subagent operations.
 
 When a user asks for a "new session", "top-level session", "visible session", or
 an independent fleet session, the default behavior is to create a normal
@@ -20,8 +20,8 @@ fleet-level session instead.
 
 Users use "subagent" to mean delegated helper work that belongs to the current
 task. Creating an unrelated top-level session breaks that mental model: the
-review/helper is harder to collect, does not appear under the parent, and is not
-managed through subagent tools.
+review/helper is harder to collect, does not appear nested under the parent, and
+is not managed through subagent tools.
 
 Top-level sessions are still useful for durable workstreams, manual panes, and
 independent agents. The distinction should be controlled by the user's wording.
@@ -32,9 +32,9 @@ Agent prompts and tool descriptions should steer models toward child subagents
 when the word "subagent" appears, including for split-review or parallelized
 research tasks.
 
-Tools that create normal sessions should describe themselves as top-level or
-visible session creation, and should explicitly point to the subagent creation
-tool when the user asked for a subagent.
+Tools that create normal sessions should describe themselves as top-level
+session creation, and should explicitly point to the subagent creation tool when
+the user asked for a subagent.
 
 ## Examples
 
