@@ -1579,8 +1579,8 @@ fn synth_group(group: &ToolGroup, cols: u16) -> SynthOutput {
 
     if group.expanded {
         for block in &group.blocks {
-            let synth = synth_block(block, cols);
-            out.extend_from_slice(&synth.bytes);
+            let synth = synth_block(block, cols.saturating_sub(2));
+            out.extend_from_slice(&indent_synth_bytes(&synth.bytes, 2));
         }
     } else {
         let status = group_status(group);
@@ -1595,6 +1595,23 @@ fn synth_group(group: &ToolGroup, cols: u16) -> SynthOutput {
         bg_button_cols: None,
         kill_button_cols: None,
     }
+}
+
+fn indent_synth_bytes(bytes: &[u8], spaces: usize) -> Vec<u8> {
+    let indent = vec![b' '; spaces];
+    let mut out = Vec::with_capacity(bytes.len() + spaces * 4);
+    let mut at_line_start = true;
+    for &b in bytes {
+        if at_line_start && b != b'\r' && b != b'\n' {
+            out.extend_from_slice(&indent);
+            at_line_start = false;
+        }
+        out.push(b);
+        if b == b'\n' {
+            at_line_start = true;
+        }
+    }
+    out
 }
 
 fn group_block_layouts(group: &ToolGroup, synth: &SynthOutput, cols: u16) -> Vec<BlockLayout> {
@@ -1616,8 +1633,9 @@ fn group_block_layouts(group: &ToolGroup, synth: &SynthOutput, cols: u16) -> Vec
     if group.expanded {
         let mut offset = 2;
         for block in &group.blocks {
-            let child = synth_block(block, cols);
-            let child_lines = count_visible_lines(&child.bytes, cols);
+            let child = synth_block(block, cols.saturating_sub(2));
+            let indented = indent_synth_bytes(&child.bytes, 2);
+            let child_lines = count_visible_lines(&indented, cols);
             layouts.push(BlockLayout {
                 call_id: block.call_id.clone(),
                 row_start_offset: offset,
@@ -2220,6 +2238,11 @@ mod tests {
         };
         assert!(h.toggle_block(&group_id));
         let out = h.replay(100, 40, 0);
+        let text = screen_text(out.screen, 40, 100);
+        assert!(
+            text.contains("  → shell"),
+            "expanded children should be indented:\n{text}"
+        );
         let ids: Vec<&str> = out.blocks.iter().map(|b| b.call_id.as_str()).collect();
         assert!(ids.contains(&group_id.as_str()), "{ids:?}");
         assert!(ids.contains(&"A"), "{ids:?}");
