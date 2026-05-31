@@ -9,7 +9,7 @@ use agentd_protocol::{
     ProjectSummary, PtyReplayResult, Request, Response, SessionAttachClipboardParams,
     SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionIdParams,
     SessionInputParams, SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams,
-    SessionSetAutomodeParams, SessionSetPinnedParams, SessionSetProjectParams,
+    SessionSetApprovalModeParams, SessionSetPinnedParams, SessionSetProjectParams,
     SessionSetTitleParams, SessionSummary, SessionToolDecisionParams, SubscribeParams,
     TranscriptParams, TranscriptResult,
 };
@@ -452,13 +452,17 @@ impl Client {
             .await?;
         Ok(())
     }
-    pub async fn set_automode(&self, id: &str, on: bool) -> Result<()> {
+    pub async fn set_approval_mode(
+        &self,
+        id: &str,
+        mode: agentd_protocol::ApprovalMode,
+    ) -> Result<()> {
         let _: serde_json::Value = self
             .request(
-                ipc_method::SESSION_SET_AUTOMODE,
-                &SessionSetAutomodeParams {
+                ipc_method::SESSION_SET_APPROVAL_MODE,
+                &SessionSetApprovalModeParams {
                     session_id: id.to_string(),
-                    on,
+                    mode,
                 },
             )
             .await?;

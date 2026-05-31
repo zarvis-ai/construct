@@ -48,8 +48,8 @@
 //! `AGENTD_ANTIGRAVITY_BIN` (binary, default `agy`),
 //! `AGENTD_ANTIGRAVITY_MODE` (`interactive`|`headless`).
 
-use agentd_protocol::adapter::pty::{PtySpec, run_session as run_pty};
-use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter, run};
+use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
@@ -348,7 +348,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => continue,
                 }
             }
@@ -488,7 +488,7 @@ async fn drive_turn(
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => {}
                 }
             }

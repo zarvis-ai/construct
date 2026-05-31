@@ -280,7 +280,7 @@ pub enum MinibufferIntent {
     Orchestrator,
     /// Approval prompt for a Risky tool call from an agent harness
     /// (currently zarvis). Single-key dispatch: `y`/Enter approve,
-    /// `n`/Esc deny, `a` approve + flip automode.
+    /// `n`/Esc deny, `a` auto-review, `f` unsafe-auto.
     ApproveTool {
         session_id: String,
         call_id: String,
@@ -3381,7 +3381,7 @@ impl App {
         };
         let short_args: String = args_summary.chars().take(80).collect();
         let prompt = format!(
-            "approve [{risk_label}] {tool}({}) ▸ y=approve  n=deny  a=automode",
+            "approve [{risk_label}] {tool}({}) ▸ y=approve  n=deny  a=auto-review  f=unsafe-auto",
             short_args
         );
         self.minibuffer = Some(Minibuffer {
@@ -3399,17 +3399,24 @@ impl App {
         });
     }
 
-    /// Toggle the selected session's automode flag.
-    pub async fn toggle_automode(&mut self) {
+    /// Cycle the selected session's approval mode.
+    pub async fn cycle_approval_mode(&mut self) {
         let Some(s) = self.selected_session() else {
             self.set_status("no session selected".into());
             return;
         };
         let id = s.id.clone();
-        let next = !s.automode;
-        match self.client.set_automode(&id, next).await {
-            Ok(()) => self.set_status(format!("automode {}", if next { "ON" } else { "off" })),
-            Err(e) => self.set_status(format!("set_automode failed: {e}")),
+        let next = match s.approval_mode {
+            agentd_protocol::ApprovalMode::Manual => agentd_protocol::ApprovalMode::AutoReview,
+            agentd_protocol::ApprovalMode::AutoReview => agentd_protocol::ApprovalMode::UnsafeAuto,
+            agentd_protocol::ApprovalMode::UnsafeAuto => agentd_protocol::ApprovalMode::Manual,
+        };
+        match self.client.set_approval_mode(&id, next).await {
+            Ok(()) => self.set_status(format!(
+                "approval mode {}",
+                next.badge().unwrap_or("manual")
+            )),
+            Err(e) => self.set_status(format!("set_approval_mode failed: {e}")),
         }
     }
 
@@ -5592,7 +5599,7 @@ impl App {
                 self.help_visible = !self.help_visible;
             }
             ToggleAutomode => {
-                self.toggle_automode().await;
+                self.cycle_approval_mode().await;
             }
             ToggleMouseCapture => {
                 self.toggle_mouse_capture();
@@ -5754,7 +5761,8 @@ impl App {
             let decision = match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => Some("approve"),
                 KeyCode::Char('n') | KeyCode::Esc => Some("deny"),
-                KeyCode::Char('a') => Some("automode"),
+                KeyCode::Char('a') => Some("auto_review"),
+                KeyCode::Char('f') => Some("unsafe_auto"),
                 KeyCode::Char('g') if ctrl => Some("deny"),
                 _ => None,
             };
@@ -7158,7 +7166,7 @@ mod tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
-            automode: false,
+            approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
         }
     }
@@ -8735,7 +8743,7 @@ mod tests {
             "has_pty": has_pty,
             "pinned": false,
             "position": 0,
-            "automode": false,
+            "approval_mode": "manual",
             "kind": "user"
         })
     }

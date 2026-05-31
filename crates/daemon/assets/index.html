@@ -1244,9 +1244,7 @@
     grid-template-columns: 1fr 1fr;
     gap: 8px;
   }
-  .approval-actions .btn-automode {
-    grid-column: 1 / 3;
-  }
+
   .approval-actions button {
     appearance: none;
     border: none;
@@ -1266,10 +1264,16 @@
     background: rgba(244, 124, 124, 0.18);
     color: var(--err);
   }
-  .approval-actions .btn-automode {
+  .approval-actions .btn-auto-review {
     background: transparent;
     border: 1px solid var(--border);
     color: var(--fg-dim);
+    font-size: 13px;
+  }
+  .approval-actions .btn-unsafe-auto {
+    background: rgba(255, 178, 92, 0.18);
+    border: 1px solid rgba(255, 178, 92, 0.34);
+    color: var(--warn);
     font-size: 13px;
   }
   .approval-actions button:disabled { opacity: 0.5; cursor: progress; }
@@ -1610,7 +1614,7 @@
   <!--
     Tool-approval bottom sheet. Shown when the adapter emits
     `tool_approval_request`; the user picks approve / deny /
-    approve-all (automode) and the client posts back via
+    auto-review / unsafe-auto and the client posts back via
     `session.tool_decision`. Queued sheet if multiple arrive while
     one is open.
   -->
@@ -1625,8 +1629,11 @@
       <div class="approval-actions">
         <button type="button" class="btn-deny" id="approvalDeny">Deny</button>
         <button type="button" class="btn-approve" id="approvalApprove">Approve</button>
-        <button type="button" class="btn-automode" id="approvalAutomode">
-          Approve all from now on (auto-mode)
+        <button type="button" class="btn-auto-review" id="approvalAutoReview">
+          Auto-review
+        </button>
+        <button type="button" class="btn-unsafe-auto" id="approvalUnsafeAuto">
+          Unsafe-auto
         </button>
       </div>
     </div>
@@ -1744,7 +1751,8 @@ const approvalSummaryEl = $("approvalSummary");
 const approvalQueueHintEl = $("approvalQueueHint");
 const approvalDenyBtn = $("approvalDeny");
 const approvalApproveBtn = $("approvalApprove");
-const approvalAutomodeBtn = $("approvalAutomode");
+const approvalAutoReviewBtn = $("approvalAutoReview");
+const approvalUnsafeAutoBtn = $("approvalUnsafeAuto");
 const VIEW_MODE_PREFS_KEY = "agentd.web.viewModePrefs";
 
 const state = {
@@ -5538,7 +5546,8 @@ function updateApprovalQueueHint() {
 function setApprovalButtonsDisabled(disabled) {
   approvalDenyBtn.disabled = disabled;
   approvalApproveBtn.disabled = disabled;
-  approvalAutomodeBtn.disabled = disabled;
+  approvalAutoReviewBtn.disabled = disabled;
+  approvalUnsafeAutoBtn.disabled = disabled;
 }
 
 async function decideApproval(decision) {
@@ -5563,7 +5572,8 @@ async function decideApproval(decision) {
 
 approvalApproveBtn.addEventListener("click", () => decideApproval("approve"));
 approvalDenyBtn.addEventListener("click", () => decideApproval("deny"));
-approvalAutomodeBtn.addEventListener("click", () => decideApproval("automode"));
+approvalAutoReviewBtn.addEventListener("click", () => decideApproval("auto_review"));
+approvalUnsafeAutoBtn.addEventListener("click", () => decideApproval("unsafe_auto"));
 
 // --- New-session dialog -------------------------------------------------
 

@@ -11,8 +11,8 @@ use agentd_protocol::{
     ProjectDeleteParams, ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
     ProjectSetCollapsedParams, ProjectStateNotificationPayload, PtyReplayParams, Request, Response,
     SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
-    SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams, SessionSetGroupParams,
-    SessionSetPinnedParams, SessionSetProjectParams, SessionSetTitleParams,
+    SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
+    SessionSetGroupParams, SessionSetPinnedParams, SessionSetProjectParams, SessionSetTitleParams,
     SessionToolActionParams, SessionToolDecisionParams, SubscribeParams, TranscriptParams,
     IPC_VERSION,
 };
@@ -1185,9 +1185,9 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
-        m if m == ipc_method::SESSION_SET_AUTOMODE => {
-            let p = params!(SessionSetAutomodeParams);
-            match manager.set_automode(&p.session_id, p.on).await {
+        m if m == ipc_method::SESSION_SET_APPROVAL_MODE => {
+            let p = params!(SessionSetApprovalModeParams);
+            match manager.set_approval_mode(&p.session_id, p.mode).await {
                 Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

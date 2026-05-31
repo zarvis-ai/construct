@@ -38,7 +38,7 @@ pub mod ahp_method {
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
     pub const SESSION_TOOL_ACTION: &str = "session.tool_action";
-    pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
+    pub const SESSION_SET_APPROVAL_MODE: &str = "session.set_approval_mode";
     pub const SHUTDOWN: &str = "shutdown";
 }
 
@@ -526,6 +526,25 @@ pub struct ListTasksResult {
 /// catalog for natural-language UI actions.
 pub const TUI_DISPATCH_TOOL: &str = "tui";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalMode {
+    #[default]
+    Manual,
+    AutoReview,
+    UnsafeAuto,
+}
+
+impl ApprovalMode {
+    pub fn badge(self) -> Option<&'static str> {
+        match self {
+            ApprovalMode::Manual => None,
+            ApprovalMode::AutoReview => Some("auto-review"),
+            ApprovalMode::UnsafeAuto => Some("unsafe-auto"),
+        }
+    }
+}
+
 /// Coarse risk classification used by adapters that gate tool calls behind
 /// user approval. Two tiers are intentional; finer-grained policies can be
 /// layered without changing the protocol (the `decision` field on
@@ -533,11 +552,10 @@ pub const TUI_DISPATCH_TOOL: &str = "tui";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolRisk {
-    /// Read-only / observation. Adapter runs these without prompting even
-    /// when automode is off.
+    /// Read-only / observation. Adapter runs these without prompting.
     Safe,
-    /// Mutates filesystem / sessions / external state. Adapter prompts the
-    /// user when automode is off.
+    /// Mutates filesystem / sessions / external state. Adapter gates these
+    /// according to the session's approval mode.
     Risky,
 }
 
@@ -638,7 +656,7 @@ pub mod ipc_method {
     pub const SESSION_RESTART: &str = "session.restart";
     pub const SESSION_SET_PINNED: &str = "session.set_pinned";
     pub const SESSION_SET_TITLE: &str = "session.set_title";
-    pub const SESSION_SET_AUTOMODE: &str = "session.set_automode";
+    pub const SESSION_SET_APPROVAL_MODE: &str = "session.set_approval_mode";
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
     pub const SESSION_TOOL_ACTION: &str = "session.tool_action";
     pub const SESSION_LIST_TASKS: &str = "session.list_tasks";
@@ -805,12 +823,9 @@ pub struct SessionSummary {
     /// avoid sending input while the agent is mid-turn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pty_at_ms: Option<i64>,
-    /// When true, the adapter auto-approves tool calls instead of pausing
-    /// for user confirmation. Only meaningful for adapters that gate tool
-    /// calls (zarvis today; future agent harnesses). Toggle via
-    /// `session.set_automode`.
+    /// How adapters that gate tools handle Risky tool calls.
     #[serde(default)]
-    pub automode: bool,
+    pub approval_mode: ApprovalMode,
     /// Distinguishes the orchestrator session (daemon-created, hidden
     /// from the session list) from ordinary user sessions. Persisted
     /// in `meta.json` so the daemon recognizes the orchestrator
@@ -887,11 +902,9 @@ pub struct SessionSetTitleParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionSetAutomodeParams {
+pub struct SessionSetApprovalModeParams {
     pub session_id: String,
-    /// `true` = adapter runs all tools without prompting.
-    /// `false` = adapter pauses on Risky tools (default).
-    pub on: bool,
+    pub mode: ApprovalMode,
 }
 
 /// Params for `session.tool_action` — the client asks the adapter
@@ -916,8 +929,8 @@ pub struct SessionToolDecisionParams {
     /// Matches the `call_id` in the originating
     /// [`SessionEvent::ToolApprovalRequest`].
     pub call_id: String,
-    /// One of `"approve"`, `"deny"`, `"automode"`. Open string so finer
-    /// decisions can be added without a protocol break.
+    /// One of `"approve"`, `"deny"`, `"auto_review"`, `"unsafe_auto"`.
+    /// Open string so finer decisions can be added without a protocol break.
     pub decision: String,
 }
 

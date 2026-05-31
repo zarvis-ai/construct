@@ -88,7 +88,7 @@ impl Tool for ListSessions {
     }
     fn description(&self) -> &str {
         "List every agentd session (running and finished). Each entry includes the \
-         session id, harness, state, cwd, pinned flag, automode flag, last_pty_at_ms \
+         session id, harness, state, cwd, pinned flag, approval mode, last_pty_at_ms \
          (use `now - last_pty_at_ms < 600ms` as a 'is the agent currently busy?' \
          signal), and group info when applicable."
     }

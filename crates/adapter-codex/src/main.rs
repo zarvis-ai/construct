@@ -15,8 +15,8 @@
 //! `AGENTD_CODEX_MODE=interactive|headless`. Honors `AGENTD_CODEX_CMD` for a
 //! full command prefix, falling back to `AGENTD_CODEX_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{PtySpec, run_session as run_pty};
-use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter, run};
+use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
@@ -518,7 +518,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => continue,
                 }
             }
@@ -643,7 +643,7 @@ async fn drive_turn(
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => {
                         // headless codex doesn't gate tools; ignore.
                     }
@@ -772,7 +772,11 @@ fn extract_text_from_blocks(v: Option<&Value>) -> Option<String> {
             out.push_str(t);
         }
     }
-    if out.is_empty() { None } else { Some(out) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn short(s: &str, max: usize) -> String {
@@ -800,12 +804,10 @@ mod tests {
     fn uuid_from_rollout_name_rejects_garbage() {
         assert!(uuid_from_rollout_name("rollout-foo.jsonl").is_none());
         assert!(uuid_from_rollout_name("not-a-rollout.jsonl").is_none());
-        assert!(
-            uuid_from_rollout_name(
-                "rollout-2026-05-16T14-21-02-019e32aa-014a-7ff0-9a3f-7ae773961a37.txt"
-            )
-            .is_none()
-        );
+        assert!(uuid_from_rollout_name(
+            "rollout-2026-05-16T14-21-02-019e32aa-014a-7ff0-9a3f-7ae773961a37.txt"
+        )
+        .is_none());
         // Right length, non-hex characters.
         assert!(
             uuid_from_rollout_name("rollout-zzz-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz.jsonl")

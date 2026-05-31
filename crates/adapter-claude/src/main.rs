@@ -19,8 +19,8 @@
 //! Honors `AGENTD_CLAUDE_CMD` for a full command prefix, falling back to
 //! `AGENTD_CLAUDE_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{PtySpec, run_session as run_pty};
-use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter, run};
+use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
@@ -292,7 +292,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => continue,
                 }
             }
@@ -435,7 +435,7 @@ async fn drive_turn(
                     Some(AdapterInboxMsg::PtyInput(_))
                     | Some(AdapterInboxMsg::PtyResize { .. })
                     | Some(AdapterInboxMsg::ToolDecision { .. })
-                    | Some(AdapterInboxMsg::SetAutoMode(_))
+                    | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => {
                         // headless claude doesn't gate tools; ignore.
                     }
@@ -769,13 +769,11 @@ mod tests {
         });
 
         match claude_events_from_json(&v).as_slice() {
-            [
-                SessionEvent::Cost {
-                    usd,
-                    tokens_in,
-                    tokens_out,
-                },
-            ] => {
+            [SessionEvent::Cost {
+                usd,
+                tokens_in,
+                tokens_out,
+            }] => {
                 assert_eq!(*usd, 0.25);
                 assert_eq!(*tokens_in, 10);
                 assert_eq!(*tokens_out, 20);

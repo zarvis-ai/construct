@@ -58,8 +58,7 @@ pub enum KeyAction {
     ScrollTop,
     ScrollBottom,
     ToggleHelp,
-    /// Toggle automode on the selected session — agents that gate tool
-    /// calls (zarvis) stop prompting for approvals when on. Bound to
+    /// Cycle approval mode on the selected session. Bound to
     /// `C-x A` (emacs) / `A` (vim).
     ToggleAutomode,
     /// Toggle terminal mouse capture. When disabled, native terminal
@@ -254,7 +253,7 @@ fn emacs() -> Keymap {
         (Chord(vec![shift('G')]), ScrollBottom),
         (Chord(vec![key(KeyCode::PageDown)]), ScrollPageDown),
         (Chord(vec![key(KeyCode::PageUp)]), ScrollPageUp),
-        // Toggle automode on the selected session (zarvis / future agents).
+        // Cycle approval mode on the selected session (zarvis / future agents).
         (Chord(vec![ctrl('x'), shift('A')]), ToggleAutomode),
         // Give the terminal mouse back for native text selection/copy.
         (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),

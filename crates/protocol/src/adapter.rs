@@ -25,7 +25,7 @@
 //!                     role: MessageRole::User, text: t,
 //!                 }),
 //!                 AdapterInboxMsg::Interrupt | AdapterInboxMsg::Stop => break,
-//!                 _ => {} // ignore PTY traffic, tool decisions, automode toggles
+//!                 _ => {} // ignore PTY traffic, tool decisions, approval-mode changes
 //!             }
 //!         }
 //!         ctx.emit.emit(SessionEvent::Done { exit_code: 0 });
@@ -304,11 +304,11 @@ pub enum AdapterInboxMsg {
     /// User's decision for a pending tool-approval request emitted by the
     /// adapter. `decision` is the open string from
     /// [`crate::SessionToolDecisionParams`] — typically `"approve"`,
-    /// `"deny"`, or `"automode"`.
+    /// `"deny"`, `"auto_review"`, or `"unsafe_auto"`.
     ToolDecision { call_id: String, decision: String },
-    /// User toggled the session's automode flag. The adapter updates its
+    /// User changed the session's approval mode. The adapter updates its
     /// in-memory copy so the next classification respects the change.
-    SetAutoMode(bool),
+    SetApprovalMode(crate::ApprovalMode),
     /// Client clicked `[kill]` / `[bg]` on a running tool block (or
     /// invoked the equivalent slash command / IPC method). The
     /// adapter looks up `call_id` in its in-flight task registry
@@ -706,15 +706,15 @@ where
             }
             ok(serde_json::Value::Null)
         }
-        ahp_method::SESSION_SET_AUTOMODE => {
-            let p: crate::SessionSetAutomodeParams =
+        ahp_method::SESSION_SET_APPROVAL_MODE => {
+            let p: crate::SessionSetApprovalModeParams =
                 match req.params.clone().map(serde_json::from_value).transpose() {
                     Ok(Some(p)) => p,
                     Ok(None) => return err(ErrorObject::invalid_params("missing params")),
                     Err(e) => return err(ErrorObject::invalid_params(e.to_string())),
                 };
             if let Some(tx) = inbox_tx {
-                let _ = tx.send(AdapterInboxMsg::SetAutoMode(p.on)).await;
+                let _ = tx.send(AdapterInboxMsg::SetApprovalMode(p.mode)).await;
             }
             ok(serde_json::Value::Null)
         }
@@ -986,8 +986,8 @@ where
                 }
                 send_ok(serde_json::Value::Null);
             }
-            ahp_method::SESSION_SET_AUTOMODE => {
-                let p: crate::SessionSetAutomodeParams =
+            ahp_method::SESSION_SET_APPROVAL_MODE => {
+                let p: crate::SessionSetApprovalModeParams =
                     match req.params.clone().map(serde_json::from_value).transpose() {
                         Ok(Some(p)) => p,
                         Ok(None) => {
@@ -1000,7 +1000,7 @@ where
                         }
                     };
                 if let Some(tx) = &inbox_tx {
-                    let _ = tx.send(AdapterInboxMsg::SetAutoMode(p.on)).await;
+                    let _ = tx.send(AdapterInboxMsg::SetApprovalMode(p.mode)).await;
                 }
                 send_ok(serde_json::Value::Null);
             }

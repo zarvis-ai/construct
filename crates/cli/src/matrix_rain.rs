@@ -268,7 +268,7 @@ impl MatrixRain {
 
     pub fn observe_tool_decision(&mut self, decision: &str, intensity: f32, session_id: &str) {
         match decision {
-            "approve" | "automode" => {
+            "approve" | "auto_review" | "unsafe_auto" => {
                 self.queue_random("approved", FlashTone::Good, 95, intensity, Some(session_id))
             }
             "deny" => self.queue_random("denied", FlashTone::Bad, 95, intensity, Some(session_id)),
@@ -872,7 +872,9 @@ mod tests {
             "word before the tail window must not be harvested (full-chunk scan regressed)"
         );
         assert!(
-            word.as_deref().map(|w| PTY_ACTIVITY_WORDS.contains(&w)).unwrap_or(false),
+            word.as_deref()
+                .map(|w| PTY_ACTIVITY_WORDS.contains(&w))
+                .unwrap_or(false),
             "expected rotation fallback when the tail carries no word, got {word:?}"
         );
     }

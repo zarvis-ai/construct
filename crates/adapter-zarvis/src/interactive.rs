@@ -139,7 +139,7 @@ impl<'a> Terminal<'a> {
         };
         let line = format!(
             "\r\n\x1b[1;33m? approve [{risk_label}]\x1b[0m {tool}\x1b[2m({args_summary})\x1b[0m\
-             — \x1b[1m[y]\x1b[0mes / \x1b[1m[n]\x1b[0mo / \x1b[1m[a]\x1b[0mutomode: "
+             — \x1b[1m[y]\x1b[0mes / \x1b[1m[n]\x1b[0mo / \x1b[1m[a]\x1b[0mauto-review / \x1b[1m[f]\x1b[0munsafe-auto: "
         );
         self.write(line.as_bytes());
     }
@@ -2680,6 +2680,8 @@ pub async fn run(
                         &mut editor,
                         &mut queue,
                         &mut queued_rows,
+                        provider.as_ref(),
+                        &model,
                         tasks.clone(),
                         bg_completion_tx.clone(),
                         bg_after,
@@ -2867,7 +2869,9 @@ async fn read_one_line(
                 term.echo_consumed_line(&t);
                 return ReadOutcome::Line(t);
             }
-            Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+            Some(AdapterInboxMsg::SetApprovalMode(mode)) => {
+                *automode = matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto)
+            }
             Some(AdapterInboxMsg::PtyInput(bytes)) => {
                 // PTY bytes only update editor state; nothing is
                 // painted inline in chat. The TUI's bottom pane shows
@@ -2924,6 +2928,8 @@ async fn run_one_tool(
     editor: &mut LineEditor,
     queue: &mut VecDeque<String>,
     queued_rows: &mut usize,
+    provider: &dyn crate::provider::LlmProvider,
+    model: &str,
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     bg_completion_tx: crate::tasks::BgCompletionTx,
     bg_after: std::time::Duration,
@@ -3055,8 +3061,47 @@ async fn run_one_tool(
                 });
             }
             ApprovalOutcome::Approve => term.print("y\r\n"),
-            ApprovalOutcome::Automode => {
+            ApprovalOutcome::AutoReview => {
                 term.print("a\r\n");
+                match crate::agent::auto_review_for_adapter(
+                    provider,
+                    model,
+                    call.name.as_str(),
+                    &args_summary,
+                )
+                .await
+                {
+                    crate::agent::AutoReviewResult::Approve => {}
+                    crate::agent::AutoReviewResult::Deny => {
+                        let msg = "auto-review denied this action".to_string();
+                        emit.emit(SessionEvent::ToolResult {
+                            tool: call.id.clone(),
+                            ok: false,
+                            output: msg.clone(),
+                        });
+                        return Ok(ToolOutcome {
+                            ok: false,
+                            output: msg,
+                        });
+                    }
+                    crate::agent::AutoReviewResult::AskUser => {
+                        let msg =
+                            "auto-review could not decide; please approve or deny this action"
+                                .to_string();
+                        emit.emit(SessionEvent::ToolResult {
+                            tool: call.id.clone(),
+                            ok: false,
+                            output: msg.clone(),
+                        });
+                        return Ok(ToolOutcome {
+                            ok: false,
+                            output: msg,
+                        });
+                    }
+                }
+            }
+            ApprovalOutcome::UnsafeAuto => {
+                term.print("f\r\n");
                 *automode = true;
             }
         }
@@ -3155,7 +3200,8 @@ async fn run_one_tool(
 enum ApprovalOutcome {
     Approve,
     Deny,
-    Automode,
+    AutoReview,
+    UnsafeAuto,
     Stop,
     Interrupt,
 }
@@ -3170,10 +3216,10 @@ async fn wait_for_approval(
             None => return ApprovalOutcome::Stop,
             Some(AdapterInboxMsg::Stop) => return ApprovalOutcome::Stop,
             Some(AdapterInboxMsg::Interrupt) => return ApprovalOutcome::Interrupt,
-            Some(AdapterInboxMsg::SetAutoMode(on)) => {
-                *automode = on;
-                if on {
-                    return ApprovalOutcome::Automode;
+            Some(AdapterInboxMsg::SetApprovalMode(mode)) => {
+                *automode = matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto);
+                if *automode {
+                    return ApprovalOutcome::UnsafeAuto;
                 }
             }
             Some(AdapterInboxMsg::ToolDecision {
@@ -3182,9 +3228,10 @@ async fn wait_for_approval(
             }) if cid == call_id => {
                 return match decision.as_str() {
                     "approve" => ApprovalOutcome::Approve,
-                    "automode" => {
+                    "auto_review" => ApprovalOutcome::AutoReview,
+                    "unsafe_auto" => {
                         *automode = true;
-                        ApprovalOutcome::Automode
+                        ApprovalOutcome::UnsafeAuto
                     }
                     _ => ApprovalOutcome::Deny,
                 };
@@ -3195,9 +3242,10 @@ async fn wait_for_approval(
                     match b {
                         b'y' | b'Y' | b'\r' | b'\n' => return ApprovalOutcome::Approve,
                         b'n' | b'N' | 0x1b | 0x07 => return ApprovalOutcome::Deny,
-                        b'a' | b'A' => {
+                        b'a' | b'A' => return ApprovalOutcome::AutoReview,
+                        b'f' | b'F' => {
                             *automode = true;
-                            return ApprovalOutcome::Automode;
+                            return ApprovalOutcome::UnsafeAuto;
                         }
                         0x03 => return ApprovalOutcome::Deny,
                         _ => {}
@@ -3526,7 +3574,7 @@ where
                     None => return DriveExit::Channel,
                     Some(AdapterInboxMsg::Stop) => return DriveExit::Stop,
                     Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
-                    Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+                    Some(AdapterInboxMsg::SetApprovalMode(mode)) => *automode = matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto),
                     Some(AdapterInboxMsg::Input(t)) => {
                         enqueue_line(queue, editor, t);
                         emit_editor_state(term.emit, editor, queue);
@@ -3886,7 +3934,7 @@ where
                     None => return DriveExit::Channel,
                     Some(AdapterInboxMsg::Stop) => return DriveExit::Stop,
                     Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
-                    Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+                    Some(AdapterInboxMsg::SetApprovalMode(mode)) => *automode = matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto),
                     Some(AdapterInboxMsg::Input(t)) => {
                         enqueue_line(queue, editor, t);
                         emit_editor_state(term.emit, editor, queue);
@@ -3968,7 +4016,7 @@ where
                     None => return DriveExit::Channel,
                     Some(AdapterInboxMsg::Stop) => return DriveExit::Stop,
                     Some(AdapterInboxMsg::Interrupt) => return DriveExit::Interrupt,
-                    Some(AdapterInboxMsg::SetAutoMode(on)) => *automode = on,
+                    Some(AdapterInboxMsg::SetApprovalMode(mode)) => *automode = matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto),
                     Some(AdapterInboxMsg::Input(t)) => {
                         enqueue_line(queue, editor, t);
                         emit_editor_state(emit, editor, queue);

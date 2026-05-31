@@ -3389,15 +3389,7 @@ fn render_agentd_markdown_lines(
             let start_col = panel_area.x.saturating_add(1);
             let row = panel_area.y.saturating_add(rendered_rows as u16);
             let spans = render_inline_action_spans(
-                line,
-                theme,
-                hover,
-                row,
-                start_col,
-                session_id,
-                panel_id,
-                hits,
-                url_hits,
+                line, theme, hover, row, start_col, session_id, panel_id, hits, url_hits,
             );
             lines.push(Line::from(spans));
         }
@@ -3745,9 +3737,9 @@ fn render_inline_action_spans(
         let after_label = &after_open[label_end + 1..];
         // Try to peel the `(target)` part out of `[label](target)`. If it
         // isn't there, render `[label]` literally.
-        let parens = after_label.strip_prefix('(').and_then(|s| {
-            s.find(')').map(|end| (&s[..end], &s[end + 1..]))
-        });
+        let parens = after_label
+            .strip_prefix('(')
+            .and_then(|s| s.find(')').map(|end| (&s[..end], &s[end + 1..])));
         let Some((target, after_close)) = parens else {
             let literal = &rest[label_start..label_start + label_end + 2];
             let rendered = strip_markdown_emphasis(literal);
@@ -4622,9 +4614,9 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    let automode_badge = match s {
-        Some(s) if s.automode => "[automode]  ".to_string(),
-        _ => String::new(),
+    let approval_mode_badge = match s.and_then(|s| s.approval_mode.badge()) {
+        Some(badge) => format!("[{badge}]  "),
+        None => String::new(),
     };
     // "● remote: N" badge when at least one phone / remote client is
     // attached to the daemon. Visible signal that another surface
@@ -4642,10 +4634,10 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
         ""
     };
     let modeline = format!(
-        " agentd  focus:{focus}  {sel}  {model}  {remote}{automode}{scrollback}{chord}{empty_hint}{status}{conn} ",
+        " agentd  focus:{focus}  {sel}  {model}  {remote}{approval_mode}{scrollback}{chord}{empty_hint}{status}{conn} ",
         focus = focus_label,
         scrollback = scrollback_label,
-        automode = automode_badge,
+        approval_mode = approval_mode_badge,
         remote = remote_badge,
         sel = match s {
             Some(s) => format!("\"{}\"", primary_label(s)),

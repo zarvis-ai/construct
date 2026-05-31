@@ -1,13 +1,11 @@
 //! The zarvis agent loop. Pulls user input from the inbox, calls the
 //! provider, runs any tool calls (gating Risky ones behind an approval
-//! prompt unless automode is on), feeds results back, and loops until
+//! prompt unless unsafe-auto is on), feeds results back, and loops until
 //! the model signals end-of-turn.
 
 use crate::context;
 use crate::persist::{self, Persist};
-use crate::provider::{
-    self, Content, LlmProvider, Message, Role, StopReason, TextSink, ToolCall, ToolSpec,
-};
+use crate::provider::{self, Content, LlmProvider, Message, Role, StopReason, TextSink, ToolCall};
 use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{MessageRole, SessionEvent, SessionStartParams, SessionState, ToolRisk};
@@ -17,6 +15,58 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::oneshot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoReviewResult {
+    Approve,
+    Deny,
+    AskUser,
+}
+
+struct NullSink;
+impl TextSink for NullSink {
+    fn delta(&mut self, _text: &str) {}
+}
+
+pub async fn auto_review_for_adapter(
+    provider: &dyn LlmProvider,
+    model: &str,
+    tool: &str,
+    args_summary: &str,
+) -> AutoReviewResult {
+    let system = r#"You are an approval reviewer for a local coding agent.
+Decide whether a pending risky tool call is reasonable and bounded.
+Return ONLY compact JSON: {"decision":"approve"|"deny"|"ask_user","reason":"..."}.
+Approve routine, expected development actions in the current task. Deny clearly destructive, secret-exfiltrating, unrelated, or user-hostile actions. Ask the user when context is insufficient or the action is broad/ambiguous."#;
+    let user = format!("Tool: {tool}\nArgs summary:\n{args_summary}");
+    let messages = [Message {
+        role: Role::User,
+        content: Content::Text { text: user },
+    }];
+    let mut sink = NullSink;
+    let Ok(turn) = provider
+        .complete(model, system, &messages, &[], &mut sink)
+        .await
+    else {
+        return AutoReviewResult::AskUser;
+    };
+    let Some(text) = turn.text else {
+        return AutoReviewResult::AskUser;
+    };
+    let trimmed = text.trim();
+    let parsed: serde_json::Value = serde_json::from_str(trimmed)
+        .or_else(|_| {
+            let start = trimmed.find('{').unwrap_or(0);
+            let end = trimmed.rfind('}').map(|i| i + 1).unwrap_or(trimmed.len());
+            serde_json::from_str(&trimmed[start..end])
+        })
+        .unwrap_or(serde_json::Value::Null);
+    match parsed.get("decision").and_then(|v| v.as_str()) {
+        Some("approve") => AutoReviewResult::Approve,
+        Some("deny") => AutoReviewResult::Deny,
+        _ => AutoReviewResult::AskUser,
+    }
+}
 
 /// Sink that pushes each assistant delta as a `SessionEvent::Message`.
 /// Used by the headless agent loop.
@@ -48,7 +98,7 @@ When the user says "subagent", default to `agentd_subagent_create`: a child agen
 
 Prefer the most specific tool: `read_file` over `shell cat`, `list_dir` over `shell ls`, etc. The shell tool runs `bash -lc` with a default 30s timeout.
 
-You are running with the user's permissions. The user must approve every Risky tool call unless they've enabled `automode`. When a tool is denied, do not retry it without revising the approach — explain what alternative you'd take instead, or ask the user a clarifying question.
+You are running with the user's permissions. The user must approve every Risky tool call unless the session is in `unsafe-auto`. When a tool is denied, do not retry it without revising the approach — explain what alternative you'd take instead, or ask the user a clarifying question.
 
 LONG-RUNNING TOOLS: a tool result of exactly "(running in background; will report when complete)" means the tool exceeded the foreground time budget and is still running. Don't retry it. Don't poll. Continue with whatever you can do without that result. You'll receive an `OBSERVATION:` message with the real output later — react to that observation when it arrives, ideally with a short summary or a `noted` if no action is needed.
 
@@ -76,7 +126,7 @@ EVENT OBSERVATIONS: messages starting with "OBSERVATION:" come from the agentd e
 
 Dynamic session UI: when a session/task benefits from compact status/actions, call `agentd_context` to discover `session_widgets.dir`, `session_widgets.action_link_scheme`, and supported `widget_markdown_extensions`, then create/update concise `.md` widget files there with normal file tools. Widget creation, updates, and cleanup are mostly automated system behavior: use best judgment and ask first only when normal safety/tool policy absolutely requires approval or the widget would make a significant product/user-facing decision. Use checklists, supported widget_markdown_extensions from `agentd_context`, and action links such as `[Open checks](agentd:action/open-checks)` or `[Open checks](agentd:action/open-checks?key=o)` when a keyboard shortcut is desired. Treat `OBSERVATION: ui.action ...` as user intent; actions still go through normal tools and approvals.
 
-Be concise. The minibuffer panel is small; aim for one to three short lines per turn, longer only when the user explicitly asks for detail. Risky tool calls (delete / kill / send) still gate through approval unless the user has enabled automode."#;
+Be concise. The minibuffer panel is small; aim for one to three short lines per turn, longer only when the user explicitly asks for detail. Risky tool calls (delete / kill / send) still gate through approval unless the session is in unsafe-auto."#;
 
 /// Pick the right system prompt for this session's kind. The daemon
 /// sets `AGENTD_SESSION_KIND` at spawn time; default is `user` so old
@@ -292,8 +342,12 @@ pub async fn run(
         )
         .await;
 
-    // Per-session automode state. Defaults to env override if set.
-    let mut automode = std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1");
+    // Per-session approval mode. Defaults to unsafe-auto when the legacy env override is set.
+    let mut approval_mode = if std::env::var("AGENTD_ZARVIS_AUTOMODE").as_deref() == Ok("1") {
+        agentd_protocol::ApprovalMode::UnsafeAuto
+    } else {
+        agentd_protocol::ApprovalMode::Manual
+    };
 
     let tool_ctx = ToolCtx {
         cwd: cwd.clone(),
@@ -345,8 +399,8 @@ pub async fn run(
                         return Ok(());
                     }
                     Some(AdapterInboxMsg::Interrupt) => continue,
-                    Some(AdapterInboxMsg::SetAutoMode(on)) => {
-                        automode = on;
+                    Some(AdapterInboxMsg::SetApprovalMode(mode)) => {
+                        approval_mode = mode;
                         continue;
                     }
                     Some(_) => continue,
@@ -664,7 +718,9 @@ pub async fn run(
                         &tool_ctx,
                         &emit,
                         &mut inbox,
-                        &mut automode,
+                        &mut approval_mode,
+                        provider.as_ref(),
+                        &model,
                         &hooks,
                         &base_hook_payload,
                     )
@@ -746,7 +802,9 @@ async fn run_one_tool(
     tool_ctx: &ToolCtx,
     emit: &EventEmitter,
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
-    automode: &mut bool,
+    approval_mode: &mut agentd_protocol::ApprovalMode,
+    provider: &dyn LlmProvider,
+    model: &str,
     hooks: &crate::hooks::Hooks,
     base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
@@ -813,11 +871,30 @@ async fn run_one_tool(
         )
         .await;
 
-    let needs_approval = !*automode
-        && matches!(
-            crate::tools::effective_risk(tool, &call.input, &tool_ctx.cwd),
-            ToolRisk::Risky
-        );
+    let is_risky = matches!(
+        crate::tools::effective_risk(tool, &call.input, &tool_ctx.cwd),
+        ToolRisk::Risky
+    );
+    if is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::AutoReview) {
+        match auto_review_for_adapter(provider, model, call.name.as_str(), &args_summary).await {
+            AutoReviewResult::Approve => {}
+            AutoReviewResult::Deny => {
+                let msg = "auto-review denied this action".to_string();
+                emit.emit(SessionEvent::ToolResult {
+                    tool: call.id.clone(),
+                    ok: false,
+                    output: msg.clone(),
+                });
+                return Ok(ToolOutcome {
+                    ok: false,
+                    output: msg,
+                });
+            }
+            AutoReviewResult::AskUser => {}
+        }
+    }
+    let needs_approval =
+        is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::Manual);
     if needs_approval {
         emit.emit(SessionEvent::ToolApprovalRequest {
             call_id: call.id.clone(),
@@ -848,18 +925,43 @@ async fn run_one_tool(
                 None => return Err("stop".into()),
                 Some(AdapterInboxMsg::Stop) => return Err("stop".into()),
                 Some(AdapterInboxMsg::Interrupt) => return Err("interrupt".into()),
-                Some(AdapterInboxMsg::SetAutoMode(on)) => {
-                    *automode = on;
-                    // If the user just turned automode on, treat it as approval.
-                    if on {
+                Some(AdapterInboxMsg::SetApprovalMode(mode)) => {
+                    *approval_mode = mode;
+                    if matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto) {
                         break;
                     }
                 }
                 Some(AdapterInboxMsg::ToolDecision { call_id, decision }) if call_id == call.id => {
                     match decision.as_str() {
                         "approve" => break,
-                        "automode" => {
-                            *automode = true;
+                        "auto_review" => {
+                            *approval_mode = agentd_protocol::ApprovalMode::AutoReview;
+                            match auto_review_for_adapter(
+                                provider,
+                                model,
+                                call.name.as_str(),
+                                &args_summary,
+                            )
+                            .await
+                            {
+                                AutoReviewResult::Approve => break,
+                                AutoReviewResult::Deny => {
+                                    let msg = "auto-review denied this action".to_string();
+                                    emit.emit(SessionEvent::ToolResult {
+                                        tool: call.id.clone(),
+                                        ok: false,
+                                        output: msg.clone(),
+                                    });
+                                    return Ok(ToolOutcome {
+                                        ok: false,
+                                        output: msg,
+                                    });
+                                }
+                                AutoReviewResult::AskUser => continue,
+                            }
+                        }
+                        "unsafe_auto" => {
+                            *approval_mode = agentd_protocol::ApprovalMode::UnsafeAuto;
                             break;
                         }
                         _ => {

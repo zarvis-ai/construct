@@ -898,7 +898,7 @@ mod tests {
             group_id: None,
             parent_session_id: Some(parent.to_string()),
             last_pty_at_ms: None,
-            automode: false,
+            approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: SessionKind::Subagent,
         }
     }
