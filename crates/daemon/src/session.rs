@@ -2433,6 +2433,15 @@ impl SessionManager {
     }
 
     pub async fn pty_replay(&self, id: &str) -> Result<PtyReplayResult> {
+        self.pty_replay_range(id, None, None).await
+    }
+
+    pub async fn pty_replay_range(
+        &self,
+        id: &str,
+        max_bytes: Option<usize>,
+        before_offset: Option<u64>,
+    ) -> Result<PtyReplayResult> {
         use base64::Engine;
         let entry = self
             .get_entry(id)
@@ -2440,18 +2449,21 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
         let size = entry.pty.lock().await.size;
         // Pull scrollback from the on-disk `pty.log`, not the (now-removed)
-        // in-memory ring. Bounded by `PTY_REPLAY_CAP`; the TUI feeds the
-        // bytes through a vt100 parser whose `SCROLLBACK_MAX` row budget is
-        // the real ceiling on what survives in scrollback.
-        let bytes = self
+        // in-memory ring. Requests are capped by `PTY_REPLAY_CAP`; clients can
+        // ask for older adjacent ranges and replay their local chunks in order.
+        let requested = max_bytes.unwrap_or(PTY_REPLAY_CAP).min(PTY_REPLAY_CAP);
+        let (bytes, start_offset, end_offset, total_bytes) = self
             .storage
-            .read_pty_tail(id, PTY_REPLAY_CAP)
+            .read_pty_range_before(id, requested, before_offset)
             .unwrap_or_else(|e| {
-                tracing::warn!(session = %id, error = ?e, "pty_log tail read failed");
-                Vec::new()
+                tracing::warn!(session = %id, error = ?e, "pty_log range read failed");
+                (Vec::new(), 0, 0, 0)
             });
         Ok(PtyReplayResult {
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            start_offset,
+            end_offset,
+            total_bytes,
             size,
         })
     }
@@ -4132,10 +4144,19 @@ mod tests {
         let id = "ssize";
         let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
-        entry.pty.lock().await.size = Some(PtySize { cols: 132, rows: 50 });
+        entry.pty.lock().await.size = Some(PtySize {
+            cols: 132,
+            rows: 50,
+        });
 
         let result = mgr.pty_replay(id).await.expect("pty_replay");
-        assert_eq!(result.size, Some(PtySize { cols: 132, rows: 50 }));
+        assert_eq!(
+            result.size,
+            Some(PtySize {
+                cols: 132,
+                rows: 50
+            })
+        );
     }
 
     #[tokio::test]
@@ -4174,7 +4195,11 @@ mod tests {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&result.data)
             .expect("base64 decode");
-        assert_eq!(decoded.len(), PTY_REPLAY_CAP, "replay must cap at PTY_REPLAY_CAP");
+        assert_eq!(
+            decoded.len(),
+            PTY_REPLAY_CAP,
+            "replay must cap at PTY_REPLAY_CAP"
+        );
         assert_eq!(
             decoded,
             bytes[extra..],

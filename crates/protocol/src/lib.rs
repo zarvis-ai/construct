@@ -980,12 +980,33 @@ pub struct LoopRemoveParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PtyReplayResult {
-    /// Base64-encoded raw bytes representing the recent PTY history (best
-    /// effort — the daemon keeps a bounded ring buffer).
+    /// Base64-encoded raw bytes representing the requested PTY log range.
     pub data: String,
+    /// Absolute byte offset where `data` starts in `pty.log`.
+    #[serde(default)]
+    pub start_offset: u64,
+    /// Absolute byte offset where `data` ends in `pty.log`.
+    #[serde(default)]
+    pub end_offset: u64,
+    /// Current total byte length of `pty.log`.
+    #[serde(default)]
+    pub total_bytes: u64,
     /// Most recent known PTY size for the session, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<PtySize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PtyReplayParams {
+    pub session_id: String,
+    /// Return up to this many bytes before `before_offset`. When omitted,
+    /// defaults to the historical replay cap from the current log tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// Exclusive end offset for the requested range. When omitted, uses the
+    /// current end of `pty.log`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_offset: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

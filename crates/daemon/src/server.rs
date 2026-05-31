@@ -9,7 +9,7 @@ use agentd_protocol::{
     GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, Notification, PingResult, ProjectCreateParams, ProjectCreateResult,
     ProjectDeleteParams, ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
-    ProjectSetCollapsedParams, ProjectStateNotificationPayload, Request, Response,
+    ProjectSetCollapsedParams, ProjectStateNotificationPayload, PtyReplayParams, Request, Response,
     SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetAutomodeParams, SessionSetGroupParams,
     SessionSetPinnedParams, SessionSetProjectParams, SessionSetTitleParams,
@@ -1120,8 +1120,11 @@ async fn dispatch(
             }
         }
         m if m == ipc_method::SESSION_PTY_REPLAY => {
-            let p = params!(SessionIdParams);
-            match manager.pty_replay(&p.session_id).await {
+            let p = params!(PtyReplayParams);
+            match manager
+                .pty_replay_range(&p.session_id, p.max_bytes, p.before_offset)
+                .await
+            {
                 Ok(r) => ok!(&r),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }

@@ -1784,6 +1784,9 @@ const SESSION_LIST_MIN_WIDTH = 180;
 const SESSION_LIST_MAX_WIDTH = 520;
 const WIDGET_VISIBILITY_KEY_PREFIX = "agentd.web.widgets.visible.";
 const WIDGET_AUTOHIDE_MS = 15000;
+const PTY_REPLAY_INITIAL_BYTES = 1024 * 1024;
+const PTY_REPLAY_MAX_BYTES = 8 * 1024 * 1024;
+const PTY_REPLAY_TOP_THRESHOLD_ROWS = 20;
 let widgetAutohideTimer = null;
 
 const miniMatrixActivity = {
@@ -2785,18 +2788,17 @@ async function enterTerminalMode(id, options = {}) {
         replayTranscriptToTerm((t && t.events) || []);
         renderEditorStateForSession(id);
       } else {
-        const r = await rpc("session.pty_replay", { session_id: id });
+        const r = await rpc("session.pty_replay", {
+          session_id: id,
+          max_bytes: PTY_REPLAY_INITIAL_BYTES,
+        });
         if (r && r.size) {
           // Daemon's last-known size wins as the initial geometry; we
           // refit below in case the phone screen is narrower.
           state.term.resize(r.size.cols, r.size.rows);
         }
-        // Hand xterm the raw bytes (not a decoded string) so its
-        // built-in streaming UTF-8 decoder owns boundary handling
-        // across this and any subsequent `term.write` call. Passing a
-        // string forces a one-shot per-call decode and corrupts
-        // multi-byte glyphs that straddle PTY frame boundaries.
-        if (r && r.data) state.term.write(decodeBase64ToBytes(r.data));
+        rememberPtyReplayChunk(handle, r);
+        await replayPtyChunks(handle);
       }
       handle.loaded = true;
     } catch (e) {
@@ -3023,6 +3025,12 @@ function createTerminalHandle(id) {
     loaded: false,
     ptyBuffer: [],
     ptyBuffering: false,
+    ptyReplayChunks: [],
+    ptyReplayStartOffset: 0,
+    ptyReplayEndOffset: 0,
+    ptyReplayTotalBytes: 0,
+    ptyReplayNextBytes: PTY_REPLAY_INITIAL_BYTES,
+    ptyReplayLoadingOlder: false,
     lastReportedSize: { cols: 0, rows: 0 },
   };
   state.terminalById.set(id, handle);
@@ -3049,8 +3057,13 @@ function createTerminalHandle(id) {
   host.addEventListener("wheel", (ev) => {
     if (state.currentId !== id) return;
     cancelResizeFollowBottom();
+    maybeLoadOlderPtyReplay(id);
     ev.stopPropagation();
   }, { passive: true });
+
+  term.onScroll(() => {
+    if (state.currentId === id) maybeLoadOlderPtyReplay(id);
+  });
 
   installTerminalScrollContainment(host, term, id);
 
@@ -3076,6 +3089,92 @@ function activateTerminalHandle(handle) {
 
 function initTerminalForSession(id) {
   return terminalHandleForSession(id) || createTerminalHandle(id);
+}
+
+function rememberPtyReplayChunk(handle, result) {
+  if (!handle || !result || !result.data) return;
+  const bytes = decodeBase64ToBytes(result.data);
+  const start = Number(result.start_offset || 0);
+  const end = Number(result.end_offset || (start + bytes.length));
+  if (!bytes.length && start === end) return;
+  if (handle.ptyReplayChunks.some((c) => c.start === start && c.end === end)) return;
+  handle.ptyReplayChunks.push({ start, end, bytes });
+  handle.ptyReplayChunks.sort((a, b) => a.start - b.start);
+  handle.ptyReplayStartOffset = handle.ptyReplayChunks[0].start;
+  handle.ptyReplayEndOffset = handle.ptyReplayChunks[handle.ptyReplayChunks.length - 1].end;
+  handle.ptyReplayTotalBytes = Number(result.total_bytes || handle.ptyReplayEndOffset || 0);
+}
+
+function writeTermBytes(term, bytes) {
+  if (!term || !bytes || !bytes.length) return Promise.resolve();
+  return new Promise((resolve) => term.write(bytes, resolve));
+}
+
+async function replayPtyChunks(handle) {
+  if (!handle || !handle.term) return;
+  handle.term.reset();
+  for (const chunk of handle.ptyReplayChunks) {
+    await writeTermBytes(handle.term, chunk.bytes);
+  }
+}
+
+function ptyReplayProgressText(handle) {
+  const loaded = Math.max(0, (handle.ptyReplayEndOffset || 0) - (handle.ptyReplayStartOffset || 0));
+  const total = handle.ptyReplayTotalBytes || loaded;
+  return `Loading older terminal history… ${(loaded / (1024 * 1024)).toFixed(1)} / ${(total / (1024 * 1024)).toFixed(1)} MiB`;
+}
+
+function setTerminalLoadingMessage(text) {
+  terminalLoadingEl.textContent = text;
+  terminalLoadingEl.classList.remove("gone");
+}
+
+function hideTerminalLoading() {
+  terminalLoadingEl.classList.add("gone");
+}
+
+function shouldLoadOlderPtyReplay(handle) {
+  if (!handle || !handle.loaded || handle.ptyReplayLoadingOlder) return false;
+  if (handle.ptyReplayStartOffset <= 0) return false;
+  const active = handle.term && handle.term.buffer && handle.term.buffer.active;
+  if (!active) return false;
+  return active.viewportY <= PTY_REPLAY_TOP_THRESHOLD_ROWS;
+}
+
+async function maybeLoadOlderPtyReplay(id) {
+  const handle = terminalHandleForSession(id);
+  if (!shouldLoadOlderPtyReplay(handle)) return;
+  handle.ptyReplayLoadingOlder = true;
+  const priorViewportY = handle.term.buffer.active.viewportY;
+  const priorBaseY = handle.term.buffer.active.baseY;
+  const maxBytes = Math.min(handle.ptyReplayNextBytes, PTY_REPLAY_MAX_BYTES);
+  setTerminalLoadingMessage(ptyReplayProgressText(handle));
+  state.ptyBuffer = [];
+  state.ptyBuffering = true;
+  try {
+    const r = await rpc("session.pty_replay", {
+      session_id: id,
+      before_offset: handle.ptyReplayStartOffset,
+      max_bytes: maxBytes,
+    });
+    if (state.currentId !== id) return;
+    rememberPtyReplayChunk(handle, r);
+    handle.ptyReplayNextBytes = Math.min(maxBytes * 2, PTY_REPLAY_MAX_BYTES);
+    setTerminalLoadingMessage(ptyReplayProgressText(handle));
+    await replayPtyChunks(handle);
+    for (const chunk of state.ptyBuffer) await writeTermBytes(handle.term, chunk);
+    const newRowsAbove = Math.max(0, handle.term.buffer.active.baseY - priorBaseY);
+    handle.term.scrollToLine(Math.max(0, priorViewportY + newRowsAbove));
+  } catch (e) {
+    console.warn("pty lazy replay failed:", e);
+  } finally {
+    state.ptyBuffer = [];
+    state.ptyBuffering = false;
+    handle.ptyBuffer = state.ptyBuffer;
+    handle.ptyBuffering = state.ptyBuffering;
+    handle.ptyReplayLoadingOlder = false;
+    hideTerminalLoading();
+  }
 }
 
 if (window.visualViewport) {

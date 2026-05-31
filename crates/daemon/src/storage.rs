@@ -512,22 +512,33 @@ impl Storage {
     /// a TUI's vt100 parser on attach so scrollback covers the on-disk log,
     /// not just a small in-memory window.
     pub fn read_pty_tail(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let (bytes, _, _, _) = self.read_pty_range_before(id, max_bytes, None)?;
+        Ok(bytes)
+    }
+
+    /// Read up to `max_bytes` ending before `before_offset` from `pty.log`.
+    /// Offsets are absolute byte offsets in the file; `before_offset: None`
+    /// means the current end. Returns `(bytes, start, end, total_len)`.
+    pub fn read_pty_range_before(
+        &self,
+        id: &str,
+        max_bytes: usize,
+        before_offset: Option<u64>,
+    ) -> Result<(Vec<u8>, u64, u64, u64)> {
         let path = self.pty_log_path(id);
-        if !path.exists() {
-            return Ok(Vec::new());
+        if !path.exists() || max_bytes == 0 {
+            return Ok((Vec::new(), 0, 0, 0));
         }
         let mut f =
             std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let len = f.metadata()?.len() as usize;
-        let offset = len.saturating_sub(max_bytes);
-        if offset > 0 {
-            use std::io::Seek;
-            f.seek(std::io::SeekFrom::Start(offset as u64))?;
-        }
-        use std::io::Read;
-        let mut buf = Vec::with_capacity(len - offset);
-        f.read_to_end(&mut buf)?;
-        Ok(buf)
+        let total = f.metadata()?.len();
+        let end = before_offset.unwrap_or(total).min(total);
+        let start = end.saturating_sub(max_bytes as u64);
+        use std::io::{Read, Seek};
+        f.seek(std::io::SeekFrom::Start(start))?;
+        let mut buf = vec![0; (end - start) as usize];
+        f.read_exact(&mut buf)?;
+        Ok((buf, start, end, total))
     }
 
     /// Remove the entire session directory (meta + transcript + worktree).
@@ -748,6 +759,41 @@ mod transcript_tail_tests {
         let tail = storage.read_transcript_tail("s1", 0).unwrap();
 
         assert!(tail.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pty_range_tests {
+    use super::*;
+
+    #[test]
+    fn pty_range_before_returns_offsets_and_requested_slice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        storage
+            .append_pty_bytes("s1", b"abcdefghijklmnopqrstuvwxyz")
+            .unwrap();
+
+        let (bytes, start, end, total) = storage.read_pty_range_before("s1", 5, Some(20)).unwrap();
+
+        assert_eq!(bytes, b"pqrst");
+        assert_eq!(start, 15);
+        assert_eq!(end, 20);
+        assert_eq!(total, 26);
+    }
+
+    #[test]
+    fn pty_range_before_clamps_to_file_start_and_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        storage.append_pty_bytes("s1", b"abcdef").unwrap();
+
+        let (bytes, start, end, total) = storage.read_pty_range_before("s1", 99, Some(99)).unwrap();
+
+        assert_eq!(bytes, b"abcdef");
+        assert_eq!(start, 0);
+        assert_eq!(end, 6);
+        assert_eq!(total, 6);
     }
 }
 
