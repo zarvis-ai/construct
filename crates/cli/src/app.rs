@@ -2799,18 +2799,22 @@ impl App {
     }
 
     fn delete_active_window(&mut self) {
+        fn is_target_leaf(node: &MainWindowTree, target: u64) -> bool {
+            matches!(node, MainWindowTree::Leaf { id, .. } if *id == target)
+        }
+
         fn remove(node: &mut MainWindowTree, target: u64) -> bool {
             match node {
-                MainWindowTree::Leaf { id, .. } => *id == target,
+                MainWindowTree::Leaf { .. } => false,
                 MainWindowTree::Split { first, second, .. } => {
-                    if remove(first, target) {
+                    if is_target_leaf(first, target) {
                         *node = (**second).clone();
                         true
-                    } else if remove(second, target) {
+                    } else if is_target_leaf(second, target) {
                         *node = (**first).clone();
                         true
                     } else {
-                        false
+                        remove(first, target) || remove(second, target)
                     }
                 }
             }
@@ -7172,6 +7176,47 @@ mod tests {
             .insert("s1".into(), crate::pty_render::ItemHistory::new());
 
         assert_eq!(app.main_window_sessions_needing_hydration(), vec!["s2"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_active_window_preserves_remaining_nested_splits() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Below,
+                ratio_percent: 40,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 2,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 3,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+        };
+        app.active_window_id = 3;
+
+        app.delete_active_window();
+
+        match &app.main_windows {
+            MainWindowTree::Split { first, second, .. } => {
+                assert!(matches!(first.as_ref(), MainWindowTree::Leaf { id: 1, .. }));
+                assert!(matches!(
+                    second.as_ref(),
+                    MainWindowTree::Leaf { id: 2, .. }
+                ));
+            }
+            MainWindowTree::Leaf { .. } => panic!("expected two remaining split panes"),
+        }
+        assert_eq!(app.leaf_window_ids(), vec![1, 2]);
         server.abort();
     }
 
