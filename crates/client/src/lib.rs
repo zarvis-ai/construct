@@ -775,6 +775,7 @@ impl Client {
                 session_id: id.to_string(),
                 from,
                 limit,
+                tail: None,
             },
         )
         .await

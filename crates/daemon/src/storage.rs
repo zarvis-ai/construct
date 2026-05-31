@@ -403,6 +403,57 @@ impl Storage {
         Ok(TranscriptResult { events, total })
     }
 
+    /// Read the most-recent `n` events of the session's transcript without
+    /// scanning the whole file. Seeks backward in 64 KiB chunks until we've
+    /// gathered at least `n + 1` newlines (or hit the start), then parses
+    /// only those lines as JSON. For a multi-GB transcript the cost is
+    /// O(`n` × average line size), not O(file size), which is what makes
+    /// the webui's tail-pagination fast enough to render the live tail
+    /// before the user notices a wait.
+    pub fn read_transcript_tail(&self, id: &str, n: usize) -> Result<Vec<TimestampedEvent>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let path = self.transcript_path(id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&path)?;
+        let size = f.metadata()?.len();
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        const CHUNK: u64 = 64 * 1024;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offset = size;
+        let mut newlines = 0usize;
+        // Read at least n + 1 newlines so the first (partial) line we slice
+        // off doesn't accidentally chop a real event in half.
+        while offset > 0 && newlines <= n {
+            let to_read = CHUNK.min(offset);
+            offset -= to_read;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut chunk = vec![0u8; to_read as usize];
+            f.read_exact(&mut chunk)?;
+            newlines += chunk.iter().filter(|&&b| b == b'\n').count();
+            chunk.extend_from_slice(&buf);
+            buf = chunk;
+        }
+        // Take the last n non-empty lines.
+        let text = String::from_utf8_lossy(&buf);
+        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        let start = lines.len().saturating_sub(n);
+        let mut events: Vec<TimestampedEvent> = Vec::with_capacity(lines.len() - start);
+        for line in &lines[start..] {
+            match serde_json::from_str(line) {
+                Ok(e) => events.push(e),
+                Err(e) => tracing::warn!(%id, error = %e, "skip bad transcript line"),
+            }
+        }
+        Ok(events)
+    }
+
     pub fn truncate_transcript(&self, id: &str) -> Result<()> {
         let path = self.transcript_path(id);
         if !path.exists() {
@@ -602,6 +653,101 @@ mod widget_tests {
         assert_eq!(widgets[0].placement, UiPlacement::Inline);
         assert!(widgets[0].markdown.starts_with("# Confirm"));
         assert!(!widgets[0].markdown.contains("placement:"));
+    }
+}
+
+#[cfg(test)]
+mod transcript_tail_tests {
+    use super::*;
+    use agentd_protocol::SessionEvent;
+    use chrono::Utc;
+
+    fn make_event(seq: u64) -> TimestampedEvent {
+        TimestampedEvent {
+            seq,
+            at: Utc::now(),
+            event: SessionEvent::Message {
+                role: agentd_protocol::MessageRole::Assistant,
+                text: format!("msg #{seq}"),
+            },
+        }
+    }
+
+    #[test]
+    fn tail_returns_last_n_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        for seq in 1..=1000 {
+            storage.append_event("s1", &make_event(seq)).unwrap();
+        }
+
+        let tail = storage.read_transcript_tail("s1", 5).unwrap();
+
+        assert_eq!(tail.len(), 5);
+        assert_eq!(tail.first().unwrap().seq, 996);
+        assert_eq!(tail.last().unwrap().seq, 1000);
+    }
+
+    #[test]
+    fn tail_handles_partial_first_chunk_without_chopping_an_event() {
+        // The seek-back read can land mid-line; the parser must drop that
+        // partial head, not parse it as garbage. Use long events so a
+        // 64 KiB chunk easily spans a line boundary that isn't on a chunk
+        // boundary.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let big_text = "x".repeat(2048);
+        for seq in 1..=100 {
+            let ev = TimestampedEvent {
+                seq,
+                at: Utc::now(),
+                event: SessionEvent::Message {
+                    role: agentd_protocol::MessageRole::Assistant,
+                    text: format!("{big_text} #{seq}"),
+                },
+            };
+            storage.append_event("s1", &ev).unwrap();
+        }
+
+        let tail = storage.read_transcript_tail("s1", 3).unwrap();
+
+        assert_eq!(tail.len(), 3);
+        assert_eq!(tail.first().unwrap().seq, 98);
+        assert_eq!(tail.last().unwrap().seq, 100);
+    }
+
+    #[test]
+    fn tail_returns_all_events_when_n_exceeds_total() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        for seq in 1..=7 {
+            storage.append_event("s1", &make_event(seq)).unwrap();
+        }
+
+        let tail = storage.read_transcript_tail("s1", 100).unwrap();
+
+        assert_eq!(tail.len(), 7);
+    }
+
+    #[test]
+    fn tail_on_missing_transcript_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+
+        let tail = storage.read_transcript_tail("never-existed", 10).unwrap();
+
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn tail_with_zero_n_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        storage.append_event("s1", &make_event(1)).unwrap();
+
+        let tail = storage.read_transcript_tail("s1", 0).unwrap();
+
+        assert!(tail.is_empty());
     }
 }
 
