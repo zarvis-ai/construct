@@ -4273,7 +4273,9 @@ function renderEvent(event, at) {
   }
   switch (event.type) {
     case "message":
-      appendMessage(event.role || "assistant", event.text || "");
+      if (shouldRenderChatMessage(event.role || "assistant", event.text || "")) {
+        appendMessage(event.role || "assistant", event.text || "");
+      }
       break;
     case "tool_use":
       appendToolUse(event.tool, event.args);
@@ -4398,6 +4400,23 @@ function appendMessage(role, text) {
     <div class="bubble"></div>`;
   row.querySelector(".bubble").textContent = text;
   target.appendChild(row);
+}
+
+function currentSession() {
+  return state.sessions.find((s) => s.id === state.currentId) || null;
+}
+
+function shouldRenderChatMessage(role, text) {
+  const s = currentSession();
+  if (!s || s.harness !== "codex") return true;
+  const trimmed = String(text || "").trimStart();
+  if (role === "assistant" && trimmed.startsWith("<permissions instructions>")) return false;
+  if (
+    role === "user" &&
+    trimmed.startsWith("# AGENTS.md instructions for ") &&
+    trimmed.includes("\n<INSTRUCTIONS>")
+  ) return false;
+  return true;
 }
 
 // --- terminal-mode tool-call synthesis (issue #134) ----------------------

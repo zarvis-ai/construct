@@ -395,7 +395,11 @@ struct PtyInputCapture {
     buf: String,
     /// 0 = not in an escape; 1 = saw ESC; 2 = saw ESC[ (CSI); 3 = saw ESC O (SS3).
     esc: u8,
-    triggered: bool,
+    last_was_cr: bool,
+}
+
+fn should_record_pty_user_message(harness: &str) -> bool {
+    matches!(harness, "claude" | "antigravity")
 }
 
 impl SessionEntry {
@@ -2258,10 +2262,27 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        // Capture the user's first typed line for auto-title (shell /
-        // claude / codex interactive sessions don't echo a Message event
-        // back to the daemon; this is the only place we see their input).
-        self.feed_pty_input_capture(&entry, &bytes).await;
+        // Capture submitted PTY lines before forwarding them. Some interactive
+        // harnesses do not echo user text as structured `Message` events, so
+        // chat-mode transcript history otherwise loses those turns.
+        let input_lines = self.capture_pty_input_lines(&entry, &bytes).await;
+        let harness = entry.summary.read().await.harness.clone();
+        for line in input_lines {
+            if should_record_pty_user_message(&harness) {
+                self.handle_event(
+                    &entry,
+                    SessionEvent::Message {
+                        role: MessageRole::User,
+                        text: line,
+                    },
+                )
+                .await;
+            } else if !entry.title_gen_attempted.load(Ordering::SeqCst)
+                && line.chars().count() >= 2
+            {
+                self.maybe_spawn_auto_title(entry.clone(), line);
+            }
+        }
         let adapter = entry
             .adapter
             .lock()
@@ -2277,39 +2298,43 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Feed PTY-input bytes through a minimal terminal-input parser
-    /// (printable ASCII + backspace + CR/LF; CSI/SS3 sequences skipped).
-    /// On the first CR/LF, hand the accumulated line to the auto-title
-    /// path. After the first trigger this becomes a no-op for the
-    /// session's lifetime.
-    async fn feed_pty_input_capture(&self, entry: &Arc<SessionEntry>, bytes: &[u8]) {
-        // Cheap early-outs before taking the per-session lock.
-        if entry.title_gen_attempted.load(Ordering::SeqCst) {
-            return;
-        }
+    /// Feed PTY-input bytes through a minimal terminal-input parser (printable
+    /// ASCII + backspace + CR/LF; CSI/SS3 sequences skipped) and return every
+    /// submitted non-empty line. The parser is intentionally small: it is for
+    /// transcript/user-title capture, not full terminal editing semantics.
+    async fn capture_pty_input_lines(
+        &self,
+        entry: &Arc<SessionEntry>,
+        bytes: &[u8],
+    ) -> Vec<String> {
         let mut cap = entry.pty_input_capture.lock().await;
-        if cap.triggered {
-            return;
-        }
+        let mut lines = Vec::new();
         for &b in bytes {
             match cap.esc {
                 0 => match b {
+                    b'\n' if cap.last_was_cr => {
+                        cap.last_was_cr = false;
+                    }
                     b'\r' | b'\n' => {
                         let s = cap.buf.trim().to_string();
-                        cap.triggered = true;
+                        cap.last_was_cr = b == b'\r';
                         cap.buf.clear();
-                        drop(cap);
                         if s.chars().count() >= 2 {
-                            self.maybe_spawn_auto_title(entry.clone(), s);
+                            lines.push(s);
                         }
-                        return;
                     }
                     0x1b => cap.esc = 1,
                     0x08 | 0x7f => {
+                        cap.last_was_cr = false;
                         cap.buf.pop();
                     }
-                    _ if (0x20..0x7f).contains(&b) => cap.buf.push(b as char),
-                    _ => {}
+                    _ if (0x20..0x7f).contains(&b) => {
+                        cap.last_was_cr = false;
+                        cap.buf.push(b as char);
+                    }
+                    _ => {
+                        cap.last_was_cr = false;
+                    }
                 },
                 1 => match b {
                     b'[' => cap.esc = 2,
@@ -2329,6 +2354,7 @@ impl SessionManager {
                 _ => cap.esc = 0,
             }
         }
+        lines
     }
 
     /// Record that a given client kind just acted on a session's
