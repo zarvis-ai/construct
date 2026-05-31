@@ -1110,6 +1110,49 @@ async fn web_client_loads_and_websocket_connects() {
         "Insert should still send PTY input: {fit_scroll:?}"
     );
 
+    let codex_submit_delay: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const oldCurrent = state.currentId;
+              const oldSessions = state.sessions;
+              const oldRpc = rpc;
+              const oldSleep = sleep;
+              const input = document.getElementById('input');
+              const calls = [];
+              rpc = async (method, params) => {
+                calls.push({ method, data: atob(params.data) });
+                return null;
+              };
+              sleep = async (ms) => {
+                calls.push({ sleep: ms });
+              };
+              state.currentId = 's-codex';
+              state.sessions = [{ id: 's-codex', harness: 'codex', has_pty: true, mode: 'interactive' }];
+              input.value = 'hello codex';
+              await submitComposer({ enter: true });
+              rpc = oldRpc;
+              sleep = oldSleep;
+              state.currentId = oldCurrent;
+              state.sessions = oldSessions;
+              return calls;
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate codex submit delay")
+        .into_value::<serde_json::Value>()
+        .expect("json array");
+    assert_eq!(
+        codex_submit_delay,
+        serde_json::json!([
+            { "method": "session.pty_input", "data": "hello codex" },
+            { "sleep": 150 },
+            { "method": "session.pty_input", "data": "\r" },
+        ]),
+        "Codex composer submit should let Codex flush paste-burst detection before Enter: {codex_submit_delay:?}"
+    );
+
     // Reconnect regression: mobile keyboard show/hide can churn the browser's
     // viewport and, on some devices, the websocket. Reconnect must not hydrate
     // the selected terminal session through transcript/PTY replay, because that

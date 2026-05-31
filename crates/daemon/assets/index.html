@@ -1838,6 +1838,7 @@ const state = {
 };
 
 const LARGE_TEXT_PASTE_CHARS = 16 * 1024;
+const CODEX_COMPOSER_SUBMIT_DELAY_MS = 150;
 const WEB_PTY_ENGAGEMENT_MS = 3000;
 const WEB_PTY_RESIZE_DEBOUNCE_MS = 120;
 const COMPOSER_RESIZE_SUPPRESS_PTY_RESIZE_MS = 350;
@@ -5244,6 +5245,10 @@ async function attachClipboardBytes({ bytes, filename, mime }) {
   return result.reference || `[#file:${result.path}]`;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function insertComposerText(text) {
   const start = inputEl.selectionStart ?? inputEl.value.length;
   const end = inputEl.selectionEnd ?? start;
@@ -5267,9 +5272,17 @@ function bytesToBase64(bytes) {
   return btoa(binary);
 }
 
+function currentSession() {
+  return state.sessions.find((x) => x.id === state.currentId) || null;
+}
+
 function currentSessionHasPty() {
-  const s = state.sessions.find((x) => x.id === state.currentId);
-  return isTerminalSession(s);
+  return isTerminalSession(currentSession());
+}
+
+function currentSessionHarness() {
+  const s = currentSession();
+  return String((s && s.harness) || "").toLowerCase();
 }
 
 function restoreComposerText(text, sessionId) {
@@ -5294,10 +5307,18 @@ async function submitComposer({ enter }) {
   inputEl.value = "";
   resetInputHeightPreservingTerminalScroll();
   const pty = currentSessionHasPty();
+  const harness = currentSessionHarness();
   if (pty) {
     try {
       if (text) {
         await rpc("session.pty_input", { session_id: sid, data: encodeBase64Utf8(text) });
+        if (enter && harness === "codex") {
+          // Codex classifies rapid terminal input as paste-like and suppresses
+          // Enter for a short window so pasted newlines stay in the draft. The
+          // web composer sends the whole prompt as one PTY write, so give Codex
+          // time to flush that burst before sending the submit Enter.
+          await sleep(CODEX_COMPOSER_SUBMIT_DELAY_MS);
+        }
       }
       if (enter) {
         await rpc("session.pty_input", { session_id: sid, data: encodeBase64Utf8("\r") });
