@@ -2167,16 +2167,17 @@ function scheduleReconnect() {
 }
 
 /**
- * User-initiated refresh: close the current socket so the existing reconnect
- * machinery (close handler -> scheduleReconnect -> connect -> subscribe +
- * refreshSessions + refreshCurrentSessionAfterReconnect) re-runs end to end.
- * No `location.reload()` — that would clear xterm buffers, scroll position,
- * widgets, and ongoing PTY input on mobile, which is the wrong UX for a
- * pull-to-refresh gesture. The reconnect-delay backoff is short-circuited
- * here so the user sees an immediate "connecting…" → "connected" flash
- * rather than waiting on the current backoff window.
+ * User-initiated hot reload: close the current socket so the existing
+ * reconnect machinery (close handler -> scheduleReconnect -> connect ->
+ * subscribe + refreshSessions + refreshCurrentSessionAfterReconnect)
+ * re-runs end to end. Distinct from `location.reload()`, which would clear
+ * the xterm buffer, scroll position, widgets, and in-flight PTY input —
+ * the wrong UX for a pull-to-refresh gesture. The reconnect-delay backoff
+ * is short-circuited here so the user sees an immediate
+ * "connecting…" → "connected" flash rather than waiting on the current
+ * backoff window.
  */
-function softRefresh() {
+function hotReload() {
   state.reconnectDelay = 50;
   if (state.ws) {
     try { state.ws.close(); } catch (_) { /* already-closed sockets are fine */ }
@@ -5463,8 +5464,8 @@ function initPullToRefresh() {
       return;
     }
     if (armed) {
-      // Brief visual confirm before the soft refresh kicks in. We don't
-      // call `location.reload()` here — see `softRefresh()`. Instead we
+      // Brief visual confirm before the hot reload kicks in. We don't
+      // call `location.reload()` here — see `hotReload()`. Instead we
       // tear down the WebSocket; the close handler re-runs the same path
       // a network hiccup would, which re-fetches the session list and
       // re-hydrates the active session without losing xterm buffers,
@@ -5474,7 +5475,7 @@ function initPullToRefresh() {
       indicator.style.height = `${MAX_HEIGHT}px`;
       setLabel("↻ refreshing…");
       setTimeout(() => {
-        softRefresh();
+        hotReload();
         // Snap the indicator out of the way; the conn pill in the header
         // already shows "connecting…" → "connected" so the user gets
         // ongoing feedback after the banner disappears.
