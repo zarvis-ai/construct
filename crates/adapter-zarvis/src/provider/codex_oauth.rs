@@ -24,10 +24,13 @@
 use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -35,6 +38,19 @@ use super::{
     Content, LlmProvider, Message, ProviderTurn, ReasoningItem, Role, StopReason, TextSink,
     ToolCall, ToolSpec, Usage,
 };
+
+/// Reused Responses WebSocket stream type.
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// Outcome of a WebSocket attempt: success; a recoverable failure *before* any
+/// output streamed (safe to fall back to HTTP); or a failure *after* partial
+/// streaming (must propagate — re-running the request would double-emit).
+enum WsResult {
+    Done(ProviderTurn),
+    Fallback(anyhow::Error),
+    Error(anyhow::Error),
+}
 
 /// Base URL for the OAuth-backed Codex backend. Not the public
 /// platform `api.openai.com`.
@@ -47,6 +63,10 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 /// Required `OpenAI-Beta` header value (from openai/codex source).
 const CODEX_OPENAI_BETA: &str = "responses=experimental";
+
+/// [P0 spike] Responses WebSocket endpoint + v2 beta header (from Codex CLI).
+const CODEX_RESPONSES_WS_URL: &str = "wss://chatgpt.com/backend-api/codex/responses";
+const CODEX_WS_BETA: &str = "responses_websockets=2026-02-06";
 
 /// Optional env var that overrides the `instructions` field. When
 /// set, takes precedence over the agent's `system` prompt — useful
@@ -196,6 +216,13 @@ struct AuthState {
 pub struct CodexOauth {
     state: Arc<Mutex<AuthState>>,
     http: reqwest::Client,
+    /// [P0 spike] Reused Responses WebSocket connection (opt-in via
+    /// AGENTD_ZARVIS_CODEX_WS=1) to test whether a warm connection lifts
+    /// the prompt-cache hit-rate vs a stateless HTTP POST per request.
+    ws: Arc<Mutex<Option<WsStream>>>,
+    /// Set after a WS connect/transport failure so the session stops retrying
+    /// WS and stays on the HTTP path (mirrors codex's session-scoped fallback).
+    ws_disabled: AtomicBool,
 }
 
 impl CodexOauth {
@@ -225,6 +252,277 @@ impl CodexOauth {
         Ok(Self {
             state: Arc::new(Mutex::new(AuthState { path, auth })),
             http,
+            ws: Arc::new(Mutex::new(None)),
+            ws_disabled: AtomicBool::new(false),
+        })
+    }
+
+    /// [P0 spike] Send one request over a reused Responses WebSocket
+    /// connection. Same full body as the HTTP path (no previous_response_id /
+    /// incremental yet); the point is to measure whether a warm connection
+    /// alone lifts the prompt-cache hit-rate. Reconnects once on a stale link.
+    /// Send one request over the reused Responses WebSocket connection. The
+    /// full body is resent each turn (a warm connection already caches ~97%);
+    /// reconnects once on a stale connection and classifies failures so the
+    /// caller can fall back to HTTP only when nothing has streamed yet.
+    async fn try_ws(
+        &self,
+        mut body: Value,
+        access_token: &str,
+        account_id: &str,
+        sink: &mut dyn TextSink,
+    ) -> WsResult {
+        if let Value::Object(map) = &mut body {
+            map.insert("type".into(), json!("response.create"));
+            map.insert("stream".into(), json!(true));
+            map.entry("tool_choice").or_insert_with(|| json!("auto"));
+            map.entry("parallel_tool_calls").or_insert_with(|| json!(true));
+        }
+        let frame = body.to_string();
+
+        let mut guard = self.ws.lock().await;
+        for attempt in 0..2 {
+            if guard.is_none() {
+                match connect_codex_ws(access_token, account_id).await {
+                    Ok(c) => *guard = Some(c),
+                    // Couldn't establish a connection at all → fall back to HTTP.
+                    Err(e) => return WsResult::Fallback(e),
+                }
+            }
+            let ws = guard.as_mut().expect("ws connected above");
+            if let Err(e) = ws.send(WsMessage::Text(frame.clone().into())).await {
+                *guard = None; // stale; reconnect on the next attempt
+                if attempt == 1 {
+                    return WsResult::Fallback(anyhow!("codex-oauth ws send failed: {e}"));
+                }
+                continue;
+            }
+            let mut emitted = false;
+            match Self::read_ws_turn(ws, sink, &mut emitted).await {
+                Ok(turn) => return WsResult::Done(turn),
+                Err(e) => {
+                    *guard = None; // drop the broken connection
+                    if emitted {
+                        // Already streamed output to the user; re-running would
+                        // double-emit, so surface the error instead.
+                        return WsResult::Error(e);
+                    }
+                    if attempt == 0 {
+                        // Nothing streamed yet (e.g. the server closed a reused
+                        // or expired connection) — reconnect and retry once.
+                        continue;
+                    }
+                    return WsResult::Fallback(e);
+                }
+            }
+        }
+        WsResult::Fallback(anyhow!("codex-oauth ws: exhausted reconnect attempts"))
+    }
+
+    /// [P0 spike] Read one Responses turn off the WebSocket. Event frames carry
+    /// the same JSON as the SSE `data` payloads, keyed by `type`.
+    async fn read_ws_turn(
+        ws: &mut WsStream,
+        sink: &mut dyn TextSink,
+        emitted: &mut bool,
+    ) -> Result<ProviderTurn> {
+        let mut assistant_text = String::new();
+        let mut fn_calls: std::collections::HashMap<String, FnCallAcc> =
+            std::collections::HashMap::new();
+        let mut fn_call_order: Vec<String> = Vec::new();
+        let mut stop_reason = StopReason::EndTurn;
+        let mut usage = Usage::default();
+        let mut reasoning_items: Vec<ReasoningItem> = Vec::new();
+        let mut completed = false;
+
+        while let Some(msg) = ws.next().await {
+            let msg = msg.context("codex-oauth ws recv")?;
+            sink.progress();
+            let text = match msg {
+                WsMessage::Text(t) => t.to_string(),
+                WsMessage::Ping(p) => {
+                    let _ = ws.send(WsMessage::Pong(p)).await;
+                    continue;
+                }
+                WsMessage::Close(frame) => {
+                    return Err(anyhow!(
+                        "codex-oauth ws closed before response.completed: {frame:?}"
+                    ));
+                }
+                _ => continue,
+            };
+            let chunk: Value = match serde_json::from_str(&text) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match chunk.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                "response.output_text.delta" => {
+                    if let Some(t) = chunk.get("delta").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            *emitted = true;
+                            sink.delta(t);
+                            assistant_text.push_str(t);
+                        }
+                    }
+                }
+                "response.reasoning_summary_text.delta" => {
+                    if let Some(t) = chunk.get("delta").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            *emitted = true;
+                            sink.reasoning_delta(t);
+                        }
+                    }
+                }
+                "response.output_item.added" => {
+                    if let Some(item) = chunk.get("item") {
+                        if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                            let item_id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let call_id = item
+                                .get("call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let name = item
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if !item_id.is_empty() {
+                                fn_call_order.push(item_id.clone());
+                                fn_calls.insert(
+                                    item_id,
+                                    FnCallAcc {
+                                        call_id,
+                                        name,
+                                        args: String::new(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                "response.function_call_arguments.delta" => {
+                    let item_id = chunk.get("item_id").and_then(|v| v.as_str()).unwrap_or_default();
+                    if let Some(acc) = fn_calls.get_mut(item_id) {
+                        if let Some(d) = chunk.get("delta").and_then(|v| v.as_str()) {
+                            acc.args.push_str(d);
+                        }
+                    }
+                }
+                "response.function_call_arguments.done" => {
+                    let item_id = chunk.get("item_id").and_then(|v| v.as_str()).unwrap_or_default();
+                    if let Some(acc) = fn_calls.get_mut(item_id) {
+                        if let Some(a) = chunk.get("arguments").and_then(|v| v.as_str()) {
+                            if !a.is_empty() {
+                                acc.args = a.to_string();
+                            }
+                        }
+                    }
+                }
+                "response.output_item.done" => {
+                    if let Some(item) = chunk.get("item") {
+                        if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if !id.is_empty() {
+                                let encrypted_content = item
+                                    .get("encrypted_content")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let summary = item
+                                    .get("summary")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|s| s.get("text").and_then(|t| t.as_str()))
+                                            .map(|t| t.to_string())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                reasoning_items.push(ReasoningItem {
+                                    id,
+                                    encrypted_content,
+                                    summary,
+                                });
+                            }
+                        }
+                    }
+                }
+                "response.completed" | "response.incomplete" | "response.failed" => {
+                    if let Some(u) = chunk.pointer("/response/usage") {
+                        usage.input_tokens = u
+                            .get("input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(usage.input_tokens);
+                        usage.output_tokens = u
+                            .get("output_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(usage.output_tokens);
+                        usage.cached_tokens = u
+                            .pointer("/input_tokens_details/cached_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(usage.cached_tokens);
+                    }
+                    if chunk
+                        .pointer("/response/incomplete_details/reason")
+                        .and_then(|v| v.as_str())
+                        == Some("max_output_tokens")
+                    {
+                        stop_reason = StopReason::MaxTokens;
+                    }
+                    if chunk.get("type").and_then(|v| v.as_str()) == Some("response.failed") {
+                        return Err(anyhow!("codex-oauth ws response.failed: {text}"));
+                    }
+                    completed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if !completed {
+            return Err(anyhow!("codex-oauth ws stream ended before response.completed"));
+        }
+        let calls: Vec<ToolCall> = fn_call_order
+            .iter()
+            .filter_map(|id| fn_calls.remove(id))
+            .filter(|a| !a.name.is_empty())
+            .map(|a| {
+                let input = if a.args.is_empty() {
+                    json!({})
+                } else {
+                    serde_json::from_str::<Value>(&a.args).unwrap_or_else(|_| json!({}))
+                };
+                ToolCall {
+                    id: if a.call_id.is_empty() {
+                        format!("tool_{}", short_hash(&a.name))
+                    } else {
+                        a.call_id
+                    },
+                    name: a.name,
+                    input,
+                }
+            })
+            .collect();
+        if !calls.is_empty() {
+            stop_reason = StopReason::ToolUse;
+        }
+        Ok(ProviderTurn {
+            text: if assistant_text.is_empty() {
+                None
+            } else {
+                Some(assistant_text)
+            },
+            tool_calls: calls,
+            stop_reason,
+            usage,
+            reasoning_items,
         })
     }
 
@@ -580,6 +878,26 @@ impl LlmProvider for CodexOauth {
         // codex-oauth turns within a process.
         drop(state);
 
+        // Opt-in Responses WebSocket transport: a warm, reused connection caches
+        // far better (~97%) than a stateless HTTP POST per request. On a connect
+        // / pre-stream failure it falls back to HTTP and disables WS for the
+        // rest of the session; a mid-stream failure propagates (no double-emit).
+        let ws_enabled = std::env::var("AGENTD_ZARVIS_CODEX_WS").as_deref() == Ok("1")
+            && !self.ws_disabled.load(Ordering::Relaxed);
+        if ws_enabled {
+            match self.try_ws(body.clone(), &access_token, &account_id, sink).await {
+                WsResult::Done(turn) => return Ok(turn),
+                WsResult::Error(e) => return Err(e),
+                WsResult::Fallback(e) => {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "codex-oauth ws unavailable; falling back to HTTP for this session"
+                    );
+                    self.ws_disabled.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
         let mut req = self
             .http
             .post(CODEX_RESPONSES_URL)
@@ -856,6 +1174,110 @@ impl LlmProvider for CodexOauth {
             reasoning_items,
         })
     }
+}
+
+/// Open a Responses WebSocket connection with codex-style auth. Honors an HTTP
+/// CONNECT proxy (`HTTPS_PROXY` / `ALL_PROXY`) — the air-gapped sandbox forces
+/// all egress through one, and `connect_async` would otherwise dial directly
+/// and be blocked.
+async fn connect_codex_ws(access_token: &str, account_id: &str) -> Result<WsStream> {
+    use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue};
+    let mut req = CODEX_RESPONSES_WS_URL
+        .into_client_request()
+        .context("codex-oauth ws: build request")?;
+    fn set(h: &mut HeaderMap, k: &'static str, v: String) -> Result<()> {
+        h.insert(k, HeaderValue::from_str(&v).with_context(|| format!("ws header {k}"))?);
+        Ok(())
+    }
+    let h = req.headers_mut();
+    set(h, "Authorization", format!("Bearer {access_token}"))?;
+    set(h, "OpenAI-Beta", CODEX_WS_BETA.to_string())?;
+    set(h, "originator", CODEX_ORIGINATOR.to_string())?;
+    set(
+        h,
+        "User-Agent",
+        format!("codex_cli_rs/{} (agentd zarvis)", env!("CARGO_PKG_VERSION")),
+    )?;
+    if !account_id.is_empty() {
+        set(h, "ChatGPT-Account-ID", account_id.to_string())?;
+    }
+
+    let proxy = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()));
+    if let Some(proxy) = proxy {
+        return connect_codex_ws_via_proxy(req, &proxy).await;
+    }
+    let (ws, _resp) = tokio_tungstenite::connect_async(req)
+        .await
+        .context("codex-oauth ws: connect")?;
+    Ok(ws)
+}
+
+/// CONNECT-tunnel a WebSocket through an HTTP proxy, then do the wss upgrade
+/// over the tunnel. Used inside the sandbox, whose egress is an authenticated
+/// Squid proxy (credentials carried in the proxy URL).
+async fn connect_codex_ws_via_proxy<R>(req: R, proxy: &str) -> Result<WsStream>
+where
+    R: IntoClientRequest + Unpin,
+{
+    use base64::Engine as _;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let purl = reqwest::Url::parse(proxy).with_context(|| format!("parse proxy url {proxy}"))?;
+    let phost = purl.host_str().context("proxy url has no host")?.to_string();
+    let pport = purl.port_or_known_default().unwrap_or(80);
+
+    let turl = reqwest::Url::parse(CODEX_RESPONSES_WS_URL).context("ws url")?;
+    let thost = turl.host_str().context("ws url has no host")?.to_string();
+    let tport = turl.port_or_known_default().unwrap_or(443);
+
+    let mut tcp = tokio::net::TcpStream::connect((phost.as_str(), pport))
+        .await
+        .with_context(|| format!("codex-oauth ws: connect proxy {phost}:{pport}"))?;
+
+    let mut connect = format!("CONNECT {thost}:{tport} HTTP/1.1\r\nHost: {thost}:{tport}\r\n");
+    if !purl.username().is_empty() {
+        let creds = format!("{}:{}", purl.username(), purl.password().unwrap_or(""));
+        let token = base64::engine::general_purpose::STANDARD.encode(creds.as_bytes());
+        connect.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
+    }
+    connect.push_str("\r\n");
+    tcp.write_all(connect.as_bytes())
+        .await
+        .context("codex-oauth ws: send CONNECT")?;
+
+    // Read the proxy's response headers up to the blank line. The client speaks
+    // first in TLS, so the proxy sends nothing past the headers — reading one
+    // byte at a time avoids swallowing any of the tunneled TLS stream.
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = tcp
+            .read(&mut byte)
+            .await
+            .context("codex-oauth ws: read CONNECT response")?;
+        if n == 0 {
+            return Err(anyhow!("codex-oauth ws: proxy closed during CONNECT"));
+        }
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if head.len() > 16 * 1024 {
+            return Err(anyhow!("codex-oauth ws: oversized CONNECT response"));
+        }
+    }
+    let head = String::from_utf8_lossy(&head);
+    let status_line = head.lines().next().unwrap_or_default();
+    if !status_line.contains(" 200") {
+        return Err(anyhow!("codex-oauth ws: proxy CONNECT failed: {status_line}"));
+    }
+
+    let (ws, _resp) = tokio_tungstenite::client_async_tls(req, tcp)
+        .await
+        .context("codex-oauth ws: tls/upgrade over proxy")?;
+    Ok(ws)
 }
 
 fn response_error_message(chunk: &Value) -> String {
