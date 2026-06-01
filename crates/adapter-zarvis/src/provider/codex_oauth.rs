@@ -462,6 +462,17 @@ pub fn build_responses_body(
     tools: &[ToolSpec],
 ) -> Value {
     let input: Vec<Value> = messages.iter().flat_map(message_to_input_items).collect();
+    // Asks the server to emit reasoning summary deltas (surfaced via
+    // `sink.reasoning_delta`). Optionally pin an explicit reasoning effort
+    // (low|medium|high) via `AGENTD_ZARVIS_REASONING_EFFORT`, mirroring Codex
+    // CLI's `model_reasoning_effort`; unset = the backend default.
+    let mut reasoning = json!({ "summary": "auto" });
+    if let Ok(effort) = std::env::var("AGENTD_ZARVIS_REASONING_EFFORT") {
+        let effort = effort.trim();
+        if !effort.is_empty() {
+            reasoning["effort"] = json!(effort);
+        }
+    }
     let mut body = json!({
         "model": model,
         "instructions": instructions,
@@ -474,11 +485,7 @@ pub fn build_responses_body(
         // `400 "Store must be set to false"`. Codex CLI sets this
         // explicitly in `codex-rs/core/src/client.rs`.
         "store": false,
-        // Asks the server to emit reasoning summary deltas. We
-        // surface them via `sink.reasoning_delta`, which the
-        // PtySink renders dim-italic in the live PTY and the
-        // headless MessageSink turns into `SessionEvent::Reasoning`.
-        "reasoning": { "summary": "auto" },
+        "reasoning": reasoning,
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.iter().map(tool_spec_to_value).collect());
