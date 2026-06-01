@@ -716,6 +716,10 @@ impl LlmProvider for CodexOauth {
                             .get("output_tokens")
                             .and_then(|n| n.as_u64())
                             .unwrap_or(usage.output_tokens);
+                        usage.cached_tokens = u
+                            .pointer("/input_tokens_details/cached_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(usage.cached_tokens);
                     }
                     if let Some(reason) = chunk
                         .pointer("/response/incomplete_details/reason")

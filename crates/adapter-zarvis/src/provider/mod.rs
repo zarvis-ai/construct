@@ -91,6 +91,8 @@ pub struct ToolCall {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cached input tokens (subset of `input_tokens`). 0 when unknown.
+    pub cached_tokens: u64,
     pub usd: f64,
 }
 

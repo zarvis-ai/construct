@@ -5110,8 +5110,9 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
             usd,
             tokens_in,
             tokens_out,
+            tokens_cached,
         } => vec![Span::styled(
-            format!("   $ ${:.4} (in={} out={})", usd, tokens_in, tokens_out),
+            format!("   $ ${:.4} (in={} out={} cached={})", usd, tokens_in, tokens_out, tokens_cached),
             Style::default().fg(theme.dim),
         )],
         SessionEvent::Diff { patch } => vec![Span::raw(format!("   Δ {}", shorten(patch, 200)))],

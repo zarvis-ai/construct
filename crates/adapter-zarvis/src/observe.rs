@@ -234,6 +234,7 @@ mod tests {
                 usd: 0.0,
                 tokens_in: 0,
                 tokens_out: 0,
+                tokens_cached: 0,
             },
             SessionEvent::Pty { data: "".into() },
         ] {

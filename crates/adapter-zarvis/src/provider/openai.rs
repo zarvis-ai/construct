@@ -196,6 +196,10 @@ impl LlmProvider for OpenAi {
                     .get("completion_tokens")
                     .and_then(|n| n.as_u64())
                     .unwrap_or(usage.output_tokens);
+                usage.cached_tokens = u
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(usage.cached_tokens);
             }
             let choice = match chunk
                 .get("choices")

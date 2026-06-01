@@ -189,6 +189,10 @@ impl LlmProvider for Anthropic {
                     if let Some(u) = v.pointer("/message/usage") {
                         usage.input_tokens =
                             u.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+                        usage.cached_tokens = u
+                            .get("cache_read_input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0);
                     }
                 }
                 "content_block_start" => {
