@@ -3046,15 +3046,11 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn set_approval_mode(
+    async fn persist_approval_mode(
         &self,
-        id: &str,
+        entry: &Arc<SessionEntry>,
         mode: agentd_protocol::ApprovalMode,
     ) -> Result<()> {
-        let entry = self
-            .get_entry(id)
-            .await
-            .ok_or_else(|| anyhow!("session not found: {}", id))?;
         let snapshot = {
             let mut s = entry.summary.write().await;
             s.approval_mode = mode;
@@ -3066,6 +3062,19 @@ impl SessionManager {
             .send(BroadcastMsg::State(StateNotificationPayload {
                 session: snapshot,
             }));
+        Ok(())
+    }
+
+    pub async fn set_approval_mode(
+        &self,
+        id: &str,
+        mode: agentd_protocol::ApprovalMode,
+    ) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        self.persist_approval_mode(&entry, mode).await?;
         // Forward to the adapter so it picks up the change for the next tool
         // classification. If the adapter is gone (session ended), skip.
         if let Some(adapter) = entry.adapter.lock().await.clone() {
@@ -3099,17 +3108,7 @@ impl SessionManager {
             _ => None,
         };
         if let Some(mode) = mode {
-            let snapshot = {
-                let mut s = entry.summary.write().await;
-                s.approval_mode = mode;
-                s.clone()
-            };
-            self.storage.save_summary(&snapshot)?;
-            let _ = self
-                .broadcast
-                .send(BroadcastMsg::State(StateNotificationPayload {
-                    session: snapshot,
-                }));
+            self.persist_approval_mode(&entry, mode).await?;
         }
         let params = serde_json::to_value(&agentd_protocol::SessionToolDecisionParams {
             session_id: id.to_string(),

@@ -23,6 +23,63 @@ pub enum AutoReviewResult {
     AskUser,
 }
 
+#[derive(Debug, Clone)]
+pub struct ApprovalHistoryEntry {
+    pub decision: String,
+    pub tool: String,
+    pub args_summary: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AutoReviewContext {
+    pub cwd: String,
+    pub current_task: Option<String>,
+    pub recent_approvals: Vec<ApprovalHistoryEntry>,
+}
+
+impl AutoReviewContext {
+    fn format_for_prompt(&self) -> String {
+        let mut out = String::new();
+        out.push_str("Current task:\n");
+        out.push_str(self.current_task.as_deref().unwrap_or("(unknown)"));
+        out.push_str("\n\nCWD:\n");
+        out.push_str(&self.cwd);
+        out.push_str("\n\nRecent approval decisions:\n");
+        if self.recent_approvals.is_empty() {
+            out.push_str("(none)\n");
+        } else {
+            for entry in self.recent_approvals.iter().rev() {
+                out.push_str("- ");
+                out.push_str(&entry.decision);
+                out.push_str(": ");
+                out.push_str(&entry.tool);
+                out.push('(');
+                out.push_str(&entry.args_summary);
+                out.push_str(")\n");
+            }
+        }
+        out
+    }
+}
+
+const APPROVAL_HISTORY_LIMIT: usize = 20;
+
+fn record_approval_history(
+    history: &mut VecDeque<ApprovalHistoryEntry>,
+    decision: impl Into<String>,
+    tool: impl Into<String>,
+    args_summary: impl Into<String>,
+) {
+    history.push_back(ApprovalHistoryEntry {
+        decision: decision.into(),
+        tool: tool.into(),
+        args_summary: args_summary.into(),
+    });
+    while history.len() > APPROVAL_HISTORY_LIMIT {
+        history.pop_front();
+    }
+}
+
 struct NullSink;
 impl TextSink for NullSink {
     fn delta(&mut self, _text: &str) {}
@@ -33,12 +90,17 @@ pub async fn auto_review_for_adapter(
     model: &str,
     tool: &str,
     args_summary: &str,
+    ctx: &AutoReviewContext,
 ) -> AutoReviewResult {
     let system = r#"You are an approval reviewer for a local coding agent.
-Decide whether a pending risky tool call is reasonable and bounded.
+Decide whether a pending risky tool call is reasonable, bounded, and clearly related to the current task.
 Return ONLY compact JSON: {"decision":"approve"|"deny"|"ask_user","reason":"..."}.
-Approve routine, expected development actions in the current task. Deny clearly destructive, secret-exfiltrating, unrelated, or user-hostile actions. Ask the user when context is insufficient or the action is broad/ambiguous."#;
-    let user = format!("Tool: {tool}\nArgs summary:\n{args_summary}");
+Use task context and recent user approval decisions as preference signals for similar actions, not as blanket permission.
+Approve routine, expected development actions in the current task. Deny clearly destructive, secret-exfiltrating, unrelated, or user-hostile actions. Ask the user when context is insufficient, prior decisions conflict, or the action is broad/ambiguous."#;
+    let user = format!(
+        "{}\n\nPending tool:\nTool: {tool}\nArgs summary:\n{args_summary}",
+        ctx.format_for_prompt()
+    );
     let messages = [Message {
         role: Role::User,
         content: Content::Text { text: user },
@@ -53,6 +115,10 @@ Approve routine, expected development actions in the current task. Deny clearly 
     let Some(text) = turn.text else {
         return AutoReviewResult::AskUser;
     };
+    parse_auto_review_decision(&text)
+}
+
+fn parse_auto_review_decision(text: &str) -> AutoReviewResult {
     let trimmed = text.trim();
     let parsed: serde_json::Value = serde_json::from_str(trimmed)
         .or_else(|_| {
@@ -369,6 +435,8 @@ pub async fn run(
     } else {
         Vec::new()
     };
+    let mut approval_history: VecDeque<ApprovalHistoryEntry> = VecDeque::new();
+    let mut current_task: Option<String>;
     let mut pending: VecDeque<String> = VecDeque::new();
     // Skip the initial prompt on resume — it's already in the loaded
     // messages and re-running it would double-charge the model.
@@ -410,6 +478,7 @@ pub async fn run(
         if user_text.trim().is_empty() {
             continue;
         }
+        current_task = Some(user_text.chars().take(2_000).collect());
         let prompt_payload = hooks
             .mutate(
                 "user_prompt_mutate",
@@ -712,6 +781,11 @@ pub async fn run(
             if !early_stop {
                 for &i in &risky_idx {
                     let call = &turn.tool_calls[i];
+                    let review_ctx = AutoReviewContext {
+                        cwd: tool_ctx.cwd.display().to_string(),
+                        current_task: current_task.clone(),
+                        recent_approvals: approval_history.iter().cloned().collect(),
+                    };
                     let outcome = run_one_tool(
                         call,
                         &registry,
@@ -721,6 +795,8 @@ pub async fn run(
                         &mut approval_mode,
                         provider.as_ref(),
                         &model,
+                        &review_ctx,
+                        &mut approval_history,
                         &hooks,
                         &base_hook_payload,
                     )
@@ -805,6 +881,8 @@ async fn run_one_tool(
     approval_mode: &mut agentd_protocol::ApprovalMode,
     provider: &dyn LlmProvider,
     model: &str,
+    review_ctx: &AutoReviewContext,
+    approval_history: &mut VecDeque<ApprovalHistoryEntry>,
     hooks: &crate::hooks::Hooks,
     base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
@@ -875,10 +953,33 @@ async fn run_one_tool(
         crate::tools::effective_risk(tool, &call.input, &tool_ctx.cwd),
         ToolRisk::Risky
     );
+    let mut needs_approval =
+        is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::Manual);
     if is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::AutoReview) {
-        match auto_review_for_adapter(provider, model, call.name.as_str(), &args_summary).await {
-            AutoReviewResult::Approve => {}
+        match auto_review_for_adapter(
+            provider,
+            model,
+            call.name.as_str(),
+            &args_summary,
+            review_ctx,
+        )
+        .await
+        {
+            AutoReviewResult::Approve => {
+                record_approval_history(
+                    approval_history,
+                    "auto_review:approve",
+                    call.name.clone(),
+                    args_summary.clone(),
+                );
+            }
             AutoReviewResult::Deny => {
+                record_approval_history(
+                    approval_history,
+                    "auto_review:deny",
+                    call.name.clone(),
+                    args_summary.clone(),
+                );
                 let msg = "auto-review denied this action".to_string();
                 emit.emit(SessionEvent::ToolResult {
                     tool: call.id.clone(),
@@ -890,11 +991,15 @@ async fn run_one_tool(
                     output: msg,
                 });
             }
-            AutoReviewResult::AskUser => {}
+            AutoReviewResult::AskUser => {
+                emit.log(format!(
+                    "auto-review asked user for {}({})",
+                    call.name, args_summary
+                ));
+                needs_approval = true;
+            }
         }
     }
-    let needs_approval =
-        is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::Manual);
     if needs_approval {
         emit.emit(SessionEvent::ToolApprovalRequest {
             call_id: call.id.clone(),
@@ -933,7 +1038,15 @@ async fn run_one_tool(
                 }
                 Some(AdapterInboxMsg::ToolDecision { call_id, decision }) if call_id == call.id => {
                     match decision.as_str() {
-                        "approve" => break,
+                        "approve" => {
+                            record_approval_history(
+                                approval_history,
+                                "user:approve",
+                                call.name.clone(),
+                                args_summary.clone(),
+                            );
+                            break;
+                        }
                         "auto_review" => {
                             *approval_mode = agentd_protocol::ApprovalMode::AutoReview;
                             match auto_review_for_adapter(
@@ -941,11 +1054,26 @@ async fn run_one_tool(
                                 model,
                                 call.name.as_str(),
                                 &args_summary,
+                                review_ctx,
                             )
                             .await
                             {
-                                AutoReviewResult::Approve => break,
+                                AutoReviewResult::Approve => {
+                                    record_approval_history(
+                                        approval_history,
+                                        "auto_review:approve",
+                                        call.name.clone(),
+                                        args_summary.clone(),
+                                    );
+                                    break;
+                                }
                                 AutoReviewResult::Deny => {
+                                    record_approval_history(
+                                        approval_history,
+                                        "auto_review:deny",
+                                        call.name.clone(),
+                                        args_summary.clone(),
+                                    );
                                     let msg = "auto-review denied this action".to_string();
                                     emit.emit(SessionEvent::ToolResult {
                                         tool: call.id.clone(),
@@ -962,11 +1090,23 @@ async fn run_one_tool(
                         }
                         "unsafe_auto" => {
                             *approval_mode = agentd_protocol::ApprovalMode::UnsafeAuto;
+                            record_approval_history(
+                                approval_history,
+                                "user:unsafe_auto",
+                                call.name.clone(),
+                                args_summary.clone(),
+                            );
                             break;
                         }
                         _ => {
                             // Denied — synthesize a result and bail out
                             // of this tool without running it.
+                            record_approval_history(
+                                approval_history,
+                                "user:deny",
+                                call.name.clone(),
+                                args_summary.clone(),
+                            );
                             let msg = "user denied this action".to_string();
                             emit.emit(SessionEvent::ToolResult {
                                 tool: call.id.clone(),
@@ -1153,4 +1293,39 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
         provider,
         kind: spec.provider,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_auto_review_decision_accepts_json_with_surrounding_text() {
+        assert_eq!(
+            parse_auto_review_decision(r#"{"decision":"approve","reason":"routine"}"#),
+            AutoReviewResult::Approve
+        );
+        assert_eq!(
+            parse_auto_review_decision(
+                "Decision:\n```json\n{\"decision\":\"deny\",\"reason\":\"dangerous\"}\n```"
+            ),
+            AutoReviewResult::Deny
+        );
+    }
+
+    #[test]
+    fn parse_auto_review_decision_falls_back_to_ask_user() {
+        assert_eq!(
+            parse_auto_review_decision(r#"{"decision":"ask_user","reason":"unclear"}"#),
+            AutoReviewResult::AskUser
+        );
+        assert_eq!(
+            parse_auto_review_decision("not json"),
+            AutoReviewResult::AskUser
+        );
+        assert_eq!(
+            parse_auto_review_decision(r#"{"decision":"maybe"}"#),
+            AutoReviewResult::AskUser
+        );
+    }
 }

@@ -1416,6 +1416,66 @@ mod tests {
         None
     }
 
+    #[tokio::test]
+    async fn wait_for_approval_maps_prompt_keys_to_new_modes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(agentd_protocol::adapter::AdapterInboxMsg::PtyInput(vec![
+            b'a',
+        ]))
+        .await
+        .unwrap();
+        let mut unsafe_auto = false;
+        assert_eq!(
+            wait_for_approval(&mut rx, "call-1", &mut unsafe_auto).await,
+            ApprovalOutcome::AutoReview
+        );
+        assert!(!unsafe_auto);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(agentd_protocol::adapter::AdapterInboxMsg::PtyInput(vec![
+            b'f',
+        ]))
+        .await
+        .unwrap();
+        let mut unsafe_auto = false;
+        assert_eq!(
+            wait_for_approval(&mut rx, "call-1", &mut unsafe_auto).await,
+            ApprovalOutcome::UnsafeAuto
+        );
+        assert!(unsafe_auto);
+    }
+
+    #[tokio::test]
+    async fn wait_for_approval_maps_decisions_to_new_modes() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(agentd_protocol::adapter::AdapterInboxMsg::ToolDecision {
+            call_id: "call-1".into(),
+            decision: "auto_review".into(),
+        })
+        .await
+        .unwrap();
+        let mut unsafe_auto = false;
+        assert_eq!(
+            wait_for_approval(&mut rx, "call-1", &mut unsafe_auto).await,
+            ApprovalOutcome::AutoReview
+        );
+        assert!(!unsafe_auto);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        tx.send(agentd_protocol::adapter::AdapterInboxMsg::ToolDecision {
+            call_id: "call-1".into(),
+            decision: "unsafe_auto".into(),
+        })
+        .await
+        .unwrap();
+        let mut unsafe_auto = false;
+        assert_eq!(
+            wait_for_approval(&mut rx, "call-1", &mut unsafe_auto).await,
+            ApprovalOutcome::UnsafeAuto
+        );
+        assert!(unsafe_auto);
+    }
+
     #[test]
     fn simple_typing_and_enter() {
         let mut ed = editor();
@@ -2682,6 +2742,16 @@ pub async fn run(
                         &mut queued_rows,
                         provider.as_ref(),
                         &model,
+                        &crate::agent::AutoReviewContext {
+                            cwd: tool_ctx.cwd.display().to_string(),
+                            current_task: messages.iter().rev().find_map(|m| match &m.content {
+                                Content::Text { text } if matches!(m.role, Role::User) => {
+                                    Some(text.chars().take(2_000).collect())
+                                }
+                                _ => None,
+                            }),
+                            recent_approvals: Vec::new(),
+                        },
                         tasks.clone(),
                         bg_completion_tx.clone(),
                         bg_after,
@@ -2930,6 +3000,7 @@ async fn run_one_tool(
     queued_rows: &mut usize,
     provider: &dyn crate::provider::LlmProvider,
     model: &str,
+    review_ctx: &crate::agent::AutoReviewContext,
     tasks: std::sync::Arc<crate::tasks::Tasks>,
     bg_completion_tx: crate::tasks::BgCompletionTx,
     bg_after: std::time::Duration,
@@ -3068,6 +3139,7 @@ async fn run_one_tool(
                     model,
                     call.name.as_str(),
                     &args_summary,
+                    review_ctx,
                 )
                 .await
                 {
@@ -3197,6 +3269,7 @@ async fn run_one_tool(
     outcome
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalOutcome {
     Approve,
     Deny,
