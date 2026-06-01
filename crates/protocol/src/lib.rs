@@ -336,6 +336,10 @@ pub enum SessionEvent {
         tokens_in: u64,
         #[serde(default)]
         tokens_out: u64,
+        /// Cached input tokens (subset of `tokens_in` served from the provider's
+        /// prompt cache). 0 when unknown or unsupported by the provider.
+        #[serde(default)]
+        tokens_cached: u64,
     },
     Diff {
         patch: String,

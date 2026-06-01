@@ -579,11 +579,17 @@ fn claude_events_from_json(v: &Value) -> Vec<SessionEvent> {
                 .and_then(|u| u.get("output_tokens"))
                 .and_then(|n| n.as_u64())
                 .unwrap_or(0);
+            let tcached = v
+                .get("usage")
+                .and_then(|u| u.get("cache_read_input_tokens"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
             if usd > 0.0 || tin > 0 || tout > 0 {
                 vec![SessionEvent::Cost {
                     usd,
                     tokens_in: tin,
                     tokens_out: tout,
+                    tokens_cached: tcached,
                 }]
             } else {
                 Vec::new()
@@ -773,6 +779,7 @@ mod tests {
                 usd,
                 tokens_in,
                 tokens_out,
+                ..
             }] => {
                 assert_eq!(*usd, 0.25);
                 assert_eq!(*tokens_in, 10);

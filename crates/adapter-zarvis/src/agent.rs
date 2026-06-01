@@ -667,6 +667,7 @@ pub async fn run(
                 usd: turn.usage.usd,
                 tokens_in: turn.usage.input_tokens,
                 tokens_out: turn.usage.output_tokens,
+                tokens_cached: turn.usage.cached_tokens,
             });
 
             if turn.is_empty() {
