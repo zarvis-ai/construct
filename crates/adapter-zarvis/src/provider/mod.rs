@@ -65,6 +65,24 @@ pub enum Content {
         /// Used for telemetry and the TUI banner.
         dropped_turn_pairs: u32,
     },
+    /// A model reasoning item, echoed back to the provider on the next
+    /// turn. The codex-oauth backend (gpt-5 Responses API with
+    /// `store:false`) requires reasoning items to be replayed with their
+    /// `id` + `encrypted_content` for prompt caching and reasoning
+    /// continuity; providers that don't support it skip this variant.
+    Reasoning(ReasoningItem),
+}
+
+/// A reasoning item captured from a Responses-API turn and replayed on the
+/// next request. `encrypted_content` is the opaque blob the backend returns
+/// when `include: ["reasoning.encrypted_content"]` is requested.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReasoningItem {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_content: Option<String>,
+    #[serde(default)]
+    pub summary: Vec<String>,
 }
 
 /// Prefix prepended to a [`Content::Summary`] body when serialized on
@@ -116,6 +134,10 @@ pub struct ProviderTurn {
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// Reasoning items emitted this turn (codex-oauth only; empty
+    /// elsewhere). The agent loop stores these in history so they're
+    /// replayed on the next request. See [`Content::Reasoning`].
+    pub reasoning_items: Vec<ReasoningItem>,
 }
 
 impl ProviderTurn {
@@ -249,6 +271,7 @@ mod provider_turn_tests {
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
+            reasoning_items: Vec::new(),
         };
         assert!(turn.is_empty());
     }
@@ -260,6 +283,7 @@ mod provider_turn_tests {
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
+            reasoning_items: Vec::new(),
         };
         assert!(turn.is_empty());
     }
@@ -271,6 +295,7 @@ mod provider_turn_tests {
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
             usage: Usage::default(),
+            reasoning_items: Vec::new(),
         };
         assert!(!text_turn.is_empty());
 
@@ -283,6 +308,7 @@ mod provider_turn_tests {
             }],
             stop_reason: StopReason::ToolUse,
             usage: Usage::default(),
+            reasoning_items: Vec::new(),
         };
         assert!(!tool_turn.is_empty());
     }

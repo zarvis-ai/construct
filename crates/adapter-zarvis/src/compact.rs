@@ -292,6 +292,8 @@ fn render_head_for_summarizer(head: &[Message]) -> String {
                 out.push_str(text.trim());
                 out.push_str("\n\n");
             }
+            // Reasoning items are codex-oauth wire detail; omit from summaries.
+            (_, Content::Reasoning(_)) => {}
             // System/Tool Text messages are not expected in practice
             // (System lives in the system prompt, Tool only carries
             // ToolResult), but the type system needs all combinations.
@@ -508,6 +510,7 @@ mod tests {
                 tool_calls: vec![],
                 stop_reason: StopReason::EndTurn,
                 usage: Usage::default(),
+                reasoning_items: Vec::new(),
             })
         }
     }

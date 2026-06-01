@@ -328,6 +328,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 stop_reason: StopReason::EndTurn,
                 usage: Usage::default(),
+                reasoning_items: Vec::new(),
             })
         }
     }
@@ -371,6 +372,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 stop_reason: StopReason::EndTurn,
                 usage: Usage::default(),
+                reasoning_items: Vec::new(),
             })
         }
     }
@@ -406,6 +408,7 @@ mod tests {
                 tool_calls: Vec::new(),
                 stop_reason: StopReason::EndTurn,
                 usage: Usage::default(),
+                reasoning_items: Vec::new(),
             })
         }
     }

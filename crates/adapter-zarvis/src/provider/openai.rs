@@ -98,6 +98,8 @@ fn messages_to_openai(system: &str, messages: &[Message]) -> Vec<Value> {
                 let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
                 out.push(json!({ "role": "user", "content": body }));
             }
+            // codex-oauth-only; nothing to send to the chat-completions API.
+            Content::Reasoning(_) => {}
         }
     }
     out
@@ -277,6 +279,7 @@ impl LlmProvider for OpenAi {
             tool_calls: calls,
             stop_reason,
             usage,
+            reasoning_items: Vec::new(),
         })
     }
 }

@@ -68,6 +68,10 @@ pub fn estimate_tokens(messages: &[Message]) -> usize {
             Content::Summary { text, .. } => {
                 chars += text.len() + crate::provider::SUMMARY_WIRE_PREFIX.len();
             }
+            Content::Reasoning(item) => {
+                chars += item.encrypted_content.as_deref().map(str::len).unwrap_or(0)
+                    + item.summary.iter().map(String::len).sum::<usize>();
+            }
         }
     }
     (chars as f64 / 3.5) as usize

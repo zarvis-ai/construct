@@ -85,6 +85,8 @@ fn messages_to_ollama(system: &str, messages: &[Message]) -> Vec<Value> {
                 let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
                 out.push(json!({ "role": "user", "content": body }));
             }
+            // codex-oauth-only; nothing to send to Ollama.
+            Content::Reasoning(_) => {}
         }
     }
     out
@@ -234,6 +236,7 @@ impl LlmProvider for Ollama {
             tool_calls,
             stop_reason,
             usage,
+            reasoning_items: Vec::new(),
         })
     }
 }

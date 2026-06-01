@@ -723,6 +723,20 @@ pub async fn run(
                 break;
             }
 
+            // Echo the model's reasoning items into history so the provider
+            // replays them on the next request (prompt caching + reasoning
+            // continuity). They precede the assistant message for this turn.
+            for item in &turn.reasoning_items {
+                push_msg!(
+                    messages,
+                    persist,
+                    Message {
+                        role: Role::Assistant,
+                        content: Content::Reasoning(item.clone()),
+                    }
+                );
+            }
+
             if turn.tool_calls.is_empty() {
                 if let Some(text) = turn.text {
                     push_msg!(

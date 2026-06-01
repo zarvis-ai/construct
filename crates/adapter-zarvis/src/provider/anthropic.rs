@@ -91,6 +91,8 @@ fn messages_to_anthropic(messages: &[Message]) -> Vec<Value> {
                 let body = format!("{}{}", super::SUMMARY_WIRE_PREFIX, text);
                 out.push(json!({ "role": "user", "content": body }));
             }
+            // codex-oauth-only; nothing to send to the Anthropic API.
+            (_, Content::Reasoning(_)) => {}
         }
     }
     out
@@ -309,6 +311,7 @@ impl LlmProvider for Anthropic {
             tool_calls,
             stop_reason,
             usage,
+            reasoning_items: Vec::new(),
         })
     }
 }

@@ -32,8 +32,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use super::{
-    Content, LlmProvider, Message, ProviderTurn, Role, StopReason, TextSink, ToolCall,
-    ToolSpec, Usage,
+    Content, LlmProvider, Message, ProviderTurn, ReasoningItem, Role, StopReason, TextSink,
+    ToolCall, ToolSpec, Usage,
 };
 
 /// Base URL for the OAuth-backed Codex backend. Not the public
@@ -437,6 +437,24 @@ fn message_to_input_items(m: &Message) -> Vec<Value> {
                 "content": [{ "type": "input_text", "text": body }],
             })]
         }
+        Content::Reasoning(item) => {
+            // Echo the reasoning item back verbatim (id + encrypted_content
+            // + summary) so the backend caches the prefix and the model
+            // keeps its prior reasoning. Dropping it busts the cache.
+            let summary: Vec<Value> = item
+                .summary
+                .iter()
+                .map(|t| json!({ "type": "summary_text", "text": t }))
+                .collect();
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), json!("reasoning"));
+            obj.insert("id".into(), json!(item.id));
+            obj.insert("summary".into(), Value::Array(summary));
+            if let Some(enc) = &item.encrypted_content {
+                obj.insert("encrypted_content".into(), json!(enc));
+            }
+            vec![Value::Object(obj)]
+        }
     }
 }
 
@@ -486,10 +504,24 @@ pub fn build_responses_body(
         // explicitly in `codex-rs/core/src/client.rs`.
         "store": false,
         "reasoning": reasoning,
+        // Ask the backend to return reasoning items WITH their encrypted
+        // content so we can echo them back next turn (prompt caching +
+        // reasoning continuity), matching the Codex CLI.
+        "include": ["reasoning.encrypted_content"],
     });
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools.iter().map(tool_spec_to_value).collect());
         body["parallel_tool_calls"] = Value::Bool(true);
+    }
+    // Stable per-session prompt-cache key (mirrors the Codex CLI). Each turn
+    // re-sends a growing, mostly-unchanged prefix; pinning a key routes those
+    // requests to the same prompt-cache node so the prefix actually hits.
+    // Without it, automatic prefix caching still works but routing is unstable
+    // under load — measured as a low/erratic hit-rate (~31% vs Codex's ~97%).
+    if let Ok(key) = std::env::var("AGENTD_SESSION_ID") {
+        if !key.is_empty() {
+            body["prompt_cache_key"] = json!(key);
+        }
     }
     body
 }
@@ -597,6 +629,7 @@ impl LlmProvider for CodexOauth {
         let mut stop_reason = StopReason::EndTurn;
         let mut usage = Usage::default();
         let mut terminal_event_seen = false;
+        let mut reasoning_items: Vec<ReasoningItem> = Vec::new();
 
         while let Some(ev) = stream.next().await {
             let ev = ev.context("codex-oauth SSE stream")?;
@@ -668,6 +701,44 @@ impl LlmProvider for CodexOauth {
                                 args: String::new(),
                             },
                         );
+                    }
+                }
+                // Completed output item. We capture `reasoning` items: they
+                // carry `encrypted_content` (because we requested
+                // include: reasoning.encrypted_content) which must be echoed
+                // back next turn for prompt caching + reasoning continuity.
+                "response.output_item.done" => {
+                    if let Some(item) = chunk.get("item") {
+                        if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
+                            let id = item
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            if !id.is_empty() {
+                                let encrypted_content = item
+                                    .get("encrypted_content")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                                let summary = item
+                                    .get("summary")
+                                    .and_then(|v| v.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .filter_map(|s| {
+                                                s.get("text").and_then(|t| t.as_str())
+                                            })
+                                            .map(|t| t.to_string())
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                reasoning_items.push(ReasoningItem {
+                                    id,
+                                    encrypted_content,
+                                    summary,
+                                });
+                            }
+                        }
                     }
                 }
                 // Tool-call arguments stream a piece at a time.
@@ -782,6 +853,7 @@ impl LlmProvider for CodexOauth {
             tool_calls: calls,
             stop_reason,
             usage,
+            reasoning_items,
         })
     }
 }
