@@ -221,8 +221,8 @@ impl MainWindowTree {
 /// What the right pane is currently showing for the selected session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    /// Structured transcript renderer (default for headless / non-PTY sessions).
-    Transcript,
+    /// Structured-event chat renderer (default for headless / non-PTY sessions).
+    Chat,
     /// Live PTY emulator (default for sessions whose adapter has supports_pty).
     Terminal,
 }
@@ -1401,7 +1401,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         should_quit: false,
         connected: true,
         remote_clients: 0,
-        view: ViewMode::Transcript,
+        view: ViewMode::Chat,
         histories: HashMap::new(),
         block_hits: HashMap::new(),
         matrix_reveal_hits: Vec::new(),
@@ -2133,7 +2133,7 @@ impl App {
         self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
             ViewMode::Terminal
         } else {
-            ViewMode::Transcript
+            ViewMode::Chat
         };
     }
 
@@ -2440,7 +2440,7 @@ impl App {
             self.view = ViewMode::Terminal;
             self.bootstrap_terminal(&id).await;
         } else {
-            self.view = ViewMode::Transcript;
+            self.view = ViewMode::Chat;
         }
         if self.selection.session_id() == Some(id.as_str()) {
             self.start_session_transition();
@@ -2771,7 +2771,7 @@ impl App {
                 self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
                     ViewMode::Terminal
                 } else {
-                    ViewMode::Transcript
+                    ViewMode::Chat
                 };
             }
         }
@@ -5500,14 +5500,14 @@ impl App {
             ToggleView => {
                 let has_pty = self.in_pty_session();
                 self.view = match (self.view, has_pty) {
-                    (ViewMode::Transcript, true) => {
+                    (ViewMode::Chat, true) => {
                         // First time switching → bootstrap from replay snapshot.
                         if let Some(id) = self.selected_id() {
                             self.bootstrap_terminal(&id).await;
                         }
                         ViewMode::Terminal
                     }
-                    _ => ViewMode::Transcript,
+                    _ => ViewMode::Chat,
                 };
             }
             MoveSelectedUp => self.move_selected(true).await,
@@ -8148,8 +8148,8 @@ mod tests {
             "the re-hydration request must actually fetch the PTY snapshot"
         );
 
-        // In Transcript view a missing history must NOT spin up fetches.
-        app.view = ViewMode::Transcript;
+        // In Chat view a missing history must NOT spin up fetches.
+        app.view = ViewMode::Chat;
         assert!(
             !app.selected_needs_hydration(),
             "transcript view should not re-fetch PTY history"
