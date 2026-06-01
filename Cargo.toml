@@ -51,7 +51,7 @@ bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 async-trait = "0.1"
 eventsource-stream = "0.2"
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 qrcode = { version = "0.14", default-features = false }
 httparse = "1"
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
