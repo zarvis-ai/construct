@@ -2042,7 +2042,12 @@ impl SessionManager {
                 | SessionEvent::BrowserPreview(_)
                 | SessionEvent::UiPanel(_)
                 | SessionEvent::UiDelete { .. }
-                | SessionEvent::EditorState { .. } => {
+                | SessionEvent::EditorState { .. }
+                // ClientCommand is a UI-control action; it never moves the
+                // session's top-level state. (Prototype: persistence still
+                // goes through the default append above — the policy-driven
+                // gate on `slash::TranscriptPolicy` is the follow-up wiring.)
+                | SessionEvent::ClientCommand { .. } => {
                     // Task-lifecycle, editor-state, and compaction
                     // events are recorded by other handlers — they
                     // don't move the session's top-level state.

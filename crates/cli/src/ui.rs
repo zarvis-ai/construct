@@ -4934,6 +4934,9 @@ fn chat_event_kind(ev: &SessionEvent) -> ChatEventKind {
         SessionEvent::Pty { .. }
         | SessionEvent::PtyResize { .. }
         | SessionEvent::EditorState { .. }
+        // Prototype: hidden like today's `tui` ToolUse. The follow-up reads
+        // `slash::COMMANDS[id].render` and shows SystemNote breadcrumbs.
+        | SessionEvent::ClientCommand { .. }
         | SessionEvent::AgentStatus(_) => ChatEventKind::Hidden,
         SessionEvent::Message { role, text } if should_render_chat_message(*role, text) => {
             if *role == MessageRole::Assistant {
@@ -5050,6 +5053,7 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
         SessionEvent::Pty { .. }
         | SessionEvent::PtyResize { .. }
         | SessionEvent::EditorState { .. }
+        | SessionEvent::ClientCommand { .. }
         | SessionEvent::AgentStatus(_) => Vec::new(),
         SessionEvent::Message { role, text } => {
             let role_label = match role {
@@ -5710,6 +5714,9 @@ fn shorten(s: &str, max: usize) -> String {
 pub fn short_event_label(ev: &SessionEvent) -> String {
     match ev {
         SessionEvent::PtyResize { cols, rows } => format!("pty_resize {cols}x{rows}"),
+        SessionEvent::ClientCommand { id, args } => {
+            format!("client-cmd {id:?}{}", args.as_deref().map(|a| format!(" {a}")).unwrap_or_default())
+        }
         SessionEvent::Message { role, text } => format!("msg:{:?} {}", role, shorten(text, 60)),
         SessionEvent::Reasoning { text } => format!("reasoning {}", shorten(text, 60)),
         SessionEvent::ToolUse { tool, .. } => format!("tool {tool}"),

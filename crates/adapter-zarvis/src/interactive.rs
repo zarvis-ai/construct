@@ -278,36 +278,6 @@ fn emit_editor_state(emit: &EventEmitter, editor: &LineEditor, queue: &VecDeque<
 /// so the at-start-of-line buffer stays tiny.
 const DIM_LINE_PREFIXES: &[&str] = &["Summary:"];
 
-/// Available slash commands surfaced by inline ghost-completion and
-/// Tab-accept in the interactive line editor. Order matters — when
-/// multiple commands share a prefix, the first one wins as the ghost.
-/// Keep in lockstep with the `match trimmed { ... }` block that handles
-/// them after submit.
-/// Commands surfaced by the `/` popup + tab completion. `/model` is
-/// adapter-internal (zarvis switches its own provider). Everything
-/// else is dispatched as a `tui` ToolUse for the TUI's slash table,
-/// except `/loop` which is parsed inline and turned into an
-/// `agentd_loop_create` call. Keep this in lockstep with the
-/// after-submit match block + the TUI's `run_slash_command`.
-const SLASH_COMMANDS: &[&str] = &[
-    "/agentd",
-    "/border",
-    "/compact",
-    "/help",
-    "/loop",
-    "/model",
-    "/new",
-    "/quit",
-    "/remote-control",
-    "/reset",
-    "/exit",
-    "/refresh",
-    "/rename",
-    "/send",
-    "/tasks",
-    "/zoom",
-];
-
 /// Padding around the assistant's streamed response. The response is
 /// rendered as a chat bubble: `❯` marks user input (the line editor's
 /// prompt), `●` marks the response's first line, continuation lines
@@ -801,16 +771,17 @@ impl LineEditor {
     }
 
     /// Slash-commands whose names start with the current buffer.
-    /// Empty when the buf doesn't start with `/`.
+    /// Empty when the buf doesn't start with `/`. Candidates come from the
+    /// shared registry's popup set, sorted for a deterministic ghost order.
     fn slash_matches(&self) -> Vec<&'static str> {
         if !self.buf.starts_with('/') {
             return Vec::new();
         }
-        SLASH_COMMANDS
-            .iter()
-            .copied()
+        let mut matches: Vec<&'static str> = agentd_protocol::slash::popup_names()
             .filter(|c| c.starts_with(self.buf.as_str()))
-            .collect()
+            .collect();
+        matches.sort_unstable();
+        matches
     }
 
     /// Tab handler: complete the buffer to the matches' common prefix.
@@ -1758,9 +1729,12 @@ mod tests {
         let all = ed.slash_matches();
         assert!(all.contains(&"/model"));
         assert!(all.contains(&"/quit"));
-        assert!(all.contains(&"/exit"));
         assert!(all.contains(&"/reset"));
         assert!(all.contains(&"/border"));
+        assert!(all.contains(&"/compact"));
+        // The popup lists canonical names only; `/exit` is an alias of `/quit`
+        // (it still resolves when typed) so it isn't a separate ghost entry.
+        assert!(!all.contains(&"/exit"));
         ed.feed_bytes(b"bor");
         assert_eq!(ed.slash_matches(), vec!["/border"]);
         let mut ed = editor();
@@ -2111,158 +2085,182 @@ pub async fn run(
             }
         };
 
-        // Slash-command meta inputs: never sent to the model. `/model`
-        // is adapter-internal (it switches zarvis state); everything
-        // else is delegated to the client via SessionEvent::ClientCommand
-        // so the TUI can dispatch its own slash table without an LLM
-        // roundtrip.
+        // Slash commands never reach the model. Resolve the verb once via the
+        // shared registry (crates/protocol/src/slash.rs), then branch on the
+        // typed CommandId / routing — never on the raw string:
+        //   * Adapter  → mutate zarvis state here (model / reset / compact)
+        //   * ToolCall → synthesize a real tool call (/loop → loop_create)
+        //   * Client   → hand off to the attached client as a ClientCommand
         let trimmed = user_text.trim();
-        if let Some(rest) = trimmed.strip_prefix("/model") {
-            let arg = rest.trim();
-            if arg.is_empty() {
-                term.note(&format!("(model: {}:{})", provider_name, model));
-            } else {
-                match crate::agent::resolve_model_from_spec(arg) {
-                    Ok(new) => {
-                        let new_name = new.provider_name();
-                        let new_model = new.model.clone();
-                        provider = new.provider;
-                        provider_name = new_name;
-                        model = new_model;
-                        term.note(&format!("(model → {}:{})", provider_name, model));
-                        emit.emit(SessionEvent::Status {
-                            state: SessionState::Running,
-                            detail: Some(format!("{}:{}  [interactive]", provider_name, model)),
-                        });
+        if let Some((verb, args)) = parse_slash_command(trimmed) {
+            use agentd_protocol::slash::{CommandId, Routing, SlashCommand};
+            match SlashCommand::resolve(&verb) {
+                Some(cmd) => match cmd.routing {
+                    Routing::Client => {
+                        // Typed client action: travels with its CommandId so the
+                        // daemon persists it for forensics, `agentd_get_transcript`
+                        // filters it (registry visibility), and the client
+                        // dispatches by id — no fake `tui` tool call, no model leak.
+                        emit.emit(SessionEvent::ClientCommand { id: cmd.id, args });
                     }
-                    Err(e) => {
-                        term.note(&format!("(model switch failed: {e})"));
+                    Routing::ToolCall => {
+                        // `/loop`: parse the spec inline (asking the LLM for an
+                        // interval when omitted), then synthesize the same
+                        // agentd_loop_create call the model would make.
+                        handle_slash_loop(
+                            args.as_deref().unwrap_or(""),
+                            &session_id_for_slash,
+                            &emit,
+                            &term,
+                            provider.as_ref(),
+                            &model,
+                            &tool_ctx,
+                        )
+                        .await;
                     }
-                }
-            }
-            emit_editor_state(&emit, &editor, &queue);
-            continue;
-        }
-        // `/loop` is special-cased before the generic tui-dispatch
-        // path: it parses the spec inline (asking the LLM for an
-        // interval when the user didn't supply one), then calls
-        // the agentd_loop_create tool synthetically — same path
-        // the LLM would take, just from the adapter side.
-        if let Some(rest) = trimmed
-            .strip_prefix("/loop ")
-            .or_else(|| (trimmed == "/loop").then_some(""))
-        {
-            handle_slash_loop(
-                rest,
-                &session_id_for_slash,
-                &emit,
-                &term,
-                provider.as_ref(),
-                &model,
-                &tool_ctx,
-            )
-            .await;
-            emit_editor_state(&emit, &editor, &queue);
-            continue;
-        }
-        if trimmed == "/reset" {
-            messages.clear();
-            if let Some(p) = persist.as_mut() {
-                p.reset();
-            }
-            pending.clear();
-            queue.clear();
-            editor.reset_history();
-            queued_rows = 0;
-            emit.emit(SessionEvent::Reset);
-            term.banner(provider_name, &model, automode);
-            term.note("(session reset)");
-            emit_editor_state(&emit, &editor, &queue);
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("/compact").map(|s| s.trim()) {
-            // Parse optional N — how many recent turn pairs to keep
-            // verbatim. Default = compact::DEFAULT_KEEP_PAIRS.
-            let keep_pairs = if rest.is_empty() {
-                crate::compact::DEFAULT_KEEP_PAIRS
-            } else {
-                match rest.parse::<usize>() {
-                    Ok(n) if n >= 1 => n,
-                    _ => {
-                        term.note("(usage: /compact [N]  — N is recent turn pairs to keep)");
-                        emit_editor_state(&emit, &editor, &queue);
-                        continue;
-                    }
-                }
-            };
-            term.note(&format!(
-                "(compacting — keeping last {keep_pairs} turn pairs…)"
-            ));
-            match crate::compact::compact(&mut messages, keep_pairs, provider.as_ref(), &model)
-                .await
-            {
-                Ok(Some(outcome)) => {
-                    if let Some(p) = persist.as_mut() {
-                        if let Err(e) = p.rewrite(&messages) {
-                            tracing::warn!(error = ?e, "compact: persist rewrite failed");
+                    Routing::Adapter => match cmd.id {
+                        CommandId::Model => {
+                            let arg = args.as_deref().unwrap_or("").trim();
+                            if arg.is_empty() {
+                                term.note(&format!("(model: {}:{})", provider_name, model));
+                            } else {
+                                match crate::agent::resolve_model_from_spec(arg) {
+                                    Ok(new) => {
+                                        let new_name = new.provider_name();
+                                        let new_model = new.model.clone();
+                                        provider = new.provider;
+                                        provider_name = new_name;
+                                        model = new_model;
+                                        term.note(&format!(
+                                            "(model → {}:{})",
+                                            provider_name, model
+                                        ));
+                                        emit.emit(SessionEvent::Status {
+                                            state: SessionState::Running,
+                                            detail: Some(format!(
+                                                "{}:{}  [interactive]",
+                                                provider_name, model
+                                            )),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        term.note(&format!("(model switch failed: {e})"));
+                                    }
+                                }
+                            }
                         }
-                    }
-                    emit.emit(SessionEvent::ContextCompacted {
-                        kept_turns: outcome.kept_turn_pairs,
-                        dropped_turns: outcome.dropped_turn_pairs,
-                        tokens_before: outcome.tokens_before,
-                        tokens_after: outcome.tokens_after,
-                        summary_preview: outcome.summary_preview.clone(),
+                        CommandId::Reset => {
+                            messages.clear();
+                            if let Some(p) = persist.as_mut() {
+                                p.reset();
+                            }
+                            pending.clear();
+                            queue.clear();
+                            editor.reset_history();
+                            queued_rows = 0;
+                            emit.emit(SessionEvent::Reset);
+                            term.banner(provider_name, &model, automode);
+                            term.note("(session reset)");
+                        }
+                        CommandId::Compact => {
+                            // Optional N — recent turn pairs to keep verbatim.
+                            let rest = args.as_deref().unwrap_or("").trim();
+                            let keep_pairs = if rest.is_empty() {
+                                Some(crate::compact::DEFAULT_KEEP_PAIRS)
+                            } else {
+                                match rest.parse::<usize>() {
+                                    Ok(n) if n >= 1 => Some(n),
+                                    _ => None,
+                                }
+                            };
+                            match keep_pairs {
+                                None => term.note(
+                                    "(usage: /compact [N]  — N is recent turn pairs to keep)",
+                                ),
+                                Some(keep_pairs) => {
+                                    term.note(&format!(
+                                        "(compacting — keeping last {keep_pairs} turn pairs…)"
+                                    ));
+                                    match crate::compact::compact(
+                                        &mut messages,
+                                        keep_pairs,
+                                        provider.as_ref(),
+                                        &model,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(outcome)) => {
+                                            if let Some(p) = persist.as_mut() {
+                                                if let Err(e) = p.rewrite(&messages) {
+                                                    tracing::warn!(error = ?e, "compact: persist rewrite failed");
+                                                }
+                                            }
+                                            emit.emit(SessionEvent::ContextCompacted {
+                                                kept_turns: outcome.kept_turn_pairs,
+                                                dropped_turns: outcome.dropped_turn_pairs,
+                                                tokens_before: outcome.tokens_before,
+                                                tokens_after: outcome.tokens_after,
+                                                summary_preview: outcome.summary_preview.clone(),
+                                            });
+                                            term.note(&format!(
+                                                "(compacted {} turns; ~{}→{} tokens)",
+                                                outcome.dropped_turn_pairs,
+                                                outcome.tokens_before,
+                                                outcome.tokens_after,
+                                            ));
+                                        }
+                                        Ok(None) => {
+                                            term.note(
+                                                "(nothing to compact — not enough history)",
+                                            );
+                                        }
+                                        Err(e) => {
+                                            term.note(&format!("(compact failed: {e})"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Routing::Adapter is only model/reset/compact today;
+                        // any other id here is a registry/handler mismatch.
+                        other => {
+                            tracing::warn!(
+                                ?other,
+                                "adapter-routed slash command has no handler"
+                            );
+                        }
+                    },
+                },
+                None => {
+                    // Unknown verb: legacy `tui` dispatch fallback so a stray
+                    // `/foo` still reaches the client's table instead of the
+                    // model. Known commands never take this path.
+                    let tool_args = match &args {
+                        Some(a) => serde_json::json!({ "command": verb, "args": a }),
+                        None => serde_json::json!({ "command": verb }),
+                    };
+                    let pretty = match &args {
+                        Some(a) => format!("/{verb} {a}"),
+                        None => format!("/{verb}"),
+                    };
+                    let call_id = format!(
+                        "tui-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos())
+                            .unwrap_or(0)
+                    );
+                    emit.emit(SessionEvent::ToolUse {
+                        tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
+                        args: tool_args,
                     });
-                    term.note(&format!(
-                        "(compacted {} turns; ~{}→{} tokens)",
-                        outcome.dropped_turn_pairs, outcome.tokens_before, outcome.tokens_after,
-                    ));
-                }
-                Ok(None) => {
-                    term.note("(nothing to compact — not enough history)");
-                }
-                Err(e) => {
-                    term.note(&format!("(compact failed: {e})"));
+                    emit.emit(SessionEvent::ToolResult {
+                        tool: call_id,
+                        ok: true,
+                        output: pretty,
+                    });
                 }
             }
-            emit_editor_state(&emit, &editor, &queue);
-            continue;
-        }
-        if let Some((name, args)) = parse_slash_command(trimmed) {
-            // Encode as a `tui` tool call so it lives in the same
-            // transcript surface as agent tool calls — the client TUI
-            // subscribes to ToolUse, recognizes the conventional
-            // tool name, and dispatches. We follow up with a
-            // synthetic ToolResult immediately so the trace looks
-            // like any other completed tool call.
-            let tool_args = match &args {
-                Some(a) => serde_json::json!({ "command": name, "args": a }),
-                None => serde_json::json!({ "command": name }),
-            };
-            let pretty = match &args {
-                Some(a) => format!("/{name} {a}"),
-                None => format!("/{name}"),
-            };
-            // Use a deterministic-enough id so a future repeat shows
-            // up as a separate call; the LLM never sees these so
-            // collision tolerance is fine.
-            let call_id = format!(
-                "tui-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0)
-            );
-            emit.emit(SessionEvent::ToolUse {
-                tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
-                args: tool_args,
-            });
-            emit.emit(SessionEvent::ToolResult {
-                tool: call_id,
-                ok: true,
-                output: pretty,
-            });
             emit_editor_state(&emit, &editor, &queue);
             continue;
         }

@@ -333,7 +333,14 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             let sid = arg_str(&args, "session_id")?;
             let from = arg_u64(&args, "from").unwrap_or(0);
             let limit = arg_usize(&args, "limit");
-            serde_json::to_value(client.transcript(&sid, from, limit).await?)?
+            let mut tr = client.transcript(&sid, from, limit).await?;
+            // Strip model-invisible control commands (e.g. `/zoom`) so UI noise
+            // never enters a reading model's context. The policy lives in the
+            // shared slash registry, not a hardcoded tool-name check — this is
+            // the principled fix for the old `tui` ToolUse transcript leak.
+            tr.events
+                .retain(|ev| !agentd_protocol::slash::is_model_hidden(&ev.event));
+            serde_json::to_value(tr)?
         }
         "agentd_get_output" => {
             let sid = arg_str(&args, "session_id")?;

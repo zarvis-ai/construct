@@ -11,6 +11,7 @@ pub mod adapter;
 pub mod agent_context;
 pub mod jsonrpc;
 pub mod paths;
+pub mod slash;
 pub mod transport;
 
 use serde::{Deserialize, Serialize};
@@ -468,6 +469,22 @@ pub enum SessionEvent {
         /// stay out of PTY scrollback.
         #[serde(default)]
         completions: Vec<String>,
+    },
+    /// A client-routed slash command, dispatched by an adapter for the
+    /// attached client to execute (`/zoom`, `/new`, `/remote-control`, …).
+    ///
+    /// Replaces the old `tui` `ToolUse` convention: instead of encoding the
+    /// command as a fake tool call (which forced every consumer to
+    /// string-sniff `"tui"` and accidentally leaked UI noise into
+    /// `agentd_get_transcript`), it carries the typed [`slash::CommandId`].
+    /// The daemon and the transcript-read path look the command's
+    /// [`slash::TranscriptPolicy`] / [`slash::ModelVisibility`] up in
+    /// [`slash::COMMANDS`] and honor it — persistence and model-visibility
+    /// become a property of the command, not a special case.
+    ClientCommand {
+        id: slash::CommandId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        args: Option<String>,
     },
 }
 

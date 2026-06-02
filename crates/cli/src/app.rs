@@ -242,6 +242,7 @@ fn chat_scroll_kind(ev: &SessionEvent) -> ChatScrollKind {
         SessionEvent::Pty { .. }
         | SessionEvent::PtyResize { .. }
         | SessionEvent::EditorState { .. }
+        | SessionEvent::ClientCommand { .. }
         | SessionEvent::AgentStatus(_) => ChatScrollKind::Hidden,
         SessionEvent::Message { role, text }
             if should_render_chat_message_for_scroll(*role, text) =>
@@ -3168,6 +3169,19 @@ impl App {
                                 // Fall through so the transcript still
                                 // records the call for forensics.
                             }
+                        }
+                        // Typed client-routed slash commands. The adapter sent
+                        // a `CommandId`; reconstruct the canonical verb from the
+                        // registry and reuse the same dispatcher as the palette.
+                        if let SessionEvent::ClientCommand { id, args } = &payload.event {
+                            let verb = agentd_protocol::slash::SlashCommand::by_id(*id)
+                                .name
+                                .trim_start_matches('/');
+                            let full = match args {
+                                Some(a) => format!("{verb} {a}"),
+                                None => verb.to_string(),
+                            };
+                            self.run_slash_command(&full).await;
                         }
                         // PTY events: feed into the per-session items history.
                         if let SessionEvent::Pty { .. } = &payload.event {
