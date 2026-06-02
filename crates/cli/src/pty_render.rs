@@ -228,6 +228,18 @@ pub struct ItemHistory {
     /// block's synth bytes change as state evolves (elapsed counter,
     /// expand/collapse, output arrival).
     cached: Option<CachedParser>,
+    /// Clean, structured conversation lines (the harness's own
+    /// `Message` / `Reasoning` events) used to back scroll-up for
+    /// cursor-addressed children. The live view still renders the
+    /// faithful PTY; only the scrollback view reads from here.
+    shadow_messages: Vec<(MessageKind, String)>,
+    /// Number of `shadow_messages` already built into the shadow parser
+    /// and the geometry they were built at — so we only rebuild (to
+    /// reflow at a new width) when messages were appended or cols
+    /// changed.
+    shadow_msg_built: usize,
+    shadow_msg_built_cols: u16,
+    shadow_msg_built_rows: u16,
 }
 
 /// Cached parser + the items-count it was last advanced to. The
@@ -427,6 +439,10 @@ impl ItemHistory {
             pending_tool_results: HashMap::new(),
             dirty: true,
             cached: None,
+            shadow_messages: Vec::new(),
+            shadow_msg_built: 0,
+            shadow_msg_built_cols: 0,
+            shadow_msg_built_rows: 0,
         }
     }
 
@@ -502,6 +518,13 @@ impl ItemHistory {
     /// natural `\r\n` accumulation can populate vt100's
     /// scrollback for the user-visible mouse-scroll-up path.
     fn shadow_feed(&mut self, bytes: &[u8]) {
+        // Once structured messages exist, scroll-up renders from them
+        // (see `render_shadow`). The viewport-snapshot heuristic below is
+        // then both unnecessary and the source of the duplicated-chrome /
+        // fragmented-history bug, so skip it.
+        if self.shadow_msg_mode() {
+            return;
+        }
         // (pattern, target state) — DEC private-mode toggles for
         // alt-screen across the three xterm variants. 1049 is the
         // modern "save+enter+restore" combo, 1047 is "enter and
@@ -538,8 +561,9 @@ impl ItemHistory {
                     self.snapshot_shadow_viewport();
                 }
                 if let Some(len) = csi_sequence_len(&bytes[i..]) {
-                    self.shadow_parser.process(&bytes[i..i + len]);
-                    if shadow_csi_is_snapshot_worthy(&bytes[i..i + len]) {
+                    let seq = &bytes[i..i + len];
+                    self.shadow_parser.process(seq);
+                    if shadow_csi_is_snapshot_worthy(seq) {
                         self.shadow_snapshot_worthy_since_snapshot = true;
                     }
                     i += len;
@@ -609,7 +633,15 @@ impl ItemHistory {
     /// scrollback offset. Cheap: just `set_size` (preserves grid +
     /// scrollback) and `set_scrollback`.
     fn render_shadow(&mut self, cols: u16, rows: u16, scrollback: usize) -> usize {
-        self.set_pty_size(cols, rows);
+        if self.shadow_msg_mode() {
+            // Cursor-addressed child (codex): render scroll-up from the
+            // clean structured message log, reflowed to width.
+            self.rebuild_shadow_from_messages(cols, rows);
+        } else {
+            // Line-oriented child (claude/shell): natural `\r\n`
+            // scrollback via the viewport-snapshot path.
+            self.set_pty_size(cols, rows);
+        }
         self.shadow_parser
             .screen_mut()
             .set_scrollback(super::app::SCROLLBACK_MAX);
@@ -897,6 +929,79 @@ impl ItemHistory {
             break_before,
         });
         self.dirty = true;
+    }
+
+    /// Append a structured conversation line used to back scroll-up for
+    /// cursor-addressed children (codex). Unlike [`feed_message`], this
+    /// does NOT touch `items` / the live view — it only feeds the
+    /// scrollback shadow, so the live PTY render stays faithful and the
+    /// prose isn't double-rendered.
+    pub fn feed_shadow_message(&mut self, kind: MessageKind, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.shadow_messages.push((kind, text.to_string()));
+        self.dirty = true;
+    }
+
+    /// True when scroll-up should render the structured message log
+    /// instead of the viewport-snapshot shadow — i.e. the session has
+    /// structured messages to render.
+    ///
+    /// Any harness whose live view is a redrawing TUI defeats the
+    /// viewport-snapshot reconstruction: codex pins a footer with a
+    /// scroll region (so `vt100` never fills scrollback); claude
+    /// rewrites lines with cursor-up + a bordered input box (so the
+    /// snapshot duplicates answer lines and splices chrome into them).
+    /// When the harness emits structured `Message`s we always have a
+    /// clean, complete source, so prefer it for scroll-up regardless of
+    /// how the child paints. Children that emit no messages (a raw
+    /// shell) keep the natural snapshot path. Tool-block sessions never
+    /// reach here — they take the synth (`replay_full`) path.
+    fn shadow_msg_mode(&self) -> bool {
+        !self.shadow_messages.is_empty()
+    }
+
+    /// (Re)build the shadow parser from `shadow_messages`, reflowing to
+    /// the current width. Messages are plain text (not position-
+    /// dependent), so re-feeding at any width wraps correctly — the
+    /// property the raw PTY stream lacks. Rebuild only when messages
+    /// were appended or the width changed; a rows-only change is a
+    /// cheap `set_size`.
+    fn rebuild_shadow_from_messages(&mut self, cols: u16, rows: u16) {
+        let cols = cols.max(VT100_MIN_DIM);
+        let rows = rows.max(VT100_MIN_DIM);
+        let rebuild = self.shadow_msg_built != self.shadow_messages.len()
+            || self.shadow_msg_built_cols != cols;
+        if rebuild {
+            let mut parser = vt100::Parser::new(rows, cols, super::app::SCROLLBACK_MAX);
+            let mut prev: Option<MessageKind> = None;
+            for (kind, text) in &self.shadow_messages {
+                // Blank line at a user<->assistant turn boundary so the
+                // log reads as a conversation, not a wall of text.
+                if matches!(prev, Some(p) if p != *kind
+                    && (p == MessageKind::User || *kind == MessageKind::User))
+                {
+                    parser.process(b"\r\n");
+                }
+                if *kind == MessageKind::User {
+                    parser.process("\u{276f} ".as_bytes());
+                }
+                parser.process(text.as_bytes());
+                parser.process(b"\r\n");
+                prev = Some(*kind);
+            }
+            self.shadow_parser = parser;
+            self.shadow_msg_built = self.shadow_messages.len();
+            self.shadow_msg_built_cols = cols;
+            self.shadow_msg_built_rows = rows;
+            self.shadow_cols = cols;
+            self.shadow_rows = rows;
+        } else if self.shadow_msg_built_rows != rows {
+            self.shadow_parser.screen_mut().set_size(rows, cols);
+            self.shadow_msg_built_rows = rows;
+            self.shadow_rows = rows;
+        }
     }
 
     fn find_block_mut(&mut self, call_id: &str) -> Option<&mut ToolBlock> {
@@ -2100,6 +2205,149 @@ mod tests {
             .map(|c| c.contents())
             .unwrap_or_default();
         assert_eq!(cell, "h");
+    }
+
+    // Codex-style scroll-up: a cursor-addressed child (it sets a
+    // DECSTBM scroll region) whose raw PTY can't linearize into clean
+    // scrollback. Scroll-up must render the clean structured message
+    // log -- not duplicated chrome / fragmented viewport snapshots.
+    #[test]
+    fn codex_scrollback_renders_clean_message_log() {
+        let mut h = ItemHistory::new();
+        // Child pins a viewport (rows 1..8) -> marks it cursor-addressed.
+        h.feed_pty(b"\x1b[1;8r");
+        // Live PTY chrome the child paints; the OLD snapshot path would
+        // fragment and duplicate this into scrollback.
+        h.feed_pty(b"== codex banner ==\r\nstatus line\r\n");
+        // Structured conversation the adapter emits (user + 40 answers).
+        h.feed_shadow_message(MessageKind::User, "list 1..40");
+        for n in 1..=40 {
+            h.feed_shadow_message(MessageKind::Assistant, &format!("ANSWER {n} of forty"));
+        }
+        let (cols, rows) = (30u16, 8u16);
+        let maxsb = { h.replay(cols, rows, usize::MAX).max_scrollback };
+        assert!(maxsb > 0, "message scrollback should have depth");
+
+        // Top of scrollback = start of the conversation, clean. The bug
+        // showed a duplicated codex banner here instead.
+        let top = { h.replay(cols, rows, maxsb).screen.contents() };
+        assert!(top.contains("list 1..40"), "top should show the prompt; got:\n{top}");
+        assert!(top.contains("ANSWER 1 "), "top should show the first answer; got:\n{top}");
+        assert!(
+            !top.contains("codex banner") && !top.contains("status line"),
+            "message scrollback must exclude raw PTY chrome; got:\n{top}"
+        );
+
+        // Walk the scrollback: the answer lines are recoverable (the bug
+        // lost most of them) and never run together.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut run_together = 0usize;
+        let mut sb = maxsb;
+        while sb > 0 {
+            let contents = { h.replay(cols, rows, sb).screen.contents() };
+            for l in contents.lines() {
+                if l.matches("ANSWER").count() >= 2 {
+                    run_together += 1;
+                }
+                if let Some(rest) = l.trim().strip_prefix("ANSWER ") {
+                    if let Ok(v) = rest.split_whitespace().next().unwrap_or("").parse::<u32>() {
+                        seen.insert(v);
+                    }
+                }
+            }
+            sb -= 1;
+        }
+        assert_eq!(run_together, 0, "answer lines must not be run together");
+        assert!(
+            seen.contains(&1) && seen.len() >= 38,
+            "most/all answer lines should be scrollable; got {} {:?}",
+            seen.len(),
+            seen
+        );
+    }
+
+    /// claude-style child: no scroll region, but it rewrites lines
+    /// with cursor-up + a bordered input box, which makes the
+    /// viewport-snapshot path duplicate answer lines and splice chrome
+    /// into them. With structured messages present, scroll-up renders
+    /// the clean message log instead — no duplicates, no chrome.
+    #[test]
+    fn claude_style_redraw_scrollback_uses_messages() {
+        let mut h = ItemHistory::new();
+        // Simulate claude's redraw: print a few answer lines, then move
+        // the cursor up and repaint a "spinner" line over them (the kind
+        // of churn that makes the snapshot reconstruction duplicate).
+        h.feed_pty(b"1
+2
+3
+");
+        h.feed_pty(b"[2A[2K~ working ~
+");
+        for n in 1..=30u32 {
+            h.feed_pty(format!("{n}
+").as_bytes());
+        }
+        // The harness's structured answer.
+        h.feed_shadow_message(MessageKind::User, "list");
+        for n in 1..=30u32 {
+            h.feed_shadow_message(MessageKind::Assistant, &n.to_string());
+        }
+
+        let (cols, rows) = (24u16, 6u16);
+        let maxsb = h.replay(cols, rows, usize::MAX).max_scrollback;
+        assert!(maxsb > 0, "message-backed scrollback should have depth");
+        // Walk scrollback in non-overlapping windows. Message-mode keeps
+        // each answer on its own line (the snapshot path splices several
+        // onto one line and leaks chrome like the "~ working ~" spinner).
+        let mut distinct = std::collections::BTreeSet::new();
+        let mut chrome = false;
+        let mut run_together = 0usize;
+        let mut sb = maxsb;
+        loop {
+            let c = { h.replay(cols, rows, sb).screen.contents() };
+            for l in c.lines() {
+                if l.contains("working") || l.contains('~') {
+                    chrome = true;
+                }
+                let nums: Vec<u32> = l
+                    .split_whitespace()
+                    .filter_map(|t| t.parse::<u32>().ok())
+                    .filter(|v| (1..=30).contains(v))
+                    .collect();
+                if nums.len() >= 2 {
+                    run_together += 1;
+                }
+                distinct.extend(nums);
+            }
+            if sb == 0 {
+                break;
+            }
+            sb = sb.saturating_sub(rows as usize);
+        }
+        assert!(!chrome, "message scrollback must not splice in PTY chrome");
+        assert_eq!(run_together, 0, "answers must each be on their own line");
+        assert!(
+            distinct.len() >= 28,
+            "most answers should be scrollable; got {}",
+            distinct.len()
+        );
+    }
+
+    /// A raw shell (no structured messages) keeps the natural snapshot
+    /// scrollback path — the message route only kicks in when messages
+    /// exist.
+    #[test]
+    fn shell_session_without_messages_keeps_natural_scrollback() {
+        let mut h = ItemHistory::new();
+        for n in 0..40 {
+            h.feed_pty(format!("row {n}
+").as_bytes());
+        }
+        let out = h.replay(40, 6, 3);
+        assert!(
+            out.max_scrollback > 0,
+            "no-message session should retain natural scrollback"
+        );
     }
 
     // --- zoom/resize freeze regression guards (issue #230) ---

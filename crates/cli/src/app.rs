@@ -3278,12 +3278,23 @@ impl App {
                                 .find(|s| s.id == payload.session_id)
                                 .map(crate::ui::is_headless)
                                 .unwrap_or(false);
+                            let history = self
+                                .histories
+                                .entry(payload.session_id.clone())
+                                .or_default();
                             if headless {
-                                let history = self
-                                    .histories
-                                    .entry(payload.session_id.clone())
-                                    .or_default();
                                 history.feed_message(kind, &text);
+                            } else {
+                                // PTY-backed: the live view stays the
+                                // faithful PTY, but a redrawing harness TUI
+                                // (codex's scroll-region footer, claude's
+                                // cursor-up redraws) doesn't linearize into
+                                // clean scrollback. Feed the structured
+                                // prose into the scroll-up shadow so
+                                // scrolling back shows a clean, complete
+                                // log. A raw shell (no messages) keeps the
+                                // snapshot path.
+                                history.feed_shadow_message(kind, &text);
                             }
                         }
                         // Adapter editor state — drives the fixed
@@ -6758,6 +6769,26 @@ pub fn apply_transcript_to_local_state(
             SessionEvent::Reasoning { text } if is_headless => {
                 history.feed_message(crate::pty_render::MessageKind::Reasoning, text);
             }
+            // PTY-backed (interactive) session: the live view stays the
+            // faithful PTY, but a redrawing harness TUI doesn't linearize
+            // into clean scrollback — codex pins a footer with a scroll
+            // region (so vt100 drops scrolled lines), claude rewrites with
+            // cursor-up + a bordered input box (so the viewport-snapshot
+            // fallback duplicates lines and splices in chrome). Feed the
+            // structured prose into the scroll-up shadow so scrolling back
+            // shows a clean, complete log. The shadow only uses these when
+            // messages exist; a raw shell (no messages) keeps the snapshot
+            // path. (Tool-block sessions take the synth path, not this.)
+            SessionEvent::Message { role, text } => {
+                let kind = match role {
+                    agentd_protocol::MessageRole::User => crate::pty_render::MessageKind::User,
+                    _ => crate::pty_render::MessageKind::Assistant,
+                };
+                history.feed_shadow_message(kind, text);
+            }
+            SessionEvent::Reasoning { text } => {
+                history.feed_shadow_message(crate::pty_render::MessageKind::Reasoning, text);
+            }
             _ => {}
         }
     }
@@ -9271,6 +9302,117 @@ mod tests {
             "TaskStart must be forwarded to ItemHistory::feed_task_start. \
              Without it, fresh-TUI bootstrap of an existing zarvis session \
              rebuilds history with no tool blocks. Got render:\n{text}",
+        );
+    }
+
+    /// A PTY harness session whose raw stream doesn't linearize into
+    /// clean scrollback (here codex, which pins a footer with a DECSTBM
+    /// scroll region). On reconnect, scroll-up must render the clean
+    /// structured Message log; the live view stays the faithful PTY.
+    #[test]
+    fn pty_session_scrollback_uses_message_log() {
+        use agentd_protocol::{MessageRole, SessionEvent, TimestampedEvent};
+        use chrono::Utc;
+        fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
+            TimestampedEvent {
+                seq,
+                at: Utc::now(),
+                event,
+            }
+        }
+        let mut events = vec![
+            // codex sets a scroll region (pins its input box) -> the
+            // ItemHistory marks the session cursor-addressed.
+            ev(1, SessionEvent::pty(b"\x1b[1;8r== codex banner ==\r\nstatus\r\n")),
+            ev(
+                2,
+                SessionEvent::Message {
+                    role: MessageRole::User,
+                    text: "list 1..30".into(),
+                },
+            ),
+        ];
+        for n in 1..=30u64 {
+            events.push(ev(
+                2 + n,
+                SessionEvent::Message {
+                    role: MessageRole::Assistant,
+                    text: format!("ANSWER {n} of thirty"),
+                },
+            ));
+        }
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        let mut editor: Option<EditorState> = None;
+        let mut status: Option<agentd_protocol::AgentStatus> = None;
+        let mut ui_panels = HashMap::new();
+        apply_transcript_to_local_state(
+            &events,
+            &mut history,
+            &mut editor,
+            &mut status,
+            &mut ui_panels,
+            /* is_headless */ false,
+        );
+
+        let (cols, rows) = (40u16, 8u16);
+        let dump = |h: &mut crate::pty_render::ItemHistory, sb: usize| -> String {
+            let out = h.replay(cols, rows, sb);
+            (0..rows)
+                .map(|r| {
+                    let mut s = String::new();
+                    for c in 0..cols {
+                        if let Some(cell) = out.screen.cell(r, c) {
+                            s.push_str(&cell.contents());
+                        }
+                    }
+                    s.trim_end().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let maxsb = history.replay(cols, rows, usize::MAX).max_scrollback;
+        assert!(maxsb > 0, "scroll-up should have message-backed scrollback");
+
+        // Top of scrollback = clean conversation start. The `❯` prefix
+        // proves it's the message render (raw codex uses `›`), and the
+        // raw PTY banner must not pollute it.
+        let top = dump(&mut history, maxsb);
+        assert!(
+            top.contains('\u{276f}') && top.contains("list 1..30"),
+            "scroll-up should render the structured message log; got:\n{top}"
+        );
+        assert!(
+            !top.contains("codex banner") && !top.contains("status"),
+            "message scrollback must exclude raw PTY chrome; got:\n{top}"
+        );
+
+        // Early answers (the ones the snapshot path lost) are scrollable.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut sb = maxsb;
+        while sb > 0 {
+            for l in dump(&mut history, sb).lines() {
+                if let Some(rest) = l.trim().strip_prefix("ANSWER ") {
+                    if let Ok(v) = rest.split_whitespace().next().unwrap_or("").parse::<u32>() {
+                        seen.insert(v);
+                    }
+                }
+            }
+            sb -= 1;
+        }
+        assert!(
+            seen.contains(&1) && seen.len() >= 27,
+            "most answer lines should be scrollable; got {} {:?}",
+            seen.len(),
+            seen
+        );
+
+        // The live view (scroll=0) stays the faithful PTY, not messages.
+        let live = dump(&mut history, 0);
+        assert!(
+            live.contains("codex banner") || live.contains("status"),
+            "live view must remain the raw PTY; got:\n{live}"
         );
     }
 
