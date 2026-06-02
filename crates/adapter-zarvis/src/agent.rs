@@ -1345,8 +1345,8 @@ impl ResolvedModel {
 /// model name. Order of precedence:
 ///   1. `params.model` if provided.
 ///   2. `AGENTD_ZARVIS_MODEL`.
-///   3. ANTHROPIC_API_KEY set → `claude-haiku-4-5`.
-///   4. OPENAI_API_KEY set → `gpt-5-mini`.
+///   3. ANTHROPIC_API_KEY set → `claude-opus-4-8`.
+///   4. OPENAI_API_KEY set → `gpt-5`.
 ///   5. fall through to Ollama with `llama3.1`.
 pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
     let spec_str = params
@@ -1356,9 +1356,9 @@ pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
         .or_else(|| std::env::var("AGENTD_ZARVIS_MODEL").ok())
         .unwrap_or_else(|| {
             if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-                "anthropic:claude-haiku-4-5".to_string()
+                "anthropic:claude-opus-4-8".to_string()
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
-                "openai:gpt-5-mini".to_string()
+                "openai:gpt-5".to_string()
             } else {
                 "ollama:llama3.1".to_string()
             }
