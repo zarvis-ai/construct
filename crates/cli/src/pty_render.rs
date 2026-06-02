@@ -987,7 +987,12 @@ impl ItemHistory {
                 if *kind == MessageKind::User {
                     parser.process("\u{276f} ".as_bytes());
                 }
-                parser.process(text.as_bytes());
+                // Message text uses bare `\n`; vt100 treats that as a
+                // line feed only (down, no carriage return), so without
+                // normalizing to `\r\n` every wrapped/multi-line message
+                // staircases to the right. (`synth_message` does the
+                // same for the headless render path.)
+                parser.process(text.replace('\n', "\r\n").as_bytes());
                 parser.process(b"\r\n");
                 prev = Some(*kind);
             }
@@ -2348,6 +2353,45 @@ mod tests {
             out.max_scrollback > 0,
             "no-message session should retain natural scrollback"
         );
+    }
+
+    /// Messages carry bare `\n` line feeds (codex/claude emit multi-line
+    /// prose). Each line of a multi-line message must render at column 0,
+    /// not staircase to the right (the bug from the first cut, which fed
+    /// `\n` to vt100 without the `\r`).
+    #[test]
+    fn multiline_message_lines_start_at_column_zero() {
+        let mut h = ItemHistory::new();
+        // A single message with many bare-`\n` lines (enough to overflow
+        // the viewport so the shadow has scrollback to show).
+        let msg = (1..=14)
+            .map(|n| format!("line{n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.feed_shadow_message(MessageKind::Assistant, &msg);
+        let (cols, rows) = (40u16, 6u16);
+        let maxsb = h.replay(cols, rows, usize::MAX).max_scrollback;
+        assert!(maxsb > 0, "need scrollback depth to exercise the shadow");
+        // Top window: each message line must sit at column 0 (the trimmed
+        // row equals the line). The staircase bug left them indented.
+        let out = h.replay(cols, rows, maxsb);
+        let top: Vec<String> = (0..rows)
+            .map(|r| {
+                let mut s = String::new();
+                for c in 0..cols {
+                    if let Some(cell) = out.screen.cell(r, c) {
+                        s.push_str(&cell.contents());
+                    }
+                }
+                s.trim_end().to_string()
+            })
+            .collect();
+        for word in ["line01", "line02", "line03"] {
+            assert!(
+                top.iter().any(|l| l == word),
+                "'{word}' must render alone at column 0 (no staircase); top: {top:?}"
+            );
+        }
     }
 
     // --- zoom/resize freeze regression guards (issue #230) ---
