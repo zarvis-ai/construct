@@ -5109,6 +5109,24 @@ impl App {
                 }
                 return;
             }
+            // PageUp/PageDown page the TUI scrollback even while the PTY is
+            // captured (same effect as the `C-x [` / `C-x ]` chords) instead
+            // of being forwarded to the child. Guarded to a plain press with
+            // no chord in flight, so a mid-chord key still reaches the keymap.
+            // Tradeoff: a full-screen program in the PTY (less, vim, man) no
+            // longer receives bare PageUp/PageDown — scrollback wins.
+            if self.chord_state.is_empty()
+                && key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            {
+                let action = if matches!(key.code, KeyCode::PageUp) {
+                    KeyAction::ScrollPageUp
+                } else {
+                    KeyAction::ScrollPageDown
+                };
+                self.run_action(action).await;
+                return;
+            }
             if self.chord_state.is_empty() && !is_ctrl_x {
                 // Typing snaps the view back to live: it's confusing to
                 // type "into the past" while reading scrollback.
@@ -8109,6 +8127,29 @@ mod tests {
         assert_eq!(
             app.view_scrollback, 10,
             "C-x [ should page PTY scrollback up in a codex terminal view"
+        );
+    }
+
+    /// PageUp/PageDown page the TUI scrollback even while the PTY is captured,
+    /// instead of being forwarded to the child — same effect as `C-x [` / `]`.
+    #[tokio::test]
+    async fn pageup_pagedown_scroll_captured_pty_view() {
+        let (mut app, _dir, _srv) = captured_app().await;
+        app.sessions[0].harness = "codex".into();
+        app.view_scrollback = 0;
+
+        app.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.view_scrollback, 10,
+            "PageUp should page PTY scrollback up in a captured terminal view"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.view_scrollback, 0,
+            "PageDown should page PTY scrollback back down"
         );
     }
 

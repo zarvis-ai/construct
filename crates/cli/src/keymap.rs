@@ -316,6 +316,8 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('x'), ch('t')]), ToggleView),
         (Chord(vec![ctrl('x'), ch('[')]), ScrollPageUp),
         (Chord(vec![ctrl('x'), ch(']')]), ScrollPageDown),
+        (Chord(vec![key(KeyCode::PageUp)]), ScrollPageUp),
+        (Chord(vec![key(KeyCode::PageDown)]), ScrollPageDown),
         (Chord(vec![ctrl('x'), ch('{')]), ScrollTop),
         (Chord(vec![ctrl('x'), shift('{')]), ScrollTop),
         (Chord(vec![ctrl('x'), ch('}')]), ScrollBottom),
@@ -430,5 +432,26 @@ mod tests {
             resolve(&km, vec![ctrl('x'), shift('}')]),
             KeymapResult::Action(KeyAction::ScrollBottom)
         ));
+    }
+
+    #[test]
+    fn pageup_pagedown_page_scroll_in_both_profiles() {
+        for profile in [Profile::Emacs, Profile::Vim] {
+            let km = default_for(profile);
+            assert!(
+                matches!(
+                    resolve(&km, vec![key(KeyCode::PageUp)]),
+                    KeymapResult::Action(KeyAction::ScrollPageUp)
+                ),
+                "PageUp should page up (like C-x [) in {profile:?}"
+            );
+            assert!(
+                matches!(
+                    resolve(&km, vec![key(KeyCode::PageDown)]),
+                    KeymapResult::Action(KeyAction::ScrollPageDown)
+                ),
+                "PageDown should page down (like C-x ]) in {profile:?}"
+            );
+        }
     }
 }
