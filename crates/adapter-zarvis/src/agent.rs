@@ -161,13 +161,13 @@ impl<'a> TextSink for MessageSink<'a> {
 pub(crate) const SYSTEM_PROMPT_USER: &str = r#"You are zarvis, an AI agent embedded in agentd (a multi-session terminal agent fleet).
 
 You have access to:
-- Local tools: shell, read_file, write_file, edit_file, list_dir, find_files.
+- Local tools: shell (run any command — read files with `cat`/`sed -n`, search with `rg`/`grep`, list with `ls`, run tests, git), edit_file (apply one or many find/replace hunks across files; also creates files), write_stdin (drive an interactive process started by `shell interactive:true`).
 - Agentd-control tools (prefix `agentd_`) for inspecting and steering other agentd sessions running on this host.
 - Subagent tools (`agentd_subagent_*`) for delegating bounded work to child agents nested under the current session when the user asks you to split or parallelize work.
 
 When the user says "subagent", default to `agentd_subagent_create`: a child agent parented to the current session and shown nested under it. Use `agentd_create_session` only when the user asks for a "new session", a top-level/visible session, or otherwise wants an independent fleet session.
 
-Prefer the most specific tool: `read_file` over `shell cat`, `list_dir` over `shell ls`, etc. The shell tool runs `bash -lc` with a default 30s timeout.
+Read, search, and list through `shell` (`cat`/`sed -n`, `rg`/`grep`, `ls`); batch independent reads into a single command, or issue them as parallel tool calls, rather than one round-trip per file. Change files with `edit_file` — prefer one call carrying several hunks (and across files) over many small single-hunk calls. The shell tool runs `bash -lc` with a default 30s timeout.
 
 You are running with the user's permissions. The user must approve every Risky tool call unless the session is in `unsafe-auto`. When a tool is denied, do not retry it without revising the approach — explain what alternative you'd take instead, or ask the user a clarifying question.
 
@@ -189,7 +189,7 @@ When the user says "subagent", default to `agentd_subagent_create`: a child agen
 
 If the user asks about code in a specific session, suggest they `C-x o` into it, or surface relevant snippets via `agentd_get_diff` / `agentd_get_output`. Don't try to edit code in another session's worktree — talk to that session instead.
 
-You also have local tools (shell, read_file, etc.) for quick host-level questions, but use them sparingly. The user has dedicated sessions for real work; you are the dispatcher.
+You also have local tools (shell, edit_file, write_stdin) for quick host-level questions, but use them sparingly. The user has dedicated sessions for real work; you are the dispatcher.
 
 LONG-RUNNING TOOLS: a tool result of exactly "(running in background; will report when complete)" means the tool exceeded the foreground time budget and is still running. Don't retry it. Don't poll. Continue with whatever you can do without that result. You'll receive an `OBSERVATION:` message with the real output later — react to that observation when it arrives, ideally with a short summary or a `noted` if no action is needed.
 
@@ -222,6 +222,7 @@ pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
         session_id: src.session_id.clone(),
         client: tokio::sync::OnceCell::new(),
         emit: src.emit.clone(),
+        procs: src.procs.clone(),
     };
     if let Some(c) = src.client.get() {
         let _ = new_ctx.client.set(c.clone());
@@ -425,6 +426,7 @@ pub async fn run(
         session_id: session_id.clone(),
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
+        procs: Arc::new(crate::tools::proc::ProcRegistry::default()),
     };
 
     // Per-session message persistence (`zarvis.jsonl`). On resume,
@@ -1266,6 +1268,7 @@ async fn run_with_interrupt(
     let cwd = ctx.cwd.clone();
     let session_id = ctx.session_id.clone();
     let emit = ctx.emit.clone();
+    let procs = ctx.procs.clone();
     let client_cell = std::sync::Mutex::new(None::<Arc<agentd_client::Client>>);
     if let Some(c) = ctx.client.get() {
         *client_cell.lock().unwrap() = Some(c.clone());
@@ -1276,6 +1279,7 @@ async fn run_with_interrupt(
             session_id,
             client: tokio::sync::OnceCell::new(),
             emit,
+            procs,
         };
         if let Some(c) = client_cell.lock().unwrap().clone() {
             let _ = local_ctx.client.set(c);

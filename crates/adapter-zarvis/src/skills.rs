@@ -72,7 +72,7 @@ pub(crate) fn format_section(cwd: &Path) -> Option<String> {
 
     let mut out = String::from(
         "## Agent skills\n\n\
-         The user has Codex/Claude-style agent skills installed. Use a skill when the user explicitly names it, or when the task clearly matches its description. Before using a skill, read its `SKILL.md` with `read_file` and follow that file's workflow. Resolve referenced scripts, assets, and relative paths from the directory containing that `SKILL.md`. Load only the skill you need, and only the referenced files needed for the task. If a skill requires a tool that Zarvis does not have, explain the limitation and continue with the closest available workflow.\n\n\
+         The user has Codex/Claude-style agent skills installed. Use a skill when the user explicitly names it, or when the task clearly matches its description. Before using a skill, read its `SKILL.md` with `shell` (e.g. `cat`) and follow that file's workflow. Resolve referenced scripts, assets, and relative paths from the directory containing that `SKILL.md`. Load only the skill you need, and only the referenced files needed for the task. If a skill requires a tool that Zarvis does not have, explain the limitation and continue with the closest available workflow.\n\n\
          Available skills:\n",
     );
     for skill in skills {
@@ -282,7 +282,7 @@ metadata:
     }
 
     #[test]
-    fn format_section_mentions_read_file_and_paths() {
+    fn format_section_mentions_skill_md_and_paths() {
         let _g = ENV_LOCK.lock().unwrap();
         let tmp = tempdir();
         std::env::set_var("CODEX_HOME", &tmp);
@@ -294,7 +294,7 @@ metadata:
         let section = format_section(&tmp).unwrap();
         std::env::remove_var("CODEX_HOME");
 
-        assert!(section.contains("read_file"));
+        assert!(section.contains("SKILL.md"));
         assert!(section.contains("openai-docs"));
         assert!(section.contains(&path.display().to_string()));
     }

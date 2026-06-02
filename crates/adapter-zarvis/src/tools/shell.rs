@@ -20,17 +20,22 @@ impl Tool for Shell {
     }
     fn description(&self) -> &str {
         "Run a shell command via `bash -lc`. Captures stdout, stderr, and exit code. \
-         Honors a per-call timeout (default 30s). Use this for ad-hoc system queries \
-         and one-off scripts; prefer dedicated tools (read_file, list_dir, find_files) \
-         for their use cases."
+         Honors a per-call timeout (default 30s); a one-off command that exceeds it is \
+         killed. Use this for everything filesystem- and system-related: read files \
+         (`cat`/`sed -n`), search (`grep`/`rg`), list (`ls`), run tests, git, etc. \
+         Batch independent reads into one call (or issue them as parallel tool calls). \
+         Set `interactive: true` to start a long-lived process (a REPL or a command \
+         that prompts for input) instead of killing it at the timeout: the call returns \
+         a `session_id` after a brief wait, and you then drive it with `write_stdin`."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "command":     { "type": "string", "description": "Shell command line; passed to `bash -lc`." },
-                "timeout_sec": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30 },
-                "cwd":         { "type": "string", "description": "Working directory (defaults to the session's cwd)." }
+                "timeout_sec": { "type": "integer", "minimum": 1, "maximum": 600, "default": 30, "description": "Kill the (non-interactive) command after this many seconds." },
+                "cwd":         { "type": "string", "description": "Working directory (defaults to the session's cwd)." },
+                "interactive": { "type": "boolean", "default": false, "description": "Keep the process alive as a session for use with write_stdin, instead of killing it at the timeout." }
             },
             "required": ["command"]
         })
@@ -73,6 +78,27 @@ impl Tool for Shell {
                     cwd.display()
                 ),
             });
+        }
+
+        let interactive = input
+            .get("interactive")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
+        if interactive {
+            // Start a persistent session; return after a brief wait so the
+            // model can drive it via write_stdin. The process is NOT killed
+            // at timeout_sec — it lives until it exits or the session ends.
+            let id = match ctx.procs.spawn(&cwd, cmd).await {
+                Ok(id) => id,
+                Err(e) => {
+                    return Ok(ToolOutcome {
+                        ok: false,
+                        output: format!("shell: failed to start interactive session: {e}\n"),
+                    })
+                }
+            };
+            let drain = ctx.procs.drain(&id, INTERACTIVE_START_WAIT).await;
+            return Ok(format_session(&id, drain, true));
         }
 
         let mut child = Command::new("bash")
@@ -143,6 +169,107 @@ fn format_output(stdout: &str, stderr: &str, exit_code: i32) -> String {
     out
 }
 
+/// How long `shell interactive: true` waits for the process to produce its
+/// first output (e.g. a prompt) before returning the session handle.
+const INTERACTIVE_START_WAIT: Duration = Duration::from_secs(3);
+
+/// `write_stdin` tool — feed input to a process started by `shell` with
+/// `interactive: true`, then return any new output.
+pub struct WriteStdin;
+
+#[async_trait]
+impl Tool for WriteStdin {
+    fn name(&self) -> &str {
+        "write_stdin"
+    }
+    fn description(&self) -> &str {
+        "Send input to a running interactive session started by `shell` with \
+         interactive=true. Writes `data` to the process's stdin verbatim — include a \
+         trailing newline to submit a line. Set `eof: true` to close stdin (signals \
+         end-of-input, which many programs need to finish). Waits up to `timeout_sec` \
+         for output and returns whatever the process emitted since the last call. The \
+         session ends automatically when the process exits."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id":  { "type": "string", "description": "Session id returned by `shell` with interactive=true." },
+                "data":        { "type": "string", "default": "", "description": "Bytes to write to stdin (include \\n to submit a line). Empty = just poll for new output." },
+                "eof":         { "type": "boolean", "default": false, "description": "Close stdin after writing (sends EOF)." },
+                "timeout_sec": { "type": "integer", "minimum": 1, "maximum": 600, "default": 5, "description": "How long to wait for output before returning." }
+            },
+            "required": ["session_id"]
+        })
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Risky
+    }
+    fn args_summary(&self, input: &Value) -> String {
+        let id = input.get("session_id").and_then(|s| s.as_str()).unwrap_or("?");
+        let data = input.get("data").and_then(|s| s.as_str()).unwrap_or("");
+        let eof = input.get("eof").and_then(|b| b.as_bool()).unwrap_or(false);
+        let preview: String = data.chars().take(60).collect();
+        format!("{id} <- {preview:?}{}", if eof { " +EOF" } else { "" })
+    }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let id = input
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'session_id'"))?;
+        let data = input.get("data").and_then(|s| s.as_str()).unwrap_or("");
+        let eof = input.get("eof").and_then(|b| b.as_bool()).unwrap_or(false);
+        let timeout_sec = input
+            .get("timeout_sec")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(5)
+            .clamp(1, 600);
+        match ctx
+            .procs
+            .write(id, data, eof, Duration::from_secs(timeout_sec))
+            .await
+        {
+            Some(drain) => Ok(format_session(id, Some(drain), false)),
+            None => Ok(ToolOutcome {
+                ok: false,
+                output: format!("write_stdin: no live session '{id}' (it may have exited)\n"),
+            }),
+        }
+    }
+}
+
+/// Render a process drain (or its absence) into a tool outcome — shared by
+/// `shell interactive` (start) and `write_stdin` (continue).
+fn format_session(id: &str, drain: Option<super::proc::Drain>, starting: bool) -> ToolOutcome {
+    let Some(drain) = drain else {
+        return ToolOutcome {
+            ok: false,
+            output: format!("session '{id}' not found\n"),
+        };
+    };
+    let mut out = String::new();
+    if starting {
+        out.push_str(&format!("session_id: {id}\n"));
+    }
+    if !drain.output.is_empty() {
+        out.push_str("output:\n");
+        out.push_str(&drain.output);
+        if !drain.output.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    match drain.exit_code {
+        Some(code) => out.push_str(&format!("exit_code: {code} (session ended)\n")),
+        None => out.push_str(&format!(
+            "status: running (use write_stdin with session_id={id})\n"
+        )),
+    }
+    ToolOutcome {
+        ok: drain.exit_code.map(|c| c == 0).unwrap_or(true),
+        output: out,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,6 +281,7 @@ mod tests {
             session_id: "test".to_string(),
             client: tokio::sync::OnceCell::new(),
             emit: None,
+            procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
         }
     }
 
@@ -201,5 +329,53 @@ mod tests {
             outcome.output
         );
         assert!(outcome.output.contains("exit_code: 0"));
+    }
+
+    #[tokio::test]
+    async fn interactive_shell_and_write_stdin_roundtrip() {
+        let ctx = ctx_with_cwd(std::env::temp_dir());
+        let start = Shell
+            .run(json!({"command": "cat", "interactive": true}), &ctx)
+            .await
+            .expect("run returns Ok");
+        assert!(
+            start.output.contains("session_id: proc-"),
+            "expected a session id: {}",
+            start.output
+        );
+        assert!(
+            start.output.contains("status: running"),
+            "cat should still be running: {}",
+            start.output
+        );
+        let id = start
+            .output
+            .lines()
+            .find_map(|l| l.strip_prefix("session_id: "))
+            .expect("session id line")
+            .to_string();
+
+        let echoed = WriteStdin
+            .run(
+                json!({"session_id": id, "data": "ping\n", "timeout_sec": 1}),
+                &ctx,
+            )
+            .await
+            .expect("run returns Ok");
+        assert!(
+            echoed.output.contains("ping"),
+            "cat should echo stdin: {}",
+            echoed.output
+        );
+
+        let done = WriteStdin
+            .run(json!({"session_id": id, "eof": true, "timeout_sec": 1}), &ctx)
+            .await
+            .expect("run returns Ok");
+        assert!(
+            done.output.contains("exit_code: 0"),
+            "closing stdin should let cat exit: {}",
+            done.output
+        );
     }
 }

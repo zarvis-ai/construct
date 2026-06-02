@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub mod agentd;
 pub mod browser;
 pub mod fs;
+pub mod proc;
 pub mod shell;
 pub mod subagent;
 
@@ -64,7 +65,7 @@ fn auto_approve_covers(tool_name: &str, input: &Value, cwd: &std::path::Path) ->
     // Only path-targeted file writes are eligible. Shell, browser, subagent,
     // and agentd-control tools are Risky for reasons unrelated to a file
     // path and must keep their gate.
-    if !matches!(tool_name, "write_file" | "edit_file") {
+    if tool_name != "edit_file" {
         return false;
     }
     let Some(rel) = input.get("path").and_then(|v| v.as_str()) else {
@@ -86,6 +87,11 @@ pub struct ToolCtx {
     pub session_id: String,
     pub client: tokio::sync::OnceCell<Arc<Client>>,
     pub emit: Option<EventEmitter>,
+    /// Persistent interactive process sessions, shared across every
+    /// `ToolCtx` in a session so `write_stdin` can reach a process that an
+    /// earlier `shell` call started. Cloned (not re-created) by
+    /// [`crate::agent::clone_tool_ctx`] and the parallel-call paths.
+    pub procs: Arc<proc::ProcRegistry>,
 }
 
 pub struct ToolRegistry {
@@ -95,12 +101,12 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     pub fn with_defaults() -> Self {
         let tools: Vec<Box<dyn Tool>> = vec![
+            // Codex-style minimal coding surface: a shell (for reads,
+            // search, tests — `cat`/`rg`/`ls`/...), a multi-hunk patch
+            // editor, and stdin for interactive sessions the shell starts.
             Box::new(shell::Shell),
-            Box::new(fs::ReadFile),
-            Box::new(fs::WriteFile),
+            Box::new(shell::WriteStdin),
             Box::new(fs::EditFile),
-            Box::new(fs::ListDir),
-            Box::new(fs::FindFiles),
             // Chrome DevTools browser tools
             Box::new(browser::BrowserOpen),
             Box::new(browser::BrowserInspect),
@@ -242,16 +248,11 @@ mod tests {
         std::env::set_var(ENV_AUTO_APPROVE_PATHS, &widgets);
 
         let cwd = std::path::PathBuf::from("/some/proj");
-        let write = fs::WriteFile;
         let edit = fs::EditFile;
         let shell = shell::Shell;
 
-        // Write into the widget dir → downgraded to Safe (no approval gate).
+        // Edit into the widget dir → downgraded to Safe (no approval gate).
         let widget_path = widgets.join("status.md");
-        assert!(matches!(
-            effective_risk(&write, &json!({ "path": widget_path.to_string_lossy() }), &cwd),
-            ToolRisk::Safe
-        ));
         assert!(matches!(
             effective_risk(
                 &edit,
@@ -261,9 +262,13 @@ mod tests {
             ToolRisk::Safe
         ));
 
-        // Write outside the widget dir → keeps its Risky gate.
+        // Edit outside the widget dir → keeps its Risky gate.
         assert!(matches!(
-            effective_risk(&write, &json!({ "path": "/some/proj/other.md" }), &cwd),
+            effective_risk(
+                &edit,
+                &json!({ "path": "/some/proj/other.md", "find": "a", "replace": "b" }),
+                &cwd,
+            ),
             ToolRisk::Risky
         ));
 

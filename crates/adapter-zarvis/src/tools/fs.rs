@@ -1,12 +1,14 @@
-//! Filesystem tools — read/write/edit a file, list a directory, and
-//! a basic find-by-glob. Designed to obviate the most common shell
-//! incantations so the agent doesn't have to escape strings.
+//! Filesystem editing — `edit_file` applies one or more find/replace hunks
+//! to files (and creates new ones), atomically. Reading, listing, and
+//! searching go through the `shell` tool (`cat`/`sed`/`ls`/`rg`); this is the
+//! codex-style minimal surface (`shell` + `edit_file` + `write_stdin`).
 
 use super::{Tool, ToolCtx, ToolOutcome};
 use agentd_protocol::ToolRisk;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub(crate) fn resolve(cwd: &std::path::Path, p: &str) -> PathBuf {
@@ -18,131 +20,23 @@ pub(crate) fn resolve(cwd: &std::path::Path, p: &str) -> PathBuf {
     }
 }
 
-pub struct ReadFile;
-
-#[async_trait]
-impl Tool for ReadFile {
-    fn name(&self) -> &str {
-        "read_file"
-    }
-    fn description(&self) -> &str {
-        "Read a UTF-8 text file. Use `start_line`/`end_line` (1-based, inclusive) to \
-         page through large files. Returns the file's bytes lossily decoded."
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path":       { "type": "string" },
-                "start_line": { "type": "integer", "minimum": 1 },
-                "end_line":   { "type": "integer", "minimum": 1 }
-            },
-            "required": ["path"]
-        })
-    }
-    fn risk(&self) -> ToolRisk {
-        ToolRisk::Safe
-    }
-    fn args_summary(&self, input: &Value) -> String {
-        input
-            .get("path")
-            .and_then(|s| s.as_str())
-            .unwrap_or("(missing path)")
-            .to_string()
-    }
-    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        let path = input
-            .get("path")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
-        let path = resolve(&ctx.cwd, path);
-        let start = input.get("start_line").and_then(|n| n.as_u64()).map(|n| n as usize);
-        let end = input.get("end_line").and_then(|n| n.as_u64()).map(|n| n as usize);
-
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) => {
-                return Ok(ToolOutcome {
-                    ok: false,
-                    output: format!("read {}: {e}", path.display()),
-                });
-            }
-        };
-        let text = String::from_utf8_lossy(&bytes);
-        let out = match (start, end) {
-            (None, None) => text.to_string(),
-            (s, e) => {
-                let lines: Vec<&str> = text.lines().collect();
-                let s = s.unwrap_or(1).saturating_sub(1);
-                let e = e.unwrap_or(lines.len()).min(lines.len());
-                let s = s.min(e);
-                lines[s..e].join("\n")
-            }
-        };
-        Ok(ToolOutcome { ok: true, output: out })
-    }
-}
-
-pub struct WriteFile;
-
-#[async_trait]
-impl Tool for WriteFile {
-    fn name(&self) -> &str {
-        "write_file"
-    }
-    fn description(&self) -> &str {
-        "Write `contents` to `path`, creating parent directories as needed. \
-         Overwrites any existing file."
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "path":     { "type": "string" },
-                "contents": { "type": "string" }
-            },
-            "required": ["path", "contents"]
-        })
-    }
-    fn risk(&self) -> ToolRisk {
-        ToolRisk::Risky
-    }
-    fn args_summary(&self, input: &Value) -> String {
-        let p = input.get("path").and_then(|s| s.as_str()).unwrap_or("(missing path)");
-        let n = input
-            .get("contents")
-            .and_then(|s| s.as_str())
-            .map(|s| s.len())
-            .unwrap_or(0);
-        format!("{} ({} bytes)", p, n)
-    }
-    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        let path = input
-            .get("path")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
-        let contents = input
-            .get("contents")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'contents'"))?;
-        let path = resolve(&ctx.cwd, path);
-        if let Some(parent) = path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        match tokio::fs::write(&path, contents).await {
-            Ok(_) => Ok(ToolOutcome {
-                ok: true,
-                output: format!("wrote {} ({} bytes)", path.display(), contents.len()),
-            }),
-            Err(e) => Ok(ToolOutcome {
-                ok: false,
-                output: format!("write {}: {e}", path.display()),
-            }),
-        }
-    }
-}
-
 pub struct EditFile;
+
+/// One normalized find/replace against a resolved path.
+struct Hunk {
+    path: PathBuf,
+    find: String,
+    replace: String,
+}
+
+/// A file's computed new contents, ready to write in phase 2.
+struct Pending {
+    path: PathBuf,
+    new_text: String,
+    created: bool,
+    replacements: usize,
+    preview: String,
+}
 
 #[async_trait]
 impl Tool for EditFile {
@@ -150,291 +44,263 @@ impl Tool for EditFile {
         "edit_file"
     }
     fn description(&self) -> &str {
-        "Replace exactly one occurrence of `find` with `replace` in `path`. \
-         Errors if `find` is not present or appears more than once — caller \
-         must include enough surrounding context to make the match unique."
+        "Apply edits to files. Single edit: pass `path`, `find`, `replace` — replaces \
+         exactly one occurrence of `find` (must be unique; include surrounding context). \
+         Multi-hunk / multi-file: pass `edits`, a list of `{find, replace, path?}` applied \
+         in order — each `find` matches against the file as modified by earlier edits in \
+         the same call, and an edit's `path` overrides the top-level `path`. To create a \
+         new file, target a non-existent `path` with an empty `find` and the file's \
+         contents in `replace`. All hunks are validated first and applied atomically: if \
+         any `find` fails to match (or matches more than once), nothing is written."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path":    { "type": "string" },
-                "find":    { "type": "string" },
-                "replace": { "type": "string" }
-            },
-            "required": ["path", "find", "replace"]
+                "path":    { "type": "string", "description": "Target file. Default for single-edit mode and for `edits` that omit their own path." },
+                "find":    { "type": "string", "description": "Text to replace (single-edit mode). Empty `find` on a non-existent path creates the file." },
+                "replace": { "type": "string", "description": "Replacement text (single-edit mode), or the new file's contents when creating." },
+                "edits": {
+                    "type": "array",
+                    "description": "Multiple edits, applied top-to-bottom.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "path":    { "type": "string" },
+                            "find":    { "type": "string" },
+                            "replace": { "type": "string" }
+                        },
+                        "required": ["find", "replace"]
+                    }
+                }
+            }
         })
     }
     fn risk(&self) -> ToolRisk {
         ToolRisk::Risky
     }
     fn args_summary(&self, input: &Value) -> String {
-        input.get("path").and_then(|s| s.as_str()).unwrap_or("(missing path)").to_string()
+        if let Some(edits) = input.get("edits").and_then(|e| e.as_array()) {
+            let mut paths: std::collections::BTreeSet<&str> = edits
+                .iter()
+                .filter_map(|e| e.get("path").and_then(|p| p.as_str()))
+                .collect();
+            if let Some(p) = input.get("path").and_then(|p| p.as_str()) {
+                paths.insert(p);
+            }
+            format!(
+                "{} edits across {} file(s)",
+                edits.len(),
+                paths.len().max(1)
+            )
+        } else {
+            input
+                .get("path")
+                .and_then(|s| s.as_str())
+                .unwrap_or("(missing path)")
+                .to_string()
+        }
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        let path = input
-            .get("path")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
-        let find = input
-            .get("find")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'find'"))?;
-        let replace = input
-            .get("replace")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'replace'"))?;
-        let path = resolve(&ctx.cwd, path);
-        let bytes = match tokio::fs::read(&path).await {
-            Ok(b) => b,
-            Err(e) => {
+        let default_path = input.get("path").and_then(|s| s.as_str());
+
+        // Normalize the request into a flat list of resolved hunks.
+        let mut hunks: Vec<Hunk> = Vec::new();
+        if let Some(edits) = input.get("edits").and_then(|e| e.as_array()) {
+            if edits.is_empty() {
                 return Ok(ToolOutcome {
                     ok: false,
-                    output: format!("read {}: {e}", path.display()),
+                    output: "`edits` is empty".into(),
                 });
             }
-        };
-        let text = String::from_utf8_lossy(&bytes).to_string();
-        let count = text.matches(find).count();
-        if count == 0 {
-            return Ok(ToolOutcome {
-                ok: false,
-                output: "no occurrences of `find` in file".into(),
-            });
-        }
-        if count > 1 {
-            return Ok(ToolOutcome {
-                ok: false,
-                output: format!("{count} occurrences of `find`; include more context to make it unique"),
-            });
-        }
-        let diff = edit_preview(&path.to_string_lossy(), &text, find, replace);
-        let new_text = text.replacen(find, replace, 1);
-        match tokio::fs::write(&path, &new_text).await {
-            Ok(_) => Ok(ToolOutcome {
-                ok: true,
-                output: format!("edited {} (1 replacement)\n{}", path.display(), diff),
-            }),
-            Err(e) => Ok(ToolOutcome {
-                ok: false,
-                output: format!("write {}: {e}", path.display()),
-            }),
-        }
-    }
-}
-
-pub struct ListDir;
-
-#[async_trait]
-impl Tool for ListDir {
-    fn name(&self) -> &str {
-        "list_dir"
-    }
-    fn description(&self) -> &str {
-        "List immediate entries of a directory. Each line is `<type> <name>` \
-         where type is `f` (file), `d` (directory), or `l` (symlink)."
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "path": { "type": "string" } },
-            "required": ["path"]
-        })
-    }
-    fn risk(&self) -> ToolRisk {
-        ToolRisk::Safe
-    }
-    fn args_summary(&self, input: &Value) -> String {
-        input.get("path").and_then(|s| s.as_str()).unwrap_or("(missing path)").to_string()
-    }
-    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        let path = input
-            .get("path")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'path'"))?;
-        let path = resolve(&ctx.cwd, path);
-        let mut rd = match tokio::fs::read_dir(&path).await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolOutcome {
-                    ok: false,
-                    output: format!("list_dir {}: {e}", path.display()),
-                });
-            }
-        };
-        let mut entries: Vec<String> = Vec::new();
-        while let Some(e) = rd.next_entry().await? {
-            let ft = e.file_type().await?;
-            let kind = if ft.is_dir() {
-                "d"
-            } else if ft.is_symlink() {
-                "l"
-            } else {
-                "f"
-            };
-            entries.push(format!("{kind} {}", e.file_name().to_string_lossy()));
-        }
-        entries.sort();
-        Ok(ToolOutcome {
-            ok: true,
-            output: entries.join("\n"),
-        })
-    }
-}
-
-pub struct FindFiles;
-
-#[async_trait]
-impl Tool for FindFiles {
-    fn name(&self) -> &str {
-        "find_files"
-    }
-    fn description(&self) -> &str {
-        "Find files matching a simple substring or glob (\"*\" wildcard) in a \
-         subtree. Returns up to 200 paths relative to the search root."
-    }
-    fn schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": { "type": "string", "description": "Substring or simple glob, e.g. `*.rs`." },
-                "cwd":     { "type": "string", "description": "Search root (defaults to session cwd)." }
-            },
-            "required": ["pattern"]
-        })
-    }
-    fn risk(&self) -> ToolRisk {
-        ToolRisk::Safe
-    }
-    fn args_summary(&self, input: &Value) -> String {
-        input.get("pattern").and_then(|s| s.as_str()).unwrap_or("(missing pattern)").to_string()
-    }
-    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
-        let pattern = input
-            .get("pattern")
-            .and_then(|s| s.as_str())
-            .ok_or_else(|| anyhow::anyhow!("missing 'pattern'"))?
-            .to_string();
-        let root = input
-            .get("cwd")
-            .and_then(|s| s.as_str())
-            .map(|p| resolve(&ctx.cwd, p))
-            .unwrap_or_else(|| ctx.cwd.clone());
-        let matcher = SimpleGlob::compile(&pattern);
-        let max = 200;
-        let mut out: Vec<String> = Vec::new();
-        let root_clone = root.clone();
-        // Walk synchronously in a blocking task to keep code simple.
-        let scanned = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let mut stack: Vec<PathBuf> = vec![root_clone.clone()];
-            let mut hits: Vec<String> = Vec::new();
-            while let Some(dir) = stack.pop() {
-                let read = match std::fs::read_dir(&dir) {
-                    Ok(r) => r,
-                    Err(_) => continue,
+            for (i, e) in edits.iter().enumerate() {
+                let p = e.get("path").and_then(|s| s.as_str()).or(default_path);
+                let Some(p) = p else {
+                    return Ok(ToolOutcome {
+                        ok: false,
+                        output: format!(
+                            "edit #{}: no `path` (set it on the edit or at top level)",
+                            i + 1
+                        ),
+                    });
                 };
-                for entry in read.flatten() {
-                    let path = entry.path();
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name.starts_with('.') {
-                        continue; // skip dotfiles / .git
-                    }
-                    if path.is_dir() {
-                        stack.push(path);
-                    } else {
-                        let rel = path
-                            .strip_prefix(&root_clone)
-                            .ok()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|| path.to_string_lossy().to_string());
-                        if !matcher.matches(&name) && !matcher.matches(&rel) {
-                            continue;
-                        }
-                        hits.push(rel);
-                        if hits.len() >= max {
-                            return Ok(hits);
-                        }
-                    }
-                }
+                hunks.push(Hunk {
+                    path: resolve(&ctx.cwd, p),
+                    find: e.get("find").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    replace: e
+                        .get("replace")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                });
             }
-            Ok(hits)
-        })
-        .await
-        .context("find_files join")??;
-        out.extend(scanned);
-        Ok(ToolOutcome {
-            ok: true,
-            output: out.join("\n"),
-        })
-    }
-}
-
-/// Tiny `*`-wildcard glob (no character classes, no `?`). Substring
-/// match when the pattern has no `*`.
-struct SimpleGlob {
-    parts: Vec<String>,
-    leading_wild: bool,
-    trailing_wild: bool,
-    has_wildcard: bool,
-}
-
-impl SimpleGlob {
-    fn compile(pat: &str) -> Self {
-        let has_wildcard = pat.contains('*');
-        let leading_wild = pat.starts_with('*');
-        let trailing_wild = pat.ends_with('*');
-        let trimmed = pat.trim_matches('*');
-        let parts: Vec<String> = trimmed
-            .split('*')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
-        Self {
-            parts,
-            leading_wild,
-            trailing_wild,
-            has_wildcard,
-        }
-    }
-    fn matches(&self, s: &str) -> bool {
-        if !self.has_wildcard {
-            return self.parts.first().map(|p| s.contains(p)).unwrap_or(true);
-        }
-        if self.parts.is_empty() {
-            return self.leading_wild || self.trailing_wild;
-        }
-        let mut i = 0;
-        let s_bytes = s.as_bytes();
-        for (idx, part) in self.parts.iter().enumerate() {
-            let part_b = part.as_bytes();
-            let from = if idx == 0 && !self.leading_wild { i } else { i };
-            let found = if idx == 0 && !self.leading_wild {
-                if s.starts_with(part.as_str()) {
-                    Some(0)
-                } else {
-                    None
-                }
-            } else {
-                find_substr(&s_bytes[from..], part_b).map(|p| p + from)
+        } else {
+            let Some(p) = default_path else {
+                return Ok(ToolOutcome {
+                    ok: false,
+                    output: "missing `path` (or `edits`)".into(),
+                });
             };
-            match found {
-                Some(pos) => i = pos + part_b.len(),
-                None => return false,
+            let (Some(find), Some(replace)) = (
+                input.get("find").and_then(|s| s.as_str()),
+                input.get("replace").and_then(|s| s.as_str()),
+            ) else {
+                return Ok(ToolOutcome {
+                    ok: false,
+                    output: "missing `find`/`replace` (or provide `edits`)".into(),
+                });
+            };
+            hunks.push(Hunk {
+                path: resolve(&ctx.cwd, p),
+                find: find.to_string(),
+                replace: replace.to_string(),
+            });
+        }
+
+        // Group by file, preserving first-seen order.
+        let mut order: Vec<PathBuf> = Vec::new();
+        let mut by_file: BTreeMap<PathBuf, Vec<&Hunk>> = BTreeMap::new();
+        for h in &hunks {
+            if !by_file.contains_key(&h.path) {
+                order.push(h.path.clone());
+            }
+            by_file.entry(h.path.clone()).or_default().push(h);
+        }
+
+        // Phase 1 — validate and compute new contents in memory (atomic):
+        // a single failed match aborts the whole call before any write.
+        let mut pending: Vec<Pending> = Vec::new();
+        for abs in &order {
+            let file_hunks = &by_file[abs];
+            let existing = tokio::fs::read(abs)
+                .await
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).to_string());
+            match existing {
+                Some(mut text) => {
+                    let mut preview = String::new();
+                    let mut n = 0usize;
+                    for h in file_hunks {
+                        if h.find.is_empty() {
+                            return Ok(ToolOutcome {
+                                ok: false,
+                                output: format!(
+                                    "{}: `find` is empty but the file exists (empty `find` only creates new files)",
+                                    abs.display()
+                                ),
+                            });
+                        }
+                        let count = text.matches(h.find.as_str()).count();
+                        if count == 0 {
+                            return Ok(ToolOutcome {
+                                ok: false,
+                                output: format!(
+                                    "{}: `find` not found:\n{}",
+                                    abs.display(),
+                                    snippet(&h.find)
+                                ),
+                            });
+                        }
+                        if count > 1 {
+                            return Ok(ToolOutcome {
+                                ok: false,
+                                output: format!(
+                                    "{}: {} occurrences of `find`; add context to make it unique:\n{}",
+                                    abs.display(),
+                                    count,
+                                    snippet(&h.find)
+                                ),
+                            });
+                        }
+                        preview.push_str(&edit_preview(
+                            &abs.to_string_lossy(),
+                            &text,
+                            &h.find,
+                            &h.replace,
+                        ));
+                        text = text.replacen(h.find.as_str(), &h.replace, 1);
+                        n += 1;
+                    }
+                    pending.push(Pending {
+                        path: abs.clone(),
+                        new_text: text,
+                        created: false,
+                        replacements: n,
+                        preview,
+                    });
+                }
+                None => {
+                    // File does not exist → creation. Every hunk must have an
+                    // empty `find`; their `replace` values concatenate.
+                    let mut content = String::new();
+                    for h in file_hunks {
+                        if !h.find.is_empty() {
+                            return Ok(ToolOutcome {
+                                ok: false,
+                                output: format!(
+                                    "{}: file does not exist — to create it use an empty `find`",
+                                    abs.display()
+                                ),
+                            });
+                        }
+                        content.push_str(&h.replace);
+                    }
+                    pending.push(Pending {
+                        path: abs.clone(),
+                        new_text: content,
+                        created: true,
+                        replacements: file_hunks.len(),
+                        preview: String::new(),
+                    });
+                }
             }
         }
-        // last part must reach end if no trailing wildcard
-        if !self.trailing_wild && i != s.len() {
-            return false;
+
+        // Phase 2 — write. Matching was fully validated above, so failures
+        // here are I/O errors only.
+        let mut out = String::new();
+        for p in &pending {
+            if p.created {
+                if let Some(parent) = p.path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+            }
+            if let Err(e) = tokio::fs::write(&p.path, &p.new_text).await {
+                return Ok(ToolOutcome {
+                    ok: false,
+                    output: format!("write {}: {e}", p.path.display()),
+                });
+            }
+            if p.created {
+                out.push_str(&format!(
+                    "created {} ({} bytes)\n",
+                    p.path.display(),
+                    p.new_text.len()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "edited {} ({} replacement{})\n{}",
+                    p.path.display(),
+                    p.replacements,
+                    if p.replacements == 1 { "" } else { "s" },
+                    p.preview
+                ));
+            }
         }
-        true
+        Ok(ToolOutcome { ok: true, output: out })
     }
 }
 
-fn find_substr(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
+/// First line of `s`, truncated to ~120 chars on a char boundary, for error
+/// messages that echo the failed `find`.
+fn snippet(s: &str) -> String {
+    let one = s.lines().next().unwrap_or("");
+    let short: String = one.chars().take(120).collect();
+    if short.len() < one.len() {
+        format!("{short}…")
+    } else {
+        short
     }
-    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 const ANSI_RESET: &str = "\x1b[0m";
@@ -528,45 +394,31 @@ fn push_numbered_line_diff(
 }
 
 fn push_numbered_context(out: &mut String, _old_line: usize, new_line: usize, text: &str) {
-    out.push_str(&format!(
-        "{ANSI_DIM}{new_line:>5}{ANSI_RESET}   {text}\n"
-    ));
+    out.push_str(&format!("{ANSI_DIM}{new_line:>5}{ANSI_RESET}   {text}\n"));
 }
 
 fn push_numbered_removed(out: &mut String, old_line: usize, text: &str) {
-    out.push_str(&format!(
-        "{ANSI_RED}{old_line:>5} - {text}{ANSI_RESET}\n"
-    ));
+    out.push_str(&format!("{ANSI_RED}{old_line:>5} - {text}{ANSI_RESET}\n"));
 }
 
 fn push_numbered_added(out: &mut String, new_line: usize, text: &str) {
-    out.push_str(&format!(
-        "{ANSI_GREEN}{new_line:>5} + {text}{ANSI_RESET}\n"
-    ));
+    out.push_str(&format!("{ANSI_GREEN}{new_line:>5} + {text}{ANSI_RESET}\n"));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{edit_preview, SimpleGlob, ANSI_GREEN, ANSI_RED};
+    use super::{edit_preview, EditFile, ANSI_GREEN, ANSI_RED};
+    use crate::tools::{Tool, ToolCtx};
+    use serde_json::json;
 
-    #[test]
-    fn simple_glob_no_wildcard_is_substring() {
-        let matcher = SimpleGlob::compile("vis");
-        assert!(matcher.matches("adapter-zarvis"));
-        assert!(matcher.matches("crates/adapter-zarvis/src/tools/fs.rs"));
-        assert!(!matcher.matches("adapter-codex"));
-    }
-
-    #[test]
-    fn simple_glob_keeps_anchored_wildcard_semantics() {
-        let matcher = SimpleGlob::compile("src/*.rs");
-        assert!(matcher.matches("src/tools/fs.rs"));
-        assert!(!matcher.matches("crates/adapter-zarvis/src/tools/fs.rs"));
-
-        let matcher = SimpleGlob::compile("*.rs");
-        assert!(matcher.matches("fs.rs"));
-        assert!(matcher.matches("src/tools/fs.rs"));
-        assert!(!matcher.matches("README.md"));
+    fn ctx_with_cwd(cwd: std::path::PathBuf) -> ToolCtx {
+        ToolCtx {
+            cwd,
+            session_id: "test".to_string(),
+            client: tokio::sync::OnceCell::new(),
+            emit: None,
+            procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+        }
     }
 
     #[test]
@@ -586,5 +438,91 @@ mod tests {
         assert!(diff.contains(" one\n"));
         assert!(diff.contains(&format!("{ANSI_RED}    2 - two")));
         assert!(diff.contains(" three\n"));
+    }
+
+    #[tokio::test]
+    async fn single_edit_replaces_unique_match() {
+        let dir = std::env::temp_dir().join(format!("zarvis-edit-single-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("a.txt");
+        std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let ctx = ctx_with_cwd(dir.clone());
+        let out = EditFile
+            .run(
+                json!({"path": f.to_string_lossy(), "find": "beta", "replace": "BETA"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "alpha\nBETA\ngamma\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multi_hunk_is_atomic_on_failure() {
+        let dir = std::env::temp_dir().join(format!("zarvis-edit-atomic-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("b.txt");
+        std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+        let ctx = ctx_with_cwd(dir.clone());
+        // First hunk matches; second does not → whole call must abort, file unchanged.
+        let out = EditFile
+            .run(
+                json!({"path": f.to_string_lossy(), "edits": [
+                    {"find": "one", "replace": "ONE"},
+                    {"find": "NOPE", "replace": "x"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(!out.ok, "should fail: {}", out.output);
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "one\ntwo\nthree\n",
+            "file must be untouched on partial failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn multi_hunk_applies_in_order() {
+        let dir = std::env::temp_dir().join(format!("zarvis-edit-order-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("c.txt");
+        std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+        let ctx = ctx_with_cwd(dir.clone());
+        let out = EditFile
+            .run(
+                json!({"path": f.to_string_lossy(), "edits": [
+                    {"find": "one", "replace": "1"},
+                    {"find": "three", "replace": "3"}
+                ]}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "1\ntwo\n3\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_find_creates_new_file() {
+        let dir = std::env::temp_dir().join(format!("zarvis-edit-create-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("nested/new.txt");
+        let ctx = ctx_with_cwd(dir.clone());
+        let out = EditFile
+            .run(
+                json!({"path": f.to_string_lossy(), "find": "", "replace": "hello\n"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
