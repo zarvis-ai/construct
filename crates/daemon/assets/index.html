@@ -2772,8 +2772,11 @@ async function switchCurrentViewMode(mode) {
     // was shown (see enterChatMode + renderEvent), so revealing it is
     // instant. Forcing a reload here is what made the terminal reset and
     // replay its entire history from the top on every chat→terminal toggle.
+    // forceGeometryClaim:false also avoids re-emitting a pty_resize for the
+    // unchanged geometry, which would SIGWINCH the child into a repaint.
     await enterTerminalMode(id, {
       focusTerminal: shouldFocusTerminalAfterSessionSwitch(),
+      forceGeometryClaim: false,
     });
   } else {
     rememberActiveTerminalState();
@@ -3009,7 +3012,16 @@ async function enterTerminalMode(id, options = {}) {
   // cols/rows on session A vs session B mean different things to
   // the daemon's active-wins policy. Reset the dedup so this
   // refit always fires `pty_resize`.
-  state.lastReportedSize = { cols: 0, rows: 0 };
+  //
+  // A same-session view toggle (chat→terminal) keeps the geometry it
+  // already reported, so DON'T reset the dedup there: forcing a
+  // pty_resize would SIGWINCH the child into a full repaint on every
+  // toggle, which looks like the terminal replaying. `forceGeometryClaim`
+  // is false for that path; refitTerminal's dedup then skips the resize
+  // when nothing actually changed.
+  if (options.forceGeometryClaim !== false) {
+    state.lastReportedSize = { cols: 0, rows: 0 };
+  }
   refitTerminal({ claim: true, immediate: true });
   if (options.focusTerminal) {
     state.term.focus();
