@@ -588,6 +588,9 @@
     color: var(--fg-dim);
   }
   .tool .tool-name { color: var(--fg); font-weight: 500; }
+  .tool .tool-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .tool .tool-head .badge { margin-left: 0; }
+  .tool .badge.running { background: var(--bg-elev-2); color: var(--fg-faint); font-style: italic; }
   .tool details { margin-top: 4px; }
   .session-widgets {
     position: absolute;
@@ -4721,14 +4724,44 @@ function replayTranscriptToTerm(events) {
   }
 }
 
+function toolResultBadge(ok) {
+  return ok ? '<span class="badge ok">ok</span>' : '<span class="badge err">err</span>';
+}
+
+// Locate the in-flight tool card a result should fold into. tool_use /
+// tool_result carry no call_id, so we pair by tool name among unresolved
+// cards (handles interleaved calls), and otherwise only fold into an
+// immediately-preceding unresolved card — the common call→result adjacency —
+// so a lingering unresolved call can't capture an unrelated later result.
+function findPendingToolRow(target, tool) {
+  const want = tool || "tool";
+  for (let el = target.lastElementChild; el; el = el.previousElementSibling) {
+    if (el.dataset && el.dataset.kind === "tool" && el.dataset.resolved === "false" &&
+        (el.dataset.tool || "") === want) {
+      return el;
+    }
+  }
+  const last = target.lastElementChild;
+  if (last && last.dataset && last.dataset.kind === "tool" && last.dataset.resolved === "false") {
+    return last;
+  }
+  return null;
+}
+
 function appendToolUse(tool, args) {
   const target = transcriptTarget();
   const row = document.createElement("div");
   row.className = "row";
+  row.dataset.kind = "tool";
+  row.dataset.tool = tool || "tool";
+  row.dataset.resolved = "false";
   const argStr = args === undefined ? "" : tryStringify(args);
   row.innerHTML = `
     <div class="tool">
-      <span class="tool-name">→ ${escape(tool || "tool")}</span>
+      <div class="tool-head">
+        <span class="tool-name">${escape(tool || "tool")}</span>
+        <span class="badge running">running…</span>
+      </div>
       ${argStr ? `<details><summary>args</summary><pre></pre></details>` : ""}
     </div>`;
   if (argStr) row.querySelector("pre").textContent = argStr;
@@ -4737,16 +4770,40 @@ function appendToolUse(tool, args) {
 
 function appendToolResult(tool, ok, output) {
   const target = transcriptTarget();
-  const row = document.createElement("div");
-  row.className = "row";
-  const badge = ok ? '<span class="badge ok">ok</span>' : '<span class="badge err">err</span>';
-  row.innerHTML = `
+  const row = findPendingToolRow(target, tool);
+  if (row) {
+    // Fold the result into the matching call card: swap the "running…"
+    // pill for an ok/err badge and append the output alongside the args.
+    row.dataset.resolved = "true";
+    const status = row.querySelector(".tool-head .badge.running");
+    if (status) status.outerHTML = toolResultBadge(ok);
+    if (output) {
+      const det = document.createElement("details");
+      const summary = document.createElement("summary");
+      summary.textContent = "output";
+      const pre = document.createElement("pre");
+      pre.textContent = output;
+      det.append(summary, pre);
+      row.querySelector(".tool").appendChild(det);
+    }
+    return;
+  }
+  // No matching call card (e.g. a result replayed without its tool_use) —
+  // render the result on its own, as a standalone card.
+  const standalone = document.createElement("div");
+  standalone.className = "row";
+  standalone.dataset.kind = "tool";
+  standalone.dataset.tool = tool || "tool";
+  standalone.dataset.resolved = "true";
+  standalone.innerHTML = `
     <div class="tool">
-      <span class="tool-name">← ${escape(tool || "tool")}</span>${badge}
+      <div class="tool-head">
+        <span class="tool-name">${escape(tool || "tool")}</span>${toolResultBadge(ok)}
+      </div>
       ${output ? `<details><summary>output</summary><pre></pre></details>` : ""}
     </div>`;
-  if (output) row.querySelector("pre").textContent = output;
-  target.appendChild(row);
+  if (output) standalone.querySelector("pre").textContent = output;
+  target.appendChild(standalone);
 }
 
 function appendToolApproval(event) {
