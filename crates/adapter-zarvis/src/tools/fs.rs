@@ -81,24 +81,15 @@ impl Tool for EditFile {
     }
     fn args_summary(&self, input: &Value) -> String {
         if let Some(edits) = input.get("edits").and_then(|e| e.as_array()) {
-            let mut paths: std::collections::BTreeSet<&str> = edits
-                .iter()
-                .filter_map(|e| e.get("path").and_then(|p| p.as_str()))
-                .collect();
-            if let Some(p) = input.get("path").and_then(|p| p.as_str()) {
-                paths.insert(p);
-            }
-            format!(
-                "{} edits across {} file(s)",
-                edits.len(),
-                paths.len().max(1)
-            )
+            multi_edit_summary(input, edits)
         } else {
-            input
+            let path = input
                 .get("path")
                 .and_then(|s| s.as_str())
-                .unwrap_or("(missing path)")
-                .to_string()
+                .unwrap_or("(missing path)");
+            let find = input.get("find").and_then(|s| s.as_str()).unwrap_or("");
+            let replace = input.get("replace").and_then(|s| s.as_str()).unwrap_or("");
+            format!("1 edit in {path}: {}", edit_snippet(find, replace))
         }
     }
     async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
@@ -126,7 +117,11 @@ impl Tool for EditFile {
                 };
                 hunks.push(Hunk {
                     path: resolve(&ctx.cwd, p),
-                    find: e.get("find").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    find: e
+                        .get("find")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     replace: e
                         .get("replace")
                         .and_then(|s| s.as_str())
@@ -287,7 +282,81 @@ impl Tool for EditFile {
                 ));
             }
         }
-        Ok(ToolOutcome { ok: true, output: out })
+        Ok(ToolOutcome {
+            ok: true,
+            output: out,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct FileEditSummary {
+    path: String,
+    snippets: Vec<String>,
+}
+
+fn multi_edit_summary(input: &Value, edits: &[Value]) -> String {
+    let default_path = input.get("path").and_then(|p| p.as_str());
+    let mut files: Vec<FileEditSummary> = Vec::new();
+    for edit in edits {
+        let path = edit
+            .get("path")
+            .and_then(|p| p.as_str())
+            .or(default_path)
+            .unwrap_or("(missing path)");
+        let find = edit.get("find").and_then(|s| s.as_str()).unwrap_or("");
+        let replace = edit.get("replace").and_then(|s| s.as_str()).unwrap_or("");
+        let snippet = edit_snippet(find, replace);
+        if let Some(existing) = files.iter_mut().find(|f| f.path == path) {
+            existing.snippets.push(snippet);
+        } else {
+            files.push(FileEditSummary {
+                path: path.to_string(),
+                snippets: vec![snippet],
+            });
+        }
+    }
+
+    let file_word = if files.len() == 1 { "file" } else { "files" };
+    let edit_word = if edits.len() == 1 { "edit" } else { "edits" };
+    let details = files
+        .iter()
+        .map(|file| {
+            let count = file.snippets.len();
+            let count_word = if count == 1 { "edit" } else { "edits" };
+            let mut snippets = file.snippets.iter().take(2).cloned().collect::<Vec<_>>();
+            if count > snippets.len() {
+                snippets.push(format!("+{} more", count - snippets.len()));
+            }
+            format!(
+                "{} ({} {}: {})",
+                file.path,
+                count,
+                count_word,
+                snippets.join("; ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{} {} across {} {}: {}",
+        edits.len(),
+        edit_word,
+        files.len().max(1),
+        file_word,
+        details
+    )
+}
+
+fn edit_snippet(find: &str, replace: &str) -> String {
+    let find = snippet(find);
+    let replace = snippet(replace);
+    if find.is_empty() {
+        format!("create `{replace}`")
+    } else if replace.is_empty() {
+        format!("remove `{find}`")
+    } else {
+        format!("`{find}` -> `{replace}`")
     }
 }
 
@@ -314,7 +383,10 @@ fn edit_preview(path: &str, old_text: &str, find: &str, replace: &str) -> String
         return String::new();
     };
     let byte_end = byte_start + find.len();
-    let old_start_line = old_text[..byte_start].bytes().filter(|b| *b == b'\n').count();
+    let old_start_line = old_text[..byte_start]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count();
     let old_end_line = old_text[..byte_end].bytes().filter(|b| *b == b'\n').count();
     let new_text = old_text.replacen(find, replace, 1);
 
@@ -322,8 +394,14 @@ fn edit_preview(path: &str, old_text: &str, find: &str, replace: &str) -> String
     let new_lines: Vec<&str> = new_text.lines().collect();
     let old_changed_end = (old_end_line + 1).min(old_lines.len());
     let new_byte_end = byte_start + replace.len();
-    let new_start_line = new_text[..byte_start].bytes().filter(|b| *b == b'\n').count();
-    let new_end_line = new_text[..new_byte_end].bytes().filter(|b| *b == b'\n').count();
+    let new_start_line = new_text[..byte_start]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count();
+    let new_end_line = new_text[..new_byte_end]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count();
     let new_changed_start = new_start_line.min(new_lines.len());
     let new_changed_end = (new_end_line + 1).min(new_lines.len());
     let old_context_start = old_start_line.saturating_sub(3);
@@ -438,6 +516,42 @@ mod tests {
         assert!(diff.contains(" one\n"));
         assert!(diff.contains(&format!("{ANSI_RED}    2 - two")));
         assert!(diff.contains(" three\n"));
+    }
+
+    #[test]
+    fn edit_file_summary_lists_files_and_snippets() {
+        let summary = EditFile.args_summary(&json!({
+            "path": "crates/cli/src/app.rs",
+            "edits": [
+                {"find": "old app one", "replace": "new app one"},
+                {"find": "old app two", "replace": "new app two"},
+                {"path": "crates/adapter-zarvis/src/interactive.rs", "find": "old prompt", "replace": "new prompt"},
+                {"path": "crates/adapter-zarvis/src/tools/fs.rs", "find": "old summary", "replace": "new summary"}
+            ]
+        }));
+
+        assert!(summary.starts_with("4 edits across 3 files: "));
+        assert!(summary.contains(
+            "crates/cli/src/app.rs (2 edits: `old app one` -> `new app one`; `old app two` -> `new app two`)"
+        ));
+        assert!(summary.contains(
+            "crates/adapter-zarvis/src/interactive.rs (1 edit: `old prompt` -> `new prompt`)"
+        ));
+        assert!(summary.contains(
+            "crates/adapter-zarvis/src/tools/fs.rs (1 edit: `old summary` -> `new summary`)"
+        ));
+        assert!(!summary.contains("file(s)"));
+    }
+
+    #[test]
+    fn edit_file_summary_makes_single_edit_explicit() {
+        let summary = EditFile.args_summary(&json!({
+            "path": "README.md",
+            "find": "before",
+            "replace": "after"
+        }));
+
+        assert_eq!(summary, "1 edit in README.md: `before` -> `after`");
     }
 
     #[tokio::test]

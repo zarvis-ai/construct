@@ -23,6 +23,8 @@ A boolean automode conflated two different needs: high-throughput trusted operat
 
 Clients should present approval mode as a session mode and use `unsafe_auto` terminology instead of generic “automode.” Adapters that do not gate tools may ignore approval-mode changes. `auto_review` is not a security boundary; it is a convenience review layer that must fall back to asking the user when uncertain. The reviewer prompt should encourage approving bounded routine development work, including ordinary file edits inside the active git worktree, while still asking the user for broad, ambiguous, unrelated, outside-worktree, or sensitive actions.
 
+Approval prompts must make clear that one decision applies to the whole pending tool call. For batched edit calls, the prompt summary should include affected file paths and edit-level hints rather than only aggregate counts.
+
 ## Non-Goals
 
 This does not make model approval equivalent to user approval for high-risk or ambiguous operations. It also does not require non-tool-gating harnesses to implement approval modes.
