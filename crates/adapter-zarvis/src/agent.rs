@@ -102,6 +102,7 @@ Approve routine, expected development actions in the current task when they are 
 - build, format, lint, and test commands such as `cargo fmt --all`, `cargo build`, `cargo check`, `cargo clippy`, or `cargo test ...`
 - inspection commands such as `git status`, `git diff`, `git log`, `rg`, `ls`, or `sed -n ...`
 - ordinary repo hygiene commands that revert or clean a clearly scoped set of tracked files, especially when the command itself derives that set from `git diff --name-only` and filters it
+- creating, updating, reading, or removing files inside the session widget directory shown below — the agent's own session-UI scratch space, which it is expected to maintain
 
 Do not ask the user merely because a shell command chains routine steps with `&&` or pipes read-only output into a bounded follow-up command.
 Do not ask the user merely because an edit changes files in the active git worktree; git makes those changes inspectable and reversible.
@@ -116,8 +117,19 @@ pub async fn auto_review_for_adapter(
     args_summary: &str,
     ctx: &AutoReviewContext,
 ) -> AutoReviewResult {
+    // Tell the reviewer where this session's widget directory is, so file
+    // operations bounded to it (which the agent is expected to maintain) read
+    // as routine rather than ambiguous. `edit_file` writes there are already
+    // auto-approved deterministically via the auto-approve policy; this covers
+    // the residual cases that still reach the reviewer (e.g. shell reads or
+    // removals of widget files).
+    let widgets_hint =
+        match std::env::var(agentd_protocol::agent_context::ENV_SESSION_WIDGETS_DIR) {
+            Ok(dir) if !dir.is_empty() => format!("\n\nSession widget directory:\n{dir}"),
+            _ => String::new(),
+        };
     let user = format!(
-        "{}\n\nPending tool:\nTool: {tool}\nArgs summary:\n{args_summary}",
+        "{}{widgets_hint}\n\nPending tool:\nTool: {tool}\nArgs summary:\n{args_summary}",
         ctx.format_for_prompt()
     );
     let messages = [Message {

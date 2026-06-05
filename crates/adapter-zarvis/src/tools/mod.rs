@@ -106,15 +106,33 @@ fn auto_approve_covers(tool_name: &str, input: &Value, cwd: &std::path::Path) ->
     if tool_name != "edit_file" {
         return false;
     }
-    let Some(rel) = input.get("path").and_then(|v| v.as_str()) else {
-        return false;
-    };
     let policy = agentd_protocol::adapter::policy::AutoApprovePolicy::from_env();
     if policy.is_empty() {
         return false;
     }
-    let abs = fs::resolve(cwd, rel);
-    policy.allows_path_write(&abs)
+    // An `edit_file` call is covered only when EVERY file it writes is inside
+    // an allowed path. The call carries either a single top-level `path`
+    // (single-hunk form) or an `edits` array whose entries each target their
+    // own `path`, falling back to the top-level one (batched form, which the
+    // model is encouraged to use). A single out-of-policy target keeps the
+    // whole call gated.
+    let default_path = input.get("path").and_then(|v| v.as_str());
+    let is_covered = |rel: &str| policy.allows_path_write(&fs::resolve(cwd, rel));
+    match input.get("edits").and_then(|e| e.as_array()) {
+        Some(edits) => {
+            !edits.is_empty()
+                && edits.iter().all(|edit| {
+                    match edit.get("path").and_then(|v| v.as_str()).or(default_path) {
+                        Some(rel) => is_covered(rel),
+                        None => false,
+                    }
+                })
+        }
+        None => match default_path {
+            Some(rel) => is_covered(rel),
+            None => false,
+        },
+    }
 }
 
 /// Context shared with every tool invocation. `cwd` is the session's
@@ -305,6 +323,34 @@ mod tests {
             effective_risk(
                 &edit,
                 &json!({ "path": "/some/proj/other.md", "find": "a", "replace": "b" }),
+                &cwd,
+            ),
+            ToolRisk::Risky
+        ));
+
+        // Batched edit_file with per-edit paths, all inside the widget dir →
+        // Safe (the form the model is encouraged to use for widget writes).
+        let widget_b = widgets.join("tasks.md");
+        assert!(matches!(
+            effective_risk(
+                &edit,
+                &json!({ "edits": [
+                    { "path": widget_path.to_string_lossy(), "find": "a", "replace": "b" },
+                    { "path": widget_b.to_string_lossy(), "find": "c", "replace": "d" },
+                ] }),
+                &cwd,
+            ),
+            ToolRisk::Safe
+        ));
+
+        // A single out-of-policy edit in the batch keeps the whole call gated.
+        assert!(matches!(
+            effective_risk(
+                &edit,
+                &json!({ "edits": [
+                    { "path": widget_path.to_string_lossy(), "find": "a", "replace": "b" },
+                    { "path": "/some/proj/other.md", "find": "c", "replace": "d" },
+                ] }),
                 &cwd,
             ),
             ToolRisk::Risky
