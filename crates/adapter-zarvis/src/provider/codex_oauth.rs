@@ -283,10 +283,23 @@ impl CodexOauth {
         let mut guard = self.ws.lock().await;
         for attempt in 0..2 {
             if guard.is_none() {
-                match connect_codex_ws(access_token, account_id).await {
-                    Ok(c) => *guard = Some(c),
+                // Bound the connect: a stalled TCP / proxy-CONNECT / TLS
+                // handshake must not hang the turn — fall back to HTTP on timeout.
+                match tokio::time::timeout(
+                    WS_CONNECT_TIMEOUT,
+                    connect_codex_ws(access_token, account_id),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => *guard = Some(c),
                     // Couldn't establish a connection at all → fall back to HTTP.
-                    Err(e) => return WsResult::Fallback(e),
+                    Ok(Err(e)) => return WsResult::Fallback(e),
+                    Err(_) => {
+                        return WsResult::Fallback(anyhow!(
+                            "codex-oauth ws: connect timed out after {}s",
+                            WS_CONNECT_TIMEOUT.as_secs()
+                        ))
+                    }
                 }
             }
             let ws = guard.as_mut().expect("ws connected above");
@@ -337,7 +350,6 @@ impl CodexOauth {
 
         while let Some(msg) = ws.next().await {
             let msg = msg.context("codex-oauth ws recv")?;
-            sink.progress();
             let text = match msg {
                 WsMessage::Text(t) => t.to_string(),
                 WsMessage::Ping(p) => {
@@ -351,6 +363,12 @@ impl CodexOauth {
                 }
                 _ => continue,
             };
+            // Count only real data frames as progress for the idle watchdog.
+            // WS keepalive Ping/control frames must NOT reset it — otherwise a
+            // stalled response stream (server holds the socket open with pings
+            // but sends no model output) never idle-times-out and hangs the
+            // whole turn (observed: a 91-min trial with zero model events).
+            sink.progress();
             let chunk: Value = match serde_json::from_str(&text) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -1180,6 +1198,11 @@ impl LlmProvider for CodexOauth {
 /// CONNECT proxy (`HTTPS_PROXY` / `ALL_PROXY`) — the air-gapped sandbox forces
 /// all egress through one, and `connect_async` would otherwise dial directly
 /// and be blocked.
+/// Hard bound on establishing the Responses WebSocket (TCP + proxy CONNECT +
+/// TLS upgrade). A healthy connect is well under a second; anything past this
+/// is a stall, so we fail fast and fall back to HTTP rather than hang the turn.
+const WS_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn connect_codex_ws(access_token: &str, account_id: &str) -> Result<WsStream> {
     use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue};
     let mut req = CODEX_RESPONSES_WS_URL
@@ -1710,5 +1733,61 @@ mod tests {
             format!("{err}"),
             "codex-oauth response failed: internal server error"
         );
+    }
+
+    /// Regression: a stalled WS that sends only keepalive Pings (no model
+    /// output) must NOT keep the idle watchdog alive — pings are not progress.
+    /// Before the fix, `sink.progress()` ran on every frame including Pings, so
+    /// a silent-but-pinging stream never idle-timed-out (observed: a 91-min
+    /// hung trial with zero model events).
+    #[tokio::test]
+    async fn ws_keepalive_pings_do_not_count_as_progress() {
+        use tokio::net::TcpListener;
+
+        #[derive(Default)]
+        struct CountingSink {
+            progress_calls: usize,
+            deltas: usize,
+        }
+        impl TextSink for CountingSink {
+            fn delta(&mut self, _t: &str) {
+                self.deltas += 1;
+            }
+            fn progress(&mut self) {
+                self.progress_calls += 1;
+            }
+        }
+
+        // Server: accept the WS, send 3 keepalive Pings (no Text), then Close.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            for _ in 0..3 {
+                let _ = ws.send(WsMessage::Ping(Vec::<u8>::new().into())).await;
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let _ = ws.send(WsMessage::Close(None)).await;
+        });
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}"))
+            .await
+            .unwrap();
+        let mut sink = CountingSink::default();
+        let mut emitted = false;
+        let res = CodexOauth::read_ws_turn(&mut ws, &mut sink, &mut emitted).await;
+        let _ = srv.await;
+
+        // Stream closed before any response.completed → the turn errors out...
+        assert!(res.is_err(), "ping-only stream must not complete a turn");
+        // ...and crucially, the keepalive pings were NOT counted as progress,
+        // so the idle watchdog would fire instead of hanging.
+        assert_eq!(
+            sink.progress_calls, 0,
+            "WS keepalive pings must not reset the idle watchdog (got {} progress calls)",
+            sink.progress_calls
+        );
+        assert!(!emitted, "no model output should have been emitted");
     }
 }
