@@ -25,6 +25,36 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TOOL_OUTPUT_BUDGET: usize = 8_000;
 
+fn one_line_approval_args(args_summary: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    let mut len = 0usize;
+
+    for ch in args_summary.chars() {
+        let ch = if ch.is_whitespace() || ch.is_control() {
+            ' '
+        } else {
+            ch
+        };
+        if ch == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        if len >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+        len += 1;
+    }
+
+    out
+}
+
 /// Wrapper around `EventEmitter` that writes raw bytes / styled text to
 /// the session's PTY stream.
 struct Terminal<'a> {
@@ -137,6 +167,7 @@ impl<'a> Terminal<'a> {
             ToolRisk::Safe => "safe",
             ToolRisk::Risky => "risky",
         };
+        let args_summary = one_line_approval_args(args_summary, 160);
         let line = format!(
             "\r\n\x1b[1;33m? approve all [{risk_label}]\x1b[0m {tool}\x1b[2m({args_summary})\x1b[0m\
              — \x1b[1m[y]\x1b[0mapprove all / \x1b[1m[n]\x1b[0mdeny all / \x1b[1m[a]\x1b[0mauto-review all / \x1b[1m[f]\x1b[0munsafe-auto: "
@@ -1313,6 +1344,22 @@ mod tests {
 
     fn editor() -> LineEditor {
         LineEditor::new(b"> ", 2)
+    }
+
+    #[test]
+    fn approval_args_are_single_line() {
+        let args = "python3 - <<'PY'\nfrom pathlib import Path\nprint('ok')\nPY";
+        let rendered = one_line_approval_args(args, 200);
+        assert_eq!(
+            rendered,
+            "python3 - <<'PY' from pathlib import Path print('ok') PY"
+        );
+        assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn approval_args_are_truncated_after_sanitizing() {
+        assert_eq!(one_line_approval_args("abcdef", 3), "abc...");
     }
 
     #[test]

@@ -3521,7 +3521,7 @@ impl App {
             agentd_protocol::ToolRisk::Safe => "safe",
             agentd_protocol::ToolRisk::Risky => "risky",
         };
-        let short_args: String = args_summary.chars().take(80).collect();
+        let short_args = one_line_approval_args(&args_summary, 80);
         let prompt = format!(
             "approve all [{risk_label}] {tool}({}) ▸ y=approve all  n=deny all  a=auto-review all  f=unsafe-auto",
             short_args
@@ -7127,6 +7127,22 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
+    #[test]
+    fn approval_prompt_args_are_single_line() {
+        let args = "python3 - <<'PY'\nfrom pathlib import Path\nprint('ok')\nPY";
+        let rendered = one_line_approval_args(args, 200);
+        assert_eq!(
+            rendered,
+            "python3 - <<'PY' from pathlib import Path print('ok') PY"
+        );
+        assert!(!rendered.contains('\n'));
+    }
+
+    #[test]
+    fn approval_prompt_args_are_truncated_after_sanitizing() {
+        assert_eq!(one_line_approval_args("abcdef", 3), "abc...");
+    }
+
     /// Regression guard for the input-priority optimization (#2).
     ///
     /// Under heavy background PTY output `notifications.recv()` is
@@ -9888,6 +9904,36 @@ fn delete_back_char(mb: &mut Minibuffer) {
         mb.cursor = prev;
         mb.error = None;
     }
+}
+
+fn one_line_approval_args(args_summary: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut prev_space = false;
+    let mut len = 0usize;
+
+    for ch in args_summary.chars() {
+        let ch = if ch.is_whitespace() || ch.is_control() {
+            ' '
+        } else {
+            ch
+        };
+        if ch == ' ' {
+            if prev_space {
+                continue;
+            }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        if len >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+        len += 1;
+    }
+
+    out
 }
 
 fn delete_forward_char(mb: &mut Minibuffer) {
