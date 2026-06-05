@@ -1,7 +1,7 @@
 # 0015-approval-modes
 
 Status: accepted
-Date: 2026-05-31
+Date: 2026-06-05
 Area: harness
 Scope: Risky tool calls are governed by explicit per-session approval modes rather than a boolean automode.
 
@@ -21,7 +21,7 @@ A boolean automode conflated two different needs: high-throughput trusted operat
 
 ## Consequences
 
-Clients should present approval mode as a session mode and use `unsafe_auto` terminology instead of generic “automode.” Adapters that do not gate tools may ignore approval-mode changes. `auto_review` is not a security boundary; it is a convenience review layer that must fall back to asking the user when uncertain.
+Clients should present approval mode as a session mode and use `unsafe_auto` terminology instead of generic “automode.” Adapters that do not gate tools may ignore approval-mode changes. `auto_review` is not a security boundary; it is a convenience review layer that must fall back to asking the user when uncertain. The reviewer prompt should encourage approving bounded routine development work, including ordinary file edits inside the active git worktree, while still asking the user for broad, ambiguous, unrelated, outside-worktree, or sensitive actions.
 
 ## Non-Goals
 

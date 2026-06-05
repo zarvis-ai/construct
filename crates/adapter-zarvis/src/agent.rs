@@ -90,6 +90,24 @@ impl TextSink for NullSink {
     fn delta(&mut self, _text: &str) {}
 }
 
+const AUTO_REVIEW_SYSTEM_PROMPT: &str = r#"You are an approval reviewer for a local coding agent.
+Decide whether a pending risky tool call is reasonable, bounded, and clearly related to the current task.
+Return ONLY compact JSON: {"decision":"approve"|"deny"|"ask_user","reason":"..."}.
+
+Use task context and recent user approval decisions as preference signals for similar actions, not as blanket permission.
+
+Approve routine, expected development actions in the current task when they are bounded to the repo or current working directory. Examples include:
+- file edits inside the active git worktree for the requested task, including source, tests, docs, configs, fixtures, and generated assets that are normally committed
+- build, format, lint, and test commands such as `cargo fmt --all`, `cargo build`, `cargo check`, `cargo clippy`, or `cargo test ...`
+- inspection commands such as `git status`, `git diff`, `git log`, `rg`, `ls`, or `sed -n ...`
+- ordinary repo hygiene commands that revert or clean a clearly scoped set of tracked files, especially when the command itself derives that set from `git diff --name-only` and filters it
+
+Do not ask the user merely because a shell command chains routine steps with `&&` or pipes read-only output into a bounded follow-up command.
+Do not ask the user merely because an edit changes files in the active git worktree; git makes those changes inspectable and reversible.
+
+Deny clearly destructive, secret-exfiltrating, unrelated, or user-hostile actions.
+Ask the user when context is insufficient, prior decisions conflict, the action targets broad/unscoped paths, touches secrets or credentials, mutates outside the active git worktree, changes user/home/system files, removes large amounts of data, or is ambiguous enough that a reasonable reviewer could not tell what will change."#;
+
 pub async fn auto_review_for_adapter(
     provider: &dyn LlmProvider,
     model: &str,
@@ -97,11 +115,6 @@ pub async fn auto_review_for_adapter(
     args_summary: &str,
     ctx: &AutoReviewContext,
 ) -> AutoReviewResult {
-    let system = r#"You are an approval reviewer for a local coding agent.
-Decide whether a pending risky tool call is reasonable, bounded, and clearly related to the current task.
-Return ONLY compact JSON: {"decision":"approve"|"deny"|"ask_user","reason":"..."}.
-Use task context and recent user approval decisions as preference signals for similar actions, not as blanket permission.
-Approve routine, expected development actions in the current task. Deny clearly destructive, secret-exfiltrating, unrelated, or user-hostile actions. Ask the user when context is insufficient, prior decisions conflict, or the action is broad/ambiguous."#;
     let user = format!(
         "{}\n\nPending tool:\nTool: {tool}\nArgs summary:\n{args_summary}",
         ctx.format_for_prompt()
@@ -112,7 +125,7 @@ Approve routine, expected development actions in the current task. Deny clearly 
     }];
     let mut sink = NullSink;
     let Ok(turn) = provider
-        .complete(model, system, &messages, &[], &mut sink)
+        .complete(model, AUTO_REVIEW_SYSTEM_PROMPT, &messages, &[], &mut sink)
         .await
     else {
         return AutoReviewResult::AskUser;
@@ -1421,5 +1434,18 @@ mod tests {
             parse_auto_review_decision(r#"{"decision":"maybe"}"#),
             AutoReviewResult::AskUser
         );
+    }
+
+    #[test]
+    fn auto_review_prompt_guides_model_toward_routine_repo_work() {
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("active git worktree"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("git makes those changes inspectable and reversible"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("cargo fmt --all"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("cargo test"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("git diff --name-only"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("&&"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("pipes read-only output"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("broad/unscoped paths"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("secrets or credentials"));
     }
 }
