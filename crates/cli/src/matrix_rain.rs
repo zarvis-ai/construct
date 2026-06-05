@@ -538,6 +538,7 @@ fn hash64(mut x: u64) -> u64 {
 fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)> {
     match event {
         SessionEvent::ToolApprovalRequest { .. } => Some(("auth", FlashTone::Warn, 90)),
+        SessionEvent::ToolApprovalResolved { .. } => None,
         SessionEvent::Error { .. } => Some(("failed", FlashTone::Bad, 100)),
         SessionEvent::Done { exit_code } if *exit_code == 0 => {
             Some(("worked", FlashTone::Good, 45))

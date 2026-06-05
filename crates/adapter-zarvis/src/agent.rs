@@ -1118,11 +1118,27 @@ async fn run_one_tool(
             )
             .await;
         // Park on the inbox until we see a matching decision.
+        let mut denied = false;
         loop {
             match inbox.recv().await {
-                None => return Err("stop".into()),
-                Some(AdapterInboxMsg::Stop) => return Err("stop".into()),
-                Some(AdapterInboxMsg::Interrupt) => return Err("interrupt".into()),
+                None => {
+                    emit.emit(SessionEvent::ToolApprovalResolved {
+                        call_id: call.id.clone(),
+                    });
+                    return Err("stop".into());
+                }
+                Some(AdapterInboxMsg::Stop) => {
+                    emit.emit(SessionEvent::ToolApprovalResolved {
+                        call_id: call.id.clone(),
+                    });
+                    return Err("stop".into());
+                }
+                Some(AdapterInboxMsg::Interrupt) => {
+                    emit.emit(SessionEvent::ToolApprovalResolved {
+                        call_id: call.id.clone(),
+                    });
+                    return Err("interrupt".into());
+                }
                 Some(AdapterInboxMsg::SetApprovalMode(mode)) => {
                     *approval_mode = mode;
                     if matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto) {
@@ -1175,24 +1191,17 @@ async fn run_one_tool(
                             break;
                         }
                         _ => {
-                            // Denied — synthesize a result and bail out
-                            // of this tool without running it.
+                            // Denied — record it and break; the result is
+                            // synthesized after the loop, next to the
+                            // approval-resolved dismissal signal.
                             record_approval_history(
                                 approval_history,
                                 "user:deny",
                                 call.name.clone(),
                                 args_summary.clone(),
                             );
-                            let msg = "user denied this action".to_string();
-                            emit.emit(SessionEvent::ToolResult {
-                                tool: call.id.clone(),
-                                ok: false,
-                                output: msg.clone(),
-                            });
-                            return Ok(ToolOutcome {
-                                ok: false,
-                                output: msg,
-                            });
+                            denied = true;
+                            break;
                         }
                     }
                 }
@@ -1202,6 +1211,24 @@ async fn run_one_tool(
                 }
                 Some(_) => {}
             }
+        }
+        // The pending approval is resolved (answered here or from another
+        // client) — tell passive viewers (web dialog, TUI minibuffer) to
+        // dismiss their prompt.
+        emit.emit(SessionEvent::ToolApprovalResolved {
+            call_id: call.id.clone(),
+        });
+        if denied {
+            let msg = "user denied this action".to_string();
+            emit.emit(SessionEvent::ToolResult {
+                tool: call.id.clone(),
+                ok: false,
+                output: msg.clone(),
+            });
+            return Ok(ToolOutcome {
+                ok: false,
+                output: msg,
+            });
         }
     }
 

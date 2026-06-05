@@ -4192,6 +4192,11 @@ function handleNotification(method, params) {
     if (event && event.type === "tool_approval_request" && event.call_id) {
       enqueueApproval(session_id, event);
     }
+    if (event && event.type === "tool_approval_resolved" && event.call_id) {
+      // Another client (the TUI, another browser) answered the prompt —
+      // dismiss our copy so a stale approval dialog doesn't linger.
+      resolveApproval(session_id, event.call_id);
+    }
     if (event && event.type === "browser_preview") {
       setBrowserPreview(session_id, event);
     }
@@ -5562,6 +5567,24 @@ function enqueueApproval(sessionId, event) {
   });
   if (!state.approvalShown) showNextApproval();
   else updateApprovalQueueHint();
+}
+
+// An approval was answered by some client (this one, the TUI, another
+// browser). Drop it from the queue, and if it is the one on screen, close
+// the sheet / advance to the next so a stale prompt doesn't linger.
+function resolveApproval(sessionId, callId) {
+  state.approvalQueue = state.approvalQueue.filter(
+    (a) => !(a.session_id === sessionId && a.call_id === callId),
+  );
+  if (
+    state.approvalShown &&
+    state.approvalShown.session_id === sessionId &&
+    state.approvalShown.call_id === callId
+  ) {
+    showNextApproval();
+  } else {
+    updateApprovalQueueHint();
+  }
 }
 
 function showNextApproval() {

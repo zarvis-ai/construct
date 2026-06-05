@@ -386,6 +386,15 @@ pub enum SessionEvent {
         #[serde(default = "default_true")]
         allow_auto_review: bool,
     },
+    /// The pending tool approval identified by `call_id` is no longer
+    /// waiting — it was approved, denied, auto-reviewed, or the turn was
+    /// interrupted. UI-only and transient (never persisted/replayed): lets
+    /// passive viewers that mirrored the [`ToolApprovalRequest`] (the web
+    /// approval dialog, the TUI minibuffer prompt) dismiss it when another
+    /// client answered the prompt.
+    ToolApprovalResolved {
+        call_id: String,
+    },
     /// Tool lifecycle: adapter started running a tool. Carries the
     /// canonical `call_id` (unlike [`ToolUse`] which doesn't) so the
     /// daemon's per-session task registry can match this against the

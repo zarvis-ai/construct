@@ -243,6 +243,7 @@ fn chat_scroll_kind(ev: &SessionEvent) -> ChatScrollKind {
         | SessionEvent::PtyResize { .. }
         | SessionEvent::EditorState { .. }
         | SessionEvent::ClientCommand { .. }
+        | SessionEvent::ToolApprovalResolved { .. }
         | SessionEvent::AgentStatus(_) => ChatScrollKind::Hidden,
         SessionEvent::Message { role, text }
             if should_render_chat_message_for_scroll(*role, text) =>
@@ -3133,6 +3134,13 @@ impl App {
                             );
                             // Also fall through so the transcript records it.
                         }
+                        // Approval resolved (answered here, in the zarvis
+                        // PTY, or by another client): close our minibuffer
+                        // prompt for it if it's still up, so it doesn't
+                        // linger after the decision was already made.
+                        if let SessionEvent::ToolApprovalResolved { call_id } = &payload.event {
+                            self.dismiss_approval_prompt(&payload.session_id, call_id);
+                        }
                         if matches!(payload.event, SessionEvent::Reset) {
                             self.histories.remove(&payload.session_id);
                             self.block_hits.remove(&payload.session_id);
@@ -3493,6 +3501,20 @@ impl App {
     /// Open the approval prompt if there's no other minibuffer in flight.
     /// Best-effort: if the user is already typing something, we skip and
     /// leave the request visible in the transcript only.
+    /// Close the minibuffer approval prompt for `call_id` if it's still
+    /// showing — the approval was answered here, in the session's PTY, or
+    /// by another client, so a lingering prompt would be stale.
+    fn dismiss_approval_prompt(&mut self, session_id: &str, call_id: &str) {
+        let is_match = matches!(
+            self.minibuffer.as_ref().map(|mb| &mb.intent),
+            Some(MinibufferIntent::ApproveTool { session_id: s, call_id: c, .. })
+                if s == session_id && c == call_id
+        );
+        if is_match {
+            self.minibuffer = None;
+        }
+    }
+
     fn maybe_open_approval_prompt(
         &mut self,
         session_id: String,

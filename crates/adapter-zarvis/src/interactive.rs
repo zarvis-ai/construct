@@ -3154,23 +3154,26 @@ async fn run_one_tool(
         // switches the session into auto-review mode (which persists)
         // and vets this call; if the reviewer still wants a human we
         // loop and ask again.
+        let mut denied = false;
         loop {
             term.approval(&call.name, &args_summary, tool.risk(), allow_auto_review);
             match wait_for_approval(inbox, &call.id, approval_mode).await {
-                ApprovalOutcome::Stop => return Err("stop".into()),
-                ApprovalOutcome::Interrupt => return Err("interrupt".into()),
+                ApprovalOutcome::Stop => {
+                    emit.emit(SessionEvent::ToolApprovalResolved {
+                        call_id: call.id.clone(),
+                    });
+                    return Err("stop".into());
+                }
+                ApprovalOutcome::Interrupt => {
+                    emit.emit(SessionEvent::ToolApprovalResolved {
+                        call_id: call.id.clone(),
+                    });
+                    return Err("interrupt".into());
+                }
                 ApprovalOutcome::Deny => {
                     term.print("n\r\n");
-                    let msg = "user denied this action".to_string();
-                    emit.emit(SessionEvent::ToolResult {
-                        tool: call.id.clone(),
-                        ok: false,
-                        output: msg.clone(),
-                    });
-                    return Ok(ToolOutcome {
-                        ok: false,
-                        output: msg,
-                    });
+                    denied = true;
+                    break;
                 }
                 ApprovalOutcome::Approve => {
                     term.print("y\r\n");
@@ -3201,6 +3204,24 @@ async fn run_one_tool(
                     }
                 }
             }
+        }
+        // The pending approval is resolved (answered here or from another
+        // client) — tell passive viewers (web dialog, TUI minibuffer) to
+        // dismiss their prompt.
+        emit.emit(SessionEvent::ToolApprovalResolved {
+            call_id: call.id.clone(),
+        });
+        if denied {
+            let msg = "user denied this action".to_string();
+            emit.emit(SessionEvent::ToolResult {
+                tool: call.id.clone(),
+                ok: false,
+                output: msg.clone(),
+            });
+            return Ok(ToolOutcome {
+                ok: false,
+                output: msg,
+            });
         }
     }
 

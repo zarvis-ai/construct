@@ -1950,6 +1950,24 @@ impl SessionManager {
                 }));
             return;
         }
+        // ToolApprovalResolved is a transient UI dismissal signal: it tells
+        // passive viewers (web approval dialog, TUI minibuffer) that a
+        // pending approval was answered — by any client — so they can close
+        // their prompt. Like AgentStatus/BrowserPreview, broadcast it live
+        // but never persist it to the transcript.
+        if let SessionEvent::ToolApprovalResolved { .. } = &event {
+            let now = Utc::now();
+            let seq = entry.transcript_count.load(Ordering::Relaxed);
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::Event(EventNotificationPayload {
+                    session_id: entry.id.clone(),
+                    at: now,
+                    event,
+                    seq,
+                }));
+            return;
+        }
         // PTY events take a fast path: append to the on-disk pty.log + a
         // live broadcast. A copy was also appended to the transcript above
         // as an ordering marker. Replay reads back from `pty.log` directly
@@ -2035,6 +2053,8 @@ impl SessionManager {
                 | SessionEvent::Pty { .. }
                 | SessionEvent::PtyResize { .. }
                 | SessionEvent::ToolApprovalRequest { .. }
+                // Transient; handled by the broadcast-only fast path above.
+                | SessionEvent::ToolApprovalResolved { .. }
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
                 | SessionEvent::TaskEnd { .. }
@@ -3862,6 +3882,65 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, SessionEvent::BrowserPreview(_))),
             "BrowserPreview must not be written to the transcript"
+        );
+        assert!(
+            transcript
+                .events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::Message { .. })),
+            "control: a normal Message event should still be persisted"
+        );
+    }
+
+    /// `ToolApprovalResolved` is a transient UI-dismissal signal: it must
+    /// be broadcast live (so passive clients can close a stale approval
+    /// prompt) but never written to the transcript — same treatment as
+    /// `BrowserPreview` / `AgentStatus`.
+    #[tokio::test]
+    async fn tool_approval_resolved_is_not_persisted_to_transcript() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "sresolved";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+
+        // Control: a normal structured event MUST be persisted.
+        mgr.handle_event(
+            &entry,
+            SessionEvent::Message {
+                role: agentd_protocol::MessageRole::Assistant,
+                text: "hi".into(),
+            },
+        )
+        .await;
+
+        // The transient approval-resolved signal MUST NOT be.
+        mgr.handle_event(
+            &entry,
+            SessionEvent::ToolApprovalResolved {
+                call_id: "call-1".into(),
+            },
+        )
+        .await;
+
+        let transcript = storage
+            .read_transcript(id, 0, None)
+            .expect("read transcript");
+        assert!(
+            !transcript
+                .events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::ToolApprovalResolved { .. })),
+            "ToolApprovalResolved must not be written to the transcript"
         );
         assert!(
             transcript
