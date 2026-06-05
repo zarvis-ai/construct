@@ -191,6 +191,86 @@ async fn web_client_loads_and_websocket_connects() {
         .expect("json value");
     assert_eq!(inherited_project["group_id"], "project-123");
 
+    // Terminal fast-open hydrates only a small recent PTY tail first;
+    // older history is explicit/lazy and remains bounded.
+    let fast_open: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const saved = {
+                sessions: state.sessions,
+                currentId: state.currentId,
+                mode: state.mode,
+                ws: state.ws,
+                terminalById: state.terminalById,
+                term: state.term,
+                fitAddon: state.fitAddon,
+              };
+              const calls = [];
+              try {
+                state.sessions = [{
+                  id: 's-fast-pty',
+                  cwd: '/tmp',
+                  harness: 'shell',
+                  has_pty: true,
+                  kind: 'user',
+                }];
+                state.currentId = 's-fast-pty';
+                state.terminalById = new Map();
+                state.ws = {
+                  readyState: 1,
+                  send(raw) {
+                    const msg = JSON.parse(raw);
+                    calls.push(msg);
+                    const pending = state.pending.get(msg.id);
+                    state.pending.delete(msg.id);
+                    let result = null;
+                    if (msg.method === 'session.pty_replay') {
+                      result = {
+                        data: '',
+                        start_offset: msg.params.before_offset ? 0 : 1048576,
+                        end_offset: msg.params.before_offset || 1179648,
+                        total_bytes: 1179648,
+                        size: { cols: 80, rows: 24 },
+                      };
+                    } else if (msg.method === 'session.pty_resize') {
+                      result = {};
+                    }
+                    queueMicrotask(() => pending.resolve(result));
+                  },
+                };
+                await enterTerminalMode('s-fast-pty', { forceReload: true });
+                const afterInitialHidden = terminalHistoryBtn.hidden;
+                await maybeLoadOlderPtyReplay('s-fast-pty', { force: true });
+                const replayCalls = calls.filter((c) => c.method === 'session.pty_replay');
+                return {
+                  replayCalls: replayCalls.map((c) => c.params),
+                  afterInitialHidden,
+                  afterOlderHidden: terminalHistoryBtn.hidden,
+                };
+              } finally {
+                state.sessions = saved.sessions;
+                state.currentId = saved.currentId;
+                state.mode = saved.mode;
+                state.ws = saved.ws;
+                state.terminalById = saved.terminalById;
+                state.term = saved.term;
+                state.fitAddon = saved.fitAddon;
+                terminalHistoryBtn.hidden = true;
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate terminal fast-open")
+        .into_value()
+        .expect("json value");
+    assert_eq!(fast_open["replayCalls"][0]["max_bytes"], 128 * 1024, "{fast_open:?}");
+    assert_eq!(fast_open["replayCalls"][1]["max_bytes"], 128 * 1024, "{fast_open:?}");
+    assert_eq!(fast_open["replayCalls"][1]["before_offset"], 1048576, "{fast_open:?}");
+    assert_eq!(fast_open["afterInitialHidden"], false);
+    assert_eq!(fast_open["afterOlderHidden"], true);
+
     // Connection state is rendered as a tiny matrix canvas rather than
     // a static "connected" text label. The accessible label remains
     // for screen readers.

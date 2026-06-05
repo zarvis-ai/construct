@@ -1527,6 +1527,7 @@
         <div class="terminal-host" id="terminal"></div>
         <div class="terminal-scroll-overlay" id="terminalScrollOverlay" hidden>
           <button type="button" id="terminalWidgetsProxy" aria-label="toggle widgets" hidden>widgets</button>
+          <button type="button" id="terminalHistoryBtn" aria-label="load older terminal history" hidden>history</button>
           <button type="button" id="terminalTopBtn" aria-label="scroll terminal to top">top</button>
           <button type="button" id="terminalBottomBtn" aria-label="scroll terminal to bottom">bottom</button>
         </div>
@@ -1728,6 +1729,7 @@ const terminalScrollOverlayEl = $("terminalScrollOverlay");
 const terminalWidgetControlsEl = $("terminalWidgetControls");
 const widgetsTriggerBtn = $("widgetsTrigger");
 const terminalWidgetsProxyBtn = $("terminalWidgetsProxy");
+const terminalHistoryBtn = $("terminalHistoryBtn");
 const terminalTopBtn = $("terminalTopBtn");
 const terminalBottomBtn = $("terminalBottomBtn");
 const browserPreviewEl = $("browserPreview");
@@ -1893,8 +1895,8 @@ const SESSION_LIST_MIN_WIDTH = 180;
 const SESSION_LIST_MAX_WIDTH = 520;
 const WIDGET_VISIBILITY_KEY_PREFIX = "agentd.web.widgets.visible.";
 const WIDGET_AUTOHIDE_MS = 15000;
-const PTY_REPLAY_INITIAL_BYTES = 1024 * 1024;
-const PTY_REPLAY_MAX_BYTES = 8 * 1024 * 1024;
+const PTY_REPLAY_INITIAL_BYTES = 128 * 1024;
+const PTY_REPLAY_MAX_BYTES = 1024 * 1024;
 const PTY_REPLAY_TOP_THRESHOLD_ROWS = 20;
 let widgetAutohideTimer = null;
 
@@ -2933,6 +2935,7 @@ function resetTerminalReplay(handle) {
   handle.ptyReplayTotalBytes = 0;
   handle.ptyReplayNextBytes = PTY_REPLAY_INITIAL_BYTES;
   handle.ptyReplayLoadingOlder = false;
+  updateTerminalHistoryButton(handle);
   if (handle.term) handle.term.reset();
 }
 
@@ -3002,9 +3005,11 @@ async function enterTerminalMode(id, options = {}) {
           state.ptySizeById.set(id, { cols: r.size.cols, rows: r.size.rows });
         }
         rememberPtyReplayChunk(handle, r);
+        updateTerminalHistoryButton(handle);
         await replayPtyChunks(handle);
       }
       handle.loaded = true;
+      updateTerminalHistoryButton(handle);
     } catch (e) {
       state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
     }
@@ -3153,6 +3158,11 @@ function initTerminalScrollButtons() {
     ev.preventDefault();
     ev.stopPropagation();
   };
+  terminalHistoryBtn.addEventListener("click", (ev) => {
+    stop(ev);
+    cancelResizeFollowBottom();
+    if (state.currentId) maybeLoadOlderPtyReplay(state.currentId, { force: true });
+  });
   terminalTopBtn.addEventListener("click", (ev) => {
     stop(ev);
     cancelResizeFollowBottom();
@@ -3162,7 +3172,7 @@ function initTerminalScrollButtons() {
     stop(ev);
     if (state.term) state.term.scrollToBottom();
   });
-  for (const btn of [terminalTopBtn, terminalBottomBtn]) {
+  for (const btn of [terminalHistoryBtn, terminalTopBtn, terminalBottomBtn]) {
     // Scroll only — never change xterm focus. Focusing xterm (either via
     // an explicit term.focus() or by the button stealing focus on press)
     // focuses the helper textarea, which summons the mobile soft keyboard.
@@ -3296,11 +3306,11 @@ function initTerminalForSession(id) {
 }
 
 function rememberPtyReplayChunk(handle, result) {
-  if (!handle || !result || !result.data) return;
-  const bytes = decodeBase64ToBytes(result.data);
+  if (!handle || !result) return;
+  const bytes = decodeBase64ToBytes(result.data || "");
   const start = Number(result.start_offset || 0);
   const end = Number(result.end_offset || (start + bytes.length));
-  if (!bytes.length && start === end) return;
+  if (!bytes.length && start === end && !result.total_bytes) return;
   if (handle.ptyReplayChunks.some((c) => c.start === start && c.end === end)) return;
   handle.ptyReplayChunks.push({ start, end, bytes });
   handle.ptyReplayChunks.sort((a, b) => a.start - b.start);
@@ -3337,18 +3347,27 @@ function hideTerminalLoading() {
   terminalLoadingEl.classList.add("gone");
 }
 
-function shouldLoadOlderPtyReplay(handle) {
+function updateTerminalHistoryButton(handle = terminalHandleForSession(state.currentId)) {
+  if (!terminalHistoryBtn) return;
+  const canLoad = !!(handle && handle.loaded && handle.ptyReplayStartOffset > 0);
+  terminalHistoryBtn.hidden = !canLoad;
+  terminalHistoryBtn.disabled = !!(canLoad && handle.ptyReplayLoadingOlder);
+}
+
+function shouldLoadOlderPtyReplay(handle, { force = false } = {}) {
   if (!handle || !handle.loaded || handle.ptyReplayLoadingOlder) return false;
   if (handle.ptyReplayStartOffset <= 0) return false;
+  if (force) return true;
   const active = handle.term && handle.term.buffer && handle.term.buffer.active;
   if (!active) return false;
   return active.viewportY <= PTY_REPLAY_TOP_THRESHOLD_ROWS;
 }
 
-async function maybeLoadOlderPtyReplay(id) {
+async function maybeLoadOlderPtyReplay(id, opts = {}) {
   const handle = terminalHandleForSession(id);
-  if (!shouldLoadOlderPtyReplay(handle)) return;
+  if (!shouldLoadOlderPtyReplay(handle, opts)) return;
   handle.ptyReplayLoadingOlder = true;
+  updateTerminalHistoryButton(handle);
   const priorViewportY = handle.term.buffer.active.viewportY;
   const priorBaseY = handle.term.buffer.active.baseY;
   const maxBytes = Math.min(handle.ptyReplayNextBytes, PTY_REPLAY_MAX_BYTES);
@@ -3364,6 +3383,7 @@ async function maybeLoadOlderPtyReplay(id) {
     if (state.currentId !== id) return;
     rememberPtyReplayChunk(handle, r);
     handle.ptyReplayNextBytes = Math.min(maxBytes * 2, PTY_REPLAY_MAX_BYTES);
+    updateTerminalHistoryButton(handle);
     setTerminalLoadingMessage(ptyReplayProgressText(handle));
     await replayPtyChunks(handle);
     for (const chunk of state.ptyBuffer) await writeTermBytes(handle.term, chunk);
@@ -3377,6 +3397,7 @@ async function maybeLoadOlderPtyReplay(id) {
     handle.ptyBuffer = state.ptyBuffer;
     handle.ptyBuffering = state.ptyBuffering;
     handle.ptyReplayLoadingOlder = false;
+    updateTerminalHistoryButton(handle);
     hideTerminalLoading();
   }
 }
