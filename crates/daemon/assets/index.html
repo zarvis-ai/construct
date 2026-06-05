@@ -5732,6 +5732,8 @@ async function submitNewSession(ev) {
   newSessionCreateBtn.disabled = true;
   newSessionErrorEl.hidden = true;
   const params = { harness, cwd };
+  const cur = state.sessions.find((s) => s.id === state.currentId);
+  if (cur && cur.group_id) params.group_id = cur.group_id;
   if (prompt) params.prompt = prompt;
   const info = state.harnesses.find((h) => h.name === harness);
   if (info && info.capabilities && info.capabilities.supports_pty) {

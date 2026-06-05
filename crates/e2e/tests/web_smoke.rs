@@ -130,6 +130,67 @@ async fn web_client_loads_and_websocket_connects() {
         "expected 'session(s)' in rendered body, got:\n{body}"
     );
 
+    // Creating a session while viewing a session inside a project should
+    // inherit that project, matching the TUI's new-session semantics.
+    let inherited_project: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const saved = {
+                sessions: state.sessions,
+                currentId: state.currentId,
+                harnesses: state.harnesses,
+                ws: state.ws,
+              };
+              const calls = [];
+              try {
+                state.sessions = [{
+                  id: 's-parent',
+                  cwd: '/tmp/agentd-project',
+                  group_id: 'project-123',
+                  kind: 'user',
+                }];
+                state.currentId = 's-parent';
+                state.harnesses = [{
+                  name: 'shell',
+                  available: true,
+                  capabilities: { supports_pty: false },
+                }];
+                newSessionHarnessEl.innerHTML = '<option value="shell">shell</option>';
+                newSessionHarnessEl.value = 'shell';
+                newSessionCwdEl.value = '/tmp/agentd-project';
+                newSessionPromptEl.value = '';
+                state.ws = {
+                  readyState: 1,
+                  send(raw) {
+                    const msg = JSON.parse(raw);
+                    calls.push(msg);
+                    const pending = state.pending.get(msg.id);
+                    state.pending.delete(msg.id);
+                    let result = null;
+                    if (msg.method === 'session.create') result = { session_id: 's-child' };
+                    if (msg.method === 'session.list') result = state.sessions;
+                    if (msg.method === 'project.list') result = [];
+                    queueMicrotask(() => pending.resolve(result));
+                  },
+                };
+                await submitNewSession({ preventDefault() {} });
+                return calls.find((c) => c.method === 'session.create')?.params || null;
+              } finally {
+                state.sessions = saved.sessions;
+                state.currentId = saved.currentId;
+                state.harnesses = saved.harnesses;
+                state.ws = saved.ws;
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate project inheritance")
+        .into_value()
+        .expect("json value");
+    assert_eq!(inherited_project["group_id"], "project-123");
+
     // Connection state is rendered as a tiny matrix canvas rather than
     // a static "connected" text label. The accessible label remains
     // for screen readers.
@@ -1223,7 +1284,10 @@ async fn web_client_loads_and_websocket_connects() {
         serde_json::json!([{ "method": "session.pty_input", "data": "instant codex" }])
     );
     assert_eq!(optimistic_send["afterRpcOptimistic"], false);
-    assert_eq!(optimistic_send["rows"], serde_json::json!(["instant codex"]));
+    assert_eq!(
+        optimistic_send["rows"],
+        serde_json::json!(["instant codex"])
+    );
     assert_eq!(optimistic_send["pending"], 0);
 
     // Reconnect regression: mobile keyboard show/hide can churn the browser's
