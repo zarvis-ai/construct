@@ -380,6 +380,11 @@ pub enum SessionEvent {
         #[serde(default)]
         args_summary: String,
         risk: ToolRisk,
+        /// Whether the UI should offer an auto-review retry action. Adapters
+        /// set this to false when auto-review already vetted this call and
+        /// deferred to the user; showing the same action again is redundant.
+        #[serde(default = "default_true")]
+        allow_auto_review: bool,
     },
     /// Tool lifecycle: adapter started running a tool. Carries the
     /// canonical `call_id` (unlike [`ToolUse`] which doesn't) so the

@@ -1061,6 +1061,7 @@ async fn run_one_tool(
     );
     let mut needs_approval =
         is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::Manual);
+    let mut allow_auto_review = true;
     if is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::AutoReview) {
         match auto_review_for_adapter(
             provider,
@@ -1087,6 +1088,7 @@ async fn run_one_tool(
                     call.name, args_summary
                 ));
                 needs_approval = true;
+                allow_auto_review = false;
             }
         }
     }
@@ -1096,6 +1098,7 @@ async fn run_one_tool(
             tool: call.name.clone(),
             args_summary: args_summary.clone(),
             risk: tool.risk(),
+            allow_auto_review,
         });
         hooks
             .run(
@@ -1407,7 +1410,8 @@ mod tests {
     #[test]
     fn auto_review_prompt_guides_model_toward_routine_repo_work() {
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("active git worktree"));
-        assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("git makes those changes inspectable and reversible"));
+        assert!(AUTO_REVIEW_SYSTEM_PROMPT
+            .contains("git makes those changes inspectable and reversible"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("cargo fmt --all"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("cargo test"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("git diff --name-only"));

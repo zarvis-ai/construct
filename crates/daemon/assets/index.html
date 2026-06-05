@@ -5558,6 +5558,7 @@ function enqueueApproval(sessionId, event) {
     tool: event.tool || "tool",
     args_summary: event.args_summary || "",
     risk: event.risk || "",
+    allow_auto_review: event.allow_auto_review !== false,
   });
   if (!state.approvalShown) showNextApproval();
   else updateApprovalQueueHint();
@@ -5578,6 +5579,7 @@ function showNextApproval() {
     approvalRiskEl.classList.add(next.risk);
   }
   approvalSummaryEl.textContent = next.args_summary || "(no args)";
+  approvalAutoReviewBtn.hidden = !next.allow_auto_review;
   setApprovalButtonsDisabled(false);
   updateApprovalQueueHint();
   approvalSheetEl.hidden = false;
@@ -5597,7 +5599,7 @@ function updateApprovalQueueHint() {
 function setApprovalButtonsDisabled(disabled) {
   approvalDenyBtn.disabled = disabled;
   approvalApproveBtn.disabled = disabled;
-  approvalAutoReviewBtn.disabled = disabled;
+  approvalAutoReviewBtn.disabled = disabled || approvalAutoReviewBtn.hidden;
   approvalUnsafeAutoBtn.disabled = disabled;
 }
 

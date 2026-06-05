@@ -135,14 +135,19 @@ impl<'a> Terminal<'a> {
             self.write(footer.as_bytes());
         }
     }
-    fn approval(&self, tool: &str, args_summary: &str, risk: ToolRisk) {
+    fn approval(&self, tool: &str, args_summary: &str, risk: ToolRisk, allow_auto_review: bool) {
         let risk_label = match risk {
             ToolRisk::Safe => "safe",
             ToolRisk::Risky => "risky",
         };
+        let auto_review_option = if allow_auto_review {
+            " / \x1b[1m[a]\x1b[0mauto-review"
+        } else {
+            ""
+        };
         let line = format!(
             "\r\n\x1b[1;33m? approve [{risk_label}]\x1b[0m {tool}\x1b[2m({args_summary})\x1b[0m\
-             — \x1b[1m[y]\x1b[0mapprove / \x1b[1m[n]\x1b[0mdeny / \x1b[1m[a]\x1b[0mauto-review / \x1b[1m[f]\x1b[0munsafe-auto: "
+             — \x1b[1m[y]\x1b[0mapprove / \x1b[1m[n]\x1b[0mdeny{auto_review_option} / \x1b[1m[f]\x1b[0munsafe-auto: "
         );
         self.write(line.as_bytes());
     }
@@ -3102,6 +3107,7 @@ async fn run_one_tool(
     // only approve or ask — it never denies on its own, so the human
     // always makes the final reject call.
     let mut ask_user = is_risky && matches!(*approval_mode, ApprovalMode::Manual);
+    let mut allow_auto_review = true;
     if is_risky && matches!(*approval_mode, ApprovalMode::AutoReview) {
         match crate::agent::auto_review_for_adapter(
             provider,
@@ -3113,8 +3119,10 @@ async fn run_one_tool(
         .await
         {
             crate::agent::AutoReviewResult::Approve => {}
-            crate::agent::AutoReviewResult::Deny
-            | crate::agent::AutoReviewResult::AskUser => ask_user = true,
+            crate::agent::AutoReviewResult::Deny | crate::agent::AutoReviewResult::AskUser => {
+                ask_user = true;
+                allow_auto_review = false;
+            }
         }
     }
     if ask_user {
@@ -3123,6 +3131,7 @@ async fn run_one_tool(
             tool: call.name.clone(),
             args_summary: args_summary.clone(),
             risk: tool.risk(),
+            allow_auto_review,
         });
         hooks
             .run(
@@ -3146,7 +3155,7 @@ async fn run_one_tool(
         // and vets this call; if the reviewer still wants a human we
         // loop and ask again.
         loop {
-            term.approval(&call.name, &args_summary, tool.risk());
+            term.approval(&call.name, &args_summary, tool.risk(), allow_auto_review);
             match wait_for_approval(inbox, &call.id, approval_mode).await {
                 ApprovalOutcome::Stop => return Err("stop".into()),
                 ApprovalOutcome::Interrupt => return Err("interrupt".into()),
@@ -3185,7 +3194,10 @@ async fn run_one_tool(
                         crate::agent::AutoReviewResult::Approve => break,
                         // Never deny outright — bounce back to the user.
                         crate::agent::AutoReviewResult::Deny
-                        | crate::agent::AutoReviewResult::AskUser => continue,
+                        | crate::agent::AutoReviewResult::AskUser => {
+                            allow_auto_review = false;
+                            continue;
+                        }
                     }
                 }
             }

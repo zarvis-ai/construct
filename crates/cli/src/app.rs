@@ -366,6 +366,7 @@ pub enum MinibufferIntent {
         tool: String,
         args_summary: String,
         risk: agentd_protocol::ToolRisk,
+        allow_auto_review: bool,
     },
 }
 
@@ -3119,6 +3120,7 @@ impl App {
                             tool,
                             args_summary,
                             risk,
+                            allow_auto_review,
                         } = &payload.event
                         {
                             self.maybe_open_approval_prompt(
@@ -3127,6 +3129,7 @@ impl App {
                                 tool.clone(),
                                 args_summary.clone(),
                                 *risk,
+                                *allow_auto_review,
                             );
                             // Also fall through so the transcript records it.
                         }
@@ -3497,6 +3500,7 @@ impl App {
         tool: String,
         args_summary: String,
         risk: agentd_protocol::ToolRisk,
+        allow_auto_review: bool,
     ) {
         // Orchestrator approvals are rendered inline in zarvis's PTY
         // (the `? approve [risk] tool(args) — y/n/a` row). The user
@@ -3522,8 +3526,13 @@ impl App {
             agentd_protocol::ToolRisk::Risky => "risky",
         };
         let short_args: String = args_summary.chars().take(80).collect();
+        let auto_review_option = if allow_auto_review {
+            "  a=auto-review"
+        } else {
+            ""
+        };
         let prompt = format!(
-            "approve [{risk_label}] {tool}({}) ▸ y=approve  n=deny  a=auto-review  f=unsafe-auto",
+            "approve [{risk_label}] {tool}({}) ▸ y=approve  n=deny{auto_review_option}  f=unsafe-auto",
             short_args
         );
         self.minibuffer = Some(Minibuffer {
@@ -3536,6 +3545,7 @@ impl App {
                 tool,
                 args_summary,
                 risk,
+                allow_auto_review,
             },
             error: None,
         });
@@ -5924,7 +5934,13 @@ impl App {
             let decision = match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => Some("approve"),
                 KeyCode::Char('n') | KeyCode::Esc => Some("deny"),
-                KeyCode::Char('a') => Some("auto_review"),
+                KeyCode::Char('a') => match self.minibuffer.as_ref().map(|m| &m.intent) {
+                    Some(MinibufferIntent::ApproveTool {
+                        allow_auto_review: true,
+                        ..
+                    }) => Some("auto_review"),
+                    _ => None,
+                },
                 KeyCode::Char('f') => Some("unsafe_auto"),
                 KeyCode::Char('g') if ctrl => Some("deny"),
                 _ => None,
@@ -7776,6 +7792,7 @@ mod tests {
             "shell".into(),
             "echo hi".into(),
             agentd_protocol::ToolRisk::Risky,
+            true,
         );
 
         assert!(matches!(
@@ -7786,6 +7803,27 @@ mod tests {
         assert!(prompt.contains("approve [risky] shell(echo hi)"));
         assert!(prompt.contains("y=approve"));
         assert!(prompt.contains("a=auto-review"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_hides_auto_review_when_disallowed() {
+        let (mut app, _dir, server) = captured_app().await;
+
+        app.maybe_open_approval_prompt(
+            "s1".into(),
+            "call-1".into(),
+            "shell".into(),
+            "echo hi".into(),
+            agentd_protocol::ToolRisk::Risky,
+            false,
+        );
+
+        let prompt = &app.minibuffer.as_ref().unwrap().prompt;
+        assert!(prompt.contains("y=approve"));
+        assert!(prompt.contains("n=deny"));
+        assert!(prompt.contains("f=unsafe-auto"));
+        assert!(!prompt.contains("a=auto-review"));
         server.abort();
     }
 
@@ -7803,6 +7841,7 @@ mod tests {
             "shell".into(),
             "echo hi".into(),
             agentd_protocol::ToolRisk::Risky,
+            true,
         );
 
         assert!(
