@@ -138,8 +138,8 @@ impl<'a> Terminal<'a> {
             ToolRisk::Risky => "risky",
         };
         let line = format!(
-            "\r\n\x1b[1;33m? approve [{risk_label}]\x1b[0m {tool}\x1b[2m({args_summary})\x1b[0m\
-             — \x1b[1m[y]\x1b[0mes / \x1b[1m[n]\x1b[0mo / \x1b[1m[a]\x1b[0mauto-review / \x1b[1m[f]\x1b[0munsafe-auto: "
+            "\r\n\x1b[1;33m? approve all [{risk_label}]\x1b[0m {tool}\x1b[2m({args_summary})\x1b[0m\
+             — \x1b[1m[y]\x1b[0mapprove all / \x1b[1m[n]\x1b[0mdeny all / \x1b[1m[a]\x1b[0mauto-review all / \x1b[1m[f]\x1b[0munsafe-auto: "
         );
         self.write(line.as_bytes());
     }

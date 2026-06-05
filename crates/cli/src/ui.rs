@@ -5144,7 +5144,7 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
             };
             vec![Span::styled(
                 format!(
-                    "   ? approve [{risk_label}] {tool}({})",
+                    "   ? approve all [{risk_label}] {tool}({})",
                     shorten(args_summary, 160)
                 ),
                 Style::default().fg(theme.warning),

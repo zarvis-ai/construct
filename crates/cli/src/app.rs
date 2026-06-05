@@ -3499,7 +3499,7 @@ impl App {
         risk: agentd_protocol::ToolRisk,
     ) {
         // Orchestrator approvals are rendered inline in zarvis's PTY
-        // (the `? approve [risk] tool(args) — y/n/a` row). The user
+        // (the `? approve all [risk] tool(args) — y/n/a` row). The user
         // responds with a single key inside the orchestrator panel,
         // not via a separate minibuffer prompt — so skip ours.
         if self.orchestrator_id.as_deref() == Some(session_id.as_str()) {
@@ -3523,7 +3523,7 @@ impl App {
         };
         let short_args: String = args_summary.chars().take(80).collect();
         let prompt = format!(
-            "approve [{risk_label}] {tool}({}) ▸ y=approve  n=deny  a=auto-review  f=unsafe-auto",
+            "approve all [{risk_label}] {tool}({}) ▸ y=approve all  n=deny all  a=auto-review all  f=unsafe-auto",
             short_args
         );
         self.minibuffer = Some(Minibuffer {
@@ -7782,6 +7782,10 @@ mod tests {
             app.minibuffer.as_ref().map(|mb| &mb.intent),
             Some(MinibufferIntent::ApproveTool { session_id, .. }) if session_id == "s1"
         ));
+        let prompt = &app.minibuffer.as_ref().unwrap().prompt;
+        assert!(prompt.contains("approve all [risky] shell(echo hi)"));
+        assert!(prompt.contains("y=approve all"));
+        assert!(prompt.contains("a=auto-review all"));
         server.abort();
     }
 
