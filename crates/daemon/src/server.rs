@@ -1,7 +1,7 @@
 //! Unix-socket IPC server. Dispatches JSON-RPC requests to [`SessionManager`]
 //! and forwards subscribed broadcast events back to the client.
 
-use crate::remote::{token_from_uri_path, RemoteState};
+use crate::remote::RemoteState;
 use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
@@ -294,9 +294,9 @@ fn web_index_html(dev_dir: Option<&std::path::Path>) -> Vec<u8> {
     #[cfg(debug_assertions)]
     if dev_dir.is_some() {
         if let Ok(html) = std::str::from_utf8(&bytes) {
-            // Poll the version endpoint; reload on any change. URL is
-            // relative to `/t/<token>/`.
-            const LIVERELOAD: &str = "<script>(function(){let last=null;async function t(){try{const r=await fetch('dev/version',{cache:'no-store'});if(r.ok){const v=await r.text();if(last!==null&&v!==last)location.reload();last=v;}}catch(e){}setTimeout(t,700);}t();})();</script>";
+            // Poll the version endpoint; reload on any change. Root-relative
+            // so it works from session paths such as `/s/<session-id>`.
+            const LIVERELOAD: &str = "<script>(function(){let last=null;async function t(){try{const r=await fetch('/dev/version',{cache:'no-store'});if(r.ok){const v=await r.text();if(last!==null&&v!==last)location.reload();last=v;}}catch(e){}setTimeout(t,700);}t();})();</script>";
             let mut out = String::with_capacity(html.len() + LIVERELOAD.len());
             match html.rfind("</body>") {
                 Some(pos) => {
@@ -462,9 +462,7 @@ where
     wr.flush().await
 }
 
-/// Write a 3xx redirect to `location`. Used to canonicalize the
-/// trailing slash on `/t/<token>` so relative URLs (static JS /
-/// CSS) resolve against `/t/<token>/` instead of `/t/`.
+/// Write a 3xx redirect to `location`.
 async fn write_redirect_response<W>(wr: &mut W, status: u16, location: &str) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -540,6 +538,19 @@ where
             write_redirect_response(wr, 301, canonical_root.unwrap()).await
         }
         "/" | "/index.html" => {
+            write_http_response(
+                wr,
+                200,
+                "OK",
+                "text/html; charset=utf-8",
+                &web_index_html(manager.dev_assets().as_deref()),
+            )
+            .await
+        }
+        path if path
+            .strip_prefix("/s/")
+            .is_some_and(|id| !id.is_empty() && !id.contains('/')) =>
+        {
             write_http_response(
                 wr,
                 200,
@@ -712,11 +723,12 @@ async fn handle_ws_connection(
 ) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
 
-    // Token gate + transport demux. The same URL the QR code points
+    // Basic-auth-gated transport demux. The same URL the QR code points
     // at serves two flows:
     //
-    //   GET /t/<token>                              → HTML web client
-    //   GET /t/<token>  + Upgrade: websocket header → WS handshake
+    //   GET /                                      → HTML web client
+    //   GET /s/<session-id>                       → HTML web client for a session
+    //   GET / or /s/<session-id> + Upgrade header → WS handshake
     //
     // tungstenite's upgrade handshake validates the WS-specific
     // headers (`Sec-WebSocket-Key`, etc.) before ever calling its
@@ -770,36 +782,7 @@ async fn handle_ws_connection(
         }
     };
 
-    let candidate = match token_from_uri_path(&info.path) {
-        Some(t) => t.to_string(),
-        None => {
-            let _ = write_http_response(
-                &mut wr,
-                403,
-                "Forbidden",
-                "text/plain; charset=utf-8",
-                b"forbidden: missing token; expected /t/<token>",
-            )
-            .await;
-            return Ok(());
-        }
-    };
-    if !remote.token_matches(&candidate) {
-        let _ = write_http_response(
-            &mut wr,
-            403,
-            "Forbidden",
-            "text/plain; charset=utf-8",
-            b"forbidden: invalid token",
-        )
-        .await;
-        return Ok(());
-    }
-
-    // HTTP Basic auth gate. Defense-in-depth on top of the token —
-    // the URL alone (screenshot, terminal history, bookmark) is no
-    // longer enough; the user also has to know the password. The
-    // browser prompts natively on the 401 + WWW-Authenticate
+    // HTTP Basic auth gate. The browser prompts natively on the 401 + WWW-Authenticate
     // challenge and remembers credentials within the session so
     // the user types the password exactly once per phone visit.
     // Username MUST equal `REMOTE_USERNAME` ("remote") so the
@@ -821,15 +804,10 @@ async fn handle_ws_connection(
     }
 
     if !info.is_ws_upgrade {
-        // Authenticated plain GET. Route by path suffix so the
-        // HTML can pull xterm + css via relative URLs without
-        // ever depending on a public CDN — the phone reached the
-        // cloudflared tunnel but couldn't reach jsdelivr in the
-        // first hand-test.
-        let token_prefix = format!("/t/{candidate}");
-        let suffix = info.path.strip_prefix(&token_prefix).unwrap_or("");
-        let canonical = format!("{token_prefix}/");
-        serve_web_asset_path(&mut wr, &manager, suffix, Some(&canonical)).await?;
+        // Authenticated plain GET. Route static assets and session paths from
+        // the browser-visible path directly; Basic auth protects all remote
+        // paths, and the localhost-only web UI uses the same asset router.
+        serve_web_asset_path(&mut wr, &manager, &info.path, None).await?;
         return Ok(());
     }
 

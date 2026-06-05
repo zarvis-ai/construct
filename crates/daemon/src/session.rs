@@ -1002,7 +1002,7 @@ impl SessionManager {
             // the URL can't be pasted into a browser at all,
             // which defeats `/remote-control-debug`'s whole
             // point.
-            let url = format!("http://127.0.0.1:{port}/t/{}", state.token());
+            let url = format!("http://127.0.0.1:{port}/");
             let qr = crate::remote::render_qr_dense1x2(&url).unwrap_or_default();
             return Ok(agentd_protocol::RemoteStartResult {
                 url,
@@ -1014,7 +1014,7 @@ impl SessionManager {
         }
 
         if !wait_for_tunnel {
-            let url = format!("http://127.0.0.1:{port}/t/{}", state.token());
+            let url = format!("http://127.0.0.1:{port}/");
             let qr = crate::remote::render_qr_dense1x2(&url).unwrap_or_default();
             return Ok(agentd_protocol::RemoteStartResult {
                 url,

@@ -4,8 +4,8 @@
 //! is on PATH, this task spawns `cloudflared tunnel --url
 //! http://127.0.0.1:<port>` as a subprocess, scrapes the
 //! `*.trycloudflare.com` URL out of cloudflared's stderr banner,
-//! and stores the resulting `wss://<host>/t/<token>` on
-//! [`RemoteState`]. The full URL (plus a terminal-rendered QR
+//! and stores the resulting browser URL on [`RemoteState`]. The full URL
+//! (plus a terminal-rendered QR
 //! code) is also logged so the user can scan it from a phone —
 //! this is what makes the Phase 1 "just works" remote experience
 //! actually just work.
@@ -68,7 +68,10 @@ pub async fn run(remote: RemoteState, local_port: u16, adopt_pid: u32) {
         while process_alive(adopt_pid) {
             tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        tracing::warn!(pid = adopt_pid, "adopted cloudflared exited; spawning fresh");
+        tracing::warn!(
+            pid = adopt_pid,
+            "adopted cloudflared exited; spawning fresh"
+        );
         remote.set_tunnel_url(None).await;
         remote.set_tunnel_pid(0).await;
     }
@@ -126,7 +129,6 @@ async fn run_once(remote: &RemoteState, local_port: u16) -> Result<()> {
         .ok_or_else(|| anyhow!("cloudflared stderr not captured"))?;
 
     let scan_remote = remote.clone();
-    let token = remote.token().to_string();
     let scan_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         let mut announced = false;
@@ -144,8 +146,8 @@ async fn run_once(remote: &RemoteState, local_port: u16) -> Result<()> {
                     // unscannable in any browser-camera flow,
                     // which is what bit us in the first phone
                     // test.
-                    let browser_url = format!("https://{host_path}/t/{token}");
-                    let ws_url = format!("wss://{host_path}/t/{token}");
+                    let browser_url = format!("https://{host_path}/");
+                    let ws_url = format!("wss://{host_path}/");
                     // The QR + URL render in the TUI's `/remote-control` modal
                     // and the webui — no need to dump them to the daemon's
                     // stdout where every restart re-paints a full-screen QR
@@ -195,7 +197,6 @@ fn extract_trycloudflare_url(line: &str) -> Option<String> {
         None
     }
 }
-
 
 #[cfg(test)]
 mod tests {

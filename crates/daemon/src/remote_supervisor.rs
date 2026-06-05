@@ -219,9 +219,7 @@ async fn handle_start(
             });
             *tunnel_task = Some(handle);
         } else {
-            tracing::info!(
-                "AGENTD_REMOTE_NO_TUNNEL is set; skipping cloudflared spawn"
-            );
+            tracing::info!("AGENTD_REMOTE_NO_TUNNEL is set; skipping cloudflared spawn");
         }
     }
 
@@ -331,8 +329,8 @@ async fn bind_and_install(
     }
     tracing::info!(
         port,
-        url = %format!("http://127.0.0.1:{port}/t/{}", state.token()),
-        "remote ws ready (token-gated, localhost-bind)"
+        url = %format!("http://127.0.0.1:{port}/"),
+        "remote ws ready (basic-auth-gated, localhost-bind)"
     );
 
     let installed = {

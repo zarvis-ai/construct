@@ -7,16 +7,16 @@
 <title>agentd · remote</title>
 <!--
   xterm.js + addon-fit are bundled into the daemon binary and served
-  at `static/...` (relative to `/t/<token>/`). The daemon redirects
-  `/t/<token>` → `/t/<token>/` so these relative paths resolve
-  correctly. Loading them from the same origin as the HTML keeps
-  the phone reachable even when its network only has the cloudflared
-  tunnel and nothing else (the captive-WiFi failure mode that bit us
-  on the first hand-test against a public CDN).
+  from root-relative `/static/...` URLs so session URLs such as
+  `/s/<session-id>` can refresh without looking for nested assets.
+  Loading them from the same origin as the HTML keeps the phone reachable
+  even when its network only has the cloudflared tunnel and nothing else
+  (the captive-WiFi failure mode that bit us on the first hand-test
+  against a public CDN).
 -->
-<link rel="stylesheet" href="static/xterm.css" />
-<script src="static/xterm.js" defer></script>
-<script src="static/xterm-addon-fit.js" defer></script>
+<link rel="stylesheet" href="/static/xterm.css" />
+<script src="/static/xterm.js" defer></script>
+<script src="/static/xterm-addon-fit.js" defer></script>
 <style>
   :root {
     --bg: #020805;
@@ -1755,6 +1755,31 @@ const approvalAutoReviewBtn = $("approvalAutoReview");
 const approvalUnsafeAutoBtn = $("approvalUnsafeAuto");
 const VIEW_MODE_PREFS_KEY = "agentd.web.viewModePrefs";
 
+function sessionIdFromLocation() {
+  const parts = location.pathname.split("/").filter(Boolean);
+  if (parts.length === 2 && parts[0] === "s" && parts[1]) {
+    try { return decodeURIComponent(parts[1]); } catch { return parts[1]; }
+  }
+  return null;
+}
+
+function setLocationSessionId(id, { replace = false } = {}) {
+  const url = new URL(location.href);
+  url.pathname = id ? `/s/${encodeURIComponent(id)}` : "/";
+  url.hash = "";
+  const next = url.pathname + url.search + url.hash;
+  if (next === location.pathname + location.search + location.hash) return;
+  if (replace) history.replaceState(null, "", next);
+  else history.pushState(null, "", next);
+}
+
+function websocketUrlForLocation() {
+  const url = new URL(location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.hash = "";
+  return url.toString();
+}
+
 const state = {
   ws: null,
   rpcNextId: 1,
@@ -1792,6 +1817,10 @@ const state = {
   // base64 PNG previews as UI-only events; keep them out of the
   // textual transcript and show only the selected session's image.
   browserPreviewById: new Map(),
+  // Session requested by the URL path. Kept separate from currentId so the
+  // first session.list snapshot can honor a refresh/deep link before the
+  // normal first-session fallback runs.
+  urlRequestedSessionId: sessionIdFromLocation(),
   // Current view mode — "chat" (headless transcript + composer)
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on `has_pty` plus the session mode.
@@ -2179,7 +2208,7 @@ function setComposerEnabled(on) {
 
 function connect() {
   setConnState("connecting", "connecting…");
-  const url = location.href.replace(/^http/, "ws");
+  const url = websocketUrlForLocation();
   let ws;
   try { ws = new WebSocket(url); } catch (e) {
     setConnState("closed", "failed");
@@ -2313,9 +2342,12 @@ async function refreshSessions() {
     // to operator only when there are no user sessions yet.
     if (!state.currentId) {
       const ordered = orderedSessions();
+      const requested = state.urlRequestedSessionId
+        ? ordered.find((s) => s.id === state.urlRequestedSessionId)
+        : null;
       const firstUser = ordered.find((s) => s.kind !== "orchestrator");
-      const pick = firstUser || ordered[0];
-      if (pick) selectSession(pick.id);
+      const pick = requested || firstUser || ordered[0];
+      if (pick) selectSession(pick.id, { replaceUrl: true });
     }
   } catch (e) {
     sessionListEl.innerHTML = `<div class="empty">${escape(e.message)}</div>`;
@@ -2785,10 +2817,14 @@ async function switchCurrentViewMode(mode) {
   setComposerEnabled(!!(state.ws && state.ws.readyState === 1 && state.currentId));
 }
 
-async function selectSession(id) {
-  if (state.currentId === id) return;
+async function selectSession(id, { replaceUrl = false } = {}) {
+  if (state.currentId === id) {
+    setLocationSessionId(id, { replace: replaceUrl });
+    return;
+  }
   const focusTerminalAfterSwitch = shouldFocusTerminalAfterSessionSwitch();
   state.currentId = id;
+  setLocationSessionId(id, { replace: replaceUrl });
   renderSessions();
   const s = state.sessions.find((x) => x.id === id);
   sessionTitleEl.textContent = s ? sessionViewTitle(s) : "";
@@ -4212,6 +4248,8 @@ function handleNotification(method, params) {
     clearBrowserPreview(params.session_id);
     if (params.session_id === state.currentId) {
       state.currentId = null;
+      state.urlRequestedSessionId = null;
+      setLocationSessionId(null, { replace: true });
       clearTranscriptPane(params.session_id);
       renderEditorState(null);
       renderBrowserPreviewForSession(null);
@@ -5940,6 +5978,13 @@ function initPullToRefresh() {
 }
 
 // --- Boot ---------------------------------------------------------------
+
+window.addEventListener("popstate", () => {
+  const id = sessionIdFromLocation();
+  state.urlRequestedSessionId = id;
+  if (!id || id === state.currentId) return;
+  if (state.sessions.some((s) => s.id === id)) selectSession(id, { replaceUrl: true });
+});
 
 initMiniMatrix();
 initPullToRefresh();

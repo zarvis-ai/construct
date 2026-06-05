@@ -28,22 +28,16 @@ use uuid::Uuid;
 pub const REMOTE_USERNAME: &str = "remote";
 
 /// Shared handle to remote-control state. Cheap to clone (one `Arc`
-/// for the inner state). The token field is immutable for the
-/// lifetime of the daemon, so it's accessible synchronously; only
-/// the tunnel URL (set after cloudflared starts) needs async access.
+/// for the inner state). The tunnel URL (set after cloudflared starts)
+/// needs async access.
 #[derive(Clone)]
 pub struct RemoteState {
-    /// Auth token. Required (in the URL path) for any WS upgrade.
-    /// Constant for the lifetime of one daemon process. Public
-    /// because the upgrade callback runs synchronously and needs to
-    /// read this without `.await`.
+    /// Legacy URL token retained in snapshots for backward-compatible
+    /// deserialization and restart adoption. The web UI is gated by Basic auth.
     token: Arc<String>,
-    /// HTTP Basic auth password. Defense-in-depth on top of the
-    /// 122-bit URL token: a screenshot or terminal-scrollback leak
-    /// of the URL alone doesn't grant access without also typing
-    /// this. Auto-generated in the `swift-fox-77` shape so it's
-    /// easy to read out loud / type on a phone. User can override
-    /// via `/remote-control <password>` to set their own.
+    /// HTTP Basic auth password. Auto-generated in the `swift-fox-77`
+    /// shape so it's easy to read out loud / type on a phone. User can
+    /// override via `/remote-control <password>` to set their own.
     password: Arc<String>,
     tunnel_url: Arc<RwLock<Option<String>>>,
     /// Active remote WS connection count. Bumped on accept,
@@ -114,9 +108,8 @@ impl RemoteSnapshot {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let snap: RemoteSnapshot = serde_json::from_slice(&bytes).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let snap: RemoteSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(Some(snap))
     }
 
@@ -129,9 +122,8 @@ impl RemoteSnapshot {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, path)
     }
@@ -145,11 +137,12 @@ impl RemoteSnapshot {
 }
 
 impl RemoteState {
-    /// Mint a fresh state with a new token and an auto-generated
-    /// password. Called once per active remote-control session
-    /// (re-minted after `/remote-stop` + `/remote-control`).
-    /// Snapshot path defaults to `None` — call `with_snapshot_path`
-    /// to install one if persistence is desired.
+    /// Mint fresh state with an auto-generated password. Called once
+    /// per active remote-control session (re-minted after
+    /// `/remote-stop` + `/remote-control`). A legacy URL token is still
+    /// generated for snapshot compatibility, but Basic auth is the web
+    /// UI gate. Snapshot path defaults to `None` — call
+    /// `with_snapshot_path` to install one if persistence is desired.
     pub fn new() -> Self {
         Self::with_password(None)
     }
@@ -253,7 +246,9 @@ impl RemoteState {
         match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => tracing::warn!(error = %e, path = %path.display(), "remote snapshot delete failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "remote snapshot delete failed")
+            }
         }
     }
 
@@ -293,38 +288,16 @@ impl RemoteState {
         u32::try_from(self.clients.load(Ordering::SeqCst)).unwrap_or(u32::MAX)
     }
 
-    pub fn token(&self) -> &str {
-        &self.token
-    }
-
     pub fn password(&self) -> &str {
         &self.password
     }
 
-    /// Constant-time password compare. Same shape as `token_matches`
-    /// — length-mismatch short-circuit isn't a meaningful leak
-    /// against the user-chosen passwords we'd accept (auto-gen
-    /// passwords are a fixed pattern; user overrides are
+    /// Constant-time password compare. Length-mismatch short-circuit isn't
+    /// a meaningful leak against the user-chosen passwords we'd accept
+    /// (auto-gen passwords are a fixed pattern; user overrides are
     /// already-known length to an attacker observing the wire).
     pub fn password_matches(&self, candidate: &str) -> bool {
         let real = &self.password;
-        if candidate.len() != real.len() {
-            return false;
-        }
-        let mut diff: u8 = 0;
-        for (a, b) in candidate.bytes().zip(real.bytes()) {
-            diff |= a ^ b;
-        }
-        diff == 0
-    }
-
-    /// Compare a candidate token to the stored one in constant time.
-    /// Returns true only on exact match. Length-mismatch short-
-    /// circuits — the wire shape leaks "wrong length" but that's
-    /// not a real attacker advantage against 122 bits of UUID-v4
-    /// randomness in a known-length token.
-    pub fn token_matches(&self, candidate: &str) -> bool {
-        let real = &self.token;
         if candidate.len() != real.len() {
             return false;
         }
@@ -388,20 +361,17 @@ impl Default for RemoteState {
 /// we don't allow access on password alone — the token must also
 /// match on the URL path.
 const WORD_ADJ: &[&str] = &[
-    "swift", "calm", "bold", "wise", "kind", "lucky", "quick", "merry",
-    "brave", "happy", "sunny", "neat", "tidy", "smart", "fresh", "clear",
-    "bright", "warm", "cool", "gentle", "honest", "humble", "loyal", "noble",
-    "polite", "quiet", "sharp", "strong", "tall", "tame", "true", "tough",
-    "vivid", "fair", "fine", "free", "good", "grand", "great", "jolly",
+    "swift", "calm", "bold", "wise", "kind", "lucky", "quick", "merry", "brave", "happy", "sunny",
+    "neat", "tidy", "smart", "fresh", "clear", "bright", "warm", "cool", "gentle", "honest",
+    "humble", "loyal", "noble", "polite", "quiet", "sharp", "strong", "tall", "tame", "true",
+    "tough", "vivid", "fair", "fine", "free", "good", "grand", "great", "jolly",
 ];
 
 const WORD_NOUN: &[&str] = &[
-    "fox", "owl", "cat", "dog", "elk", "bee", "ant", "bug",
-    "wolf", "bear", "hawk", "moth", "frog", "duck", "swan", "lark",
-    "deer", "lynx", "mole", "newt", "otter", "robin", "shark", "skunk",
-    "snail", "spider", "tiger", "vole", "whale", "yak", "eagle",
-    "raven", "salmon", "panda", "moose", "lemur", "horse", "goat", "crab",
-    "hare",
+    "fox", "owl", "cat", "dog", "elk", "bee", "ant", "bug", "wolf", "bear", "hawk", "moth", "frog",
+    "duck", "swan", "lark", "deer", "lynx", "mole", "newt", "otter", "robin", "shark", "skunk",
+    "snail", "spider", "tiger", "vole", "whale", "yak", "eagle", "raven", "salmon", "panda",
+    "moose", "lemur", "horse", "goat", "crab", "hare",
 ];
 
 /// Build a `<adj>.<noun>.<NN>` style password. Uses random bytes
@@ -444,73 +414,17 @@ pub fn render_qr_dense1x2(content: &str) -> Option<String> {
     )
 }
 
-/// Extract the token from an HTTP request URI path. Accepts the
-/// shape `/t/<token>` (and trailing path segments, ignored). Returns
-/// `None` when the path doesn't match.
-pub fn token_from_uri_path(path: &str) -> Option<&str> {
-    let rest = path.strip_prefix("/t/")?;
-    let token = rest.split('/').next()?;
-    if token.is_empty() {
-        None
-    } else {
-        Some(token)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Token extraction from URI paths. Strict on the `/t/` prefix
-    /// so we don't accidentally accept a request to `/token` (or
-    /// any other route the web client might add later).
-    #[test]
-    fn extracts_token_from_t_path() {
-        assert_eq!(token_from_uri_path("/t/abc123"), Some("abc123"));
-        assert_eq!(token_from_uri_path("/t/abc123/some/extra"), Some("abc123"));
-        assert_eq!(token_from_uri_path("/"), None);
-        assert_eq!(token_from_uri_path("/t/"), None);
-        assert_eq!(token_from_uri_path("/t"), None);
-        assert_eq!(token_from_uri_path("/token/abc123"), None);
-        assert_eq!(token_from_uri_path(""), None);
-    }
-
-    /// `token_matches` is exact-match only. Empty / wrong-length /
-    /// off-by-one inputs all reject.
-    #[test]
-    fn token_matches_is_exact_only() {
-        let s = RemoteState::new();
-        let real = s.token().to_string();
-        assert!(s.token_matches(&real));
-        // Length mismatch.
-        assert!(!s.token_matches(&format!("{real}x")));
-        assert!(!s.token_matches(&real[..real.len() - 1]));
-        // Wrong content of same length.
-        let mut wrong = real.clone();
-        let first = wrong.remove(0);
-        wrong.push(first); // rotate one char
-        assert!(!s.token_matches(&wrong));
-        // Empty.
-        assert!(!s.token_matches(""));
-    }
-
-    /// Fresh `RemoteState`s mint independent tokens — no static /
-    /// shared state.
-    #[test]
-    fn fresh_state_mints_unique_tokens() {
-        let a = RemoteState::new();
-        let b = RemoteState::new();
-        assert_ne!(a.token(), b.token());
-        // UUID-v4 simple form is 32 hex chars.
-        assert_eq!(a.token().len(), 32);
-    }
 
     /// Tunnel URL is settable + readable.
     #[tokio::test]
     async fn tunnel_url_round_trip() {
         let s = RemoteState::new();
         assert_eq!(s.tunnel_url().await, None);
-        s.set_tunnel_url(Some("https://x.trycloudflare.com".into())).await;
+        s.set_tunnel_url(Some("https://x.trycloudflare.com".into()))
+            .await;
         assert_eq!(
             s.tunnel_url().await.as_deref(),
             Some("https://x.trycloudflare.com"),
