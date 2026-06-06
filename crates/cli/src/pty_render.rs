@@ -302,6 +302,17 @@ struct BlockLayout {
     kill_cols: Option<(u16, u16)>,
 }
 
+fn suffix_rebuild_start(layouts: &[ItemLayout], changed_idx: usize, rows: u16) -> usize {
+    let budget = reflow_budget_lines(rows);
+    let mut retained_lines = 0usize;
+    let mut start = layouts.len();
+    while start > 0 && retained_lines < budget {
+        start -= 1;
+        retained_lines += layouts[start].lines;
+    }
+    start.min(changed_idx)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ItemSig {
     Chunk(usize),
@@ -404,6 +415,7 @@ impl ItemSig {
 pub const VT100_MIN_DIM: u16 = 2;
 
 pub const TOOL_BLOCK_COLLAPSED_LINES: usize = 5;
+pub const TOOL_BLOCK_EXPANDED_LINES: usize = 240;
 /// Per-line truncation in collapsed mode (mirrors zarvis).
 pub const TOOL_BLOCK_MAX_COLS: usize = 200;
 
@@ -1186,23 +1198,38 @@ impl ItemHistory {
     /// when invalidation is required.
     fn replay_full(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
         // Per-item signatures: if anything in the prefix mutated,
-        // we have to rebuild because vt100 has no "undo bytes" API.
+        // we have to rebuild from that item onward because vt100 has
+        // no "undo bytes" API.
         let current_sigs: Vec<ItemSig> = self.items.iter().map(ItemSig::of).collect();
 
-        let needs_rebuild = match &self.cached {
+        let rebuild_from = match &self.cached {
             None => true,
             Some(c) => {
                 c.cols != cols
                     || current_sigs.len() < c.signatures.len()
                     || self.pending_chunk.len() < c.pending_consumed
-                    || c.signatures
-                        .iter()
-                        .zip(current_sigs.iter())
-                        .any(|(a, b)| a != b)
             }
         };
+        let changed_idx = self.cached.as_ref().and_then(|c| {
+            c.signatures
+                .iter()
+                .zip(current_sigs.iter())
+                .position(|(a, b)| a != b)
+        });
+        let rebuild_from = if rebuild_from {
+            Some(0)
+        } else {
+            self.cached.as_ref().and_then(|c| {
+                changed_idx.map(|idx| suffix_rebuild_start(&c.item_layouts, idx, rows))
+            })
+        };
 
-        if needs_rebuild {
+        if let Some(start) = rebuild_from {
+            let preserved_layouts = self
+                .cached
+                .as_ref()
+                .map(|cache| cache.item_layouts[..start.min(cache.item_layouts.len())].to_vec())
+                .unwrap_or_default();
             self.cached = Some(CachedParser {
                 parser: vt100::Parser::new(
                     rows.max(VT100_MIN_DIM),
@@ -1215,11 +1242,11 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
-                item_layouts: Vec::new(),
+                item_layouts: preserved_layouts,
             });
         }
         let cache = self.cached.as_mut().expect("just populated above");
-        if !needs_rebuild && cache.rows != rows {
+        if rebuild_from.is_none() && cache.rows != rows {
             cache
                 .parser
                 .screen_mut()
@@ -1238,18 +1265,16 @@ impl ItemHistory {
         // Compute layouts only for items past the cached prefix.
         // Cached layouts for `[0..reuse_upto)` stay valid because the
         // non-rebuild path guarantees `cols` is unchanged (a cols
-        // change forces a rebuild, which clears `item_layouts`), and
-        // any signature mutation in the prefix also forces a rebuild.
-        // The unchanged prefix is exactly the items already fed into
-        // the persistent parser, so we only `process` the new tail —
-        // and we no longer re-scan the whole history with
+        // change forces a rebuild), and any signature mutation drops
+        // layouts from the changed suffix onward. When a suffix
+        // rebuild preserves old prefix layouts, those prefix rows are
+        // retained only for absolute hit-rect math; the new parser is
+        // fed from `start_processing_at`, which covers the retained
+        // scrollback window and avoids replaying ancient history.
+        // We no longer re-scan the whole history with
         // `count_visible_lines` / `synth_block` every frame. That
         // O(history)-per-frame re-scan was the zarvis typing lag.
-        let start_processing_at = if needs_rebuild {
-            0
-        } else {
-            cache.processed_count
-        };
+        let start_processing_at = rebuild_from.unwrap_or(cache.processed_count);
         let reuse_upto = cache.item_layouts.len().min(self.items.len());
         let mut cursor_col = cache
             .item_layouts
@@ -1368,7 +1393,7 @@ impl ItemHistory {
         // never re-iterate the whole pending buffer (otherwise long
         // sessions pay O(history) per frame just to position block
         // spans).
-        if needs_rebuild {
+        if rebuild_from.is_some() {
             cache.pending_visible_lines = 0;
         }
         let pending_start = cache.pending_consumed.min(self.pending_chunk.len());
@@ -1670,6 +1695,17 @@ fn push_text_crlf(out: &mut Vec<u8>, text: &str) {
     }
 }
 
+fn count_lines_up_to(text: &str, limit: usize) -> (usize, bool) {
+    let mut count = 0usize;
+    for _ in text.lines() {
+        if count >= limit {
+            return (count, true);
+        }
+        count += 1;
+    }
+    (count, false)
+}
+
 /// Synthesize terminal bytes for a structured chat [`Item::Message`].
 /// vt100 handles column wrapping, so we only normalize newlines and add
 /// role styling. `break_before` (set on the first item of a run) starts
@@ -1909,18 +1945,18 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
             "\x1b[1;31m✗\x1b[0m"
         };
         let output = output_opt.unwrap_or("");
-        let total_lines = output.lines().count();
+        let (known_lines, has_more_lines) = count_lines_up_to(output, TOOL_BLOCK_EXPANDED_LINES);
         let visible = if block.expanded {
-            total_lines
+            known_lines
         } else {
-            TOOL_BLOCK_COLLAPSED_LINES.min(total_lines)
+            TOOL_BLOCK_COLLAPSED_LINES.min(known_lines)
         };
         let max_col = (cols as usize)
             .saturating_sub(7)
             .min(TOOL_BLOCK_MAX_COLS)
             .max(8);
 
-        if total_lines == 0 {
+        if known_lines == 0 {
             let payload = format!("  {glyph}  \x1b[2m(no output)\x1b[0m\r\n");
             out.extend_from_slice(payload.as_bytes());
         } else {
@@ -1936,14 +1972,25 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
             }
         }
 
-        if total_lines > 0 {
-            if block.expanded && total_lines > TOOL_BLOCK_COLLAPSED_LINES {
-                let footer = "     \x1b[2;36m[click to collapse]\x1b[0m\r\n".to_string();
-                out.extend_from_slice(footer.as_bytes());
-            } else if !block.expanded && total_lines > TOOL_BLOCK_COLLAPSED_LINES {
-                let remaining = total_lines - TOOL_BLOCK_COLLAPSED_LINES;
-                let footer =
-                    format!("     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n");
+        if known_lines > 0 {
+            if block.expanded && (known_lines > TOOL_BLOCK_COLLAPSED_LINES || has_more_lines) {
+                if has_more_lines {
+                    let footer = format!(
+                        "     \x1b[2;36m[showing {visible}/{visible}+ lines — click to collapse]\x1b[0m\r\n"
+                    );
+                    out.extend_from_slice(footer.as_bytes());
+                } else {
+                    let footer = "     \x1b[2;36m[click to collapse]\x1b[0m\r\n".to_string();
+                    out.extend_from_slice(footer.as_bytes());
+                }
+            } else if !block.expanded
+                && (known_lines > TOOL_BLOCK_COLLAPSED_LINES || has_more_lines)
+            {
+                let remaining = known_lines.saturating_sub(TOOL_BLOCK_COLLAPSED_LINES);
+                let plus = if has_more_lines { "+" } else { "" };
+                let footer = format!(
+                    "     \x1b[2;36m[+{remaining}{plus} lines — click to expand]\x1b[0m\r\n"
+                );
                 out.extend_from_slice(footer.as_bytes());
             }
         }
@@ -2533,6 +2580,52 @@ mod tests {
         assert!(
             expanded_rows > collapsed_rows,
             "expand should grow the row range: collapsed={collapsed_rows} expanded={expanded_rows}"
+        );
+    }
+
+    #[test]
+    fn expanded_tool_output_is_capped_inline() {
+        let mut block = ToolBlock {
+            call_id: "c1".into(),
+            tool: Some("read_file".into()),
+            args_summary: Some("large.log".into()),
+            output: Some(
+                (0..(TOOL_BLOCK_EXPANDED_LINES + 20))
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ok: true,
+            expanded: true,
+            started_at: Instant::now(),
+        };
+
+        let rendered = String::from_utf8(synth_block(&block, 100).bytes).unwrap();
+        assert!(
+            rendered.contains(&format!(
+                "showing {}/{}+ lines",
+                TOOL_BLOCK_EXPANDED_LINES, TOOL_BLOCK_EXPANDED_LINES
+            )),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("click to collapse"), "{rendered:?}");
+        assert!(
+            rendered.contains(&format!("line {}", TOOL_BLOCK_EXPANDED_LINES - 1)),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&format!("line {}", TOOL_BLOCK_EXPANDED_LINES)),
+            "{rendered:?}"
+        );
+
+        block.expanded = false;
+        let collapsed = String::from_utf8(synth_block(&block, 100).bytes).unwrap();
+        assert!(
+            collapsed.contains(&format!(
+                "+{}+ lines",
+                TOOL_BLOCK_EXPANDED_LINES - TOOL_BLOCK_COLLAPSED_LINES
+            )),
+            "{collapsed:?}"
         );
     }
 
@@ -3353,6 +3446,87 @@ mod tests {
         assert!(
             per_frame < 300,
             "zarvis steady-state render too slow: {per_frame} µs/frame — replay_full is re-scanning history every frame"
+        );
+    }
+
+    #[test]
+    fn zarvis_tool_expand_collapse_rebuilds_only_retained_suffix() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        for i in 0..1_200u32 {
+            let mut chat = Vec::with_capacity(900);
+            for j in 0..8 {
+                chat.extend_from_slice(
+                    format!(
+                        "\x1b[33mhistory {i}.{j} before the clicked tool block\x1b[0m\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            h.feed_pty(&chat);
+            let call = format!("c{i}");
+            h.feed_tool_use("shell".into(), format!("cmd {i}"));
+            h.feed_pty(
+                format!("\x1b]7700;open;call={call}\x07out\x1b]7700;close;call={call}\x07")
+                    .as_bytes(),
+            );
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+
+        let target = "target";
+        h.feed_tool_use("read_file".into(), "produce large output".into());
+        h.feed_pty(
+            format!("\x1b]7700;open;call={target}\x07out\x1b]7700;close;call={target}\x07")
+                .as_bytes(),
+        );
+        let output = (0..600u32)
+            .map(|i| format!("expanded output line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.feed_tool_result(target, true, output);
+
+        // Warm the cache in the collapsed state.
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        assert!(h.toggle_block(target));
+        let expand_t = Instant::now();
+        let expanded = h.replay(cols, rows, 0);
+        let expand_us = expand_t.elapsed().as_micros();
+        assert!(
+            expanded
+                .blocks
+                .iter()
+                .any(|hit| hit.call_id == target),
+            "expanded block hit rect should survive suffix rebuild: {:?}",
+            expanded.blocks
+        );
+
+        assert!(h.toggle_block(target));
+        let collapse_t = Instant::now();
+        let collapsed = h.replay(cols, rows, 0);
+        let collapse_us = collapse_t.elapsed().as_micros();
+        assert!(
+            collapsed
+                .blocks
+                .iter()
+                .any(|hit| hit.call_id == target),
+            "collapsed block hit rect should survive suffix rebuild"
+        );
+
+        eprintln!(
+            "zarvis expand/collapse after long history: expand {expand_us} µs, collapse {collapse_us} µs"
+        );
+        assert!(
+            expand_us < 80_000,
+            "tool expand replay too slow after long history: {expand_us} µs"
+        );
+        assert!(
+            collapse_us < 80_000,
+            "tool collapse replay too slow after long history: {collapse_us} µs"
         );
     }
 
