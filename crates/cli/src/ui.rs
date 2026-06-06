@@ -1630,8 +1630,10 @@ fn render_matrix_widget_viewport(f: &mut Frame, rain_area: Rect, app: &mut App, 
         &mut app.layout.dynamic_ui_url_hits,
         suppress_first_heading,
     );
-    lines.extend(std::iter::repeat(Line::raw("")));
-    let visible_lines: Vec<_> = lines.into_iter().take(inner.height as usize).collect();
+    let viewport_rows = inner.height as usize;
+    let padding_rows = viewport_rows.saturating_sub(lines.len());
+    lines.extend(std::iter::repeat(Line::raw("")).take(padding_rows));
+    let visible_lines: Vec<_> = lines.into_iter().take(viewport_rows).collect();
     f.render_widget(
         Paragraph::new(visible_lines).wrap(Wrap { trim: false }),
         inner,
@@ -1834,7 +1836,11 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
     app.layout.matrix_operator_title_hit = Some((operator_start, operator_end, area.y));
 
     let selected_id = app.matrix_widget_selected.clone();
-    let mut icon_x = operator_end.saturating_add(1);
+    let separator_x = operator_end.saturating_add(1);
+    if !panels.is_empty() {
+        f.buffer_mut().set_string(separator_x, area.y, "─", line_style);
+    }
+    let mut icon_x = separator_x.saturating_add(2);
     let icon_limit = area.x + area.width.saturating_sub(5);
     for panel in panels {
         if icon_x >= icon_limit {
