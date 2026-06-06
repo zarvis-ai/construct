@@ -1626,6 +1626,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         .main_window_sessions_needing_hydration()
         .into_iter()
         .chain(app.pinned_sessions_needing_hydration())
+        .chain(app.orchestrator_session_needing_hydration())
     {
         app.hydrating_sessions.insert(id);
     }
@@ -1800,6 +1801,7 @@ async fn run_loop(
             .main_window_sessions_needing_hydration()
             .into_iter()
             .chain(app.pinned_sessions_needing_hydration())
+            .chain(app.orchestrator_session_needing_hydration())
         {
             if selected_hydrating.contains(&id)
                 || pinned_hydration_session.as_deref() == Some(id.as_str())
@@ -2410,6 +2412,16 @@ impl App {
             .filter(|s| s.pinned && s.has_pty && !self.histories.contains_key(&s.id))
             .map(|s| s.id.clone())
             .collect()
+    }
+
+    fn orchestrator_session_needing_hydration(&self) -> Option<String> {
+        let id = self.orchestrator_id.as_ref()?;
+        let needs_history = self
+            .sessions
+            .iter()
+            .any(|s| s.id == *id && s.has_pty && !self.histories.contains_key(&s.id));
+        let needs_ui_panels = !self.ui_panels.contains_key(id);
+        (needs_history || needs_ui_panels).then(|| id.clone())
     }
 
     async fn apply_session_hydration(&mut self, hydration: SessionHydration) {
@@ -8707,6 +8719,49 @@ mod tests {
             "completed stale hydration should clear the loading marker"
         );
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn orchestrator_hydration_loads_existing_sticky_widgets() {
+        use agentd_protocol::{UiPanel, UiPlacement};
+
+        let (mut app, _dir, server) = captured_app().await;
+        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        orch.id = "orch".into();
+        orch.has_pty = true;
+        app.sessions.push(orch);
+        app.refresh_orchestrator_id();
+
+        assert_eq!(
+            app.orchestrator_session_needing_hydration().as_deref(),
+            Some("orch"),
+            "a freshly launched TUI should hydrate the hidden orchestrator before live widget events arrive"
+        );
+
+        app.apply_pinned_session_hydration(SessionHydration {
+            session_id: "orch".into(),
+            transcript: Vec::new(),
+            history: Some(crate::pty_render::ItemHistory::new()),
+            editor_state: None,
+            agent_status: None,
+            ui_panels: HashMap::from([(
+                "fleet-pulse".into(),
+                UiPanel {
+                    id: "fleet-pulse".into(),
+                    source: Some("fleet-pulse.md".into()),
+                    title: Some("Fleet pulse".into()),
+                    placement: UiPlacement::Sticky,
+                    markdown: "# Fleet pulse".into(),
+                },
+            )]),
+            status_messages: Vec::new(),
+        })
+        .await;
+
+        assert!(app.orchestrator_session_needing_hydration().is_none());
+        assert_eq!(app.orchestrator_widget_panels().len(), 1);
+        assert_eq!(app.orchestrator_widget_panels()[0].id, "fleet-pulse");
         server.abort();
     }
 
