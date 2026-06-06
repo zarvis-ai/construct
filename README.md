@@ -43,8 +43,9 @@ first:
 - **Codex** — install the `codex` CLI and complete its OAuth login.
 - **Claude Code** — install the `claude` CLI and complete its OAuth login.
 - **Antigravity** — install the `agy` CLI and complete its OAuth login.
-- **Zarvis** — built in to agentd. Today it uses Codex CLI OAuth for OpenAI GPT
-  models, or a local Ollama install for local models.
+- **Zarvis** — built in to agentd; no separate CLI to install. Talks to OpenAI,
+  Anthropic, or Google Gemini via API key, a local Ollama, or a ChatGPT
+  subscription via Codex OAuth.
 
 Once those CLIs are available and authenticated, `agentd` can create and resume
 their sessions from the fleet TUI.
