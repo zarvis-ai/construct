@@ -433,6 +433,12 @@ pub enum SessionEvent {
     ToolApprovalResolved {
         call_id: String,
     },
+    /// Adapter changed the session's approval mode internally, typically
+    /// because the user answered an inline PTY approval prompt with an
+    /// action that changes future approval behavior.
+    ApprovalModeChanged {
+        mode: ApprovalMode,
+    },
     /// Tool lifecycle: adapter started running a tool. Carries the
     /// canonical `call_id` (unlike [`ToolUse`] which doesn't) so the
     /// daemon's per-session task registry can match this against the

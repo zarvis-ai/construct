@@ -17,6 +17,8 @@ Approval prompts expose `a` for `auto_review` and `f` for `unsafe_auto`. `unsafe
 
 When a session renders its own inline approval prompt, clients should not also open a global minibuffer approval prompt for the same request. The user's approval keystrokes should go to the session that asked for approval, and other sessions should not lose input focus because a background session needs a decision.
 
+When an inline approval prompt changes the session's future approval mode, the adapter must report that change back to the daemon so all clients render the current mode from the shared session summary.
+
 ## Reason
 
 A boolean automode conflated two different needs: high-throughput trusted operation and model-mediated review. Naming the modes separately lets users choose a guarded middle ground without hiding the risk of fully bypassing approvals.

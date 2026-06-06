@@ -2015,6 +2015,18 @@ impl SessionManager {
                 }));
             return;
         }
+        // ApprovalModeChanged updates durable per-session state. The state
+        // notification is enough for clients; do not record a transcript row.
+        if let SessionEvent::ApprovalModeChanged { mode } = &event {
+            if let Err(e) = self.persist_approval_mode(entry, *mode).await {
+                tracing::warn!(
+                    session = %entry.id,
+                    error = ?e,
+                    "persist approval mode from adapter event failed"
+                );
+            }
+            return;
+        }
         // PTY events take a fast path: append to the on-disk pty.log + a
         // live broadcast. A copy was also appended to the transcript above
         // as an ordering marker. Replay reads back from `pty.log` directly
@@ -2102,6 +2114,7 @@ impl SessionManager {
                 | SessionEvent::ToolApprovalRequest { .. }
                 // Transient; handled by the broadcast-only fast path above.
                 | SessionEvent::ToolApprovalResolved { .. }
+                | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
                 | SessionEvent::TaskEnd { .. }
@@ -3995,6 +4008,53 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, SessionEvent::Message { .. })),
             "control: a normal Message event should still be persisted"
+        );
+    }
+
+    /// Inline PTY approval prompts can change the approval mode locally
+    /// inside the adapter (`a` / `f`). The adapter reports that state change
+    /// back to the daemon with `ApprovalModeChanged`; the daemon must update
+    /// the session summary so modelines and other clients stop showing the
+    /// stale mode, without recording a transcript row.
+    #[tokio::test]
+    async fn approval_mode_changed_updates_summary_without_transcript_row() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "sapprovalmode";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+
+        mgr.handle_event(
+            &entry,
+            SessionEvent::ApprovalModeChanged {
+                mode: agentd_protocol::ApprovalMode::UnsafeAuto,
+            },
+        )
+        .await;
+
+        let summary = storage.load_summary(id).expect("summary");
+        assert_eq!(
+            summary.approval_mode,
+            agentd_protocol::ApprovalMode::UnsafeAuto
+        );
+        let transcript = storage
+            .read_transcript(id, 0, None)
+            .expect("read transcript");
+        assert!(
+            !transcript
+                .events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::ApprovalModeChanged { .. })),
+            "ApprovalModeChanged must not be written to the transcript"
         );
     }
 
