@@ -649,6 +649,10 @@ pub struct App {
     /// Per-session live agent status, fed by `SessionEvent::AgentStatus`
     /// and rendered above queued input while a turn is active.
     pub agent_statuses: HashMap<String, agentd_protocol::AgentStatus>,
+    /// Pending tool approvals by session id. Orchestrator approvals stay inline
+    /// in the Operator PTY, but this lets the Matrix title bar surface a clear
+    /// attention marker while the prompt is waiting.
+    pub pending_tool_approvals: HashMap<String, HashSet<String>>,
     /// Latest browser preview per session, fed by `SessionEvent::BrowserPreview`
     /// and rendered as a top-right overlay in the terminal view.
     pub browser_previews: HashMap<String, BrowserPreviewState>,
@@ -1583,6 +1587,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
+        pending_tool_approvals: HashMap::new(),
         browser_previews: HashMap::new(),
         ui_panels: HashMap::new(),
         dynamic_ui_popover_open: None,
@@ -3228,6 +3233,10 @@ impl App {
                             allow_auto_review,
                         } = &payload.event
                         {
+                            self.pending_tool_approvals
+                                .entry(payload.session_id.clone())
+                                .or_default()
+                                .insert(call_id.clone());
                             self.maybe_open_approval_prompt(
                                 payload.session_id.clone(),
                                 call_id.clone(),
@@ -3243,6 +3252,7 @@ impl App {
                         // prompt for it if it's still up, so it doesn't
                         // linger after the decision was already made.
                         if let SessionEvent::ToolApprovalResolved { call_id } = &payload.event {
+                            self.clear_pending_tool_approval(&payload.session_id, call_id);
                             self.dismiss_approval_prompt(&payload.session_id, call_id);
                         }
                         if matches!(payload.event, SessionEvent::Reset) {
@@ -3250,6 +3260,7 @@ impl App {
                             self.block_hits.remove(&payload.session_id);
                             self.editor_states.remove(&payload.session_id);
                             self.agent_statuses.remove(&payload.session_id);
+                            self.pending_tool_approvals.remove(&payload.session_id);
                             self.browser_previews.remove(&payload.session_id);
                             self.ui_panels.remove(&payload.session_id);
                             self.pty_activity.remove(&payload.session_id);
@@ -3638,6 +3649,33 @@ impl App {
         }
     }
 
+    fn clear_pending_tool_approval(&mut self, session_id: &str, call_id: &str) {
+        let Some(pending) = self.pending_tool_approvals.get_mut(session_id) else {
+            return;
+        };
+        pending.remove(call_id);
+        if pending.is_empty() {
+            self.pending_tool_approvals.remove(session_id);
+        }
+    }
+
+    pub fn operator_has_pending_approval(&self) -> bool {
+        let Some(orchestrator_id) = self.orchestrator_id.as_deref() else {
+            return false;
+        };
+        self.pending_tool_approvals
+            .get(orchestrator_id)
+            .is_some_and(|pending| !pending.is_empty())
+    }
+
+    fn toggle_orchestrator_panel(&mut self) {
+        if self.is_orchestrator_panel_open() {
+            self.minibuffer = None;
+        } else {
+            self.open_minibuffer_for_command();
+        }
+    }
+
     fn maybe_open_approval_prompt(
         &mut self,
         session_id: String,
@@ -3727,6 +3765,7 @@ impl App {
         }
         self.histories.remove(id);
         self.block_hits.remove(id);
+        self.pending_tool_approvals.remove(id);
         self.ui_panels.remove(id);
         self.pty_activity.remove(id);
         self.matrix_rain.forget_session(id);
@@ -4137,6 +4176,11 @@ impl App {
             return false;
         }
         if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
+            if row == y && col >= xs && col < xe {
+                return false;
+            }
+        }
+        if let Some((xs, xe, y)) = self.layout.matrix_operator_title_hit {
             if row == y && col >= xs && col < xe {
                 return false;
             }
@@ -4776,6 +4820,41 @@ impl App {
     }
 
     async fn click_list(&mut self, list: ratatui::layout::Rect, col: u16, row: u16) {
+        // Matrix-rain title controls are part of the Operator surface, not a
+        // request to focus the session list. Handle them before the generic
+        // list-pane focus path, otherwise clicking `operator` while the panel
+        // is open would collapse it and then immediately re-open it.
+        if !self.matrix_rain_hidden {
+            if let Some(rain) = self.layout.matrix_rain_area {
+                if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
+                    if row == y && col >= xs && col < xe {
+                        self.matrix_rain_hidden = true;
+                        self.set_status("matrix rain hidden — M-x rain to show".into());
+                        return;
+                    }
+                }
+            }
+            if let Some(hit) = self
+                .layout
+                .matrix_widget_hits
+                .iter()
+                .find(|hit| hit.contains(col, row))
+                .cloned()
+            {
+                match hit.kind {
+                    MatrixWidgetHitKind::Select { panel_id } => {
+                        self.toggle_matrix_widget_panel(panel_id)
+                    }
+                }
+                return;
+            }
+            if let Some((xs, xe, y)) = self.layout.matrix_operator_title_hit {
+                if row == y && col >= xs && col < xe {
+                    self.toggle_orchestrator_panel();
+                    return;
+                }
+            }
+        }
         // A click anywhere inside the list pane focuses it, even on the
         // border or empty space past the last item — matching the
         // intuitive "click the pane to focus it" UX.
@@ -4833,6 +4912,12 @@ impl App {
                     }
                 }
                 return;
+            }
+            if let Some((xs, xe, y)) = self.layout.matrix_operator_title_hit {
+                if row == y && col >= xs && col < xe {
+                    self.toggle_orchestrator_panel();
+                    return;
+                }
             }
         }
         // Top + bottom border are 1 row each; rows outside the inner
@@ -7561,6 +7646,7 @@ mod tests {
             remote_control_task: None,
             editor_states: HashMap::new(),
             agent_statuses: HashMap::new(),
+            pending_tool_approvals: HashMap::new(),
             browser_previews: HashMap::new(),
             ui_panels: HashMap::new(),
             dynamic_ui_popover_open: None,
@@ -8955,6 +9041,67 @@ mod tests {
             !text.contains("2/3"),
             "widget viewport title should not include widget count"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_title_marks_pending_approval_and_toggles_panel_on_click() {
+        use agentd_protocol::SessionKind;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut app, _dir, server) = captured_app().await;
+        let mut orch = summary_with_kind(SessionKind::Orchestrator);
+        orch.id = "orch".into();
+        app.sessions.push(orch);
+        app.refresh_orchestrator_id();
+        app.matrix_rain_hidden = false;
+        app.pending_tool_approvals.insert(
+            "orch".into(),
+            HashSet::from(["call-1".to_string()]),
+        );
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("operator approval title should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(text.contains("operator !"));
+        let (x_start, _x_end, y) = app
+            .layout
+            .matrix_operator_title_hit
+            .expect("operator title hitbox");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(app.is_orchestrator_panel_open());
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(!app.is_orchestrator_panel_open());
         server.abort();
     }
 

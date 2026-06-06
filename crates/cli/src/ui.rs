@@ -1754,6 +1754,9 @@ fn matrix_widget_title(app: &App, panel_id: &str) -> Option<String> {
 }
 
 fn matrix_operator_status(app: &App) -> &'static str {
+    if app.operator_has_pending_approval() {
+        return "approval";
+    }
     let Some(orchestrator_id) = app.orchestrator_id.as_deref() else {
         return "offline";
     };
@@ -1921,17 +1924,32 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
 
     let panels = app.orchestrator_widget_panels();
     let viewport_visible = app.matrix_widget_visible(now);
-    let operator_text = "operator";
+    let approval_pending = app.operator_has_pending_approval();
+    let operator_text = if approval_pending {
+        "operator !"
+    } else {
+        "operator"
+    };
     let label = format!(" {operator_text} ");
     let label_x = area.x.saturating_add(1);
-    f.buffer_mut().set_string(
-        label_x,
-        area.y,
-        label.as_str(),
-        Style::default().fg(app.theme.accent),
-    );
     let operator_start = label_x.saturating_add(1);
     let operator_end = operator_start.saturating_add(UnicodeWidthStr::width(operator_text) as u16);
+    let operator_hovered = app.mouse_pos.is_some_and(|(mx, my)| {
+        my == area.y && mx >= operator_start && mx < operator_end
+    });
+    let operator_style = if approval_pending {
+        Style::default()
+            .fg(app.theme.warning)
+            .add_modifier(Modifier::BOLD)
+    } else if operator_hovered {
+        Style::default()
+            .fg(app.theme.matrix_flash_good)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.theme.accent)
+    };
+    f.buffer_mut()
+        .set_string(label_x, area.y, label.as_str(), operator_style);
     app.layout.matrix_operator_title_hit = Some((operator_start, operator_end, area.y));
 
     let selected_id = app.matrix_widget_selected.clone();
