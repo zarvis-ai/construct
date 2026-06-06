@@ -143,9 +143,7 @@ pub fn cached_update_notice() -> Option<String> {
 /// The notice string for `latest` vs `current`, or `None` when `latest` is
 /// not strictly newer (or unparseable).
 fn notice_for(latest: &str, current: &str) -> Option<String> {
-    is_newer(latest, current).then(|| {
-        format!("agentd {latest} available (you have {current}) — run `agent upgrade`")
-    })
+    is_newer(latest, current).then(|| format!("↑ agentd {latest} · agent upgrade"))
 }
 
 // --- `agent upgrade` -------------------------------------------------------
@@ -259,7 +257,7 @@ mod tests {
     fn notice_only_when_a_newer_version_exists() {
         assert_eq!(
             notice_for("0.2.0", "0.1.0").as_deref(),
-            Some("agentd 0.2.0 available (you have 0.1.0) — run `agent upgrade`")
+            Some("↑ agentd 0.2.0 · agent upgrade")
         );
         assert_eq!(notice_for("0.1.0", "0.1.0"), None);
         assert_eq!(notice_for("0.1.0", "0.2.0"), None);
