@@ -1,6 +1,6 @@
 //! Zarvis — agentd's built-in multi-provider agent harness.
 //!
-//! Talks to OpenAI / Anthropic / Ollama directly (no vendor CLI required),
+//! Talks to OpenAI / Anthropic / Gemini / Ollama directly (no vendor CLI required),
 //! runs its own agent loop, and executes shell + filesystem +
 //! agentd-control tools on the model's behalf. See README for the full
 //! design.
@@ -89,8 +89,9 @@ async fn main() -> anyhow::Result<()> {
                 ctx.emit.emit(SessionEvent::Error {
                     message: format!(
                         "{e}\n\nzarvis needs one of: AGENTD_ZARVIS_MODEL set, \
-                         ANTHROPIC_API_KEY set, OPENAI_API_KEY set, or a local \
-                         Ollama (set OLLAMA_HOST if not at localhost:11434)."
+                         ANTHROPIC_API_KEY set, OPENAI_API_KEY set, \
+                         GEMINI_API_KEY set, or a local Ollama (set OLLAMA_HOST \
+                         if not at localhost:11434)."
                     ),
                 });
                 ctx.emit.emit(SessionEvent::Done { exit_code: 2 });
