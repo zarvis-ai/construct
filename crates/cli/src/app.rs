@@ -2152,6 +2152,16 @@ impl App {
         self.sessions = sessions;
         self.groups = groups;
         self.harnesses = harnesses;
+        // A daemon restart respawns every PTY session and truncates each
+        // session's pty.log so the new child renders into a clean slate
+        // (see Manager::respawn). But our in-memory terminal histories
+        // still hold the *previous* child's screen state. Codex/claude/
+        // shell repaint on resume without a full screen clear, so feeding
+        // the new child's output on top of the stale grid leaves the pane
+        // half-rendered — typically blank until the user resizes. Drop the
+        // histories so the visible/pinned sessions re-hydrate from the
+        // daemon's (now clean) pty.log, mirroring the daemon-side truncate.
+        self.histories.clear();
         self.connected = true;
         self.ensure_selection_valid();
         self.orchestrator_id = self
