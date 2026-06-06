@@ -1470,6 +1470,15 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         return;
     }
 
+    // Operator monolog: when the orchestrator has just said something, take
+    // over the rain body with a monochrome typewriter line. Once it finishes
+    // the type→hold→fade cycle it clears itself and the rain resumes; widgets
+    // still render on top so an open widget isn't hidden.
+    if render_operator_monolog(f, rain_area, app, now) {
+        render_matrix_widget_viewport(f, rain_area, app, now);
+        return;
+    }
+
     // Wallpaper: paint the most recent browser preview from ANY session
     // (cross-session — the matrix rain is a fleet visualization, so the
     // backdrop reflects the whole fleet, not just the focused session,
@@ -1649,6 +1658,67 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     // session it came from. Drawn last so it sits on top of the rain.
     render_matrix_reveal_tooltip(f, rain_area, app);
     render_matrix_widget_viewport(f, rain_area, app, now);
+}
+
+/// Reveal speed and post-typing dwell for the operator monolog.
+const MONOLOG_MS_PER_CHAR: u64 = 28;
+const MONOLOG_HOLD_MS: u64 = 4200;
+const MONOLOG_FADE_MS: u64 = 800;
+
+/// Typewriter-render the operator's latest monolog over the matrix-rain body,
+/// then clear it (returning `false`) once the type → hold → fade cycle
+/// completes, so the rain resumes. Returns `true` while it's showing.
+pub(crate) fn render_operator_monolog(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    now: Instant,
+) -> bool {
+    // Snapshot what we need so the borrow ends before we may clear the state.
+    let (chars, started_at) = match app.operator_monolog.as_ref() {
+        Some(m) => (m.text.chars().collect::<Vec<char>>(), m.started_at),
+        None => return false,
+    };
+    let n = chars.len() as u64;
+    let elapsed = now.saturating_duration_since(started_at).as_millis() as u64;
+    let type_ms = n.saturating_mul(MONOLOG_MS_PER_CHAR);
+    if elapsed >= type_ms + MONOLOG_HOLD_MS + MONOLOG_FADE_MS {
+        app.operator_monolog = None;
+        return false;
+    }
+    if area.width < 12 || area.height < 3 {
+        return true; // showing — suppress the rain even if too small to draw
+    }
+
+    // Monochrome terminal takeover: clear the rain body, then the prompt + text.
+    f.render_widget(Clear, area);
+    let shown = ((elapsed / MONOLOG_MS_PER_CHAR) as usize).min(chars.len());
+    let mut body: String = chars[..shown].iter().collect();
+    let typing = (shown as u64) < n;
+    if typing && (elapsed / 450) % 2 == 0 {
+        body.push('▌'); // blinking cursor while typing
+    }
+    let fading = elapsed >= type_ms + MONOLOG_HOLD_MS;
+    let text_style = Style::default().fg(if fading {
+        app.theme.matrix_dim
+    } else {
+        app.theme.matrix_glow
+    });
+    let prompt_style = Style::default()
+        .fg(app.theme.matrix_dim)
+        .add_modifier(Modifier::BOLD);
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 1,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
+    let lines = vec![
+        Line::from(Span::styled("operator ▸", prompt_style)),
+        Line::from(Span::styled(body, text_style)),
+    ];
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    true
 }
 
 /// If the mouse is hovering a matrix-rain horizontal reveal word, draw a

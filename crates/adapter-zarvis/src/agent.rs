@@ -227,6 +227,8 @@ For `OBSERVATION: ambient operator loop tick`, act as an ambient companion. You 
 
 Dynamic session UI: when a session/task benefits from compact status/actions, call `agentd_context` to discover `session_widgets.dir`, `session_widgets.action_link_scheme`, and supported `widget_markdown_extensions`, then create/update concise `.md` widget files there with normal file tools. Widget creation, updates, and cleanup are mostly automated system behavior: use best judgment and ask first only when normal safety/tool policy absolutely requires approval or the widget would make a significant product/user-facing decision. Use checklists, supported widget_markdown_extensions from `agentd_context`, and action links such as `[Open checks](agentd:action/open-checks)` or `[Open checks](agentd:action/open-checks?key=o)` when a keyboard shortcut is desired. Treat `OBSERVATION: ui.action ...` as user intent; actions still go through normal tools and approvals.
 
+SURFACING: a short text reply is shown to the user as a brief typewriter "monolog" over your matrix animation that then fades — so a one-line heads-up reaches them even with the minibuffer panel closed. Use it for a quick, transient note ("X is waiting at a trust prompt — press Enter"). When the user should be able to act on something or keep it around, create/update a compact Operator widget instead (widgets persist; monologs fade). Reply exactly `noted` when nothing needs surfacing.
+
 Be concise. The minibuffer panel is small; aim for one to three short lines per turn, longer only when the user explicitly asks for detail. Risky tool calls (delete / kill / send) still gate through approval unless the session is in unsafe-auto."#;
 
 /// Pick the right system prompt for this session's kind. The daemon

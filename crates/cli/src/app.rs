@@ -554,6 +554,11 @@ pub struct App {
     /// history does not leave the main session view scrolled when the panel
     /// closes.
     pub orchestrator_scrollback: usize,
+    /// Active operator monolog typewritten over the matrix rain (`None` = rain).
+    pub operator_monolog: Option<OperatorMonolog>,
+    /// Accumulates the orchestrator's streaming assistant text across the
+    /// current turn; consolidated into `operator_monolog` at turn end.
+    pub operator_utterance: String,
     /// User-preferred height for the daemon-owned orchestrator panel rendered
     /// in the minibuffer. Clamped by terminal height at render time.
     pub orchestrator_panel_h: Option<u16>,
@@ -775,6 +780,30 @@ pub struct EditorState {
     pub buf: String,
     pub cursor: usize,
     pub completions: Vec<String>,
+}
+
+/// The operator's latest finalized utterance, typewritten over the matrix
+/// rain as an ambient "monolog" then auto-cleared. Lets the user see what the
+/// operator said without opening the (collapsed) minibuffer panel.
+#[derive(Debug, Clone)]
+pub struct OperatorMonolog {
+    pub text: String,
+    pub started_at: Instant,
+}
+
+/// Consolidate the orchestrator's streaming assistant text into a user-facing
+/// monolog line, or `None` if it's empty or the internal `noted` no-op token
+/// (which the operator replies when nothing needs surfacing).
+pub fn operator_monolog_text(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower == "noted" || lower == "noted." {
+        return None;
+    }
+    Some(t.to_string())
 }
 
 /// MRU cache of resized preview images, keyed by `(source Arc ptr,
@@ -1585,6 +1614,8 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         skip_redraw_after_event: false,
         hydrating_sessions: HashSet::new(),
         orchestrator_scrollback: 0,
+        operator_monolog: None,
+        operator_utterance: String::new(),
         orchestrator_panel_h: persisted.orchestrator_panel_h,
         resizing_orchestrator_panel: None,
         dragging_terminal_scrollbar: None,
@@ -3446,6 +3477,15 @@ impl App {
                                     .or_default();
                                 history.feed_message(kind, &text);
                             }
+                            // Accumulate the orchestrator's streaming assistant
+                            // text; finalized into a typewriter monolog at turn
+                            // end (the AgentStatus active=false handler below).
+                            if matches!(kind, crate::pty_render::MessageKind::Assistant)
+                                && self.orchestrator_id.as_deref()
+                                    == Some(payload.session_id.as_str())
+                            {
+                                self.operator_utterance.push_str(&text);
+                            }
                         }
                         // Adapter editor state — drives the fixed
                         // bottom input pane.
@@ -3522,11 +3562,30 @@ impl App {
                             _ => {}
                         }
                         if let SessionEvent::AgentStatus(status) = &payload.event {
+                            let is_orchestrator = self.orchestrator_id.as_deref()
+                                == Some(payload.session_id.as_str());
                             if status.active {
+                                // New orchestrator turn — start a fresh utterance.
+                                if is_orchestrator {
+                                    self.operator_utterance.clear();
+                                }
                                 self.agent_statuses
                                     .insert(payload.session_id.clone(), status.clone());
                             } else {
                                 self.agent_statuses.remove(&payload.session_id);
+                                // Turn end — consolidate the accumulated text into
+                                // a single typewriter monolog over the matrix rain.
+                                if is_orchestrator {
+                                    if let Some(text) =
+                                        operator_monolog_text(&self.operator_utterance)
+                                    {
+                                        self.operator_monolog = Some(OperatorMonolog {
+                                            text,
+                                            started_at: Instant::now(),
+                                        });
+                                    }
+                                    self.operator_utterance.clear();
+                                }
                                 if let Some(bytes) = agent_status_history_line(status) {
                                     let history = self
                                         .histories
@@ -7497,6 +7556,19 @@ mod tests {
     use super::*;
     use ratatui::layout::Rect;
 
+    #[test]
+    fn operator_monolog_text_filters_noise() {
+        assert_eq!(operator_monolog_text(""), None);
+        assert_eq!(operator_monolog_text("   "), None);
+        assert_eq!(operator_monolog_text("noted"), None);
+        assert_eq!(operator_monolog_text("  Noted.  "), None);
+        assert_eq!(
+            operator_monolog_text("  'run using zarvis' is waiting at the trust prompt.  ")
+                .as_deref(),
+            Some("'run using zarvis' is waiting at the trust prompt.")
+        );
+    }
+
     /// Regression guard for the input-priority optimization (#2).
     ///
     /// Under heavy background PTY output `notifications.recv()` is
@@ -7668,6 +7740,8 @@ mod tests {
             skip_redraw_after_event: false,
             hydrating_sessions: HashSet::new(),
             orchestrator_scrollback: 0,
+            operator_monolog: None,
+            operator_utterance: String::new(),
             orchestrator_panel_h: None,
             resizing_orchestrator_panel: None,
             dragging_terminal_scrollbar: None,
@@ -8435,6 +8509,41 @@ mod tests {
             selection_bounds_for_layout(&layout, 0, false, 55, 5),
             Some(Rect::new(21, 1, 38, 18))
         );
+    }
+
+    #[tokio::test]
+    async fn operator_monolog_typewriter_renders_then_expires() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 60, 12);
+
+        // ~500ms in: several characters revealed, still showing.
+        app.operator_monolog = Some(OperatorMonolog {
+            text: "session waiting at trust prompt".into(),
+            started_at: Instant::now() - std::time::Duration::from_millis(500),
+        });
+        let mut showing = false;
+        terminal
+            .draw(|f| showing = crate::ui::render_operator_monolog(f, area, &mut app, Instant::now()))
+            .expect("draw");
+        assert!(showing, "monolog should be showing mid-cycle");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(screen.contains("operator"), "missing prompt:\n{screen}");
+        assert!(screen.contains("session"), "missing typed text:\n{screen}");
+
+        // Far past type+hold+fade: clears itself and yields the rain.
+        app.operator_monolog = Some(OperatorMonolog {
+            text: "session waiting at trust prompt".into(),
+            started_at: Instant::now() - std::time::Duration::from_secs(30),
+        });
+        terminal
+            .draw(|f| showing = crate::ui::render_operator_monolog(f, area, &mut app, Instant::now()))
+            .expect("draw");
+        assert!(!showing, "monolog should have expired");
+        assert!(app.operator_monolog.is_none(), "expired monolog not cleared");
+
+        server.abort();
     }
 
     #[tokio::test]
