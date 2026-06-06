@@ -3563,7 +3563,14 @@ async fn run_one_tool(
         let mut denied = false;
         loop {
             term.approval(&call.name, &args_summary, tool.risk(), allow_auto_review);
-            match wait_for_approval(inbox, &call.id, approval_mode).await {
+            let mode_before_approval = *approval_mode;
+            let approval_outcome = wait_for_approval(inbox, &call.id, approval_mode).await;
+            if *approval_mode != mode_before_approval {
+                emit.emit(SessionEvent::ApprovalModeChanged {
+                    mode: *approval_mode,
+                });
+            }
+            match approval_outcome {
                 ApprovalOutcome::Stop => {
                     emit.emit(SessionEvent::ToolApprovalResolved {
                         call_id: call.id.clone(),
