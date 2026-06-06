@@ -419,6 +419,39 @@ impl MatrixRevealHit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixWidgetNavDirection {
+    Previous,
+    Next,
+}
+
+#[derive(Debug, Clone)]
+pub enum MatrixWidgetHitKind {
+    Toggle,
+    Nav(MatrixWidgetNavDirection),
+}
+
+#[derive(Debug, Clone)]
+pub struct MatrixWidgetHit {
+    pub kind: MatrixWidgetHitKind,
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
+}
+
+impl MatrixWidgetHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.start_col && col < self.end_col
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixWidgetVisibility {
+    Hidden,
+    Auto { until: Instant },
+    Browsing,
+}
+
 pub struct App {
     pub client: Arc<Client>,
     pub sessions: Vec<SessionSummary>,
@@ -652,6 +685,10 @@ pub struct App {
     /// Matrix-rain drop cycle keys that already spawned. Intensity decay stops
     /// future cycles from entering this set; existing drops finish their fall.
     pub matrix_rain_active_drops: HashMap<u64, u16>,
+    /// Transient viewport state for the collapsed operator/orchestrator
+    /// widgets rendered inside the Matrix-rain panel.
+    pub matrix_widget_visibility: MatrixWidgetVisibility,
+    pub matrix_widget_selected: Option<String>,
     /// User-hidden Matrix-rain panel. Toggle with `/rain`; close with the
     /// panel's `x` button.
     pub matrix_rain_hidden: bool,
@@ -1286,6 +1323,8 @@ pub struct LayoutSnapshot {
     pub dynamic_ui_widget_hits: Vec<DynamicUiWidgetHit>,
     pub dynamic_ui_panel_close_hits: Vec<DynamicUiPanelCloseHit>,
     pub dynamic_ui_inline_hit: Option<DynamicUiInlineHit>,
+    /// Matrix-rain title-bar widget viewport affordances for the operator session.
+    pub matrix_widget_hits: Vec<MatrixWidgetHit>,
     /// Dynamic UI title-bar affordance bounds: `(x_start, x_end, y, session_id)`.
     pub dynamic_ui_trigger: Option<(u16, u16, u16, String)>,
     pub dynamic_ui_triggers: Vec<(u16, u16, u16, String)>,
@@ -1543,6 +1582,8 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         matrix_rain_intensity_updated_at: now,
         matrix_rain_foreground_epoch: now,
         matrix_rain_active_drops: HashMap::new(),
+        matrix_widget_visibility: MatrixWidgetVisibility::Hidden,
+        matrix_widget_selected: None,
         matrix_rain_hidden: persisted.matrix_rain_hidden,
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
@@ -3347,11 +3388,19 @@ impl App {
                                     self.dynamic_ui_focused =
                                         Some((payload.session_id.clone(), panel.id.clone()));
                                 } else {
+                                    let until = Instant::now()
+                                        + Duration::from_secs(DYNAMIC_UI_AUTOHIDE_SECS);
                                     self.dynamic_ui_temporary_until.insert(
                                         (payload.session_id.clone(), panel.id.clone()),
-                                        Instant::now()
-                                            + Duration::from_secs(DYNAMIC_UI_AUTOHIDE_SECS),
+                                        until,
                                     );
+                                    if self.orchestrator_id.as_deref()
+                                        == Some(payload.session_id.as_str())
+                                    {
+                                        self.matrix_widget_selected = Some(panel.id.clone());
+                                        self.matrix_widget_visibility =
+                                            MatrixWidgetVisibility::Auto { until };
+                                    }
                                 }
                             }
                             SessionEvent::UiDelete { id } => {
@@ -3366,6 +3415,13 @@ impl App {
                                 self.dynamic_ui_temporary_until.remove(&key);
                                 if self.dynamic_ui_focused.as_ref() == Some(&key) {
                                     self.dynamic_ui_focused = None;
+                                }
+                                if self.orchestrator_id.as_deref()
+                                    == Some(payload.session_id.as_str())
+                                    && self.matrix_widget_selected.as_deref() == Some(id.as_str())
+                                {
+                                    self.matrix_widget_selected = None;
+                                    self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
                                 }
                             }
                             _ => {}
@@ -4018,6 +4074,14 @@ impl App {
                 return false;
             }
         }
+        if self
+            .layout
+            .matrix_widget_hits
+            .iter()
+            .any(|hit| hit.contains(col, row))
+        {
+            return false;
+        }
         true
     }
 
@@ -4284,9 +4348,7 @@ impl App {
         fn contains(r: ratatui::layout::Rect, c: u16, y: u16) -> bool {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
         }
-        if self.is_over_dynamic_ui_overlay(col, row)
-            && self.handle_dynamic_ui_overlay_click(col, row).await
-        {
+        if self.handle_dynamic_ui_overlay_click(col, row).await {
             return;
         }
         if let Some(modal) = self.layout.modal_area {
@@ -4690,6 +4752,19 @@ impl App {
                         return;
                     }
                 }
+            }
+            if let Some(hit) = self
+                .layout
+                .matrix_widget_hits
+                .iter()
+                .find(|hit| hit.contains(col, row))
+                .cloned()
+            {
+                match hit.kind {
+                    MatrixWidgetHitKind::Toggle => self.toggle_matrix_widget_viewport(),
+                    MatrixWidgetHitKind::Nav(direction) => self.select_matrix_widget(direction),
+                }
+                return;
             }
         }
         // Top + bottom border are 1 row each; rows outside the inner
@@ -5363,6 +5438,80 @@ impl App {
                 .dynamic_ui_temporary_until
                 .get(&key)
                 .is_some_and(|until| *until > Instant::now())
+    }
+
+    pub fn orchestrator_widget_panels(&self) -> Vec<agentd_protocol::UiPanel> {
+        let Some(orchestrator_id) = self.orchestrator_id.as_deref() else {
+            return Vec::new();
+        };
+        let Some(panels) = self.ui_panels.get(orchestrator_id) else {
+            return Vec::new();
+        };
+        let mut panels: Vec<_> = panels
+            .values()
+            .filter(|panel| panel.placement == agentd_protocol::UiPlacement::Sticky)
+            .cloned()
+            .collect();
+        panels.sort_by(|a, b| a.id.cmp(&b.id));
+        panels
+    }
+
+    pub fn matrix_widget_visible(&mut self, now: Instant) -> bool {
+        if self.orchestrator_id.is_none() || self.orchestrator_widget_panels().is_empty() {
+            self.matrix_widget_selected = None;
+            self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+            return false;
+        }
+        match self.matrix_widget_visibility {
+            MatrixWidgetVisibility::Hidden => false,
+            MatrixWidgetVisibility::Auto { until } => {
+                if until > now {
+                    true
+                } else {
+                    self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+                    false
+                }
+            }
+            MatrixWidgetVisibility::Browsing => true,
+        }
+    }
+
+    pub fn select_matrix_widget(&mut self, direction: MatrixWidgetNavDirection) {
+        let panels = self.orchestrator_widget_panels();
+        if panels.is_empty() {
+            self.matrix_widget_selected = None;
+            self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+            return;
+        }
+        let current = self
+            .matrix_widget_selected
+            .as_ref()
+            .and_then(|id| panels.iter().position(|panel| &panel.id == id))
+            .unwrap_or(0);
+        let next = match direction {
+            MatrixWidgetNavDirection::Previous => current
+                .checked_sub(1)
+                .unwrap_or_else(|| panels.len().saturating_sub(1)),
+            MatrixWidgetNavDirection::Next => (current + 1) % panels.len(),
+        };
+        self.matrix_widget_selected = Some(panels[next].id.clone());
+        self.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
+    }
+
+    pub fn toggle_matrix_widget_viewport(&mut self) {
+        if self.orchestrator_widget_panels().is_empty() {
+            self.matrix_widget_selected = None;
+            self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+            return;
+        }
+        match self.matrix_widget_visibility {
+            MatrixWidgetVisibility::Browsing => {
+                self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+            }
+            MatrixWidgetVisibility::Hidden | MatrixWidgetVisibility::Auto { .. } => {
+                self.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
+            }
+        }
     }
 
     fn hide_dynamic_ui_panel(&mut self, session_id: String, panel_id: String) {
@@ -7233,6 +7382,7 @@ mod tests {
             dynamic_ui_widget_hits: Vec::new(),
             dynamic_ui_panel_close_hits: Vec::new(),
             dynamic_ui_inline_hit: None,
+            matrix_widget_hits: Vec::new(),
             dynamic_ui_trigger: None,
             dynamic_ui_triggers: Vec::new(),
             dynamic_ui_popover_area: None,
@@ -7322,6 +7472,8 @@ mod tests {
             matrix_rain_intensity_updated_at: now,
             matrix_rain_foreground_epoch: now,
             matrix_rain_active_drops: HashMap::new(),
+            matrix_widget_visibility: MatrixWidgetVisibility::Hidden,
+            matrix_widget_selected: None,
             matrix_rain_hidden: false,
             hide_pane_side_borders: true,
             frame_text: Vec::new(),

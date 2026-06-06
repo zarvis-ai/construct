@@ -102,6 +102,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_widget_hits.clear();
     app.layout.dynamic_ui_panel_close_hits.clear();
     app.layout.dynamic_ui_inline_hit = None;
+    app.layout.matrix_widget_hits.clear();
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_triggers.clear();
     app.layout.shortcut_hints.clear();
@@ -1327,7 +1328,8 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         return;
     }
     app.layout.matrix_rain_area = Some(rain_area);
-    render_matrix_rain_header(f, rain_area, &app.theme);
+    let now = Instant::now();
+    render_matrix_rain_header(f, rain_area, app, now);
     let rain_area = Rect {
         x: rain_area.x,
         y: rain_area.y + 1,
@@ -1337,8 +1339,6 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     if rain_area.height < 3 {
         return;
     }
-
-    let now = Instant::now();
 
     // Wallpaper: paint the most recent browser preview from ANY session
     // (cross-session — the matrix rain is a fleet visualization, so the
@@ -1518,10 +1518,138 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     // Hover tooltip: if the cursor is over a horizontal word, name the
     // session it came from. Drawn last so it sits on top of the rain.
     render_matrix_reveal_tooltip(f, rain_area, app);
+    render_matrix_widget_viewport(f, rain_area, app, now);
 }
 
 /// If the mouse is hovering a matrix-rain horizontal reveal word, draw a
 /// one-line tooltip on an adjacent row naming the source session.
+fn render_matrix_widget_viewport(f: &mut Frame, rain_area: Rect, app: &mut App, now: Instant) {
+    if !app.matrix_widget_visible(now) {
+        return;
+    }
+    let panels = app.orchestrator_widget_panels();
+    if panels.is_empty() || rain_area.width < 8 || rain_area.height < 3 {
+        return;
+    }
+    let cursor_inside = app
+        .mouse_pos
+        .is_some_and(|(mx, my)| contains_rect(rain_area, mx, my));
+    match app.matrix_widget_visibility {
+        crate::app::MatrixWidgetVisibility::Browsing if !cursor_inside => {
+            app.matrix_widget_visibility = crate::app::MatrixWidgetVisibility::Auto {
+                until: now + Duration::from_secs(crate::app::DYNAMIC_UI_AUTOHIDE_SECS),
+            };
+        }
+        crate::app::MatrixWidgetVisibility::Auto { .. } if cursor_inside => {
+            app.matrix_widget_visibility = crate::app::MatrixWidgetVisibility::Auto {
+                until: now + Duration::from_secs(crate::app::DYNAMIC_UI_AUTOHIDE_SECS),
+            };
+        }
+        _ => {}
+    }
+    let selected_idx = selected_matrix_widget_index(app, &panels).unwrap_or(0);
+    let panel = panels[selected_idx].clone();
+    app.matrix_widget_selected = Some(panel.id.clone());
+    let Some(session_id) = app.orchestrator_id.clone() else {
+        return;
+    };
+
+    let width = rain_area.width.saturating_sub(2).max(1);
+    let max_height = rain_area.height.saturating_sub(2).max(1);
+    let height = max_height.min(8).max(1);
+    let area = Rect {
+        x: rain_area.x.saturating_add(1),
+        y: rain_area
+            .y
+            .saturating_add(rain_area.height.saturating_sub(height + 1) / 2),
+        width,
+        height,
+    };
+    let title = dynamic_ui_panel_title(&panel).unwrap_or_else(|| "Operator widget".to_string());
+    let title = if panels.len() > 1 {
+        format!(" {}/{} · {} ", selected_idx + 1, panels.len(), title)
+    } else {
+        format!(" {} ", title)
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(
+                truncate_to_width(&title, area.width.saturating_sub(2) as usize),
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .border_style(Style::default().fg(app.theme.matrix_line)),
+        area,
+    );
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+    let mut lines = render_agentd_markdown_lines(
+        &panel.markdown,
+        &app.theme,
+        app.mouse_pos,
+        inner,
+        Some(session_id.as_str()),
+        Some(panel.id.as_str()),
+        &mut app.layout.dynamic_ui_action_hits,
+        &mut app.layout.dynamic_ui_url_hits,
+        suppress_first_heading,
+    );
+    lines.extend(std::iter::repeat(Line::raw("")));
+    let visible_lines: Vec<_> = lines.into_iter().take(inner.height as usize).collect();
+    f.render_widget(
+        Paragraph::new(visible_lines).wrap(Wrap { trim: false }),
+        inner,
+    );
+}
+
+fn selected_matrix_widget_index(app: &App, panels: &[agentd_protocol::UiPanel]) -> Option<usize> {
+    app.matrix_widget_selected
+        .as_ref()
+        .and_then(|id| panels.iter().position(|panel| &panel.id == id))
+        .or_else(|| (!panels.is_empty()).then_some(0))
+}
+
+fn matrix_operator_status(app: &App) -> &'static str {
+    let Some(orchestrator_id) = app.orchestrator_id.as_deref() else {
+        return "offline";
+    };
+    if app
+        .agent_statuses
+        .get(orchestrator_id)
+        .is_some_and(|status| status.active)
+    {
+        return "thinking";
+    }
+    if app
+        .sessions
+        .iter()
+        .find(|session| session.id == orchestrator_id)
+        .is_some_and(|session| session.last_pty_at_ms.is_some_and(recent_pty_activity))
+    {
+        return "acting";
+    }
+    "watching"
+}
+
+fn recent_pty_activity(last_pty_at_ms: i64) -> bool {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return false;
+    };
+    let now_ms = now.as_millis() as i64;
+    now_ms.saturating_sub(last_pty_at_ms) < 600
+}
+
 fn render_matrix_reveal_tooltip(f: &mut Frame, rain_area: Rect, app: &App) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
@@ -1649,14 +1777,97 @@ fn build_vertical_letter_overlay(
 /// column's threshold.
 const MATRIX_RAIN_REGISTRATION_TOP_ROW: u16 = 1;
 
-fn render_matrix_rain_header(f: &mut Frame, area: Rect, theme: &Theme) {
-    let line_style = Style::default().fg(theme.matrix_line);
+fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Instant) {
+    let line_style = Style::default().fg(app.theme.matrix_line);
     let close_style = Style::default()
-        .fg(theme.matrix_close)
+        .fg(app.theme.matrix_close)
         .add_modifier(Modifier::BOLD);
     for x in area.x..area.x + area.width {
         f.buffer_mut().set_string(x, area.y, "─", line_style);
     }
+
+    let panels = app.orchestrator_widget_panels();
+    let widget_count = panels.len();
+    let viewport_visible = app.matrix_widget_visible(now);
+    let status = matrix_operator_status(app);
+    let mut label = format!(" Operator · {status}");
+    if widget_count > 0 {
+        let selected = selected_matrix_widget_index(app, &panels).unwrap_or(0) + 1;
+        if viewport_visible {
+            label.push_str(&format!(" · [{selected}/{widget_count}]"));
+        } else {
+            label.push_str(&format!(" · [{widget_count}]"));
+        }
+    }
+    let max_label_w = area.width.saturating_sub(10) as usize;
+    let label = truncate_to_width(&label, max_label_w);
+    f.buffer_mut().set_string(
+        area.x.saturating_add(1),
+        area.y,
+        label.as_str(),
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    if widget_count > 0 {
+        let count_text = if viewport_visible {
+            format!(
+                "[{}/{}]",
+                selected_matrix_widget_index(app, &panels).unwrap_or(0) + 1,
+                widget_count
+            )
+        } else {
+            format!("[{widget_count}]")
+        };
+        if let Some(offset) = label.find(&count_text) {
+            let start_col = area.x + 1 + UnicodeWidthStr::width(&label[..offset]) as u16;
+            let end_col = start_col + UnicodeWidthStr::width(count_text.as_str()) as u16;
+            app.layout
+                .matrix_widget_hits
+                .push(crate::app::MatrixWidgetHit {
+                    kind: crate::app::MatrixWidgetHitKind::Toggle,
+                    row: area.y,
+                    start_col,
+                    end_col,
+                });
+        }
+    }
+
+    if widget_count > 1 && viewport_visible {
+        let nav = " ‹ › ";
+        let nav_w = UnicodeWidthStr::width(nav) as u16;
+        let nav_x = area.x + area.width.saturating_sub(nav_w + 4);
+        f.buffer_mut().set_string(
+            nav_x,
+            area.y,
+            nav,
+            Style::default()
+                .fg(app.theme.text)
+                .add_modifier(Modifier::BOLD),
+        );
+        app.layout
+            .matrix_widget_hits
+            .push(crate::app::MatrixWidgetHit {
+                kind: crate::app::MatrixWidgetHitKind::Nav(
+                    crate::app::MatrixWidgetNavDirection::Previous,
+                ),
+                row: area.y,
+                start_col: nav_x.saturating_add(1),
+                end_col: nav_x.saturating_add(2),
+            });
+        app.layout
+            .matrix_widget_hits
+            .push(crate::app::MatrixWidgetHit {
+                kind: crate::app::MatrixWidgetHitKind::Nav(
+                    crate::app::MatrixWidgetNavDirection::Next,
+                ),
+                row: area.y,
+                start_col: nav_x.saturating_add(3),
+                end_col: nav_x.saturating_add(4),
+            });
+    }
+
     let x = area.x + area.width.saturating_sub(3);
     f.buffer_mut().set_string(x, area.y, " x ", close_style);
 }
@@ -5118,7 +5329,10 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
             tokens_out,
             tokens_cached,
         } => vec![Span::styled(
-            format!("   $ ${:.4} (in={} out={} cached={})", usd, tokens_in, tokens_out, tokens_cached),
+            format!(
+                "   $ ${:.4} (in={} out={} cached={})",
+                usd, tokens_in, tokens_out, tokens_cached
+            ),
             Style::default().fg(theme.dim),
         )],
         SessionEvent::Diff { patch } => vec![Span::raw(format!("   Δ {}", shorten(patch, 200)))],
@@ -5720,7 +5934,10 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
             format!("approval-resolved {call_id}")
         }
         SessionEvent::ClientCommand { id, args } => {
-            format!("client-cmd {id:?}{}", args.as_deref().map(|a| format!(" {a}")).unwrap_or_default())
+            format!(
+                "client-cmd {id:?}{}",
+                args.as_deref().map(|a| format!(" {a}")).unwrap_or_default()
+            )
         }
         SessionEvent::Message { role, text } => format!("msg:{:?} {}", role, shorten(text, 60)),
         SessionEvent::Reasoning { text } => format!("reasoning {}", shorten(text, 60)),
