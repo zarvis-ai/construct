@@ -1470,15 +1470,6 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
         return;
     }
 
-    // Operator monolog: when the orchestrator has just said something, take
-    // over the rain body with a monochrome typewriter line. Once it finishes
-    // the type→hold→fade cycle it clears itself and the rain resumes; widgets
-    // still render on top so an open widget isn't hidden.
-    if render_operator_monolog(f, rain_area, app, now) {
-        render_matrix_widget_viewport(f, rain_area, app, now);
-        return;
-    }
-
     // Wallpaper: paint the most recent browser preview from ANY session
     // (cross-session — the matrix rain is a fleet visualization, so the
     // backdrop reflects the whole fleet, not just the focused session,
@@ -1657,6 +1648,11 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     // Hover tooltip: if the cursor is over a horizontal word, name the
     // session it came from. Drawn last so it sits on top of the rain.
     render_matrix_reveal_tooltip(f, rain_area, app);
+    // Operator monolog: overlaid on the still-running rain (not a takeover), so
+    // the rain keeps animating underneath and doesn't restart when the text
+    // clears. Skipped while the orchestrator panel is open (the text is already
+    // visible right below). Widgets render after, on top.
+    render_operator_monolog(f, rain_area, app, now);
     render_matrix_widget_viewport(f, rain_area, app, now);
 }
 
@@ -1665,9 +1661,13 @@ const MONOLOG_MS_PER_CHAR: u64 = 28;
 const MONOLOG_HOLD_MS: u64 = 4200;
 const MONOLOG_FADE_MS: u64 = 800;
 
-/// Typewriter-render the operator's latest monolog over the matrix-rain body,
-/// then clear it (returning `false`) once the type → hold → fade cycle
-/// completes, so the rain resumes. Returns `true` while it's showing.
+/// Overlay the operator's latest monolog on top of the (still-running) matrix
+/// rain as a typewriter line, clearing it once the type → hold → fade cycle
+/// completes. Returns `true` if it drew this frame. Crucially this is an
+/// *overlay*, not a takeover: the rain is rendered every frame regardless, so
+/// it keeps animating underneath and never restarts when the text clears.
+/// Skipped while the orchestrator panel is open — the operator's text is
+/// already visible right below in the panel, so the overlay would duplicate it.
 pub(crate) fn render_operator_monolog(
     f: &mut Frame,
     area: Rect,
@@ -1686,12 +1686,16 @@ pub(crate) fn render_operator_monolog(
         app.operator_monolog = None;
         return false;
     }
+    if matches!(
+        app.minibuffer.as_ref().map(|m| &m.intent),
+        Some(MinibufferIntent::Orchestrator)
+    ) {
+        return false; // duplicate of the open panel below
+    }
     if area.width < 12 || area.height < 3 {
-        return true; // showing — suppress the rain even if too small to draw
+        return false;
     }
 
-    // Monochrome terminal takeover: clear the rain body, then the prompt + text.
-    f.render_widget(Clear, area);
     let shown = ((elapsed / MONOLOG_MS_PER_CHAR) as usize).min(chars.len());
     let mut body: String = chars[..shown].iter().collect();
     let typing = (shown as u64) < n;
@@ -1699,11 +1703,14 @@ pub(crate) fn render_operator_monolog(
         body.push('▌'); // blinking cursor while typing
     }
     let fading = elapsed >= type_ms + MONOLOG_HOLD_MS;
-    let text_style = Style::default().fg(if fading {
-        app.theme.matrix_dim
-    } else {
-        app.theme.matrix_glow
-    });
+    // Solid bg so the typed line reads cleanly as an overlay over the rain.
+    let text_style = Style::default()
+        .fg(if fading {
+            app.theme.matrix_dim
+        } else {
+            app.theme.matrix_glow
+        })
+        .bg(Color::Black);
     let inner = Rect {
         x: area.x + 2,
         y: area.y + 1,

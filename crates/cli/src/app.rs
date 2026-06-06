@@ -8561,6 +8561,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_monolog_skipped_while_orchestrator_panel_open() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let area = Rect::new(0, 0, 60, 12);
+        app.operator_monolog = Some(OperatorMonolog {
+            text: "session waiting at trust prompt".into(),
+            started_at: Instant::now() - std::time::Duration::from_millis(500),
+        });
+        // Orchestrator panel open → the text is visible below, so don't overlay.
+        app.minibuffer = Some(Minibuffer {
+            prompt: String::new(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::Orchestrator,
+            error: None,
+        });
+        let mut drew = true;
+        terminal
+            .draw(|f| drew = crate::ui::render_operator_monolog(f, area, &mut app, Instant::now()))
+            .expect("draw");
+        assert!(!drew, "monolog should be skipped while the panel is open");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(!screen.contains("session"), "should not draw over rain:\n{screen}");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn operator_monolog_accumulates_across_delta_heartbeats() {
         // `AgentStatus active=true` fires on every delta (a per-token "Working"
         // heartbeat), so the utterance must accumulate across them, not reset —
