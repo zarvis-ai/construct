@@ -75,3 +75,12 @@ strip = "symbols"
 # (fast incremental rebuilds, full debuggability).
 [profile.dev.package."*"]
 opt-level = 3
+
+# Vendored `vt100` fork (see `vendor/vt100`). Upstream `Grid::scroll_up`
+# only pushes scrolled-off lines to scrollback when no scroll region is
+# active, which drops the entire conversation for children that pin a
+# footer with a top-anchored DECSTBM region (codex: `ESC[1;Nr`). The fork
+# saves whenever the region's top margin is row 0, matching xterm /
+# xterm.js, so PTY scroll-up shows the real, complete terminal history.
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
