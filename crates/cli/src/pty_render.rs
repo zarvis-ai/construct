@@ -51,11 +51,6 @@ pub enum Item {
     /// events; PTY bytes between the corresponding OSC `7700`
     /// markers are discarded.
     ToolBlock(ToolBlock),
-    /// Adjacent tool calls with the same tool name, rendered as one
-    /// collapsible presentation group. This is derived client-side
-    /// from the normal event stream; individual blocks are still kept
-    /// so results, status, and expansion remain inspectable.
-    ToolGroup(ToolGroup),
     /// A structured chat message from a session that emits no PTY for
     /// its conversation (headless harnesses). Rendered as synthesized,
     /// role-styled text. Streaming deltas arrive as many consecutive
@@ -66,13 +61,6 @@ pub enum Item {
         text: String,
         break_before: bool,
     },
-}
-
-#[derive(Debug, Clone)]
-pub struct ToolGroup {
-    pub tool: String,
-    pub blocks: Vec<ToolBlock>,
-    pub expanded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +140,10 @@ fn buttons_after_ms() -> u64 {
         .unwrap_or(7_000)
 }
 
+fn tool_block_controls_ready(block: &ToolBlock) -> bool {
+    block.started_at.elapsed().as_millis() as u64 >= buttons_after_ms()
+}
+
 #[derive(Debug, Default)]
 enum OscState {
     #[default]
@@ -215,18 +207,17 @@ pub struct ItemHistory {
     /// open. Keyed by call_id (the `tool` field on `ToolResult`
     /// carries call_id by zarvis convention).
     pending_tool_results: HashMap<String, (bool, String)>,
-    /// Whether the next [`replay`] should rebuild from scratch.
-    /// Set by every mutation; cleared by `replay`. Future-proofing
-    /// for an incremental cache.
+    /// Whether the next [`replay`] should account for a mutation.
+    /// Set by every mutation; cleared by `replay`.
     pub dirty: bool,
     /// Persistent `vt100::Parser` reused across frames for sessions
     /// without tool blocks (claude / codex / shell) — these never
     /// have items mutate underfoot, so we can process only the
     /// items appended since the last replay and just `set_size` on
     /// resize instead of replaying the full history.
-    /// Sessions WITH tool blocks (zarvis) always rebuild because a
-    /// block's synth bytes change as state evolves (elapsed counter,
-    /// expand/collapse, output arrival).
+    /// Sessions with synthesized items (zarvis tool blocks and
+    /// headless messages) keep signatures so unchanged frames reuse
+    /// the parser and only mutations rebuild.
     cached: Option<CachedParser>,
 }
 
@@ -252,7 +243,7 @@ struct CachedParser {
     pending_consumed: usize,
     /// Per-item signature for `replay_full` — lets us detect when
     /// an existing item mutated (block hydrated, expanded toggled,
-    /// running counter ticked) vs. when the items list was only
+    /// running controls appeared) vs. when the items list was only
     /// appended to. On mutation we rebuild; on append-only we just
     /// process the new tail through the persistent parser.
     /// Empty for the non-tool-block fast path (which doesn't need it).
@@ -262,6 +253,9 @@ struct CachedParser {
     /// per frame for block-span row math — we just add the new
     /// tail's visible-line count.
     pending_visible_lines: usize,
+    /// Cursor column after the pending bytes already accounted for
+    /// by `pending_visible_lines`.
+    pending_end_col: usize,
     /// Per-item rendered layout for `replay_full` — the visible-line
     /// count and (for tool blocks) the hit-rect metadata. Parallel to
     /// `self.items`. Lets steady-state frames skip the O(history)
@@ -299,6 +293,17 @@ struct BlockLayout {
     kill_cols: Option<(u16, u16)>,
 }
 
+fn suffix_rebuild_start(layouts: &[ItemLayout], changed_idx: usize, rows: u16) -> usize {
+    let budget = reflow_budget_lines(rows);
+    let mut retained_lines = 0usize;
+    let mut start = layouts.len();
+    while start > 0 && retained_lines < budget {
+        start -= 1;
+        retained_lines += layouts[start].lines;
+    }
+    start.min(changed_idx)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ItemSig {
     Chunk(usize),
@@ -307,16 +312,10 @@ enum ItemSig {
         has_output: bool,
         ok: bool,
         expanded: bool,
-        /// `Some(elapsed_sec)` while the block is running (its
-        /// status row shows a live counter). `None` once the
-        /// block has output — the synth bytes are stable.
-        running_elapsed: Option<u64>,
-    },
-    Group {
-        tool: String,
-        count: usize,
-        expanded: bool,
-        blocks: Vec<ItemSig>,
+        /// `Some(controls_ready)` while the block is running. The
+        /// status row stays stable until the control hint appears;
+        /// a per-second elapsed counter forced full parser replays.
+        running_controls_ready: Option<bool>,
     },
     /// Message items are immutable once pushed (streaming appends new
     /// items rather than growing one), so the text length + kind fully
@@ -328,50 +327,11 @@ enum ItemSig {
     },
 }
 
-impl ToolGroup {
-    fn call_id(&self) -> String {
-        self.blocks
-            .first()
-            .map(|b| format!("group:{}", b.call_id))
-            .unwrap_or_else(|| format!("group:{}", self.tool))
-    }
-}
-
 impl ItemSig {
     fn of(item: &Item) -> Self {
         match item {
             Item::PtyChunk(b) => ItemSig::Chunk(b.len()),
-            Item::ToolBlock(b) => ItemSig::Block {
-                call_id: b.call_id.clone(),
-                has_output: b.output.is_some(),
-                ok: b.ok,
-                expanded: b.expanded,
-                running_elapsed: if b.output.is_some() {
-                    None
-                } else {
-                    Some(b.started_at.elapsed().as_secs())
-                },
-            },
-            Item::ToolGroup(g) => ItemSig::Group {
-                tool: g.tool.clone(),
-                count: g.blocks.len(),
-                expanded: g.expanded,
-                blocks: g
-                    .blocks
-                    .iter()
-                    .map(|b| ItemSig::Block {
-                        call_id: b.call_id.clone(),
-                        has_output: b.output.is_some(),
-                        ok: b.ok,
-                        expanded: b.expanded,
-                        running_elapsed: if b.output.is_some() {
-                            None
-                        } else {
-                            Some(b.started_at.elapsed().as_secs())
-                        },
-                    })
-                    .collect(),
-            },
+            Item::ToolBlock(b) => block_sig(b),
             Item::Message {
                 kind,
                 text,
@@ -382,6 +342,20 @@ impl ItemSig {
                 break_before: *break_before,
             },
         }
+    }
+}
+
+fn block_sig(b: &ToolBlock) -> ItemSig {
+    ItemSig::Block {
+        call_id: b.call_id.clone(),
+        has_output: b.output.is_some(),
+        ok: b.ok,
+        expanded: b.expanded,
+        running_controls_ready: if b.output.is_some() {
+            None
+        } else {
+            Some(tool_block_controls_ready(b))
+        },
     }
 }
 
@@ -401,8 +375,39 @@ impl ItemSig {
 pub const VT100_MIN_DIM: u16 = 2;
 
 pub const TOOL_BLOCK_COLLAPSED_LINES: usize = 5;
+pub const TOOL_BLOCK_EXPANDED_LINES: usize = 240;
 /// Per-line truncation in collapsed mode (mirrors zarvis).
 pub const TOOL_BLOCK_MAX_COLS: usize = 200;
+const TOOL_BLOCK_HISTORY_LINE_CHARS: usize = TOOL_BLOCK_MAX_COLS * 2;
+
+pub fn tool_output_preview_for_history(output: &str) -> String {
+    let mut preview = String::new();
+    let mut truncated = false;
+    for (idx, line) in output.lines().enumerate() {
+        if idx >= TOOL_BLOCK_EXPANDED_LINES {
+            truncated = true;
+            break;
+        }
+        if idx > 0 {
+            preview.push('\n');
+        }
+        let mut chars = line.chars();
+        for ch in chars.by_ref().take(TOOL_BLOCK_HISTORY_LINE_CHARS) {
+            preview.push(ch);
+        }
+        if chars.next().is_some() {
+            truncated = true;
+            preview.push_str(" ...");
+        }
+    }
+    if truncated {
+        if !preview.is_empty() {
+            preview.push('\n');
+        }
+        preview.push_str("[output truncated for TUI preview]");
+    }
+    preview
+}
 
 impl ItemHistory {
     pub fn new() -> Self {
@@ -719,11 +724,11 @@ impl ItemHistory {
             self.pending_block_hydrations.push_back(self.items.len());
         }
         if let Some((ok, output)) = self.pending_tool_results.remove(call_id) {
-            block.output = Some(output);
+            block.output = Some(tool_output_preview_for_history(&output));
             block.ok = ok;
         }
         if block.tool.is_some() {
-            self.push_tool_block_grouped(block);
+            self.push_tool_block(block);
         } else {
             self.items.push(Item::ToolBlock(block));
         }
@@ -744,60 +749,8 @@ impl ItemHistory {
         }
     }
 
-    fn push_tool_block_grouped(&mut self, block: ToolBlock) {
-        let tool = block.tool.clone().unwrap_or_else(|| "?".to_string());
-        if let Some(last) = self.items.last_mut() {
-            match last {
-                Item::ToolBlock(prev) if prev.tool.as_deref() == Some(tool.as_str()) => {
-                    let prev = prev.clone();
-                    *last = Item::ToolGroup(ToolGroup {
-                        tool,
-                        blocks: vec![prev, block],
-                        expanded: false,
-                    });
-                    return;
-                }
-                Item::ToolGroup(group) if group.tool == tool => {
-                    group.blocks.push(block);
-                    return;
-                }
-                _ => {}
-            }
-        }
+    fn push_tool_block(&mut self, block: ToolBlock) {
         self.items.push(Item::ToolBlock(block));
-    }
-
-    fn regroup_tool_block_at(&mut self, idx: usize) {
-        if idx >= self.items.len() {
-            return;
-        }
-        let Item::ToolBlock(block) = &self.items[idx] else {
-            return;
-        };
-        let Some(tool) = block.tool.clone() else {
-            return;
-        };
-        if idx == 0 {
-            return;
-        }
-        let block = match self.items.remove(idx) {
-            Item::ToolBlock(block) => block,
-            _ => return,
-        };
-        match self.items.get_mut(idx - 1) {
-            Some(Item::ToolBlock(prev)) if prev.tool.as_deref() == Some(tool.as_str()) => {
-                let prev = prev.clone();
-                self.items[idx - 1] = Item::ToolGroup(ToolGroup {
-                    tool,
-                    blocks: vec![prev, block],
-                    expanded: false,
-                });
-            }
-            Some(Item::ToolGroup(group)) if group.tool == tool => {
-                group.blocks.push(block);
-            }
-            _ => self.items.insert(idx, Item::ToolBlock(block)),
-        }
     }
 
     /// Apply a `ToolUse` event. The protocol's `ToolUse` carries no
@@ -810,7 +763,6 @@ impl ItemHistory {
             if let Some(Item::ToolBlock(b)) = self.items.get_mut(idx) {
                 b.tool = Some(tool.clone());
                 b.args_summary = Some(args_summary.clone());
-                self.regroup_tool_block_at(idx);
                 self.dirty = true;
                 return;
             }
@@ -852,10 +804,10 @@ impl ItemHistory {
             started_at: Instant::now(),
         };
         if let Some((ok, output)) = self.pending_tool_results.remove(&call_id) {
-            block.output = Some(output);
+            block.output = Some(tool_output_preview_for_history(&output));
             block.ok = ok;
         }
-        self.push_tool_block_grouped(block);
+        self.push_tool_block(block);
         self.dirty = true;
     }
 
@@ -863,6 +815,7 @@ impl ItemHistory {
     /// carries the *call_id* (zarvis convention), so we can match
     /// directly. If the OSC open hasn't arrived yet, stash for later.
     pub fn feed_tool_result(&mut self, call_id: &str, ok: bool, output: String) {
+        let output = tool_output_preview_for_history(&output);
         if let Some(block) = self.find_block_mut(call_id) {
             block.output = Some(output);
             block.ok = ok;
@@ -902,7 +855,6 @@ impl ItemHistory {
     fn find_block_mut(&mut self, call_id: &str) -> Option<&mut ToolBlock> {
         self.items.iter_mut().rev().find_map(|it| match it {
             Item::ToolBlock(b) if b.call_id == call_id => Some(b),
-            Item::ToolGroup(g) => g.blocks.iter_mut().rev().find(|b| b.call_id == call_id),
             _ => None,
         })
     }
@@ -910,19 +862,6 @@ impl ItemHistory {
     /// Toggle the expand state of a block. Returns true when a
     /// matching block was found (and toggled), false otherwise.
     pub fn toggle_block(&mut self, call_id: &str) -> bool {
-        if let Some(group) = self.items.iter_mut().rev().find_map(|it| match it {
-            Item::ToolGroup(g) if g.call_id() == call_id => Some(g),
-            _ => None,
-        }) {
-            group.expanded = !group.expanded;
-            if group.expanded {
-                for block in &mut group.blocks {
-                    block.expanded = false;
-                }
-            }
-            self.dirty = true;
-            return true;
-        }
         if let Some(block) = self.find_block_mut(call_id) {
             block.expanded = !block.expanded;
             self.dirty = true;
@@ -935,9 +874,10 @@ impl ItemHistory {
     /// Render the session's accumulated content into a `vt100::Screen`
     /// at the requested size. Two strategies:
     ///
-    /// 1. **Tool-block sessions (zarvis):** rebuild the parser from
-    ///    scratch every frame so tool blocks can reflect live state
-    ///    (elapsed counters, expand/collapse, in-flight output).
+    /// 1. **Tool-block sessions (zarvis):** use per-item signatures to
+    ///    reuse the parser across unchanged frames and rebuild only when
+    ///    synthesized state changes (control hints, expand/collapse,
+    ///    output arrival).
     /// 2. **Non-tool sessions (claude / codex / shell):** keep the
     ///    parser alive across frames. On resize, call `set_size` and
     ///    skip replay — matches what a real terminal does for those
@@ -1027,6 +967,7 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
+                pending_end_col: 0,
                 item_layouts: Vec::new(),
             });
         }
@@ -1139,6 +1080,7 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
+                pending_end_col: 0,
                 item_layouts: Vec::new(),
             };
             // Same scrollback-tail bound as the width-change rebuild:
@@ -1175,30 +1117,64 @@ impl ItemHistory {
     /// Tool-block-aware replay. Reuses the persistent parser when
     /// safe; falls back to a full rebuild only when an item
     /// mid-history actually mutated (block hydrated, expanded
-    /// toggled, running counter ticked to a new second). Append-only
+    /// toggled, running controls appeared). Append-only
     /// changes (new chunks, new blocks at the tail) just feed the
     /// new suffix through the live parser — same shape as
     /// `replay_cached` but with per-block signatures so we know
     /// when invalidation is required.
     fn replay_full(&mut self, cols: u16, rows: u16, scrollback: usize) -> RenderOutput<'_> {
         // Per-item signatures: if anything in the prefix mutated,
-        // we have to rebuild because vt100 has no "undo bytes" API.
+        // we have to rebuild from that item onward because vt100 has
+        // no "undo bytes" API.
         let current_sigs: Vec<ItemSig> = self.items.iter().map(ItemSig::of).collect();
 
-        let needs_rebuild = match &self.cached {
+        let flushed_pending_layout = self.cached.as_ref().and_then(|c| {
+            let pending_shrank = self.pending_chunk.len() < c.pending_consumed;
+            if !pending_shrank || !self.pending_chunk.is_empty() {
+                return None;
+            }
+            match self.items.get(c.processed_count) {
+                Some(Item::PtyChunk(bytes)) if bytes.len() >= c.pending_consumed => {
+                    Some((
+                        c.processed_count,
+                        c.pending_consumed,
+                        c.pending_visible_lines,
+                        c.pending_end_col,
+                    ))
+                }
+                _ => None,
+            }
+        });
+
+        let rebuild_from = match &self.cached {
             None => true,
             Some(c) => {
                 c.cols != cols
                     || current_sigs.len() < c.signatures.len()
-                    || self.pending_chunk.len() < c.pending_consumed
-                    || c.signatures
-                        .iter()
-                        .zip(current_sigs.iter())
-                        .any(|(a, b)| a != b)
+                    || (self.pending_chunk.len() < c.pending_consumed
+                        && flushed_pending_layout.is_none())
             }
         };
+        let changed_idx = self.cached.as_ref().and_then(|c| {
+            c.signatures
+                .iter()
+                .zip(current_sigs.iter())
+                .position(|(a, b)| a != b)
+        });
+        let rebuild_from = if rebuild_from {
+            Some(0)
+        } else {
+            self.cached.as_ref().and_then(|c| {
+                changed_idx.map(|idx| suffix_rebuild_start(&c.item_layouts, idx, rows))
+            })
+        };
 
-        if needs_rebuild {
+        if let Some(start) = rebuild_from {
+            let preserved_layouts = self
+                .cached
+                .as_ref()
+                .map(|cache| cache.item_layouts[..start.min(cache.item_layouts.len())].to_vec())
+                .unwrap_or_default();
             self.cached = Some(CachedParser {
                 parser: vt100::Parser::new(
                     rows.max(VT100_MIN_DIM),
@@ -1211,11 +1187,12 @@ impl ItemHistory {
                 pending_consumed: 0,
                 signatures: Vec::new(),
                 pending_visible_lines: 0,
-                item_layouts: Vec::new(),
+                pending_end_col: 0,
+                item_layouts: preserved_layouts,
             });
         }
         let cache = self.cached.as_mut().expect("just populated above");
-        if !needs_rebuild && cache.rows != rows {
+        if rebuild_from.is_none() && cache.rows != rows {
             cache
                 .parser
                 .screen_mut()
@@ -1234,18 +1211,18 @@ impl ItemHistory {
         // Compute layouts only for items past the cached prefix.
         // Cached layouts for `[0..reuse_upto)` stay valid because the
         // non-rebuild path guarantees `cols` is unchanged (a cols
-        // change forces a rebuild, which clears `item_layouts`), and
-        // any signature mutation in the prefix also forces a rebuild.
-        // The unchanged prefix is exactly the items already fed into
-        // the persistent parser, so we only `process` the new tail —
-        // and we no longer re-scan the whole history with
+        // change forces a rebuild), and any signature mutation drops
+        // layouts from the changed suffix onward. When a suffix
+        // rebuild preserves old prefix layouts, those prefix rows are
+        // retained only for absolute hit-rect math; the new parser is
+        // fed from `start_processing_at`, which covers the retained
+        // scrollback window and avoids replaying ancient history.
+        // We no longer re-scan the whole history with
         // `count_visible_lines` / `synth_block` every frame. That
         // O(history)-per-frame re-scan was the zarvis typing lag.
-        let start_processing_at = if needs_rebuild {
-            0
-        } else {
-            cache.processed_count
-        };
+        let start_processing_at = flushed_pending_layout
+            .map(|(idx, _, _, _)| idx + 1)
+            .unwrap_or_else(|| rebuild_from.unwrap_or(cache.processed_count));
         let reuse_upto = cache.item_layouts.len().min(self.items.len());
         let mut cursor_col = cache
             .item_layouts
@@ -1255,15 +1232,48 @@ impl ItemHistory {
         for (idx, item) in self.items.iter().enumerate().skip(reuse_upto) {
             let layout = match item {
                 Item::PtyChunk(b) => {
-                    if idx >= start_processing_at {
+                    let uses_flushed_pending_layout = matches!(
+                        flushed_pending_layout,
+                        Some((flushed_idx, _, _, _)) if idx == flushed_idx
+                    );
+                    if uses_flushed_pending_layout {
+                        let (_, consumed, flushed_lines, flushed_end_col) =
+                            flushed_pending_layout.expect("checked above");
+                        if consumed < b.len() {
+                            let suffix = &b[consumed..];
+                            cache.parser.process(suffix);
+                            let metrics = visible_metrics_from_col(suffix, cols, flushed_end_col);
+                            cursor_col = metrics.end_col;
+                            ItemLayout {
+                                lines: flushed_lines + metrics.lines,
+                                end_col: metrics.end_col,
+                                blocks: Vec::new(),
+                            }
+                        } else {
+                            cursor_col = flushed_end_col;
+                            ItemLayout {
+                                lines: flushed_lines,
+                                end_col: flushed_end_col,
+                                blocks: Vec::new(),
+                            }
+                        }
+                    } else if idx >= start_processing_at {
                         cache.parser.process(b);
-                    }
-                    let metrics = visible_metrics_from_col(b, cols, cursor_col);
-                    cursor_col = metrics.end_col;
-                    ItemLayout {
-                        lines: metrics.lines,
-                        end_col: metrics.end_col,
-                        blocks: Vec::new(),
+                        let metrics = visible_metrics_from_col(b, cols, cursor_col);
+                        cursor_col = metrics.end_col;
+                        ItemLayout {
+                            lines: metrics.lines,
+                            end_col: metrics.end_col,
+                            blocks: Vec::new(),
+                        }
+                    } else {
+                        let metrics = visible_metrics_from_col(b, cols, cursor_col);
+                        cursor_col = metrics.end_col;
+                        ItemLayout {
+                            lines: metrics.lines,
+                            end_col: metrics.end_col,
+                            blocks: Vec::new(),
+                        }
                     }
                 }
                 Item::ToolBlock(block) => {
@@ -1284,39 +1294,6 @@ impl ItemHistory {
                             bg_cols: synth.bg_button_cols,
                             kill_cols: synth.kill_button_cols,
                         }],
-                    }
-                }
-                Item::ToolGroup(group) => {
-                    let header = synth_group_header(group);
-                    let body = synth_group_body(group, cols);
-                    if idx >= start_processing_at {
-                        cache.parser.process(&header);
-                    }
-                    let header_metrics = visible_metrics_from_col(&header, cols, cursor_col);
-                    let group_row_start = 0;
-                    let group_row_end = header_metrics.lines;
-                    cursor_col = header_metrics.end_col;
-
-                    if idx >= start_processing_at {
-                        cache.parser.process(&body);
-                    }
-                    let body_metrics = visible_metrics_from_col(&body, cols, cursor_col);
-                    let child_layouts =
-                        group_child_block_layouts(group, cols, cursor_col, group_row_end);
-                    cursor_col = body_metrics.end_col;
-                    let mut blocks = vec![BlockLayout {
-                        call_id: group.call_id(),
-                        row_start_offset: group_row_start,
-                        row_end_offset: group_row_end,
-                        status_row_offset: None,
-                        bg_cols: None,
-                        kill_cols: None,
-                    }];
-                    blocks.extend(child_layouts);
-                    ItemLayout {
-                        lines: header_metrics.lines + body_metrics.lines,
-                        end_col: body_metrics.end_col,
-                        blocks,
                     }
                 }
                 Item::Message {
@@ -1364,14 +1341,20 @@ impl ItemHistory {
         // never re-iterate the whole pending buffer (otherwise long
         // sessions pay O(history) per frame just to position block
         // spans).
-        if needs_rebuild {
+        if rebuild_from.is_some() || flushed_pending_layout.is_some() {
             cache.pending_visible_lines = 0;
+            cache.pending_end_col = cursor_col;
         }
         let pending_start = cache.pending_consumed.min(self.pending_chunk.len());
+        if pending_start == 0 && cache.pending_visible_lines == 0 {
+            cache.pending_end_col = cursor_col;
+        }
         if pending_start < self.pending_chunk.len() {
             let suffix = &self.pending_chunk[pending_start..];
             cache.parser.process(suffix);
-            cache.pending_visible_lines += count_visible_lines(suffix, cols);
+            let metrics = visible_metrics_from_col(suffix, cols, cache.pending_end_col);
+            cache.pending_visible_lines += metrics.lines;
+            cache.pending_end_col = metrics.end_col;
         }
         abs_line += cache.pending_visible_lines;
 
@@ -1632,10 +1615,12 @@ fn visible_metrics_from_col(bytes: &[u8], cols: u16, start_col: usize) -> Visibl
     }
 }
 
+#[cfg(test)]
 fn count_visible_lines_from_col(bytes: &[u8], cols: u16, start_col: usize) -> usize {
     visible_metrics_from_col(bytes, cols, start_col).lines
 }
 
+#[cfg(test)]
 fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
     count_visible_lines_from_col(bytes, cols, 0)
 }
@@ -1646,7 +1631,7 @@ fn count_visible_lines(bytes: &[u8], cols: u16) -> usize {
 ///
 /// States rendered:
 /// - **Running** (`output == None`): header + status row with
-///   elapsed counter; a keyboard-control hint appears after the
+///   stable status row; a keyboard-control hint appears after the
 ///   `BUTTONS_AFTER_MS` threshold.
 /// - **Backgrounded** (`output == BG_PLACEHOLDER_OUTPUT`): header +
 ///   status row with "in background"; `Esc` kill hint only.
@@ -1664,6 +1649,17 @@ fn push_text_crlf(out: &mut Vec<u8>, text: &str) {
             _ => out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes()),
         }
     }
+}
+
+fn count_lines_up_to(text: &str, limit: usize) -> (usize, bool) {
+    let mut count = 0usize;
+    for _ in text.lines() {
+        if count >= limit {
+            return (count, true);
+        }
+        count += 1;
+    }
+    (count, false)
 }
 
 /// Synthesize terminal bytes for a structured chat [`Item::Message`].
@@ -1689,148 +1685,6 @@ fn synth_message(kind: MessageKind, text: &str, break_before: bool) -> Vec<u8> {
             push_text_crlf(&mut out, text);
             out.extend_from_slice(b"\x1b[0m");
         }
-    }
-    out
-}
-
-fn synth_group_header(group: &ToolGroup) -> Vec<u8> {
-    let summary = summarize_group(group);
-    let chevron = if group.expanded { "▾" } else { "▸" };
-    format!(
-        "\r\n\x1b[2;32m{chevron} \x1b[0m\x1b[1;92m{}\x1b[0m\x1b[2m × {} · {}\x1b[0m\r\n",
-        group.tool,
-        group.blocks.len(),
-        summary
-    )
-    .into_bytes()
-}
-
-fn synth_group_body(group: &ToolGroup, cols: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-    if group.expanded {
-        for block in &group.blocks {
-            let synth = synth_block(block, cols.saturating_sub(2));
-            out.extend_from_slice(&indent_synth_bytes(&synth.bytes, 2));
-        }
-    } else {
-        let status = group_status(group);
-        if !status.is_empty() {
-            out.extend_from_slice(format!("  \x1b[2m{}\x1b[0m\r\n", status).as_bytes());
-        }
-    }
-    out
-}
-
-fn indent_synth_bytes(bytes: &[u8], spaces: usize) -> Vec<u8> {
-    let indent = vec![b' '; spaces];
-    let mut out = Vec::with_capacity(bytes.len() + spaces * 4);
-    let mut at_line_start = true;
-    for &b in bytes {
-        if at_line_start && b != b'\r' && b != b'\n' {
-            out.extend_from_slice(&indent);
-            at_line_start = false;
-        }
-        out.push(b);
-        if b == b'\n' {
-            at_line_start = true;
-        }
-    }
-    out
-}
-
-fn group_child_block_layouts(
-    group: &ToolGroup,
-    cols: u16,
-    start_col: usize,
-    row_offset: usize,
-) -> Vec<BlockLayout> {
-    let mut layouts = Vec::new();
-    if group.expanded {
-        let mut offset = row_offset;
-        let mut cursor_col = start_col;
-        for block in &group.blocks {
-            let child = synth_block(block, cols.saturating_sub(2));
-            let indented = indent_synth_bytes(&child.bytes, 2);
-            let metrics = visible_metrics_from_col(&indented, cols, cursor_col);
-            layouts.push(BlockLayout {
-                call_id: block.call_id.clone(),
-                row_start_offset: offset,
-                row_end_offset: offset + metrics.lines,
-                status_row_offset: child.status_row_offset.map(|off| offset + off as usize),
-                bg_cols: child.bg_button_cols,
-                kill_cols: child.kill_button_cols,
-            });
-            offset += metrics.lines;
-            cursor_col = metrics.end_col;
-        }
-    }
-    layouts
-}
-
-fn summarize_group(group: &ToolGroup) -> String {
-    let items: Vec<String> = group
-        .blocks
-        .iter()
-        .filter_map(|b| b.args_summary.as_deref())
-        .filter_map(primary_arg_summary)
-        .take(4)
-        .collect();
-    if items.is_empty() {
-        format!("{} calls", group.blocks.len())
-    } else {
-        let more = group.blocks.len().saturating_sub(items.len());
-        if more > 0 {
-            format!("{}{}", items.join(", "), format!(", +{more} more"))
-        } else {
-            items.join(", ")
-        }
-    }
-}
-
-fn group_status(group: &ToolGroup) -> String {
-    let running = group.blocks.iter().filter(|b| b.output.is_none()).count();
-    let failed = group
-        .blocks
-        .iter()
-        .filter(|b| b.output.is_some() && !b.ok)
-        .count();
-    let completed = group.blocks.iter().filter(|b| b.output.is_some()).count();
-    let mut parts = Vec::new();
-    if completed > 0 {
-        parts.push(format!("{completed} completed"));
-    }
-    if running > 0 {
-        parts.push(format!("{running} running"));
-    }
-    if failed > 0 {
-        parts.push(format!("{failed} failed"));
-    }
-    parts.join(", ")
-}
-
-fn primary_arg_summary(args: &str) -> Option<String> {
-    let compact = compact_tool_args(args);
-    if compact.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&compact) {
-        for key in ["path", "cwd", "url", "session_id", "command"] {
-            if let Some(value) = value.get(key).and_then(|v| v.as_str()) {
-                return Some(truncate_summary(value, 48));
-            }
-        }
-    }
-    Some(truncate_summary(&compact, 48))
-}
-
-fn truncate_summary(text: &str, max_chars: usize) -> String {
-    let mut out = String::new();
-    for (idx, ch) in text.chars().enumerate() {
-        if idx >= max_chars {
-            out.push('…');
-            return out;
-        }
-        out.push(ch);
     }
     out
 }
@@ -1877,15 +1731,14 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
 
     if is_running || is_backgrounded {
         status_row_offset = Some(1 + header_rows as u16);
-        let elapsed_secs = block.started_at.elapsed().as_secs();
-        let controls_ready = block.started_at.elapsed().as_millis() as u64 >= buttons_after_ms();
+        let controls_ready = tool_block_controls_ready(block);
 
         let mut line = String::new();
         line.push_str("  ");
         let status_text = if is_running {
-            format!("running {elapsed_secs}s")
+            "running"
         } else {
-            format!("in background {elapsed_secs}s")
+            "in background"
         };
         line.push_str(&format!("\x1b[2;33m{status_text}\x1b[0m"));
         if controls_ready {
@@ -1906,18 +1759,18 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
             "\x1b[1;31m✗\x1b[0m"
         };
         let output = output_opt.unwrap_or("");
-        let total_lines = output.lines().count();
+        let (known_lines, has_more_lines) = count_lines_up_to(output, TOOL_BLOCK_EXPANDED_LINES);
         let visible = if block.expanded {
-            total_lines
+            known_lines
         } else {
-            TOOL_BLOCK_COLLAPSED_LINES.min(total_lines)
+            TOOL_BLOCK_COLLAPSED_LINES.min(known_lines)
         };
         let max_col = (cols as usize)
             .saturating_sub(7)
             .min(TOOL_BLOCK_MAX_COLS)
             .max(8);
 
-        if total_lines == 0 {
+        if known_lines == 0 {
             let payload = format!("  {glyph}  \x1b[2m(no output)\x1b[0m\r\n");
             out.extend_from_slice(payload.as_bytes());
         } else {
@@ -1933,14 +1786,25 @@ fn synth_block(block: &ToolBlock, cols: u16) -> SynthOutput {
             }
         }
 
-        if total_lines > 0 {
-            if block.expanded && total_lines > TOOL_BLOCK_COLLAPSED_LINES {
-                let footer = "     \x1b[2;36m[click to collapse]\x1b[0m\r\n".to_string();
-                out.extend_from_slice(footer.as_bytes());
-            } else if !block.expanded && total_lines > TOOL_BLOCK_COLLAPSED_LINES {
-                let remaining = total_lines - TOOL_BLOCK_COLLAPSED_LINES;
-                let footer =
-                    format!("     \x1b[2;36m[+{remaining} lines — click to expand]\x1b[0m\r\n");
+        if known_lines > 0 {
+            if block.expanded && (known_lines > TOOL_BLOCK_COLLAPSED_LINES || has_more_lines) {
+                if has_more_lines {
+                    let footer = format!(
+                        "     \x1b[2;36m[showing {visible}/{visible}+ lines — click to collapse]\x1b[0m\r\n"
+                    );
+                    out.extend_from_slice(footer.as_bytes());
+                } else {
+                    let footer = "     \x1b[2;36m[click to collapse]\x1b[0m\r\n".to_string();
+                    out.extend_from_slice(footer.as_bytes());
+                }
+            } else if !block.expanded
+                && (known_lines > TOOL_BLOCK_COLLAPSED_LINES || has_more_lines)
+            {
+                let remaining = known_lines.saturating_sub(TOOL_BLOCK_COLLAPSED_LINES);
+                let plus = if has_more_lines { "+" } else { "" };
+                let footer = format!(
+                    "     \x1b[2;36m[+{remaining}{plus} lines — click to expand]\x1b[0m\r\n"
+                );
                 out.extend_from_slice(footer.as_bytes());
             }
         }
@@ -2082,7 +1946,6 @@ mod tests {
     fn tool_block_ids(item: &Item) -> Vec<String> {
         match item {
             Item::ToolBlock(b) => vec![b.call_id.clone()],
-            Item::ToolGroup(g) => g.blocks.iter().map(|b| b.call_id.clone()).collect(),
             _ => Vec::new(),
         }
     }
@@ -2302,29 +2165,22 @@ mod tests {
     }
 
     #[test]
-    fn adjacent_same_tool_task_starts_group() {
+    fn adjacent_same_tool_task_starts_stay_separate_blocks() {
         let mut h = ItemHistory::new();
         h.feed_task_start("A".into(), "read_file".into(), r#"{"path":"a.rs"}"#.into());
         h.feed_task_start("B".into(), "read_file".into(), r#"{"path":"b.rs"}"#.into());
         h.feed_tool_result("A", true, "a".into());
         h.feed_tool_result("B", false, "missing".into());
 
-        assert_eq!(h.items.len(), 1);
-        match &h.items[0] {
-            Item::ToolGroup(g) => {
-                assert_eq!(g.tool, "read_file");
-                assert_eq!(tool_block_ids(&h.items[0]), vec!["A", "B"]);
-                assert_eq!(g.blocks[0].output.as_deref(), Some("a"));
-                assert!(!g.blocks[1].ok);
-            }
-            other => panic!("expected tool group, got {other:?}"),
-        }
+        assert_eq!(h.items.len(), 2);
+        assert_eq!(tool_block_ids(&h.items[0]), vec!["A"]);
+        assert_eq!(tool_block_ids(&h.items[1]), vec!["B"]);
 
         let text = screen_text(h.replay(100, 20, 0).screen, 20, 100);
-        assert!(text.contains("▸ read_file × 2"), "{text}");
-        assert!(text.contains("a.rs, b.rs"), "{text}");
-        assert!(text.contains("2 completed"), "{text}");
-        assert!(text.contains("1 failed"), "{text}");
+        assert!(text.contains("→ read_file("), "{text}");
+        assert!(text.contains("a.rs"), "{text}");
+        assert!(text.contains("b.rs"), "{text}");
+        assert!(!text.contains("× 2"), "{text}");
     }
 
     #[test]
@@ -2342,46 +2198,29 @@ mod tests {
     }
 
     #[test]
-    fn expanded_group_exposes_child_hit_rects() {
+    fn adjacent_same_tool_blocks_expose_individual_hit_rects() {
         let mut h = ItemHistory::new();
         h.feed_task_start("A".into(), "shell".into(), "echo a".into());
         h.feed_task_start("B".into(), "shell".into(), "echo b".into());
         h.feed_tool_result("A", true, "a\nmore a\nstill a".into());
         h.feed_tool_result("B", true, "b\nmore b\nstill b".into());
 
-        let group_id = match &h.items[0] {
-            Item::ToolGroup(g) => g.call_id(),
-            other => panic!("expected tool group, got {other:?}"),
-        };
-        assert!(h.toggle_block(&group_id));
         let out = h.replay(100, 40, 0);
         let text = screen_text(out.screen, 40, 100);
-        assert!(
-            text.contains("  → shell"),
-            "expanded children should be indented:\n{text}"
-        );
+        assert!(text.contains("→ shell"), "{text}");
         let ids: Vec<&str> = out.blocks.iter().map(|b| b.call_id.as_str()).collect();
-        assert!(ids.contains(&group_id.as_str()), "{ids:?}");
         assert!(ids.contains(&"A"), "{ids:?}");
         assert!(ids.contains(&"B"), "{ids:?}");
-        let group_hit = out.blocks.iter().find(|b| b.call_id == group_id).unwrap();
-        assert!(
-            group_hit.row_end - group_hit.row_start <= 2,
-            "{group_hit:?}"
-        );
 
         assert!(h.toggle_block("A"));
         match &h.items[0] {
-            Item::ToolGroup(g) => {
-                assert!(g.expanded, "child toggle should not collapse the group");
-                assert!(g.blocks[0].expanded, "child output should expand");
-            }
-            other => panic!("expected tool group, got {other:?}"),
+            Item::ToolBlock(block) => assert!(block.expanded, "child output should expand"),
+            other => panic!("expected tool block, got {other:?}"),
         }
     }
 
     #[test]
-    fn late_tool_use_hydration_can_group_with_previous_block() {
+    fn late_tool_use_hydration_stays_separate_from_previous_block() {
         let mut h = ItemHistory::new();
         h.feed_task_start("A".into(), "shell".into(), "echo a".into());
         h.feed_pty(b"\x1b]7700;open;call=B\x07inline");
@@ -2389,15 +2228,15 @@ mod tests {
         h.feed_tool_result("B", true, "b".into());
         h.feed_pty(b"\x1b]7700;close;call=B\x07");
 
-        assert_eq!(h.items.len(), 1);
-        match &h.items[0] {
-            Item::ToolGroup(g) => {
-                assert_eq!(g.tool, "shell");
-                assert_eq!(tool_block_ids(&h.items[0]), vec!["A", "B"]);
-                assert_eq!(g.blocks[1].args_summary.as_deref(), Some("echo b"));
-                assert_eq!(g.blocks[1].output.as_deref(), Some("b"));
+        assert_eq!(h.items.len(), 2);
+        match &h.items[1] {
+            Item::ToolBlock(block) => {
+                assert_eq!(block.call_id, "B");
+                assert_eq!(block.tool.as_deref(), Some("shell"));
+                assert_eq!(block.args_summary.as_deref(), Some("echo b"));
+                assert_eq!(block.output.as_deref(), Some("b"));
             }
-            other => panic!("expected tool group, got {other:?}"),
+            other => panic!("expected tool block, got {other:?}"),
         }
     }
 
@@ -2531,6 +2370,69 @@ mod tests {
             expanded_rows > collapsed_rows,
             "expand should grow the row range: collapsed={collapsed_rows} expanded={expanded_rows}"
         );
+    }
+
+    #[test]
+    fn expanded_tool_output_is_capped_inline() {
+        let mut block = ToolBlock {
+            call_id: "c1".into(),
+            tool: Some("read_file".into()),
+            args_summary: Some("large.log".into()),
+            output: Some(
+                (0..(TOOL_BLOCK_EXPANDED_LINES + 20))
+                    .map(|i| format!("line {i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            ok: true,
+            expanded: true,
+            started_at: Instant::now(),
+        };
+
+        let rendered = String::from_utf8(synth_block(&block, 100).bytes).unwrap();
+        assert!(
+            rendered.contains(&format!(
+                "showing {}/{}+ lines",
+                TOOL_BLOCK_EXPANDED_LINES, TOOL_BLOCK_EXPANDED_LINES
+            )),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("click to collapse"), "{rendered:?}");
+        assert!(
+            rendered.contains(&format!("line {}", TOOL_BLOCK_EXPANDED_LINES - 1)),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains(&format!("line {}", TOOL_BLOCK_EXPANDED_LINES)),
+            "{rendered:?}"
+        );
+
+        block.expanded = false;
+        let collapsed = String::from_utf8(synth_block(&block, 100).bytes).unwrap();
+        assert!(
+            collapsed.contains(&format!(
+                "+{}+ lines",
+                TOOL_BLOCK_EXPANDED_LINES - TOOL_BLOCK_COLLAPSED_LINES
+            )),
+            "{collapsed:?}"
+        );
+    }
+
+    #[test]
+    fn tool_result_history_preview_is_bounded() {
+        let huge = (0..10_000usize)
+            .map(|i| format!("line {i} {}", "x".repeat(2_000)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = tool_output_preview_for_history(&huge);
+        assert!(
+            preview.len() < 120_000,
+            "preview should be bounded, got {} bytes",
+            preview.len()
+        );
+        assert!(preview.contains("[output truncated for TUI preview]"));
+        assert!(preview.contains("line 0"));
+        assert!(!preview.contains("line 9999"));
     }
 
     #[test]
@@ -3351,6 +3253,269 @@ mod tests {
             per_frame < 300,
             "zarvis steady-state render too slow: {per_frame} µs/frame — replay_full is re-scanning history every frame"
         );
+    }
+
+    #[test]
+    fn zarvis_tool_expand_collapse_rebuilds_only_retained_suffix() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        for i in 0..1_200u32 {
+            let mut chat = Vec::with_capacity(900);
+            for j in 0..8 {
+                chat.extend_from_slice(
+                    format!(
+                        "\x1b[33mhistory {i}.{j} before the clicked tool block\x1b[0m\r\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            h.feed_pty(&chat);
+            let call = format!("c{i}");
+            h.feed_tool_use("shell".into(), format!("cmd {i}"));
+            h.feed_pty(
+                format!("\x1b]7700;open;call={call}\x07out\x1b]7700;close;call={call}\x07")
+                    .as_bytes(),
+            );
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+
+        let target = "target";
+        h.feed_tool_use("read_file".into(), "produce large output".into());
+        h.feed_pty(
+            format!("\x1b]7700;open;call={target}\x07out\x1b]7700;close;call={target}\x07")
+                .as_bytes(),
+        );
+        let output = (0..600u32)
+            .map(|i| format!("expanded output line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        h.feed_tool_result(target, true, output);
+
+        // Warm the cache in the collapsed state.
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        assert!(h.toggle_block(target));
+        let expand_t = Instant::now();
+        let expanded = h.replay(cols, rows, 0);
+        let expand_us = expand_t.elapsed().as_micros();
+        assert!(
+            expanded
+                .blocks
+                .iter()
+                .any(|hit| hit.call_id == target),
+            "expanded block hit rect should survive suffix rebuild: {:?}",
+            expanded.blocks
+        );
+
+        assert!(h.toggle_block(target));
+        let collapse_t = Instant::now();
+        let collapsed = h.replay(cols, rows, 0);
+        let collapse_us = collapse_t.elapsed().as_micros();
+        assert!(
+            collapsed
+                .blocks
+                .iter()
+                .any(|hit| hit.call_id == target),
+            "collapsed block hit rect should survive suffix rebuild"
+        );
+
+        eprintln!(
+            "zarvis expand/collapse after long history: expand {expand_us} µs, collapse {collapse_us} µs"
+        );
+        assert!(
+            expand_us < 80_000,
+            "tool expand replay too slow after long history: {expand_us} µs"
+        );
+        assert!(
+            collapse_us < 80_000,
+            "tool collapse replay too slow after long history: {collapse_us} µs"
+        );
+    }
+
+    #[test]
+    fn zarvis_tool_start_reuses_already_rendered_pending_text() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        for i in 0..800u32 {
+            let mut chat = Vec::with_capacity(900);
+            for j in 0..8 {
+                chat.extend_from_slice(
+                    format!("\x1b[33mhistory {i}.{j} before live pending text\x1b[0m\r\n")
+                        .as_bytes(),
+                );
+            }
+            h.feed_pty(&chat);
+            let call = format!("c{i}");
+            h.feed_task_start(call.clone(), "shell".into(), format!("cmd {i}"));
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        let mut live_pending = Vec::with_capacity(40_000);
+        for i in 0..900u32 {
+            live_pending.extend_from_slice(
+                format!("\x1b[36massistant live pending line {i}\x1b[0m\r\n").as_bytes(),
+            );
+        }
+        h.feed_pty(&live_pending);
+        let _ = h.replay(cols, rows, 0);
+
+        let target = "new-tool";
+        h.feed_task_start(target.into(), "read_file".into(), "src/main.rs".into());
+        let t = Instant::now();
+        let rendered = h.replay(cols, rows, 0);
+        let tool_start_us = t.elapsed().as_micros();
+        assert!(
+            rendered.blocks.iter().any(|hit| hit.call_id == target),
+            "new tool block hit rect should render after pending flush"
+        );
+        eprintln!("zarvis tool start after live pending: {tool_start_us} µs");
+        assert!(
+            tool_start_us < 80_000,
+            "tool start replay too slow after pending flush: {tool_start_us} µs"
+        );
+    }
+
+    #[test]
+    fn zarvis_tool_start_reuses_partially_rendered_pending_text() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        for i in 0..1_200u32 {
+            let mut chat = Vec::with_capacity(900);
+            for j in 0..8 {
+                chat.extend_from_slice(
+                    format!("\x1b[33mhistory {i}.{j} before partial pending\x1b[0m\r\n")
+                        .as_bytes(),
+                );
+            }
+            h.feed_pty(&chat);
+            let call = format!("c{i}");
+            h.feed_task_start(call.clone(), "shell".into(), format!("cmd {i}"));
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        let rendered_prefix = (0..600u32)
+            .map(|i| format!("\x1b[36malready rendered pending line {i}\x1b[0m\r\n"))
+            .collect::<String>();
+        h.feed_pty(rendered_prefix.as_bytes());
+        let _ = h.replay(cols, rows, 0);
+
+        let unrendered_suffix = (0..600u32)
+            .map(|i| format!("\x1b[35mnot yet rendered pending line {i}\x1b[0m\r\n"))
+            .collect::<String>();
+        h.feed_pty(unrendered_suffix.as_bytes());
+
+        let target = "partial-new-tool";
+        h.feed_task_start(target.into(), "read_file".into(), "src/main.rs".into());
+        let t = Instant::now();
+        let rendered = h.replay(cols, rows, 0);
+        let tool_start_us = t.elapsed().as_micros();
+        assert!(
+            rendered.blocks.iter().any(|hit| hit.call_id == target),
+            "new tool block hit rect should render after partial pending flush"
+        );
+        eprintln!("zarvis tool start after partial pending: {tool_start_us} µs");
+        assert!(
+            tool_start_us < 80_000,
+            "tool start replay too slow after partial pending flush: {tool_start_us} µs"
+        );
+    }
+
+    #[test]
+    fn ungrouped_tool_update_stays_bounded() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        for i in 0..2_000u32 {
+            let call = format!("g{i}");
+            h.feed_task_start(call.clone(), "shell".into(), format!("cmd {i}"));
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        let call = "group-new";
+        h.feed_task_start(call.into(), "shell".into(), "cmd new".into());
+        let start_t = Instant::now();
+        let started = h.replay(cols, rows, 0);
+        let start_us = start_t.elapsed().as_micros();
+        assert!(
+            started.blocks.iter().any(|hit| hit.call_id == call),
+            "new tool hit rect should render after append"
+        );
+
+        h.feed_tool_result(call, true, "ok".into());
+        let result_t = Instant::now();
+        let finished = h.replay(cols, rows, 0);
+        let result_us = result_t.elapsed().as_micros();
+        assert!(
+            finished.blocks.iter().any(|hit| hit.call_id == call),
+            "new tool hit rect should survive result"
+        );
+        eprintln!(
+            "ungrouped tool update after 2000 calls: start {start_us} µs, result {result_us} µs"
+        );
+        assert!(
+            start_us < 80_000,
+            "ungrouped tool start replay too slow: {start_us} µs"
+        );
+        assert!(
+            result_us < 80_000,
+            "ungrouped tool result replay too slow: {result_us} µs"
+        );
+    }
+
+    #[test]
+    fn live_tool_start_after_render_stays_append_only() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "cmd a".into());
+        h.feed_tool_result("A", true, "ok".into());
+        let _ = h.replay(100, 30, 0);
+
+        h.feed_task_start("B".into(), "shell".into(), "cmd b".into());
+        assert_eq!(h.items.len(), 2, "{:?}", h.items);
+        assert!(matches!(h.items[0], Item::ToolBlock(_)), "{:?}", h.items);
+        assert!(matches!(h.items[1], Item::ToolBlock(_)), "{:?}", h.items);
+
+        let before = h
+            .cached
+            .as_ref()
+            .map(|cache| cache.processed_count)
+            .expect("cache warmed");
+        let _ = h.replay(100, 30, 0);
+        let after = h.cached.as_ref().map(|cache| cache.processed_count);
+        assert_eq!(before, 1);
+        assert_eq!(after, Some(2));
+    }
+
+    #[test]
+    fn live_late_tool_use_hydration_after_render_stays_append_only() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "cmd a".into());
+        h.feed_tool_result("A", true, "ok".into());
+        let _ = h.replay(100, 30, 0);
+
+        h.feed_pty(b"\x1b]7700;open;call=B\x07inline");
+        h.feed_tool_use("shell".into(), "cmd b".into());
+        h.feed_tool_result("B", true, "ok".into());
+        assert_eq!(h.items.len(), 2, "{:?}", h.items);
+        assert!(matches!(h.items[0], Item::ToolBlock(_)), "{:?}", h.items);
+        assert!(matches!(h.items[1], Item::ToolBlock(_)), "{:?}", h.items);
     }
 
     // ----- orchestrator / minibuffer (zarvis-like content, no
@@ -4611,6 +4776,40 @@ mod tests {
             "button hit zones should not be exposed for text hints: {:?}",
             out.blocks
         );
+    }
+
+    #[test]
+    fn running_tool_signature_ignores_elapsed_seconds_until_controls_appear() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start(
+            "t1".to_string(),
+            "shell".to_string(),
+            "sleep 60".to_string(),
+        );
+        let Item::ToolBlock(block) = h.items.last().expect("tool block") else {
+            panic!("expected tool block");
+        };
+        let mut fresh = block.clone();
+        let mut older = block.clone();
+        let threshold = buttons_after_ms();
+        let below_threshold = threshold.saturating_sub(1).min(1_000);
+        older.started_at = Instant::now() - std::time::Duration::from_millis(below_threshold);
+
+        assert_eq!(
+            ItemSig::of(&Item::ToolBlock(fresh.clone())),
+            ItemSig::of(&Item::ToolBlock(older)),
+            "elapsed seconds alone must not invalidate the tool-block parser cache"
+        );
+
+        if threshold > 0 {
+            fresh.started_at =
+                Instant::now() - std::time::Duration::from_millis(threshold.saturating_add(1));
+            assert_ne!(
+                ItemSig::of(&Item::ToolBlock(block.clone())),
+                ItemSig::of(&Item::ToolBlock(fresh)),
+                "the signature should change once the control hint becomes visible"
+            );
+        }
     }
 
     #[test]

@@ -1429,6 +1429,25 @@ pub const SPINNER_FRAME_MS: u128 = 120;
 pub const SPINNER_FRAMES: [&str; 8] = ["✦", "✧", "✶", "✷", "✸", "✷", "✶", "✧"];
 /// Duration of the session-switch visual transition.
 pub const SESSION_TRANSITION_MS: u128 = 200;
+/// Maximum number of queued daemon notifications to fold into one event-loop
+/// pass. Keeps terminal redraw fragments from repainting one chunk at a time.
+const MAX_NOTIFICATION_DRAIN: usize = 256;
+/// Time budget for the same notification-drain pass. Under many active
+/// sessions, per-notification PTY feed work can be expensive enough that a
+/// count-only drain skips visible animation frames before the loop paints again.
+const NOTIFICATION_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+fn should_continue_notification_drain(
+    drained: usize,
+    drain_started: Instant,
+    now: Instant,
+) -> bool {
+    drained < MAX_NOTIFICATION_DRAIN
+        && now
+            .checked_duration_since(drain_started)
+            .unwrap_or(Duration::ZERO)
+            < NOTIFICATION_DRAIN_BUDGET
+}
 
 #[allow(dead_code)]
 pub async fn run(client: Arc<Client>) -> Result<()> {
@@ -2011,9 +2030,13 @@ async fn run_loop(
                         // a single render renders only the final
                         // settled state. Capped to keep input + tick
                         // arms responsive under sustained load.
-                        const MAX_DRAIN: usize = 256;
+                        let drain_started = Instant::now();
                         let mut drained = 0;
-                        while drained < MAX_DRAIN {
+                        while should_continue_notification_drain(
+                            drained,
+                            drain_started,
+                            Instant::now(),
+                        ) {
                             match notifications.try_recv() {
                                 Ok(n) => {
                                     app.on_notification(n).await;
@@ -3346,7 +3369,11 @@ impl App {
                                 .histories
                                 .entry(payload.session_id.clone())
                                 .or_default();
-                            history.feed_tool_result(tool, *ok, output.clone());
+                            history.feed_tool_result(
+                                tool,
+                                *ok,
+                                crate::pty_render::tool_output_preview_for_history(output),
+                            );
                         }
                         // Headless sessions (any harness) emit their
                         // conversation as structured Message/Reasoning
@@ -6930,7 +6957,11 @@ pub fn apply_transcript_to_local_state(
                 }
             }
             SessionEvent::ToolResult { tool, ok, output } => {
-                history.feed_tool_result(tool, *ok, output.clone());
+                history.feed_tool_result(
+                    tool,
+                    *ok,
+                    crate::pty_render::tool_output_preview_for_history(output),
+                );
             }
             // Each new EditorState supersedes the prior one — the
             // adapter emits one on every buffer / cursor / queue /
@@ -7369,6 +7400,52 @@ mod tests {
             input < notif,
             "input arm must be polled before the notification-drain arm \
              (bias toward input under background feed load)"
+        );
+    }
+
+    /// Regression guard for frame starvation under many active sessions.
+    ///
+    /// Coalescing daemon notifications is useful: one codex/claude terminal
+    /// redraw can arrive as several PTY chunks, and drawing after every chunk
+    /// looks like a replay cascade. A count-only drain, though, can spend a
+    /// whole animation frame budget feeding background PTY bytes before the
+    /// loop paints again. The drain therefore has both a count cap and a small
+    /// elapsed-time budget.
+    #[test]
+    fn notification_drain_stops_on_count_or_time_budget() {
+        let start = Instant::now();
+        assert!(should_continue_notification_drain(0, start, start));
+        assert!(should_continue_notification_drain(
+            MAX_NOTIFICATION_DRAIN - 1,
+            start,
+            start + NOTIFICATION_DRAIN_BUDGET / 2
+        ));
+        assert!(!should_continue_notification_drain(
+            MAX_NOTIFICATION_DRAIN,
+            start,
+            start
+        ));
+        assert!(!should_continue_notification_drain(
+            1,
+            start,
+            start + NOTIFICATION_DRAIN_BUDGET
+        ));
+    }
+
+    #[test]
+    fn run_loop_notification_drain_uses_time_budget() {
+        let src = include_str!("app.rs");
+        let recv_at = src
+            .find("notif = notifications.recv()")
+            .expect("notification arm");
+        let body = &src[recv_at..(recv_at + 2500).min(src.len())];
+        assert!(
+            body.contains("should_continue_notification_drain"),
+            "notification drain must check both count and elapsed time"
+        );
+        assert!(
+            body.contains("drain_started"),
+            "notification drain must measure elapsed time from the batch start"
         );
     }
 
