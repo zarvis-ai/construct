@@ -2788,7 +2788,7 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
         (4_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
         (5_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
         (6_u16, 2_u16, "?", KeyAction::ToggleHelp),
-        (7_u16, 2_u16, "q", KeyAction::Quit),
+        (7_u16, 2_u16, "C-x C-c", KeyAction::Quit),
     ];
     let mut hovered = [false; 4];
     for (i, (row, col, label, action)) in shortcut_rows.iter().enumerate() {
@@ -2840,8 +2840,11 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
         ]),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled("q", if hovered[3] { hover_style } else { label_style }),
-            Span::raw("        exit agentd"),
+            Span::styled(
+                "C-x C-c",
+                if hovered[3] { hover_style } else { label_style },
+            ),
+            Span::raw("  exit TUI"),
         ]),
     ];
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });

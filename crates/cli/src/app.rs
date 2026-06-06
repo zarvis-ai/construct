@@ -8576,8 +8576,16 @@ mod tests {
             "missing create shortcut:\n{screen}"
         );
         assert!(
-            screen.contains("exit agentd"),
+            screen.contains("exit TUI"),
             "missing exit shortcut:\n{screen}"
+        );
+        assert!(
+            screen.contains("C-x C-c  exit TUI"),
+            "missing quit shortcut:\n{screen}"
+        );
+        assert!(
+            !screen.contains("q        exit agentd"),
+            "empty state should not show q as the quit shortcut:\n{screen}"
         );
         assert!(
             screen.contains("new: C-x C-f  help: ?  palette: C-x x"),
