@@ -1329,6 +1329,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_triage_finding_filters_nothing() {
+        assert!(parse_triage_finding("nothing").is_none());
+        assert!(parse_triage_finding("  Nothing.  ").is_none());
+        assert!(parse_triage_finding("").is_none());
+        let f = parse_triage_finding("s123 \"dogfood\": stuck on a trust prompt").unwrap();
+        assert!(f.contains("ambient fleet monitor flagged"), "{f}");
+        assert!(f.contains("dogfood") && f.contains("trust prompt"), "{f}");
+    }
+
+    #[test]
     fn truncate_keep_tail_keeps_recent_drops_older() {
         assert_eq!(truncate_keep_tail("short", 100), "short");
         let long = "0123456789".repeat(20); // 200 bytes
@@ -2061,6 +2071,15 @@ pub async fn run(
     // prior-tick session states (for the per-tick delta).
     let self_id_for_ambient = session_id.clone();
     let mut prev_fleet: HashMap<String, agentd_protocol::SessionState> = HashMap::new();
+    // Ambient monitor model: the fleet scan + triage runs as a one-shot
+    // completion off the operator's own conversation, so the bulky snapshot /
+    // previews never accumulate in the operator's context and only escalations
+    // reach it. Configure a cheaper model via AGENTD_OPERATOR_MONITOR_MODEL;
+    // otherwise it falls back to the operator's own model.
+    let monitor_model = std::env::var("AGENTD_OPERATOR_MONITOR_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|spec| crate::agent::resolve_model_from_spec(&spec).ok());
 
     'outer: loop {
         // Wait for a user message — drain order: startup prompt
@@ -2113,7 +2132,19 @@ pub async fn run(
                     text
                 }
                 ReadOutcome::AmbientTick => {
-                    build_ambient_observation(&self_id_for_ambient, &mut prev_fleet).await
+                    // Offload the fleet scan + triage to a cheap one-shot
+                    // monitor. Only a real finding becomes an operator turn;
+                    // quiet ticks never touch the operator's context.
+                    let scan =
+                        build_ambient_observation(&self_id_for_ambient, &mut prev_fleet).await;
+                    let (mp, mm): (&dyn provider::LlmProvider, &str) = match &monitor_model {
+                        Some(r) => (r.provider.as_ref(), r.model.as_str()),
+                        None => (provider.as_ref(), model.as_str()),
+                    };
+                    match run_ambient_triage(&scan, mp, mm).await {
+                        Some(finding) => finding,
+                        None => continue 'outer,
+                    }
                 }
                 ReadOutcome::BackgroundCompletion(bc) => {
                     // Emit the real ToolResult so the transcript +
@@ -3116,6 +3147,67 @@ async fn build_ambient_observation(
     out
 }
 
+/// System prompt for the one-shot ambient fleet-monitor triage. It judges the
+/// snapshot + previews and returns only what's worth the operator's attention.
+const AMBIENT_MONITOR_SYSTEM: &str = "You are an ambient fleet monitor for an operator agent. \
+You are given a current fleet snapshot plus recent-activity previews of notable sessions. \
+Identify ONLY things genuinely worth the operator's attention: a session that looks stuck or \
+blocked (e.g. waiting on a prompt like 'trust this folder?'), errored, finished with notable \
+output, or a clear opportunity to reduce user effort. Be conservative — routine activity and \
+normal idleness are NOT notable, and you have no broader context about what the user is doing. \
+If anything qualifies, reply with at most 3 one-line findings, each: '<session id> \"<title>\": \
+<what + why, with a short evidence snippet>'. If nothing qualifies, reply with exactly the single \
+word: nothing";
+
+/// Null sink for one-shot completions where we only want the final text.
+struct DiscardSink;
+impl TextSink for DiscardSink {
+    fn delta(&mut self, _text: &str) {}
+}
+
+/// Run the ambient monitor: a one-shot completion (cheap model when configured)
+/// that triages the scan off the operator's context. Returns a compact
+/// operator-facing observation when there's a finding, or `None` to skip the
+/// operator turn entirely.
+async fn run_ambient_triage(
+    scan: &str,
+    provider: &dyn provider::LlmProvider,
+    model: &str,
+) -> Option<String> {
+    let messages = vec![Message {
+        role: Role::User,
+        content: Content::Text {
+            text: scan.to_string(),
+        },
+    }];
+    let mut sink = DiscardSink;
+    let turn = crate::provider_watchdog::complete(
+        provider,
+        model,
+        AMBIENT_MONITOR_SYSTEM,
+        &messages,
+        &[],
+        &mut sink,
+    )
+    .await
+    .ok()?;
+    parse_triage_finding(turn.text.as_deref().unwrap_or(""))
+}
+
+/// Turn the monitor's raw reply into an operator-facing observation, or `None`
+/// when it found nothing worth surfacing.
+fn parse_triage_finding(reply: &str) -> Option<String> {
+    let t = reply.trim().trim_end_matches('.');
+    if t.is_empty() || t.eq_ignore_ascii_case("nothing") {
+        return None;
+    }
+    Some(format!(
+        "OBSERVATION: ambient fleet monitor flagged the following. Decide whether to surface it to \
+         the user or update an Operator widget; reply exactly `noted` if it's not worth it.\n{}",
+        reply.trim()
+    ))
+}
+
 /// Compact, ANSI-free preview of a session's recent activity, byte-bounded
 /// (older part truncated past `max_bytes`). Prefers the rendered PTY screen —
 /// it works for PTY-heavy claude/codex sessions whose transcript tail is all
@@ -3318,17 +3410,16 @@ fn compute_ambient_snapshot(
         c.join("; ")
     };
 
+    // Data-only fleet snapshot — this feeds the one-shot monitor triage, which
+    // owns the judgment instructions (see AMBIENT_MONITOR_SYSTEM).
     let summary = format!(
-        "OBSERVATION: ambient operator loop tick.\n\
+        "Fleet snapshot.\n\
          Fleet now: {running} running ({idle} idle ≥{IDLE_RUNNING_MINS}m), {awaiting} awaiting_input, {errored} errored.\n\
          Changes since last tick: {changes_line}.\n\
          Needs attention: {}.\n\
-         A 'running but quiet' session is likely waiting for the user or stuck — interactive \
-         claude/codex sessions don't signal awaiting_input, so judge them by the previews.\n\
-         Recent-activity previews follow, each headed by its full session id. Call \
-         agentd_get_transcript / agentd_get_output / agentd_get_diff on a session id (or \
-         agentd_list_sessions) to inspect deeper. Surface one short sentence or update an Operator \
-         widget if useful, otherwise reply exactly `noted`.",
+         Note: a 'running but quiet' session is likely waiting for the user or stuck — interactive \
+         claude/codex sessions don't signal awaiting_input, so judge them by the previews below.\n\
+         Recent-activity previews of notable sessions follow, each headed by its full session id.",
         cap_lines(&attention, 6),
     );
 
