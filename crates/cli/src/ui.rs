@@ -249,6 +249,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_pin_diamond_tooltip(f, app, &pinned_ids);
     render_view_close_tooltip(f, app);
     render_browser_preview_close_tooltip(f, app);
+    render_dynamic_ui_widget_title_tooltip(f, app);
     render_list_title_button_tooltips(f, app);
     render_view_uncollapse_tooltip(f, app);
     render_harness_unavailable_tooltip(f, app);
@@ -589,6 +590,35 @@ fn render_button_tooltip(f: &mut Frame, theme: &Theme, label: &str, anchor_x: u1
     f.render_widget(p, rect);
 }
 
+fn render_dynamic_ui_widget_title_tooltip(f: &mut Frame, app: &App) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    let Some(hit) = app
+        .layout
+        .dynamic_ui_widget_hits
+        .iter()
+        .find(|hit| hit.contains(mx, my))
+    else {
+        return;
+    };
+    let Some(panel) = app
+        .ui_panels
+        .get(&hit.session_id)
+        .and_then(|panels| panels.get(&hit.panel_id))
+    else {
+        return;
+    };
+    let title = dynamic_ui_panel_title(panel).unwrap_or_else(|| panel.id.clone());
+    render_button_tooltip(
+        f,
+        &app.theme,
+        &format!(" {title} "),
+        hit.start_col,
+        hit.row.saturating_add(2),
+    );
+}
+
 fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
     let Some(list) = app.layout.list_area else {
         return;
@@ -603,7 +633,7 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
                 &app.theme,
                 &format!(" operator {} ", matrix_operator_status(app)),
                 xs,
-                y,
+                y.saturating_add(2),
             );
             return;
         }
@@ -616,7 +646,13 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
     {
         let crate::app::MatrixWidgetHitKind::Select { panel_id } = &hit.kind;
         if let Some(title) = matrix_widget_title(app, panel_id) {
-            render_button_tooltip(f, &app.theme, &format!(" {title} "), hit.start_col, hit.row);
+            render_button_tooltip(
+                f,
+                &app.theme,
+                &format!(" {title} "),
+                hit.start_col,
+                hit.row.saturating_add(2),
+            );
             return;
         }
     }
@@ -640,7 +676,7 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
         if let Some(rain) = app.layout.matrix_rain_area {
             if let Some((xs, xe, y)) = matrix_rain_close_button_range(rain) {
                 if my == y && mx >= xs && mx < xe {
-                    render_button_tooltip(f, &app.theme, " Hide Operator ", xs, y);
+                    render_button_tooltip(f, &app.theme, " Hide Operator ", xs, y.saturating_add(2));
                 }
             }
         }
@@ -693,6 +729,73 @@ pub fn dynamic_ui_trigger_range(
         .saturating_sub(if close_shown { 4 } else { 1 })
         .saturating_sub(reserved_right_width);
     (right.saturating_sub(label_width), right, view_area.y)
+}
+
+fn session_sticky_widget_panels(app: &App, session_id: &str) -> Vec<agentd_protocol::UiPanel> {
+    let Some(panels) = app.ui_panels.get(session_id) else {
+        return Vec::new();
+    };
+    let mut panels: Vec<_> = panels
+        .values()
+        .filter(|panel| panel.placement != agentd_protocol::UiPlacement::Inline)
+        .cloned()
+        .collect();
+    panels.sort_by(|a, b| {
+        a.created_at_ms
+            .cmp(&b.created_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    panels
+}
+
+fn render_session_widget_title(
+    app: &mut App,
+    view_area: Rect,
+    session_id: String,
+    panels: Vec<agentd_protocol::UiPanel>,
+    close_shown: bool,
+    reserved_right_width: u16,
+    focused: bool,
+) -> Line<'static> {
+    let label_width = 2u16.saturating_add((panels.len() as u16).saturating_mul(2));
+    let (x_start, _x_end, y) =
+        dynamic_ui_trigger_range(view_area, close_shown, label_width, reserved_right_width);
+    let mut spans = vec![Span::styled("─ ", pane_border_style(&app.theme, focused))];
+    // Ratatui right-aligned block titles paint one cell left of the simple
+    // `right - width` geometry used for layout reservation; mirror that for
+    // hit-testing so hover/click lands on the visible square, not one cell over.
+    let mut icon_x = x_start.saturating_add(1);
+    for panel in panels {
+        let filled = app.dynamic_ui_panel_visible(&session_id, &panel.id);
+        let hovered = app
+            .mouse_pos
+            .is_some_and(|(mx, my)| my == y && mx >= icon_x && mx < icon_x.saturating_add(1));
+        let glyph = if filled { "■" } else { "□" };
+        let style = if filled {
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if hovered {
+            Style::default()
+                .fg(app.theme.matrix_flash_good)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.dim)
+        };
+        app.layout
+            .dynamic_ui_widget_hits
+            .push(crate::app::DynamicUiWidgetHit {
+                session_id: session_id.clone(),
+                panel_id: panel.id.clone(),
+                row: y,
+                start_col: icon_x,
+                end_col: icon_x.saturating_add(1),
+            });
+        spans.push(Span::styled(glyph, style));
+        spans.push(Span::raw(" "));
+        icon_x = icon_x.saturating_add(2);
+    }
+    Line::from(spans).alignment(ratatui::layout::Alignment::Right)
 }
 
 fn hovered_view_close_button(app: &App, view_area: Rect) -> bool {
@@ -1843,10 +1946,17 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
             break;
         }
         let filled = viewport_visible && selected_id.as_deref() == Some(panel.id.as_str());
+        let hovered = app
+            .mouse_pos
+            .is_some_and(|(mx, my)| my == area.y && mx >= icon_x && mx < icon_x.saturating_add(1));
         let glyph = if filled { "■" } else { "□" };
         let style = if filled {
             Style::default()
                 .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else if hovered {
+            Style::default()
+                .fg(app.theme.matrix_flash_good)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(app.theme.dim)
@@ -2511,39 +2621,19 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .alignment(ratatui::layout::Alignment::Right)
     });
     let show_close = summary.is_some();
-    let ui_session_id = summary.as_ref().and_then(|s| {
-        app.ui_panels
-            .get(&s.id)
-            .filter(|panels| !panels.is_empty())
-            .map(|_| s.id.clone())
-    });
-    let ui_trigger_label = " widgets ".to_string();
-    let ui_trigger_width = ui_trigger_label.width() as u16;
-    let ui_trigger_hovered = ui_session_id.as_ref().is_some_and(|_| {
-        let (x_start, x_end, y) =
-            dynamic_ui_trigger_range(area, show_close, ui_trigger_width, harness_width);
-        app.mouse_pos
-            .map(|(mx, my)| my == y && mx >= x_start && mx < x_end)
-            .unwrap_or(false)
-    });
-    let ui_trigger_style = if ui_trigger_hovered {
-        Style::default()
-            .fg(app.theme.matrix_flash_good)
-            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
-    } else {
-        Style::default().fg(app.theme.text)
-    };
-    let ui_trigger = ui_session_id.as_ref().map(|session_id| {
-        let (x_start, x_end, y) =
-            dynamic_ui_trigger_range(area, show_close, ui_trigger_width, harness_width);
-        (
-            session_id.clone(),
-            x_start,
-            x_end,
-            y,
-            Line::from(Span::styled(ui_trigger_label.clone(), ui_trigger_style))
-                .alignment(ratatui::layout::Alignment::Right),
-        )
+    let widget_title = summary.as_ref().and_then(|s| {
+        let panels = session_sticky_widget_panels(app, &s.id);
+        (!panels.is_empty()).then(|| {
+            render_session_widget_title(
+                app,
+                area,
+                s.id.clone(),
+                panels,
+                show_close,
+                harness_width,
+                focused,
+            )
+        })
     });
     // Right-aligned close button on the top border. Hover is
     // hit-tested against `app.mouse_pos` so the glyph bolds when the
@@ -2566,15 +2656,11 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .border_style(pane_border_style(&app.theme, focused))
         .title(title);
     // Order matters: ratatui stacks right-aligned titles left-to-right
-    // in the order they're added. Add the harness FIRST so it sits
-    // to the left, then the close button SECOND so it lands at the
+    // in the order they're added. Add widget indicators FIRST so they sit
+    // left of the harness, then the close button LAST so it lands at the
     // rightmost edge (matching `view_close_button_range`, which
     // hit-tests the last 3 cells of the top border).
-    if let Some((session_id, x_start, x_end, y, ui)) = ui_trigger {
-        app.layout.dynamic_ui_trigger = Some((x_start, x_end, y, session_id.clone()));
-        app.layout
-            .dynamic_ui_triggers
-            .push((x_start, x_end, y, session_id));
+    if let Some(ui) = widget_title {
         block = block.title(ui);
     }
     if let Some(h) = harness_right {

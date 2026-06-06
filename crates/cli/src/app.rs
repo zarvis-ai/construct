@@ -4321,6 +4321,22 @@ impl App {
             open_url(&hit.url);
             return true;
         }
+        if let Some(hit) = self
+            .layout
+            .dynamic_ui_widget_hits
+            .iter()
+            .find(|hit| hit.contains(col, row))
+            .cloned()
+        {
+            let key = (hit.session_id, hit.panel_id);
+            if self.dynamic_ui_selected.contains(&key) {
+                self.dynamic_ui_selected.remove(&key);
+            } else {
+                self.dynamic_ui_selected.insert(key.clone());
+                self.dynamic_ui_temporary_until.remove(&key);
+            }
+            return true;
+        }
         for (x_start, x_end, y, session_id) in self.layout.dynamic_ui_triggers.clone() {
             if row == y && col >= x_start && col < x_end {
                 self.dynamic_ui_popover_open =
@@ -4333,22 +4349,6 @@ impl App {
             }
         }
         if self.dynamic_ui_popover_open.is_some() {
-            if let Some(hit) = self
-                .layout
-                .dynamic_ui_widget_hits
-                .iter()
-                .find(|hit| hit.contains(col, row))
-                .cloned()
-            {
-                let key = (hit.session_id, hit.panel_id);
-                if self.dynamic_ui_selected.contains(&key) {
-                    self.dynamic_ui_selected.remove(&key);
-                } else {
-                    self.dynamic_ui_selected.insert(key.clone());
-                    self.dynamic_ui_temporary_until.remove(&key);
-                }
-                return true;
-            }
             if let Some(dropdown) = self.layout.dynamic_ui_dropdown_area {
                 if contains(dropdown, col, row) {
                     return true;
@@ -8839,6 +8839,59 @@ mod tests {
             !text.contains("2/3"),
             "widget viewport title should not include widget count"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_widgets_render_as_title_bar_indicators_by_creation_time() {
+        use agentd_protocol::{UiPanel, UiPlacement};
+
+        let (mut app, _dir, server) = captured_app().await;
+        app.dynamic_ui_selected
+            .insert(("s1".into(), "newer".into()));
+        app.ui_panels.insert(
+            "s1".into(),
+            HashMap::from([
+                (
+                    "newer".into(),
+                    UiPanel {
+                        id: "newer".into(),
+                        source: Some("newer.md".into()),
+                        title: Some("Newer".into()),
+                        created_at_ms: 20,
+                        placement: UiPlacement::Sticky,
+                        markdown: "# Newer".into(),
+                    },
+                ),
+                (
+                    "older".into(),
+                    UiPanel {
+                        id: "older".into(),
+                        source: Some("older.md".into()),
+                        title: Some("Older".into()),
+                        created_at_ms: 10,
+                        placement: UiPlacement::Sticky,
+                        markdown: "# Older".into(),
+                    },
+                ),
+            ]),
+        );
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("session widget title indicators should render");
+
+        let hit_ids: Vec<_> = app
+            .layout
+            .dynamic_ui_widget_hits
+            .iter()
+            .map(|hit| hit.panel_id.as_str())
+            .collect();
+        assert_eq!(hit_ids, vec!["older", "newer"]);
+        let text = rendered_text(term.backend().buffer());
+        assert!(text.contains("□"));
+        assert!(text.contains("■"));
         server.abort();
     }
 
