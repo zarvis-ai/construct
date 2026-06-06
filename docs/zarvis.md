@@ -1,7 +1,7 @@
 # zarvis built-in agent
 
 `zarvis` is the built-in agent that ships with agentd. It talks to OpenAI,
-Anthropic, or a local Ollama directly and runs its own agent loop with shell +
+Anthropic, Google Gemini, or a local Ollama directly and runs its own agent loop with shell +
 filesystem + agentd-control tools. No external CLI install required. Many PRs
 for the agentd repository have already been made from Zarvis sessions running
 inside agentd.
@@ -12,6 +12,7 @@ inside agentd.
 # Pick a provider — only one of these needs to be set:
 export ANTHROPIC_API_KEY=sk-ant-...
 # or  export OPENAI_API_KEY=sk-...
+# or  export GEMINI_API_KEY=...        # (or GOOGLE_API_KEY)
 # or  run a local ollama (default http://localhost:11434)
 
 agent new zarvis "list the rust files in this repo and summarize what each crate does"
@@ -24,15 +25,17 @@ The spec is one of:
 
 - `openai:<name>` — e.g. `openai:gpt-5-mini`
 - `anthropic:<name>` — e.g. `anthropic:claude-haiku-4-5`
+- `gemini:<name>` — e.g. `gemini:gemini-2.5-pro`
 - `ollama:<name>` — e.g. `ollama:llama3.1`
 
 Bare names auto-detect: `gpt-*` / `o[1-5]*` → OpenAI, `claude-*` →
-Anthropic, anything else → Ollama. When in doubt, use the explicit
-prefix.
+Anthropic, `gemini-*` → Gemini, anything else → Ollama. When in doubt,
+use the explicit prefix.
 
 If you don't pass a model and `AGENTD_ZARVIS_MODEL` isn't set, zarvis
-picks: `ANTHROPIC_API_KEY` → `claude-haiku-4-5`, else `OPENAI_API_KEY`
-→ `gpt-5-mini`, else `ollama:llama3.1`. The initial Status event
+picks: `ANTHROPIC_API_KEY` → `claude-opus-4-8`, else `OPENAI_API_KEY`
+→ `gpt-5`, else `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) →
+`gemini-2.5-pro`, else `ollama:llama3.1`. The initial Status event
 records the chosen `provider:model` so you can verify.
 
 ### Tools
@@ -89,5 +92,9 @@ two most-recent.
 - `AGENTD_ZARVIS_AUTOMODE=1` — start with automode on.
 - `AGENTD_ZARVIS_MODEL=<spec>` — default model when `--model` is
   omitted.
-- `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `OLLAMA_HOST` — point at
-  alternate endpoints (OpenAI-compatible vendors, self-hosted, etc.).
+- `GEMINI_API_KEY` / `GOOGLE_API_KEY` — Gemini credentials (either is
+  accepted).
+- `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `GEMINI_BASE_URL` /
+  `OLLAMA_HOST` — point at alternate endpoints. Pointing `OPENAI_BASE_URL`
+  at an OpenAI-compatible vendor (OpenRouter, DeepSeek, Groq, xAI,
+  Mistral, …) reuses the `openai:` path with no extra config.
