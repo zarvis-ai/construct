@@ -9,6 +9,7 @@ use serde_json::Value;
 
 pub mod anthropic;
 pub mod codex_oauth;
+pub mod gemini;
 pub mod ollama;
 pub mod openai;
 pub mod routing;

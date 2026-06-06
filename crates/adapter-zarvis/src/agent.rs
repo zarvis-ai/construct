@@ -1362,6 +1362,7 @@ impl ResolvedModel {
         match self.kind {
             provider::routing::Provider::OpenAI => "openai",
             provider::routing::Provider::Anthropic => "anthropic",
+            provider::routing::Provider::Gemini => "gemini",
             provider::routing::Provider::Ollama => "ollama",
             provider::routing::Provider::CodexOauth => "codex-oauth",
         }
@@ -1374,7 +1375,8 @@ impl ResolvedModel {
 ///   2. `AGENTD_ZARVIS_MODEL`.
 ///   3. ANTHROPIC_API_KEY set → `claude-opus-4-8`.
 ///   4. OPENAI_API_KEY set → `gpt-5`.
-///   5. fall through to Ollama with `llama3.1`.
+///   5. GEMINI_API_KEY (or GOOGLE_API_KEY) set → `gemini-2.5-pro`.
+///   6. fall through to Ollama with `llama3.1`.
 pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
     let spec_str = params
         .model
@@ -1386,6 +1388,10 @@ pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
                 "anthropic:claude-opus-4-8".to_string()
             } else if std::env::var("OPENAI_API_KEY").is_ok() {
                 "openai:gpt-5".to_string()
+            } else if std::env::var("GEMINI_API_KEY").is_ok()
+                || std::env::var("GOOGLE_API_KEY").is_ok()
+            {
+                "gemini:gemini-2.5-pro".to_string()
             } else {
                 "ollama:llama3.1".to_string()
             }
@@ -1404,6 +1410,7 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
         provider::routing::Provider::Anthropic => {
             Box::new(provider::anthropic::Anthropic::from_env()?)
         }
+        provider::routing::Provider::Gemini => Box::new(provider::gemini::Gemini::from_env()?),
         provider::routing::Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
         provider::routing::Provider::CodexOauth => {
             Box::new(provider::codex_oauth::CodexOauth::from_env()?)

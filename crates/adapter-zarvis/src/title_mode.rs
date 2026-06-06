@@ -42,6 +42,9 @@ fn pick_default_spec_str() -> String {
     if std::env::var("OPENAI_API_KEY").is_ok() {
         return "openai:gpt-5-mini".to_string();
     }
+    if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok() {
+        return "gemini:gemini-2.5-flash".to_string();
+    }
     "ollama:llama3.1".to_string()
 }
 
@@ -49,6 +52,7 @@ fn provider_for(p: Provider) -> Result<Box<dyn LlmProvider>> {
     Ok(match p {
         Provider::OpenAI => Box::new(provider::openai::OpenAi::from_env()?),
         Provider::Anthropic => Box::new(provider::anthropic::Anthropic::from_env()?),
+        Provider::Gemini => Box::new(provider::gemini::Gemini::from_env()?),
         Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
         // Title generation always uses one of the trio above; the
         // user never picks `codex-oauth:` for title-gen since the

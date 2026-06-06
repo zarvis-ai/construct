@@ -1,9 +1,10 @@
 //! Translate a model spec string into a (provider, bare model name).
 //!
-//! Explicit prefixes (`openai:`, `anthropic:`, `ollama:`, `codex-oauth:`)
-//! always win. Otherwise we sniff the bare name:
+//! Explicit prefixes (`openai:`, `anthropic:`, `gemini:`, `ollama:`,
+//! `codex-oauth:`) always win. Otherwise we sniff the bare name:
 //!   - starts with `gpt-` or `o[1-5]` → OpenAI
 //!   - starts with `claude-` → Anthropic
+//!   - starts with `gemini-` → Gemini
 //!   - anything else → Ollama (local fallback)
 //!
 //! Returning an enum keeps the dispatch table small and testable.
@@ -18,6 +19,7 @@
 pub enum Provider {
     OpenAI,
     Anthropic,
+    Gemini,
     Ollama,
     /// OAuth-backed Codex backend; reads `~/.codex/auth.json`, bills
     /// against the user's ChatGPT subscription.
@@ -47,6 +49,12 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
             model: rest.to_string(),
         });
     }
+    if let Some(rest) = s.strip_prefix("gemini:") {
+        return Ok(ModelSpec {
+            provider: Provider::Gemini,
+            model: rest.to_string(),
+        });
+    }
     if let Some(rest) = s.strip_prefix("ollama:") {
         return Ok(ModelSpec {
             provider: Provider::Ollama,
@@ -62,7 +70,10 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
     if let Some(prefix) = s.split(':').next() {
         // Reject unknown explicit prefixes so typos don't silently fall through.
         if s.contains(':')
-            && !matches!(prefix, "openai" | "anthropic" | "ollama" | "codex-oauth")
+            && !matches!(
+                prefix,
+                "openai" | "anthropic" | "gemini" | "ollama" | "codex-oauth"
+            )
         {
             return Err(format!(
                 "unknown provider prefix `{prefix}:` (expected one of \
@@ -74,6 +85,8 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
         Provider::OpenAI
     } else if s.starts_with("claude-") {
         Provider::Anthropic
+    } else if s.starts_with("gemini-") {
+        Provider::Gemini
     } else {
         Provider::Ollama
     };
@@ -127,6 +140,20 @@ mod tests {
     fn claude_haiku_is_anthropic() {
         assert_eq!(parse("claude-haiku-4-5").provider, Provider::Anthropic);
         assert_eq!(parse("claude-haiku-4-5").model, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn gemini_bare_and_prefixed_route_to_gemini() {
+        assert_eq!(parse("gemini-2.5-pro").provider, Provider::Gemini);
+        assert_eq!(parse("gemini-2.5-pro").model, "gemini-2.5-pro");
+
+        let s = parse("gemini:gemini-2.5-flash");
+        assert_eq!(s.provider, Provider::Gemini);
+        assert_eq!(s.model, "gemini-2.5-flash");
+
+        // `gemma` (Google's open weights) is not the Gemini API — it stays a
+        // bare-name Ollama fallback.
+        assert_eq!(parse("gemma2").provider, Provider::Ollama);
     }
 
     #[test]
