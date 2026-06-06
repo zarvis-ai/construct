@@ -1329,6 +1329,30 @@ mod tests {
     }
 
     #[test]
+    fn default_monitor_spec_picks_cheap_same_provider_tier() {
+        // Frontier operator models → a cheaper same-provider model.
+        assert_eq!(
+            default_monitor_spec("codex-oauth", "gpt-5.5").as_deref(),
+            Some("codex-oauth:gpt-5.4-mini")
+        );
+        assert_eq!(
+            default_monitor_spec("openai", "gpt-5.5").as_deref(),
+            Some("openai:gpt-5-mini")
+        );
+        assert_eq!(
+            default_monitor_spec("anthropic", "claude-opus-4-8").as_deref(),
+            Some("anthropic:claude-sonnet-4-5")
+        );
+        // Already-small operator models → keep them (no downgrade).
+        assert_eq!(default_monitor_spec("openai", "gpt-5-mini"), None);
+        assert_eq!(default_monitor_spec("anthropic", "claude-haiku-4-5"), None);
+        assert_eq!(default_monitor_spec("anthropic", "claude-sonnet-4-5"), None);
+        // No confident cheap default → keep the operator's model.
+        assert_eq!(default_monitor_spec("ollama", "llama3"), None);
+        assert_eq!(default_monitor_spec("gemini", "gemini-pro"), None);
+    }
+
+    #[test]
     fn parse_triage_finding_filters_nothing() {
         assert!(parse_triage_finding("nothing").is_none());
         assert!(parse_triage_finding("  Nothing.  ").is_none());
@@ -2076,10 +2100,35 @@ pub async fn run(
     // previews never accumulate in the operator's context and only escalations
     // reach it. Configure a cheaper model via AGENTD_OPERATOR_MONITOR_MODEL;
     // otherwise it falls back to the operator's own model.
-    let monitor_model = std::env::var("AGENTD_OPERATOR_MONITOR_MODEL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|spec| crate::agent::resolve_model_from_spec(&spec).ok());
+    // Resolve the monitor model (orchestrator-only — that's the only session
+    // that ambient-ticks). The explicit override wins; otherwise default to a
+    // cheaper same-provider tier (e.g. mini / sonnet) so the per-tick triage
+    // doesn't run on the operator's frontier model. A startup health-check
+    // falls back to the operator's own model when the chosen model can't be
+    // resolved or doesn't actually answer.
+    let monitor_model = if is_orchestrator {
+        let candidate = std::env::var("AGENTD_OPERATOR_MONITOR_MODEL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| default_monitor_spec(provider_name, &model))
+            .and_then(|spec| crate::agent::resolve_model_from_spec(&spec).ok());
+        match candidate {
+            Some(m) if monitor_model_usable(&m).await => {
+                tracing::info!(model = %m.model, "operator ambient monitor model");
+                Some(m)
+            }
+            Some(m) => {
+                tracing::warn!(
+                    model = %m.model,
+                    "ambient monitor model unusable; falling back to operator model"
+                );
+                None
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
 
     'outer: loop {
         // Wait for a user message — drain order: startup prompt
@@ -3158,6 +3207,53 @@ normal idleness are NOT notable, and you have no broader context about what the 
 If anything qualifies, reply with at most 3 one-line findings, each: '<session id> \"<title>\": \
 <what + why, with a short evidence snippet>'. If nothing qualifies, reply with exactly the single \
 word: nothing";
+
+/// Default monitor model when `AGENTD_OPERATOR_MONITOR_MODEL` is unset: a
+/// cheaper tier on the **same provider** as the operator (so auth/keys are
+/// already present), using model names the codebase/provider is known to
+/// accept. Returns `None` — keep the operator's own model — when the operator
+/// is already on a small model, or the provider has no obvious cheap default
+/// (gemini/ollama/unknown), so we never silently pick a non-existent model.
+fn default_monitor_spec(provider_name: &str, operator_model: &str) -> Option<String> {
+    let m = operator_model.to_ascii_lowercase();
+    if m.contains("mini") || m.contains("nano") || m.contains("haiku") {
+        return None; // already a small/cheap model
+    }
+    match provider_name {
+        // ChatGPT-account Codex exposes a restricted model set; `gpt-5.4-mini`
+        // is the small tier (the `*-codex-mini` names are rejected). The
+        // startup health-check falls back if an account lacks it.
+        "codex-oauth" => Some("codex-oauth:gpt-5.4-mini".to_string()),
+        "openai" => Some("openai:gpt-5-mini".to_string()),
+        "anthropic" if !m.contains("sonnet") => Some("anthropic:claude-sonnet-4-5".to_string()),
+        // anthropic already on sonnet, or gemini/ollama/unknown → keep operator's.
+        _ => None,
+    }
+}
+
+/// One-shot liveness check for the chosen monitor model. A wrong model name
+/// resolves fine but 400s at call time, which would silently blind the monitor
+/// (every triage returns "nothing"). A tiny completion at startup lets us fall
+/// back to the operator's own model — which we know works — instead.
+async fn monitor_model_usable(m: &crate::agent::ResolvedModel) -> bool {
+    let messages = vec![Message {
+        role: Role::User,
+        content: Content::Text {
+            text: "Reply with the single word: ok".to_string(),
+        },
+    }];
+    let mut sink = DiscardSink;
+    crate::provider_watchdog::complete(
+        m.provider.as_ref(),
+        &m.model,
+        "Health check.",
+        &messages,
+        &[],
+        &mut sink,
+    )
+    .await
+    .is_ok()
+}
 
 /// Null sink for one-shot completions where we only want the final text.
 struct DiscardSink;
