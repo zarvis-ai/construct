@@ -33,12 +33,34 @@ const ADAPTER_DRAIN_CAP: usize = 256;
 /// codex/claude/antigravity sessions. 8 MiB covers ~40-80k rows of dense
 /// PTY content, well above the vt100 row budget.
 const PTY_REPLAY_CAP: usize = 8 * 1024 * 1024;
-/// Delay between session.start succeeding on respawn and the
-/// force-redraw bump+restore that nudges the child into a full
-/// SIGWINCH redraw. Long enough for the child to finish its initial
-/// startup draw, short enough that the user sees the resumed pane
-/// painted by the time they navigate to it.
-const RESPAWN_REDRAW_DELAY: Duration = Duration::from_millis(250);
+/// The post-resume force-redraw (a bump+restore SIGWINCH that nudges a
+/// non-silent-resume child into repainting) waits until the child's PTY
+/// output has *settled* rather than firing on a fixed delay. A fixed
+/// delay was too short for a slow resume — codex loading a large
+/// conversation — so the bump landed before the child had drawn anything
+/// and the pane stayed blank until the user manually resized. We poll the
+/// child's last-output timestamp every [`RESPAWN_REDRAW_POLL`] and fire
+/// the bump once output has been quiet for [`RESPAWN_REDRAW_SETTLE`] (the
+/// child finished its resume draw), or after [`RESPAWN_REDRAW_MAX_WAIT`]
+/// as a hard cap.
+const RESPAWN_REDRAW_POLL: Duration = Duration::from_millis(100);
+const RESPAWN_REDRAW_SETTLE: Duration = Duration::from_millis(400);
+const RESPAWN_REDRAW_MAX_WAIT: Duration = Duration::from_secs(6);
+
+/// Whether the post-resume force-redraw should fire now: the child has
+/// produced PTY output and then gone quiet for [`RESPAWN_REDRAW_SETTLE`],
+/// or [`RESPAWN_REDRAW_MAX_WAIT`] has elapsed (so a child that streams
+/// forever, or never draws, still gets a redraw). `last_pty_at_ms` is the
+/// child's most recent PTY-output timestamp (`None` = nothing yet).
+fn resume_redraw_ready(last_pty_at_ms: Option<i64>, now_ms: i64, elapsed: Duration) -> bool {
+    if elapsed >= RESPAWN_REDRAW_MAX_WAIT {
+        return true;
+    }
+    match last_pty_at_ms {
+        Some(t) => now_ms.saturating_sub(t) >= RESPAWN_REDRAW_SETTLE.as_millis() as i64,
+        None => false,
+    }
+}
 const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
 const ENV_GLOBAL_MEMORY_FILE: &str = "AGENTD_GLOBAL_MEMORY_FILE";
 const ENV_PROJECT_MEMORY_FILE: &str = "AGENTD_PROJECT_MEMORY_FILE";
@@ -1772,8 +1794,22 @@ impl SessionManager {
         if let Some(size) = force_redraw_size_on_resume(&info.capabilities, start_params.pty_size) {
             let manager_for_redraw = self.clone();
             let id_owned = id.to_string();
+            let entry_for_redraw = entry.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(RESPAWN_REDRAW_DELAY).await;
+                // Wait for the resumed child's PTY output to settle (it
+                // produced its resume draw and went quiet) before forcing
+                // the redraw, so the SIGWINCH lands after the child has
+                // loaded its conversation rather than on a half-drawn
+                // banner. Falls back to a hard cap if it never settles.
+                let started = tokio::time::Instant::now();
+                loop {
+                    tokio::time::sleep(RESPAWN_REDRAW_POLL).await;
+                    let last = entry_for_redraw.summary.read().await.last_pty_at_ms;
+                    if resume_redraw_ready(last, Utc::now().timestamp_millis(), started.elapsed())
+                    {
+                        break;
+                    }
+                }
                 let bumped_cols = size.cols.saturating_add(1);
                 let _ = manager_for_redraw
                     .pty_resize(&id_owned, bumped_cols, size.rows)
@@ -3549,6 +3585,27 @@ mod tests {
     fn force_redraw_skipped_without_cached_size() {
         let caps = pty_caps();
         assert_eq!(force_redraw_size_on_resume(&caps, None), None);
+    }
+
+    /// The settle gate: don't fire while the child is still drawing
+    /// (recent output) or hasn't drawn at all, but do fire once it goes
+    /// quiet, and always fire past the hard cap.
+    #[test]
+    fn resume_redraw_settle_gate() {
+        let now = 1_000_000i64;
+        let settle = RESPAWN_REDRAW_SETTLE.as_millis() as i64;
+        // Nothing drawn yet, well under the cap → wait.
+        assert!(!resume_redraw_ready(None, now, Duration::from_millis(0)));
+        // Output 50ms ago (< settle) → still drawing, wait.
+        assert!(!resume_redraw_ready(Some(now - 50), now, Duration::from_secs(1)));
+        // Quiet for exactly the settle window → fire.
+        assert!(resume_redraw_ready(Some(now - settle), now, Duration::from_secs(1)));
+        // Quiet well past settle → fire.
+        assert!(resume_redraw_ready(Some(now - 5_000), now, Duration::from_secs(1)));
+        // Never settles (recent output) but hit the hard cap → fire anyway.
+        assert!(resume_redraw_ready(Some(now), now, RESPAWN_REDRAW_MAX_WAIT));
+        // Never drew anything, but hit the hard cap → fire anyway.
+        assert!(resume_redraw_ready(None, now, RESPAWN_REDRAW_MAX_WAIT));
     }
 
     /// Headless / non-PTY adapters (anything zarvis-headless-only or
