@@ -8822,7 +8822,7 @@ mod tests {
             .expect("operator widget render should not panic");
         assert_eq!(app.layout.matrix_widget_hits.len(), 3);
         let text = rendered_text(term.backend().buffer());
-        assert!(text.contains("operator"));
+        assert!(text.contains("operator ─"));
         assert!(
             text.contains("■"),
             "selected widget indicator should be filled"
