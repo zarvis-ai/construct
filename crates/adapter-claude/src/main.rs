@@ -79,6 +79,40 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
     }
 }
 
+/// Generate a minimal Claude `--settings` file registering the AskUserQuestion
+/// chat-gate `PreToolUse` hook, and return its path. The hook shells out to
+/// `agent ask-gate`, which degrades the picker to a plain-text question only
+/// when a chat viewer is active for this session (otherwise it allows, so the
+/// native picker behaves normally for terminal viewers).
+///
+/// Returns `None` — no injection — when the `agent` binary or session data dir
+/// can't be located, or when disabled via `AGENTD_CLAUDE_ASKGATE=0`. Verified
+/// that `--settings` *merges* with the user's existing settings/hooks, so this
+/// never clobbers their setup.
+fn askgate_settings_path() -> Option<PathBuf> {
+    if std::env::var("AGENTD_CLAUDE_ASKGATE").as_deref() == Ok("0") {
+        return None;
+    }
+    let agent = agentd_protocol::paths::locate_sibling_binary("agent")?;
+    let dir = std::env::var("AGENTD_SESSION_DATA_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    let path = PathBuf::from(dir).join("agentd-askgate-settings.json");
+    let settings = serde_json::json!({
+        "hooks": {
+            "PreToolUse": [{
+                "matcher": "AskUserQuestion",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("\"{}\" ask-gate", agent.display()),
+                }],
+            }],
+        }
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&settings).ok()?).ok()?;
+    Some(path)
+}
+
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let command = agentd_protocol::adapter::resolve_command_override(
         "AGENTD_CLAUDE_CMD",
@@ -97,6 +131,12 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&ctx.session_id) {
         args.push("--mcp-config".into());
         args.push(cfg.to_string_lossy().to_string());
+    }
+    // Inject the AskUserQuestion chat-gate hook (degrades the picker to text
+    // when a chat viewer is active). Merges with the user's settings.
+    if let Some(p) = askgate_settings_path() {
+        args.push("--settings".into());
+        args.push(p.to_string_lossy().to_string());
     }
     // Translate the daemon-defined auto-approval policy into Claude's native
     // `--allowed-tools` patterns. Single policy in agentd; each adapter
@@ -317,6 +357,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&agentd_session_id) {
             child_args.push("--mcp-config".into());
             child_args.push(cfg.to_string_lossy().to_string());
+        }
+        if let Some(p) = askgate_settings_path() {
+            child_args.push("--settings".into());
+            child_args.push(p.to_string_lossy().to_string());
         }
         child_args.extend(
             agentd_protocol::adapter::policy::AutoApprovePolicy::from_env()
