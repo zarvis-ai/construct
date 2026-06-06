@@ -3575,10 +3575,13 @@ impl App {
                             let is_orchestrator = self.orchestrator_id.as_deref()
                                 == Some(payload.session_id.as_str());
                             if status.active {
-                                // New orchestrator turn — start a fresh utterance.
-                                if is_orchestrator {
-                                    self.operator_utterance.clear();
-                                }
+                                // NOTE: `active=true` fires on *every* delta (a
+                                // per-token "Working" heartbeat), not just at
+                                // turn start — so we must NOT clear the utterance
+                                // here, or only the final delta would survive
+                                // (e.g. "noted" → "ed"). The accumulator is
+                                // cleared at turn end (finalize, below), so each
+                                // turn already starts clean.
                                 self.agent_statuses
                                     .insert(payload.session_id.clone(), status.clone());
                             } else {
@@ -8539,8 +8542,9 @@ mod tests {
             .expect("draw");
         assert!(showing, "monolog should be showing mid-cycle");
         let screen = rendered_text(terminal.backend().buffer());
-        assert!(screen.contains("operator"), "missing prompt:\n{screen}");
         assert!(screen.contains("session"), "missing typed text:\n{screen}");
+        // No "operator ▸" label — the matrix panel title already says "operator".
+        assert!(!screen.contains("▸"), "label should be gone:\n{screen}");
 
         // Far past type+hold+fade: clears itself and yields the rain.
         app.operator_monolog = Some(OperatorMonolog {
@@ -8552,6 +8556,78 @@ mod tests {
             .expect("draw");
         assert!(!showing, "monolog should have expired");
         assert!(app.operator_monolog.is_none(), "expired monolog not cleared");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn operator_monolog_accumulates_across_delta_heartbeats() {
+        // `AgentStatus active=true` fires on every delta (a per-token "Working"
+        // heartbeat), so the utterance must accumulate across them, not reset —
+        // otherwise only the final delta survives ("noted" → "ed").
+        let (mut app, _dir, server) = empty_app().await;
+        app.orchestrator_id = Some("op".into());
+
+        async fn feed(app: &mut App, event: SessionEvent, seq: u64) {
+            let n = Notification {
+                jsonrpc: "2.0".into(),
+                method: agentd_protocol::ipc_notif::EVENT.into(),
+                params: Some(
+                    serde_json::to_value(EventNotificationPayload {
+                        session_id: "op".into(),
+                        at: chrono::Utc::now(),
+                        event,
+                        seq,
+                    })
+                    .unwrap(),
+                ),
+            };
+            app.on_notification(n).await;
+        }
+        fn working() -> SessionEvent {
+            SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
+                active: true,
+                started_at_ms: 1,
+                status: "Working".into(),
+            })
+        }
+        fn worked() -> SessionEvent {
+            SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
+                active: false,
+                started_at_ms: 1,
+                status: "Worked".into(),
+            })
+        }
+        fn say(t: &str) -> SessionEvent {
+            SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: t.into(),
+            }
+        }
+
+        // "noted" as two deltas, each preceded by a heartbeat → full "noted"
+        // accumulates → filtered → no monolog (NOT the bare tail "ed").
+        feed(&mut app, working(), 1).await;
+        feed(&mut app, say("not"), 2).await;
+        feed(&mut app, working(), 3).await;
+        feed(&mut app, say("ed"), 4).await;
+        feed(&mut app, worked(), 5).await;
+        assert!(
+            app.operator_monolog.is_none(),
+            "noted must be filtered, got {:?}",
+            app.operator_monolog.as_ref().map(|m| &m.text)
+        );
+
+        // A real finding across deltas → monolog gets the FULL text, not a tail.
+        feed(&mut app, working(), 6).await;
+        feed(&mut app, say("session "), 7).await;
+        feed(&mut app, working(), 8).await;
+        feed(&mut app, say("blocked"), 9).await;
+        feed(&mut app, worked(), 10).await;
+        assert_eq!(
+            app.operator_monolog.as_ref().map(|m| m.text.as_str()),
+            Some("session blocked")
+        );
 
         server.abort();
     }

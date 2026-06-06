@@ -1704,20 +1704,16 @@ pub(crate) fn render_operator_monolog(
     } else {
         app.theme.matrix_glow
     });
-    let prompt_style = Style::default()
-        .fg(app.theme.matrix_dim)
-        .add_modifier(Modifier::BOLD);
     let inner = Rect {
         x: area.x + 2,
         y: area.y + 1,
         width: area.width.saturating_sub(4),
         height: area.height.saturating_sub(2),
     };
-    let lines = vec![
-        Line::from(Span::styled("operator ▸", prompt_style)),
-        Line::from(Span::styled(body, text_style)),
-    ];
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    f.render_widget(
+        Paragraph::new(Span::styled(body, text_style)).wrap(Wrap { trim: false }),
+        inner,
+    );
     true
 }
 
