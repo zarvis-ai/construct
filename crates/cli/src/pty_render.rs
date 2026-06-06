@@ -1249,8 +1249,13 @@ impl ItemHistory {
                 return None;
             }
             match self.items.get(c.processed_count) {
-                Some(Item::PtyChunk(bytes)) if bytes.len() == c.pending_consumed => {
-                    Some((c.processed_count, c.pending_visible_lines, c.pending_end_col))
+                Some(Item::PtyChunk(bytes)) if bytes.len() >= c.pending_consumed => {
+                    Some((
+                        c.processed_count,
+                        c.pending_consumed,
+                        c.pending_visible_lines,
+                        c.pending_end_col,
+                    ))
                 }
                 _ => None,
             }
@@ -1331,7 +1336,7 @@ impl ItemHistory {
         // `count_visible_lines` / `synth_block` every frame. That
         // O(history)-per-frame re-scan was the zarvis typing lag.
         let start_processing_at = flushed_pending_layout
-            .map(|(idx, _, _)| idx + 1)
+            .map(|(idx, _, _, _)| idx + 1)
             .unwrap_or_else(|| rebuild_from.unwrap_or(cache.processed_count));
         let reuse_upto = cache.item_layouts.len().min(self.items.len());
         let mut cursor_col = cache
@@ -1344,16 +1349,28 @@ impl ItemHistory {
                 Item::PtyChunk(b) => {
                     let uses_flushed_pending_layout = matches!(
                         flushed_pending_layout,
-                        Some((flushed_idx, _, _)) if idx == flushed_idx
+                        Some((flushed_idx, _, _, _)) if idx == flushed_idx
                     );
                     if uses_flushed_pending_layout {
-                        let (_, flushed_lines, flushed_end_col) =
+                        let (_, consumed, flushed_lines, flushed_end_col) =
                             flushed_pending_layout.expect("checked above");
-                        cursor_col = flushed_end_col;
-                        ItemLayout {
-                            lines: flushed_lines,
-                            end_col: flushed_end_col,
-                            blocks: Vec::new(),
+                        if consumed < b.len() {
+                            let suffix = &b[consumed..];
+                            cache.parser.process(suffix);
+                            let metrics = visible_metrics_from_col(suffix, cols, flushed_end_col);
+                            cursor_col = metrics.end_col;
+                            ItemLayout {
+                                lines: flushed_lines + metrics.lines,
+                                end_col: metrics.end_col,
+                                blocks: Vec::new(),
+                            }
+                        } else {
+                            cursor_col = flushed_end_col;
+                            ItemLayout {
+                                lines: flushed_lines,
+                                end_col: flushed_end_col,
+                                blocks: Vec::new(),
+                            }
                         }
                     } else if idx >= start_processing_at {
                         cache.parser.process(b);
@@ -3679,6 +3696,56 @@ mod tests {
         assert!(
             tool_start_us < 80_000,
             "tool start replay too slow after pending flush: {tool_start_us} µs"
+        );
+    }
+
+    #[test]
+    fn zarvis_tool_start_reuses_partially_rendered_pending_text() {
+        use std::time::Instant;
+        let mut h = ItemHistory::new();
+        let cols = 100u16;
+        let rows = 30u16;
+
+        for i in 0..1_200u32 {
+            let mut chat = Vec::with_capacity(900);
+            for j in 0..8 {
+                chat.extend_from_slice(
+                    format!("\x1b[33mhistory {i}.{j} before partial pending\x1b[0m\r\n")
+                        .as_bytes(),
+                );
+            }
+            h.feed_pty(&chat);
+            let call = format!("c{i}");
+            h.feed_task_start(call.clone(), "shell".into(), format!("cmd {i}"));
+            h.feed_tool_result(&call, true, "ok".into());
+        }
+        let _ = h.replay(cols, rows, 0);
+        let _ = h.replay(cols, rows, 0);
+
+        let rendered_prefix = (0..600u32)
+            .map(|i| format!("\x1b[36malready rendered pending line {i}\x1b[0m\r\n"))
+            .collect::<String>();
+        h.feed_pty(rendered_prefix.as_bytes());
+        let _ = h.replay(cols, rows, 0);
+
+        let unrendered_suffix = (0..600u32)
+            .map(|i| format!("\x1b[35mnot yet rendered pending line {i}\x1b[0m\r\n"))
+            .collect::<String>();
+        h.feed_pty(unrendered_suffix.as_bytes());
+
+        let target = "partial-new-tool";
+        h.feed_task_start(target.into(), "read_file".into(), "src/main.rs".into());
+        let t = Instant::now();
+        let rendered = h.replay(cols, rows, 0);
+        let tool_start_us = t.elapsed().as_micros();
+        assert!(
+            rendered.blocks.iter().any(|hit| hit.call_id == target),
+            "new tool block hit rect should render after partial pending flush"
+        );
+        eprintln!("zarvis tool start after partial pending: {tool_start_us} µs");
+        assert!(
+            tool_start_us < 80_000,
+            "tool start replay too slow after partial pending flush: {tool_start_us} µs"
         );
     }
 
