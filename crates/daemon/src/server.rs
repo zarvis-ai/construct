@@ -5,7 +5,8 @@ use crate::remote::RemoteState;
 use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
-    ipc_method, ipc_notif, transport, CreateSessionParams, ErrorObject, GroupCreateParams,
+    ipc_method, ipc_notif, transport, ChatViewerActiveResult, CreateSessionParams, ErrorObject,
+    GroupCreateParams,
     GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, Notification, PingResult, ProjectCreateParams, ProjectCreateResult,
     ProjectDeleteParams, ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
@@ -13,6 +14,7 @@ use agentd_protocol::{
     SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetGroupParams, SessionSetPinnedParams, SessionSetProjectParams, SessionSetTitleParams,
+    SessionSetViewParams,
     SessionToolActionParams, SessionToolDecisionParams, SubscribeParams, TranscriptParams,
     IPC_VERSION,
 };
@@ -99,6 +101,7 @@ async fn run_session<I: Inbound>(
     manager: Arc<SessionManager>,
     kind: ClientKind,
 ) {
+    let conn_id = manager.alloc_conn_id();
     let (sub_cmd_tx, sub_cmd_rx) = mpsc::channel::<SubCmd>(8);
 
     let sub_out_tx = out_tx.clone();
@@ -126,7 +129,7 @@ async fn run_session<I: Inbound>(
                 continue;
             }
         };
-        let resp = dispatch(&manager, &sub_cmd_tx, kind, req).await;
+        let resp = dispatch(&manager, &sub_cmd_tx, kind, conn_id, req).await;
         let v = match serde_json::to_value(&resp) {
             Ok(v) => v,
             Err(e) => {
@@ -140,6 +143,7 @@ async fn run_session<I: Inbound>(
     }
 
     sub_task.abort();
+    manager.clear_conn(conn_id);
 }
 
 /// Inbound-value source for `run_session`. Yields the next JSON
@@ -1011,6 +1015,7 @@ async fn dispatch(
     manager: &Arc<SessionManager>,
     sub_cmd_tx: &mpsc::Sender<SubCmd>,
     kind: ClientKind,
+    conn_id: u64,
     req: Request,
 ) -> Response {
     let id = req.id.clone();
@@ -1050,6 +1055,17 @@ async fn dispatch(
                 Ok(d) => ok!(&d),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
+        }
+        m if m == ipc_method::SESSION_SET_VIEW => {
+            let p = params!(SessionSetViewParams);
+            manager.set_conn_view(conn_id, p.session_id, p.view);
+            Response::ok(id.clone(), serde_json::Value::Null)
+        }
+        m if m == ipc_method::SESSION_CHAT_VIEWER_ACTIVE => {
+            let p = params!(SessionIdParams);
+            ok!(&ChatViewerActiveResult {
+                active: manager.chat_viewer_active(&p.session_id),
+            })
         }
         m if m == ipc_method::SESSION_INPUT => {
             let p = params!(SessionInputParams);

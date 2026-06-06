@@ -65,6 +65,12 @@ enum Command {
         session_id: String,
         text: String,
     },
+    /// Internal: `PreToolUse` hook body for the AskUserQuestion chat-gate.
+    /// Reads the hook payload on stdin; if a chat viewer is active for
+    /// `$AGENTD_SESSION_ID`, prints a `deny` decision that degrades Claude's
+    /// picker to a plain-text question. Fails open (allow) on any error.
+    #[command(hide = true)]
+    AskGate,
     /// Stop a session cleanly.
     Stop { session_id: String },
     /// Force-kill a session (SIGKILL the adapter; keeps the record errored).
@@ -217,6 +223,44 @@ async fn main() -> Result<()> {
         Command::Send { session_id, text } => {
             let c = connect(&socket).await?;
             c.send_input(&session_id, text).await?;
+            Ok(())
+        }
+        Command::AskGate => {
+            // Drain stdin (the PreToolUse payload) so the hook's pipe closes
+            // cleanly, then resolve the session id from the adapter-set env
+            // (preferred) or the payload.
+            use std::io::Read as _;
+            let mut buf = String::new();
+            let _ = std::io::stdin().read_to_string(&mut buf);
+            let session_id = std::env::var("AGENTD_SESSION_ID")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    serde_json::from_str::<serde_json::Value>(&buf)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("session_id")
+                                .and_then(|s| s.as_str())
+                                .map(String::from)
+                        })
+                });
+            // Fail open: deny *only* when we positively confirm a chat viewer.
+            // Any missing piece, connect error, or query error → allow (print
+            // nothing) so we never strand the model.
+            if let Some(sid) = session_id {
+                if let Ok(c) = connect(&socket).await {
+                    if c.chat_viewer_active(&sid).await.unwrap_or(false) {
+                        let deny = serde_json::json!({
+                            "hookSpecificOutput": {
+                                "hookEventName": "PreToolUse",
+                                "permissionDecision": "deny",
+                                "permissionDecisionReason": "The AskUserQuestion interactive picker isn't available in the active chat view. Ask your question as a plain text message, listing the options inline (e.g. \"1) ...  2) ...\"), and wait for the user's text reply."
+                            }
+                        });
+                        println!("{deny}");
+                    }
+                }
+            }
             Ok(())
         }
         Command::Stop { session_id } => {

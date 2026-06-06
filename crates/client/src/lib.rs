@@ -2,7 +2,8 @@
 
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
-    ipc_method, transport, CreateSessionParams, DiffResult, ErrorObject, GroupCreateParams,
+    ipc_method, transport, ChatViewerActiveResult, ClientView, CreateSessionParams, DiffResult,
+    ErrorObject, GroupCreateParams,
     GroupDeleteParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, GroupSummary,
     HarnessInfo, MoveDirection, Notification, PingResult, ProjectCreateParams, ProjectCreateResult,
     ProjectDeleteParams, ProjectMoveParams, ProjectRenameParams, ProjectSetCollapsedParams,
@@ -10,7 +11,8 @@ use agentd_protocol::{
     SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionIdParams,
     SessionInputParams, SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams,
     SessionSetApprovalModeParams, SessionSetPinnedParams, SessionSetProjectParams,
-    SessionSetTitleParams, SessionSummary, SessionToolDecisionParams, SubscribeParams,
+    SessionSetTitleParams, SessionSetViewParams, SessionSummary, SessionToolDecisionParams,
+    SubscribeParams,
     TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
@@ -307,6 +309,32 @@ impl Client {
             )
             .await?;
         Ok(())
+    }
+    /// Report which surface (chat vs terminal) this client is currently
+    /// showing the given session through. Best-effort UI hint for the daemon.
+    pub async fn set_view(&self, id: &str, view: ClientView) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_SET_VIEW,
+                &SessionSetViewParams {
+                    session_id: id.to_string(),
+                    view,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    /// Whether any connected client is watching the session in the chat view.
+    pub async fn chat_viewer_active(&self, id: &str) -> Result<bool> {
+        let r: ChatViewerActiveResult = self
+            .request(
+                ipc_method::SESSION_CHAT_VIEWER_ACTIVE,
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
+            )
+            .await?;
+        Ok(r.active)
     }
     pub async fn attach_clipboard(
         &self,

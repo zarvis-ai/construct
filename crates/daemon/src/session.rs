@@ -5,7 +5,7 @@ use crate::config::Config;
 use crate::storage::Storage;
 use crate::worktree;
 use agentd_protocol::{
-    ahp_method, CreateSessionParams, DeletedNotificationPayload, EventNotificationPayload,
+    ahp_method, ClientView, CreateSessionParams, DeletedNotificationPayload, EventNotificationPayload,
     GroupDeletedNotificationPayload, GroupStateNotificationPayload, GroupSummary, HarnessInfo,
     MessageRole, MoveDirection, PtyReplayResult, PtySize, SessionAttachClipboardParams,
     SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionEvent,
@@ -530,6 +530,15 @@ pub struct SessionManager {
     /// UI in a worktree against a running daemon without rebuilding.
     dev_assets: std::sync::Mutex<Option<PathBuf>>,
     widget_snapshots: tokio::sync::Mutex<HashMap<String, WidgetSnapshot>>,
+    /// Monotonic id handed to each client connection so its current
+    /// view can be tracked and cleared on disconnect.
+    next_conn_id: AtomicU64,
+    /// Which session + surface each live client connection is currently
+    /// viewing (`conn_id -> (session_id, view)`). Drives
+    /// `chat_viewer_active`, which the `AskUserQuestion` chat-gate hook
+    /// queries. A `std::sync::Mutex` is fine — every critical section is a
+    /// tiny insert/remove/scan never held across an `.await`.
+    conn_views: std::sync::Mutex<HashMap<u64, (String, ClientView)>>,
 }
 
 /// Payload of a `daemon.restart` request, sent from the IPC
@@ -739,10 +748,47 @@ impl SessionManager {
                 restart_tx,
                 dev_assets: std::sync::Mutex::new(dev_assets),
                 widget_snapshots: tokio::sync::Mutex::new(widget_snapshots),
+                next_conn_id: AtomicU64::new(1),
+                conn_views: std::sync::Mutex::new(HashMap::new()),
             },
             remote_rx,
             restart_rx,
         ))
+    }
+
+    /// Allocate a monotonic id for a new client connection. The connection
+    /// uses it for `set_conn_view` / `clear_conn`.
+    pub fn alloc_conn_id(&self) -> u64 {
+        self.next_conn_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Record which session + surface a connection is currently viewing.
+    /// A connection views one session at a time, so this overwrites any prior
+    /// entry for `conn_id`.
+    pub fn set_conn_view(&self, conn_id: u64, session_id: String, view: ClientView) {
+        if let Ok(mut m) = self.conn_views.lock() {
+            m.insert(conn_id, (session_id, view));
+        }
+    }
+
+    /// Drop a connection's view registration when it disconnects.
+    pub fn clear_conn(&self, conn_id: u64) {
+        if let Ok(mut m) = self.conn_views.lock() {
+            m.remove(&conn_id);
+        }
+    }
+
+    /// Whether any live connection is currently watching `session_id` in the
+    /// chat view. The `AskUserQuestion` chat-gate degrades the picker to text
+    /// when this is true.
+    pub fn chat_viewer_active(&self, session_id: &str) -> bool {
+        self.conn_views
+            .lock()
+            .map(|m| {
+                m.values()
+                    .any(|(s, v)| s == session_id && *v == ClientView::Chat)
+            })
+            .unwrap_or(false)
     }
 
     fn install_memory_env(&self, env: &mut HashMap<String, String>, project_id: Option<&str>) {

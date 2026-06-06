@@ -2789,6 +2789,28 @@ function renderViewModeToggle(s) {
   viewModeChatBtn.setAttribute("aria-pressed", mode === "chat" ? "true" : "false");
 }
 
+let lastReportedView = null;
+/**
+ * Tell the daemon which surface we're showing the focused session through
+ * (chat vs terminal), so the AskUserQuestion chat-gate can degrade Claude's
+ * native picker to a plain-text question when a chat viewer is active.
+ * Reports "terminal" only when actually viewing a live PTY; debounced.
+ */
+function reportView() {
+  const id = state.currentId;
+  if (!id) return;
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s) return;
+  const view =
+    isTerminalSession(s) && preferredViewModeForSession(s) === "terminal"
+      ? "terminal"
+      : "chat";
+  const key = id + ":" + view;
+  if (key === lastReportedView) return;
+  lastReportedView = key;
+  rpc("session.set_view", { session_id: id, view }).catch(() => {});
+}
+
 async function switchCurrentViewMode(mode) {
   if (mode !== "terminal" && mode !== "chat") return;
   const id = state.currentId;
@@ -2820,6 +2842,7 @@ async function switchCurrentViewMode(mode) {
     await loadTranscript(id, { force: true });
   }
   setComposerEnabled(!!(state.ws && state.ws.readyState === 1 && state.currentId));
+  reportView();
 }
 
 async function selectSession(id, { replaceUrl = false } = {}) {
@@ -2851,6 +2874,7 @@ async function selectSession(id, { replaceUrl = false } = {}) {
   // sessions, `session.input` for chat-only adapters. Just block
   // on disconnect / no-selection.
   setComposerEnabled(!!(state.ws && state.ws.readyState === 1 && state.currentId));
+  reportView();
 }
 
 // --- PTY / xterm.js mode -------------------------------------------------

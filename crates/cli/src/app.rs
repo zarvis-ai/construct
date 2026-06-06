@@ -454,6 +454,9 @@ pub enum MatrixWidgetVisibility {
 
 pub struct App {
     pub client: Arc<Client>,
+    /// Last `(session, view)` reported to the daemon via `set_view`, so we only
+    /// re-send on change. Drives the AskUserQuestion chat-gate.
+    last_reported_view: Option<(String, agentd_protocol::ClientView)>,
     pub sessions: Vec<SessionSummary>,
     pub groups: Vec<GroupSummary>,
     pub selection: Selection,
@@ -1494,6 +1497,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
     let mut app = App {
         client: client.clone(),
+        last_reported_view: None,
         sessions,
         groups,
         selection: initial_window_sel,
@@ -1771,6 +1775,7 @@ async fn run_loop(
         // loop iteration with the flag cleared. This is what makes a
         // held key (delete / arrow across long text) cheap: one
         // render per output batch instead of one per keypress.
+        app.report_view();
         let skip_draw = std::mem::take(&mut app.skip_redraw_after_event);
         if !skip_draw {
             terminal.draw(|f| ui::render(f, app))?;
@@ -2265,6 +2270,27 @@ impl App {
         } else {
             ViewMode::Chat
         };
+    }
+
+    /// Tell the daemon which surface we're showing the focused session through
+    /// (chat vs terminal) so the AskUserQuestion chat-gate can degrade the
+    /// picker to text when a chat viewer is active. Debounced + fire-and-forget.
+    fn report_view(&mut self) {
+        let Some(sid) = self.selected_id() else {
+            return;
+        };
+        let view = match self.view {
+            ViewMode::Chat => agentd_protocol::ClientView::Chat,
+            ViewMode::Terminal => agentd_protocol::ClientView::Terminal,
+        };
+        if self.last_reported_view.as_ref() == Some(&(sid.clone(), view)) {
+            return;
+        }
+        self.last_reported_view = Some((sid.clone(), view));
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let _ = client.set_view(&sid, view).await;
+        });
     }
 
     pub fn select_group(&mut self, id: String) {
@@ -7396,6 +7422,7 @@ mod tests {
         let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
         App {
             client,
+            last_reported_view: None,
             sessions,
             groups: Vec::new(),
             selection: Selection::Session("s1".into()),

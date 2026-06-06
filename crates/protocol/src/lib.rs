@@ -166,6 +166,34 @@ pub struct SessionInputParams {
     pub text: String,
 }
 
+/// Which surface a client is currently showing a session through. Reported by
+/// clients via `session.set_view` so the daemon knows whether a given session
+/// is being watched in the structured chat view (where Claude's native PTY
+/// widgets aren't usable) or the raw terminal view (where they are). Drives the
+/// `AskUserQuestion` chat-gate: when a chat viewer is active, the injected
+/// `PreToolUse` hook degrades the picker to a plain-text question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientView {
+    /// Structured chat rendering (no usable native PTY widget).
+    Chat,
+    /// Raw terminal rendering (native PTY widgets work).
+    Terminal,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSetViewParams {
+    pub session_id: String,
+    pub view: ClientView,
+}
+
+/// Result of `session.chat_viewer_active`: whether any connected client is
+/// currently watching the session in [`ClientView::Chat`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatViewerActiveResult {
+    pub active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAttachClipboardParams {
     pub session_id: String,
@@ -721,6 +749,14 @@ pub mod ipc_method {
     pub const PROJECT_MOVE: &str = "project.move";
     pub const SESSION_DIFF: &str = "session.diff";
     pub const SESSION_TRANSCRIPT: &str = "session.transcript";
+    /// A client reports which surface (chat vs terminal) it is currently
+    /// showing a session through. The daemon tracks this per connection so it
+    /// can answer `session.chat_viewer_active`.
+    pub const SESSION_SET_VIEW: &str = "session.set_view";
+    /// Query whether any connected client is watching the session in the chat
+    /// view. Used by the `agent ask-gate` hook to decide whether to degrade
+    /// `AskUserQuestion` to a plain-text question.
+    pub const SESSION_CHAT_VIEWER_ACTIVE: &str = "session.chat_viewer_active";
     pub const SUBSCRIBE_EVENTS: &str = "subscribe.events";
     pub const UNSUBSCRIBE_EVENTS: &str = "unsubscribe.events";
     /// Start the remote WS listener + cloudflared tunnel (idempotent)
