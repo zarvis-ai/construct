@@ -1821,7 +1821,7 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
     let panels = app.orchestrator_widget_panels();
     let viewport_visible = app.matrix_widget_visible(now);
     let operator_text = "operator";
-    let label = format!(" {operator_text}");
+    let label = format!(" {operator_text} ");
     let label_x = area.x.saturating_add(1);
     f.buffer_mut().set_string(
         label_x,
