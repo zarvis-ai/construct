@@ -473,7 +473,8 @@ pub struct App {
     /// Persistent "update available" advisory, sourced from the upgrade cache.
     /// Unlike `status`, it is never auto-cleared on tick — it stays in the
     /// modeline until you upgrade (after which `cached_update_notice` returns
-    /// None). A transient `status` message takes precedence while it is active.
+    /// None). Rendered right-aligned at the far edge of the modeline, so it
+    /// coexists with a transient `status` message shown inline on the left.
     pub update_notice: Option<String>,
     pub last_diff: Option<String>,
     pub should_quit: bool,
@@ -8323,6 +8324,37 @@ mod tests {
                 .shortcut_hints
                 .iter()
                 .any(|h| h.action == KeyAction::Quit)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn update_notice_renders_right_aligned_in_modeline() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.update_notice = Some("↑ agentd 9.9.9 · agent upgrade".to_string());
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let screen = rendered_text(terminal.backend().buffer());
+        let modeline = screen
+            .lines()
+            .find(|l| l.contains("↑ agentd 9.9.9 · agent upgrade"))
+            .expect("update notice should be on screen");
+
+        // Right-aligned: only padding follows it to the right edge.
+        assert!(
+            modeline.trim_end().ends_with("agent upgrade"),
+            "notice should sit at the right edge:\n{modeline}"
+        );
+        // ...and it lives in the right half, not inline on the left.
+        let col = modeline.find('↑').expect("arrow present");
+        assert!(
+            col > 60,
+            "notice should start in the right half (byte col {col}):\n{modeline}"
         );
         server.abort();
     }

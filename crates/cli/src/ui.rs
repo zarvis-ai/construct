@@ -5179,14 +5179,7 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
     } else {
         String::new()
     };
-    // Prefer a transient status message; when none is active, fall back to the
-    // persistent "update available" notice so it stays visible until upgrade.
-    let status = app
-        .status
-        .as_ref()
-        .map(|(m, _)| m.as_str())
-        .or(app.update_notice.as_deref())
-        .unwrap_or("");
+    let status = app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
     let empty_hint = if s.is_none() && app.list_items().is_empty() && status.is_empty() {
         "new: C-x C-f  help: ?  palette: C-x x"
     } else {
@@ -5220,6 +5213,29 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &App) {
             .fg(app.theme.modeline_fg),
     );
     f.render_widget(para, area);
+
+    // Persistent "update available" notice, right-aligned at the far edge of
+    // the status bar so it stays visible until upgrade without crowding the
+    // left-aligned modeline (transient `status` messages still render inline).
+    if let Some(notice) = app.update_notice.as_deref() {
+        use unicode_width::UnicodeWidthStr;
+        let text = format!(" {notice} ");
+        let w = UnicodeWidthStr::width(text.as_str()) as u16;
+        if w > 0 && w < area.width {
+            let nrect = Rect {
+                x: area.x + area.width - w,
+                y: area.y,
+                width: w,
+                height: area.height,
+            };
+            let np = Paragraph::new(text).style(
+                Style::default()
+                    .bg(app.theme.modeline_bg)
+                    .fg(app.theme.modeline_fg),
+            );
+            f.render_widget(np, nrect);
+        }
+    }
 }
 
 /// Compute how many rows the minibuffer footer occupies this frame.
