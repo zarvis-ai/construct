@@ -1703,14 +1703,15 @@ pub(crate) fn render_operator_monolog(
         body.push('▌'); // blinking cursor while typing
     }
     let fading = elapsed >= type_ms + MONOLOG_HOLD_MS;
-    // Solid bg so the typed line reads cleanly as an overlay over the rain.
+    // Match the rain's backdrop (terminal default) rather than a solid band, so
+    // the typed line reads as a subtle overlay instead of a highlight.
     let text_style = Style::default()
         .fg(if fading {
             app.theme.matrix_dim
         } else {
             app.theme.matrix_glow
         })
-        .bg(Color::Black);
+        .bg(Color::Reset);
     let inner = Rect {
         x: area.x + 2,
         y: area.y + 1,
