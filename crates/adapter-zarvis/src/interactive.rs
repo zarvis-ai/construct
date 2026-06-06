@@ -10,18 +10,18 @@
 //! The TUI's `vt100`-backed terminal pane parses these bytes the same
 //! way it parses any other PTY-backed adapter's output.
 
-use crate::agent::{push_msg, system_prompt_for_env, ResolvedModel};
+use crate::agent::{ResolvedModel, push_msg, system_prompt_for_env};
 use crate::context;
 use crate::persist::{self, Persist};
 use crate::provider::{self, Content, Message, Role, StopReason, TextSink, ToolCall};
-use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
+use crate::tools::{ToolCtx, ToolOutcome, ToolRegistry, truncate_for_model};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{ApprovalMode, SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TOOL_OUTPUT_BUDGET: usize = 8_000;
 
@@ -364,6 +364,10 @@ struct PtySink<'a> {
     /// Visible column inside the padded block (0 = just past left
     /// padding). ASCII-counted; CJK chars may misalign.
     col: usize,
+    /// When true, deltas render into the session PTY. Off for quiet
+    /// ambient Operator ticks where the model should update widgets or
+    /// say `noted` without adding visible minibuffer chatter.
+    emit_pty: bool,
     /// When true, every delta also fires a `SessionEvent::Message` so
     /// the daemon's transcript view sees the streaming text. Off for
     /// replay paths where the message is already in the transcript.
@@ -386,6 +390,7 @@ impl<'a> PtySink<'a> {
             width,
             emitted: false,
             col: 0,
+            emit_pty: true,
             emit_messages: true,
             status_started_at_ms,
             in_reasoning: false,
@@ -492,7 +497,7 @@ impl<'a> PtySink<'a> {
         for _ in 0..PAD_BOTTOM {
             out.extend_from_slice(b"\r\n");
         }
-        if !out.is_empty() {
+        if self.emit_pty && !out.is_empty() {
             self.emit.emit(SessionEvent::pty(&out));
         }
     }
@@ -569,7 +574,7 @@ impl<'a> TextSink for PtySink<'a> {
             out.extend_from_slice(s.as_bytes());
             self.col += 1;
         }
-        if !out.is_empty() {
+        if self.emit_pty && !out.is_empty() {
             self.emit.emit(SessionEvent::pty(&out));
         }
         if self.emit_messages {
@@ -610,7 +615,7 @@ impl<'a> TextSink for PtySink<'a> {
             out.extend_from_slice(s.as_bytes());
             self.col += 1;
         }
-        if !out.is_empty() {
+        if self.emit_pty && !out.is_empty() {
             self.emit.emit(SessionEvent::pty(&out));
         }
         if self.emit_messages {
@@ -1979,6 +1984,7 @@ pub async fn run(
         None
     };
     let mut obs_limiter = crate::observe::RateLimiter::new(5, std::time::Duration::from_secs(60));
+    let ambient_loop = is_orchestrator.then(operator_ambient_loop_interval);
 
     'outer: loop {
         // Wait for a user message — drain order: startup prompt
@@ -2013,6 +2019,7 @@ pub async fn run(
                 obs_rx.as_mut(),
                 &mut bg_completion_rx,
                 &tasks,
+                ambient_loop,
             )
             .await
             {
@@ -2028,6 +2035,9 @@ pub async fn run(
                     let text = obs.as_synthetic_user_message();
                     term.note(&text);
                     text
+                }
+                ReadOutcome::AmbientTick => {
+                    "OBSERVATION: ambient operator loop tick. Quietly inspect only if useful; update Operator widgets for helpful ambient status; reply exactly `noted` if nothing needs surfacing.".to_string()
                 }
                 ReadOutcome::BackgroundCompletion(bc) => {
                     // Emit the real ToolResult so the transcript +
@@ -2224,9 +2234,7 @@ pub async fn run(
                                             ));
                                         }
                                         Ok(None) => {
-                                            term.note(
-                                                "(nothing to compact — not enough history)",
-                                            );
+                                            term.note("(nothing to compact — not enough history)");
                                         }
                                         Err(e) => {
                                             term.note(&format!("(compact failed: {e})"));
@@ -2238,10 +2246,7 @@ pub async fn run(
                         // Routing::Adapter is only model/reset/compact today;
                         // any other id here is a registry/handler mismatch.
                         other => {
-                            tracing::warn!(
-                                ?other,
-                                "adapter-routed slash command has no handler"
-                            );
+                            tracing::warn!(?other, "adapter-routed slash command has no handler");
                         }
                     },
                 },
@@ -2324,6 +2329,7 @@ pub async fn run(
                 },
             }
         );
+        let ambient_turn = user_text.starts_with("OBSERVATION: ambient operator loop tick");
         emit.emit(SessionEvent::Message {
             role: agentd_protocol::MessageRole::User,
             text: user_text,
@@ -2401,6 +2407,10 @@ pub async fn run(
             }
             let _pruned = context::prune_to_budget(&mut messages, budget);
             let mut sink = PtySink::new(&emit, pty_width, turn_started_at_ms);
+            if ambient_turn {
+                sink.emit_pty = false;
+                sink.emit_messages = false;
+            }
             // Wrap the provider call so user typing during the
             // stream is fed to the editor and pressed-Enter lines
             // join the pending-input queue instead of vanishing
@@ -2461,6 +2471,10 @@ pub async fn run(
                             )),
                         });
                         let mut sink2 = PtySink::new(&emit, pty_width, turn_started_at_ms);
+                        if ambient_turn {
+                            sink2.emit_pty = false;
+                            sink2.emit_messages = false;
+                        }
                         let drive2 = drive_with_input_silent(
                             &mut inbox,
                             &mut editor,
@@ -2876,6 +2890,8 @@ enum ReadOutcome {
     /// while we were waiting for user input. The outer loop turns
     /// this into a pseudo-user message so the agent can react.
     Observation(crate::observe::Observation),
+    /// Ambient operator loop tick while the orchestrator is idle.
+    AmbientTick,
     /// A backgrounded tool just finished. The outer loop emits the
     /// real `ToolResult` event (so the transcript catches up) and
     /// synthesizes an `OBSERVATION:` user message so the agent's
@@ -2883,6 +2899,15 @@ enum ReadOutcome {
     BackgroundCompletion(crate::tasks::BackgroundCompletion),
     Stop,
     Eof,
+}
+
+fn operator_ambient_loop_interval() -> Duration {
+    let secs = std::env::var("AGENTD_OPERATOR_AMBIENT_LOOP_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(300)
+        .clamp(60, 86_400);
+    Duration::from_secs(secs)
 }
 
 fn background_completion_observation_text(
@@ -2915,6 +2940,7 @@ async fn read_one_line(
     mut obs_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<crate::observe::Observation>>,
     bg_completion_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tasks::BackgroundCompletion>,
     tasks: &std::sync::Arc<crate::tasks::Tasks>,
+    ambient_loop: Option<Duration>,
 ) -> ReadOutcome {
     loop {
         let inbox_recv = inbox.recv();
@@ -2925,6 +2951,12 @@ async fn read_one_line(
             }
         };
         let bg_recv = bg_completion_rx.recv();
+        let ambient_tick = async {
+            match ambient_loop {
+                Some(interval) => tokio::time::sleep(interval).await,
+                None => std::future::pending().await,
+            }
+        };
         let msg = tokio::select! {
             biased;
             obs = obs_recv => match obs {
@@ -2938,6 +2970,7 @@ async fn read_one_line(
                 Some(c) => return ReadOutcome::BackgroundCompletion(c),
                 None => continue, // channel closed; ignore
             },
+            _ = ambient_tick => return ReadOutcome::AmbientTick,
             m = inbox_recv => m,
         };
         match msg {

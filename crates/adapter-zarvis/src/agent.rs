@@ -6,7 +6,7 @@
 use crate::context;
 use crate::persist::{self, Persist};
 use crate::provider::{self, Content, LlmProvider, Message, Role, StopReason, TextSink, ToolCall};
-use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
+use crate::tools::{ToolCtx, ToolOutcome, ToolRegistry, truncate_for_model};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{MessageRole, SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::Result;
@@ -123,11 +123,11 @@ pub async fn auto_review_for_adapter(
     // auto-approved deterministically via the auto-approve policy; this covers
     // the residual cases that still reach the reviewer (e.g. shell reads or
     // removals of widget files).
-    let widgets_hint =
-        match std::env::var(agentd_protocol::agent_context::ENV_SESSION_WIDGETS_DIR) {
-            Ok(dir) if !dir.is_empty() => format!("\n\nSession widget directory:\n{dir}"),
-            _ => String::new(),
-        };
+    let widgets_hint = match std::env::var(agentd_protocol::agent_context::ENV_SESSION_WIDGETS_DIR)
+    {
+        Ok(dir) if !dir.is_empty() => format!("\n\nSession widget directory:\n{dir}"),
+        _ => String::new(),
+    };
     let user = format!(
         "{}{widgets_hint}\n\nPending tool:\nTool: {tool}\nArgs summary:\n{args_summary}",
         ctx.format_for_prompt()
@@ -219,7 +219,11 @@ You also have local tools (shell, edit_file, write_stdin) for quick host-level q
 
 LONG-RUNNING TOOLS: a tool result of exactly "(running in background; will report when complete)" means the tool exceeded the foreground time budget and is still running. Don't retry it. Don't poll. Continue with whatever you can do without that result. You'll receive an `OBSERVATION:` message with the real output later — react to that observation when it arrives, ideally with a short summary or a `noted` if no action is needed.
 
-EVENT OBSERVATIONS: messages starting with "OBSERVATION:" come from the agentd event monitor, not the user. They tell you another session in the fleet changed state (entered awaiting_input, errored, finished, or is asking for approval). For each observation, decide whether the user benefits from being notified or whether action is helpful. If neither — most cases, especially routine awaiting_input transitions — reply with exactly the single word `noted` and nothing else. If something is genuinely worth surfacing (an unexpected error, a session done with notable output, an approval request the user may have missed), give one short sentence. Never start a turn by re-stating the observation back at the user. Never invoke tools just to "check in" on a session whose state you already know from the observation.
+EVENT OBSERVATIONS: messages starting with "OBSERVATION:" come from agentd, not the user. They can be fleet events or ambient loop ticks.
+
+For fleet-event observations, decide whether the user benefits from being notified or whether action is helpful. If neither — most cases, especially routine awaiting_input transitions — reply with exactly the single word `noted` and nothing else. If something is genuinely worth surfacing (an unexpected error, a session done with notable output, an approval request the user may have missed), give one short sentence. Never start a turn by re-stating the observation back at the user. Never invoke tools just to "check in" on a session whose state you already know from the observation.
+
+For `OBSERVATION: ambient operator loop tick`, act as an ambient companion. You may inspect fleet state, project memory, widgets, transcripts, diffs, or outputs when that would help you notice blockers, stale work, workflow issues, or opportunities to reduce user effort. Prefer updating/removing compact Operator widgets over chatting. If nothing is worth surfacing, reply exactly `noted`. Do not take risky/destructive/external actions without normal approval; ambient help is advisory and no critical user journey should rely on it.
 
 Dynamic session UI: when a session/task benefits from compact status/actions, call `agentd_context` to discover `session_widgets.dir`, `session_widgets.action_link_scheme`, and supported `widget_markdown_extensions`, then create/update concise `.md` widget files there with normal file tools. Widget creation, updates, and cleanup are mostly automated system behavior: use best judgment and ask first only when normal safety/tool policy absolutely requires approval or the widget would make a significant product/user-facing decision. Use checklists, supported widget_markdown_extensions from `agentd_context`, and action links such as `[Open checks](agentd:action/open-checks)` or `[Open checks](agentd:action/open-checks?key=o)` when a keyboard shortcut is desired. Treat `OBSERVATION: ui.action ...` as user intent; actions still go through normal tools and approvals.
 
@@ -1449,8 +1453,10 @@ mod tests {
     #[test]
     fn auto_review_prompt_guides_model_toward_routine_repo_work() {
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("active git worktree"));
-        assert!(AUTO_REVIEW_SYSTEM_PROMPT
-            .contains("git makes those changes inspectable and reversible"));
+        assert!(
+            AUTO_REVIEW_SYSTEM_PROMPT
+                .contains("git makes those changes inspectable and reversible")
+        );
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("cargo fmt --all"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("cargo test"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("git diff --name-only"));
