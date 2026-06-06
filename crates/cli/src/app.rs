@@ -8211,6 +8211,10 @@ mod tests {
             "missing create shortcut:\n{screen}"
         );
         assert!(
+            screen.contains("exit agentd"),
+            "missing exit shortcut:\n{screen}"
+        );
+        assert!(
             screen.contains("new: C-x C-f  help: ?  palette: C-x x"),
             "missing modeline hint:\n{screen}"
         );
@@ -8219,7 +8223,7 @@ mod tests {
             "empty state should not include CLI examples:\n{screen}"
         );
         assert!(
-            app.layout.shortcut_hints.len() >= 3,
+            app.layout.shortcut_hints.len() >= 4,
             "expected clickable shortcuts, got {:?}",
             app.layout.shortcut_hints
         );
@@ -8240,6 +8244,12 @@ mod tests {
                 .shortcut_hints
                 .iter()
                 .any(|h| h.action == KeyAction::ToggleHelp)
+        );
+        assert!(
+            app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.action == KeyAction::Quit)
         );
         server.abort();
     }
@@ -8291,6 +8301,11 @@ mod tests {
             app.minibuffer.as_ref().map(|m| &m.intent),
             Some(MinibufferIntent::NewSessionHarness)
         ));
+        app.minibuffer = None;
+
+        let (x, y) = click(&app, KeyAction::Quit);
+        app.handle_left_click(x, y).await;
+        assert!(app.should_quit);
         server.abort();
     }
 
