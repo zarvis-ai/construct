@@ -27,7 +27,7 @@ pub const MCP_CONTEXT_ENV_VARS: &[&str] = &[
 ];
 
 pub const TOOL_DESCRIPTION: &str =
-    "Load agentd global/project memory, session widget paths, and operating context. Call this before starting any user task, before planning, and before using other tools. Use the returned memory as durable context, follow its maintenance policy, update listed Markdown memory files with normal file tools when you learn durable information, and create/update session widgets when compact task status or actions would help the user.";
+    "Load agentd global/project memory, session widget paths, and operating context. Call this when memory, session widget paths, or operating context are needed for the current task; it is not necessary for brief conversational replies that do not depend on that context. Use the returned memory as durable context, follow its maintenance policy, update listed Markdown memory files with normal file tools when you learn durable information, and create/update session widgets when compact task status or actions would help the user.";
 
 const WIDGET_POLICY: &[&str] = &[
     "Use session widgets for compact task status, checklists, decision prompts, and action links that help the user monitor or steer the current session.",
@@ -107,8 +107,9 @@ pub fn build_from_env() -> AgentdContext {
         session_id: std::env::var(ENV_SESSION_ID).ok(),
         project_id: std::env::var(ENV_PROJECT_ID).ok(),
         instructions: vec![
-            "Use this context before starting work in this agentd session.".to_string(),
-            "Read global_memory and project_memory, if present, before planning or making changes."
+            "Use this context when memory, session widget paths, or operating context are needed for the current task.".to_string(),
+            "For brief conversational replies that do not depend on memory, widgets, or operating context, calling agentd_context is optional and usually unnecessary.".to_string(),
+            "Read global_memory and project_memory, if present, before planning substantial work or making changes."
                 .to_string(),
             "When you learn durable information, update the listed Markdown memory file directly with normal file tools according to memory_policy.".to_string(),
             "When compact task status or actions would help the user, create/update Markdown widgets in session_widgets.dir according to widget_policy.".to_string(),
@@ -200,7 +201,7 @@ mod tests {
         assert!(context
             .instructions
             .iter()
-            .any(|s| s.contains("before starting work")));
+            .any(|s| s.contains("brief conversational replies")));
         assert!(context
             .memory_policy
             .iter()

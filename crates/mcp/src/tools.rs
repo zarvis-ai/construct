@@ -661,7 +661,7 @@ mod tests {
             .get("description")
             .and_then(|description| description.as_str())
             .unwrap_or_default()
-            .contains("Call this before starting any user task"));
+            .contains("brief conversational replies"));
     }
 
     #[test]

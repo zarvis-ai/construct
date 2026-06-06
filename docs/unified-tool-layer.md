@@ -40,7 +40,7 @@ sessions; it should be able to use `agentd_list_sessions` without running the
 
 | Tool | Purpose |
 |---|---|
-| `agentd_context` | Load the calling session's agentd context, including global/project memory, memory file paths, session widget paths, widget policy, and memory maintenance policy. Agents should call this before starting a user task. See [Memory](memory.md) and [Generative widgets](generative-widgets.md). |
+| `agentd_context` | Load the calling session's agentd context, including global/project memory, memory file paths, session widget paths, widget policy, and memory maintenance policy. Agents should call this when the current task needs memory, widget paths, or operating context; brief conversational replies that do not depend on that context do not need it. See [Memory](memory.md) and [Generative widgets](generative-widgets.md). |
 | `agentd_whoami` | Return the current session id. |
 | `agentd_list_sessions` | List sessions, status, cwd, pinned state, automode, and grouping metadata. |
 | `agentd_get_session` | Fetch summary and structured transcript for one session. |
