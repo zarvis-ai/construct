@@ -792,6 +792,10 @@ impl ItemHistory {
 
     fn push_tool_block_grouped(&mut self, block: ToolBlock) {
         let tool = block.tool.clone().unwrap_or_else(|| "?".to_string());
+        if self.cached.is_some() {
+            self.items.push(Item::ToolBlock(block));
+            return;
+        }
         if let Some(last) = self.items.last_mut() {
             match last {
                 Item::ToolBlock(prev) if prev.tool.as_deref() == Some(tool.as_str()) => {
@@ -824,6 +828,9 @@ impl ItemHistory {
             return;
         };
         if idx == 0 {
+            return;
+        }
+        if self.cached.is_some() {
             return;
         }
         let block = match self.items.remove(idx) {
@@ -3719,6 +3726,44 @@ mod tests {
             result_us < 80_000,
             "collapsed group result replay too slow: {result_us} µs"
         );
+    }
+
+    #[test]
+    fn live_tool_start_after_render_stays_append_only() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "cmd a".into());
+        h.feed_tool_result("A", true, "ok".into());
+        let _ = h.replay(100, 30, 0);
+
+        h.feed_task_start("B".into(), "shell".into(), "cmd b".into());
+        assert_eq!(h.items.len(), 2, "{:?}", h.items);
+        assert!(matches!(h.items[0], Item::ToolBlock(_)), "{:?}", h.items);
+        assert!(matches!(h.items[1], Item::ToolBlock(_)), "{:?}", h.items);
+
+        let before = h
+            .cached
+            .as_ref()
+            .map(|cache| cache.processed_count)
+            .expect("cache warmed");
+        let _ = h.replay(100, 30, 0);
+        let after = h.cached.as_ref().map(|cache| cache.processed_count);
+        assert_eq!(before, 1);
+        assert_eq!(after, Some(2));
+    }
+
+    #[test]
+    fn live_late_tool_use_hydration_after_render_stays_append_only() {
+        let mut h = ItemHistory::new();
+        h.feed_task_start("A".into(), "shell".into(), "cmd a".into());
+        h.feed_tool_result("A", true, "ok".into());
+        let _ = h.replay(100, 30, 0);
+
+        h.feed_pty(b"\x1b]7700;open;call=B\x07inline");
+        h.feed_tool_use("shell".into(), "cmd b".into());
+        h.feed_tool_result("B", true, "ok".into());
+        assert_eq!(h.items.len(), 2, "{:?}", h.items);
+        assert!(matches!(h.items[0], Item::ToolBlock(_)), "{:?}", h.items);
+        assert!(matches!(h.items[1], Item::ToolBlock(_)), "{:?}", h.items);
     }
 
     // ----- orchestrator / minibuffer (zarvis-like content, no
