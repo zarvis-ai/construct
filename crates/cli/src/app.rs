@@ -419,16 +419,9 @@ impl MatrixRevealHit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatrixWidgetNavDirection {
-    Previous,
-    Next,
-}
-
 #[derive(Debug, Clone)]
 pub enum MatrixWidgetHitKind {
-    Toggle,
-    Nav(MatrixWidgetNavDirection),
+    Select { panel_id: String },
 }
 
 #[derive(Debug, Clone)]
@@ -4789,8 +4782,9 @@ impl App {
                 .cloned()
             {
                 match hit.kind {
-                    MatrixWidgetHitKind::Toggle => self.toggle_matrix_widget_viewport(),
-                    MatrixWidgetHitKind::Nav(direction) => self.select_matrix_widget(direction),
+                    MatrixWidgetHitKind::Select { panel_id } => {
+                        self.toggle_matrix_widget_panel(panel_id)
+                    }
                 }
                 return;
             }
@@ -5504,41 +5498,20 @@ impl App {
         }
     }
 
-    pub fn select_matrix_widget(&mut self, direction: MatrixWidgetNavDirection) {
+    pub fn toggle_matrix_widget_panel(&mut self, panel_id: String) {
         let panels = self.orchestrator_widget_panels();
-        if panels.is_empty() {
+        if !panels.iter().any(|panel| panel.id == panel_id) {
             self.matrix_widget_selected = None;
             self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
             return;
         }
-        let current = self
-            .matrix_widget_selected
-            .as_ref()
-            .and_then(|id| panels.iter().position(|panel| &panel.id == id))
-            .unwrap_or(0);
-        let next = match direction {
-            MatrixWidgetNavDirection::Previous => current
-                .checked_sub(1)
-                .unwrap_or_else(|| panels.len().saturating_sub(1)),
-            MatrixWidgetNavDirection::Next => (current + 1) % panels.len(),
-        };
-        self.matrix_widget_selected = Some(panels[next].id.clone());
-        self.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
-    }
-
-    pub fn toggle_matrix_widget_viewport(&mut self) {
-        if self.orchestrator_widget_panels().is_empty() {
-            self.matrix_widget_selected = None;
+        let already_visible = self.matrix_widget_visible(Instant::now())
+            && self.matrix_widget_selected.as_deref() == Some(panel_id.as_str());
+        if already_visible {
             self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
-            return;
-        }
-        match self.matrix_widget_visibility {
-            MatrixWidgetVisibility::Browsing => {
-                self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
-            }
-            MatrixWidgetVisibility::Hidden | MatrixWidgetVisibility::Auto { .. } => {
-                self.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
-            }
+        } else {
+            self.matrix_widget_selected = Some(panel_id);
+            self.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
         }
     }
 

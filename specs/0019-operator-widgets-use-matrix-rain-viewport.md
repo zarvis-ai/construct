@@ -9,7 +9,7 @@ Scope: Defines how the collapsed Operator communicates through the Matrix-rain p
 
 When the Operator session is collapsed, the Matrix-rain panel may act as a transient viewport over the Operator session's normal sticky widgets. Operator widgets keep the same lifecycle as all session widgets: sessions create, update, and delete them, and the viewport only controls temporary visibility.
 
-Updating an Operator widget briefly reveals it in the Matrix-rain panel. The title bar shows the Operator name and widget count; hovering the Operator label may reveal the current Operator status in a tooltip. When visible, previous/next controls let the user browse the widget stack. The existing Matrix-rain close button continues to hide the rain panel itself. When the widget viewport hides or no Operator widgets exist, the panel returns to Matrix rain.
+Updating an Operator widget briefly reveals it in the Matrix-rain panel. The title bar shows the lowercase `operator` label followed by one square indicator per visible Operator widget. Hovering the Operator label may reveal the current Operator status in a tooltip. Hovering a widget indicator may reveal that widget's title. Clicking an empty square selects and shows the widget; clicking the filled square hides the widget viewport. The existing Matrix-rain close button continues to hide the Operator/rain panel itself. When the widget viewport hides or no Operator widgets exist, the panel returns to Matrix rain.
 
 ## Reason
 

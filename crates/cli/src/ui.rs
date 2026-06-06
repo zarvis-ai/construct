@@ -601,10 +601,22 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
             render_button_tooltip(
                 f,
                 &app.theme,
-                &format!(" Operator {} ", matrix_operator_status(app)),
+                &format!(" operator {} ", matrix_operator_status(app)),
                 xs,
                 y,
             );
+            return;
+        }
+    }
+    if let Some(hit) = app
+        .layout
+        .matrix_widget_hits
+        .iter()
+        .find(|hit| hit.contains(mx, my))
+    {
+        let crate::app::MatrixWidgetHitKind::Select { panel_id } = &hit.kind;
+        if let Some(title) = matrix_widget_title(app, panel_id) {
+            render_button_tooltip(f, &app.theme, &format!(" {title} "), hit.start_col, hit.row);
             return;
         }
     }
@@ -1633,6 +1645,13 @@ fn selected_matrix_widget_index(app: &App, panels: &[agentd_protocol::UiPanel]) 
         .or_else(|| (!panels.is_empty()).then_some(0))
 }
 
+fn matrix_widget_title(app: &App, panel_id: &str) -> Option<String> {
+    app.orchestrator_widget_panels()
+        .into_iter()
+        .find(|panel| panel.id == panel_id)
+        .map(|panel| dynamic_ui_panel_title(&panel).unwrap_or(panel.id))
+}
+
 fn matrix_operator_status(app: &App) -> &'static str {
     let Some(orchestrator_id) = app.orchestrator_id.as_deref() else {
         return "offline";
@@ -1800,89 +1819,49 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
     }
 
     let panels = app.orchestrator_widget_panels();
-    let widget_count = panels.len();
     let viewport_visible = app.matrix_widget_visible(now);
-    let operator_text = "Operator";
-    let mut label = format!(" {operator_text}");
-    if widget_count > 0 {
-        let selected = selected_matrix_widget_index(app, &panels).unwrap_or(0) + 1;
-        if viewport_visible {
-            label.push_str(&format!(" · [{selected}/{widget_count}]"));
-        } else {
-            label.push_str(&format!(" · [{widget_count}]"));
-        }
-    }
-    let max_label_w = area.width.saturating_sub(10) as usize;
-    let label = truncate_to_width(&label, max_label_w);
+    let operator_text = "operator";
+    let label = format!(" {operator_text}");
     let label_x = area.x.saturating_add(1);
     f.buffer_mut().set_string(
         label_x,
         area.y,
         label.as_str(),
-        Style::default()
-            .fg(app.theme.accent)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(app.theme.accent),
     );
     let operator_start = label_x.saturating_add(1);
     let operator_end = operator_start.saturating_add(UnicodeWidthStr::width(operator_text) as u16);
     app.layout.matrix_operator_title_hit = Some((operator_start, operator_end, area.y));
 
-    if widget_count > 0 {
-        let count_text = if viewport_visible {
-            format!(
-                "[{}/{}]",
-                selected_matrix_widget_index(app, &panels).unwrap_or(0) + 1,
-                widget_count
-            )
-        } else {
-            format!("[{widget_count}]")
-        };
-        if let Some(offset) = label.find(&count_text) {
-            let start_col = area.x + 1 + UnicodeWidthStr::width(&label[..offset]) as u16;
-            let end_col = start_col + UnicodeWidthStr::width(count_text.as_str()) as u16;
-            app.layout
-                .matrix_widget_hits
-                .push(crate::app::MatrixWidgetHit {
-                    kind: crate::app::MatrixWidgetHitKind::Toggle,
-                    row: area.y,
-                    start_col,
-                    end_col,
-                });
+    let selected_id = app.matrix_widget_selected.clone();
+    let mut icon_x = operator_end.saturating_add(1);
+    let icon_limit = area.x + area.width.saturating_sub(5);
+    for panel in panels {
+        if icon_x >= icon_limit {
+            break;
         }
-    }
-
-    if widget_count > 1 && viewport_visible {
-        let nav = " ‹ › ";
-        let nav_w = UnicodeWidthStr::width(nav) as u16;
-        let nav_x = area.x + area.width.saturating_sub(nav_w + 4);
-        f.buffer_mut().set_string(
-            nav_x,
-            area.y,
-            nav,
+        let filled = viewport_visible && selected_id.as_deref() == Some(panel.id.as_str());
+        let glyph = if filled { "■" } else { "□" };
+        let style = if filled {
             Style::default()
-                .fg(app.theme.text)
-                .add_modifier(Modifier::BOLD),
-        );
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.dim)
+        };
+        f.buffer_mut().set_string(icon_x, area.y, glyph, style);
+        let w = UnicodeWidthStr::width(glyph) as u16;
         app.layout
             .matrix_widget_hits
             .push(crate::app::MatrixWidgetHit {
-                kind: crate::app::MatrixWidgetHitKind::Nav(
-                    crate::app::MatrixWidgetNavDirection::Previous,
-                ),
+                kind: crate::app::MatrixWidgetHitKind::Select {
+                    panel_id: panel.id.clone(),
+                },
                 row: area.y,
-                start_col: nav_x.saturating_add(1),
-                end_col: nav_x.saturating_add(2),
+                start_col: icon_x,
+                end_col: icon_x.saturating_add(w),
             });
-        app.layout
-            .matrix_widget_hits
-            .push(crate::app::MatrixWidgetHit {
-                kind: crate::app::MatrixWidgetHitKind::Nav(
-                    crate::app::MatrixWidgetNavDirection::Next,
-                ),
-                row: area.y,
-                start_col: nav_x.saturating_add(3),
-                end_col: nav_x.saturating_add(4),
-            });
+        icon_x = icon_x.saturating_add(w + 1);
     }
 
     let x = area.x + area.width.saturating_sub(3);
