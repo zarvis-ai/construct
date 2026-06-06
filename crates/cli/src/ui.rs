@@ -2857,7 +2857,12 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     app.layout.browser_preview_close = None;
     app.layout.terminal_scrollbar = None;
     let row_offset = area.height.saturating_sub(chat_area.height);
+    let replay_started = Instant::now();
     let out = history.replay(area.width, area.height, scroll);
+    crate::app::trace_tui_duration(
+        format!("render:terminal_replay:{}", id),
+        replay_started.elapsed(),
+    );
     let clamped_scrollback = out.screen.scrollback();
     // Hide the chat pane's cursor block if we have our own editor pane
     // — otherwise the chat's vt100 cursor would render as a stray
@@ -5568,7 +5573,12 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
             let (main_cols, main_rows) = app.terminal_pane_size;
             let cols = main_cols.max(inner.width).max(1);
             let rows = main_rows.max(inner.height).max(1);
+            let replay_started = Instant::now();
             let out = history.replay(cols, rows, 0);
+            crate::app::trace_tui_duration(
+                format!("render:inline_panel_replay:{}", id),
+                replay_started.elapsed(),
+            );
             render_pty_tail(f, inner, out.screen, &app.theme);
         } else {
             // No PTY data yet — show a placeholder.
@@ -6112,7 +6122,9 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
     // the editor pane grows on each keystroke; render only the bottom
     // slice. See the matching note in `render_terminal`.
     let row_offset = inner.height.saturating_sub(chat_area.height);
+    let replay_started = Instant::now();
     let out = history.replay(inner.width, inner.height, app.orchestrator_scrollback);
+    crate::app::trace_tui_duration("render:orchestrator_replay", replay_started.elapsed());
     render_pty_screen(
         f,
         chat_area,

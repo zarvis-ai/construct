@@ -21,9 +21,11 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::io::{Stdout, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -42,6 +44,86 @@ pub const MINIBUFFER_PANEL_H_DEFAULT: u16 = 13;
 pub const MINIBUFFER_PANEL_H_MIN: u16 = 3;
 pub const MINIBUFFER_PANEL_H_MAX: u16 = 80;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
+const TUI_TRACE_SLOW_MS: u128 = 4;
+
+fn tui_trace_path() -> Option<&'static PathBuf> {
+    static TRACE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    TRACE_PATH
+        .get_or_init(|| std::env::var_os("AGENTD_TUI_TRACE").map(PathBuf::from))
+        .as_ref()
+}
+
+pub(crate) fn trace_tui_duration(label: impl AsRef<str>, elapsed: Duration) {
+    if elapsed.as_millis() < TUI_TRACE_SLOW_MS {
+        return;
+    }
+    let Some(path) = tui_trace_path() else {
+        return;
+    };
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let _ = writeln!(
+        file,
+        "{now_ms} {} {}us",
+        label.as_ref(),
+        elapsed.as_micros()
+    );
+}
+
+struct TuiTraceGuard {
+    label: String,
+    started: Instant,
+}
+
+impl TuiTraceGuard {
+    fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for TuiTraceGuard {
+    fn drop(&mut self) {
+        trace_tui_duration(&self.label, self.started.elapsed());
+    }
+}
+
+fn session_event_trace_name(event: &SessionEvent) -> &'static str {
+    match event {
+        SessionEvent::Pty { .. } => "pty",
+        SessionEvent::ToolUse { .. } => "tool_use",
+        SessionEvent::ToolResult { .. } => "tool_result",
+        SessionEvent::TaskStart { .. } => "task_start",
+        SessionEvent::TaskEnd { .. } => "task_end",
+        SessionEvent::TaskBackgrounded { .. } => "task_backgrounded",
+        SessionEvent::EditorState { .. } => "editor_state",
+        SessionEvent::AgentStatus(_) => "agent_status",
+        SessionEvent::Message { .. } => "message",
+        SessionEvent::Reasoning { .. } => "reasoning",
+        SessionEvent::ToolApprovalRequest { .. } => "tool_approval_request",
+        SessionEvent::ToolApprovalResolved { .. } => "tool_approval_resolved",
+        SessionEvent::Status { .. } => "status",
+        SessionEvent::AwaitingInput { .. } => "awaiting_input",
+        SessionEvent::Cost { .. } => "cost",
+        SessionEvent::Diff { .. } => "diff",
+        SessionEvent::Error { .. } => "error",
+        SessionEvent::Reset => "reset",
+        SessionEvent::Done { .. } => "done",
+        SessionEvent::ClientCommand { .. } => "client_command",
+        SessionEvent::PtyResize { .. } => "pty_resize",
+        SessionEvent::UiPanel(_) => "ui_panel",
+        SessionEvent::UiDelete { .. } => "ui_delete",
+        SessionEvent::BrowserPreview(_) => "browser_preview",
+        SessionEvent::ContextCompacted { .. } => "context_compacted",
+    }
+}
 
 /// A row in the rendered list view. Sessions and group headers share the
 /// list; key dispatch and selection are typed.
@@ -1799,7 +1881,9 @@ async fn run_loop(
         app.report_view();
         let skip_draw = std::mem::take(&mut app.skip_redraw_after_event);
         if !skip_draw {
+            let draw_started = Instant::now();
             terminal.draw(|f| ui::render(f, app))?;
+            trace_tui_duration("draw", draw_started.elapsed());
         }
 
         // A session switch should stay interactive while history-sized
@@ -3195,10 +3279,18 @@ impl App {
     }
 
     async fn on_notification(&mut self, n: agentd_protocol::Notification) {
+        let trace_label = n.method.clone();
+        let _notification_trace = TuiTraceGuard::new(format!("notification:{trace_label}"));
         match n.method.as_str() {
             m if m == agentd_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
+                        let trace_label = format!(
+                            "notification:event:{}:{}",
+                            session_event_trace_name(&payload.event),
+                            payload.session_id
+                        );
+                        let _event_trace = TuiTraceGuard::new(trace_label);
                         self.matrix_rain.observe_event(
                             &payload.event,
                             self.matrix_rain_intensity,
