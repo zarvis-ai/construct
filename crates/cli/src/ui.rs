@@ -1827,9 +1827,7 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
         label_x,
         area.y,
         label.as_str(),
-        Style::default()
-            .fg(app.theme.accent)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(app.theme.accent),
     );
     let operator_start = label_x.saturating_add(1);
     let operator_end = operator_start.saturating_add(UnicodeWidthStr::width(operator_text) as u16);
