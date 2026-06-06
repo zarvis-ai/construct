@@ -2053,7 +2053,10 @@ pub async fn run(
         None
     };
     let mut obs_limiter = crate::observe::RateLimiter::new(5, std::time::Duration::from_secs(60));
-    let ambient_loop = is_orchestrator.then(operator_ambient_loop_interval);
+    let ambient_loop = is_orchestrator.then(|| OperatorAmbientLoop {
+        interval: operator_ambient_loop_interval(),
+        self_id: session_id.clone(),
+    });
     // Operator's own id (to exclude from the ambient fleet snapshot) and the
     // prior-tick session states (for the per-tick delta).
     let self_id_for_ambient = session_id.clone();
@@ -2092,7 +2095,7 @@ pub async fn run(
                 obs_rx.as_mut(),
                 &mut bg_completion_rx,
                 &tasks,
-                ambient_loop,
+                ambient_loop.clone(),
             )
             .await
             {
@@ -2974,12 +2977,18 @@ enum ReadOutcome {
     Eof,
 }
 
+#[derive(Clone)]
+struct OperatorAmbientLoop {
+    interval: Duration,
+    self_id: String,
+}
+
 fn operator_ambient_loop_interval() -> Duration {
     let secs = std::env::var("AGENTD_OPERATOR_AMBIENT_LOOP_SECS")
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
-        .unwrap_or(300)
-        .clamp(60, 86_400);
+        .unwrap_or(60)
+        .clamp(10, 86_400);
     Duration::from_secs(secs)
 }
 
@@ -2991,6 +3000,15 @@ const AMBIENT_TICK_FALLBACK: &str = "OBSERVATION: ambient operator loop tick. Qu
 /// claude/codex/shell sessions never emit `AwaitingInput`, so PTY quiescence
 /// (`last_pty_at_ms`) is the only "is it waiting?" signal available for them.
 const IDLE_RUNNING_MINS: i64 = 10;
+
+fn ambient_active_window() -> Duration {
+    let secs = std::env::var("AGENTD_OPERATOR_ACTIVE_WINDOW_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(IDLE_RUNNING_MINS as u64 * 60)
+        .clamp(60, 86_400);
+    Duration::from_secs(secs)
+}
 
 /// Max sessions previewed per tick. Override with `AGENTD_OPERATOR_PREVIEW_SESSIONS`.
 fn preview_session_cap() -> usize {
@@ -3028,6 +3046,43 @@ struct AmbientSnapshot {
     /// `(session_id, label)` for the notable sessions worth an inline preview,
     /// most important first. The caller previews the top [`PREVIEW_SESSIONS`].
     preview_targets: Vec<(String, String)>,
+}
+
+async fn operator_fleet_has_active_session(self_id: &str) -> bool {
+    let socket = agentd_protocol::paths::Paths::discover().socket();
+    let Ok(client) = agentd_client::Client::connect(&socket).await else {
+        return false;
+    };
+    let Ok(sessions) = client.list().await else {
+        return false;
+    };
+    let now = chrono::Utc::now();
+    let window = ambient_active_window();
+    sessions
+        .iter()
+        .any(|session| ambient_session_is_active(session, self_id, now, window))
+}
+
+fn ambient_session_is_active(
+    session: &agentd_protocol::SessionSummary,
+    self_id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    window: Duration,
+) -> bool {
+    if session.id == self_id || session.state.is_terminal() {
+        return false;
+    }
+    let window_ms = window.as_millis() as i64;
+    let now_ms = now.timestamp_millis();
+    let recent_pty = session
+        .last_pty_at_ms
+        .is_some_and(|last| now_ms.saturating_sub(last).max(0) <= window_ms);
+    let recent_event = session
+        .last_event_at
+        .is_some_and(|last| (now - last).num_milliseconds().max(0) <= window_ms);
+    recent_pty || recent_event || session.state == agentd_protocol::SessionState::Running
+        && session.last_pty_at_ms.is_none()
+        && session.last_event_at.is_none()
 }
 
 /// Build the ambient-tick observation text. Pulls a live fleet snapshot from
@@ -3313,7 +3368,7 @@ async fn read_one_line(
     mut obs_rx: Option<&mut tokio::sync::mpsc::UnboundedReceiver<crate::observe::Observation>>,
     bg_completion_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tasks::BackgroundCompletion>,
     tasks: &std::sync::Arc<crate::tasks::Tasks>,
-    ambient_loop: Option<Duration>,
+    ambient_loop: Option<OperatorAmbientLoop>,
 ) -> ReadOutcome {
     loop {
         let inbox_recv = inbox.recv();
@@ -3325,9 +3380,15 @@ async fn read_one_line(
         };
         let bg_recv = bg_completion_rx.recv();
         let ambient_tick = async {
-            match ambient_loop {
-                Some(interval) => tokio::time::sleep(interval).await,
-                None => std::future::pending().await,
+            let Some(config) = ambient_loop.clone() else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            loop {
+                tokio::time::sleep(config.interval).await;
+                if operator_fleet_has_active_session(&config.self_id).await {
+                    return;
+                }
             }
         };
         let msg = tokio::select! {
