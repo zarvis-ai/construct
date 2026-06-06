@@ -812,6 +812,20 @@ impl Client {
         )
         .await
     }
+    /// Fetch the most-recent `n` transcript events (bounded tail) — used for
+    /// compact previews without paginating a long history.
+    pub async fn transcript_tail(&self, id: &str, n: usize) -> Result<TranscriptResult> {
+        self.request(
+            ipc_method::SESSION_TRANSCRIPT,
+            &TranscriptParams {
+                session_id: id.to_string(),
+                from: 0,
+                limit: None,
+                tail: Some(n),
+            },
+        )
+        .await
+    }
     pub async fn subscribe(&self, session_id: Option<String>) -> Result<()> {
         let _: serde_json::Value = self
             .request(

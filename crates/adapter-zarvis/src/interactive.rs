@@ -1329,47 +1329,59 @@ mod tests {
     }
 
     #[test]
-    fn ambient_observation_counts_excludes_self_and_reports_deltas() {
-        fn summary(id: &str, state: &str) -> agentd_protocol::SessionSummary {
-            serde_json::from_value(serde_json::json!({
-                "id": id, "harness": "zarvis", "cwd": "/x",
-                "state": state, "created_at": "2026-06-06T00:00:00Z"
-            }))
-            .unwrap()
-        }
+    fn ambient_snapshot_counts_idle_deltas_and_preview_priority() {
         let now = chrono::Utc::now();
+        let stale = now.timestamp_millis() - 15 * 60_000; // quiet 15m → idle
+        let fresh = now.timestamp_millis();
+        fn summary(id: &str, state: &str, last_pty_ms: Option<i64>) -> agentd_protocol::SessionSummary {
+            let mut v = serde_json::json!({
+                "id": id, "harness": "claude", "cwd": "/x",
+                "state": state, "created_at": "2026-06-06T00:00:00Z"
+            });
+            if let Some(ms) = last_pty_ms {
+                v["last_pty_at_ms"] = ms.into();
+            }
+            serde_json::from_value(v).unwrap()
+        }
         let mut prev = HashMap::new();
 
-        // First tick: counts exclude the operator's own session; baseline only.
+        // First tick: own session excluded; a running session quiet ≥10m is
+        // flagged idle while a freshly-active one is not; baseline (no delta).
         let sessions = vec![
-            summary("self0000", "running"),
-            summary("aaaa1111", "running"),
-            summary("bbbb2222", "awaiting_input"),
-            summary("cccc3333", "errored"),
+            summary("self0000", "running", Some(fresh)),
+            summary("aaaa1111", "running", Some(stale)), // idle
+            summary("bbbb2222", "running", Some(fresh)), // busy
+            summary("cccc3333", "errored", None),
         ];
-        let first = format_ambient_observation(&sessions, "self0000", &mut prev, now);
+        let snap = compute_ambient_snapshot(&sessions, "self0000", &mut prev, now);
         assert!(
-            first.contains("1 running, 1 awaiting_input, 1 errored"),
-            "{first}"
+            snap.summary.contains("2 running (1 idle"),
+            "{}",
+            snap.summary
         );
-        assert!(first.contains("baseline only"), "{first}");
+        assert!(snap.summary.contains("1 errored"), "{}", snap.summary);
+        assert!(
+            snap.summary.contains("aaaa1111") && snap.summary.contains("quiet"),
+            "{}",
+            snap.summary
+        );
+        assert!(snap.summary.contains("baseline only"), "{}", snap.summary);
+        // Preview priority: errored first, then idle.
+        assert_eq!(snap.preview_targets[0].0, "cccc3333");
+        assert!(snap.preview_targets.iter().any(|(id, _)| id == "aaaa1111"));
 
-        // Second tick: aaaa1111 running → errored should surface as a delta,
-        // and the counts update (running 0, errored 2).
+        // Second tick: aaaa1111 → done surfaces as a delta.
         let sessions2 = vec![
-            summary("self0000", "running"),
-            summary("aaaa1111", "errored"),
-            summary("bbbb2222", "awaiting_input"),
-            summary("cccc3333", "errored"),
+            summary("self0000", "running", Some(fresh)),
+            summary("aaaa1111", "done", None),
+            summary("bbbb2222", "running", Some(fresh)),
+            summary("cccc3333", "errored", None),
         ];
-        let second = format_ambient_observation(&sessions2, "self0000", &mut prev, now);
+        let snap2 = compute_ambient_snapshot(&sessions2, "self0000", &mut prev, now);
         assert!(
-            second.contains("aaaa1111") && second.contains("→ errored"),
-            "{second}"
-        );
-        assert!(
-            second.contains("0 running, 1 awaiting_input, 2 errored"),
-            "{second}"
+            snap2.summary.contains("aaaa1111") && snap2.summary.contains("→ done"),
+            "{}",
+            snap2.summary
         );
     }
 
@@ -2962,11 +2974,27 @@ fn operator_ambient_loop_interval() -> Duration {
 /// Bare ambient-tick prompt used when the daemon snapshot is unavailable.
 const AMBIENT_TICK_FALLBACK: &str = "OBSERVATION: ambient operator loop tick. Quietly inspect only if useful; update Operator widgets for helpful ambient status; reply exactly `noted` if nothing needs surfacing.";
 
+/// Minutes a `Running` PTY session may go without output before the snapshot
+/// treats it as idle (likely waiting for input, or stuck). Interactive
+/// claude/codex/shell sessions never emit `AwaitingInput`, so PTY quiescence
+/// (`last_pty_at_ms`) is the only "is it waiting?" signal available for them.
+const IDLE_RUNNING_MINS: i64 = 10;
+/// How many notable sessions get an inline transcript preview each tick. Keeps
+/// the observation's input cost bounded even on a large fleet.
+const PREVIEW_SESSIONS: usize = 3;
+
+struct AmbientSnapshot {
+    summary: String,
+    /// `(session_id, label)` for the notable sessions worth an inline preview,
+    /// most important first. The caller previews the top [`PREVIEW_SESSIONS`].
+    preview_targets: Vec<(String, String)>,
+}
+
 /// Build the ambient-tick observation text. Pulls a live fleet snapshot from
-/// the daemon and folds in what changed since the previous tick, so the
-/// Operator has concrete signal to react to instead of a blank "go look".
+/// the daemon, folds in what changed since the previous tick, and attaches a
+/// short recent-transcript preview for the few most notable sessions — so the
+/// Operator has concrete signal instead of a blank "go look".
 /// Falls back to [`AMBIENT_TICK_FALLBACK`] if the daemon can't be reached.
-/// `prev` carries each session's last-seen state across ticks for the delta.
 async fn build_ambient_observation(
     self_id: &str,
     prev: &mut HashMap<String, agentd_protocol::SessionState>,
@@ -2978,34 +3006,81 @@ async fn build_ambient_observation(
     let Ok(sessions) = client.list().await else {
         return AMBIENT_TICK_FALLBACK.to_string();
     };
-    format_ambient_observation(&sessions, self_id, prev, chrono::Utc::now())
+    let snap = compute_ambient_snapshot(&sessions, self_id, prev, chrono::Utc::now());
+    let mut out = snap.summary;
+    // Selectively attach a compact preview for only the top few notable
+    // sessions, so the Operator can judge them without ballooning context.
+    for (sid, label) in snap.preview_targets.iter().take(PREVIEW_SESSIONS) {
+        if let Some(preview) = fetch_session_preview(&client, sid).await {
+            out.push_str(&format!("\n\n{label} — recent:\n{preview}"));
+        }
+    }
+    out
 }
 
-/// Pure formatter for the ambient-tick observation: counts active sessions by
-/// state, lists what changed since the previous tick, flags what needs
-/// attention, and updates `prev` for the next delta. Split out from the daemon
-/// round-trip so it's testable.
-fn format_ambient_observation(
+/// Compact, ANSI-free preview of a session's recent activity: the last few
+/// non-empty messages from its transcript tail. Bounded by design (a small
+/// tail, a few messages, each truncated).
+async fn fetch_session_preview(client: &agentd_client::Client, sid: &str) -> Option<String> {
+    let tr = client.transcript_tail(sid, 24).await.ok()?;
+    let mut lines: Vec<String> = Vec::new();
+    for ev in tr.events.iter().rev() {
+        if let agentd_protocol::SessionEvent::Message { role, text } = &ev.event {
+            let t = text.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let one: String = t.chars().take(200).collect::<String>().replace('\n', " ");
+            lines.push(format!("  [{role:?}] {one}"));
+            if lines.len() >= 3 {
+                break;
+            }
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
+}
+
+/// Pure snapshot builder: counts active sessions by state (including idle
+/// running, detected via PTY quiescence), lists what changed since the previous
+/// tick, flags what needs attention, and returns the notable sessions to
+/// preview. Split from the daemon round-trip so it's testable. Updates `prev`.
+fn compute_ambient_snapshot(
     sessions: &[agentd_protocol::SessionSummary],
     self_id: &str,
     prev: &mut HashMap<String, agentd_protocol::SessionState>,
     now: chrono::DateTime<chrono::Utc>,
-) -> String {
+) -> AmbientSnapshot {
     use agentd_protocol::SessionState;
+    let now_ms = now.timestamp_millis();
     let first_tick = prev.is_empty();
     let label = |s: &agentd_protocol::SessionSummary| -> String {
         let title = s.title.clone().unwrap_or_else(|| s.harness.clone());
         let short: String = s.id.chars().take(8).collect();
         format!("{short} \"{}\"", title.chars().take(32).collect::<String>())
     };
-    let idle_min = |s: &agentd_protocol::SessionSummary| -> i64 {
+    let event_idle_min = |s: &agentd_protocol::SessionSummary| -> i64 {
         s.last_event_at
             .map(|t| (now - t).num_minutes().max(0))
             .unwrap_or(0)
     };
+    // Minutes since last PTY byte — the "actually quiet?" signal. `None` (no
+    // PTY, e.g. headless) yields a negative value so it never counts as idle.
+    let pty_idle_min = |s: &agentd_protocol::SessionSummary| -> i64 {
+        match s.last_pty_at_ms {
+            Some(ms) => (now_ms - ms).max(0) / 60_000,
+            None => -1,
+        }
+    };
 
-    let (mut running, mut awaiting, mut errored) = (0usize, 0usize, 0usize);
-    let mut notable: Vec<String> = Vec::new();
+    let (mut running, mut awaiting, mut errored, mut idle) = (0usize, 0usize, 0usize, 0usize);
+    // (session_id, line) per category, in priority order for needs-attention + preview.
+    let mut errored_list: Vec<(String, String)> = Vec::new();
+    let mut idle_list: Vec<(String, String)> = Vec::new();
+    let mut awaiting_list: Vec<(String, String)> = Vec::new();
     let mut changes: Vec<String> = Vec::new();
     let mut cur: HashMap<String, SessionState> = HashMap::new();
 
@@ -3025,49 +3100,79 @@ fn format_ambient_observation(
             }
         }
         match s.state {
-            SessionState::Running => running += 1,
+            SessionState::Running => {
+                running += 1;
+                let pm = pty_idle_min(s);
+                if pm >= IDLE_RUNNING_MINS {
+                    idle += 1;
+                    idle_list.push((
+                        s.id.clone(),
+                        format!("{} running but quiet {pm}m (idle/waiting?)", label(s)),
+                    ));
+                }
+            }
             SessionState::AwaitingInput => {
                 awaiting += 1;
-                let m = idle_min(s);
+                let m = event_idle_min(s);
                 if m >= 30 {
-                    notable.push(format!("{} awaiting_input {m}m", label(s)));
+                    awaiting_list.push((s.id.clone(), format!("{} awaiting_input {m}m", label(s))));
                 }
             }
             SessionState::Errored => {
                 errored += 1;
-                notable.push(format!("{} errored {}m ago", label(s), idle_min(s)));
+                errored_list
+                    .push((s.id.clone(), format!("{} errored {}m ago", label(s), event_idle_min(s))));
             }
             _ => {}
         }
     }
     *prev = cur;
 
-    let cap = |mut v: Vec<String>, n: usize| -> String {
+    let mut notable: Vec<(String, String)> = Vec::new();
+    notable.extend(errored_list);
+    notable.extend(idle_list);
+    notable.extend(awaiting_list);
+
+    let cap_lines = |v: &[(String, String)], n: usize| -> String {
         if v.is_empty() {
             return "none".to_string();
         }
         let extra = v.len().saturating_sub(n);
-        v.truncate(n);
+        let mut shown: Vec<String> = v.iter().take(n).map(|(_, l)| l.clone()).collect();
         if extra > 0 {
-            v.push(format!("(+{extra} more)"));
+            shown.push(format!("(+{extra} more)"));
         }
-        v.join("; ")
+        shown.join("; ")
     };
     let changes_line = if first_tick {
         "(first tick — baseline only)".to_string()
+    } else if changes.is_empty() {
+        "none".to_string()
     } else {
-        cap(changes, 6)
+        let extra = changes.len().saturating_sub(6);
+        let mut c: Vec<String> = changes.into_iter().take(6).collect();
+        if extra > 0 {
+            c.push(format!("(+{extra} more)"));
+        }
+        c.join("; ")
     };
 
-    format!(
+    let summary = format!(
         "OBSERVATION: ambient operator loop tick.\n\
-         Fleet now: {running} running, {awaiting} awaiting_input, {errored} errored.\n\
+         Fleet now: {running} running ({idle} idle ≥{IDLE_RUNNING_MINS}m), {awaiting} awaiting_input, {errored} errored.\n\
          Changes since last tick: {changes_line}.\n\
          Needs attention: {}.\n\
-         If a session looks stuck, errored, or surprising, inspect it (transcript/diff/output) and \
-         surface one short sentence or update an Operator widget. Otherwise reply exactly `noted`.",
-        cap(notable, 6),
-    )
+         A 'running but quiet' session is likely waiting for the user or stuck — interactive \
+         claude/codex sessions don't signal awaiting_input, so judge them by the preview below.\n\
+         If a session looks stuck, errored, or worth surfacing, say one short sentence or update an \
+         Operator widget. Otherwise reply exactly `noted`.",
+        cap_lines(&notable, 6),
+    );
+
+    AmbientSnapshot {
+        summary,
+        preview_targets: notable,
+    }
 }
 
 fn background_completion_observation_text(

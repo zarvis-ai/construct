@@ -27,3 +27,19 @@ The tick now performs a cheap daemon round-trip (`session.list`) every interval;
 ## Non-Goals
 
 Does not change the loop interval, the orchestrator-only gate, or the fleet-event observation pipeline. Does not persist snapshot state across restarts. Does not grant the ambient loop extra authority.
+
+## Update (idle detection + selective previews)
+
+The snapshot also flags **idle running** sessions — `Running` with no PTY byte
+for `IDLE_RUNNING_MINS` (10m), detected from `last_pty_at_ms`. This closes a
+blind spot: interactive `claude`/`codex`/`shell` sessions never emit
+`AwaitingInput` (only their headless paths do) and the daemon doesn't infer
+idle from quiescence, so the Operator otherwise can't tell a finished/waiting
+session from a busy one. Idle running is the most common "needs attention" case
+for those harnesses.
+
+For the few most notable sessions (errored, then idle, then long-awaiting,
+capped at `PREVIEW_SESSIONS`), the tick attaches a short ANSI-free preview — the
+last few non-empty messages from the session's transcript tail — so the
+Operator has concrete content to judge. Previews are deliberately selective to
+keep the observation's input cost bounded on a large fleet.
