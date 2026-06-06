@@ -652,6 +652,10 @@
   .widget-body { padding: 8px; font-size: 13px; line-height: 1.35; }
   .widget-body p { margin: 0 0 8px; }
   .widget-body h1, .widget-body h2, .widget-body h3 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
+  .widget-table { border-collapse: collapse; width: 100%; margin: 4px 0 8px; font-size: 12px; }
+  .widget-table th, .widget-table td { border: 1px solid var(--border); padding: 3px 7px; vertical-align: top; }
+  .widget-table th { color: var(--accent); font-weight: 600; background: color-mix(in srgb, var(--accent) 10%, transparent); }
+  .widget-table tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
   .widget-line { display: flex; gap: 6px; align-items: baseline; min-height: 1.35em; }
   .widget-indent { display: inline-block; flex: 0 0 auto; }
   .widget-glyph { color: var(--accent); width: 1.2em; flex: 0 0 1.2em; text-align: center; }
@@ -5095,6 +5099,12 @@ function renderWidgetMarkdown(markdown, sessionId, panelId, options = {}) {
       html.push(renderTimeline(block, sessionId, panelId));
       continue;
     }
+    if (isTableStart(lines, i)) {
+      const table = renderTableFrom(lines, i, sessionId, panelId);
+      html.push(table.html);
+      i = table.next - 1; // the loop's i += 1 lands on the next line
+      continue;
+    }
     if (!line.trim()) continue;
     const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);
     if (heading) {
@@ -5114,6 +5124,58 @@ function renderWidgetMarkdown(markdown, sessionId, panelId, options = {}) {
     }
   }
   return html.join("");
+}
+
+function tableCells(line) {
+  let t = String(line || "").trim();
+  if (t.startsWith("|")) t = t.slice(1);
+  if (t.endsWith("|")) t = t.slice(0, -1);
+  return t.split("|").map((c) => c.trim());
+}
+
+function isTableDelimiterRow(line) {
+  if (!String(line || "").includes("|")) return false;
+  const cells = tableCells(line);
+  return cells.length > 0 && cells.every((c) => /^:?-+:?$/.test(c));
+}
+
+// A GFM table is a header row immediately followed by a `| --- |` delimiter
+// row. Requiring the delimiter keeps a plain line that merely contains a pipe
+// from being treated as a table.
+function isTableStart(lines, i) {
+  const header = lines[i];
+  if (!header || !header.includes("|") || !header.trim()) return false;
+  return isTableDelimiterRow(lines[i + 1] || "");
+}
+
+function tableCellAlign(cell) {
+  const c = String(cell || "").trim();
+  const left = c.startsWith(":");
+  const right = c.endsWith(":");
+  if (left && right) return "center";
+  if (right) return "right";
+  return "left";
+}
+
+function renderTableFrom(lines, start, sessionId, panelId) {
+  const header = tableCells(lines[start]);
+  const aligns = tableCells(lines[start + 1]).map(tableCellAlign);
+  const rows = [];
+  let i = start + 2;
+  while (i < lines.length) {
+    const l = lines[i];
+    if (!l.trim() || !l.includes("|") || isTableDelimiterRow(l)) break;
+    rows.push(tableCells(l));
+    i += 1;
+  }
+  const cell = (text, c, tag) => {
+    const align = aligns[c] || "left";
+    const inner = renderInlineActions(stripMarkdownEmphasis(text || ""), sessionId, panelId);
+    return `<${tag} style="text-align:${align}">${inner}</${tag}>`;
+  };
+  const thead = `<thead><tr>${header.map((c, idx) => cell(c, idx, "th")).join("")}</tr></thead>`;
+  const tbody = `<tbody>${rows.map((row) => `<tr>${row.map((c, idx) => cell(c, idx, "td")).join("")}</tr>`).join("")}</tbody>`;
+  return { html: `<table class="widget-table">${thead}${tbody}</table>`, next: i };
 }
 
 function isTimelineOpen(line) {

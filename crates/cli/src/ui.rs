@@ -3452,7 +3452,15 @@ fn render_agentd_markdown_lines(
     let mut rendered_rows = 0usize;
     let mut skipped_first_heading = false;
     let mut in_timeline: Option<TimelineBlock> = None;
-    for raw in markdown.lines() {
+    // Index-based so block elements that need lookahead (GFM tables, whose
+    // header row is only a table once the next line is a `| --- |` delimiter)
+    // can consume several source lines at once.
+    let src_lines: Vec<&str> = markdown.lines().collect();
+    let mut li = 0;
+    while li < src_lines.len() {
+        let cur = li;
+        let raw = src_lines[cur];
+        li += 1;
         let line = raw.trim_end();
         if let Some(timeline) = in_timeline.as_mut() {
             if line.trim() == ":::" {
@@ -3473,6 +3481,22 @@ fn render_agentd_markdown_lines(
             } else {
                 timeline.items.push(line.to_string());
             }
+            continue;
+        }
+        // GFM table: a header row immediately followed by a `| --- |`
+        // delimiter row. Consumes the whole block (hence the index loop) and
+        // is detected before the paragraph fallback so the pipes render as an
+        // aligned grid instead of literal text.
+        if let Some((table, consumed)) = parse_markdown_table(&src_lines, cur) {
+            if !pending_action_spans.is_empty() {
+                let flushed = Line::from(std::mem::take(&mut pending_action_spans));
+                rendered_rows += visual_line_count(std::iter::once(&flushed), panel_area.width);
+                lines.push(flushed);
+            }
+            let rendered = render_markdown_table(&table, theme, panel_area);
+            rendered_rows += visual_line_count(rendered.iter(), panel_area.width);
+            lines.extend(rendered);
+            li = cur + consumed;
             continue;
         }
         if is_timeline_open(line) {
@@ -3626,6 +3650,238 @@ fn render_agentd_markdown_lines(
         ));
     }
     lines
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CellAlign {
+    Left,
+    Center,
+    Right,
+}
+
+#[derive(Debug)]
+struct MarkdownTable {
+    header: Vec<String>,
+    aligns: Vec<CellAlign>,
+    rows: Vec<Vec<String>>,
+}
+
+/// Detect a GFM table starting at `lines[start]`: a header row immediately
+/// followed by a delimiter row (`| --- | :--: |`). Returns the parsed table
+/// plus how many source lines it spans, or `None` when `start` isn't a table.
+/// The delimiter-row requirement keeps a plain paragraph that merely contains
+/// a `|` from being mistaken for a table.
+fn parse_markdown_table(lines: &[&str], start: usize) -> Option<(MarkdownTable, usize)> {
+    let header_line = lines.get(start)?.trim();
+    let delim_line = lines.get(start + 1)?.trim();
+    if !line_has_table_cells(header_line) || !line_has_table_cells(delim_line) {
+        return None;
+    }
+    let delim_cells = split_table_cells(delim_line);
+    if delim_cells.is_empty() || !delim_cells.iter().all(|c| is_delimiter_cell(c)) {
+        return None;
+    }
+    let header = split_table_cells(header_line);
+    let aligns = delim_cells.iter().map(|c| cell_align(c)).collect();
+    let mut rows = Vec::new();
+    let mut i = start + 2;
+    while let Some(l) = lines.get(i) {
+        let t = l.trim();
+        if t.is_empty() || !line_has_table_cells(t) || is_delimiter_row(t) {
+            break;
+        }
+        rows.push(split_table_cells(t));
+        i += 1;
+    }
+    Some((
+        MarkdownTable {
+            header,
+            aligns,
+            rows,
+        },
+        i - start,
+    ))
+}
+
+fn line_has_table_cells(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.contains('|')
+}
+
+fn is_delimiter_row(line: &str) -> bool {
+    let cells = split_table_cells(line);
+    !cells.is_empty() && cells.iter().all(|c| is_delimiter_cell(c))
+}
+
+/// Split one `| a | b |` row into trimmed cells, tolerating missing outer
+/// pipes (`a | b`).
+fn split_table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    t.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn is_delimiter_cell(cell: &str) -> bool {
+    let c = cell.trim();
+    let inner = c.trim_start_matches(':').trim_end_matches(':');
+    !inner.is_empty() && inner.chars().all(|ch| ch == '-')
+}
+
+fn cell_align(cell: &str) -> CellAlign {
+    let c = cell.trim();
+    match (c.starts_with(':'), c.ends_with(':')) {
+        (true, true) => CellAlign::Center,
+        (false, true) => CellAlign::Right,
+        _ => CellAlign::Left,
+    }
+}
+
+/// Reduce a cell's inline markdown to plain display text: strip `**` emphasis
+/// and collapse `[label](target)` links to their label. TUI table cells render
+/// as aligned plain text — an action link inside a cell shows as its label
+/// rather than being clickable (the web UI renders cell links live).
+fn table_cell_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        let Some(close) = after.find(']') else {
+            out.push_str(&rest[open..]);
+            return out.replace("**", "");
+        };
+        let label = &after[..close];
+        let tail = &after[close + 1..];
+        if let Some(paren_inner) = tail.strip_prefix('(') {
+            if let Some(end) = paren_inner.find(')') {
+                out.push_str(label);
+                rest = &paren_inner[end + 1..];
+                continue;
+            }
+        }
+        out.push('[');
+        out.push_str(label);
+        out.push(']');
+        rest = tail;
+    }
+    out.push_str(rest);
+    out.replace("**", "")
+}
+
+fn render_markdown_table(
+    table: &MarkdownTable,
+    theme: &Theme,
+    panel_area: Rect,
+) -> Vec<Line<'static>> {
+    let ncols = table
+        .header
+        .len()
+        .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
+    if ncols == 0 {
+        return Vec::new();
+    }
+    // Natural column widths from the plain-text header + body cells.
+    let mut widths = vec![0usize; ncols];
+    let measure = |s: &str| UnicodeWidthStr::width(table_cell_text(s).as_str());
+    for (c, h) in table.header.iter().enumerate() {
+        if c < ncols {
+            widths[c] = widths[c].max(measure(h));
+        }
+    }
+    for row in &table.rows {
+        for (c, cell) in row.iter().enumerate() {
+            if c < ncols {
+                widths[c] = widths[c].max(measure(cell));
+            }
+        }
+    }
+    // Fit to the panel: columns join with " │ " (width 3). Shrink the widest
+    // column (floor 3) until the row fits the panel's inner width.
+    const SEP_W: usize = 3;
+    let avail = (panel_area.width as usize).saturating_sub(2);
+    let overhead = SEP_W * ncols.saturating_sub(1);
+    let mut total = widths.iter().sum::<usize>() + overhead;
+    while total > avail {
+        let Some((idx, &w)) = widths.iter().enumerate().max_by_key(|(_, w)| **w) else {
+            break;
+        };
+        if w <= 3 {
+            break;
+        }
+        widths[idx] -= 1;
+        total -= 1;
+    }
+    let mut out = Vec::with_capacity(table.rows.len() + 2);
+    out.push(table_row_line(&table.header, &widths, &table.aligns, theme, true));
+    out.push(table_rule_line(&widths, theme));
+    for row in &table.rows {
+        out.push(table_row_line(row, &widths, &table.aligns, theme, false));
+    }
+    out
+}
+
+fn table_row_line(
+    cells: &[String],
+    widths: &[usize],
+    aligns: &[CellAlign],
+    theme: &Theme,
+    header: bool,
+) -> Line<'static> {
+    let cell_style = if header {
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.text)
+    };
+    let sep_style = Style::default().fg(theme.dim);
+    let mut spans = Vec::with_capacity(widths.len() * 2);
+    for (c, &width) in widths.iter().enumerate() {
+        if c > 0 {
+            spans.push(Span::styled(" │ ".to_string(), sep_style));
+        }
+        let raw = cells.get(c).map(String::as_str).unwrap_or("");
+        let align = aligns.get(c).copied().unwrap_or(CellAlign::Left);
+        spans.push(Span::styled(pad_table_cell(raw, width, align), cell_style));
+    }
+    Line::from(spans)
+}
+
+fn table_rule_line(widths: &[usize], theme: &Theme) -> Line<'static> {
+    let mut s = String::new();
+    for (c, &width) in widths.iter().enumerate() {
+        if c > 0 {
+            s.push_str("─┼─");
+        }
+        s.push_str(&"─".repeat(width));
+    }
+    Line::from(Span::styled(s, Style::default().fg(theme.dim)))
+}
+
+/// Plain-text cell content padded (or truncated with `…`) to `width` columns
+/// per `align`.
+fn pad_table_cell(text: &str, width: usize, align: CellAlign) -> String {
+    let content = table_cell_text(text);
+    let w = UnicodeWidthStr::width(content.as_str());
+    if w > width {
+        // Reuse the shared truncator, then pad to the exact column width so
+        // the grid stays aligned even when truncation lands on a wide-char
+        // boundary.
+        let mut truncated = truncate_to_width(&content, width);
+        let tw = UnicodeWidthStr::width(truncated.as_str());
+        if tw < width {
+            truncated.push_str(&" ".repeat(width - tw));
+        }
+        return truncated;
+    }
+    let pad = width - w;
+    match align {
+        CellAlign::Left => format!("{content}{}", " ".repeat(pad)),
+        CellAlign::Right => format!("{}{content}", " ".repeat(pad)),
+        CellAlign::Center => {
+            let left = pad / 2;
+            format!("{}{content}{}", " ".repeat(left), " ".repeat(pad - left))
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -7372,5 +7628,53 @@ mod tests {
         let panel = widget(&huge);
         let h = inline_widget_rows(&panel, 40, 12, &Theme::default());
         assert_eq!(h, 12, "must never exceed available_height");
+    }
+
+    #[test]
+    fn parse_markdown_table_detects_gfm() {
+        let lines = vec![
+            "| Name | Status |",
+            "| --- | :---: |",
+            "| build | ok |",
+            "| test | fail |",
+        ];
+        let (table, consumed) = parse_markdown_table(&lines, 0).expect("table");
+        assert_eq!(consumed, 4);
+        assert_eq!(table.header, vec!["Name", "Status"]);
+        assert_eq!(table.aligns, vec![CellAlign::Left, CellAlign::Center]);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[1], vec!["test", "fail"]);
+    }
+
+    #[test]
+    fn parse_markdown_table_tolerates_missing_outer_pipes() {
+        let lines = vec!["a | b", "--- | ---:", "1 | 2"];
+        let (table, _) = parse_markdown_table(&lines, 0).expect("table");
+        assert_eq!(table.header, vec!["a", "b"]);
+        assert_eq!(table.aligns, vec![CellAlign::Left, CellAlign::Right]);
+        assert_eq!(table.rows[0], vec!["1", "2"]);
+    }
+
+    #[test]
+    fn parse_markdown_table_requires_a_delimiter_row() {
+        // A paragraph that merely contains a pipe must not become a table.
+        let lines = vec!["a | b is a sentence", "more prose"];
+        assert!(parse_markdown_table(&lines, 0).is_none());
+    }
+
+    #[test]
+    fn table_cell_text_collapses_links_and_emphasis() {
+        assert_eq!(table_cell_text("**bold**"), "bold");
+        assert_eq!(table_cell_text("[Run](agentd:action/run)"), "Run");
+        assert_eq!(table_cell_text("see [x](y) end"), "see x end");
+        assert_eq!(table_cell_text("[keep] me"), "[keep] me");
+    }
+
+    #[test]
+    fn render_markdown_table_emits_header_rule_and_rows() {
+        let lines = vec!["| A | B |", "| --- | --- |", "| 1 | 2 |"];
+        let (table, _) = parse_markdown_table(&lines, 0).unwrap();
+        let rendered = render_markdown_table(&table, &Theme::default(), Rect::new(0, 0, 40, 10));
+        assert_eq!(rendered.len(), 3, "header + rule + one body row");
     }
 }

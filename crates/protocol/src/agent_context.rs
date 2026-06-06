@@ -131,6 +131,15 @@ fn widget_markdown_extensions() -> Vec<WidgetMarkdownExtension> {
             .to_string(),
         use_when: "Use for multi-step task progress, mission plans, status history, and review/check workflows where connected bullets read better than a plain list."
             .to_string(),
+    },
+    WidgetMarkdownExtension {
+        name: "table".to_string(),
+        description: "Render a GitHub-flavored Markdown table: a header row, then a `| --- | :--: |` delimiter row (colons set column alignment — `:--` left, `:-:` center, `--:` right), then one row per line. Outer pipes are optional. Cells may contain inline agentd action links. Wide tables shrink to fit the panel."
+            .to_string(),
+        syntax: "| Check | Status |\n| --- | :---: |\n| build | [x] ok |\n| tests | [Run](agentd:action/run-tests?key=t) |"
+            .to_string(),
+        use_when: "Use for compact tabular status — checks, metrics, file/owner lists, side-by-side comparisons — where columns read better than prose or a flat list."
+            .to_string(),
     }]
 }
 
