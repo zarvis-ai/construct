@@ -33,8 +33,9 @@ async fn tui_starts_and_quits() {
         .await
         .expect("modeline never rendered");
 
-    // q is the default Quit chord (see crates/cli/src/keymap.rs).
-    tui.send(b"q").expect("send q");
+    // C-x C-c (0x18 0x03) is the global Quit chord — see
+    // crates/cli/src/keymap.rs (plain `q` is no longer bound to Quit).
+    tui.send(b"\x18\x03").expect("send C-x C-c");
     let status = tui
         .wait_exit(Duration::from_secs(5))
         .await
@@ -104,7 +105,7 @@ async fn tui_remote_control_popup_via_palette() {
 
     tui.send(b"\x1b").expect("send Esc");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    tui.send(b"q").expect("send q");
+    tui.send(b"\x18\x03").expect("send C-x C-c"); // global Quit chord
     let status = tui
         .wait_exit(Duration::from_secs(5))
         .await
