@@ -1,0 +1,273 @@
+warning: fields `tool`, `args_summary`, and `risk` are never read
+   --> crates/cli/src/app.rs:368:9
+    |
+365 |     ApproveTool {
+    |     ----------- fields in this variant
+...
+368 |         tool: String,
+    |         ^^^^
+369 |         args_summary: String,
+    |         ^^^^^^^^^^^^
+370 |         risk: agentd_protocol::ToolRisk,
+    |         ^^^^
+    |
+    = note: `MinibufferIntent` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `profile` is never read
+   --> crates/cli/src/app.rs:469:9
+    |
+449 | pub struct App {
+    |            --- field in this struct
+...
+469 |     pub profile: Profile,
+    |         ^^^^^^^
+
+warning: method `selected_list_index` is never used
+    --> crates/cli/src/app.rs:2668:12
+     |
+2136 | impl App {
+     | -------- method in this implementation
+...
+2668 |     pub fn selected_list_index(&self) -> Option<usize> {
+     |            ^^^^^^^^^^^^^^^^^^^
+
+warning: variants `Refresh`, `ScrollUp`, and `ScrollDown` are never constructed
+  --> crates/cli/src/keymap.rs:12:5
+   |
+ 8 | pub enum KeyAction {
+   |          --------- variants in this enum
+...
+12 |     Refresh,
+   |     ^^^^^^^
+...
+54 |     ScrollUp,
+   |     ^^^^^^^^
+55 |     ScrollDown,
+   |     ^^^^^^^^^^
+   |
+   = note: `KeyAction` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: method `label` is never used
+  --> crates/cli/src/keymap.rs:76:12
+   |
+75 | impl Profile {
+   | ------------ method in this implementation
+76 |     pub fn label(self) -> &'static str {
+   |            ^^^^^
+
+warning: method `reset` is never used
+   --> crates/cli/src/keymap.rs:147:12
+    |
+110 | impl ChordState {
+    | --------------- method in this implementation
+...
+147 |     pub fn reset(&mut self) {
+    |            ^^^^^
+
+warning: method `queue` is never used
+   --> crates/cli/src/matrix_rain.rs:313:12
+    |
+172 | impl MatrixRain {
+    | --------------- method in this implementation
+...
+313 |     pub fn queue(
+    |            ^^^^^
+
+warning: method `is_empty` is never used
+   --> crates/cli/src/pty_render.rs:438:12
+    |
+412 | impl ItemHistory {
+    | ---------------- method in this implementation
+...
+438 |     pub fn is_empty(&self) -> bool {
+    |            ^^^^^^^^
+
+warning: unused `Result` that must be used
+    --> crates/cli/src/app.rs:4464:17
+     |
+4464 |                 open_url(&hit.url);
+     |                 ^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+4464 |                 let _ = open_url(&hit.url);
+     |                 +++++++
+
+warning: unused `Result` that must be used
+    --> crates/cli/src/app.rs:4510:13
+     |
+4510 |             open_url(&hit.url);
+     |             ^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+     |
+4510 |             let _ = open_url(&hit.url);
+     |             +++++++
+
+warning: `agentd-cli` (bin "construct") generated 10 warnings
+warning: field `session_id` is never read
+  --> crates/daemon/src/adapter.rs:28:9
+   |
+27 |     Log {
+   |     --- field in this variant
+28 |         session_id: Option<String>,
+   |         ^^^^^^^^^^
+   |
+   = note: `AdapterMessage` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `min_interval_secs` is never used
+  --> crates/daemon/src/loops.rs:44:8
+   |
+44 | pub fn min_interval_secs() -> u64 {
+   |        ^^^^^^^^^^^^^^^^^
+
+warning: function `max_interval_secs` is never used
+  --> crates/daemon/src/loops.rs:52:8
+   |
+52 | pub fn max_interval_secs() -> u64 {
+   |        ^^^^^^^^^^^^^^^^^
+
+warning: function `clamp_interval` is never used
+  --> crates/daemon/src/loops.rs:62:8
+   |
+62 | pub fn clamp_interval(secs: u64) -> (u64, bool) {
+   |        ^^^^^^^^^^^^^^
+
+warning: function `parse_slash_spec` is never used
+   --> crates/daemon/src/loops.rs:345:8
+    |
+345 | pub fn parse_slash_spec(input: &str, now_ms: i64) -> Option<(LoopSpec, Option<i64>, String)> {
+    |        ^^^^^^^^^^^^^^^^
+
+warning: function `parse_duration_secs` is never used
+   --> crates/daemon/src/loops.rs:373:4
+    |
+373 | fn parse_duration_secs(tok: &str) -> Option<u64> {
+    |    ^^^^^^^^^^^^^^^^^^^
+
+warning: methods `port` and `client_count` are never used
+   --> crates/daemon/src/remote.rs:193:12
+    |
+139 | impl RemoteState {
+    | ---------------- methods in this implementation
+...
+193 |     pub fn port(&self) -> u16 {
+    |            ^^^^
+...
+287 |     pub fn client_count(&self) -> u32 {
+    |            ^^^^^^^^^^^^
+
+warning: method `pty_replay` is never used
+    --> crates/daemon/src/session.rs:2587:18
+     |
+ 653 | impl SessionManager {
+     | ------------------- method in this implementation
+...
+2587 |     pub async fn pty_replay(&self, id: &str) -> Result<PtyReplayResult> {
+     |                  ^^^^^^^^^^
+
+warning: method `read_pty_tail` is never used
+   --> crates/daemon/src/storage.rs:521:12
+    |
+ 40 | impl Storage {
+    | ------------ method in this implementation
+...
+521 |     pub fn read_pty_tail(&self, id: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    |            ^^^^^^^^^^^^^
+
+   Compiling construct-adapter-smith v0.8.3 (/Users/moon/agentd/.claude/worktrees/smith-pty-prompt-readline/crates/adapter-smith)
+warning: `agentd` (bin "constructd") generated 9 warnings
+warning: unused import: `system_prompt_for_env`
+  --> crates/adapter-smith/src/interactive.rs:13:30
+   |
+13 | use crate::agent::{push_msg, system_prompt_for_env, ResolvedModel};
+   |                              ^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `ToolCtx`
+  --> crates/adapter-smith/src/tasks.rs:27:20
+   |
+27 | use crate::tools::{ToolCtx, ToolOutcome};
+   |                    ^^^^^^^
+
+warning: unused import: `oneshot`
+  --> crates/adapter-smith/src/tasks.rs:31:25
+   |
+31 | use tokio::sync::{mpsc, oneshot, Mutex};
+   |                         ^^^^^^^
+
+error[E0599]: no method named `reset_history` found for struct `LineEditor` in the current scope
+    --> crates/adapter-smith/src/interactive.rs:2366:36
+     |
+ 637 | struct LineEditor {
+     | ----------------- method `reset_history` not found for this struct
+...
+2366 |                             editor.reset_history();
+     |                                    ^^^^^^^^^^^^^ method not found in `LineEditor`
+
+warning: unused variable: `tasks`
+    --> crates/adapter-smith/src/interactive.rs:3621:5
+     |
+3621 |     tasks: &std::sync::Arc<crate::tasks::Tasks>,
+     |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_tasks`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `emitted_so_far` is assigned to, but never used
+   --> crates/adapter-smith/src/provider/anthropic.rs:173:13
+    |
+173 |         let mut emitted_so_far = 0usize;
+    |             ^^^^^^^^^^^^^^^^^^
+    |
+    = note: consider using `_emitted_so_far` instead
+
+warning: value assigned to `emitted_so_far` is never read
+   --> crates/adapter-smith/src/provider/anthropic.rs:243:37
+    |
+243 | ...                   emitted_so_far = assistant_text.len();
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable `emitted_so_far` is assigned to, but never used
+   --> crates/adapter-smith/src/provider/ollama.rs:164:13
+    |
+164 |         let mut emitted_so_far = 0usize;
+    |             ^^^^^^^^^^^^^^^^^^
+    |
+    = note: consider using `_emitted_so_far` instead
+
+warning: value assigned to `emitted_so_far` is never read
+   --> crates/adapter-smith/src/provider/ollama.rs:192:29
+    |
+192 | ...                   emitted_so_far = assistant_text.len();
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+warning: variable `emitted_so_far` is assigned to, but never used
+   --> crates/adapter-smith/src/provider/openai.rs:176:13
+    |
+176 |         let mut emitted_so_far = 0usize;
+    |             ^^^^^^^^^^^^^^^^^^
+    |
+    = note: consider using `_emitted_so_far` instead
+
+warning: value assigned to `emitted_so_far` is never read
+   --> crates/adapter-smith/src/provider/openai.rs:229:21
+    |
+229 |                     emitted_so_far = assistant_text.len();
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+
+For more information about this error, try `rustc --explain E0599`.
+warning: `construct-adapter-smith` (bin "construct-adapter-smith") generated 10 warnings
+error: could not compile `construct-adapter-smith` (bin "construct-adapter-smith") due to 1 previous error; 10 warnings emitted
