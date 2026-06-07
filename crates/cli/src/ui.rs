@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const MATRIX_RAIN_RAMP_UP_SECS: f32 = 5.0;
 const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
@@ -1665,11 +1665,51 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
 /// Reveal speed and post-typing dwell for the operator monolog.
 const MONOLOG_MS_PER_CHAR: u64 = 28;
 const MONOLOG_HOLD_MS: u64 = 4200;
-const MONOLOG_FADE_MS: u64 = 800;
+/// Clear-space padding around the typewriter text so it reads cleanly over the
+/// rain instead of blending into it.
+const MONOLOG_HPAD: u16 = 2;
+const MONOLOG_VPAD: u16 = 1;
+
+/// Word-wrap `text` to `max_w` display columns: break at spaces where possible,
+/// hard-break overlong words, honor embedded newlines. Returns the lines so the
+/// caller can size a tight box around them.
+fn wrap_to_width(text: &str, max_w: usize) -> Vec<String> {
+    let max_w = max_w.max(1);
+    let mut lines = Vec::new();
+    for raw in text.split('\n') {
+        let mut cur = String::new();
+        let mut cur_w = 0usize;
+        let mut last_space: Option<usize> = None;
+        for ch in raw.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cur_w + cw > max_w && cur_w > 0 {
+                if let Some(sp) = last_space {
+                    let rest = cur[sp + 1..].to_string();
+                    cur.truncate(sp);
+                    lines.push(std::mem::take(&mut cur));
+                    cur = rest;
+                    cur_w = UnicodeWidthStr::width(cur.as_str());
+                } else {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                last_space = None;
+            }
+            if ch == ' ' {
+                last_space = Some(cur.len());
+            }
+            cur.push(ch);
+            cur_w += cw;
+        }
+        lines.push(cur);
+    }
+    lines
+}
 
 /// Overlay the operator's latest monolog on top of the (still-running) matrix
-/// rain as a typewriter line, clearing it once the type → hold → fade cycle
-/// completes. Returns `true` if it drew this frame. Crucially this is an
+/// rain as a bright typewriter line in a padded clear-box, removing it at once
+/// after the type → hold window (no fade). Returns `true` if it drew this
+/// frame. Crucially this is an
 /// *overlay*, not a takeover: the rain is rendered every frame regardless, so
 /// it keeps animating underneath and never restarts when the text clears.
 /// Skipped while the orchestrator panel is open — the operator's text is
@@ -1688,7 +1728,8 @@ pub(crate) fn render_operator_monolog(
     let n = chars.len() as u64;
     let elapsed = now.saturating_duration_since(started_at).as_millis() as u64;
     let type_ms = n.saturating_mul(MONOLOG_MS_PER_CHAR);
-    if elapsed >= type_ms + MONOLOG_HOLD_MS + MONOLOG_FADE_MS {
+    // Disappear at once after the hold — no fade-out.
+    if elapsed >= type_ms + MONOLOG_HOLD_MS {
         app.operator_monolog = None;
         return false;
     }
@@ -1708,26 +1749,45 @@ pub(crate) fn render_operator_monolog(
     if typing && (elapsed / 450) % 2 == 0 {
         body.push('▌'); // blinking cursor while typing
     }
-    let fading = elapsed >= type_ms + MONOLOG_HOLD_MS;
-    // Match the rain's backdrop (terminal default) rather than a solid band, so
-    // the typed line reads as a subtle overlay instead of a highlight.
-    let text_style = Style::default()
-        .fg(if fading {
-            app.theme.matrix_dim
-        } else {
-            app.theme.matrix_glow
-        })
-        .bg(Color::Reset);
-    let inner = Rect {
-        x: area.x + 2,
-        y: area.y + 1,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(2),
-    };
+
+    // Wrap to a tight box and clear a padded region around it, so the text sits
+    // on clean backdrop (no rain bleeding into it) with a margin on all sides.
+    let max_text_w = area
+        .width
+        .saturating_sub(2 + 2 * MONOLOG_HPAD) // 1-col area margin each side + padding
+        .max(1) as usize;
+    let lines = wrap_to_width(&body, max_text_w);
+    let text_w = lines
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(0) as u16;
+    let max_text_h = area.height.saturating_sub(1 + 2 * MONOLOG_VPAD).max(1);
+    let text_h = (lines.len() as u16).min(max_text_h);
+    let box_w = (text_w + 2 * MONOLOG_HPAD).min(area.width);
+    let box_h = (text_h + 2 * MONOLOG_VPAD).min(area.height);
+    let box_x = area.x + 1;
+    let box_y = area.y + 1;
+    // Clear removes the rain in the padded box (resets to the terminal/backdrop
+    // bg the rain draws on), leaving a clean margin around the text.
     f.render_widget(
-        Paragraph::new(Span::styled(body, text_style)).wrap(Wrap { trim: false }),
-        inner,
+        Clear,
+        Rect {
+            x: box_x,
+            y: box_y,
+            width: box_w,
+            height: box_h,
+        },
     );
+
+    // Bright, matching the matrix horizontal keyword reveals (theme.text).
+    let text_style = Style::default().fg(app.theme.text);
+    let tx = box_x + MONOLOG_HPAD;
+    let ty = box_y + MONOLOG_VPAD;
+    for (i, line) in lines.iter().take(text_h as usize).enumerate() {
+        f.buffer_mut()
+            .set_string(tx, ty + i as u16, line, text_style);
+    }
     true
 }
 
