@@ -6151,25 +6151,31 @@ fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[Stri
         let inner = block.inner(*tile_area);
         f.render_widget(block, *tile_area);
         clear_pane_side_borders(f, *tile_area, app);
+        let (main_cols, main_rows) = app.terminal_pane_size;
         if let Some(history) = app.histories.get_mut(id) {
-            // Render at the *main view's* virtual size, not the
-            // pin tile's narrow size. Each `ItemHistory` is shared
-            // between the main view and the pin tile, and `replay`
-            // resizes the cached vt100 parser to the requested
-            // dims. Asking the pin tile (e.g. 30×6) and then the
-            // main view (e.g. 120×30) on alternating frames
-            // thrashes the parser: every resize re-feeds the
-            // pending chunk through a freshly-sized grid, content
-            // reflows at the wrong width, and the main view
-            // appears clipped at the pin width.
+            // Render the pin tile at the parser's CURRENT cached size when
+            // it has one. Each `ItemHistory` is shared between the main
+            // view and the pin tile, and `replay` resizes the cached vt100
+            // parser to the requested dims — so rendering the pin at a
+            // different width than the main view just used re-feeds the
+            // pending chunk through a freshly-sized grid every frame
+            // (~45000x slower than a no-op resize; see the regression test
+            // `pin_tile_reuses_cached_size_to_avoid_split_thrash`).
             //
-            // Always replay at main-view dims so the parser stays
-            // stable; `render_pty_tail` crops to `inner` for
-            // display (top-left of the rendered screen, anchored
-            // to the cursor row).
-            let (main_cols, main_rows) = app.terminal_pane_size;
-            let cols = main_cols.max(inner.width).max(1);
-            let rows = main_rows.max(inner.height).max(1);
+            // The main/split render runs earlier this frame and leaves the
+            // parser sized to whichever pane is showing this session, so
+            // reusing that size makes the pin's replay a no-op resize.
+            // Forcing a single "main view" size used to be safe — but split
+            // view gives each pane its own width, so a session shown in a
+            // split pane (width A) and a pin tile (width B) thrashed the
+            // shared parser on every frame: the split+pin lag. Fall back to
+            // the main-view size only to seed a session with no cached
+            // parser yet (pin-only, never opened in the main view).
+            // `render_pty_tail` crops the rendered screen to `inner`.
+            let (cols, rows) = history.cached_dims().unwrap_or((
+                main_cols.max(inner.width).max(1),
+                main_rows.max(inner.height).max(1),
+            ));
             let out = history.replay(cols, rows, 0);
             render_pty_tail(f, inner, out.screen, &app.theme);
         } else {

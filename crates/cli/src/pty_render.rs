@@ -478,10 +478,12 @@ impl ItemHistory {
     }
 
     /// Dimensions the live (non-shadow) parser was last built/sized at,
-    /// or `None` before the first replay. Test-only: lets the render
-    /// layer assert that editor-pane growth doesn't resize (and thus
-    /// rebuild) the chat parser.
-    #[cfg(test)]
+    /// or `None` before the first replay. The pin-strip render reuses this
+    /// so it can replay a session at whatever width the main/split render
+    /// already sized the shared parser to, avoiding a per-frame rebuild
+    /// (see `pin_tile_reuses_cached_size_to_avoid_split_thrash`). Tests
+    /// also use it to assert editor-pane growth doesn't resize the chat
+    /// parser.
     pub fn cached_dims(&self) -> Option<(u16, u16)> {
         self.cached.as_ref().map(|c| (c.cols, c.rows))
     }
@@ -2065,6 +2067,46 @@ mod tests {
             us < 120_000,
             "resize on a 300k-line history took {us} µs — bound removed? \
              (should re-feed only the scrollback tail, not all history)"
+        );
+    }
+
+    /// REGRESSION: split-view + pin-strip lag. A pinned session shown in a
+    /// split pane (width A) is also rendered by the pin tile. If the pin
+    /// forces a different width (B), the shared cached parser rebuilds on
+    /// every frame — ~45000x slower than a no-op resize, which is the
+    /// "extremely laggy with both split + pinned" report. The fix renders
+    /// the pin at the parser's current `cached_dims()`, so reusing the
+    /// width the split pane just set makes the pin's replay a no-op.
+    #[test]
+    fn pin_tile_reuses_cached_size_to_avoid_split_thrash() {
+        let mut h = ItemHistory::new();
+        for i in 1..=200_000u32 {
+            h.feed_pty(format!("L{i}\r\n").as_bytes());
+        }
+        // BUG shape: pin forces a width that differs from the split pane's,
+        // so each frame does two parser rebuilds.
+        let _ = h.replay(60, 30, 0); // settle at the split-pane width
+        let t_thrash = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = h.replay(60, 30, 0); // split pane (main render)
+            let _ = h.replay(120, 30, 0); // pin forcing main-view width → rebuild
+        }
+        let thrash_us = t_thrash.elapsed().as_micros();
+
+        // FIX shape: pin reuses the parser's current cached size → no-op.
+        let _ = h.replay(60, 30, 0);
+        let t_fixed = std::time::Instant::now();
+        for _ in 0..10 {
+            let _ = h.replay(60, 30, 0); // split pane (main render)
+            let (c, r) = h.cached_dims().expect("parser cached after replay");
+            let _ = h.replay(c, r, 0); // pin reuses cached dims → no rebuild
+        }
+        let fixed_us = t_fixed.elapsed().as_micros();
+
+        assert!(
+            fixed_us * 10 < thrash_us,
+            "pin reusing cached size should avoid the rebuild thrash: \
+             fixed={fixed_us}us thrash={thrash_us}us"
         );
     }
 
