@@ -123,8 +123,11 @@ async fn tui_auto_reconnects_after_restart() {
         .await
         .expect("TUI did not auto-reconnect after restart");
 
-    // Still interactive afterward: quit cleanly.
-    tui.send(b"q").expect("send q");
+    // Still interactive afterward: quit cleanly with the global quit
+    // chord `C-x C-c` (= 0x18 0x03). Plain `q` is no longer a quit key
+    // (the welcome screen, shown here with an empty fleet, advertises
+    // and binds `C-x C-c` instead — see keymap.rs / #382).
+    tui.send(b"\x18\x03").expect("send C-x C-c");
     let status = tui
         .wait_exit(Duration::from_secs(5))
         .await

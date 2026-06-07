@@ -472,20 +472,27 @@ impl Tui {
             .child
             .take()
             .ok_or_else(|| anyhow!("wait_exit called twice"))?;
-        // `portable_pty::Child::wait` is blocking and takes
-        // `&mut self`, so we ferry it across a spawn_blocking
-        // and a oneshot.
+        // `portable_pty::Child::wait` is blocking and takes `&mut self`,
+        // so we ferry it across a thread + oneshot. Grab a killer handle
+        // FIRST: on timeout we must kill the child, otherwise the wait
+        // thread blocks forever holding the process alive, the PTY reader
+        // never hits EOF, and the tokio runtime can't shut down — turning
+        // a "TUI didn't quit" failure into a `cargo test` hang (Drop can't
+        // help here: `self.child` is already taken).
+        let mut killer = child.clone_killer();
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
-            let status = child.wait();
-            let _ = tx.send(status);
+            let _ = tx.send(child.wait());
         });
-        let status = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| anyhow!("TUI did not exit within {:?}", timeout))?
-            .map_err(|_| anyhow!("TUI wait channel closed"))?
-            .map_err(|e| anyhow!("child.wait: {e}"))?;
-        Ok(status)
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(status))) => Ok(status),
+            Ok(Ok(Err(e))) => Err(anyhow!("child.wait: {e}")),
+            Ok(Err(_)) => Err(anyhow!("TUI wait channel closed")),
+            Err(_) => {
+                let _ = killer.kill();
+                Err(anyhow!("TUI did not exit within {:?}", timeout))
+            }
+        }
     }
 }
 
