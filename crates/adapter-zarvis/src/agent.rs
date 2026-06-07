@@ -221,13 +221,13 @@ LONG-RUNNING TOOLS: a tool result of exactly "(running in background; will repor
 
 EVENT OBSERVATIONS: messages starting with "OBSERVATION:" come from agentd, not the user. They can be fleet events or ambient loop ticks.
 
-For fleet-event observations, decide whether the user benefits from being notified or whether action is helpful. If neither — most cases, especially routine awaiting_input transitions — reply with exactly the single word `noted` and nothing else. If something is genuinely worth surfacing (an unexpected error or a session done with notable output), give one short sentence. Never start a turn by re-stating the observation back at the user. Never invoke tools just to "check in" on a session whose state you already know from the observation.
+For fleet-event observations, decide whether the user benefits from being notified or whether action is helpful. If neither — most cases, especially routine awaiting_input transitions — reply with exactly the single word `noted` and nothing else. If something is genuinely worth surfacing (an unexpected error or a session done with notable output), surface it per SURFACING below. Never start a turn by re-stating the observation back at the user. Never invoke tools just to "check in" on a session whose state you already know from the observation.
 
-For `OBSERVATION: ambient operator loop tick`, act as an ambient companion. You may inspect fleet state, project memory, widgets, transcripts, diffs, or outputs when that would help you notice blockers, stale work, workflow issues, or opportunities to reduce user effort. Prefer updating/removing compact Operator widgets over chatting. If nothing is worth surfacing, reply exactly `noted`. Do not take risky/destructive/external actions without normal approval; ambient help is advisory and no critical user journey should rely on it.
+For `OBSERVATION: ambient fleet monitor` findings, act as an ambient companion. You may inspect fleet state, project memory, widgets, transcripts, diffs, or outputs when that would help you notice blockers, stale work, workflow issues, or opportunities to reduce user effort. Surface anything worth the user's attention per SURFACING below — text for a passing FYI, a widget for anything that needs a response. If nothing is worth surfacing, reply exactly `noted`. Do not take risky/destructive/external actions without normal approval; ambient help is advisory and no critical user journey should rely on it.
 
 Dynamic session UI: when a session/task benefits from compact status/actions, call `agentd_context` to discover `session_widgets.dir`, `session_widgets.action_link_scheme`, and supported `widget_markdown_extensions`, then create/update concise `.md` widget files there with normal file tools. Widget creation, updates, and cleanup are mostly automated system behavior: use best judgment and ask first only when normal safety/tool policy absolutely requires approval or the widget would make a significant product/user-facing decision. Use checklists, supported widget_markdown_extensions from `agentd_context`, and action links such as `[Open checks](agentd:action/open-checks)` or `[Open checks](agentd:action/open-checks?key=o)` when a keyboard shortcut is desired. Treat `OBSERVATION: ui.action ...` as user intent; actions still go through normal tools and approvals.
 
-SURFACING: a short text reply is shown to the user as a brief typewriter "monolog" over your matrix animation that then fades — so a one-line heads-up reaches them even with the minibuffer panel closed. Use it for a quick, transient note ("X is waiting at a trust prompt — press Enter"). When the user should be able to act on something or keep it around, create/update a compact Operator widget instead (widgets persist; monologs fade). Reply exactly `noted` when nothing needs surfacing.
+SURFACING — choose the channel by whether the user needs to respond. A short text reply is literally your *monolog*: it types out over your matrix animation, then fades, and the user has no way to reply to it. Use text ONLY for a low-stakes, transient FYI of what you noticed or did ("dogfood finished its build; fleet's quiet"). NEVER use a text monolog to ask a question, request a decision or action, or raise something important — the user may not be looking and cannot respond to it. Anything the user should act on, decide, or be reliably notified of MUST be a compact Operator widget instead — widgets persist and carry action links the user can act on (e.g. a session stuck at a trust prompt, an error needing a choice, "ready to merge?"). Reply exactly `noted` when nothing needs surfacing.
 
 Be concise. The minibuffer panel is small; aim for one to three short lines per turn, longer only when the user explicitly asks for detail. Risky tool calls (delete / kill / send) still gate through approval unless the session is in unsafe-auto."#;
 
@@ -1456,6 +1456,31 @@ mod tests {
         assert_eq!(
             parse_auto_review_decision(r#"{"decision":"maybe"}"#),
             AutoReviewResult::AskUser
+        );
+    }
+
+    #[test]
+    fn orchestrator_surfacing_guidance_is_current_and_unambiguous() {
+        let p = SYSTEM_PROMPT_ORCHESTRATOR;
+        // Stale observation string (renamed in #376) must not reappear — the
+        // ambient guidance keyed on it would silently never fire.
+        assert!(
+            !p.contains("ambient operator loop tick"),
+            "stale ambient observation string is back"
+        );
+        assert!(p.contains("ambient fleet monitor"), "ambient string not updated");
+        // The text-vs-widget principle: monolog is FYI-only; anything needing a
+        // response is a widget.
+        assert!(p.contains("SURFACING"), "missing surfacing guidance");
+        assert!(p.contains("monolog"), "missing monolog description");
+        assert!(
+            p.contains("MUST be a compact Operator widget"),
+            "widget-for-response rule weakened"
+        );
+        // The old blunt contradiction is gone.
+        assert!(
+            !p.contains("Prefer updating/removing compact Operator widgets over chatting"),
+            "contradictory 'prefer widgets over chatting' line is back"
         );
     }
 
