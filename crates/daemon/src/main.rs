@@ -370,6 +370,12 @@ fn legacy_migration_notice_with_paths(current: &Paths, legacy: &Paths) -> Option
             old_config = shell_quote(&legacy_config),
             new_config = shell_quote(&current.config_file())
         ));
+
+        let new_config = shell_quote(&current.config_file());
+        out.push_str(&format!(
+            "  tmp=$(mktemp) && perl -0pe 's/\\[adapters\\.zarvis([^\\]]*)\\]/[adapters.smith$1]/g' {new_config} > \"$tmp\" && mv \"$tmp\" {new_config}\n",
+            new_config = new_config
+        ));
     }
 
     out.push_str("\nMove or copy what you need; restart after migration.\n");
@@ -445,6 +451,8 @@ mod tests {
         assert!(msg.contains("Copy/paste migration command:"));
         assert!(msg.contains("mkdir -p"));
         assert!(msg.contains("cp -a"));
+        assert!(msg.contains("tmp=$(mktemp) && perl"));
+        assert!(msg.contains("adapters.smith"));
     }
 }
 
