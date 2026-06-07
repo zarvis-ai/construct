@@ -14,6 +14,8 @@ The operator surfaces in two ways, and it chooses by *which event it emits*:
 
 The TUI consolidates the orchestrator's streaming assistant `Message` deltas across a turn into one finalized string at turn end (`AgentStatus active=false`), filters the internal `noted`/empty no-op token, and plays it once as the monolog. No new protocol event — `Message` (stream) vs `UiPanel` (widget) already distinguishes the two.
 
+**Channel principle (operator prompt):** the monolog is literally the operator's *monolog* — a low-stakes FYI that fades and the user cannot reply to. So text is for passing narration only; **anything that needs a user action/decision, or any important notification, MUST be a widget** (widgets persist and carry action links the user can act on). `noted` for nothing. A text monolog must never carry a question, a decision request, or something important — the user may not be looking and has no way to respond.
+
 ## Reason
 
 The operator's text replies landed only in the daemon-owned orchestrator panel, which is collapsed by default (`orchestrator_panel_h: None`) — so a genuinely useful line ("'run using zarvis' is waiting at the folder trust prompt — press Enter") was invisible unless the user opened the panel. The matrix area is the operator's always-visible visual home, so surfacing its monolog there (without stealing focus or a panel) closes the gap. A typewriter over the rain is ambient: visible but not modal, and self-dismissing.
