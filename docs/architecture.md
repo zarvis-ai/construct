@@ -18,17 +18,19 @@ Five layers, each replaceable:
 └──────────────────────────────────────────────┘
 ```
 
-- **Daemon** (`constructd`) owns sessions, spawns adapters, persists transcripts. Speaks JSON-RPC over a Unix socket to clients.
+- **Daemon** owns sessions, spawns adapters, persists transcripts. Speaks JSON-RPC over a Unix socket to clients. Run it with `construct daemon run` (or the back-compat `constructd` alias — same binary code).
 - **Client** (`construct`) is the TUI plus a set of one-shot subcommands. Multiple clients can attach concurrently.
 - **Adapter** binaries are independent processes. They implement the AHP over stdio. Anyone can ship one in any language.
+
+The daemon and client ship as **one binary**: `construct` runs the TUI by default and the daemon under `construct daemon`. The daemon's runtime lives in the `agentd` library crate; both `construct daemon` and the standalone `constructd` binary are thin entry points over it. They are not merged into one *process* — the daemon stays a separate long-lived process that many clients attach to — only into one shipped executable. See [`specs/0026-single-binary-daemon-and-client.md`](../specs/0026-single-binary-daemon-and-client.md).
 
 ## Crates
 
 | Crate | Binary | Purpose |
 |---|---|---|
 | `crates/protocol` | — (lib) | AHP + IPC types, transport, adapter SDK |
-| `crates/daemon` | `constructd` | Session supervisor, IPC server |
-| `crates/cli` | `construct` | TUI client + control subcommands |
+| `crates/daemon` | `agentd` (lib) + `constructd` (bin) | Session supervisor, IPC server. Runtime lives in the lib; `constructd` is a thin alias for `construct daemon` |
+| `crates/cli` | `construct` | TUI client + control subcommands + `construct daemon` (runs the daemon via the `agentd` lib) |
 | `crates/adapter-shell` | `construct-adapter-shell` | Generic shell command runner |
 | `crates/adapter-claude` | `construct-adapter-claude` | Wraps the `claude` CLI |
 | `crates/adapter-codex` | `construct-adapter-codex` | Wraps the `codex` CLI |

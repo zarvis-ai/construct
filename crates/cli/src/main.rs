@@ -17,7 +17,7 @@ use agentd_protocol::paths::Paths;
 #[derive(Debug, Parser)]
 #[command(
     name = "construct",
-    about = "construct: TUI client for constructd",
+    about = "construct: TUI client and daemon for the agent fleet",
     version
 )]
 struct Cli {
@@ -32,6 +32,16 @@ struct Cli {
 enum Command {
     /// Launch the TUI (default).
     Tui,
+    /// Run the construct daemon (session supervisor + IPC server).
+    ///
+    /// This is the same daemon shipped as the standalone `constructd`
+    /// binary — `construct daemon run` and `constructd run` are
+    /// equivalent. One installed `construct` binary can run both the
+    /// client and the daemon.
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
     /// Print resolved paths.
     Paths,
     /// Ping the daemon.
@@ -113,6 +123,18 @@ enum Command {
     },
 }
 
+/// Subcommands of `construct daemon`. Mirrors the standalone `constructd`
+/// binary's CLI so the two entry points behave identically.
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Run the daemon in the foreground (default).
+    Run,
+    /// Print resolved paths and exit.
+    Paths,
+    /// Print the embedded default config and exit.
+    DefaultConfig,
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
@@ -123,12 +145,38 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Tui);
+
+    // Daemon mode runs the supervisor in-process via the shared `agentd`
+    // library — the same code path as the standalone `constructd` binary.
+    // Handled before the client tracing init so the daemon's verbose filter
+    // applies, and before socket discovery (the daemon *owns* the socket
+    // rather than connecting to it). The daemon's restart self-`exec()`
+    // replays this argv (`construct daemon run …`) verbatim, so picking up an
+    // upgraded binary keeps working.
+    if let Command::Daemon { command: daemon_cmd } = command {
+        agentd::init_tracing();
+        return match daemon_cmd.unwrap_or(DaemonCommand::Run) {
+            DaemonCommand::Run => agentd::run(cli.socket).await,
+            DaemonCommand::Paths => {
+                agentd::print_paths();
+                Ok(())
+            }
+            DaemonCommand::DefaultConfig => {
+                println!("{}", agentd::DEFAULT_CONFIG_TOML);
+                Ok(())
+            }
+        };
+    }
+
+    init_tracing();
     let socket = cli.socket.unwrap_or_else(|| Paths::discover().socket());
 
-    match cli.command.unwrap_or(Command::Tui) {
+    match command {
         Command::Tui => run_tui(socket).await,
+        // Handled above (early return); listed for match exhaustiveness.
+        Command::Daemon { .. } => unreachable!("daemon mode handled before this match"),
         Command::Paths => {
             let p = Paths::discover();
             println!("config:  {}", p.config_dir.display());

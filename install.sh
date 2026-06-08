@@ -128,4 +128,4 @@ case ":${PATH}:" in
 esac
 
 say ""
-say "Done. Try:  constructd run    (in another terminal)  construct"
+say "Done. Try:  construct daemon run    (in another terminal)  construct"

@@ -16,6 +16,10 @@ path = "src/main.rs"
 tempfile = "3"
 agentd-protocol = { workspace = true }
 agentd-client = { workspace = true }
+# The daemon, as a library, so the unified `construct` binary can run it
+# directly via the `daemon` subcommand (the standalone `constructd` binary is
+# a thin shim over the same crate, kept as a back-compat alias).
+agentd = { path = "../daemon" }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

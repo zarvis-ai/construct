@@ -65,11 +65,12 @@ Pin a version or change the directory with `CONSTRUCT_VERSION=v0.2.0` /
 ### 3. Start the daemon
 
 ```sh
-constructd
+construct daemon run
 ```
 
 Leave this running. It owns sessions, persists state, and exposes the local IPC
-socket used by clients.
+socket used by clients. (`constructd` is a back-compat alias for the same
+daemon — `constructd run` and `construct daemon run` are equivalent.)
 
 ### 4. Open the fleet TUI
 
@@ -114,8 +115,8 @@ cargo build --workspace
 
 Debug binaries land in `target/debug/`:
 
-- `target/debug/constructd` — daemon / session supervisor
-- `target/debug/construct` — TUI and control CLI
+- `target/debug/construct` — TUI, control CLI, **and the daemon** (`construct daemon run`)
+- `target/debug/constructd` — standalone daemon binary; a thin back-compat alias for `construct daemon run`
 - `target/debug/construct-mcp` — MCP bridge for agents
 - `target/debug/construct-adapter-*` — harness adapters
 

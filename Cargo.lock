@@ -39,6 +39,7 @@ dependencies = [
 name = "agentd-cli"
 version = "0.8.3"
 dependencies = [
+ "agentd",
  "agentd-client",
  "agentd-protocol",
  "anyhow",
