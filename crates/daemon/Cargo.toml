@@ -8,9 +8,8 @@ repository.workspace = true
 rust-version.workspace = true
 description = "agentd daemon: supervises agent sessions across harnesses"
 
-[[bin]]
-name = "constructd"
-path = "src/main.rs"
+# Library-only: the daemon runtime is driven by `construct daemon` (see
+# `crates/cli`). There is no standalone daemon binary.
 
 [dependencies]
 agentd-protocol = { workspace = true }
