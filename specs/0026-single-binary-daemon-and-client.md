@@ -54,20 +54,34 @@ multiple daemons.
   must happen before socket discovery and before tracing init, so the daemon's
   verbose log filter applies in daemon mode and the client's quiet filter
   applies otherwise.
+- **The client auto-starts a daemon when none is live.** Since one binary does
+  both, running the TUI with no daemon is a setup mistake, not a user intent —
+  so the TUI spawns a detached `construct daemon run` in the background and
+  waits for the socket, instead of erroring out. Opt out with
+  `CONSTRUCT_NO_AUTOSTART=1`. Auto-start is best-effort: on failure the normal
+  connect error still surfaces.
+- **A single-instance lock makes concurrent starts safe.** Auto-start means two
+  `construct` launches (or a stray second `daemon run`) can race to start a
+  daemon. The daemon takes an exclusive advisory file lock keyed to its socket
+  path (`<socket>.lock`) before binding; the loser exits cleanly rather than
+  unlinking and stealing the live socket. The lock is held for the process
+  lifetime and released across the restart `exec()` (CLOEXEC fd), so the
+  re-execed image re-acquires it. Daemons on *different* sockets don't contend.
 
 ## Non-Goals
 
 - Not merging the adapter binaries or the MCP bridge into the unified binary.
   Adapters are an independent process/plugin boundary and stay separate.
-- Not adding auto-spawn of the daemon from the client. Daemon startup stays
-  explicit so two concurrent `construct` invocations can never race to bind the
-  IPC socket (the bind path unlinks any existing socket before binding, so an
-  accidental second daemon would steal a live socket).
+- Not auto-starting a daemon for one-shot control subcommands (`list`, `ping`,
+  …). Only the interactive TUI auto-starts one; a scripted one-shot that finds
+  no daemon should fail fast rather than leave a lingering background daemon.
 
 ## Examples
 
-- Start the system: run the daemon in one place (`construct daemon run`), attach
-  one or more clients elsewhere (`construct`).
+- First run: `construct` with no daemon running auto-starts one in the
+  background and attaches — no separate `construct daemon run` step needed.
+- Start the system explicitly: run the daemon in one place
+  (`construct daemon run`), attach one or more clients elsewhere (`construct`).
 - Upgrade in place, then restart the running daemon: the daemon re-execs itself
   at the same path and rebinds the socket without losing sessions, regardless of
   whether it was launched as `construct daemon` or `constructd`.

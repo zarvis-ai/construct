@@ -391,12 +391,52 @@ async fn main() -> Result<()> {
 async fn connect(socket: &std::path::Path) -> Result<std::sync::Arc<Client>> {
     Client::connect(socket).await.with_context(|| {
         format!(
-            "connect to daemon at {} (is `agentd` running?)",
+            "connect to daemon at {} (start one with `construct daemon run`)",
             socket.display()
         )
     })
 }
 
 async fn run_tui(socket: PathBuf) -> Result<()> {
+    // The TUI is the default `construct` entry point, so make it "just work"
+    // when no daemon is running yet: auto-start one in the background.
+    ensure_daemon_running(&socket).await;
     app::run_with_socket(socket).await
+}
+
+/// Ensure a daemon is listening on `socket`, auto-starting one in the
+/// background if not. Best-effort: on any failure we fall through and let
+/// `run_with_socket`'s own connect surface the original error. Set
+/// `CONSTRUCT_NO_AUTOSTART=1` to opt out (e.g. scripts that manage the daemon
+/// themselves). Concurrent auto-starts are safe — the daemon's single-instance
+/// lock lets only one survive.
+async fn ensure_daemon_running(socket: &std::path::Path) {
+    use std::time::Duration;
+
+    if socket_is_live(socket) {
+        return;
+    }
+    if std::env::var("CONSTRUCT_NO_AUTOSTART").as_deref() == Ok("1") {
+        return;
+    }
+    if let Err(e) = agentd::spawn_detached_daemon(Some(socket)) {
+        tracing::warn!(error = %e, "failed to auto-start construct daemon");
+        return;
+    }
+    tracing::info!(socket = %socket.display(), "no daemon running; auto-started one");
+
+    // The daemon binds the socket early in startup; poll for readiness (~5s).
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if socket_is_live(socket) {
+            return;
+        }
+    }
+    tracing::warn!(socket = %socket.display(), "auto-started daemon not ready yet; continuing");
+}
+
+/// Cheap readiness probe: can we open the IPC socket? A stale socket file
+/// (the daemon is gone) fails to connect, so this correctly reports "not live".
+fn socket_is_live(socket: &std::path::Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
 }

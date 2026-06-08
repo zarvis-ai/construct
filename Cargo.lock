@@ -19,6 +19,7 @@ dependencies = [
  "clap",
  "futures",
  "httparse",
+ "libc",
  "nix 0.29.0",
  "qrcode",
  "serde",

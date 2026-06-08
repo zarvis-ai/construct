@@ -62,29 +62,32 @@ curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | 
 Pin a version or change the directory with `CONSTRUCT_VERSION=v0.2.0` /
 `CONSTRUCT_BIN_DIR=/usr/local/bin`.
 
-### 3. Start the daemon
-
-```sh
-construct daemon run
-```
-
-Leave this running. It owns sessions, persists state, and exposes the local IPC
-socket used by clients. (`constructd` is a back-compat alias for the same
-daemon — `constructd run` and `construct daemon run` are equivalent.)
-
-### 4. Open the fleet TUI
-
-In a second shell:
+### 3. Open the fleet TUI
 
 ```sh
 construct
 ```
 
+If no daemon is running yet, `construct` auto-starts one in the background and
+attaches — there's no separate daemon step. (Opt out with
+`CONSTRUCT_NO_AUTOSTART=1`, e.g. in scripts that manage the daemon themselves.)
+
 Use `?` for help and `M-x` for the command palette. From the TUI you can create
 sessions, switch between agents, send input, inspect diffs, and interrupt or stop
 work without leaving the flow.
 
-### 5. Start crack the matrix
+To run the daemon explicitly instead (e.g. on a server, or under a process
+supervisor):
+
+```sh
+construct daemon run
+```
+
+It owns sessions, persists state, and exposes the local IPC socket used by
+clients. (`constructd` is a back-compat alias — `constructd run` and
+`construct daemon run` are equivalent.)
+
+### 4. Start crack the matrix
 
 Happy hacking. Chase the dream idea from your terminal: ask Codex, Claude Code,
 Antigravity, and [smith](docs/smith.md) to dive into the hard parts, then keep

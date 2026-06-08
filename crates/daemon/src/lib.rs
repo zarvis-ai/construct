@@ -79,6 +79,35 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     std::fs::create_dir_all(&paths.runtime_dir).ok();
     std::fs::create_dir_all(&paths.config_dir).ok();
 
+    // Resolve the socket path early so the single-instance lock can key off
+    // it: two daemons on the *same* socket must not coexist (the second would
+    // unlink and steal the first's socket in `server::serve`), while daemons
+    // on *different* sockets are independent.
+    let socket_path = socket_override.unwrap_or_else(|| paths.socket());
+
+    // Single-instance guard. Auto-start (a client spawning the daemon when it
+    // finds no live socket — see `spawn_detached_daemon`) means two `construct`
+    // launches can race to start a daemon. Whoever wins this exclusive
+    // advisory lock binds the socket; the loser exits cleanly instead of
+    // stealing the socket. Held for the process lifetime — dropped on exit,
+    // and released across the restart `exec()` (the fd is CLOEXEC) so the new
+    // image re-acquires it.
+    let _singleton = match acquire_singleton_lock(&socket_path) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            tracing::info!(
+                socket = %socket_path.display(),
+                "another construct daemon already owns this socket; exiting"
+            );
+            eprintln!(
+                "construct: a daemon already owns {}; not starting another.",
+                socket_path.display()
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e.context("acquire daemon single-instance lock")),
+    };
+
     let config = config::Config::load_or_default(&paths)?;
     tracing::info!(
         adapters = config.adapters.len(),
@@ -123,8 +152,6 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
             loops::run_scheduler(mgr, loops).await;
         });
     }
-
-    let socket_path = socket_override.unwrap_or_else(|| paths.socket());
 
     // Always expose the browser UI on localhost without remote-control
     // credentials. This is intentionally local-only: `/remote-control`
@@ -268,6 +295,99 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
             Err(anyhow::anyhow!("exec({}) failed: {err}", cmd.exe.display()))
         }
     }
+}
+
+/// RAII holder for the daemon single-instance advisory lock. The lock is
+/// released when this is dropped (process exit) or when the fd is closed
+/// (across the restart `exec()` — the fd is CLOEXEC by default).
+pub struct SingletonGuard {
+    _file: std::fs::File,
+}
+
+/// Try to acquire the exclusive single-instance lock for `socket_path`. The
+/// lock file sits next to the socket (`<socket>.lock`), so daemons on
+/// different sockets don't contend. Returns `Ok(Some(guard))` when acquired,
+/// `Ok(None)` when another daemon already holds it, or `Err` on an unexpected
+/// I/O failure.
+fn acquire_singleton_lock(socket_path: &std::path::Path) -> Result<Option<SingletonGuard>> {
+    use std::os::unix::io::AsRawFd;
+
+    let mut lock_path = socket_path.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open lock file {}", lock_path.display()))?;
+
+    // Non-blocking exclusive advisory lock; EWOULDBLOCK means another live
+    // daemon holds it.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(SingletonGuard { _file: file }));
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(None),
+        _ => Err(anyhow::Error::new(err).context(format!("flock {}", lock_path.display()))),
+    }
+}
+
+/// Spawn the construct daemon as a detached background process. Used by the
+/// client to auto-start a daemon when none is listening: runs `<current exe>
+/// daemon run [--socket <socket>]` in a new session (so it survives the
+/// spawning TUI's exit and terminal SIGHUP), with stdio redirected to the
+/// daemon log (falling back to `/dev/null`).
+///
+/// Safe to call from multiple clients concurrently — the single-instance lock
+/// in [`run`] ensures only one of the spawned daemons survives; the rest exit
+/// immediately.
+pub fn spawn_detached_daemon(socket: Option<&std::path::Path>) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("daemon").arg("run");
+    if let Some(s) = socket {
+        cmd.arg("--socket").arg(s);
+    }
+    cmd.stdin(Stdio::null());
+
+    // Redirect logs to a file so an auto-started daemon stays debuggable;
+    // discard them if the log can't be opened.
+    let paths = Paths::discover();
+    std::fs::create_dir_all(&paths.state_dir).ok();
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(paths.state_dir.join("daemon.log"))
+    {
+        Ok(log) => {
+            let log2 = log.try_clone()?;
+            cmd.stdout(log).stderr(log2);
+        }
+        Err(_) => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+
+    // New session: detach from the spawning process's controlling terminal and
+    // process group so the daemon isn't taken down when the TUI exits.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Ignore errors (e.g. EPERM if already a session leader).
+            let _ = nix::unistd::setsid();
+            Ok(())
+        });
+    }
+
+    cmd.spawn()?;
+    Ok(())
 }
 
 fn warn_legacy_paths(current: &Paths) {
