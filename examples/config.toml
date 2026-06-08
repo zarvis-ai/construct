@@ -4,7 +4,7 @@
 # ~/.config/construct/config.toml). All adapter entries here are optional —
 # `shell`, `claude`, and `codex` are registered automatically. Override the
 # binary path when the adapter binary is not on $PATH and not next to the
-# `constructd` binary.
+# `construct` binary.
 
 # [adapters.shell]
 # binary = "construct-adapter-shell"

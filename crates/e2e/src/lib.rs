@@ -1,6 +1,6 @@
-//! End-to-end test harness for `constructd`.
+//! End-to-end test harness for the construct daemon.
 //!
-//! Spawns the **real** `constructd` binary out of the workspace's
+//! Spawns the **real** daemon (`construct daemon run`) out of the workspace's
 //! `target/debug/` against a fresh tempdir for every test (so
 //! the test never touches the developer's actual `$CONSTRUCT_*_DIR`
 //! state), waits for the IPC socket to come up, and returns a
@@ -32,7 +32,7 @@ use tokio::process::{Child, Command};
 
 use agentd_client::Client;
 
-/// One isolated `constructd` instance + a connected IPC client.
+/// One isolated daemon instance + a connected IPC client.
 /// `Drop` kills the daemon (via tokio's `kill_on_drop`) and
 /// cleans up the tempdir (via `TempDir`).
 pub struct Daemon {
@@ -45,10 +45,10 @@ pub struct Daemon {
     /// passing to the TUI helper.
     pub socket: PathBuf,
     /// Path the daemon binary was launched from. For `spawn()`
-    /// this is the workspace `target/debug/constructd`. For
-    /// `spawn_relocatable()` it's a private copy under the
-    /// tempdir that the test can swap to exercise the
-    /// "exec picks up an upgraded binary" path.
+    /// this is the workspace `target/debug/construct` (run as
+    /// `construct daemon run`). For `spawn_relocatable()` it's a
+    /// private copy under the tempdir that the test can swap to
+    /// exercise the "exec picks up an upgraded binary" path.
     pub binary_path: PathBuf,
     /// Pre-connected IPC client. Tests start using it directly —
     /// no separate "connect" step.
@@ -57,8 +57,8 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    /// Spawn a fresh `constructd` against a tempdir and wait for its
-    /// IPC socket to come up. Always sets
+    /// Spawn a fresh daemon (`construct daemon run`) against a tempdir and wait
+    /// for its IPC socket to come up. Always sets
     /// `CONSTRUCT_REMOTE_NO_TUNNEL=1` because the e2e tests should
     /// never spawn a real cloudflared subprocess (would publish a
     /// real tunnel URL and the CI runner can't reach a `*.try
@@ -71,10 +71,11 @@ impl Daemon {
         Self::spawn_inner(false).await
     }
 
-    /// Like `spawn`, but copies the `constructd` binary into the
-    /// tempdir and launches that copy instead of the workspace
-    /// binary. The copy lives at `Daemon::binary_path`, so a
-    /// test can atomically swap it (write-then-rename) and then
+    /// Like `spawn`, but copies the `construct` binary into the
+    /// tempdir and launches that copy (as `construct daemon run`)
+    /// instead of the workspace binary. The copy lives at
+    /// `Daemon::binary_path`, so a test can atomically swap it
+    /// (write-then-rename) and then
     /// `daemon.restart` to verify the daemon exec()s the new
     /// on-disk bytes. Running from a private copy also keeps the
     /// swap from disturbing other tests that share the workspace
@@ -137,8 +138,8 @@ impl Daemon {
         let binary_path = if relocatable {
             let bin_dir = dir.path().join("bin");
             std::fs::create_dir_all(&bin_dir)?;
-            let src = constructd_bin_path()?;
-            let dst = bin_dir.join("constructd");
+            let src = construct_bin_path()?;
+            let dst = bin_dir.join("construct");
             std::fs::copy(&src, &dst)
                 .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
             copy_executable_perms(&dst)?;
@@ -162,7 +163,7 @@ impl Daemon {
             }
             dst
         } else {
-            constructd_bin_path()?
+            construct_bin_path()?
         };
 
         let mut cmd = Command::new(&binary_path);
@@ -173,7 +174,7 @@ impl Daemon {
             // Skip cloudflared in every e2e test — its absence
             // from CI runners is not a test failure.
             .env("CONSTRUCT_REMOTE_NO_TUNNEL", "1")
-            .args(["run", "--socket"])
+            .args(["daemon", "run", "--socket"])
             .arg(&socket)
             // Silence the daemon's stderr / stdout in tests by
             // default — flip these to `inherit()` while debugging.
@@ -523,14 +524,10 @@ fn copy_executable_perms(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Locate the `constructd` binary in the workspace `target/`
+/// Locate the `construct` binary in the workspace `target/`
 /// directory. Honors `CARGO_TARGET_DIR` first, then falls back
 /// to walking up two levels from `CARGO_MANIFEST_DIR`
 /// (`crates/e2e` → workspace root).
-fn constructd_bin_path() -> Result<PathBuf> {
-    bin_path("constructd")
-}
-
 fn construct_bin_path() -> Result<PathBuf> {
     bin_path("construct")
 }

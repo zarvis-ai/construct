@@ -8,9 +8,8 @@ checksums, and publishes a GitHub Release with auto-generated release notes.
 ## Versioning
 
 The single source of truth is `version` under `[workspace.package]` in the
-root `Cargo.toml`. `constructd --version` and
-`construct --version` always report the workspace version. Use [semver](https://semver.org/)
-(`MAJOR.MINOR.PATCH`).
+root `Cargo.toml`. `construct --version` always reports the workspace version.
+Use [semver](https://semver.org/) (`MAJOR.MINOR.PATCH`).
 
 The release workflow's `verify` job refuses to build unless the pushed tag
 (minus its leading `v`) exactly matches the Cargo version — a mistyped tag can
@@ -45,8 +44,12 @@ never publish a mislabelled binary.
    - `constructd-aarch64-unknown-linux-gnu.tar.gz` (Linux arm64)
    - `SHA256SUMS`
 
-   Each tarball contains all release binaries (`construct`, `constructd`,
-   `construct-mcp`, `construct-adapter-*`) plus `README.md` and `LICENSE`.
+   The tarballs keep their historical `constructd-<target>` name (the download
+   URL `install.sh` and `construct upgrade` expect) even though there is no
+   longer a `constructd` binary inside.
+
+   Each tarball contains all release binaries (`construct`, `construct-mcp`,
+   `construct-adapter-*`) plus `README.md` and `LICENSE`.
 
 4. Review the release notes. The workflow passes `generate_release_notes: true`
    to the release step, so GitHub fills the release body automatically from the

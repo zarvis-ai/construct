@@ -5,9 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_DIR="$WT/target/debug"
 CLIENT_BIN="$BIN_DIR/construct"
-CONSTRUCTD_BIN="$BIN_DIR/constructd"
 
-if [[ ! -x "$CONSTRUCTD_BIN" || ! -x "$CLIENT_BIN" ]]; then
+if [[ ! -x "$CLIENT_BIN" ]]; then
   echo "missing $BIN_DIR binaries; run: cargo build" >&2
   exit 1
 fi
@@ -72,7 +71,7 @@ if [[ "${CONSTRUCT_TEST_KEEP:-0}" != "1" ]]; then
 fi
 mkdir -p "$DEMO_DIR/run" "$DEMO_DIR/state" "$DEMO_DIR/data" "$DEMO_DIR/config"
 
-"$CONSTRUCTD_BIN" run >"$LOG" 2>&1 &
+"$CLIENT_BIN" daemon run >"$LOG" 2>&1 &
 PID=$!
 echo "$PID" >"$PID_FILE"
 

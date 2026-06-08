@@ -19,7 +19,7 @@ set -eu
 REPO="zarvis-ai/agentd"
 VERSION="${CONSTRUCT_VERSION:-latest}"
 BIN_DIR="${CONSTRUCT_BIN_DIR:-$HOME/.local/bin}"
-BINS="construct constructd construct-mcp construct-adapter-shell construct-adapter-claude construct-adapter-codex construct-adapter-antigravity construct-adapter-smith"
+BINS="construct construct-mcp construct-adapter-shell construct-adapter-claude construct-adapter-codex construct-adapter-antigravity construct-adapter-smith"
 
 say() { printf '%s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -73,7 +73,7 @@ fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-say "Installing constructd ($VERSION) for $target"
+say "Installing construct ($VERSION) for $target"
 
 if ! fetch "${base}/${asset}" "${tmp}/${asset}"; then
   err "could not download ${base}/${asset}

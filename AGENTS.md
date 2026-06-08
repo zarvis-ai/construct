@@ -9,7 +9,7 @@ All code changes go through a branch, worktree, and PR — no exceptions.
 - **Release process lives in [`docs/RELEASING.md`](docs/RELEASING.md).** Use that guide for versioned releases and publishing prebuilt binaries.
 - **No `Co-Authored-By: Claude` trailer in commits.** Don't append model attribution to commit messages. `Co-authored-by:` for other humans is fine.
 - **Clean up after merge.** Remove the worktree (`git worktree remove <path>`), delete the local branch (`git branch -d <name>`), and delete the remote branch (e.g. via GitHub's "delete branch after merge", or `git push <remote> --delete <name>`).
-- **After merge, update and build the main worktree.** Once a PR is merged and the feature worktree is cleaned up, switch to the top-level checkout (`~/agentd`), pull latest `main`, and run `cargo build` there (debug profile). This keeps the user's main worktree binaries current so `/construct restart` can pick up the latest merged `construct` / `constructd` changes, especially when operating from a remote-control session. Report the updated main-worktree debug binary paths when relevant.
+- **After merge, update and build the main worktree.** Once a PR is merged and the feature worktree is cleaned up, switch to the top-level checkout (`~/agentd`), pull latest `main`, and run `cargo build` there (debug profile). This keeps the user's main worktree binaries current so `/construct restart` can pick up the latest merged `construct` changes, especially when operating from a remote-control session. Report the updated main-worktree debug binary paths when relevant.
 - **When the change is testable, build all binaries in the worktree and report paths in the agent response.** Run `cargo build` inside the worktree (debug profile — much faster to iterate on than release; the binaries live under `.claude/worktrees/<branch>/target/debug/`), then print the absolute path of every binary the workspace produces — `construct`, `constructd`, `construct-mcp`, and every `construct-adapter-*` — in the agent response so the user can copy and run them. Explicitly call out *which* binary the PR's code lives in so the user can run the right one without grepping the diff (e.g. "this PR only touches `crates/cli` → relevant binary is `construct`; the others are built but unchanged from main").
 - **Record a video / screenshot when it helps the reviewer, and post accessible artifacts on the PR.** This is a judgment call:
   - Sometimes only an "after" recording makes sense (a brand-new pane / popup / view that didn't exist before).
@@ -52,7 +52,7 @@ Use [vhs](https://github.com/charmbracelet/vhs) to capture deterministic mp4 / g
   export CONSTRUCT_SHELL_BIN="/bin/bash"        # adapter discovery
   export PATH="$BIN_DIR:$PATH"
 
-  "$BIN_DIR/constructd" run >"/tmp/rain-${VARIANT}-daemon.log" 2>&1 &
+  "$BIN_DIR/construct" daemon run >"/tmp/rain-${VARIANT}-daemon.log" 2>&1 &
   DAEMON_PID=$!
   trap 'kill $DAEMON_PID 2>/dev/null || true; wait $DAEMON_PID 2>/dev/null || true' EXIT
   for _ in $(seq 1 50); do "$BIN_DIR/construct" ping >/dev/null 2>&1 && break; sleep 0.2; done

@@ -84,8 +84,7 @@ construct daemon run
 ```
 
 It owns sessions, persists state, and exposes the local IPC socket used by
-clients. (`constructd` is a back-compat alias — `constructd run` and
-`construct daemon run` are equivalent.)
+clients.
 
 ### 4. Start crack the matrix
 
@@ -119,7 +118,6 @@ cargo build --workspace
 Debug binaries land in `target/debug/`:
 
 - `target/debug/construct` — TUI, control CLI, **and the daemon** (`construct daemon run`)
-- `target/debug/constructd` — standalone daemon binary; a thin back-compat alias for `construct daemon run`
 - `target/debug/construct-mcp` — MCP bridge for agents
 - `target/debug/construct-adapter-*` — harness adapters
 

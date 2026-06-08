@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "construct: TUI client for constructd"
+description = "construct: TUI client and daemon for the agent fleet"
 
 [[bin]]
 name = "construct"
@@ -16,9 +16,8 @@ path = "src/main.rs"
 tempfile = "3"
 agentd-protocol = { workspace = true }
 agentd-client = { workspace = true }
-# The daemon, as a library, so the unified `construct` binary can run it
-# directly via the `daemon` subcommand (the standalone `constructd` binary is
-# a thin shim over the same crate, kept as a back-compat alias).
+# The daemon, as a library, so the `construct` binary can run it directly via
+# the `daemon` subcommand. The daemon has no standalone binary of its own.
 agentd = { path = "../daemon" }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }

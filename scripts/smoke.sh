@@ -19,12 +19,10 @@ export CONSTRUCT_DATA_DIR="$SANDBOX/data"
 export CONSTRUCT_CONFIG_DIR="$SANDBOX/config"
 export CONSTRUCT_RUNTIME_DIR="$SANDBOX/runtime"
 
-CONSTRUCTD="$ROOT/target/debug/constructd"
 CONSTRUCT_CLI="$ROOT/target/debug/construct"
-[ -x "$CONSTRUCTD" ] || { echo "build first: cargo build --workspace" >&2; exit 1; }
 [ -x "$CONSTRUCT_CLI" ]  || { echo "build first: cargo build --workspace" >&2; exit 1; }
 
-"$CONSTRUCTD" run >"$SANDBOX/daemon.log" 2>&1 &
+"$CONSTRUCT_CLI" daemon run >"$SANDBOX/daemon.log" 2>&1 &
 DAEMON_PID=$!
 trap 'kill $DAEMON_PID 2>/dev/null || true' EXIT
 sleep 0.4

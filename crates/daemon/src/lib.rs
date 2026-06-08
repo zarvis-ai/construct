@@ -1,19 +1,14 @@
-//! construct daemon (`constructd` / `construct daemon`): session supervisor and
-//! IPC server.
+//! construct daemon: session supervisor and IPC server.
 //!
-//! The daemon's entire runtime lives here as a library so it can be driven from
-//! two binaries that share one code path:
+//! The daemon's entire runtime lives here as a library. It is driven by the
+//! `construct daemon` subcommand of the unified `construct` binary (see
+//! `crates/cli`) — there is no standalone daemon binary. The TUI also calls
+//! [`spawn_detached_daemon`] to auto-start one when none is running.
 //!
-//! - `constructd` — the standalone daemon binary (thin shim in `main.rs`),
-//!   kept as a back-compat alias.
-//! - `construct daemon …` — the unified `construct` binary's daemon subcommand
-//!   (see `crates/cli`), so a single installed binary can run both the TUI
-//!   client and the daemon.
-//!
-//! Both entry points call [`run`] after [`init_tracing`]. They each replay
-//! their own argv on `daemon.restart` (see `session::request_daemon_restart`),
-//! so the self-`exec()` restart path stays correct regardless of which name
-//! launched the daemon.
+//! The entry point calls [`run`] after [`init_tracing`]. On `daemon.restart`
+//! the daemon replays its own argv (`construct daemon run …`; see
+//! `session::request_daemon_restart`), so the self-`exec()` restart path picks
+//! up an upgraded binary in place.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

@@ -34,10 +34,9 @@ enum Command {
     Tui,
     /// Run the construct daemon (session supervisor + IPC server).
     ///
-    /// This is the same daemon shipped as the standalone `constructd`
-    /// binary — `construct daemon run` and `constructd run` are
-    /// equivalent. One installed `construct` binary can run both the
-    /// client and the daemon.
+    /// One installed `construct` binary runs both the client and the daemon;
+    /// the TUI also auto-starts a daemon when none is running, so you rarely
+    /// need to invoke this directly (mainly servers / process supervisors).
     Daemon {
         #[command(subcommand)]
         command: Option<DaemonCommand>,
@@ -123,8 +122,7 @@ enum Command {
     },
 }
 
-/// Subcommands of `construct daemon`. Mirrors the standalone `constructd`
-/// binary's CLI so the two entry points behave identically.
+/// Subcommands of `construct daemon`.
 #[derive(Debug, Subcommand)]
 enum DaemonCommand {
     /// Run the daemon in the foreground (default).
@@ -149,8 +147,7 @@ async fn main() -> Result<()> {
     let command = cli.command.unwrap_or(Command::Tui);
 
     // Daemon mode runs the supervisor in-process via the shared `agentd`
-    // library — the same code path as the standalone `constructd` binary.
-    // Handled before the client tracing init so the daemon's verbose filter
+    // library. Handled before the client tracing init so the daemon's verbose filter
     // applies, and before socket discovery (the daemon *owns* the socket
     // rather than connecting to it). The daemon's restart self-`exec()`
     // replays this argv (`construct daemon run …`) verbatim, so picking up an

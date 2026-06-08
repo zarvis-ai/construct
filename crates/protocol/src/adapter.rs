@@ -179,10 +179,10 @@ fn parse_command_words(raw: &str) -> Option<CommandOverride> {
 pub fn missing_bin_hint(bin: &str, source: &std::io::Error) -> String {
     format!(
         "Failed to start `{bin}`: {source}.\n\
-         Make sure `{bin}` is on PATH in the shell you started constructd from \
-         (try `which {bin}` there). If you use a version manager (nvm, asdf, \
-         pyenv, …), activate it in your shell's startup file so PATH is set \
-         before launching constructd."
+         Make sure `{bin}` is on PATH in the shell you started the construct \
+         daemon from (try `which {bin}` there). If you use a version manager \
+         (nvm, asdf, pyenv, …), activate it in your shell's startup file so \
+         PATH is set before launching the daemon."
     )
 }
 
