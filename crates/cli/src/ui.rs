@@ -2801,8 +2801,8 @@ fn loadout_text_cursor(s: &str, cursor: usize, base: Style, show: bool) -> Vec<S
 }
 
 /// The Construct loadout screen — a cinematic full-screen new-session
-/// composer. Matrix backdrop + scrolling rack rail behind a centered panel
-/// whose rows slide in like racks being loaded.
+/// composer. Faint matrix sparkle backdrop behind a centered panel whose
+/// rows slide in like racks being loaded.
 fn render_loadout(f: &mut Frame, area: Rect, app: &mut App) {
     let now = Instant::now();
     let theme = app.theme.clone();
@@ -2843,21 +2843,6 @@ fn render_loadout(f: &mut Frame, area: Rect, app: &mut App) {
                     buf.set_string(x, y, g.to_string(), dim);
                 }
             }
-        }
-        // --- rack rail: a row of weapon-rack ticks scrolling sideways near
-        // the bottom, conveying the "racks rushing past" motion. ---
-        if area.height >= 3 {
-            let pattern: Vec<char> = "╪══╪  ".chars().collect();
-            let offset = ((elapsed / 45) as usize) % pattern.len();
-            let rail: String = (0..area.width as usize)
-                .map(|i| pattern[(i + offset) % pattern.len()])
-                .collect();
-            buf.set_string(
-                area.x,
-                area.bottom() - 1,
-                rail,
-                Style::default().fg(theme.matrix_glow),
-            );
         }
     }
 
