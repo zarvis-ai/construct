@@ -814,6 +814,11 @@
     font-style: italic;
   }
   .editor-state .editor-agent-status::before { content: "* "; }
+  /* Inline thinking row in chat mode */
+  .thinking-row .bubble { display: inline-flex; align-items: center; gap: 8px; }
+  .thinking-row .spinner { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+
   .editor-state .editor-completions {
     color: var(--fg-faint);
     font-size: 11px;
@@ -2921,7 +2926,10 @@ function enterChatMode() {
   terminalEl.classList.remove("hide-xterm-cursor");
   terminalScrollOverlayEl.hidden = true;
   renderWidgets();
-  renderEditorState(null);
+  // Show minimal agent-status in chat mode so user sees "Working.. <elapsed>"
+  // after send when a turn is active. We reuse renderEditorState with the
+  // current session's agent status; queued/buffer lines are empty in chat mode.
+  renderEditorState(state.editorById.get(state.currentId) || null, state.agentStatusById.get(state.currentId) || null);
   // Virtual keyboard only makes sense over xterm — chat sessions
   // have a text-style editor instead.
   vkbdEl.hidden = true;
@@ -4376,6 +4384,10 @@ function renderEvent(event, at) {
       if (event.active) state.agentStatusById.set(state.currentId, event);
       else state.agentStatusById.delete(state.currentId);
       renderEditorStateForSession(state.currentId);
+      if (state.mode === "chat") {
+        if (event.active) ensureThinkingBanner(state.currentId);
+        else removeThinkingBanner(state.currentId);
+      }
     }
     if (event.type === "reset") {
       if (state.term) state.term.reset();
@@ -4448,6 +4460,10 @@ function renderEvent(event, at) {
       if (event.active) state.agentStatusById.set(state.currentId, event);
       else state.agentStatusById.delete(state.currentId);
       renderEditorStateForSession(state.currentId);
+      if (state.mode === "chat") {
+        if (event.active) ensureThinkingBanner(state.currentId);
+        else removeThinkingBanner(state.currentId);
+      }
       break;
     case "tool_approval_request":
       // Render as a tool-use card; v1 doesn't yet implement
@@ -4563,6 +4579,38 @@ function appendMessage(role, text, opts = {}) {
   return row;
 }
 
+function ensureThinkingBanner(sessionId) {
+  const s = state.sessions.find((x) => x.id === sessionId);
+  if (!s || state.mode !== "chat") return;
+  const active = state.agentStatusById.get(sessionId);
+  if (!active || !active.active) return;
+  // Prepend/ensure a lightweight thinking row at the end of the active transcript.
+  const target = transcriptTarget();
+  if (!target) return;
+  // Avoid duplicating if one is already present as the very last row.
+  const last = target.lastElementChild;
+  if (last && last.classList && last.classList.contains("thinking-row")) return;
+  const row = document.createElement("div");
+  row.className = "row role-assistant thinking-row";
+  row.innerHTML = `
+    <div class="meta">assistant · thinking</div>
+    <div class="bubble">
+      <span class="spinner" aria-hidden="true">⏳</span>
+      <span>Working..</span>
+    </div>`;
+  target.appendChild(row);
+  scrollTranscriptToBottomSmooth();
+}
+
+function removeThinkingBanner(sessionId) {
+  const target = transcriptTarget();
+  if (!target) return;
+  const last = target.lastElementChild;
+  if (last && last.classList && last.classList.contains("thinking-row")) {
+    last.remove();
+  }
+}
+
 function appendOptimisticUserMessage(sessionId, text) {
   if (!sessionId || state.mode !== "chat" || !text || state.renderingTranscriptHistory) return null;
   if (!shouldRenderChatMessage("user", text)) return null;
@@ -4578,11 +4626,15 @@ function appendOptimisticUserMessage(sessionId, text) {
 }
 
 function markOptimisticMessageSent(entry) {
+  ensureThinkingBanner(entry.sessionId);
+
   if (!entry || !entry.row) return;
   entry.row.classList.remove("optimistic");
 }
 
 function removeOptimisticMessage(sessionId, entry) {
+  removeThinkingBanner(sessionId);
+
   if (!sessionId || !entry) return;
   const list = state.optimisticMessagesById.get(sessionId) || [];
   const next = list.filter((x) => x !== entry);
@@ -5574,6 +5626,8 @@ function currentSessionHarness() {
 }
 
 function restoreComposerText(text, sessionId) {
+  removeThinkingBanner(sessionId);
+
   // Put the user's text back if the send failed so it isn't lost —
   // unless they've already started typing something new, or switched
   // to a different session while the send was in flight (the box is
