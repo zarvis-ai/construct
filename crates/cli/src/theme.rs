@@ -1,9 +1,13 @@
 //! User-editable TUI color theme.
 //!
-//! Defaults to a Matrix-inspired palette. Users can override any slot in:
+//! Ships a Matrix-inspired palette in dark and light variants. By default
+//! (`mode = "auto"`) the active variant is chosen at startup by querying the
+//! terminal's background color (OSC 11); `mode = "light"`/`"dark"` force one.
+//! Individual slots can be overridden on top of the active variant:
 //!
 //! ```toml
 //! # $CONSTRUCT_CONFIG_DIR/theme.toml, default ~/.config/construct/theme.toml
+//! mode = "auto"   # "auto" | "light" | "dark"
 //! [colors]
 //! text = "#b8ffcc"
 //! accent = "#39ff88"
@@ -86,26 +90,135 @@ impl Default for Theme {
     }
 }
 
-impl Theme {
-    pub fn load_or_default() -> (Self, Option<String>) {
+/// Whether the TUI palette tracks the terminal's background. `Auto` queries the
+/// terminal (OSC 11) and picks the light or dark base; `Light`/`Dark` force it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeMode {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+/// Parsed `theme.toml` (the `mode` + raw `[colors]` text), kept so the final
+/// palette can be resolved *after* the terminal background is detected.
+pub struct ThemeConfig {
+    pub mode: ThemeMode,
+    /// Raw file contents (empty if no theme.toml), re-applied as `[colors]`
+    /// overrides onto whichever base palette is chosen.
+    text: String,
+    pub warning: Option<String>,
+}
+
+impl ThemeConfig {
+    pub fn load() -> Self {
         let path = theme_file();
         let text = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Self::default(), None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Self {
+                    mode: ThemeMode::Auto,
+                    text: String::new(),
+                    warning: None,
+                }
+            }
             Err(e) => {
-                return (
-                    Self::default(),
-                    Some(format!("theme read failed ({}): {e}", path.display())),
-                )
+                return Self {
+                    mode: ThemeMode::Auto,
+                    text: String::new(),
+                    warning: Some(format!("theme read failed ({}): {e}", path.display())),
+                }
             }
         };
-        match parse_theme(&text) {
-            Ok(theme) => (theme, None),
-            Err(e) => (
-                Self::default(),
-                Some(format!("theme parse failed ({}): {e}", path.display())),
-            ),
+        // Validate the color overrides up front (against the dark base) to
+        // surface a single warning; the actual base is chosen later in resolve.
+        let warning = parse_theme_onto(Theme::dark(), &text)
+            .err()
+            .map(|e| format!("theme parse failed ({}): {e}", path.display()));
+        Self {
+            mode: parse_mode(&text),
+            text,
+            warning,
         }
+    }
+
+    /// Build the final palette. `detected_light` is the OSC 11 result for
+    /// `Auto` (ignored for forced modes); `None` falls back to dark.
+    pub fn resolve(&self, detected_light: Option<bool>) -> Theme {
+        let light = match self.mode {
+            ThemeMode::Light => true,
+            ThemeMode::Dark => false,
+            ThemeMode::Auto => detected_light.unwrap_or(false),
+        };
+        let base = if light { Theme::light() } else { Theme::dark() };
+        if self.text.is_empty() {
+            return base;
+        }
+        // Overrides were validated at load; ignore errors here.
+        parse_theme_onto(base.clone(), &self.text).unwrap_or(base)
+    }
+}
+
+impl Theme {
+    /// The default Matrix palette, tuned for a dark terminal background.
+    pub fn dark() -> Self {
+        Self::default()
+    }
+
+    /// Matrix-flavored palette tuned for a *light* terminal background:
+    /// dark-green functional text + darker greens for the rain heads (so they
+    /// read on white), with pale greens for the fading tails.
+    pub fn light() -> Self {
+        Self {
+            text: Color::Rgb(20, 52, 32),
+            dim: Color::Rgb(96, 140, 108),
+            muted: Color::Rgb(108, 128, 114),
+            border: Color::Rgb(150, 190, 162),
+            border_focused: Color::Rgb(20, 140, 78),
+            accent: Color::Rgb(16, 138, 74),
+            accent_alt: Color::Rgb(22, 110, 150),
+            highlight_fg: Color::Rgb(248, 255, 250),
+            highlight_bg: Color::Rgb(32, 158, 92),
+            inactive_highlight_bg: Color::Rgb(206, 232, 214),
+            modeline_fg: Color::Rgb(238, 255, 242),
+            modeline_bg: Color::Rgb(22, 110, 62),
+            success: Color::Rgb(24, 150, 74),
+            warning: Color::Rgb(168, 118, 12),
+            danger: Color::Rgb(190, 44, 40),
+            info: Color::Rgb(22, 108, 150),
+            group: Color::Rgb(36, 128, 80),
+            harness: Color::Rgb(36, 128, 80),
+            user: Color::Rgb(40, 64, 50),
+            assistant: Color::Rgb(28, 120, 72),
+            system: Color::Rgb(108, 128, 114),
+            tool: Color::Rgb(24, 150, 74),
+            matrix_dim: Color::Rgb(176, 212, 186),
+            matrix_line: Color::Rgb(120, 178, 138),
+            matrix_close: Color::Rgb(28, 120, 72),
+            matrix_glow: Color::Rgb(70, 160, 104),
+            matrix_flash_work: Color::Rgb(28, 140, 84),
+            matrix_flash_good: Color::Rgb(18, 150, 70),
+            matrix_flash_warn: Color::Rgb(176, 126, 18),
+            matrix_flash_bad: Color::Rgb(190, 50, 44),
+        }
+    }
+
+    /// Back-compat: dark palette + theme.toml color overrides, no detection.
+    pub fn load_or_default() -> (Self, Option<String>) {
+        let cfg = ThemeConfig::load();
+        (cfg.resolve(Some(false)), cfg.warning)
+    }
+}
+
+fn parse_mode(text: &str) -> ThemeMode {
+    match toml::from_str::<RawTheme>(text)
+        .ok()
+        .and_then(|r| r.mode)
+        .as_deref()
+    {
+        Some("light") => ThemeMode::Light,
+        Some("dark") => ThemeMode::Dark,
+        _ => ThemeMode::Auto,
     }
 }
 
@@ -113,10 +226,86 @@ pub fn theme_file() -> PathBuf {
     Paths::discover().config_dir.join("theme.toml")
 }
 
-fn parse_theme(text: &str) -> Result<Theme, String> {
+/// Query the terminal's background color via OSC 11 and return `Some(true)` for
+/// a light background, `Some(false)` for dark, or `None` if the terminal didn't
+/// answer within `timeout` (caller falls back). Must run in raw mode, before
+/// the event loop starts consuming stdin.
+#[cfg(unix)]
+pub fn detect_terminal_is_light(timeout: std::time::Duration) -> Option<bool> {
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
+
+    {
+        let mut out = std::io::stdout();
+        out.write_all(b"\x1b]11;?\x07").ok()?;
+        out.flush().ok()?;
+    }
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = Instant::now() + timeout;
+    let mut buf: Vec<u8> = Vec::with_capacity(64);
+    loop {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        let ms = remaining.as_millis().min(60_000) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, ms) } <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 64];
+        let n = unsafe {
+            libc::read(
+                fd,
+                chunk.as_mut_ptr() as *mut libc::c_void,
+                chunk.len(),
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n as usize]);
+        // OSC response ends with BEL (0x07) or ST (ESC \).
+        if buf.contains(&0x07) || buf.windows(2).any(|w| w == [0x1b, b'\\']) {
+            break;
+        }
+    }
+    parse_osc11_luminance(&buf).map(|lum| lum > 0.5)
+}
+
+#[cfg(not(unix))]
+pub fn detect_terminal_is_light(_timeout: std::time::Duration) -> Option<bool> {
+    None
+}
+
+/// Parse an OSC 11 reply (`...rgb:RRRR/GGGG/BBBB...`) into perceived luminance
+/// (0.0 dark .. 1.0 light). Channels may be 1–4 hex digits each.
+fn parse_osc11_luminance(bytes: &[u8]) -> Option<f32> {
+    let s = String::from_utf8_lossy(bytes);
+    let rest = &s[s.find("rgb:")? + 4..];
+    let mut parts = rest.split('/');
+    let r = parse_hex_channel(parts.next()?)?;
+    let g = parse_hex_channel(parts.next()?)?;
+    let b = parse_hex_channel(parts.next()?)?;
+    Some((0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0)
+}
+
+fn parse_hex_channel(s: &str) -> Option<u8> {
+    let hex: String = s.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+    if hex.is_empty() {
+        return None;
+    }
+    let val = u32::from_str_radix(&hex, 16).ok()?;
+    let max = (1u32 << (hex.len() * 4)) - 1;
+    Some(((val * 255) / max) as u8)
+}
+
+fn parse_theme_onto(base: Theme, text: &str) -> Result<Theme, String> {
     let raw: RawTheme = toml::from_str(text).map_err(|e| e.to_string())?;
     let colors = raw.colors.unwrap_or_default();
-    let mut theme = Theme::default();
+    let mut theme = base;
     apply(&mut theme.text, colors.text, "text")?;
     apply(&mut theme.dim, colors.dim, "dim")?;
     apply(&mut theme.muted, colors.muted, "muted")?;
@@ -223,8 +412,10 @@ fn parse_color(s: &str) -> Result<Color, String> {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct RawTheme {
+    #[serde(default)]
+    mode: Option<String>,
     #[serde(default)]
     colors: Option<RawColors>,
 }
@@ -274,7 +465,8 @@ mod tests {
 
     #[test]
     fn parses_partial_theme_over_default() {
-        let theme = parse_theme(
+        let theme = parse_theme_onto(
+            Theme::dark(),
             r##"
             [colors]
             text = "#ffffff"
@@ -292,5 +484,58 @@ mod tests {
     #[test]
     fn default_matrix_theme_uses_green_for_tools() {
         assert_eq!(Theme::default().tool, Theme::default().success);
+    }
+
+    #[test]
+    fn theme_mode_parses_from_config() {
+        assert_eq!(parse_mode(""), ThemeMode::Auto);
+        assert_eq!(parse_mode("mode = \"auto\""), ThemeMode::Auto);
+        assert_eq!(parse_mode("mode = \"light\""), ThemeMode::Light);
+        assert_eq!(parse_mode("mode = \"dark\""), ThemeMode::Dark);
+        assert_eq!(parse_mode("mode = \"weird\""), ThemeMode::Auto);
+    }
+
+    #[test]
+    fn forced_mode_ignores_detection() {
+        // Dark mode stays dark even if the terminal reports light, and vice versa.
+        let dark = ThemeConfig {
+            mode: ThemeMode::Dark,
+            text: String::new(),
+            warning: None,
+        };
+        assert_eq!(dark.resolve(Some(true)).text, Theme::dark().text);
+        let light = ThemeConfig {
+            mode: ThemeMode::Light,
+            text: String::new(),
+            warning: None,
+        };
+        assert_eq!(light.resolve(Some(false)).text, Theme::light().text);
+    }
+
+    #[test]
+    fn auto_mode_follows_detection_and_falls_back_dark() {
+        let auto = ThemeConfig {
+            mode: ThemeMode::Auto,
+            text: String::new(),
+            warning: None,
+        };
+        assert_eq!(auto.resolve(Some(true)).text, Theme::light().text);
+        assert_eq!(auto.resolve(Some(false)).text, Theme::dark().text);
+        assert_eq!(auto.resolve(None).text, Theme::dark().text); // no answer → dark
+    }
+
+    #[test]
+    fn osc11_luminance_distinguishes_light_and_dark() {
+        // White background → high luminance (light).
+        let white = b"\x1b]11;rgb:ffff/ffff/ffff\x07";
+        assert!(parse_osc11_luminance(white).unwrap() > 0.5);
+        // Black background → low luminance (dark).
+        let black = b"\x1b]11;rgb:0000/0000/0000\x07";
+        assert!(parse_osc11_luminance(black).unwrap() < 0.5);
+        // 8-bit channels work too.
+        let white8 = b"\x1b]11;rgb:ff/ff/ff\x1b\\";
+        assert!(parse_osc11_luminance(white8).unwrap() > 0.5);
+        // Garbage → None.
+        assert!(parse_osc11_luminance(b"nope").is_none());
     }
 }

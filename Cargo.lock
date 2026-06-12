@@ -50,6 +50,7 @@ dependencies = [
  "crossterm 0.28.1",
  "futures",
  "image",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",

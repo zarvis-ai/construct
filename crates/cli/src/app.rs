@@ -1519,7 +1519,11 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     let sessions = client.list().await.unwrap_or_default();
     let groups = client.list_projects().await.unwrap_or_default();
     let harnesses = client.harnesses().await.unwrap_or_default();
-    let (theme, theme_warning) = crate::theme::Theme::load_or_default();
+    // Theme config is parsed now; the final palette (light vs dark) is resolved
+    // after raw mode is on, once we can query the terminal background (OSC 11).
+    let theme_config = crate::theme::ThemeConfig::load();
+    let theme_warning = theme_config.warning.clone();
+    let theme = theme_config.resolve(None);
     let initial_orch_id = sessions
         .iter()
         .find(|s| s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal())
@@ -1712,6 +1716,17 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
 
     // Terminal setup.
     enable_raw_mode().context("enable raw mode")?;
+    // Now that the terminal is in raw mode (and before the event loop starts
+    // consuming stdin), resolve the palette against the terminal background for
+    // `mode = "auto"`. Forced light/dark skip the query; a non-answering
+    // terminal falls back to dark.
+    let detected_light = if theme_config.mode == crate::theme::ThemeMode::Auto {
+        crate::theme::detect_terminal_is_light(std::time::Duration::from_millis(120))
+    } else {
+        None
+    };
+    app.theme = theme_config.resolve(detected_light);
+    tracing::info!(mode = ?theme_config.mode, ?detected_light, "tui theme resolved");
     let mut stdout = std::io::stdout();
     execute!(
         stdout,

@@ -38,3 +38,7 @@ base64 = { workspace = true }
 image = { workspace = true }
 toml = { workspace = true }
 reqwest = { workspace = true }
+
+# OSC 11 terminal-background detection (timed poll/read on the tty).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
