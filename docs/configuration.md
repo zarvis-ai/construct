@@ -86,10 +86,27 @@ env = { CONSTRUCT_CODEX_CMD = "exec codex" }
 
 ## TUI Theme
 
-The TUI uses a built-in Matrix theme by default. Override any color slot in
-`$CONSTRUCT_CONFIG_DIR/theme.toml` (default `~/.config/construct/theme.toml`):
+The TUI ships a Matrix-inspired palette in two variants — one for dark
+terminals and one for light — and, by default, **detects which your terminal
+uses** (via an OSC 11 background-color query) and picks the matching variant.
+Set this in `$CONSTRUCT_CONFIG_DIR/theme.toml` (default
+`~/.config/construct/theme.toml`):
 
 ```toml
+mode = "auto"   # "auto" (default) | "light" | "dark"
+```
+
+- `auto` — query the terminal at startup; light background → light palette,
+  dark → dark. If the terminal doesn't answer (or doesn't support the query),
+  it falls back to the dark palette.
+- `light` / `dark` — force a variant, skipping detection.
+
+Override any individual color slot under `[colors]` (applied on top of whichever
+variant is active):
+
+```toml
+mode = "auto"
+
 [colors]
 text = "#b8ffcc"
 accent = "#39ff88"
@@ -100,4 +117,4 @@ matrix_dim = "indexed:34"
 ```
 
 Colors accept `#rrggbb`, `indexed:N`, or ANSI names such as `green`, `cyan`,
-`dark_gray`, and `light_yellow`. Omitted slots keep the Matrix default.
+`dark_gray`, and `light_yellow`. Omitted slots keep the variant's default.
