@@ -4643,10 +4643,33 @@ function removeOptimisticMessage(sessionId, entry) {
   if (entry.row && entry.row.isConnected) entry.row.remove();
 }
 
+// Whitespace-insensitive normalization for matching an echoed user message to
+// its optimistic row. Harnesses re-emit the text we sent, but not byte-for-byte:
+// codex stores+replays it through its rollout, smith/claude re-emit it, and any
+// of them can add a trailing newline, CRLF, or reflow line wrapping. An exact
+// `===` then misses, so the optimistic row AND the echo both show (the dup).
+function normalizeChatText(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
 function consumeOptimisticMessage(sessionId, role, text) {
   if (state.renderingTranscriptHistory || role !== "user" || !sessionId) return false;
   const list = state.optimisticMessagesById.get(sessionId) || [];
-  const idx = list.findIndex((entry) => entry.role === role && entry.text === text);
+  if (!list.length) return false;
+  const n = normalizeChatText(text);
+  // Match exact → whitespace-normalized → one normalized text wrapping the other
+  // (a harness may prepend/append a little). Pick the oldest match so rapid
+  // sends pair up in send order. Dissimilar messages (e.g. injected
+  // `OBSERVATION:` user events) don't match, so they still render.
+  let idx = list.findIndex((e) => e.role === role && e.text === text);
+  if (idx < 0) idx = list.findIndex((e) => e.role === role && normalizeChatText(e.text) === n);
+  if (idx < 0 && n) {
+    idx = list.findIndex((e) => {
+      if (e.role !== role) return false;
+      const en = normalizeChatText(e.text);
+      return en && (en.startsWith(n) || n.startsWith(en));
+    });
+  }
   if (idx < 0) return false;
   const [entry] = list.splice(idx, 1);
   if (list.length) state.optimisticMessagesById.set(sessionId, list);

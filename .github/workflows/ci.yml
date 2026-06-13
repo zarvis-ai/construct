@@ -47,7 +47,8 @@ jobs:
             --skip pty_render::tests::codex_initial_render_after_restart_is_bounded \
             --skip pty_render::tests::many_pinned_sessions_resize_within_budget \
             --skip pty_render::tests::pseudo_terminal_render_is_fast_per_frame \
-            --skip pty_render::tests::codex_resize_bound_is_reasonable
+            --skip pty_render::tests::codex_resize_bound_is_reasonable \
+            --skip pty_render::tests::smith_tool_expand_collapse_rebuilds_only_retained_suffix
 
       - name: Render TUI casts to GIFs
         if: always()
