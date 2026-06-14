@@ -666,8 +666,35 @@ where
 {
     tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
+        // codex CLI prints a per-turn footer like:
+        //   tokens used
+        //   2,280
+        // on two consecutive lines. Track whether we just saw the header.
+        let mut expecting_token_count = false;
         while let Ok(Some(line)) = lines.next_line().await {
             if line.trim().is_empty() {
+                continue;
+            }
+            // Stateful token-footer parse, BEFORE any emit, so the footer
+            // never leaks to the transcript as assistant prose.
+            if expecting_token_count {
+                expecting_token_count = false;
+                if let Some(n) = parse_token_count(&line) {
+                    emit.emit(SessionEvent::Cost {
+                        usd: 0.0,
+                        // codex reports a single "total tokens used" per turn
+                        // without splitting in/out. Stored in tokens_in as a
+                        // conservative proxy (the prompt/context dominates).
+                        tokens_in: n,
+                        tokens_out: 0,
+                        tokens_cached: 0,
+                    });
+                    continue;
+                }
+                // Fall through if the line wasn't a number — treat it normally.
+            }
+            if line.trim().eq_ignore_ascii_case("tokens used") {
+                expecting_token_count = true;
                 continue;
             }
             // Best-effort JSON parse; if not JSON, emit as plain assistant text.
@@ -692,6 +719,19 @@ where
             }
         }
     })
+}
+
+/// Parse codex's "2,280" style total-tokens line. Strips commas/whitespace.
+/// Returns None if the line isn't a pure integer (modulo separators).
+fn parse_token_count(line: &str) -> Option<u64> {
+    let cleaned: String = line
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != ',' && *c != '_')
+        .collect();
+    if cleaned.is_empty() {
+        return None;
+    }
+    cleaned.parse::<u64>().ok()
 }
 
 fn spawn_stderr<R>(reader: R, emit: EventEmitter) -> tokio::task::JoinHandle<()>
@@ -790,6 +830,19 @@ fn short(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_token_count_handles_codex_formats() {
+        // Plain integer, comma-separated, underscore-separated, with whitespace.
+        assert_eq!(parse_token_count("2280"), Some(2280));
+        assert_eq!(parse_token_count("2,280"), Some(2280));
+        assert_eq!(parse_token_count("  4,448 "), Some(4448));
+        assert_eq!(parse_token_count("1_234_567"), Some(1234567));
+        // Non-numbers reject.
+        assert_eq!(parse_token_count("hello"), None);
+        assert_eq!(parse_token_count(""), None);
+        assert_eq!(parse_token_count("12abc"), None);
+    }
 
     #[test]
     fn uuid_from_rollout_name_parses_real_codex_filename() {
