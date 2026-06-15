@@ -1330,6 +1330,9 @@ pub struct LayoutSnapshot {
     pub pin_strip_area: Option<ratatui::layout::Rect>,
     pub matrix_rain_area: Option<ratatui::layout::Rect>,
     pub minibuffer_area: Option<ratatui::layout::Rect>,
+    /// Last rendered chat areas by session id to conditionally clear only
+    /// when geometry grows (editor shrinks), avoiding per-frame clears.
+    pub last_chat_areas: std::collections::HashMap<String, ratatui::layout::Rect>,
     /// Clickable approval-mode badge in the modeline for the selected session.
     pub modeline_approval_mode_hit: Option<ModelineApprovalModeHit>,
     /// Number of rows of the list pane currently in use (so a click
@@ -7718,6 +7721,7 @@ mod tests {
             pin_strip_area: Some(Rect::new(20, 20, 80, 8)),
             matrix_rain_area: None,
             minibuffer_area: Some(Rect::new(0, 29, 100, 4)),
+            last_chat_areas: std::collections::HashMap::new(),
             modeline_approval_mode_hit: None,
             list_row_count: 0,
             list_items_area: None,

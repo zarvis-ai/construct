@@ -140,14 +140,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let modeline_area = vertical[1];
     let minibuffer_area = vertical[2];
 
-    // Clear the main area and chrome regions so any stale cells from prior
-    // larger editor popups don't persist visually. This forces a full
-    // repaint of the content region and avoids relying on a terminal
-    // resize to flush artifacts.
-    f.render_widget(Clear, main_area);
-    f.render_widget(Clear, modeline_area);
-    f.render_widget(Clear, minibuffer_area);
-
+    // Avoid per-frame full-surface clears; they cause faint background
+    // blinking on some terminals. Only clear when we know geometry likely
+    // exposed stale cells (handled inside individual renderers when panes
+    // shrink).
     // Clamp the user-adjusted list width to leave room for the view
     // pane on narrow terminals. The drag handler stores the raw width
     // (so the user's intent is preserved when the terminal grows
@@ -3098,22 +3094,36 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     // — otherwise the chat's vt100 cursor would render as a stray
     // block. For non-editor-pane sessions (claude / codex / shell)
     // keep the cursor visible so users see where their typing lands.
-    // Clear the chat area before painting so any rows uncovered when the
-    // editor pane shrinks are not left stale. This prevents visual gaps
-    // that only disappear on terminal resize.
-    f.render_widget(Clear, chat_area);
-    // Extra defensive clear: fill the chat area with blank rows so some
-    // terminals that don't honor Clear promptly still see overwritten cells.
-    for row in 0..chat_area.height {
-        let blank = " ".repeat(chat_area.width as usize);
-        let r = Rect {
-            x: chat_area.x,
-            y: chat_area.y + row,
-            width: chat_area.width,
-            height: 1,
-        };
-        f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
+    // Only clear when the editor pane has SHUNK (chat area grew) this frame —
+    // otherwise let vt100 overdraw normally to avoid background blinking.
+    let need_clear = app
+        .layout
+        .last_chat_areas
+        .get(&id)
+        .map(|prev| chat_area.height > prev.height || chat_area.width != prev.width)
+        .unwrap_or(true);
+    if need_clear {
+        f.render_widget(Clear, chat_area);
+        // Fill only the newly-exposed rows (when taller); cheap bound.
+        let prev_h = app
+            .layout
+            .last_chat_areas
+            .get(&id)
+            .map(|r| r.height)
+            .unwrap_or(0);
+        let start = prev_h.min(chat_area.height);
+        for row in start..chat_area.height {
+            let blank = " ".repeat(chat_area.width as usize);
+            let r = Rect {
+                x: chat_area.x,
+                y: chat_area.y + row,
+                width: chat_area.width,
+                height: 1,
+            };
+            f.render_widget(Paragraph::new(Line::from(vec![Span::raw(blank)])), r);
+        }
     }
+    app.layout.last_chat_areas.insert(id.clone(), chat_area);
 
     // Gapless bottom-align for short smith chats: when the history content
     // is shorter than the chat viewport, paint it hugging the editor pane
@@ -6770,7 +6780,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::TOP)
         .border_style(Style::default().fg(app.theme.border));
     let inner = block.inner(area);
-    f.render_widget(Clear, area);
+    // Avoid per-frame clear to limit flicker; block draw overwrites borders.
     f.render_widget(block, area);
 
     // Publish the orchestrator panel's inner size; `run_loop` debounces
