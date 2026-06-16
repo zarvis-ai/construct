@@ -99,14 +99,13 @@ pub struct AdapterConfig {
     /// per-session env takes precedence so an explicit
     /// `construct new --env KEY=VAL` still overrides.
     ///
-    /// Example: pin every new smith session to use the
-    /// Codex OAuth path (subscription-billed) instead of the heuristic
-    /// fallback:
-    /// path (subscription-billed) instead of the heuristic fallback:
+    /// Example: pin every new smith session to use an explicit
+    /// subscription-backed OAuth path instead of the heuristic fallback:
     ///
     /// ```toml
     /// [adapters.smith]
     /// env = { CONSTRUCT_SMITH_MODEL = "codex-oauth:gpt-5.5" }
+    /// # or: env = { CONSTRUCT_SMITH_MODEL = "claude-oauth:sonnet" }
     /// ```
     #[serde(default)]
     pub env: HashMap<String, String>,

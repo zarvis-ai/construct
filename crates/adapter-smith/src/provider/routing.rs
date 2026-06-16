@@ -1,7 +1,8 @@
 //! Translate a model spec string into a (provider, bare model name).
 //!
 //! Explicit prefixes (`openai:`, `anthropic:`, `gemini:`, `ollama:`,
-//! `codex-oauth:`) always win. Otherwise we sniff the bare name:
+//! `codex-oauth:`, `claude-oauth:`, `claude-code-oauth:`) always win.
+//! Otherwise we sniff the bare name:
 //!   - starts with `gpt-` or `o[1-5]` → OpenAI
 //!   - starts with `claude-` → Anthropic
 //!   - starts with `gemini-` → Gemini
@@ -14,6 +15,11 @@
 //! which hits the public platform API at `api.openai.com`. There is no
 //! bare-name fallback for it — users must opt in explicitly because the
 //! billing path is different.
+//!
+//! `claude-oauth:` is the Claude Code OAuth path, delegated through the
+//! installed `claude` CLI so Smith can use the user's Claude Code login
+//! without reading credentials directly. It is distinct from `anthropic:`,
+//! which uses `ANTHROPIC_API_KEY`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
@@ -24,6 +30,8 @@ pub enum Provider {
     /// OAuth-backed Codex backend; reads `~/.codex/auth.json`, bills
     /// against the user's ChatGPT subscription.
     CodexOauth,
+    /// OAuth-backed Claude Code CLI path; delegates auth to `claude`.
+    ClaudeOauth,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,17 +75,32 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
             model: rest.to_string(),
         });
     }
+    if let Some(rest) = s
+        .strip_prefix("claude-oauth:")
+        .or_else(|| s.strip_prefix("claude-code-oauth:"))
+    {
+        return Ok(ModelSpec {
+            provider: Provider::ClaudeOauth,
+            model: rest.to_string(),
+        });
+    }
     if let Some(prefix) = s.split(':').next() {
         // Reject unknown explicit prefixes so typos don't silently fall through.
         if s.contains(':')
             && !matches!(
                 prefix,
-                "openai" | "anthropic" | "gemini" | "ollama" | "codex-oauth"
+                "openai"
+                    | "anthropic"
+                    | "gemini"
+                    | "ollama"
+                    | "codex-oauth"
+                    | "claude-oauth"
+                    | "claude-code-oauth"
             )
         {
             return Err(format!(
                 "unknown provider prefix `{prefix}:` (expected one of \
-                 openai:, anthropic:, ollama:, codex-oauth:)"
+                 openai:, anthropic:, ollama:, codex-oauth:, claude-oauth:)"
             ));
         }
     }
@@ -217,5 +240,21 @@ mod tests {
         // router treats it as OpenAI based on the `gpt-` prefix; users
         // must type the `codex-oauth:` prefix explicitly.
         assert_eq!(parse("gpt-5-codex").provider, Provider::OpenAI);
+    }
+
+    #[test]
+    fn claude_oauth_prefixes_are_recognized() {
+        let s = parse("claude-oauth:sonnet");
+        assert_eq!(s.provider, Provider::ClaudeOauth);
+        assert_eq!(s.model, "sonnet");
+
+        let s = parse("claude-code-oauth:claude-sonnet-4-6");
+        assert_eq!(s.provider, Provider::ClaudeOauth);
+        assert_eq!(s.model, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn claude_bare_still_routes_to_anthropic_api() {
+        assert_eq!(parse("claude-sonnet-4-6").provider, Provider::Anthropic);
     }
 }
