@@ -2,14 +2,17 @@
 //!
 //! A [`Sandbox`] backend turns a [`SandboxPolicy`] into real enforcement around
 //! a spawned command (`shell`/`proc`) or a file write (`edit_file`). Backends
-//! are swappable: [`seatbelt`] (macOS), `Noop` (unsupported/disabled →
-//! cooperative gate only), and future bubblewrap/Landlock/custom backends.
+//! are swappable: [`seatbelt`] (macOS), [`bubblewrap`] (Linux), `Noop`
+//! (unsupported/disabled → cooperative gate only), and future Landlock/custom
+//! backends.
 //!
 //! Selected once at startup via [`select`]. **Opt-in** for now:
-//! `CONSTRUCT_SMITH_SANDBOX=auto|seatbelt|none` (default `none` → `Noop`), so
-//! default behavior is unchanged while the first cut is validated.
+//! `CONSTRUCT_SMITH_SANDBOX=auto|seatbelt|bwrap|none` (default `none` → `Noop`),
+//! so default behavior is unchanged while the first cut is validated.
 
 mod policy;
+#[cfg(target_os = "linux")]
+pub mod bubblewrap;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 
@@ -96,6 +99,7 @@ pub fn select() -> Box<dyn Sandbox> {
     match choice.as_str() {
         "auto" | "1" | "on" => auto(),
         "seatbelt" => seatbelt_or_noop(),
+        "bwrap" | "bubblewrap" => bubblewrap_or_noop(),
         // "none" | "0" | "" | unknown
         _ => Box::new(Noop),
     }
@@ -106,7 +110,11 @@ fn auto() -> Box<dyn Sandbox> {
     {
         seatbelt_or_noop()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        bubblewrap_or_noop()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Box::new(Noop)
     }
@@ -116,6 +124,17 @@ fn seatbelt_or_noop() -> Box<dyn Sandbox> {
     #[cfg(target_os = "macos")]
     {
         let sb = seatbelt::Seatbelt;
+        if sb.available() {
+            return Box::new(sb);
+        }
+    }
+    Box::new(Noop)
+}
+
+fn bubblewrap_or_noop() -> Box<dyn Sandbox> {
+    #[cfg(target_os = "linux")]
+    {
+        let sb = bubblewrap::Bubblewrap;
         if sb.available() {
             return Box::new(sb);
         }

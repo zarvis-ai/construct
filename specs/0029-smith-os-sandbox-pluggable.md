@@ -1,6 +1,6 @@
 # 0029-smith-os-sandbox-pluggable
 
-Status: proposed
+Status: implemented (macOS Seatbelt + Linux bubblewrap; opt-in via `CONSTRUCT_SMITH_SANDBOX`)
 Date: 2026-06-14
 Area: adapter-smith
 Scope: OS-level sandbox enforcement for smith's tool execution, behind a pluggable backend — with `edit_file` writes guarded too.

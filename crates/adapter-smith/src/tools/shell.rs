@@ -368,6 +368,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// End-to-end wiring check (Linux): the bubblewrap backend equivalent of
+    /// `confined_shell_blocks_out_of_root_write`. Skipped when `bwrap` can't
+    /// sandbox here (no binary / no unprivileged user namespaces).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn confined_shell_blocks_out_of_root_write_bwrap() {
+        let sb = crate::sandbox::bubblewrap::Bubblewrap;
+        if !sb.available() {
+            eprintln!("skipping: bwrap unavailable or cannot create namespaces here");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("smith-shell-bwrap-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let policy = crate::sandbox::SandboxPolicy {
+            mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+            writable_roots: vec![crate::sandbox::canon(&root)],
+            readable: crate::sandbox::ReadScope::All,
+            network: crate::sandbox::NetworkPolicy::Denied,
+        };
+        let ctx = ToolCtx {
+            cwd: root.clone(),
+            session_id: "test".to_string(),
+            client: tokio::sync::OnceCell::new(),
+            emit: None,
+            procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            sandbox: std::sync::Arc::new(sb),
+            sandbox_policy: policy,
+        };
+
+        let inside = root.join("ok.txt");
+        let out = Shell
+            .run(
+                json!({"command": format!("echo hi > {}", inside.display()), "timeout_sec": 10}),
+                &ctx,
+            )
+            .await
+            .expect("run returns Ok");
+        assert!(out.ok, "write inside the worktree should succeed: {}", out.output);
+        assert!(inside.exists());
+
+        let outside = std::env::temp_dir().join(format!("smith-shell-bwOUT-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let out = Shell
+            .run(
+                json!({"command": format!("echo hi > {}", outside.display()), "timeout_sec": 10}),
+                &ctx,
+            )
+            .await
+            .expect("run returns Ok");
+        assert!(
+            !out.ok,
+            "write outside the writable roots must be blocked by the sandbox: {}",
+            out.output
+        );
+        assert!(!outside.exists(), "blocked write must not have created the file");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn returns_descriptive_error_when_cwd_missing() {
         let missing = std::env::temp_dir().join("agentd-smith-shell-test-missing-cwd-xyz123");

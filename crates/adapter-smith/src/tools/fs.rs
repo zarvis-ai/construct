@@ -643,6 +643,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// End-to-end wiring check (Linux): the bubblewrap equivalent of
+    /// `confined_edit_file_blocks_out_of_root_write`. Skipped when `bwrap` can't
+    /// sandbox here.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn confined_edit_file_blocks_out_of_root_write_bwrap() {
+        let sb = crate::sandbox::bubblewrap::Bubblewrap;
+        if !sb.available() {
+            eprintln!("skipping: bwrap unavailable or cannot create namespaces here");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("smith-edit-bwrap-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let policy = crate::sandbox::SandboxPolicy {
+            mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+            writable_roots: vec![crate::sandbox::canon(&root)],
+            readable: crate::sandbox::ReadScope::All,
+            network: crate::sandbox::NetworkPolicy::Denied,
+        };
+        let ctx = ToolCtx {
+            cwd: root.clone(),
+            session_id: "test".to_string(),
+            client: tokio::sync::OnceCell::new(),
+            emit: None,
+            procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            sandbox: std::sync::Arc::new(sb),
+            sandbox_policy: policy,
+        };
+
+        // In-root edit succeeds.
+        let inside = root.join("in.txt");
+        std::fs::write(&inside, "alpha\n").unwrap();
+        let out = EditFile
+            .run(
+                json!({"path": inside.to_string_lossy(), "find": "alpha", "replace": "BETA"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.ok, "in-root edit should succeed: {}", out.output);
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "BETA\n");
+
+        // Out-of-root edit is blocked by the kernel; content unchanged.
+        let outside =
+            std::env::temp_dir().join(format!("smith-edit-bwOUT-{}.txt", std::process::id()));
+        std::fs::write(&outside, "alpha\n").unwrap();
+        let out = EditFile
+            .run(
+                json!({"path": outside.to_string_lossy(), "find": "alpha", "replace": "BETA"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.ok,
+            "out-of-root edit must be blocked by the sandbox: {}",
+            out.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "alpha\n",
+            "blocked write must not have changed the file"
+        );
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn single_edit_replaces_unique_match() {
         let dir = std::env::temp_dir().join(format!("smith-edit-single-{}", std::process::id()));
