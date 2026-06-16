@@ -270,11 +270,7 @@ fn emit_editor_state(emit: &EventEmitter, editor: &LineEditor, queue: &VecDeque<
         queued: queue.iter().cloned().collect(),
         buf: editor.buf.clone(),
         cursor: editor.cursor,
-        completions: editor
-            .slash_matches()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        completions: editor.slash_matches(),
     });
 }
 
@@ -784,13 +780,17 @@ impl LineEditor {
     /// Slash-commands whose names start with the current buffer.
     /// Empty when the buf doesn't start with `/`. Candidates come from the
     /// shared registry's popup set, sorted for a deterministic ghost order.
-    fn slash_matches(&self) -> Vec<&'static str> {
+    fn slash_matches(&self) -> Vec<String> {
         if !self.buf.starts_with('/') {
             return Vec::new();
         }
-        let mut matches: Vec<&'static str> = agentd_protocol::slash::popup_names()
-            .filter(|c| c.starts_with(self.buf.as_str()))
-            .collect();
+        let mut matches = agentd_protocol::slash::model_completion_matches(&self.buf);
+        if matches.is_empty() {
+            matches = agentd_protocol::slash::popup_names()
+                .filter(|c| c.starts_with(self.buf.as_str()))
+                .map(str::to_string)
+                .collect();
+        }
         matches.sort_unstable();
         matches
     }
@@ -804,16 +804,17 @@ impl LineEditor {
         if matches.is_empty() {
             return false;
         }
-        let prefix = common_prefix(&matches);
+        let match_refs: Vec<&str> = matches.iter().map(String::as_str).collect();
+        let prefix = common_prefix(&match_refs);
         if prefix.chars().count() > self.buf.chars().count() {
             self.buf = prefix;
-            if matches.len() == 1 && self.buf == matches[0] {
+            if matches.len() == 1 && self.buf == matches[0].as_str() {
                 self.buf.push(' ');
             }
             self.cursor = self.buf.chars().count();
             return true;
         }
-        if matches.len() == 1 && self.buf == matches[0] {
+        if matches.len() == 1 && self.buf == matches[0].as_str() {
             self.buf.push(' ');
             self.cursor = self.buf.chars().count();
             return true;
@@ -1871,20 +1872,20 @@ mod tests {
         let mut ed = editor();
         ed.feed_bytes(b"/");
         let all = ed.slash_matches();
-        assert!(all.contains(&"/model"));
-        assert!(all.contains(&"/quit"));
-        assert!(all.contains(&"/reset"));
-        assert!(all.contains(&"/border"));
-        assert!(all.contains(&"/compact"));
+        assert!(all.iter().any(|s| s == "/model"));
+        assert!(all.iter().any(|s| s == "/quit"));
+        assert!(all.iter().any(|s| s == "/reset"));
+        assert!(all.iter().any(|s| s == "/border"));
+        assert!(all.iter().any(|s| s == "/compact"));
         // The popup lists canonical names only; `/exit` is an alias of `/quit`
         // (it still resolves when typed) so it isn't a separate ghost entry.
-        assert!(!all.contains(&"/exit"));
+        assert!(!all.iter().any(|s| s == "/exit"));
         ed.feed_bytes(b"bor");
-        assert_eq!(ed.slash_matches(), vec!["/border"]);
+        assert_eq!(ed.slash_matches(), vec!["/border".to_string()]);
         let mut ed = editor();
         ed.feed_bytes(b"/");
         ed.feed_bytes(b"q");
-        assert_eq!(ed.slash_matches(), vec!["/quit"]);
+        assert_eq!(ed.slash_matches(), vec!["/quit".to_string()]);
         ed.feed_bytes(b"x");
         assert!(ed.slash_matches().is_empty());
     }
@@ -1895,6 +1896,10 @@ mod tests {
         ed.feed_bytes(b"/m");
         ed.feed_bytes(&[0x09]); // Tab — only /model matches
         assert_eq!(ed.buf, "/model ");
+        let mut ed = editor();
+        ed.feed_bytes(b"/model codex-oauth:gpt-5.");
+        ed.feed_bytes(&[0x09]);
+        assert_eq!(ed.buf, "/model codex-oauth:gpt-5.5 ");
         let mut ed = editor();
         // `/` has 3 matches with no shared chars beyond `/` — Tab is a no-op.
         ed.feed_bytes(b"/");
