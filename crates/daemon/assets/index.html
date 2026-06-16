@@ -1848,6 +1848,7 @@ const state = {
   term: null,
   fitAddon: null,
   terminalById: new Map(),
+  pendingTerminalFocusId: null,
   // Current PTY size per session (cols/rows the daemon reports) so a passive
   // web viewer can render at the real width instead of wrapping wide output.
   ptySizeById: new Map(),
@@ -3048,6 +3049,14 @@ async function enterTerminalMode(id, options = {}) {
         await replayPtyChunks(handle);
       }
       handle.loaded = true;
+      // If a click tried to focus/claim during hydrate, complete it now.
+      if (state.pendingTerminalFocusId === id) {
+        state.pendingTerminalFocusId = null;
+        noteWebPtyEngagement();
+        refitTerminal({ claim: true, immediate: true });
+        const h = terminalHandleForSession(id);
+        if (h && h.term) h.term.focus();
+      }
       updateTerminalHistoryButton(handle);
     } catch (e) {
       state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
@@ -3324,6 +3333,11 @@ function createTerminalHandle(id) {
   // is what summons the soft keyboard on iOS/Android.
   host.addEventListener("click", () => {
     if (state.currentId !== id) return;
+    const handle = terminalHandleForSession(id);
+    if (!handle || !handle.loaded) {
+      state.pendingTerminalFocusId = id;
+      return;
+    }
     noteWebPtyEngagement();
     refitTerminal({ claim: true, immediate: true });
     term.focus();
