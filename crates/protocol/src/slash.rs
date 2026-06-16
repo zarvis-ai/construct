@@ -351,6 +351,53 @@ pub fn popup_names() -> impl Iterator<Item = &'static str> {
     COMMANDS.iter().filter(|c| c.in_popup).map(|c| c.name)
 }
 
+/// Curated model specs shown after `/model `. These are intentionally
+/// explicit `provider:model` strings so choosing one also selects the billing /
+/// auth path instead of relying on bare-name heuristics. The list is a UI hint,
+/// not a validator: `/model <any valid spec>` still accepts newer provider
+/// models that are not listed here yet.
+pub const MODEL_COMPLETIONS: &[&str] = &[
+    // ChatGPT subscription / Codex CLI OAuth path.
+    "codex-oauth:gpt-5.5",
+    "codex-oauth:gpt-5-codex",
+    "codex-oauth:gpt-5",
+    // OpenAI platform API path.
+    "openai:gpt-5.5",
+    "openai:gpt-5",
+    "openai:gpt-5-mini",
+    // Claude Code subscription OAuth path.
+    "claude-oauth:sonnet",
+    "claude-oauth:opus",
+    // Anthropic API path.
+    "anthropic:claude-opus-4-8",
+    "anthropic:claude-sonnet-4-6",
+    "anthropic:claude-haiku-4-5",
+    // Google Gemini API path.
+    "gemini:gemini-2.5-pro",
+    "gemini:gemini-2.5-flash",
+    // Local Ollama examples.
+    "ollama:llama3.1",
+    "ollama:qwen3-coder",
+];
+
+/// Completion rows for the current `/model` input buffer.
+pub fn model_completion_matches(buf: &str) -> Vec<String> {
+    let Some(rest) = buf.strip_prefix("/model") else {
+        return Vec::new();
+    };
+    // Only offer model specs once the user is editing the argument position.
+    if !rest.starts_with(char::is_whitespace) {
+        return Vec::new();
+    }
+    let arg_prefix = rest.trim_start();
+    MODEL_COMPLETIONS
+        .iter()
+        .copied()
+        .filter(|spec| spec.starts_with(arg_prefix))
+        .map(|spec| format!("/model {spec}"))
+        .collect()
+}
+
 /// Whether an event must be withheld from a reading model (i.e. filtered out
 /// of `agentd_get_transcript`). True for a [`crate::SessionEvent::ClientCommand`]
 /// whose registry [`ModelVisibility`] is `Hidden` — the principled, table-driven
@@ -421,6 +468,19 @@ mod tests {
         );
         assert!(SlashCommand::resolve("/definitely-not-a-command").is_none());
         assert!(SlashCommand::resolve("/").is_none());
+    }
+
+    #[test]
+    fn model_completions_are_offered_after_model_command() {
+        assert!(model_completion_matches("/mod").is_empty());
+        assert!(model_completion_matches("/model").is_empty());
+
+        let matches = model_completion_matches("/model codex-oauth:gpt-5.");
+        assert_eq!(matches, vec!["/model codex-oauth:gpt-5.5"]);
+
+        let matches = model_completion_matches("/model claude-oauth:");
+        assert!(matches.contains(&"/model claude-oauth:sonnet".to_string()));
+        assert!(matches.contains(&"/model claude-oauth:opus".to_string()));
     }
 
     /// The leak fix in action: a `/zoom` ClientCommand event is hidden from
