@@ -260,7 +260,26 @@ impl Tool for EditFile {
                     let _ = tokio::fs::create_dir_all(parent).await;
                 }
             }
-            if let Err(e) = tokio::fs::write(&p.path, &p.new_text).await {
+            // Route the write through the sandbox so the kernel enforces the
+            // policy on the in-process `edit_file` path too (spec 0029): a
+            // confined write goes through a sandboxed writer subprocess and
+            // gets `EPERM` outside the writable roots; `FullAccess`/`Noop`
+            // writes directly. Run on the blocking pool — the writer may spawn
+            // a subprocess. (For a confined `edit_file` the target is always an
+            // auto-approved path, which is a writable root, so this succeeds;
+            // an escalated/Risky edit runs `FullAccess`.)
+            let sandbox = ctx.sandbox.clone();
+            let policy = ctx.sandbox_policy.clone();
+            let path = p.path.clone();
+            let content = p.new_text.clone().into_bytes();
+            let write_res =
+                tokio::task::spawn_blocking(move || sandbox.write_file(&policy, &path, &content))
+                    .await;
+            let io_res = match write_res {
+                Ok(r) => r,
+                Err(e) => Err(std::io::Error::other(format!("writer task panicked: {e}"))),
+            };
+            if let Err(e) = io_res {
                 return Ok(ToolOutcome {
                     ok: false,
                     output: format!("write {}: {e}", p.path.display()),
@@ -490,12 +509,15 @@ mod tests {
     use serde_json::json;
 
     fn ctx_with_cwd(cwd: std::path::PathBuf) -> ToolCtx {
+        let sandbox_policy = crate::sandbox::SandboxPolicy::workspace_default(&cwd);
         ToolCtx {
             cwd,
             session_id: "test".to_string(),
             client: tokio::sync::OnceCell::new(),
             emit: None,
             procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            sandbox: std::sync::Arc::new(crate::sandbox::Noop),
+            sandbox_policy,
         }
     }
 
@@ -552,6 +574,73 @@ mod tests {
         }));
 
         assert_eq!(summary, "1 edit in README.md: `before` -> `after`");
+    }
+
+    /// End-to-end wiring check (macOS): a confined Seatbelt policy must make
+    /// `edit_file`'s write go through the sandboxed writer and get blocked
+    /// outside the writable roots, while an in-root edit succeeds — proving the
+    /// in-process write actually routes through `ctx.sandbox.write_file`.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_edit_file_blocks_out_of_root_write() {
+        let sb = crate::sandbox::seatbelt::Seatbelt;
+        if !sb.available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("smith-edit-enf-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let policy = crate::sandbox::SandboxPolicy {
+            mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+            writable_roots: vec![crate::sandbox::canon(&root)],
+            readable: crate::sandbox::ReadScope::All,
+            network: crate::sandbox::NetworkPolicy::Denied,
+        };
+        let ctx = ToolCtx {
+            cwd: root.clone(),
+            session_id: "test".to_string(),
+            client: tokio::sync::OnceCell::new(),
+            emit: None,
+            procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            sandbox: std::sync::Arc::new(sb),
+            sandbox_policy: policy,
+        };
+
+        // In-root edit succeeds.
+        let inside = root.join("in.txt");
+        std::fs::write(&inside, "alpha\n").unwrap();
+        let out = EditFile
+            .run(
+                json!({"path": inside.to_string_lossy(), "find": "alpha", "replace": "BETA"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(out.ok, "in-root edit should succeed: {}", out.output);
+        assert_eq!(std::fs::read_to_string(&inside).unwrap(), "BETA\n");
+
+        // Out-of-root edit is blocked by the kernel; content unchanged.
+        let outside = std::env::temp_dir().join(format!("smith-edit-OUT-{}.txt", std::process::id()));
+        std::fs::write(&outside, "alpha\n").unwrap();
+        let out = EditFile
+            .run(
+                json!({"path": outside.to_string_lossy(), "find": "alpha", "replace": "BETA"}),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !out.ok,
+            "out-of-root edit must be blocked by the sandbox: {}",
+            out.output
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "alpha\n",
+            "blocked write must not have changed the file"
+        );
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

@@ -255,6 +255,8 @@ pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
         client: tokio::sync::OnceCell::new(),
         emit: src.emit.clone(),
         procs: src.procs.clone(),
+        sandbox: src.sandbox.clone(),
+        sandbox_policy: src.sandbox_policy.clone(),
     };
     if let Some(c) = src.client.get() {
         let _ = new_ctx.client.set(c.clone());
@@ -459,7 +461,14 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
         procs: Arc::new(crate::tools::proc::ProcRegistry::default()),
+        sandbox: crate::sandbox::select().into(),
+        sandbox_policy: crate::sandbox::SandboxPolicy::workspace_default(&cwd),
     };
+    tracing::debug!(
+        backend = tool_ctx.sandbox.name(),
+        enforces = tool_ctx.sandbox.enforces(),
+        "smith sandbox backend selected"
+    );
 
     // Per-session message persistence (`smith.jsonl`). On resume,
     // hydrate `messages` from the file before the loop starts.
@@ -1251,7 +1260,20 @@ async fn run_one_tool(
     }
 
     // Run the tool — under a cancelable future so interrupts work.
-    let outcome = run_with_interrupt(tool, call.input.clone(), tool_ctx, inbox).await;
+    //
+    // Sandbox escalation: a Risky (effective) call that reaches this point has
+    // been *permitted* (user-approved, auto-review-approved, or an auto mode),
+    // so it may legitimately cross the confined boundary — run it with the
+    // policy relaxed. Safe calls keep the confined floor (no network, writes
+    // only within the worktree/widgets/tmp). See spec 0029's gate reframe.
+    let escalated_ctx;
+    let run_ctx = if is_risky {
+        escalated_ctx = tool_ctx.escalated();
+        &escalated_ctx
+    } else {
+        tool_ctx
+    };
+    let outcome = run_with_interrupt(tool, call.input.clone(), run_ctx, inbox).await;
     match &outcome {
         Ok(o) => emit.emit(SessionEvent::ToolResult {
             tool: call.id.clone(),
@@ -1298,6 +1320,8 @@ async fn run_with_interrupt(
     let session_id = ctx.session_id.clone();
     let emit = ctx.emit.clone();
     let procs = ctx.procs.clone();
+    let sandbox = ctx.sandbox.clone();
+    let sandbox_policy = ctx.sandbox_policy.clone();
     let client_cell = std::sync::Mutex::new(None::<Arc<agentd_client::Client>>);
     if let Some(c) = ctx.client.get() {
         *client_cell.lock().unwrap() = Some(c.clone());
@@ -1309,6 +1333,8 @@ async fn run_with_interrupt(
             client: tokio::sync::OnceCell::new(),
             emit,
             procs,
+            sandbox,
+            sandbox_policy,
         };
         if let Some(c) = client_cell.lock().unwrap().clone() {
             let _ = local_ctx.client.set(c);

@@ -104,8 +104,20 @@ impl Tool for Shell {
             return Ok(format_session(&id, drain, true));
         }
 
-        let mut child = Command::new("bash")
-            .args(["-lc", cmd])
+        // Front the command with the session's sandbox backend. Under the
+        // confined floor (a Safe `read_only` shell) this becomes
+        // `sandbox-exec -p <profile> bash -lc <cmd>` and the kernel denies
+        // network + out-of-root writes; an escalated (approved) call runs
+        // `bash` directly. `Noop`/disabled is an identity wrap. (Interactive
+        // sessions are always Risky → escalated → `FullAccess`, so the
+        // separate `procs.spawn` path needs no wrap.)
+        let (prog, prog_args) = ctx.sandbox.wrap_command(
+            &ctx.sandbox_policy,
+            "bash",
+            &["-lc".to_string(), cmd.to_string()],
+        );
+        let mut child = Command::new(&prog)
+            .args(&prog_args)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -282,13 +294,78 @@ mod tests {
     use crate::tools::{Tool, ToolCtx};
 
     fn ctx_with_cwd(cwd: std::path::PathBuf) -> ToolCtx {
+        let sandbox_policy = crate::sandbox::SandboxPolicy::workspace_default(&cwd);
         ToolCtx {
             cwd,
             session_id: "test".to_string(),
             client: tokio::sync::OnceCell::new(),
             emit: None,
             procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            sandbox: std::sync::Arc::new(crate::sandbox::Noop),
+            sandbox_policy,
         }
+    }
+
+    /// End-to-end wiring check (macOS): a `ToolCtx` carrying the real Seatbelt
+    /// backend + a confined policy must make `Shell::run` block a write outside
+    /// the writable roots and allow one inside — proving the spawn site
+    /// actually fronts the command with `ctx.sandbox`, not just that the
+    /// backend can enforce in isolation.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn confined_shell_blocks_out_of_root_write() {
+        let sb = crate::sandbox::seatbelt::Seatbelt;
+        if !sb.available() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("smith-shell-enf-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        // Only `root` is writable (not tmp), so a sibling under tmp is a genuine
+        // out-of-root target.
+        let policy = crate::sandbox::SandboxPolicy {
+            mode: crate::sandbox::SandboxMode::WorkspaceWrite,
+            writable_roots: vec![crate::sandbox::canon(&root)],
+            readable: crate::sandbox::ReadScope::All,
+            network: crate::sandbox::NetworkPolicy::Denied,
+        };
+        let ctx = ToolCtx {
+            cwd: root.clone(),
+            session_id: "test".to_string(),
+            client: tokio::sync::OnceCell::new(),
+            emit: None,
+            procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            sandbox: std::sync::Arc::new(sb),
+            sandbox_policy: policy,
+        };
+
+        let inside = root.join("ok.txt");
+        let out = Shell
+            .run(
+                json!({"command": format!("echo hi > {}", inside.display()), "timeout_sec": 10}),
+                &ctx,
+            )
+            .await
+            .expect("run returns Ok");
+        assert!(out.ok, "write inside the worktree should succeed: {}", out.output);
+        assert!(inside.exists());
+
+        let outside = std::env::temp_dir().join(format!("smith-shell-OUT-{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        let out = Shell
+            .run(
+                json!({"command": format!("echo hi > {}", outside.display()), "timeout_sec": 10}),
+                &ctx,
+            )
+            .await
+            .expect("run returns Ok");
+        assert!(
+            !out.ok,
+            "write outside the writable roots must be blocked by the sandbox: {}",
+            out.output
+        );
+        assert!(!outside.exists(), "blocked write must not have created the file");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]

@@ -148,6 +148,26 @@ pub struct ToolCtx {
     /// earlier `shell` call started. Cloned (not re-created) by
     /// [`crate::agent::clone_tool_ctx`] and the parallel-call paths.
     pub procs: Arc<proc::ProcRegistry>,
+    /// OS sandbox backend for the session (`Noop` when disabled). Shared
+    /// across every clone of the context — selected once at session start.
+    pub sandbox: Arc<dyn crate::sandbox::Sandbox>,
+    /// Effective policy for the *current* call. Confined (`workspace_default`)
+    /// by default; the approval gate hands an
+    /// [`crate::sandbox::SandboxPolicy::escalated`] copy to the action it has
+    /// approved (see [`ToolCtx::escalated`]).
+    pub sandbox_policy: crate::sandbox::SandboxPolicy,
+}
+
+impl ToolCtx {
+    /// A clone of this context whose sandbox policy is relaxed — used by the
+    /// gate to run an approved boundary-crossing action without the confined
+    /// floor. Shares the `Client`/`procs`/`sandbox` like
+    /// [`crate::agent::clone_tool_ctx`].
+    pub fn escalated(&self) -> ToolCtx {
+        let mut c = crate::agent::clone_tool_ctx(self);
+        c.sandbox_policy = self.sandbox_policy.escalated();
+        c
+    }
 }
 
 pub struct ToolRegistry {
