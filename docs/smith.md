@@ -1,10 +1,10 @@
 # smith built-in agent
 
 `smith` is the built-in agent that ships with construct. It talks to OpenAI,
-Anthropic, Google Gemini, or a local Ollama directly and runs its own agent loop with shell +
-filesystem + construct-control tools. No external CLI install required. Many PRs
-for the construct repository have already been made from smith sessions running
-inside construct.
+Anthropic, Google Gemini, or a local Ollama directly, and can also delegate
+subscription auth to Codex or Claude Code. Smith runs its own agent loop with
+shell + filesystem + construct-control tools. Many PRs for the construct
+repository have already been made from smith sessions running inside construct.
 
 ### Quick start
 
@@ -13,6 +13,8 @@ inside construct.
 export ANTHROPIC_API_KEY=sk-ant-...
 # or  export OPENAI_API_KEY=sk-...
 # or  export GEMINI_API_KEY=...        # (or GOOGLE_API_KEY)
+# or  codex login, then use --model codex-oauth:gpt-5
+# or  claude login, then use --model claude-oauth:sonnet
 # or  run a local ollama (default http://localhost:11434)
 
 construct new smith "list the rust files in this repo and summarize what each crate does"
@@ -25,12 +27,23 @@ The spec is one of:
 
 - `openai:<name>` — e.g. `openai:gpt-5-mini`
 - `anthropic:<name>` — e.g. `anthropic:claude-haiku-4-5`
+- `claude-oauth:<name>` — e.g. `claude-oauth:sonnet` (alias: `claude-code-oauth:`)
 - `gemini:<name>` — e.g. `gemini:gemini-2.5-pro`
 - `ollama:<name>` — e.g. `ollama:llama3.1`
+- `codex-oauth:<name>` — e.g. `codex-oauth:gpt-5-codex`
 
 Bare names auto-detect: `gpt-*` / `o[1-5]*` → OpenAI, `claude-*` →
 Anthropic, `gemini-*` → Gemini, anything else → Ollama. When in doubt,
 use the explicit prefix.
+
+`claude-oauth:` delegates model access to the installed `claude` CLI, so run
+`claude login` first and keep `claude` on `PATH` (or set `CONSTRUCT_CLAUDE_BIN`
+/ `CONSTRUCT_CLAUDE_CMD`). Smith disables Claude Code's built-in tools on this
+path and asks Claude for structured Smith tool calls, so construct's normal
+tool approvals and transcript persistence still apply. The child CLI process
+does not inherit `ANTHROPIC_API_KEY` or third-party Claude provider env vars on
+this path, so the explicit `claude-oauth:` prefix does not silently become API
+key billing.
 
 If you don't pass a model and `CONSTRUCT_SMITH_MODEL` isn't set, smith
 picks: `ANTHROPIC_API_KEY` → `claude-opus-4-8`, else `OPENAI_API_KEY`
@@ -92,6 +105,8 @@ two most-recent.
 - `CONSTRUCT_SMITH_AUTOMODE=1` — start with automode on.
 - `CONSTRUCT_SMITH_MODEL=<spec>` — default model when `--model` is
   omitted.
+- `CONSTRUCT_CLAUDE_BIN` / `CONSTRUCT_CLAUDE_CMD` — choose the `claude` CLI
+  used by `claude-oauth:`.
 - `GEMINI_API_KEY` / `GOOGLE_API_KEY` — Gemini credentials (either is
   accepted).
 - `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `GEMINI_BASE_URL` /

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub mod anthropic;
+pub mod claude_oauth;
 pub mod codex_oauth;
 pub mod gemini;
 pub mod ollama;

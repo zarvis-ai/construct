@@ -1367,6 +1367,7 @@ impl ResolvedModel {
             provider::routing::Provider::Gemini => "gemini",
             provider::routing::Provider::Ollama => "ollama",
             provider::routing::Provider::CodexOauth => "codex-oauth",
+            provider::routing::Provider::ClaudeOauth => "claude-oauth",
         }
     }
 }
@@ -1416,6 +1417,9 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
         provider::routing::Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
         provider::routing::Provider::CodexOauth => {
             Box::new(provider::codex_oauth::CodexOauth::from_env()?)
+        }
+        provider::routing::Provider::ClaudeOauth => {
+            Box::new(provider::claude_oauth::ClaudeOauth::from_env()?)
         }
     };
     Ok(ResolvedModel {
