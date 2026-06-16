@@ -36,10 +36,19 @@ impl ClaudeOauth {
 
 #[derive(Debug, Default)]
 struct CliOutput {
+    /// Structured payload captured from the synthetic `StructuredOutput` tool
+    /// call that the claude CLI uses to satisfy `--json-schema`. This is the
+    /// real Smith turn; the top-level `result` text is empty in that case.
+    structured: Option<String>,
     result: Option<String>,
     usage: Usage,
     error: Option<String>,
 }
+
+/// Name of the synthetic tool the claude CLI exposes when `--json-schema` is
+/// set: the model "returns" structured output by calling it, and the payload
+/// lands in the tool call's `input` rather than the turn's visible text.
+const STRUCTURED_OUTPUT_TOOL: &str = "StructuredOutput";
 
 #[derive(Debug, Deserialize)]
 struct CliResult {
@@ -260,6 +269,31 @@ fn process_cli_line(line: &str, out: &mut CliOutput) {
                     .to_string(),
             );
         }
+        // Under `--json-schema` the CLI delivers the structured turn as a
+        // `StructuredOutput` tool call inside the assistant message, leaving the
+        // final `result` string empty. Capture that input (last one wins) so the
+        // turn parser sees the JSON instead of an empty string.
+        "assistant" => {
+            let content = v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array());
+            if let Some(blocks) = content {
+                for block in blocks {
+                    let is_structured = block.get("type").and_then(|t| t.as_str())
+                        == Some("tool_use")
+                        && block.get("name").and_then(|n| n.as_str())
+                            == Some(STRUCTURED_OUTPUT_TOOL);
+                    if is_structured {
+                        if let Some(input) = block.get("input") {
+                            if let Ok(s) = serde_json::to_string(input) {
+                                out.structured = Some(s);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -426,8 +460,12 @@ impl LlmProvider for ClaudeOauth {
         if let Some(err) = cli.error {
             return Err(anyhow!("claude-oauth: {err}"));
         }
+        // Prefer the `StructuredOutput` tool payload (the real turn under
+        // `--json-schema`); fall back to the visible `result` text only when the
+        // model answered in plain text without the structured tool.
         let raw = cli
-            .result
+            .structured
+            .or(cli.result)
             .ok_or_else(|| anyhow!("claude-oauth stream ended without a result"))?;
         let mut turn = parse_protocol_turn(&raw)?;
         if let Some(text) = turn.text.as_deref() {
@@ -481,6 +519,44 @@ mod tests {
         assert_eq!(turn.text.as_deref(), Some("Hello from Claude."));
         assert!(turn.tool_calls.is_empty());
         assert_eq!(turn.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn structured_output_tool_call_is_captured_when_result_is_empty() {
+        // Under `--json-schema`, claude 2.x emits the turn as a `StructuredOutput`
+        // tool call and leaves the final `result` string empty. We must read the
+        // tool input, not the empty result (regression for the
+        // "parse claude-oauth structured turn: EOF" error).
+        let mut out = CliOutput::default();
+        process_cli_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"StructuredOutput","input":{"text":"hi there","tool_calls":[],"stop_reason":"end_turn"}}]}}"#,
+            &mut out,
+        );
+        process_cli_line(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"","total_cost_usd":0.004}"#,
+            &mut out,
+        );
+        assert!(out.error.is_none());
+        assert_eq!(out.result.as_deref(), Some(""));
+        let raw = out.structured.expect("structured payload captured");
+        let turn = parse_protocol_turn(&raw).unwrap();
+        assert_eq!(turn.text.as_deref(), Some("hi there"));
+        assert!(turn.tool_calls.is_empty());
+        assert_eq!(turn.stop_reason, StopReason::EndTurn);
+    }
+
+    #[test]
+    fn structured_output_tool_call_carries_smith_tool_calls() {
+        let mut out = CliOutput::default();
+        process_cli_line(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_2","name":"StructuredOutput","input":{"text":"","tool_calls":[{"name":"shell","input":{"cmd":"pwd"}}],"stop_reason":"tool_use"}}]}}"#,
+            &mut out,
+        );
+        let raw = out.structured.expect("structured payload captured");
+        let turn = parse_protocol_turn(&raw).unwrap();
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "shell");
+        assert_eq!(turn.stop_reason, StopReason::ToolUse);
     }
 
     #[test]
