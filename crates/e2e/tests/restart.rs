@@ -135,6 +135,77 @@ async fn tui_auto_reconnects_after_restart() {
     assert!(status.success(), "TUI exited non-success: {status:?}");
 }
 
+/// The user's real `/construct restart` path: the command is typed
+/// into the smith orchestrator's REPL, not issued by an external
+/// client. Smith resolves it as a `Routing::Client` slash and emits
+/// `SessionEvent::ClientCommand { id: Agentd, args: "restart" }`; the
+/// TUI turns that into `daemon_restart()` from *inside*
+/// `on_notification` (the notification-drain arm of the run loop).
+/// `tui_auto_reconnects_after_restart` triggers the restart from an
+/// external client, so this is the only coverage of the in-loop
+/// trigger + reconnect. (Smith handles the slash before any model
+/// call, so no provider/API key is needed.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tui_reconnects_after_orchestrator_typed_construct_restart() {
+    use agentd_protocol::CreateSessionParams;
+
+    let d = Daemon::spawn().await.expect("spawn daemon");
+
+    // Create the smith orchestrator directly (the e2e harness
+    // disables daemon auto-create). The TUI renders an
+    // Orchestrator-kind session as its focused REPL panel.
+    let orch = CreateSessionParams {
+        harness: "smith".to_string(),
+        cwd: "/tmp".to_string(),
+        prompt: None,
+        model: None,
+        title: Some("orchestrator".to_string()),
+        mode: Some("interactive".to_string()),
+        pty_size: Some(agentd_protocol::PtySize { cols: 100, rows: 20 }),
+        worktree: false,
+        env: Default::default(),
+        args: Vec::new(),
+        kind: agentd_protocol::SessionKind::Orchestrator,
+        parent_session_id: None,
+        group_id: None,
+    };
+    let orch_id = match d.client.create(orch).await {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("skipping: could not create smith orchestrator ({e})");
+            return;
+        }
+    };
+
+    let mut tui = Tui::spawn_with_recording(&d.socket, "restart_orchestrator_typed")
+        .expect("spawn TUI");
+    tui.wait_for("focus:", Duration::from_secs(15))
+        .await
+        .expect("modeline never rendered");
+    // Let smith's interactive REPL come up and start reading its PTY.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+
+    // Type the command into the orchestrator PTY (carriage return =
+    // Enter). Smith emits ClientCommand → TUI runs daemon_restart.
+    d.client
+        .pty_input(&orch_id, b"/construct restart\r".to_vec())
+        .await
+        .expect("pty_input to orchestrator");
+
+    // Must reconnect on its own — the in-loop trigger is the whole
+    // point of this test.
+    tui.wait_for("reconnected to daemon", Duration::from_secs(45))
+        .await
+        .expect("TUI did not auto-reconnect after orchestrator-typed /construct restart");
+
+    tui.send(b"\x18\x03").expect("send C-x C-c");
+    let status = tui
+        .wait_exit(Duration::from_secs(5))
+        .await
+        .expect("TUI did not exit after reconnect");
+    assert!(status.success(), "TUI exited non-success: {status:?}");
+}
+
 // ---------------------------------------------------------------------------
 // 3. Web client reconnect to the same URL
 // ---------------------------------------------------------------------------

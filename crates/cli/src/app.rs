@@ -2156,7 +2156,18 @@ async fn run_loop(
                     }
                 }
             }
-            notif = notifications.recv() => {
+            // Gate on `reconnect.is_none()`: once the daemon drops, the
+            // old `notifications` channel is closed, so `recv()` is
+            // *immediately* ready with `None` on every poll. Left
+            // ungated, this arm wins the select every iteration and
+            // spins the loop at 100% CPU (repainting each pass) for the
+            // entire reconnect window — which, during a slow daemon
+            // restart, reads as a frozen UI. Disabling the arm while a
+            // reconnect is pending lets the loop idle on `tick` (which
+            // also drives the reconnect-retry cadence) instead. The
+            // top-of-loop `is_disconnected()` check still catches the
+            // initial drop, so detection isn't lost.
+            notif = notifications.recv(), if reconnect.is_none() => {
                 match notif {
                     Some(n) => {
                         app.on_notification(n).await;

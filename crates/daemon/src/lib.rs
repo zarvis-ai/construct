@@ -125,16 +125,37 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
             remote_supervisor::run(mgr, remote_rx).await;
         });
     }
-    // Best-effort resume: re-spawn adapters for sessions that were alive at
-    // the previous shutdown. Sessions whose adapter binary is missing or
-    // whose start params can't be loaded get marked Errored. Logs only;
-    // never fatal.
-    manager.clone().resume_running_sessions().await;
-    // Best-effort: create the orchestrator session if config enables
-    // one and no orchestrator exists yet. Logged-only on failure (e.g.
-    // chosen harness missing or no API key); clients fall back to the
-    // static palette in that case.
-    manager.clone().ensure_orchestrator().await;
+    // Resume + orchestrator bootstrap in the BACKGROUND so the IPC
+    // socket (`server::serve` below) binds immediately, before any of
+    // this slow, network/subprocess-bound work runs.
+    //
+    // Why this matters for `/construct restart`: each adapter reattach
+    // / respawn is bounded but slow — `connect_with_retry` waits up to
+    // 5s for the adapter to re-bind its socket and `initialize()` waits
+    // up to 60s for the handshake — and resume runs them sequentially.
+    // A fresh orchestrator spawn (when the prior smith session was
+    // terminal) adds another such round-trip. If even one adapter is
+    // wedged, awaiting all of this before binding the socket leaves the
+    // daemon unreachable for tens of seconds (worst case minutes), and
+    // a TUI/web client that dropped on the restart `exec()` just spins
+    // in "reconnecting…" the whole time — indistinguishable from a
+    // hang. Binding first means the client reconnects within a poll
+    // cycle; sessions and the orchestrator panel then populate as they
+    // resume (each reattach broadcasts its State, and the orchestrator
+    // appears via the same event). `resume` stays first so an existing
+    // orchestrator is reattached before `ensure_orchestrator` checks
+    // for a live one (no duplicate spawn).
+    //
+    // Both steps are best-effort and log-only on failure: resume marks
+    // un-resumable sessions Errored; a failed orchestrator spawn just
+    // leaves clients in palette mode.
+    {
+        let mgr = manager.clone();
+        tokio::spawn(async move {
+            mgr.clone().resume_running_sessions().await;
+            mgr.ensure_orchestrator().await;
+        });
+    }
     manager.spawn_widget_watcher();
     // Loop scheduler: wakes every second, fires due loops by
     // calling `SessionManager::send_input`. Persisted per-session
