@@ -18,8 +18,15 @@ pub struct Ollama {
 
 impl Ollama {
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("OLLAMA_HOST")
-            .unwrap_or_else(|_| "http://localhost:11434".to_string())
+        Self::with_config(std::env::var("OLLAMA_HOST").ok())
+    }
+
+    /// Build pointed at an explicit host (None → `http://localhost:11434`).
+    /// Used by named `[smith.models.*]` profiles so multiple local servers
+    /// can coexist, independent of `OLLAMA_HOST`.
+    pub fn with_config(base_url: Option<String>) -> Result<Self> {
+        let base_url = base_url
+            .unwrap_or_else(|| "http://localhost:11434".to_string())
             .trim_end_matches('/')
             .to_string();
         Ok(Self {

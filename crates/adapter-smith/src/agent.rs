@@ -438,6 +438,9 @@ pub async fn run(
     };
 
     let provider_name = spec.provider_name();
+    // User-facing label (`@profile` when from config, else the wire name);
+    // `provider_name` stays the wire name for limit/context keying.
+    let display_name = spec.display_name();
     let model = spec.model.clone();
     let provider = spec.provider;
     // Per-model learned token limits — adapts on overflow errors
@@ -448,7 +451,7 @@ pub async fn run(
     // actually resolved to.
     emit.emit(SessionEvent::Status {
         state: SessionState::Running,
-        detail: Some(format!("{}:{}", provider_name, model)),
+        detail: Some(format!("{}:{}", display_name, model)),
     });
     hooks
         .run(
@@ -772,7 +775,7 @@ pub async fn run(
                 emit.emit(SessionEvent::Error {
                     message: format!(
                         "{} returned an empty response for model {}",
-                        provider_name, model
+                        display_name, model
                     ),
                 });
                 break;
@@ -1395,9 +1398,17 @@ pub struct ResolvedModel {
     pub model: String,
     pub provider: Box<dyn LlmProvider>,
     pub kind: provider::routing::Provider,
+    /// `Some("@<name>")` when this came from a `[smith.models.<name>]`
+    /// config profile; `None` for a direct/prefixed spec. Only affects the
+    /// user-facing label — `kind` still carries the real wire protocol so
+    /// context-window and learned-limit lookups stay correct.
+    pub profile: Option<String>,
 }
 
 impl ResolvedModel {
+    /// The wire protocol name. Stable key for context-window heuristics and
+    /// learned token limits — NOT a display label (a profile reports its
+    /// underlying wire name here, e.g. `openai`).
     pub fn provider_name(&self) -> &'static str {
         match self.kind {
             provider::routing::Provider::OpenAI => "openai",
@@ -1407,6 +1418,14 @@ impl ResolvedModel {
             provider::routing::Provider::CodexOauth => "codex-oauth",
             provider::routing::Provider::ClaudeOauth => "claude-oauth",
         }
+    }
+
+    /// User-facing provider label for banners / status / notes: the
+    /// `@profile` name when resolved from config, else the wire name.
+    pub fn display_name(&self) -> String {
+        self.profile
+            .clone()
+            .unwrap_or_else(|| self.provider_name().to_string())
     }
 }
 
@@ -1440,10 +1459,19 @@ pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
     resolve_model_from_spec(&spec_str)
 }
 
-/// Build a [`ResolvedModel`] from an explicit `<provider>:<name>` (or
-/// auto-detect bare-name) spec string. Used by the `/model <spec>`
-/// slash command to swap mid-session.
+/// Build a [`ResolvedModel`] from a model spec string. Used by the
+/// `/model <spec>` slash command to swap mid-session.
+///
+/// Three forms:
+///   - `@<name>` / `@<name>:<model>` — a `[smith.models.<name>]` config
+///     profile (its own endpoint + key + default model, optionally model-
+///     overridden). Lets several distinct endpoints coexist in one session.
+///   - `<provider>:<name>` — explicit provider prefix.
+///   - bare name — auto-detected provider.
 pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
+    if let Some(rest) = spec_str.trim().strip_prefix('@') {
+        return resolve_profile(rest);
+    }
     let spec = provider::routing::parse_model_spec(spec_str)
         .map_err(|e| anyhow::anyhow!("invalid model spec `{spec_str}`: {e}"))?;
     let provider: Box<dyn LlmProvider> = match spec.provider {
@@ -1464,12 +1492,202 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
         model: spec.model,
         provider,
         kind: spec.provider,
+        profile: None,
     })
+}
+
+/// Resolve a `@<name>` (or `@<name>:<model-override>`) reference against
+/// the `[smith.models.<name>]` profiles in `config.toml`.
+fn resolve_profile(rest: &str) -> Result<ResolvedModel> {
+    let (name, override_model) = match rest.split_once(':') {
+        Some((n, m)) => (n.trim(), Some(m.trim().to_string())),
+        None => (rest.trim(), None),
+    };
+    if name.is_empty() {
+        anyhow::bail!("empty profile name after `@` (try `@<name>`)");
+    }
+    let profile = provider::config::load_profile(name)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "no `[smith.models.{name}]` profile in config.toml — declare one \
+             with `provider`, `base_url`, `api_key_env`, and `model`"
+        )
+    })?;
+    build_profile_model(name, &profile, override_model)
+}
+
+/// Turn a loaded profile (+ optional model override) into a [`ResolvedModel`].
+/// Split from the filesystem load so the validation rules are unit-testable.
+fn build_profile_model(
+    name: &str,
+    profile: &provider::config::ModelProfile,
+    override_model: Option<String>,
+) -> Result<ResolvedModel> {
+    // Map the declared wire protocol. OAuth-backed providers are excluded:
+    // they have no base-URL/key surface and keep their explicit prefixes
+    // (spec 0028).
+    let kind = match profile.provider.as_str() {
+        "openai" => provider::routing::Provider::OpenAI,
+        "anthropic" => provider::routing::Provider::Anthropic,
+        "gemini" => provider::routing::Provider::Gemini,
+        "ollama" => provider::routing::Provider::Ollama,
+        "codex-oauth" | "claude-oauth" | "claude-code-oauth" => anyhow::bail!(
+            "profile `{name}`: provider `{}` is OAuth-backed and has no \
+             configurable endpoint — use the `{}:` model prefix directly",
+            profile.provider,
+            profile.provider
+        ),
+        other => anyhow::bail!(
+            "profile `{name}`: unknown provider `{other}` \
+             (expected openai | anthropic | gemini | ollama)"
+        ),
+    };
+
+    let model = override_model
+        .or_else(|| profile.model.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile `{name}`: no model — set `model = \"...\"` in the \
+                 profile or reference it as `@{name}:<model>`"
+            )
+        })?;
+
+    let base_url = profile.base_url.clone();
+    let provider: Box<dyn LlmProvider> = match kind {
+        provider::routing::Provider::OpenAI => Box::new(provider::openai::OpenAi::with_config(
+            base_url,
+            profile_api_key(profile, name, &["OPENAI_API_KEY"])?,
+        )?),
+        provider::routing::Provider::Anthropic => {
+            Box::new(provider::anthropic::Anthropic::with_config(
+                base_url,
+                profile_api_key(profile, name, &["ANTHROPIC_API_KEY"])?,
+            )?)
+        }
+        provider::routing::Provider::Gemini => Box::new(provider::gemini::Gemini::with_config(
+            base_url,
+            profile_api_key(profile, name, &["GEMINI_API_KEY", "GOOGLE_API_KEY"])?,
+        )?),
+        provider::routing::Provider::Ollama => {
+            Box::new(provider::ollama::Ollama::with_config(base_url)?)
+        }
+        // codex-oauth / claude-oauth rejected above.
+        _ => unreachable!("oauth providers rejected above"),
+    };
+
+    Ok(ResolvedModel {
+        model,
+        provider,
+        kind,
+        profile: Some(format!("@{name}")),
+    })
+}
+
+/// Resolve a profile's API key: explicit `api_key_env` (read that var),
+/// else inline `api_key`, else fall back to the wire protocol's standard
+/// env var(s). Errors with actionable guidance when none is available.
+fn profile_api_key(
+    profile: &provider::config::ModelProfile,
+    name: &str,
+    default_envs: &[&str],
+) -> Result<String> {
+    if let Some(var) = &profile.api_key_env {
+        return std::env::var(var).map_err(|_| {
+            anyhow::anyhow!("profile `{name}`: api_key_env `{var}` is not set in the environment")
+        });
+    }
+    if let Some(key) = &profile.api_key {
+        return Ok(key.clone());
+    }
+    for var in default_envs {
+        if let Ok(key) = std::env::var(var) {
+            return Ok(key);
+        }
+    }
+    anyhow::bail!(
+        "profile `{name}`: no API key — set `api_key_env` (preferred) or \
+         `api_key` in the profile, or export {}",
+        default_envs.join(" / ")
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use provider::config::ModelProfile;
+
+    fn profile(provider: &str, model: Option<&str>) -> ModelProfile {
+        ModelProfile {
+            provider: provider.to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            // inline key so build doesn't depend on process env in tests
+            api_key: Some("test-key".to_string()),
+            api_key_env: None,
+            model: model.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn profile_builds_with_label_and_wire_kind() {
+        let r = build_profile_model("deepseek", &profile("openai", Some("deepseek-chat")), None)
+            .expect("build");
+        assert_eq!(r.model, "deepseek-chat");
+        assert_eq!(r.kind, provider::routing::Provider::OpenAI);
+        // wire name keeps internal keying correct; label shows the profile.
+        assert_eq!(r.provider_name(), "openai");
+        assert_eq!(r.display_name(), "@deepseek");
+    }
+
+    #[test]
+    fn profile_model_override_wins() {
+        let r = build_profile_model(
+            "deepseek",
+            &profile("openai", Some("deepseek-chat")),
+            Some("deepseek-reasoner".to_string()),
+        )
+        .expect("build");
+        assert_eq!(r.model, "deepseek-reasoner");
+    }
+
+    #[test]
+    fn profile_rejects_oauth_providers() {
+        let e = build_profile_model("x", &profile("codex-oauth", Some("gpt-5")), None)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(e.contains("OAuth-backed"), "got: {e}");
+    }
+
+    #[test]
+    fn profile_rejects_unknown_provider() {
+        let e = build_profile_model("x", &profile("cohere", Some("command")), None)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(e.contains("unknown provider"), "got: {e}");
+    }
+
+    #[test]
+    fn profile_requires_a_model() {
+        let e = build_profile_model("x", &profile("openai", None), None)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(e.contains("no model"), "got: {e}");
+    }
+
+    #[test]
+    fn empty_profile_name_after_at_errors() {
+        assert!(resolve_profile("")
+            .err()
+            .expect("expected error")
+            .to_string()
+            .contains("empty profile name"));
+        assert!(resolve_profile(":gpt-5")
+            .err()
+            .expect("expected error")
+            .to_string()
+            .contains("empty profile name"));
+    }
 
     /// Both paths of the "no OS backstop" notice, driven through the real
     /// emit code: a requested-but-unavailable sandbox emits exactly one notice;

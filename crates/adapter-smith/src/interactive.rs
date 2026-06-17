@@ -1970,6 +1970,9 @@ pub async fn run(
         mut inbox,
     } = ctx;
     let mut provider_name = spec.provider_name();
+    // User-facing label (`@profile` when from config, else the wire name).
+    // `provider_name` stays the wire name for limit/context/monitor keying.
+    let mut display_name = spec.display_name();
     let mut model = spec.model.clone();
     let mut provider = spec.provider;
     let cwd = PathBuf::from(&params.cwd);
@@ -2023,11 +2026,11 @@ pub async fn run(
     // cleanly. (Pressing Enter on an empty line is also a no-op + fresh
     // prompt, so the user has an explicit "wake me up" escape hatch.)
     if !resuming {
-        term.banner(provider_name, &model, approval_mode);
+        term.banner(&display_name, &model, approval_mode);
     }
     emit.emit(SessionEvent::Status {
         state: SessionState::Running,
-        detail: Some(format!("{}:{}  [interactive]", provider_name, model)),
+        detail: Some(format!("{}:{}  [interactive]", display_name, model)),
     });
     hooks
         .run(
@@ -2143,7 +2146,11 @@ pub async fn run(
         let candidate = std::env::var("CONSTRUCT_OPERATOR_MONITOR_MODEL")
             .ok()
             .filter(|s| !s.is_empty())
-            .or_else(|| default_monitor_spec(provider_name, &model))
+            // Pass the display label: for a `@profile` it won't match any
+            // known wire name, so we keep the operator's own model rather
+            // than swap in a cheap default that lives on a different
+            // endpoint/billing path than the profile's.
+            .or_else(|| default_monitor_spec(&display_name, &model))
             .and_then(|spec| crate::agent::resolve_model_from_spec(&spec).ok());
         match candidate {
             Some(m) if monitor_model_usable(&m).await => {
@@ -2335,24 +2342,36 @@ pub async fn run(
                         CommandId::Model => {
                             let arg = args.as_deref().unwrap_or("").trim();
                             if arg.is_empty() {
-                                term.note(&format!("(model: {}:{})", provider_name, model));
+                                term.note(&format!("(model: {}:{})", display_name, model));
+                                // Surface any configured `@profile` endpoints so
+                                // the user can discover what `/model @<name>`
+                                // accepts without leaving the session.
+                                if let Ok(profiles) = crate::provider::config::load_all() {
+                                    if !profiles.is_empty() {
+                                        let names: Vec<String> =
+                                            profiles.keys().map(|n| format!("@{n}")).collect();
+                                        term.note(&format!("(profiles: {})", names.join(", ")));
+                                    }
+                                }
                             } else {
                                 match crate::agent::resolve_model_from_spec(arg) {
                                     Ok(new) => {
                                         let new_name = new.provider_name();
+                                        let new_display = new.display_name();
                                         let new_model = new.model.clone();
                                         provider = new.provider;
                                         provider_name = new_name;
+                                        display_name = new_display;
                                         model = new_model;
                                         term.note(&format!(
                                             "(model → {}:{})",
-                                            provider_name, model
+                                            display_name, model
                                         ));
                                         emit.emit(SessionEvent::Status {
                                             state: SessionState::Running,
                                             detail: Some(format!(
                                                 "{}:{}  [interactive]",
-                                                provider_name, model
+                                                display_name, model
                                             )),
                                         });
                                     }
@@ -2372,7 +2391,7 @@ pub async fn run(
                             editor.reset_history();
                             queued_rows = 0;
                             emit.emit(SessionEvent::Reset);
-                            term.banner(provider_name, &model, approval_mode);
+                            term.banner(&display_name, &model, approval_mode);
                             term.note("(session reset)");
                         }
                         CommandId::Compact => {
@@ -2759,7 +2778,7 @@ pub async fn run(
                 final_status = "Errored";
                 let msg = format!(
                     "{} returned an empty response for model {}",
-                    provider_name, model
+                    display_name, model
                 );
                 term.note(&format!("(provider error: {msg})"));
                 emit.emit(SessionEvent::Error { message: msg });

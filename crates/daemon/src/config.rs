@@ -32,6 +32,19 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# construct configuration
 # #
 # smith is the native built-in harness.
 
+# [smith.models.<name>]
+# # Named smith endpoint profiles. Reference at runtime with `/model @<name>`
+# # (or `--model @<name>`), e.g. `/model @deepseek`. Lets several endpoints of
+# # the same wire protocol coexist in one session — unlike the single
+# # OPENAI_BASE_URL/ANTHROPIC_BASE_URL/... env vars. `provider` is the wire
+# # protocol: openai | anthropic | gemini | ollama.
+# #
+# # [smith.models.deepseek]
+# # provider    = "openai"
+# # base_url    = "https://api.deepseek.com/v1"
+# # api_key_env = "DEEPSEEK_API_KEY"
+# # model       = "deepseek-chat"
+
 # [defaults]
 # worktree = false   # default value of session.worktree if not specified
 "#;

@@ -31,6 +31,8 @@ The spec is one of:
 - `gemini:<name>` — e.g. `gemini:gemini-2.5-pro`
 - `ollama:<name>` — e.g. `ollama:llama3.1`
 - `codex-oauth:<name>` — e.g. `codex-oauth:gpt-5-codex`
+- `@<name>` — a named endpoint profile (see [Model profiles](#model-profiles)),
+  e.g. `@deepseek` or `@deepseek:deepseek-reasoner` to override its model
 
 Bare names auto-detect: `gpt-*` / `o[1-5]*` → OpenAI, `claude-*` →
 Anthropic, `gemini-*` → Gemini, anything else → Ollama. When in doubt,
@@ -50,6 +52,49 @@ picks: `ANTHROPIC_API_KEY` → `claude-opus-4-8`, else `OPENAI_API_KEY`
 → `gpt-5`, else `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) →
 `gemini-2.5-pro`, else `ollama:llama3.1`. The initial Status event
 records the chosen `provider:model` so you can verify.
+
+### Model profiles
+
+The base-URL env vars below bind one endpoint per wire protocol. To use
+**several** endpoints of the same protocol in one session — e.g. first-party
+OpenAI plus two OpenAI-compatible vendors — declare named profiles in
+`config.toml` and switch between them at runtime with `/model @<name>`.
+
+Each `[smith.models.<name>]` entry sets:
+
+- `provider` — wire protocol to speak: `openai`, `anthropic`, `gemini`, or
+  `ollama`. (OAuth providers can't be profiled — use their prefixes directly.)
+- `base_url` — endpoint URL (defaults to the protocol's public endpoint).
+- `api_key_env` — name of the env var holding the key (preferred). Or
+  `api_key = "..."` inline (discouraged). If neither is set, the protocol's
+  standard key env var is used (`OPENAI_API_KEY`, etc.).
+- `model` — default model name; override per call with `@<name>:<model>`.
+
+```toml
+[smith.models.deepseek]
+provider    = "openai"
+base_url    = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+model       = "deepseek-chat"
+
+[smith.models.groq-llama]
+provider    = "openai"
+base_url    = "https://api.groq.com/openai/v1"
+api_key_env = "GROQ_API_KEY"
+model       = "llama-3.3-70b-versatile"
+```
+
+```text
+construct new smith "..." --model @deepseek   # start on a profile
+/model openai:gpt-5                            # first-party OpenAI
+/model @deepseek                               # DeepSeek
+/model @groq-llama:llama-3.1-8b-instant        # Groq, one-off model override
+/model                                         # shows current + lists @profiles
+```
+
+Profiles are always referenced with the explicit `@` prefix; bare names never
+resolve to a profile. The status line shows `@<name>:<model>` so you can tell
+which endpoint is active.
 
 ### Tools
 
@@ -112,4 +157,6 @@ two most-recent.
 - `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `GEMINI_BASE_URL` /
   `OLLAMA_HOST` — point at alternate endpoints. Pointing `OPENAI_BASE_URL`
   at an OpenAI-compatible vendor (OpenRouter, DeepSeek, Groq, xAI,
-  Mistral, …) reuses the `openai:` path with no extra config.
+  Mistral, …) reuses the `openai:` path with no extra config. These bind
+  one endpoint per protocol; to switch between several at runtime, use
+  [Model profiles](#model-profiles) instead.
