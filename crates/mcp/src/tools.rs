@@ -940,6 +940,7 @@ mod tests {
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: SessionKind::Subagent,
             archived: false,
+            operator_loop_disabled: false,
         }
     }
 }

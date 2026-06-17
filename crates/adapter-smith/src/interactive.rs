@@ -2127,6 +2127,11 @@ pub async fn run(
         interval: operator_ambient_loop_interval(),
         self_id: session_id.clone(),
     });
+    // Runtime toggle: `/operator enable|disable` flips this without restart.
+    // Seeded from the env var the daemon re-injects on respawn so the choice
+    // survives daemon restarts.
+    let mut ambient_loop_enabled = is_orchestrator
+        && std::env::var("CONSTRUCT_OPERATOR_LOOP_DISABLED").as_deref() != Ok("1");
     // Operator's own id (to exclude from the ambient fleet snapshot) and the
     // prior-tick session states (for the per-tick delta).
     let self_id_for_ambient = session_id.clone();
@@ -2203,7 +2208,7 @@ pub async fn run(
                 obs_rx.as_mut(),
                 &mut bg_completion_rx,
                 &tasks,
-                ambient_loop.clone(),
+                ambient_loop_enabled.then(|| ambient_loop.clone()).flatten(),
             )
             .await
             {
@@ -2466,7 +2471,32 @@ pub async fn run(
                                 }
                             }
                         }
-                        // Routing::Adapter is only model/reset/compact today;
+                        CommandId::Operator => {
+                            if ambient_loop.is_none() {
+                                term.note("(/operator is only available in the operator session)");
+                            } else {
+                                match args.as_deref().map(str::trim).unwrap_or("") {
+                                    "enable" => {
+                                        ambient_loop_enabled = true;
+                                        emit.emit(SessionEvent::OperatorLoopChanged {
+                                            enabled: true,
+                                        });
+                                        term.note("(operator loop enabled)");
+                                    }
+                                    "disable" => {
+                                        ambient_loop_enabled = false;
+                                        emit.emit(SessionEvent::OperatorLoopChanged {
+                                            enabled: false,
+                                        });
+                                        term.note("(operator loop disabled)");
+                                    }
+                                    _ => {
+                                        term.note("(usage: /operator enable|disable)");
+                                    }
+                                }
+                            }
+                        }
+                        // Routing::Adapter is only model/reset/compact/operator today;
                         // any other id here is a registry/handler mismatch.
                         other => {
                             tracing::warn!(?other, "adapter-routed slash command has no handler");

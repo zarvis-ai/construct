@@ -1382,6 +1382,7 @@ impl SessionManager {
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: params.kind,
             archived: false,
+            operator_loop_disabled: false,
         };
         self.storage.save_summary(&summary)?;
 
@@ -1680,9 +1681,9 @@ impl SessionManager {
             "CONSTRUCT_SESSION_DATA_DIR".to_string(),
             self.storage.session_dir(id).to_string_lossy().to_string(),
         );
-        let (project_id, current_model) = {
+        let (project_id, current_model, operator_loop_disabled) = {
             let s = entry.summary.read().await;
-            (s.group_id.clone(), s.model.clone())
+            (s.group_id.clone(), s.model.clone(), s.operator_loop_disabled)
         };
         // The summary's model is the live source of truth — it tracks any
         // mid-session `/model` switch (via `ModelChanged`), whereas the start
@@ -1690,6 +1691,15 @@ impl SessionManager {
         // comes back on the model the session was last running.
         if current_model.is_some() {
             start_params.model = current_model;
+        }
+        // Re-inject the operator loop toggle so the resumed adapter starts
+        // with the same enabled/disabled state the user left it in.
+        if operator_loop_disabled {
+            start_params
+                .env
+                .insert("CONSTRUCT_OPERATOR_LOOP_DISABLED".to_string(), "1".to_string());
+        } else {
+            start_params.env.remove("CONSTRUCT_OPERATOR_LOOP_DISABLED");
         }
         self.install_memory_env(&mut start_params.env, project_id.as_deref());
         let widgets_dir = self.storage.ensure_widgets_dir(id).unwrap_or_else(|e| {
@@ -2155,6 +2165,16 @@ impl SessionManager {
             }
             return;
         }
+        if let SessionEvent::OperatorLoopChanged { enabled } = &event {
+            if let Err(e) = self.persist_operator_loop(entry, *enabled).await {
+                tracing::warn!(
+                    session = %entry.id,
+                    error = ?e,
+                    "persist operator loop from adapter event failed"
+                );
+            }
+            return;
+        }
         // ModelChanged updates the session's recorded model (durable
         // per-session state). The state notification carries the new label to
         // clients; like ApprovalModeChanged it is not a transcript row.
@@ -2256,6 +2276,7 @@ impl SessionManager {
                 // Transient; handled by the broadcast-only fast path above.
                 | SessionEvent::ToolApprovalResolved { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
+                | SessionEvent::OperatorLoopChanged { .. }
                 | SessionEvent::ModelChanged { .. }
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
@@ -3337,6 +3358,24 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Record whether the operator ambient loop is enabled/disabled after a
+    /// `/operator enable|disable` command. Persisted so the choice survives
+    /// daemon restart — `respawn` re-injects the flag via env.
+    async fn persist_operator_loop(&self, entry: &Arc<SessionEntry>, enabled: bool) -> Result<()> {
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.operator_loop_disabled = !enabled;
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        Ok(())
+    }
+
     /// Record the session's active model after an adapter `/model` switch.
     /// Updates the summary (so the UI label tracks the change) and persists
     /// it, so `respawn` re-injects the model into the adapter's start params
@@ -3740,6 +3779,7 @@ mod tests {
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
+            operator_loop_disabled: false,
         }
     }
 
@@ -3935,6 +3975,7 @@ mod tests {
                 approval_mode: agentd_protocol::ApprovalMode::Manual,
                 kind,
                 archived: false,
+                operator_loop_disabled: false,
             }),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
@@ -4503,6 +4544,7 @@ mod tests {
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             archived: false,
+            operator_loop_disabled: false,
         };
         let entry = Arc::new(SessionEntry {
             id: id.clone(),

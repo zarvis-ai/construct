@@ -459,6 +459,12 @@ pub enum SessionEvent {
     ApprovalModeChanged {
         mode: ApprovalMode,
     },
+    /// Adapter toggled the operator ambient loop (`/operator enable|disable`).
+    /// Durable per-session state like [`ApprovalModeChanged`]: never written
+    /// to the transcript; the daemon persists it so the choice survives restart.
+    OperatorLoopChanged {
+        enabled: bool,
+    },
     /// Adapter switched the session's active model internally (e.g. the
     /// smith `/model` slash command). `model` is a canonical spec string the
     /// adapter can re-resolve on resume (`provider:model`, or `@profile:model`
@@ -960,6 +966,10 @@ pub struct SessionSummary {
     /// The daemon does not auto-resume archived sessions on startup.
     #[serde(default)]
     pub archived: bool,
+    /// Operator ambient loop is disabled (`/operator disable`). Only meaningful
+    /// for the orchestrator session; false for all other sessions.
+    #[serde(default)]
+    pub operator_loop_disabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
