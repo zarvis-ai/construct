@@ -909,6 +909,7 @@ mod tests {
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: SessionKind::Subagent,
+            archived: false,
         }
     }
 }

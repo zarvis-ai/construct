@@ -520,6 +520,20 @@ pub fn list_collapse_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
     Some((x_start, x_end, list_area.y))
 }
 
+/// Hit zone for the "show archived" toggle square on the session-list title,
+/// rendered just after the ` + sessions ` label at a fixed column. Returns
+/// `(x_start, x_end_exclusive, y)`, or `None` when the pane is too narrow to
+/// fit it clear of the right-aligned collapse button.
+pub fn list_archive_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
+    // ` ` + `+` + ` sessions ` = 12 cells starting at `list.x + 1`, so the
+    // toggle lands on `list.x + 13`. Require room before the collapse button.
+    if list_area.width < 18 {
+        return None;
+    }
+    let x = list_area.x + 13;
+    Some((x, x + 1, list_area.y))
+}
+
 /// Hit zone for the Matrix-rain panel's collapse/expand toggle button (the
 /// `−` / `+` glyph at the right edge of the panel title bar). Only one row is
 /// needed because the title bar survives even when the panel is collapsed.
@@ -618,6 +632,17 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
     if let Some((xs, xe, y)) = list_plus_button_range(list) {
         if my == y && mx >= xs && mx < xe {
             render_button_tooltip(f, &app.theme, " New session ", xs, y);
+            return;
+        }
+    }
+    if let Some((xs, xe, y)) = list_archive_button_range(list) {
+        if my == y && mx >= xs && mx < xe {
+            let label = if app.show_archived {
+                " Hide archived "
+            } else {
+                " Show archived "
+            };
+            render_button_tooltip(f, &app.theme, label, xs, y);
             return;
         }
     }
@@ -1197,11 +1222,28 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     let plus_style = Style::default()
         .fg(app.theme.accent)
         .add_modifier(Modifier::BOLD);
-    let title_line = Line::from(vec![
+    let mut title_spans = vec![
         Span::raw(" "),
         Span::styled("+", plus_style),
         Span::raw(" sessions "),
-    ]);
+    ];
+    // "Show archived" toggle: filled square when on, hollow when off. Same
+    // □/■ on/off idiom used elsewhere; the hover tooltip names it.
+    if let Some((axs, axe, ay)) = list_archive_button_range(area) {
+        let archive_hovered = app
+            .mouse_pos
+            .is_some_and(|(mx, my)| my == ay && mx >= axs && mx < axe);
+        let archive_style = if app.show_archived || archive_hovered {
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.muted)
+        };
+        let glyph = if app.show_archived { "■" } else { "□" };
+        title_spans.push(Span::styled(glyph, archive_style));
+    }
+    let title_line = Line::from(title_spans);
     let minus_hovered = match app.mouse_pos {
         Some((mx, my)) => list_collapse_button_range(area)
             .map(|(xs, xe, y)| my == y && mx >= xs && mx < xe)
@@ -1274,6 +1316,15 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let name_display_w = name_display.chars().count();
                     let gap = row_w.saturating_sub(prefix_w + name_display_w + harness_w);
                     let gap_str: String = " ".repeat(gap);
+                    // Archived sessions read as muted — they're terminated and
+                    // only visible because the "show archived" toggle is on.
+                    let name_style = if s.archived {
+                        Style::default()
+                            .fg(app.theme.dim)
+                            .add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(app.theme.text)
+                    };
                     let mut spans = vec![Span::raw(indent_prefix.to_string())];
                     if let Some(expand_glyph) = expand_glyph {
                         spans.push(Span::styled(
@@ -1287,7 +1338,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                             format!(" {} ", session_status_glyph(app, s)),
                             state_style(&app.theme, s.state),
                         ),
-                        Span::styled(name_display, Style::default().fg(app.theme.text)),
+                        Span::styled(name_display, name_style),
                         Span::raw(gap_str),
                         Span::styled(harness, harness_style(&app.theme)),
                     ]);

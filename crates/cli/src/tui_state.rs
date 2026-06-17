@@ -41,6 +41,9 @@ pub struct TuiState {
     pub list_collapsed: bool,
     #[serde(default)]
     pub matrix_rain_hidden: bool,
+    /// Show archived sessions in the list. Off by default.
+    #[serde(default)]
+    pub show_archived: bool,
     #[serde(default = "default_hide_pane_side_borders")]
     pub hide_pane_side_borders: bool,
     #[serde(default)]
@@ -62,6 +65,7 @@ impl Default for TuiState {
             matrix_rain_h: None,
             list_collapsed: false,
             matrix_rain_hidden: false,
+            show_archived: false,
             hide_pane_side_borders: default_hide_pane_side_borders(),
             main_windows: None,
             active_window_id: None,

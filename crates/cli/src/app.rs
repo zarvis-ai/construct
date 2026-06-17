@@ -730,6 +730,9 @@ pub struct App {
     /// User-hidden Matrix-rain panel. Toggle with `/rain`; close with the
     /// panel's `x` button.
     pub matrix_rain_hidden: bool,
+    /// Show archived sessions in the list. Off by default; toggle with
+    /// `/archived` or the list-title archive button. Persisted across runs.
+    pub show_archived: bool,
     /// Hide left, right, and bottom border lines for list/view/pin panes.
     pub hide_pane_side_borders: bool,
     /// Last rendered frame, one string per terminal row. Mouse drag
@@ -1697,6 +1700,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         matrix_widget_pinned: None,
         matrix_widget_hover: None,
         matrix_rain_hidden: persisted.matrix_rain_hidden,
+        show_archived: persisted.show_archived,
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
         text_selection: None,
@@ -1801,6 +1805,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         matrix_rain_h: app.matrix_rain_h,
         list_collapsed: app.list_collapsed,
         matrix_rain_hidden: app.matrix_rain_hidden,
+        show_archived: app.show_archived,
         hide_pane_side_borders: app.hide_pane_side_borders,
         main_windows: Some(app.main_windows.clone()),
         active_window_id: Some(app.active_window_id),
@@ -2628,6 +2633,8 @@ impl App {
         let mut out: Vec<ListItem> = Vec::new();
 
         let orch_id = self.orchestrator_id.as_deref();
+        // Archived sessions are hidden unless the user toggled them on.
+        let show_archived = self.show_archived;
         let mut subagents_by_parent: HashMap<&str, Vec<&SessionSummary>> = HashMap::new();
         for s in self.sessions.iter().filter(|s| is_subagent_session(s)) {
             if let Some(parent) = s.parent_session_id.as_deref() {
@@ -2675,6 +2682,7 @@ impl App {
             // of their parent session.
             .filter(|s| Some(s.id.as_str()) != orch_id)
             .filter(|s| is_user_list_session(s))
+            .filter(|s| show_archived || !s.archived)
             .collect();
         ungrouped.sort_by(|a, b| {
             a.position
@@ -2693,6 +2701,7 @@ impl App {
                 .iter()
                 .filter(|s| s.group_id.as_deref() == Some(g.id.as_str()))
                 .filter(|s| is_user_list_session(s))
+                .filter(|s| show_archived || !s.archived)
                 .collect();
             members.sort_by_key(|s| s.position);
             out.push(ListItem::GroupHeader {
@@ -2706,6 +2715,20 @@ impl App {
             }
         }
         out
+    }
+
+    /// Toggle whether archived sessions appear in the list. Shared by the
+    /// `/archived` command and the list-title archive button.
+    pub fn toggle_show_archived(&mut self) {
+        self.show_archived = !self.show_archived;
+        self.set_status(
+            if self.show_archived {
+                "showing archived sessions"
+            } else {
+                "hiding archived sessions"
+            }
+            .to_string(),
+        );
     }
 
     /// Find the index of the currently-selected item in the materialized
@@ -5069,6 +5092,12 @@ impl App {
                     return;
                 }
             }
+            if let Some((xs, xe, y)) = crate::ui::list_archive_button_range(list) {
+                if row == y && col >= xs && col < xe {
+                    self.toggle_show_archived();
+                    return;
+                }
+            }
             if let Some((xs, xe, y)) = crate::ui::list_collapse_button_range(list) {
                 if row == y && col >= xs && col < xe {
                     self.list_collapsed = true;
@@ -6002,7 +6031,7 @@ impl App {
                 Selection::Session(id) => {
                     self.minibuffer = Some(Minibuffer {
                         prompt: format!(
-                            "Delete {} (kill if running, drop transcript + worktree)? (y/N): ",
+                            "Session {}: [d] delete (drop transcript + worktree) / [a] archive (terminate, keep, hide) / [N] cancel: ",
                             short_id(&id)
                         ),
                         input: String::new(),
@@ -6758,14 +6787,18 @@ impl App {
                 }
             }
             MinibufferIntent::DeleteConfirm { session_id } => {
-                let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
-                if !yes {
-                    self.set_status("delete cancelled".to_string());
-                    return;
-                }
-                match self.client.delete(&session_id).await {
-                    Ok(()) => self.set_status(format!("deleted {}", short_id(&session_id))),
-                    Err(e) => self.set_status(format!("delete failed: {e}")),
+                match parse_session_end_choice(&input) {
+                    SessionEndChoice::Delete => match self.client.delete(&session_id).await {
+                        Ok(()) => self.set_status(format!("deleted {}", short_id(&session_id))),
+                        Err(e) => self.set_status(format!("delete failed: {e}")),
+                    },
+                    SessionEndChoice::Archive => match self.client.archive(&session_id).await {
+                        Ok(()) => self.set_status(format!("archived {}", short_id(&session_id))),
+                        Err(e) => self.set_status(format!("archive failed: {e}")),
+                    },
+                    SessionEndChoice::Cancel => {
+                        self.set_status("cancelled".to_string());
+                    }
                 }
             }
             MinibufferIntent::RestartConfirm { session_id } => {
@@ -6874,6 +6907,9 @@ impl App {
                         "expanded"
                     }
                 ));
+            }
+            "archived" | "archive" | "archives" => {
+                self.toggle_show_archived();
             }
             "border" => {
                 self.hide_pane_side_borders = !self.hide_pane_side_borders;
@@ -7885,6 +7921,7 @@ mod tests {
             matrix_widget_pinned: None,
             matrix_widget_hover: None,
             matrix_rain_hidden: false,
+            show_archived: false,
             hide_pane_side_borders: true,
             frame_text: Vec::new(),
             text_selection: None,
@@ -7931,6 +7968,7 @@ mod tests {
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
+            archived: false,
         }
     }
 
@@ -9922,6 +9960,60 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn list_items_hides_archived_until_toggled() {
+        use agentd_client::Client;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let _server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut active = summary_with_kind(agentd_protocol::SessionKind::User);
+        active.id = "active".into();
+        active.position = 0;
+        let mut archived = summary_with_kind(agentd_protocol::SessionKind::User);
+        archived.id = "archived".into();
+        archived.position = 1;
+        archived.archived = true;
+
+        let mut app = test_app(client, vec![active, archived]);
+
+        // Hidden by default: only the active session shows.
+        let items = app.list_items();
+        assert_eq!(items.len(), 1);
+        assert!(
+            matches!(&items[0], ListItem::Session { summary, .. } if summary.id == "active"),
+            "default list should show only the active session",
+        );
+
+        // Toggled on: both appear.
+        app.toggle_show_archived();
+        assert!(app.show_archived);
+        let ids: Vec<String> = app
+            .list_items()
+            .iter()
+            .filter_map(|it| match it {
+                ListItem::Session { summary, .. } => Some(summary.id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "toggle on should reveal the archived session");
+        assert!(ids.iter().any(|id| id == "archived"));
+
+        // Toggled back off: hidden again.
+        app.toggle_show_archived();
+        assert_eq!(app.list_items().len(), 1);
+    }
+
     #[test]
     fn list_session_indent_policy_distinguishes_subagents_and_grouped_parents() {
         let user = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -11584,6 +11676,28 @@ pub fn parse_group_delete_choice(input: &str) -> GroupDeleteChoice {
     }
 }
 
+/// Outcome of the session kill prompt (`C-x k` / the view `x` button).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndChoice {
+    /// `d` / `delete` — drop the transcript, worktree, and all on-disk state.
+    Delete,
+    /// `a` / `archive` — terminate the adapter but keep the session; it's
+    /// hidden from the list until the "show archived" toggle is on, and can be
+    /// restarted later.
+    Archive,
+    /// Anything else (including `y`, `n`, empty Enter) — do nothing.
+    Cancel,
+}
+
+pub fn parse_session_end_choice(input: &str) -> SessionEndChoice {
+    match input.trim().to_lowercase().as_str() {
+        "d" | "delete" => SessionEndChoice::Delete,
+        "a" | "archive" => SessionEndChoice::Archive,
+        // No `y` alias: delete is destructive, so require an explicit `d`.
+        _ => SessionEndChoice::Cancel,
+    }
+}
+
 #[cfg(test)]
 mod group_delete_prompt_tests {
     use super::{parse_group_delete_choice, GroupDeleteChoice};
@@ -11639,6 +11753,46 @@ mod group_delete_prompt_tests {
             assert_eq!(
                 parse_group_delete_choice(s),
                 GroupDeleteChoice::Cancel,
+                "input {s:?} should cancel",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_end_prompt_tests {
+    use super::{parse_session_end_choice, SessionEndChoice};
+
+    #[test]
+    fn d_or_delete_deletes() {
+        for s in ["d", "D", "  d  ", "delete", "DELETE", " Delete "] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::Delete,
+                "input {s:?} should delete",
+            );
+        }
+    }
+
+    #[test]
+    fn a_or_archive_archives() {
+        for s in ["a", "A", "  a  ", "archive", "ARCHIVE", " Archive "] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::Archive,
+                "input {s:?} should archive",
+            );
+        }
+    }
+
+    /// `y`/`yes` no longer mean delete — the destructive action requires an
+    /// explicit `d`, so a reflexive `y` cancels rather than deletes.
+    #[test]
+    fn y_and_anything_else_cancels() {
+        for s in ["", " ", "y", "Y", "yes", "n", "N", "no", "x", "1"] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::Cancel,
                 "input {s:?} should cancel",
             );
         }

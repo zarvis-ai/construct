@@ -440,6 +440,19 @@ impl Client {
             .await?;
         Ok(())
     }
+    /// Archive a session: terminate its adapter but keep history/worktree and
+    /// hide it from the list by default. Reversed by [`Self::restart`].
+    pub async fn archive(&self, id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_ARCHIVE,
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
     pub async fn delete_widget(&self, session_id: &str, panel_id: &str) -> Result<()> {
         let _: serde_json::Value = self
             .request(

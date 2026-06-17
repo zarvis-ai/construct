@@ -1307,6 +1307,7 @@ impl SessionManager {
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: params.kind,
+            archived: false,
         };
         self.storage.save_summary(&summary)?;
 
@@ -1556,7 +1557,10 @@ impl SessionManager {
             let mut v = Vec::new();
             for (id, entry) in guard.iter() {
                 let s = entry.summary.read().await;
-                if should_resume_on_startup(s.state) {
+                // Archived sessions stay down across daemon restarts — the
+                // user terminated them on purpose and brings them back with an
+                // explicit restart, not auto-resume.
+                if should_resume_on_startup(s.state) && !s.archived {
                     v.push(id.clone());
                 }
             }
@@ -1644,6 +1648,9 @@ impl SessionManager {
                     let mut s = entry.summary.write().await;
                     s.state = SessionState::Running;
                     s.pending_input = false;
+                    // Restarting an archived session brings it back to life:
+                    // it returns to the active list.
+                    s.archived = false;
                     s.clone()
                 };
                 let _ = self.storage.save_summary(&snapshot);
@@ -1760,6 +1767,9 @@ impl SessionManager {
             let mut s = entry.summary.write().await;
             s.state = SessionState::Running;
             s.pending_input = false;
+            // Restarting an archived session brings it back to life: it
+            // returns to the active list.
+            s.archived = false;
             s.clone()
         };
         let _ = self.storage.save_summary(&snapshot);
@@ -2660,6 +2670,51 @@ impl SessionManager {
         )
         .await;
         let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
+        Ok(())
+    }
+
+    /// Archive a session: terminate its adapter (if any) but keep the
+    /// transcript, worktree, and start params on disk so it can be restarted
+    /// later. The session is marked `archived` (hidden from the list by
+    /// default and skipped by startup auto-resume) and persisted. Archiving an
+    /// already-terminal session just sets the flag. Reversed by `restart`,
+    /// which clears `archived` and brings the session back to the active list.
+    pub async fn archive(&self, id: &str) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        // Gracefully terminate the live adapter, if there is one. The adapter's
+        // Closed event clears `entry.adapter` so a later restart sees no live
+        // adapter. Tolerate sessions that are already terminal (no adapter).
+        if let Some(adapter) = entry.adapter.lock().await.clone() {
+            let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
+                session_id: id.to_string(),
+            })?;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                adapter.request(ahp_method::SESSION_STOP, params),
+            )
+            .await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
+        }
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.archived = true;
+            // A live session we just stopped should read as cleanly terminated,
+            // not mid-run; leave an already-terminal state (Done/Errored) as-is.
+            if !s.state.is_terminal() {
+                s.state = SessionState::Done;
+            }
+            s.pending_input = false;
+            s.clone()
+        };
+        let _ = self.storage.save_summary(&snapshot);
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
         Ok(())
     }
 
@@ -3694,6 +3749,7 @@ mod tests {
                 last_pty_at_ms: None,
                 approval_mode: agentd_protocol::ApprovalMode::Manual,
                 kind,
+                archived: false,
             }),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
@@ -3746,6 +3802,46 @@ mod tests {
         assert_eq!(b.position, 10);
         assert_eq!(a.position, 30);
         assert_eq!(hidden.position, 20);
+    }
+
+    #[tokio::test]
+    async fn archive_marks_terminal_and_keeps_session() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "s1".into(),
+            synthetic_entry("s1", agentd_protocol::SessionKind::User, 0),
+        );
+
+        mgr.archive("s1").await.expect("archive");
+
+        let entry = mgr.get_entry("s1").await.expect("entry still present");
+        {
+            let s = entry.summary.read().await;
+            assert!(s.archived, "session should be marked archived");
+            assert!(
+                s.state.is_terminal(),
+                "a running session should read as terminated after archive",
+            );
+        }
+        // Archived sessions stay in the manager (unlike delete) so they can be
+        // listed when the toggle is on and later restarted.
+        assert!(
+            mgr.list().await.iter().any(|s| s.id == "s1"),
+            "archived session must remain in the manager",
+        );
+        // The persisted meta.json carries the archived flag across restarts.
+        let persisted = mgr.storage.load_summary("s1").expect("load meta");
+        assert!(persisted.archived, "archived flag must be persisted");
     }
 
     async fn insert_group(mgr: &SessionManager, id: &str, position: i64, collapsed: bool) {
@@ -4178,6 +4274,7 @@ mod tests {
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
+            archived: false,
         };
         let entry = Arc::new(SessionEntry {
             id: id.clone(),
