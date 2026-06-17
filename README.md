@@ -19,6 +19,9 @@ you. Remote control from your phone when you're in motion.
   observe all your sessions across different harnesses.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
   output, spawn helpers, send input, inspect diffs, and drive Chrome.
+- **ACP (Agent Client Protocol) server** — point Agent Client Protocol clients at
+  `construct acp` to create, load, resume, prompt, cancel, and close construct
+  daemon sessions through the same installed binary.
 - **Generative widgets** — construct generates and updates widgets for your task,
   so you can track progress, review outputs, and take action without leaving
   the TUI or web client.
@@ -62,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | 
 Pin a version or change the directory with `CONSTRUCT_VERSION=v0.2.0` /
 `CONSTRUCT_BIN_DIR=/usr/local/bin`.
 
-### 3. Open the fleet TUI
+### 3. Open the construct Terminal UI
 
 ```sh
 construct
@@ -107,6 +110,19 @@ running daemon keeps the old code until it restarts — pass `--restart`, or run
 The TUI also surfaces a one-line notice when a newer release is available
 (disable with `CONSTRUCT_NO_UPDATE_CHECK=1`).
 
+## ACP (Agent Client Protocol) server
+
+`construct acp` runs an Agent Client Protocol stdio server. Configure ACP
+clients to launch this command:
+
+```sh
+construct acp
+```
+
+It auto-starts the daemon if needed, then maps ACP session lifecycle calls onto
+construct daemon sessions. Use `--harness`, `--model`, or `--cwd` to set
+defaults for `session/new` requests that omit those fields.
+
 ## Building from source
 
 ```sh
@@ -117,7 +133,8 @@ cargo build --workspace
 
 Debug binaries land in `target/debug/`:
 
-- `target/debug/construct` — TUI, control CLI, **and the daemon** (`construct daemon run`)
+- `target/debug/construct` — TUI, control CLI, **the daemon**
+  (`construct daemon run`), and ACP stdio server (`construct acp`)
 - `target/debug/construct-mcp` — MCP bridge for agents
 - `target/debug/construct-adapter-*` — harness adapters
 

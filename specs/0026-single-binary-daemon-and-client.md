@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-06-07
 Area: architecture
-Scope: The daemon and the TUI/CLI client ship as one executable; the daemon's runtime is a library driven by the `construct daemon` subcommand, with no standalone daemon binary.
+Scope: The daemon, TUI/CLI client, and client-facing protocol entrypoints ship as one executable; the daemon's runtime is a library driven by the `construct daemon` subcommand, with no standalone daemon binary.
 
 ## Decision
 
@@ -12,6 +12,10 @@ binary runs the TUI by default and runs the daemon under a `daemon` subcommand
 (`construct daemon run`). The daemon's entire runtime lives in a library crate
 (`agentd`) that the `construct` binary drives — there is **no standalone daemon
 binary**.
+
+Client-facing protocol servers that attach to the daemon also belong in the
+same `construct` binary when they are part of the client surface. For example,
+ACP is exposed as `construct acp`, not as a separate `construct-acp` executable.
 
 This consolidation is about the *executable*, not the *process*. The daemon is
 still a single long-lived process that many clients attach to over the IPC
@@ -31,6 +35,9 @@ multiple daemons.
   briefly as a transition alias, then dropped once `construct daemon` and TUI
   auto-start covered every way it was used. Fewer binaries to build, ship, and
   install.
+- ACP clients need a stdio command, but they do not need a separate executable.
+  A `construct acp` subcommand preserves the one-binary install model while
+  still letting external ACP clients launch construct as their agent server.
 
 ## Consequences
 
@@ -51,6 +58,10 @@ multiple daemons.
   must happen before socket discovery and before tracing init, so the daemon's
   verbose log filter applies in daemon mode and the client's quiet filter
   applies otherwise.
+- **ACP mode is a client mode.** It connects to or auto-starts the daemon and
+  translates ACP session lifecycle calls into daemon IPC; it does not own
+  construct sessions directly and should not be modeled as an AHP harness
+  adapter.
 - **The client auto-starts a daemon when none is live.** Since one binary does
   both, running the TUI with no daemon is a setup mistake, not a user intent —
   so the TUI spawns a detached `construct daemon run` in the background and

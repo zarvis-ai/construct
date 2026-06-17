@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 mod app;
+mod acp;
 mod keymap;
 mod matrix_rain;
 mod pty_render;
@@ -68,6 +69,18 @@ enum Command {
         mode: Option<String>,
         #[arg(long, default_value_t = false)]
         worktree: bool,
+    },
+    /// Run `construct` as an Agent Client Protocol stdio server.
+    Acp {
+        /// Default harness when `session/new` omits `harness`.
+        #[arg(long)]
+        harness: Option<String>,
+        /// Default model when `session/new` omits `model`.
+        #[arg(long)]
+        model: Option<String>,
+        /// Default working directory for `session/new`.
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
     },
     /// Send input to a session.
     Send { session_id: String, text: String },
@@ -382,6 +395,16 @@ async fn main() -> Result<()> {
             restart,
             check,
         } => upgrade::run(version, bin_dir, restart, check, &socket).await,
+        Command::Acp {
+            harness,
+            model,
+            cwd,
+        } => {
+            let cwd = std::fs::canonicalize(&cwd)
+                .with_context(|| format!("resolve cwd {}", cwd.display()))?;
+            ensure_daemon_running(&socket).await;
+            acp::run(socket, harness, model, cwd).await
+        }
     }
 }
 

@@ -19,10 +19,10 @@ Five layers, each replaceable:
 ```
 
 - **Daemon** owns sessions, spawns adapters, persists transcripts. Speaks JSON-RPC over a Unix socket to clients. Run it with `construct daemon run` (the TUI also auto-starts one when none is running).
-- **Client** (`construct`) is the TUI plus a set of one-shot subcommands. Multiple clients can attach concurrently.
+- **Client** (`construct`) is the TUI plus a set of one-shot subcommands and protocol-facing entrypoints such as `construct acp`. Multiple clients can attach concurrently.
 - **Adapter** binaries are independent processes. They implement the AHP over stdio. Anyone can ship one in any language.
 
-The daemon and client ship as **one binary**: `construct` runs the TUI by default and the daemon under `construct daemon`. The daemon's runtime lives in the `agentd` library crate; there is no standalone daemon binary. The daemon and client are not merged into one *process* — the daemon stays a separate long-lived process that many clients attach to — only into one shipped executable. See [`specs/0026-single-binary-daemon-and-client.md`](../specs/0026-single-binary-daemon-and-client.md).
+The daemon and client ship as **one binary**: `construct` runs the TUI by default, the daemon under `construct daemon`, and the Agent Client Protocol stdio bridge under `construct acp`. The daemon's runtime lives in the `agentd` library crate; there is no standalone daemon binary. The daemon and client are not merged into one *process* — the daemon stays a separate long-lived process that many clients attach to — only into one shipped executable. See [`specs/0026-single-binary-daemon-and-client.md`](../specs/0026-single-binary-daemon-and-client.md).
 
 ## Crates
 
@@ -30,7 +30,7 @@ The daemon and client ship as **one binary**: `construct` runs the TUI by defaul
 |---|---|---|
 | `crates/protocol` | — (lib) | AHP + IPC types, transport, adapter SDK |
 | `crates/daemon` | `agentd` (lib only) | Session supervisor + IPC server runtime. No standalone binary — driven by `construct daemon` |
-| `crates/cli` | `construct` | TUI client + control subcommands + `construct daemon` (runs the daemon via the `agentd` lib) |
+| `crates/cli` | `construct` | TUI client + control subcommands + `construct daemon` (runs the daemon via the `agentd` lib) + `construct acp` |
 | `crates/adapter-shell` | `construct-adapter-shell` | Generic shell command runner |
 | `crates/adapter-claude` | `construct-adapter-claude` | Wraps the `claude` CLI |
 | `crates/adapter-codex` | `construct-adapter-codex` | Wraps the `codex` CLI |
