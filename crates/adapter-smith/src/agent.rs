@@ -264,6 +264,23 @@ pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
     new_ctx
 }
 
+/// Select the OS sandbox backend for a session, log which one, and surface a
+/// one-time "no OS backstop" notice to the user when a sandbox was *requested*
+/// but can't enforce here (degraded to `Noop`). Shared by the headless
+/// ([`run`]) and interactive session entry points so the behavior is identical.
+pub(crate) fn announce_sandbox(emit: &EventEmitter) -> Arc<dyn crate::sandbox::Sandbox> {
+    let sel = crate::sandbox::select();
+    tracing::debug!(
+        backend = sel.backend.name(),
+        enforces = sel.backend.enforces(),
+        "smith sandbox backend selected"
+    );
+    if let Some(msg) = sel.notice {
+        emit.log(msg);
+    }
+    sel.backend.into()
+}
+
 /// Run one Safe tool call without going through the approval gate or
 /// touching the inbox. Emits the same `ToolUse` / `ToolResult` events
 /// `run_one_tool` does so the transcript reads the same. Used by the
@@ -461,14 +478,9 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
         procs: Arc::new(crate::tools::proc::ProcRegistry::default()),
-        sandbox: crate::sandbox::select().into(),
+        sandbox: announce_sandbox(&emit),
         sandbox_policy: crate::sandbox::SandboxPolicy::workspace_default(&cwd),
     };
-    tracing::debug!(
-        backend = tool_ctx.sandbox.name(),
-        enforces = tool_ctx.sandbox.enforces(),
-        "smith sandbox backend selected"
-    );
 
     // Per-session message persistence (`smith.jsonl`). On resume,
     // hydrate `messages` from the file before the loop starts.
@@ -1458,6 +1470,51 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both paths of the "no OS backstop" notice, driven through the real
+    /// emit code: a requested-but-unavailable sandbox emits exactly one notice;
+    /// off-by-default and an enforcing backend stay silent. One test owns the
+    /// process-global `CONSTRUCT_SMITH_SANDBOX` var (no other test reads it) so
+    /// the set/remove can't race a parallel reader.
+    #[test]
+    fn sandbox_notice_emits_only_on_degrade() {
+        // Degrade: request a backend this OS can't provide (seatbelt is
+        // macOS-only, bubblewrap Linux-only) → guaranteed Noop → one notice.
+        let foreign = if cfg!(target_os = "macos") {
+            "bwrap"
+        } else {
+            "seatbelt"
+        };
+        std::env::set_var("CONSTRUCT_SMITH_SANDBOX", foreign);
+        let (emit, mut rx) = EventEmitter::channel("s");
+        let sb = announce_sandbox(&emit);
+        assert!(!sb.enforces(), "{foreign} must not enforce on this OS");
+        let note = rx.try_recv().expect("degrade path must emit a notice");
+        assert!(
+            note.to_string().contains("no OS-enforced backstop"),
+            "unexpected notice payload: {note}"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one notice on degrade");
+
+        // Off by default → silent.
+        std::env::set_var("CONSTRUCT_SMITH_SANDBOX", "none");
+        let (emit, mut rx) = EventEmitter::channel("s");
+        let _ = announce_sandbox(&emit);
+        assert!(rx.try_recv().is_err(), "`none` must be silent");
+
+        // An actually-enforcing backend → silent (macOS host with Seatbelt).
+        #[cfg(target_os = "macos")]
+        {
+            std::env::set_var("CONSTRUCT_SMITH_SANDBOX", "seatbelt");
+            let (emit, mut rx) = EventEmitter::channel("s");
+            let sb = announce_sandbox(&emit);
+            if sb.enforces() {
+                assert!(rx.try_recv().is_err(), "an enforcing backend needs no notice");
+            }
+        }
+
+        std::env::remove_var("CONSTRUCT_SMITH_SANDBOX");
+    }
 
     #[test]
     fn parse_auto_review_decision_accepts_json_with_surrounding_text() {
