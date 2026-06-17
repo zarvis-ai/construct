@@ -5902,6 +5902,7 @@ fn chat_event_kind(ev: &SessionEvent) -> ChatEventKind {
         | SessionEvent::ClientCommand { .. }
         | SessionEvent::ToolApprovalResolved { .. }
         | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::ModelChanged { .. }
         | SessionEvent::AgentStatus(_) => ChatEventKind::Hidden,
         SessionEvent::Message { role, text } if should_render_chat_message(*role, text) => {
             if *role == MessageRole::Assistant {
@@ -6021,6 +6022,7 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
         | SessionEvent::ClientCommand { .. }
         | SessionEvent::ToolApprovalResolved { .. }
         | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::ModelChanged { .. }
         | SessionEvent::AgentStatus(_) => Vec::new(),
         SessionEvent::Message { role, text } => {
             let role_label = match role {
@@ -6752,6 +6754,7 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::ApprovalModeChanged { mode } => {
             format!("approval-mode {}", mode.badge().unwrap_or("manual"))
         }
+        SessionEvent::ModelChanged { model } => format!("model {model}"),
         SessionEvent::TaskStart { tool, call_id, .. } => format!("task-start {tool} {call_id}"),
         SessionEvent::TaskBackgrounded { call_id } => format!("task-bg {call_id}"),
         SessionEvent::TaskEnd { call_id, ok, .. } => format!("task-end {call_id} ok={ok}"),

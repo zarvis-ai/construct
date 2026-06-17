@@ -1452,6 +1452,10 @@ impl ResolvedModel {
 ///   5. GEMINI_API_KEY (or GOOGLE_API_KEY) set → `gemini-2.5-pro`.
 ///   6. fall through to Ollama with `llama3.1`.
 pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
+    // `params.model` carries the session's active model. The daemon keeps it
+    // current across a `/model` switch (it persists the `ModelChanged` event
+    // into the session summary and re-injects it on resume), so a resumed
+    // session comes back on the model it was last running, not the default.
     let spec_str = params
         .model
         .clone()

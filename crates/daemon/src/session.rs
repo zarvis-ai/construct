@@ -1605,10 +1605,17 @@ impl SessionManager {
             "CONSTRUCT_SESSION_DATA_DIR".to_string(),
             self.storage.session_dir(id).to_string_lossy().to_string(),
         );
-        let project_id = {
+        let (project_id, current_model) = {
             let s = entry.summary.read().await;
-            s.group_id.clone()
+            (s.group_id.clone(), s.model.clone())
         };
+        // The summary's model is the live source of truth — it tracks any
+        // mid-session `/model` switch (via `ModelChanged`), whereas the start
+        // params were frozen at create. Re-inject it so the resumed adapter
+        // comes back on the model the session was last running.
+        if current_model.is_some() {
+            start_params.model = current_model;
+        }
         self.install_memory_env(&mut start_params.env, project_id.as_deref());
         let widgets_dir = self.storage.ensure_widgets_dir(id).unwrap_or_else(|e| {
             tracing::warn!(session = %id, error = ?e, "ensure widgets dir failed");
@@ -2073,6 +2080,19 @@ impl SessionManager {
             }
             return;
         }
+        // ModelChanged updates the session's recorded model (durable
+        // per-session state). The state notification carries the new label to
+        // clients; like ApprovalModeChanged it is not a transcript row.
+        if let SessionEvent::ModelChanged { model } = &event {
+            if let Err(e) = self.persist_model(entry, model.clone()).await {
+                tracing::warn!(
+                    session = %entry.id,
+                    error = ?e,
+                    "persist model from adapter event failed"
+                );
+            }
+            return;
+        }
         // PTY events take a fast path: append to the on-disk pty.log + a
         // live broadcast. A copy was also appended to the transcript above
         // as an ordering marker. Replay reads back from `pty.log` directly
@@ -2161,6 +2181,7 @@ impl SessionManager {
                 // Transient; handled by the broadcast-only fast path above.
                 | SessionEvent::ToolApprovalResolved { .. }
                 | SessionEvent::ApprovalModeChanged { .. }
+                | SessionEvent::ModelChanged { .. }
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
                 | SessionEvent::TaskEnd { .. }
@@ -3241,6 +3262,25 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Record the session's active model after an adapter `/model` switch.
+    /// Updates the summary (so the UI label tracks the change) and persists
+    /// it, so `respawn` re-injects the model into the adapter's start params
+    /// on the next restart instead of reverting to the creation-time value.
+    async fn persist_model(&self, entry: &Arc<SessionEntry>, model: String) -> Result<()> {
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            s.model = Some(model);
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        Ok(())
+    }
+
     pub async fn set_approval_mode(
         &self,
         id: &str,
@@ -4220,6 +4260,49 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e.event, SessionEvent::ApprovalModeChanged { .. })),
             "ApprovalModeChanged must not be written to the transcript"
+        );
+    }
+
+    /// A smith `/model` switch reports the new model to the daemon with
+    /// `ModelChanged`. The daemon must record it on the session summary so the
+    /// choice survives restart (`respawn` re-injects `summary.model`) and the
+    /// UI label tracks it — without recording a transcript row.
+    #[tokio::test]
+    async fn model_changed_updates_summary_without_transcript_row() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "smodelchange";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+
+        mgr.handle_event(
+            &entry,
+            SessionEvent::ModelChanged {
+                model: "anthropic:claude-opus-4-8".into(),
+            },
+        )
+        .await;
+
+        let summary = storage.load_summary(id).expect("summary");
+        assert_eq!(summary.model.as_deref(), Some("anthropic:claude-opus-4-8"));
+        let transcript = storage
+            .read_transcript(id, 0, None)
+            .expect("read transcript");
+        assert!(
+            !transcript
+                .events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::ModelChanged { .. })),
+            "ModelChanged must not be written to the transcript"
         );
     }
 

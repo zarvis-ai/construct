@@ -459,6 +459,17 @@ pub enum SessionEvent {
     ApprovalModeChanged {
         mode: ApprovalMode,
     },
+    /// Adapter switched the session's active model internally (e.g. the
+    /// smith `/model` slash command). `model` is a canonical spec string the
+    /// adapter can re-resolve on resume (`provider:model`, or `@profile:model`
+    /// for a named-endpoint profile). The daemon records it as the session's
+    /// model so the choice survives restart and the UI label tracks the
+    /// switch. Durable per-session state, like
+    /// [`ApprovalModeChanged`](Self::ApprovalModeChanged): never written to
+    /// the transcript.
+    ModelChanged {
+        model: String,
+    },
     /// Tool lifecycle: adapter started running a tool. Carries the
     /// canonical `call_id` (unlike [`ToolUse`] which doesn't) so the
     /// daemon's per-session task registry can match this against the

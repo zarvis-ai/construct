@@ -268,6 +268,7 @@ fn chat_scroll_kind(ev: &SessionEvent) -> ChatScrollKind {
         | SessionEvent::ClientCommand { .. }
         | SessionEvent::ToolApprovalResolved { .. }
         | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::ModelChanged { .. }
         | SessionEvent::AgentStatus(_) => ChatScrollKind::Hidden,
         SessionEvent::Message { role, text }
             if should_render_chat_message_for_scroll(*role, text) =>

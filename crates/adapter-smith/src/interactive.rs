@@ -2360,6 +2360,20 @@ pub async fn run(
                                         let new_name = new.provider_name();
                                         let new_display = new.display_name();
                                         let new_model = new.model.clone();
+                                        // Tell the daemon the active model
+                                        // changed so it records the new spec on
+                                        // the session (survives restart) and the
+                                        // UI label tracks the switch. A profile
+                                        // keeps its `@name` form — re-resolving
+                                        // as `provider:model` would drop the
+                                        // profile's endpoint/key.
+                                        let spec = match &new.profile {
+                                            Some(p) => format!("{p}:{new_model}"),
+                                            None => format!("{new_name}:{new_model}"),
+                                        };
+                                        emit.emit(SessionEvent::ModelChanged {
+                                            model: spec,
+                                        });
                                         provider = new.provider;
                                         provider_name = new_name;
                                         display_name = new_display;
