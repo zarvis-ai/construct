@@ -2123,9 +2123,9 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
                 until: now + Duration::from_millis(crate::app::DYNAMIC_UI_HOVER_GRACE_MS),
             });
         }
-        let filled = app.matrix_widget_shown(now).as_deref() == Some(panel.id.as_str());
-        let glyph = if filled { "■" } else { "□" };
-        let style = if filled {
+        let pinned = app.matrix_widget_pinned.as_deref() == Some(panel.id.as_str());
+        let glyph = if pinned { "■" } else { "□" };
+        let style = if pinned {
             Style::default()
                 .fg(app.theme.accent)
                 .add_modifier(Modifier::BOLD)
