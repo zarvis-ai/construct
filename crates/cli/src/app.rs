@@ -9767,6 +9767,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn matrix_widget_hover_keeps_title_icon_outline_until_pinned() {
+        use agentd_protocol::{UiPanel, UiPlacement};
+
+        let (mut app, _dir, server) = captured_app().await;
+        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        orch.id = "orch".into();
+        app.sessions.push(orch);
+        app.refresh_orchestrator_id();
+        app.matrix_rain_hidden = false;
+        app.ui_panels.insert(
+            "orch".into(),
+            HashMap::from([(
+                "alpha".into(),
+                UiPanel {
+                    id: "alpha".into(),
+                    source: Some("alpha.md".into()),
+                    title: Some("alpha".into()),
+                    created_at_ms: 1,
+                    placement: UiPlacement::Sticky,
+                    markdown: "# alpha".into(),
+                },
+            )]),
+        );
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("operator widget title indicator should render");
+        let hit = app
+            .layout
+            .matrix_widget_hits
+            .first()
+            .cloned()
+            .expect("widget title hit");
+
+        app.mouse_pos = Some((hit.start_col, hit.row));
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("hovered operator widget title indicator should render");
+        assert_eq!(
+            term.backend()
+                .buffer()
+                .cell((hit.start_col, hit.row))
+                .map(|cell| cell.symbol()),
+            Some("□"),
+            "hover preview should keep the operator widget title icon outlined"
+        );
+        assert_eq!(
+            app.matrix_widget_hover
+                .as_ref()
+                .map(|h| h.panel_id.as_str()),
+            Some("alpha")
+        );
+
+        app.toggle_matrix_widget_panel("alpha".into());
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("pinned operator widget title indicator should render");
+        assert_eq!(
+            term.backend()
+                .buffer()
+                .cell((hit.start_col, hit.row))
+                .map(|cell| cell.symbol()),
+            Some("■"),
+            "clicked/pinned operator widget title icon should be filled"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn dynamic_ui_hover_reveals_only_the_hovered_session_panel() {
         use std::time::{Duration, Instant};
 
