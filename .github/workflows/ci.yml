@@ -26,10 +26,13 @@ jobs:
         # into a GIF. Both produced as e2e artifacts so reviewers
         # can replay the test interactively from the workflow run
         # page.
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          curl -sSL -o /usr/local/bin/agg \
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
+          curl -sSfL -o /usr/local/bin/agg \
             https://github.com/asciinema/agg/releases/latest/download/agg-x86_64-unknown-linux-gnu
           chmod +x /usr/local/bin/agg
 
