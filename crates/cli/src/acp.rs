@@ -9,7 +9,7 @@ use agentd_protocol::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::{self, AsyncBufReadExt, BufReader, BufWriter};
+use tokio::io::{self, BufReader, BufWriter};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 const ACP_PROTOCOL_VERSION: &str = "1.0";
@@ -132,11 +132,12 @@ pub async fn run(
                 let method = raw.get("method").and_then(Value::as_str).unwrap_or("");
                 let id = raw.get("id").cloned();
                 let params = raw.get("params").cloned().unwrap_or_else(|| json!({}));
-                if let Err(err) = handle_request(method, id, params, &client, &out_tx, &mut state).await {
+                if let Err(err) = handle_request(method, id.clone(), params, &client, &out_tx, &mut state).await {
                     if let Some(req_id) = id {
+                        let fallback_id = req_id.clone();
                         let _ = out_tx.send(
                             serde_json::to_value(Response::err(req_id, ErrorObject::internal(err.to_string())))
-                                .unwrap_or_else(|_| json!({"jsonrpc":"2.0","id":req_id,"error":{"code":-32603,"message":"internal error"}})),
+                                .unwrap_or_else(|_| json!({"jsonrpc":"2.0","id":fallback_id,"error":{"code":-32603,"message":"internal error"}})),
                         );
                     }
                 }
