@@ -178,6 +178,7 @@ pub struct ItemHistory {
     shadow_last_snapshot: Vec<ShadowSnapshotLine>,
     shadow_dirty_since_snapshot: bool,
     shadow_snapshot_worthy_since_snapshot: bool,
+    shadow_line_feed_since_snapshot: bool,
     /// Last cols/rows the shadow was sized to, so we only call
     /// `set_size` when the dims actually changed (matches the
     /// main-parser caching idiom).
@@ -421,6 +422,7 @@ impl ItemHistory {
             shadow_last_snapshot: Vec::new(),
             shadow_dirty_since_snapshot: false,
             shadow_snapshot_worthy_since_snapshot: false,
+            shadow_line_feed_since_snapshot: false,
             shadow_cols: 80,
             shadow_rows: 24,
             items: Vec::new(),
@@ -556,6 +558,9 @@ impl ItemHistory {
                 if shadow_byte_may_paint(bytes[i]) {
                     self.shadow_dirty_since_snapshot = true;
                 }
+                if bytes[i] == b'\n' {
+                    self.shadow_line_feed_since_snapshot = true;
+                }
                 if shadow_byte_is_snapshot_worthy(bytes[i]) {
                     self.shadow_snapshot_worthy_since_snapshot = true;
                 }
@@ -594,15 +599,25 @@ impl ItemHistory {
             self.shadow_dirty_since_snapshot = false;
             return;
         }
-        if lines.is_empty() || lines == self.shadow_last_snapshot {
+        if lines.is_empty() {
             self.shadow_dirty_since_snapshot = false;
             self.shadow_snapshot_worthy_since_snapshot = false;
+            self.shadow_line_feed_since_snapshot = false;
             return;
         }
+        if self.shadow_line_feed_since_snapshot {
+            self.shadow_last_snapshot = lines;
+            self.shadow_dirty_since_snapshot = false;
+            self.shadow_snapshot_worthy_since_snapshot = false;
+            self.shadow_line_feed_since_snapshot = false;
+            return;
+        }
+        let append_start = snapshot_overlap_prefix_len(&self.shadow_last_snapshot, &lines);
         self.shadow_last_snapshot = lines.clone();
         self.shadow_dirty_since_snapshot = false;
         self.shadow_snapshot_worthy_since_snapshot = false;
-        for line in lines {
+        self.shadow_line_feed_since_snapshot = false;
+        for line in lines.into_iter().skip(append_start) {
             match line {
                 ShadowSnapshotLine::Text(text) => self.shadow_parser.process(text.as_bytes()),
                 ShadowSnapshotLine::Blank => {}
@@ -1434,6 +1449,33 @@ fn trim_outer_blank_snapshot_lines(lines: &mut Vec<ShadowSnapshotLine>) {
         .unwrap_or(first_text);
     if first_text > 0 || last_text + 1 < lines.len() {
         *lines = lines[first_text..=last_text].to_vec();
+    }
+}
+
+fn snapshot_overlap_prefix_len(
+    previous: &[ShadowSnapshotLine],
+    current: &[ShadowSnapshotLine],
+) -> usize {
+    let max = previous.len().min(current.len());
+    for overlap in (1..=max).rev() {
+        if previous[previous.len() - overlap..]
+            .iter()
+            .zip(current[..overlap].iter())
+            .all(|(a, b)| snapshot_lines_overlap(a, b))
+        {
+            return overlap;
+        }
+    }
+    0
+}
+
+fn snapshot_lines_overlap(a: &ShadowSnapshotLine, b: &ShadowSnapshotLine) -> bool {
+    match (a, b) {
+        (ShadowSnapshotLine::Blank, ShadowSnapshotLine::Blank) => true,
+        (ShadowSnapshotLine::Text(a), ShadowSnapshotLine::Text(b)) => {
+            a == b || a.starts_with(b) || b.starts_with(a)
+        }
+        _ => false,
     }
 }
 
@@ -4672,10 +4714,9 @@ mod tests {
         h.feed_pty(b"\x1b[5;1H");
         h.feed_pty(b"Tool result");
 
-        // Trigger snapshot of the current viewport before Codex-style
-        // full-screen repaint. The blank rows between text rows should
-        // be copied into the shadow history rather than compacted away.
-        h.feed_pty(b"\r\n");
+        // Trigger snapshot of the current cursor-addressed viewport before
+        // Codex-style full-screen repaint. The blank rows between text rows
+        // should be copied into the shadow history rather than compacted away.
         h.feed_pty(b"\x1b[1;1H");
         h.feed_pty(b"Next frame");
 
@@ -4684,6 +4725,104 @@ mod tests {
         assert!(
             scrolled.contains(expected),
             "scrolled snapshot should preserve internal blank rows, got:\n{scrolled}"
+        );
+    }
+
+    #[test]
+    fn shadow_snapshot_overlap_detects_shifted_viewport() {
+        let previous = vec![
+            ShadowSnapshotLine::Text("line 00".into()),
+            ShadowSnapshotLine::Text("line 01".into()),
+            ShadowSnapshotLine::Blank,
+            ShadowSnapshotLine::Text("line 03".into()),
+        ];
+        let current = vec![
+            ShadowSnapshotLine::Text("line 01".into()),
+            ShadowSnapshotLine::Blank,
+            ShadowSnapshotLine::Text("line 03".into()),
+            ShadowSnapshotLine::Text("line 04".into()),
+        ];
+        assert_eq!(snapshot_overlap_prefix_len(&previous, &current), 3);
+        assert_eq!(
+            snapshot_overlap_prefix_len(&current, &current),
+            current.len()
+        );
+    }
+
+    #[test]
+    fn shadow_snapshot_overlap_tolerates_stale_row_tails() {
+        let previous = vec![
+            ShadowSnapshotLine::Text(
+                "PTY-first adapters are weaker ACP agents. Codex/Claude interactive PTY mode can be exposed as streamed text".into(),
+            ),
+            ShadowSnapshotLine::Text(
+                "works best with structured events. Smith/headless-style sessions are a better first target.".into(),
+            ),
+            ShadowSnapshotLine::Text(
+                "MCP server forwarding needs design. ACP session/new passes MCP server configs.".into(),
+            ),
+        ];
+        let current = vec![
+            ShadowSnapshotLine::Text(
+                "works best with structured events. Smith/headless-style sessions are a better first target.as streamed text".into(),
+            ),
+            ShadowSnapshotLine::Text(
+                "MCP server forwarding needs design. ACP session/new passes MCP server configs.".into(),
+            ),
+            ShadowSnapshotLine::Text("Client callbacks need an implementation policy.".into()),
+        ];
+        assert_eq!(snapshot_overlap_prefix_len(&previous, &current), 2);
+    }
+
+    #[test]
+    fn codex_shadow_shifted_repaints_append_only_new_rows() {
+        let mut h = ItemHistory::new();
+        let (cols, rows) = (40u16, 6u16);
+        h.set_pty_size(cols, rows);
+
+        for first_line in 0..4u32 {
+            h.feed_pty(b"\x1b[H");
+            for row in 0..rows {
+                h.feed_pty(
+                    format!(
+                        "\x1b[{};1H\x1b[Kline {:02}",
+                        row + 1,
+                        first_line + row as u32
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+
+        let max_scrollback = h.replay(cols, rows, usize::MAX).max_scrollback;
+        assert!(
+            max_scrollback <= rows as usize + 3,
+            "shifted repaint snapshots should append only newly revealed rows, \
+             not every overlapping viewport; max_scrollback={max_scrollback}"
+        );
+    }
+
+    #[test]
+    fn codex_shadow_line_feed_repaints_do_not_snapshot_viewport() {
+        let mut h = ItemHistory::new();
+        let (cols, rows) = (40u16, 6u16);
+        h.set_pty_size(cols, rows);
+
+        for i in 0..20u32 {
+            h.feed_pty(format!("line {i:02}\r\n").as_bytes());
+        }
+        let before = h.replay(cols, rows, usize::MAX).max_scrollback;
+
+        h.feed_pty(b"\x1b[H");
+        for row in 0..rows {
+            h.feed_pty(format!("\x1b[{};1H\x1b[Kline {:02}", row + 1, row).as_bytes());
+        }
+        let after = h.replay(cols, rows, usize::MAX).max_scrollback;
+
+        assert_eq!(
+            before, after,
+            "cursor-addressed repaint after line-fed output should not append \
+             a duplicate synthetic viewport into scrollback"
         );
     }
 
