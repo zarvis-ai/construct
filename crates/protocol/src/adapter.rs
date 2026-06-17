@@ -334,6 +334,23 @@ pub struct EventEmitter {
 }
 
 impl EventEmitter {
+    /// Build an emitter wired to a fresh in-memory channel, returning the
+    /// receiving end. Production emitters are constructed by the adapter
+    /// runner; this is for tests and embedding that want to observe emitted
+    /// notifications directly.
+    pub fn channel(
+        session_id: impl Into<String>,
+    ) -> (Self, mpsc::UnboundedReceiver<serde_json::Value>) {
+        let (out_tx, out_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                out_tx,
+                session_id: session_id.into(),
+            },
+            out_rx,
+        )
+    }
+
     pub fn emit(&self, event: SessionEvent) {
         let env = EventEnvelope {
             session_id: self.session_id.clone(),

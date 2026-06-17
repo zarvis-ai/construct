@@ -2057,14 +2057,9 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
         procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
-        sandbox: crate::sandbox::select().into(),
+        sandbox: crate::agent::announce_sandbox(&emit),
         sandbox_policy: crate::sandbox::SandboxPolicy::workspace_default(&cwd),
     };
-    tracing::debug!(
-        backend = tool_ctx.sandbox.name(),
-        enforces = tool_ctx.sandbox.enforces(),
-        "smith sandbox backend selected"
-    );
 
     // Prompt bytes the line editor will re-emit on every redraw. Must
     // match Terminal::prompt's payload sans the leading `\r\n` (we keep

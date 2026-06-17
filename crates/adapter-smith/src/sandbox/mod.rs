@@ -91,18 +91,43 @@ impl Sandbox for Noop {
     }
 }
 
+/// The outcome of [`select`]: the chosen backend plus an optional one-time
+/// notice for the session layer to surface.
+pub struct Selection {
+    pub backend: Box<dyn Sandbox>,
+    /// `Some(reason)` **only** when a sandbox was *requested* but the chosen
+    /// backend doesn't enforce (degraded to `Noop`) — the "no OS backstop"
+    /// case. `None` when the sandbox is off by default/`none`, or when a real
+    /// backend is active. So a notice fires iff the user asked for protection
+    /// they didn't get.
+    pub notice: Option<String>,
+}
+
 /// Pick the backend from `CONSTRUCT_SMITH_SANDBOX` (default off → `Noop`).
-pub fn select() -> Box<dyn Sandbox> {
+pub fn select() -> Selection {
     let choice = std::env::var("CONSTRUCT_SMITH_SANDBOX")
         .unwrap_or_default()
         .to_ascii_lowercase();
-    match choice.as_str() {
+    let requested = matches!(
+        choice.as_str(),
+        "auto" | "1" | "on" | "seatbelt" | "bwrap" | "bubblewrap"
+    );
+    let backend: Box<dyn Sandbox> = match choice.as_str() {
         "auto" | "1" | "on" => auto(),
         "seatbelt" => seatbelt_or_noop(),
         "bwrap" | "bubblewrap" => bubblewrap_or_noop(),
         // "none" | "0" | "" | unknown
         _ => Box::new(Noop),
-    }
+    };
+    let notice = if requested && !backend.enforces() {
+        Some(format!(
+            "OS sandbox requested (CONSTRUCT_SMITH_SANDBOX={choice}) but no backend can enforce \
+             here — running with the cooperative approval gate only, with no OS-enforced backstop."
+        ))
+    } else {
+        None
+    };
+    Selection { backend, notice }
 }
 
 fn auto() -> Box<dyn Sandbox> {
