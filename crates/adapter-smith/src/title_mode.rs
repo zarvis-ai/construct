@@ -54,7 +54,13 @@ fn provider_for(p: Provider) -> Result<Box<dyn LlmProvider>> {
         Provider::Anthropic => Box::new(provider::anthropic::Anthropic::from_env()?),
         Provider::Gemini => Box::new(provider::gemini::Gemini::from_env()?),
         Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
-        // Title generation always uses one of the trio above; the
+        Provider::Grok => Box::new(provider::openai::OpenAi::with_config(
+            Some("https://api.x.ai/v1".to_string()),
+            std::env::var("GROK_API_KEY")
+                .or_else(|_| std::env::var("XAI_API_KEY"))
+                .map_err(|_| anyhow!("grok requires GROK_API_KEY or XAI_API_KEY"))?,
+        )?),
+        // Title generation always uses one of the key providers above; the
         // user never picks OAuth providers for title-gen since the
         // selection comes from `pick_default_spec_str` which only
         // emits openai/anthropic/ollama. Bail loudly if we ever get
@@ -64,6 +70,9 @@ fn provider_for(p: Provider) -> Result<Box<dyn LlmProvider>> {
         }
         Provider::ClaudeOauth => {
             return Err(anyhow!("title-gen does not support claude-oauth provider"));
+        }
+        Provider::GrokOauth => {
+            return Err(anyhow!("title-gen does not support grok-oauth provider"));
         }
     })
 }

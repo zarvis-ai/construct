@@ -2,7 +2,7 @@
 //!
 //! Read from `[smith.models.<name>]` tables in the shared `config.toml`.
 //! Each profile pins a wire protocol (`openai` / `anthropic` / `gemini` /
-//! `ollama`) to its own base URL, credential, and default model — so a
+//! `ollama` / `grok`) to its own base URL, credential, and default model — so a
 //! single session can switch between many distinct endpoints at runtime
 //! via `/model @<name>`, including several OpenAI-compatible vendors plus
 //! the real OpenAI API at the same time. The single `OPENAI_BASE_URL`
@@ -11,8 +11,9 @@
 //! Profiles are always referenced with the explicit `@` prefix and never
 //! win bare-name routing — consistent with spec 0028, switching the
 //! endpoint/billing path is an explicit act. OAuth-backed providers
-//! (`codex-oauth` / `claude-oauth`) are intentionally not configurable
-//! here; they have no base-URL/key surface and keep their own prefixes.
+//! (`codex-oauth` / `claude-oauth` / `grok-oauth`) are intentionally not
+//! configurable here; they have no base-URL/key surface and keep their own
+//! prefixes.
 //!
 //! Example `config.toml`:
 //!
@@ -37,7 +38,8 @@ use std::collections::BTreeMap;
 /// One `[smith.models.<name>]` entry.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelProfile {
-    /// Wire protocol to speak: `openai` | `anthropic` | `gemini` | `ollama`.
+    /// Wire protocol to speak: `openai` | `anthropic` | `gemini` |
+    /// `ollama` | `grok`.
     pub provider: String,
     /// Endpoint base URL. Falls back to the wire protocol's default when unset.
     #[serde(default)]

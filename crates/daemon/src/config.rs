@@ -160,7 +160,7 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
     BuiltinAdapter {
         name: "smith",
         binary: "construct-adapter-smith",
-        description: "Built-in multi-provider agent (OpenAI / Anthropic / Ollama)",
+        description: "Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)",
     },
 ];
 

@@ -33,6 +33,10 @@ pub fn context_window_tokens(provider: &str, model: &str) -> usize {
         ("openai", _) => 32_000,
         ("anthropic", _) => 200_000,
         ("ollama", _) => 8_000,
+        // xAI Grok models currently expose large context windows on the
+        // cloud endpoint (order-of-magnitude in the same class as recent
+        // OpenAI models); this is a safe conservative starting value.
+        ("grok", _) => 100_000,
         // ChatGPT-subscription Codex backend. Same gpt-5* family,
         // same advertised context window as the platform API — the
         // billing pipe is what differs, not the model. Starting

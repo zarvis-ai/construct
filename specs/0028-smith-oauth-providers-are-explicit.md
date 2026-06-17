@@ -8,8 +8,8 @@ Scope: Smith providers that draw from subscription-backed OAuth credentials.
 ## Decision
 
 Smith subscription-backed providers must be selected with explicit model
-prefixes such as `codex-oauth:` or `claude-oauth:`. Bare model names keep using
-their direct API provider routes.
+prefixes such as `codex-oauth:`, `claude-oauth:`, or `grok-oauth:`. Bare
+model names keep using their direct API provider routes.
 
 ## Reason
 
