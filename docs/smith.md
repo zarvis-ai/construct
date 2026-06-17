@@ -1,8 +1,8 @@
 # smith built-in agent
 
 `smith` is the built-in agent that ships with construct. It talks to OpenAI,
-Anthropic, Google Gemini, or a local Ollama directly, and can also delegate
-subscription auth to Codex or Claude Code. Smith runs its own agent loop with
+Anthropic, Google Gemini, or a local Ollama directly, and can also draw on your
+Codex or Claude (Pro/Max) subscription. Smith runs its own agent loop with
 shell + filesystem + construct-control tools. Many PRs for the construct
 repository have already been made from smith sessions running inside construct.
 
@@ -36,14 +36,18 @@ Bare names auto-detect: `gpt-*` / `o[1-5]*` → OpenAI, `claude-*` →
 Anthropic, `gemini-*` → Gemini, anything else → Ollama. When in doubt,
 use the explicit prefix.
 
-`claude-oauth:` delegates model access to the installed `claude` CLI, so run
-`claude login` first and keep `claude` on `PATH` (or set `CONSTRUCT_CLAUDE_BIN`
-/ `CONSTRUCT_CLAUDE_CMD`). Smith disables Claude Code's built-in tools on this
-path and asks Claude for structured Smith tool calls, so construct's normal
-tool approvals and transcript persistence still apply. The child CLI process
-does not inherit `ANTHROPIC_API_KEY` or third-party Claude provider env vars on
-this path, so the explicit `claude-oauth:` prefix does not silently become API
-key billing.
+`claude-oauth:` uses your Claude Code subscription login: run `claude login`
+once so the credentials are stored (macOS keychain, or
+`~/.claude/.credentials.json`), and smith reads them from there and calls the
+Anthropic API directly with the subscription OAuth token — the `claude` CLI
+does not need to stay on `PATH` at runtime (override the credential location
+with `CONSTRUCT_CLAUDE_OAUTH_CREDENTIALS`). Smith passes its own tools natively,
+so construct's normal tool approvals and transcript persistence apply. This path
+uses your subscription, not `ANTHROPIC_API_KEY` (that's the separate
+`anthropic:` path). Note: it routes the subscription token straight at the API
+rather than through `claude -p` / the Agent SDK — your own subscription on your
+own machine, but not the surface Anthropic documents for subscription use. See
+`specs/0030-claude-oauth-direct-api.md`.
 
 If you don't pass a model and `CONSTRUCT_SMITH_MODEL` isn't set, smith
 picks: `ANTHROPIC_API_KEY` → `claude-opus-4-8`, else `OPENAI_API_KEY`
