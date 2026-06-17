@@ -296,6 +296,76 @@ impl Client {
         let r: R = self.request(ipc_method::SESSION_CREATE, &p).await?;
         Ok(r.session_id)
     }
+    /// Fork an existing session into a new **sibling** session backed by
+    /// `harness` (which may differ from the source's). The new session
+    /// inherits the source's cwd and group and runs as an independent
+    /// top-level session — not a child/subagent — so the source is left
+    /// untouched (a session's own harness is immutable, per spec 0001).
+    ///
+    /// Unless [`ForkOptions::seed`] is false or the target is the `shell`
+    /// harness (which takes a command, not conversation context), the fork's
+    /// initial prompt is seeded with a rendered summary of the source
+    /// transcript so an agent harness can pick up where the original left
+    /// off. Returns the new session id.
+    pub async fn fork_session(
+        &self,
+        source_id: &str,
+        harness: &str,
+        opts: ForkOptions,
+    ) -> Result<String> {
+        let src = self.get(source_id).await?.summary;
+
+        let mut prompt_parts: Vec<String> = Vec::new();
+        if opts.seed && harness != "shell" {
+            // Full transcript from the start (seq 0) so the original objective
+            // — usually stated in the opening message — is carried, not just
+            // the recent tail.
+            if let Ok(tr) = self.transcript(source_id, 0, None).await {
+                if let Some(seed) = render_fork_seed(&tr.events, opts.max_seed_bytes) {
+                    prompt_parts.push(seed);
+                }
+            }
+        }
+        if let Some(p) = opts
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            prompt_parts.push(p.to_string());
+        }
+        let prompt = (!prompt_parts.is_empty()).then(|| prompt_parts.join("\n\n"));
+
+        // A model spec is harness-specific (`openai:gpt-5` means nothing to
+        // the claude harness), so only carry the source's model when the
+        // harness is unchanged — unless the caller passed an explicit one.
+        let model = opts
+            .model
+            .clone()
+            .or_else(|| (harness == src.harness).then(|| src.model.clone()).flatten());
+
+        let title = Some(match &src.title {
+            Some(t) => format!("⑂ {t}"),
+            None => format!("⑂ fork of {}", short_id(&src.id)),
+        });
+
+        self.create(CreateSessionParams {
+            harness: harness.to_string(),
+            cwd: src.cwd.clone(),
+            prompt,
+            model,
+            title,
+            mode: None,
+            pty_size: None,
+            worktree: false,
+            env: HashMap::new(),
+            args: Vec::new(),
+            kind: agentd_protocol::SessionKind::User,
+            parent_session_id: None, // sibling, not a subagent
+            group_id: src.group_id.clone(), // same group → rendered alongside the source
+        })
+        .await
+    }
     pub async fn send_input(&self, id: &str, text: String) -> Result<()> {
         let _: serde_json::Value = self
             .request(
@@ -864,5 +934,247 @@ impl Client {
             .request(ipc_method::UNSUBSCRIBE_EVENTS, &serde_json::Value::Null)
             .await?;
         Ok(())
+    }
+}
+
+/// Options for [`Client::fork_session`].
+#[derive(Debug, Clone)]
+pub struct ForkOptions {
+    /// Model spec for the new session. `None` lets the target harness pick
+    /// its default; the source's model is only inherited when the harness is
+    /// unchanged.
+    pub model: Option<String>,
+    /// Extra user instruction appended after the seeded context (e.g.
+    /// "continue from here"). `None` leaves the fork at just the seed (or
+    /// interactive when nothing is seeded).
+    pub prompt: Option<String>,
+    /// Seed the fork's initial prompt with a rendering of the source
+    /// transcript. Ignored for the `shell` harness.
+    pub seed: bool,
+    /// Safety ceiling on the rendered seed, in bytes. `0` (the default) means
+    /// unlimited — the **full** transcript is seeded. When a positive cap is
+    /// exceeded, the opening (which usually states the user's objective) and
+    /// the most-recent activity are kept while the middle is elided, so the
+    /// goal is never dropped.
+    pub max_seed_bytes: usize,
+}
+
+impl Default for ForkOptions {
+    fn default() -> Self {
+        Self {
+            model: None,
+            prompt: None,
+            seed: true,
+            max_seed_bytes: 0,
+        }
+    }
+}
+
+/// Render transcript events into a plain-text context block for a forked
+/// session. Renders the full history in chronological order so the opening
+/// (objective) comes first. Returns `None` when there's nothing worth
+/// seeding. When `max_bytes > 0` and the body exceeds it, keeps the opening
+/// and the most-recent activity and elides the middle (see [`elide_middle`]).
+fn render_fork_seed(
+    events: &[agentd_protocol::TimestampedEvent],
+    max_bytes: usize,
+) -> Option<String> {
+    use agentd_protocol::{MessageRole, SessionEvent};
+    let mut lines: Vec<String> = Vec::new();
+    for ev in events {
+        match &ev.event {
+            SessionEvent::Message { role, text } => {
+                let t = text.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let who = match role {
+                    MessageRole::User => "User",
+                    MessageRole::Assistant => "Assistant",
+                    MessageRole::System => "System",
+                    MessageRole::Tool => "Tool",
+                };
+                lines.push(format!("{who}: {t}"));
+            }
+            SessionEvent::ToolUse { tool, .. } => lines.push(format!("[tool: {tool}]")),
+            SessionEvent::ToolResult {
+                tool, ok, output, ..
+            } => {
+                let status = if *ok { "ok" } else { "error" };
+                lines.push(format!(
+                    "[tool result: {tool} ({status})] {}",
+                    truncate_str(output.trim(), 200)
+                ));
+            }
+            // PTY/status/cost/etc. carry no portable conversation content.
+            _ => {}
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let body = lines.join("\n");
+    let body = if max_bytes > 0 && body.len() > max_bytes {
+        elide_middle(&body, max_bytes)
+    } else {
+        body
+    };
+    Some(format!(
+        "[Forked session context. The following is the prior conversation you \
+         are continuing from — treat it as background; do not re-run past tool \
+         calls.]\n\n{body}\n\n[End of forked context.]"
+    ))
+}
+
+/// Keep roughly the first and last halves of `s` within `budget` bytes,
+/// replacing the middle with an elision marker. The opening usually carries
+/// the user's objective, so both ends are preserved. Char-boundary safe.
+fn elide_middle(s: &str, budget: usize) -> String {
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+    let mut head_end = head_budget.min(s.len());
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len().saturating_sub(tail_budget);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if tail_start <= head_end {
+        return s.to_string();
+    }
+    let middle = tail_start - head_end;
+    format!(
+        "{}\n…({middle} chars of earlier context elided)…\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max).collect();
+    format!("{head}…")
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use agentd_protocol::{MessageRole, SessionEvent, TimestampedEvent};
+
+    // Build via serde so the test doesn't need a direct `chrono` dep just to
+    // stamp `at` (render_fork_seed only reads `.event`).
+    fn ev(event: SessionEvent) -> TimestampedEvent {
+        serde_json::from_value(serde_json::json!({
+            "seq": 0,
+            "at": "1970-01-01T00:00:00Z",
+            "event": serde_json::to_value(&event).unwrap(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn seed_renders_messages_and_tools() {
+        let events = vec![
+            ev(SessionEvent::Message {
+                role: MessageRole::User,
+                text: "fix the bug".into(),
+            }),
+            ev(SessionEvent::ToolUse {
+                tool: "edit_file".into(),
+                args: serde_json::json!({}),
+                call_id: None,
+            }),
+            ev(SessionEvent::ToolResult {
+                tool: "edit_file".into(),
+                ok: true,
+                output: "patched".into(),
+                call_id: None,
+            }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "done".into(),
+            }),
+        ];
+        let seed = render_fork_seed(&events, 0).expect("seed");
+        assert!(seed.contains("User: fix the bug"));
+        assert!(seed.contains("[tool: edit_file]"));
+        assert!(seed.contains("[tool result: edit_file (ok)] patched"));
+        assert!(seed.contains("Assistant: done"));
+        assert!(seed.contains("Forked session context"));
+    }
+
+    #[test]
+    fn seed_none_when_nothing_renderable() {
+        let events = vec![
+            ev(SessionEvent::Pty { data: "x".into() }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "   ".into(),
+            }),
+        ];
+        assert!(render_fork_seed(&events, 0).is_none());
+    }
+
+    #[test]
+    fn seed_unlimited_includes_full_history() {
+        let events = vec![
+            ev(SessionEvent::Message {
+                role: MessageRole::User,
+                text: "OBJECTIVE".into(),
+            }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "MIDDLE".into(),
+            }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "RECENT".into(),
+            }),
+        ];
+        // max_bytes = 0 → nothing elided.
+        let seed = render_fork_seed(&events, 0).unwrap();
+        assert!(seed.contains("OBJECTIVE") && seed.contains("MIDDLE") && seed.contains("RECENT"));
+        assert!(!seed.contains("elided"));
+    }
+
+    #[test]
+    fn seed_cap_keeps_objective_and_recent_elides_middle() {
+        let filler = "z".repeat(2000);
+        let events = vec![
+            ev(SessionEvent::Message {
+                role: MessageRole::User,
+                text: "OBJECTIVE_MARKER: build the thing".into(),
+            }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: filler.clone(),
+            }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: filler,
+            }),
+            ev(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "RECENT_MARKER: latest state".into(),
+            }),
+        ];
+        let seed = render_fork_seed(&events, 1000).unwrap();
+        assert!(seed.contains("OBJECTIVE_MARKER"), "opening/objective preserved");
+        assert!(seed.contains("RECENT_MARKER"), "recent tail preserved");
+        assert!(seed.contains("elided"), "middle elided with a marker");
+    }
+
+    #[test]
+    fn default_options_seed_full() {
+        let o = ForkOptions::default();
+        assert!(o.seed);
+        assert_eq!(o.max_seed_bytes, 0, "0 = unlimited / full transcript");
     }
 }

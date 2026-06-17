@@ -86,6 +86,21 @@ pub fn catalog() -> Vec<Value> {
             }),
         ),
         tool(
+            "agentd_fork_session",
+            "Fork an existing session into a NEW sibling session backed by `harness` (which may differ from the source's). The fork inherits the source's working directory and group and runs independently — NOT a child/subagent, and the original session is left untouched (a session's own harness can't be changed in place). Unless `seed:false` (or the target is the `shell` harness), the fork is seeded with a summary of the source transcript so an agent harness can continue the prior context. Use this to continue a conversation under a different harness or model. Returns the new session_id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source_session_id": { "type": "string" },
+                    "harness":           { "type": "string" },
+                    "model":             { "type": "string" },
+                    "prompt":            { "type": "string" },
+                    "seed":              { "type": "boolean" }
+                },
+                "required": ["source_session_id", "harness"]
+            }),
+        ),
+        tool(
             "agentd_send_input",
             "Send a line of text to a session as user input. For PTY sessions a trailing newline is added automatically.",
             schema_obj(&[
@@ -390,6 +405,18 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 group_id: arg_str(&args, "group_id").ok(),
             };
             let sid = client.create(params).await?;
+            json!({ "session_id": sid })
+        }
+        "agentd_fork_session" => {
+            let source = arg_str(&args, "source_session_id")?;
+            let harness = arg_str(&args, "harness")?;
+            let opts = agentd_client::ForkOptions {
+                model: arg_str(&args, "model").ok(),
+                prompt: arg_str(&args, "prompt").ok(),
+                seed: args.get("seed").and_then(|v| v.as_bool()).unwrap_or(true),
+                ..Default::default()
+            };
+            let sid = client.fork_session(&source, &harness, opts).await?;
             json!({ "session_id": sid })
         }
         "agentd_send_input" => {

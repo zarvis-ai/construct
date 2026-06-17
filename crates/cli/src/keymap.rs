@@ -14,6 +14,10 @@ pub enum KeyAction {
     OpenNewSession,
     OpenDeleteConfirm,
     OpenRename,
+    /// Fork the selected session into a new sibling session backed by a
+    /// chosen harness (reuses the harness picker). Bound to `C-x f`
+    /// (emacs) / `f` (vim) — distinct from "new session" (`C-x C-f` / `n`).
+    OpenFork,
     /// Zoom: the session view fills the screen (list / pin strip / modeline
     /// all hidden; only the minibuffer stays). Toggling again restores the
     /// default layout. Bound to `C-x z` (emacs) / `z` (vim), matching
@@ -222,6 +226,9 @@ fn emacs() -> Keymap {
         // Refresh moved to the command palette (M-x refresh) — it's rarely
         // needed since the daemon pushes state changes automatically.
         (Chord(vec![ctrl('x'), ch('r')]), OpenRename),
+        // `C-x f` forks the selected session into a new harness (distinct
+        // from `C-x C-f`, which creates a fresh session).
+        (Chord(vec![ctrl('x'), ch('f')]), OpenFork),
         // Pin / unpin selected session (or all members of a selected group)
         (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
         (Chord(vec![ch(' ')]), TogglePin),
@@ -277,6 +284,7 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('c')]), Interrupt),
         // `r` opens the rename minibuffer; refresh moved to M-x refresh.
         (Chord(vec![ch('r')]), OpenRename),
+        (Chord(vec![ch('f')]), OpenFork),
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch('z')]), ToggleZoom),
         (Chord(vec![ch(' ')]), TogglePin),

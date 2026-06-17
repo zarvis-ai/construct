@@ -950,16 +950,20 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
 /// `app.layout.minibuffer_harness_hits` so the click handler can
 /// submit the picked name without the user having to type it.
 fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuffer) {
-    // Show every registered harness plus the synthetic `project` op.
+    // Show every registered harness. For a new session we also surface the
+    // synthetic `project` op; forking targets a real harness only.
     // Unavailable harnesses (binary not on PATH) render dimmed and
     // strike-through; clicking them no-ops + drops a status note;
     // hover surfaces a "not installed" tooltip.
+    let is_fork = matches!(mb.intent, MinibufferIntent::ForkSessionHarness { .. });
     let mut entries: Vec<(String, bool)> = app
         .harnesses
         .iter()
         .map(|h| (h.name.clone(), h.available))
         .collect();
-    entries.push(("project".to_string(), true));
+    if !is_fork {
+        entries.push(("project".to_string(), true));
+    }
 
     let (hovered_x, hovered_y) = app.mouse_pos.unwrap_or((u16::MAX, u16::MAX));
     let base_available = Style::default()
@@ -983,7 +987,7 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
         spans.push(Span::raw(s.to_string()));
     };
 
-    push_raw(&mut spans, &mut col, "New [");
+    push_raw(&mut spans, &mut col, if is_fork { "Fork → [" } else { "New [" });
     for (i, (name, available)) in entries.iter().enumerate() {
         if i > 0 {
             push_raw(&mut spans, &mut col, "|");
@@ -5674,7 +5678,10 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         // Harness picker: render `[name1|name2|...|group]` with each
         // name as its own clickable span, recording column ranges
         // for the click handler. Hover bolds + underlines.
-        if matches!(mb.intent, MinibufferIntent::NewSessionHarness) {
+        if matches!(
+            mb.intent,
+            MinibufferIntent::NewSessionHarness | MinibufferIntent::ForkSessionHarness { .. }
+        ) {
             let mb_clone = mb.clone();
             render_harness_picker(f, area, app, &mb_clone);
             return;
@@ -5849,6 +5856,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x k           delete selected session (confirms; kills if running)
     C-x d           show diff
     C-x r           rename selected session (clears title on empty submit)
+    C-x f           fork selected session into a new harness (seeded w/ history)
     C-c C-c         interrupt
 
   scrollback
@@ -5871,7 +5879,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
-                    palette commands: new send delete rename diff border
+                    palette commands: new fork send delete rename diff border
                                       zoom interrupt refresh harnesses help
     ?               toggle this help
     C-x C-c          quit

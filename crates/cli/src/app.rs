@@ -352,6 +352,12 @@ pub enum MinibufferIntent {
         session_id: String,
     },
     NewSessionHarness,
+    /// Harness picker for forking the selected session into a new sibling
+    /// (`OpenFork`). Shares the harness-picker UI/completion with
+    /// `NewSessionHarness`; on submit, calls `client.fork_session`.
+    ForkSessionHarness {
+        source_session_id: String,
+    },
     /// Second stage of the new-session wizard when the user typed `group`:
     /// asks for the group's name.
     NewGroupName,
@@ -5105,7 +5111,10 @@ impl App {
             // names are visually disabled (strikethrough); clicks
             // on them drop a status note rather than submitting —
             // the hover tooltip explains why.
-            if matches!(mb.intent, MinibufferIntent::NewSessionHarness) {
+            if matches!(
+                mb.intent,
+                MinibufferIntent::NewSessionHarness | MinibufferIntent::ForkSessionHarness { .. }
+            ) {
                 let hits = self.layout.minibuffer_harness_hits.clone();
                 for hit in hits {
                     if hit.y == mb_area.y && col >= hit.x_start && col < hit.x_end {
@@ -6103,6 +6112,31 @@ impl App {
                     error: None,
                 });
             }
+            OpenFork => {
+                let Some(id) = self.selected_id() else {
+                    self.set_status("fork: no session selected".to_string());
+                    return;
+                };
+                if self.harnesses.is_empty() {
+                    self.harnesses = self.client.harnesses().await.unwrap_or_default();
+                }
+                let names: Vec<&str> = self
+                    .harnesses
+                    .iter()
+                    .filter(|h| h.available)
+                    .map(|h| h.name.as_str())
+                    .collect();
+                let hint = names.join("|");
+                self.minibuffer = Some(Minibuffer {
+                    prompt: format!("Fork → [{hint}] (Tab completes): "),
+                    input: String::new(),
+                    cursor: 0,
+                    intent: MinibufferIntent::ForkSessionHarness {
+                        source_session_id: id,
+                    },
+                    error: None,
+                });
+            }
             OpenRename => match self.selection.clone() {
                 Selection::Session(id) => {
                     let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
@@ -6499,6 +6533,13 @@ impl App {
             self.minibuffer.as_ref().map(|m| &m.intent),
             Some(MinibufferIntent::NewSessionHarness)
         );
+        let is_fork_harness = matches!(
+            self.minibuffer.as_ref().map(|m| &m.intent),
+            Some(MinibufferIntent::ForkSessionHarness { .. })
+        );
+        // Fork shares the new-session harness picker (completion + Enter
+        // validation), but offers only real harnesses — no `project`/`group`.
+        let is_harness_picker = is_new_harness || is_fork_harness;
         let is_switch_session = matches!(
             self.minibuffer.as_ref().map(|m| &m.intent),
             Some(MinibufferIntent::SwitchSession)
@@ -6518,6 +6559,12 @@ impl App {
             v.push("project".to_string());
             v.push("group".to_string());
             v
+        } else if is_fork_harness {
+            self.harnesses
+                .iter()
+                .filter(|h| h.available)
+                .map(|h| h.name.clone())
+                .collect()
         } else {
             Vec::new()
         };
@@ -6629,7 +6676,7 @@ impl App {
                 return;
             }
             KeyCode::Tab => {
-                if is_new_harness {
+                if is_harness_picker {
                     apply_harness_completion(mb, &available_harnesses);
                 } else if matches!(mb.intent, MinibufferIntent::SwitchSession) {
                     let input = mb.input.clone();
@@ -6645,7 +6692,7 @@ impl App {
                 return;
             }
             KeyCode::Enter => {
-                if is_new_harness {
+                if is_harness_picker {
                     let trimmed = mb.input.trim().to_string();
                     if trimmed.is_empty() {
                         mb.error = Some("pick a harness".to_string());
@@ -6817,6 +6864,43 @@ impl App {
                         self.focus = PaneFocus::View;
                     }
                     Err(e) => self.set_status(format!("create failed: {e}")),
+                }
+            }
+            MinibufferIntent::ForkSessionHarness { source_session_id } => {
+                let harness = input.trim().to_string();
+                if harness.is_empty() {
+                    return;
+                }
+                // Default options: seed the fork with the full source
+                // transcript (skipped for `shell` inside the client).
+                match self
+                    .client
+                    .fork_session(
+                        &source_session_id,
+                        &harness,
+                        agentd_client::ForkOptions::default(),
+                    )
+                    .await
+                {
+                    Ok(id) => {
+                        self.set_status(format!(
+                            "forked {} → {} ({harness})",
+                            short_id(&source_session_id),
+                            short_id(&id),
+                        ));
+                        self.refresh_sessions().await;
+                        // Mirror the new-session path: pre-insert an empty PTY
+                        // parser so the transcript bootstrap short-circuits and
+                        // the live subscription isn't raced into a double banner.
+                        if !self.histories.contains_key(&id) {
+                            self.histories
+                                .insert(id.clone(), crate::pty_render::ItemHistory::new());
+                        }
+                        self.select_session(id);
+                        self.sync_active_window_selection();
+                        self.focus = PaneFocus::View;
+                    }
+                    Err(e) => self.set_status(format!("fork failed: {e}")),
                 }
             }
             MinibufferIntent::GroupDeleteConfirm { group_id } => {
@@ -7003,6 +7087,7 @@ impl App {
             "send" | "send-input" => self.run_action(KeyAction::OpenSendInput).await,
             "delete" | "kill" | "rm" => self.run_action(KeyAction::OpenDeleteConfirm).await,
             "rename" => self.run_action(KeyAction::OpenRename).await,
+            "fork" => self.run_action(KeyAction::OpenFork).await,
             "zoom" | "fullscreen" => self.run_action(KeyAction::ToggleZoom).await,
             "rain" | "matrix" | "matrix-rain" => {
                 self.matrix_rain_hidden = !self.matrix_rain_hidden;
