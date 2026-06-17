@@ -4957,18 +4957,21 @@ impl App {
     }
 
     async fn click_list(&mut self, list: ratatui::layout::Rect, col: u16, row: u16) {
-        // Matrix-rain title controls are part of the Operator surface, not a
-        // request to focus the session list. Handle them before the generic
-        // list-pane focus path, otherwise clicking `operator` while the panel
-        // is open would collapse it and then immediately re-open it.
-        if !self.matrix_rain_hidden {
-            if let Some(rain) = self.layout.matrix_rain_area {
-                if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
-                    if row == y && col >= xs && col < xe {
-                        self.matrix_rain_hidden = true;
-                        self.set_status("matrix rain hidden — M-x rain to show".into());
-                        return;
-                    }
+        // Matrix-rain title-bar controls are part of the Operator surface, not a
+        // request to focus the session list. The title bar stays visible even
+        // when the panel is collapsed (only the bar shows), so handle its
+        // controls regardless of collapsed state, before the generic focus path.
+        if let Some(rain) = self.layout.matrix_rain_area {
+            if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
+                if row == y && col >= xs && col < xe {
+                    self.matrix_rain_hidden = !self.matrix_rain_hidden;
+                    let status = if self.matrix_rain_hidden {
+                        "matrix rain collapsed"
+                    } else {
+                        "matrix rain expanded"
+                    };
+                    self.set_status(status.into());
+                    return;
                 }
             }
             if let Some(hit) = self
@@ -5022,37 +5025,6 @@ impl App {
                     // frame (effective_collapsed = list_collapsed
                     // && focus != List).
                     self.focus = PaneFocus::View;
-                    return;
-                }
-            }
-        }
-        if !self.matrix_rain_hidden {
-            if let Some(rain) = self.layout.matrix_rain_area {
-                if let Some((xs, xe, y)) = crate::ui::matrix_rain_close_button_range(rain) {
-                    if row == y && col >= xs && col < xe {
-                        self.matrix_rain_hidden = true;
-                        self.set_status("matrix rain hidden — M-x rain to show".into());
-                        return;
-                    }
-                }
-            }
-            if let Some(hit) = self
-                .layout
-                .matrix_widget_hits
-                .iter()
-                .find(|hit| hit.contains(col, row))
-                .cloned()
-            {
-                match hit.kind {
-                    MatrixWidgetHitKind::Select { panel_id } => {
-                        self.toggle_matrix_widget_panel(panel_id)
-                    }
-                }
-                return;
-            }
-            if let Some((xs, xe, y)) = self.layout.matrix_operator_title_hit {
-                if row == y && col >= xs && col < xe {
-                    self.toggle_orchestrator_panel();
                     return;
                 }
             }
@@ -6821,9 +6793,9 @@ impl App {
                 self.set_status(format!(
                     "matrix rain {}",
                     if self.matrix_rain_hidden {
-                        "hidden"
+                        "collapsed"
                     } else {
-                        "shown"
+                        "expanded"
                     }
                 ));
             }
@@ -9406,6 +9378,57 @@ mod tests {
             !text.contains("2/3"),
             "widget viewport title should not include widget count"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn collapsed_matrix_rain_shows_title_bar_with_expand_button() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut app, _dir, server) = captured_app().await;
+        app.matrix_rain_hidden = true; // collapsed → only the title bar shows
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("collapsed rain title bar should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("operator"),
+            "collapsed panel should keep its title bar: {text:?}"
+        );
+
+        let rain = app
+            .layout
+            .matrix_rain_area
+            .expect("collapsed rain title bar area");
+        assert_eq!(
+            rain.height, 1,
+            "collapsed panel should be a 1-row title bar"
+        );
+
+        let (x_start, _x_end, y) =
+            crate::ui::matrix_rain_close_button_range(rain).expect("expand button hitbox");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            !app.matrix_rain_hidden,
+            "clicking + on the collapsed title bar should expand the panel"
+        );
+
         server.abort();
     }
 

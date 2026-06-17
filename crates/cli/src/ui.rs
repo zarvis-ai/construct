@@ -521,9 +521,11 @@ pub fn list_collapse_button_range(list_area: Rect) -> Option<(u16, u16, u16)> {
     Some((x_start, x_end, list_area.y))
 }
 
-/// Hit zone for the Matrix-rain panel close button.
+/// Hit zone for the Matrix-rain panel's collapse/expand toggle button (the
+/// `−` / `+` glyph at the right edge of the panel title bar). Only one row is
+/// needed because the title bar survives even when the panel is collapsed.
 pub fn matrix_rain_close_button_range(rain_area: Rect) -> Option<(u16, u16, u16)> {
-    if rain_area.width < 8 || rain_area.height < 4 {
+    if rain_area.width < 8 || rain_area.height < 1 {
         return None;
     }
     let x_start = rain_area.x + rain_area.width.saturating_sub(4);
@@ -670,18 +672,15 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
             return;
         }
     }
-    if !app.matrix_rain_hidden {
-        if let Some(rain) = app.layout.matrix_rain_area {
-            if let Some((xs, xe, y)) = matrix_rain_close_button_range(rain) {
-                if my == y && mx >= xs && mx < xe {
-                    render_button_tooltip(
-                        f,
-                        &app.theme,
-                        " Hide Operator ",
-                        xs,
-                        y.saturating_add(2),
-                    );
-                }
+    if let Some(rain) = app.layout.matrix_rain_area {
+        if let Some((xs, xe, y)) = matrix_rain_close_button_range(rain) {
+            if my == y && mx >= xs && mx < xe {
+                let (label, anchor_y) = if app.matrix_rain_hidden {
+                    (" Expand Operator ", y)
+                } else {
+                    (" Collapse Operator ", y.saturating_add(2))
+                };
+                render_button_tooltip(f, &app.theme, label, xs, anchor_y);
             }
         }
     }
@@ -1405,10 +1404,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
 /// The matrix panel is "sticky": it always claims its preferred
 /// height at the bottom whenever there is room. The list shrinks to
 /// the remaining rows and scrolls when items overflow. Below
-/// `SESSION_LIST_H_MIN + MATRIX_RAIN_H_MIN` of total inner height
-/// (or when the user hid the rain), the list takes the entire pane
-/// and the rain area is reported as zero-height — i.e., the rain
-/// effectively goes "out of view" when the terminal is too short.
+/// `SESSION_LIST_H_MIN + MATRIX_RAIN_H_MIN` of total inner height the
+/// list takes the entire pane and the rain area is reported as
+/// zero-height — i.e., the rain effectively goes "out of view" when
+/// the terminal is too short. When the user collapses the rain, only
+/// its 1-row title bar stays pinned at the bottom of the list pane.
 fn split_list_pane(
     inner: Rect,
     matrix_rain_hidden: bool,
@@ -1420,8 +1420,27 @@ fn split_list_pane(
         width: inner.width,
         height: 0,
     };
+    // Collapsed: the rain panel shrinks to just its 1-row title bar, pinned at
+    // the bottom of the list pane, as long as the list keeps its minimum height
+    // above it. When the pane is too short the rain goes fully out of view.
     if matrix_rain_hidden {
-        return (inner, empty_matrix);
+        if inner.height <= crate::app::SESSION_LIST_H_MIN {
+            return (inner, empty_matrix);
+        }
+        let list_h = inner.height.saturating_sub(1);
+        let list = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: list_h,
+        };
+        let matrix = Rect {
+            x: inner.x,
+            y: inner.y.saturating_add(list_h),
+            width: inner.width,
+            height: 1,
+        };
+        return (list, matrix);
     }
     let max_matrix_h = inner.height.saturating_sub(crate::app::SESSION_LIST_H_MIN);
     if max_matrix_h < crate::app::MATRIX_RAIN_H_MIN {
@@ -1453,15 +1472,21 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
     // paths below — otherwise a hidden/too-small panel would leave stale
     // hits from a prior frame clickable.
     app.matrix_reveal_hits.clear();
-    if app.matrix_rain_hidden {
-        return;
-    }
-    if rain_area.width < 8 || rain_area.height < 4 {
+    // One row is enough for the title bar; below that the panel is fully out of
+    // view. A collapsed panel keeps the title bar and skips the animated body.
+    if rain_area.width < 8 || rain_area.height < 1 {
         return;
     }
     app.layout.matrix_rain_area = Some(rain_area);
     let now = Instant::now();
     render_matrix_rain_header(f, rain_area, app, now);
+    if app.matrix_rain_hidden {
+        // Collapsed: only the title bar shows; skip the animated body.
+        return;
+    }
+    if rain_area.height < 4 {
+        return;
+    }
     let rain_area = Rect {
         x: rain_area.x,
         y: rain_area.y + 1,
@@ -2133,8 +2158,24 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
         icon_x = icon_x.saturating_add(w + 1);
     }
 
-    let x = area.x + area.width.saturating_sub(3);
-    f.buffer_mut().set_string(x, area.y, " x ", close_style);
+    let toggle_glyph = if app.matrix_rain_hidden {
+        " + "
+    } else {
+        " − "
+    };
+    let toggle_x = area.x + area.width.saturating_sub(3);
+    let toggle_hovered = app
+        .mouse_pos
+        .is_some_and(|(mx, my)| my == area.y && mx >= toggle_x && mx < toggle_x.saturating_add(3));
+    let toggle_style = if toggle_hovered {
+        Style::default()
+            .fg(app.theme.matrix_flash_good)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        close_style
+    };
+    f.buffer_mut()
+        .set_string(toggle_x, area.y, toggle_glyph, toggle_style);
 }
 
 fn update_matrix_rain_intensity(app: &mut App, now: Instant) -> f32 {
@@ -7721,8 +7762,23 @@ mod tests {
     }
 
     #[test]
-    fn split_list_pane_skips_matrix_when_hidden() {
+    fn split_list_pane_keeps_title_bar_when_collapsed() {
+        // Collapsed: the rain panel shrinks to just its 1-row title bar,
+        // pinned at the bottom of the list pane, while the list keeps the rest.
         let inner = Rect::new(0, 0, 20, 30);
+        let (list, matrix) = split_list_pane(inner, true, None);
+        assert_eq!(list.height, inner.height - 1);
+        assert_eq!(matrix.height, 1);
+        assert_eq!(matrix.y, list.y + list.height);
+        assert_eq!(list.x, inner.x);
+        assert_eq!(matrix.x, inner.x);
+    }
+
+    #[test]
+    fn split_list_pane_drops_collapsed_title_bar_when_pane_too_short() {
+        // When the pane can't keep the list's minimum height above the title
+        // bar, the rain goes fully out of view and the list takes everything.
+        let inner = Rect::new(0, 0, 20, crate::app::SESSION_LIST_H_MIN);
         let (list, matrix) = split_list_pane(inner, true, None);
         assert_eq!(list, inner);
         assert_eq!(matrix.height, 0);
