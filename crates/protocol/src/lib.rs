@@ -746,6 +746,10 @@ pub mod ipc_method {
     pub const SESSION_STOP: &str = "session.stop";
     pub const SESSION_KILL: &str = "session.kill";
     pub const SESSION_DELETE: &str = "session.delete";
+    /// Terminate a session's adapter and mark it archived: it keeps its
+    /// transcript/worktree but is hidden from the list by default and is
+    /// not auto-resumed on daemon startup. Reversed by `SESSION_RESTART`.
+    pub const SESSION_ARCHIVE: &str = "session.archive";
     pub const SESSION_WIDGET_DELETE: &str = "session.widget.delete";
     /// Respawn a session's adapter — typically used to bring a `Done`
     /// session back to life so the user can continue typing. The
@@ -939,6 +943,12 @@ pub struct SessionSummary {
     /// across restarts.
     #[serde(default)]
     pub kind: SessionKind,
+    /// Archived sessions have had their adapter terminated and are hidden
+    /// from the session list by default, but keep their transcript/worktree
+    /// and can be restarted. Persisted in `meta.json`; cleared on restart.
+    /// The daemon does not auto-resume archived sessions on startup.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

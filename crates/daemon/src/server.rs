@@ -1149,6 +1149,13 @@ async fn dispatch(
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
+        m if m == ipc_method::SESSION_ARCHIVE => {
+            let p = params!(SessionIdParams);
+            match manager.archive(&p.session_id).await {
+                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
         m if m == ipc_method::SESSION_WIDGET_DELETE => {
             let p = params!(agentd_protocol::SessionWidgetDeleteParams);
             match manager.delete_widget(p).await {

@@ -1274,6 +1274,15 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let name_display_w = name_display.chars().count();
                     let gap = row_w.saturating_sub(prefix_w + name_display_w + harness_w);
                     let gap_str: String = " ".repeat(gap);
+                    // Archived sessions read as muted — they're terminated and
+                    // only visible because the "show archived" toggle is on.
+                    let name_style = if s.archived {
+                        Style::default()
+                            .fg(app.theme.dim)
+                            .add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(app.theme.text)
+                    };
                     let mut spans = vec![Span::raw(indent_prefix.to_string())];
                     if let Some(expand_glyph) = expand_glyph {
                         spans.push(Span::styled(
@@ -1287,7 +1296,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                             format!(" {} ", session_status_glyph(app, s)),
                             state_style(&app.theme, s.state),
                         ),
-                        Span::styled(name_display, Style::default().fg(app.theme.text)),
+                        Span::styled(name_display, name_style),
                         Span::raw(gap_str),
                         Span::styled(harness, harness_style(&app.theme)),
                     ]);
@@ -1307,6 +1316,24 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                             Style::default().fg(app.theme.dim),
                         ),
                     ]))
+                }
+                AppListItem::ArchivedRow {
+                    count,
+                    expanded,
+                    indented,
+                    ..
+                } => {
+                    // Expandable footer: "▸ N archived" (collapsed) /
+                    // "▾ N archived" (open). Indented to sit under a project's
+                    // members; flush-left for the ungrouped section.
+                    let disclosure = if *expanded { "▾" } else { "▸" };
+                    let indent = if *indented { "  " } else { "" };
+                    ListItem::new(Line::from(Span::styled(
+                        format!("{indent}{disclosure} {count} archived"),
+                        Style::default()
+                            .fg(app.theme.dim)
+                            .add_modifier(Modifier::DIM),
+                    )))
                 }
             }
         })

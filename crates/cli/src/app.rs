@@ -62,6 +62,24 @@ pub enum ListItem {
         group: GroupSummary,
         member_count: usize,
     },
+    /// Expandable "▸ N archived" / "▾ N archived" row that ends a section
+    /// (the ungrouped top-level run or a project) when that section has
+    /// archived sessions. Clicking it reveals/hides that section's archived
+    /// sessions; it is not itself a selectable target.
+    ArchivedRow {
+        section: ArchiveSection,
+        count: usize,
+        expanded: bool,
+        indented: bool,
+    },
+}
+
+/// A region of the session list whose archived sessions can be revealed
+/// independently: the ungrouped top-level run, or a specific project.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ArchiveSection {
+    Ungrouped,
+    Group(String),
 }
 
 fn is_user_list_session(s: &SessionSummary) -> bool {
@@ -730,6 +748,14 @@ pub struct App {
     /// User-hidden Matrix-rain panel. Toggle with `/rain`; close with the
     /// panel's `x` button.
     pub matrix_rain_hidden: bool,
+    /// Whether the ungrouped top-level section's archived sessions are
+    /// revealed. Toggled by its "N archived" row. Ephemeral — archived
+    /// sessions default to hidden on each launch.
+    pub show_archived_ungrouped: bool,
+    /// Project ids whose archived sessions are currently revealed, toggled by
+    /// each project's "N archived" row. Ephemeral, like
+    /// [`Self::show_archived_ungrouped`].
+    pub show_archived_groups: HashSet<String>,
     /// Hide left, right, and bottom border lines for list/view/pin panes.
     pub hide_pane_side_borders: bool,
     /// Last rendered frame, one string per terminal row. Mouse drag
@@ -1697,6 +1723,8 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         matrix_widget_pinned: None,
         matrix_widget_hover: None,
         matrix_rain_hidden: persisted.matrix_rain_hidden,
+        show_archived_ungrouped: false,
+        show_archived_groups: HashSet::new(),
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
         text_selection: None,
@@ -2681,8 +2709,26 @@ impl App {
                 .cmp(&b.position)
                 .then_with(|| b.created_at.cmp(&a.created_at))
         });
-        for s in ungrouped {
+        // Active sessions render directly; archived ones sit behind an
+        // expandable "N archived" row that ends the section.
+        let (ungrouped_active, ungrouped_archived): (Vec<&SessionSummary>, Vec<&SessionSummary>) =
+            ungrouped.into_iter().partition(|s| !s.archived);
+        for s in ungrouped_active {
             push_session(&mut out, s, false);
+        }
+        if !ungrouped_archived.is_empty() {
+            let expanded = self.show_archived_ungrouped;
+            out.push(ListItem::ArchivedRow {
+                section: ArchiveSection::Ungrouped,
+                count: ungrouped_archived.len(),
+                expanded,
+                indented: false,
+            });
+            if expanded {
+                for s in ungrouped_archived {
+                    push_session(&mut out, s, false);
+                }
+            }
         }
 
         let mut groups: Vec<&GroupSummary> = self.groups.iter().collect();
@@ -2695,17 +2741,78 @@ impl App {
                 .filter(|s| is_user_list_session(s))
                 .collect();
             members.sort_by_key(|s| s.position);
+            let (active, archived): (Vec<&SessionSummary>, Vec<&SessionSummary>) =
+                members.into_iter().partition(|s| !s.archived);
             out.push(ListItem::GroupHeader {
                 group: g.clone(),
-                member_count: members.len(),
+                member_count: active.len(),
             });
             if !g.collapsed {
-                for s in members {
+                for s in active {
                     push_session(&mut out, s, true);
+                }
+                if !archived.is_empty() {
+                    let expanded = self.show_archived_groups.contains(&g.id);
+                    out.push(ListItem::ArchivedRow {
+                        section: ArchiveSection::Group(g.id.clone()),
+                        count: archived.len(),
+                        expanded,
+                        indented: true,
+                    });
+                    if expanded {
+                        for s in archived {
+                            push_session(&mut out, s, true);
+                        }
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Toggle whether a section's archived sessions are revealed — the click
+    /// target of an "N archived" row.
+    pub fn toggle_archive_section(&mut self, section: &ArchiveSection) {
+        let revealed = match section {
+            ArchiveSection::Ungrouped => {
+                self.show_archived_ungrouped = !self.show_archived_ungrouped;
+                self.show_archived_ungrouped
+            }
+            ArchiveSection::Group(id) => {
+                if self.show_archived_groups.remove(id) {
+                    false
+                } else {
+                    self.show_archived_groups.insert(id.clone());
+                    true
+                }
+            }
+        };
+        self.set_status(
+            if revealed {
+                "showing archived sessions"
+            } else {
+                "hiding archived sessions"
+            }
+            .to_string(),
+        );
+    }
+
+    /// `/archived` keyboard entry point: reveal/hide archived sessions for the
+    /// section the current selection lives in — the selected project, the
+    /// selected session's project, or the ungrouped section.
+    pub fn toggle_archived_for_selection(&mut self) {
+        let section = match &self.selection {
+            Selection::Group(id) => ArchiveSection::Group(id.clone()),
+            Selection::Session(id) => self
+                .sessions
+                .iter()
+                .find(|s| s.id == *id)
+                .and_then(|s| s.group_id.clone())
+                .map(ArchiveSection::Group)
+                .unwrap_or(ArchiveSection::Ungrouped),
+            Selection::None => ArchiveSection::Ungrouped,
+        };
+        self.toggle_archive_section(&section);
     }
 
     /// Find the index of the currently-selected item in the materialized
@@ -3287,18 +3394,25 @@ impl App {
     /// wrapping at the ends. No-op if the list is empty.
     async fn step_selection(&mut self, delta: i32) {
         let items = self.list_items();
-        if items.is_empty() {
+        // Only Session / GroupHeader rows are selectable; "N archived" rows are
+        // click-only and skipped by keyboard navigation.
+        let selectable: Vec<&ListItem> = items
+            .iter()
+            .filter(|it| matches!(it, ListItem::Session { .. } | ListItem::GroupHeader { .. }))
+            .collect();
+        if selectable.is_empty() {
             return;
         }
-        let cur = items
+        let cur = selectable
             .iter()
             .position(|it| it.matches(&self.selection))
             .unwrap_or(0);
-        let n = items.len() as i32;
+        let n = selectable.len() as i32;
         let next = ((cur as i32 + delta).rem_euclid(n)) as usize;
-        match &items[next] {
+        match selectable[next] {
             ListItem::Session { summary, .. } => self.select_session(summary.id.clone()),
             ListItem::GroupHeader { group, .. } => self.select_group(group.id.clone()),
+            ListItem::ArchivedRow { .. } => {}
         }
         self.sync_active_window_selection();
     }
@@ -3310,11 +3424,14 @@ impl App {
         if items.iter().any(|it| it.matches(&self.selection)) {
             return;
         }
-        self.selection = match items.first() {
-            Some(ListItem::Session { summary, .. }) => Selection::Session(summary.id.clone()),
-            Some(ListItem::GroupHeader { group, .. }) => Selection::Group(group.id.clone()),
-            None => Selection::None,
-        };
+        self.selection = items
+            .iter()
+            .find_map(|it| match it {
+                ListItem::Session { summary, .. } => Some(Selection::Session(summary.id.clone())),
+                ListItem::GroupHeader { group, .. } => Some(Selection::Group(group.id.clone())),
+                ListItem::ArchivedRow { .. } => None,
+            })
+            .unwrap_or(Selection::None);
     }
 
     async fn on_notification(&mut self, n: agentd_protocol::Notification) {
@@ -5168,6 +5285,10 @@ impl App {
                     self.set_status(format!("collapse failed: {e}"));
                 }
             }
+            ListItem::ArchivedRow { section, .. } => {
+                let section = section.clone();
+                self.toggle_archive_section(&section);
+            }
         }
     }
 
@@ -6012,7 +6133,7 @@ impl App {
                 Selection::Session(id) => {
                     self.minibuffer = Some(Minibuffer {
                         prompt: format!(
-                            "Delete {} (kill if running, drop transcript + worktree)? (y/N): ",
+                            "Session {}: [d] delete (drop transcript + worktree) / [a] archive (terminate, keep, hide) / [N] cancel: ",
                             short_id(&id)
                         ),
                         input: String::new(),
@@ -6768,14 +6889,18 @@ impl App {
                 }
             }
             MinibufferIntent::DeleteConfirm { session_id } => {
-                let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
-                if !yes {
-                    self.set_status("delete cancelled".to_string());
-                    return;
-                }
-                match self.client.delete(&session_id).await {
-                    Ok(()) => self.set_status(format!("deleted {}", short_id(&session_id))),
-                    Err(e) => self.set_status(format!("delete failed: {e}")),
+                match parse_session_end_choice(&input) {
+                    SessionEndChoice::Delete => match self.client.delete(&session_id).await {
+                        Ok(()) => self.set_status(format!("deleted {}", short_id(&session_id))),
+                        Err(e) => self.set_status(format!("delete failed: {e}")),
+                    },
+                    SessionEndChoice::Archive => match self.client.archive(&session_id).await {
+                        Ok(()) => self.set_status(format!("archived {}", short_id(&session_id))),
+                        Err(e) => self.set_status(format!("archive failed: {e}")),
+                    },
+                    SessionEndChoice::Cancel => {
+                        self.set_status("cancelled".to_string());
+                    }
                 }
             }
             MinibufferIntent::RestartConfirm { session_id } => {
@@ -6884,6 +7009,9 @@ impl App {
                         "expanded"
                     }
                 ));
+            }
+            "archived" | "archive" | "archives" => {
+                self.toggle_archived_for_selection();
             }
             "border" => {
                 self.hide_pane_side_borders = !self.hide_pane_side_borders;
@@ -7903,6 +8031,8 @@ mod tests {
             matrix_widget_pinned: None,
             matrix_widget_hover: None,
             matrix_rain_hidden: false,
+            show_archived_ungrouped: false,
+            show_archived_groups: HashSet::new(),
             hide_pane_side_borders: true,
             frame_text: Vec::new(),
             text_selection: None,
@@ -7949,6 +8079,7 @@ mod tests {
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
+            archived: false,
         }
     }
 
@@ -9940,6 +10071,72 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn list_items_hides_archived_behind_expandable_row() {
+        use agentd_client::Client;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let _server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut active = summary_with_kind(agentd_protocol::SessionKind::User);
+        active.id = "active".into();
+        active.position = 0;
+        let mut archived = summary_with_kind(agentd_protocol::SessionKind::User);
+        archived.id = "archived".into();
+        archived.position = 1;
+        archived.archived = true;
+
+        let mut app = test_app(client, vec![active, archived]);
+
+        // Collapsed by default: the active session plus a "1 archived" row.
+        let items = app.list_items();
+        assert_eq!(items.len(), 2);
+        assert!(
+            matches!(&items[0], ListItem::Session { summary, .. } if summary.id == "active"),
+            "active session should render directly",
+        );
+        match &items[1] {
+            ListItem::ArchivedRow {
+                section,
+                count,
+                expanded,
+                ..
+            } => {
+                assert_eq!(*section, ArchiveSection::Ungrouped);
+                assert_eq!(*count, 1);
+                assert!(!*expanded, "archived row starts collapsed");
+            }
+            other => panic!("expected an archived row, got {other:?}"),
+        }
+
+        // Reveal: active session, the open row, then the archived session.
+        app.toggle_archive_section(&ArchiveSection::Ungrouped);
+        let items = app.list_items();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[1],
+            ListItem::ArchivedRow { expanded: true, .. }
+        ));
+        assert!(
+            matches!(&items[2], ListItem::Session { summary, .. } if summary.id == "archived"),
+            "revealed archived session should follow its row",
+        );
+
+        // Toggle back off: collapsed again.
+        app.toggle_archive_section(&ArchiveSection::Ungrouped);
+        assert_eq!(app.list_items().len(), 2);
+    }
+
     #[test]
     fn list_session_indent_policy_distinguishes_subagents_and_grouped_parents() {
         let user = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -11605,6 +11802,28 @@ pub fn parse_group_delete_choice(input: &str) -> GroupDeleteChoice {
     }
 }
 
+/// Outcome of the session kill prompt (`C-x k` / the view `x` button).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndChoice {
+    /// `d` / `delete` — drop the transcript, worktree, and all on-disk state.
+    Delete,
+    /// `a` / `archive` — terminate the adapter but keep the session; it's
+    /// hidden from the list until the "show archived" toggle is on, and can be
+    /// restarted later.
+    Archive,
+    /// Anything else (including `y`, `n`, empty Enter) — do nothing.
+    Cancel,
+}
+
+pub fn parse_session_end_choice(input: &str) -> SessionEndChoice {
+    match input.trim().to_lowercase().as_str() {
+        "d" | "delete" => SessionEndChoice::Delete,
+        "a" | "archive" => SessionEndChoice::Archive,
+        // No `y` alias: delete is destructive, so require an explicit `d`.
+        _ => SessionEndChoice::Cancel,
+    }
+}
+
 #[cfg(test)]
 mod group_delete_prompt_tests {
     use super::{parse_group_delete_choice, GroupDeleteChoice};
@@ -11660,6 +11879,46 @@ mod group_delete_prompt_tests {
             assert_eq!(
                 parse_group_delete_choice(s),
                 GroupDeleteChoice::Cancel,
+                "input {s:?} should cancel",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod session_end_prompt_tests {
+    use super::{parse_session_end_choice, SessionEndChoice};
+
+    #[test]
+    fn d_or_delete_deletes() {
+        for s in ["d", "D", "  d  ", "delete", "DELETE", " Delete "] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::Delete,
+                "input {s:?} should delete",
+            );
+        }
+    }
+
+    #[test]
+    fn a_or_archive_archives() {
+        for s in ["a", "A", "  a  ", "archive", "ARCHIVE", " Archive "] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::Archive,
+                "input {s:?} should archive",
+            );
+        }
+    }
+
+    /// `y`/`yes` no longer mean delete — the destructive action requires an
+    /// explicit `d`, so a reflexive `y` cancels rather than deletes.
+    #[test]
+    fn y_and_anything_else_cancels() {
+        for s in ["", " ", "y", "Y", "yes", "n", "N", "no", "x", "1"] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::Cancel,
                 "input {s:?} should cancel",
             );
         }
