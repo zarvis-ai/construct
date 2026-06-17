@@ -30,6 +30,11 @@ use tokio::sync::mpsc;
 
 pub const TERMINAL_SCROLLBAR_TTL: Duration = Duration::from_millis(1200);
 pub(crate) const DYNAMIC_UI_AUTOHIDE_SECS: u64 = 15;
+/// How long a hover-revealed widget lingers after the cursor leaves its title
+/// square (and the widget body). Short and responsive, just enough for the
+/// pointer to travel from the square down onto the widget without it vanishing —
+/// distinct from the 15s create/update auto-reveal above.
+pub(crate) const DYNAMIC_UI_HOVER_GRACE_MS: u64 = 1000;
 
 /// Which pane currently owns the keyboard. `View` covers both the transcript
 /// and the terminal renderer — when the view shows a PTY-backed session and
@@ -439,11 +444,23 @@ impl MatrixWidgetHit {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatrixWidgetVisibility {
-    Hidden,
-    Auto { until: Instant },
-    Browsing,
+/// A widget panel shown transiently because the cursor is over its title
+/// square (or, briefly after a create/update, auto-revealed). `until` is the
+/// expiry; each hover frame pushes it out. Cleared when it lapses or the cursor
+/// moves to a different square.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DynamicUiHover {
+    pub session_id: String,
+    pub panel_id: String,
+    pub until: Instant,
+}
+
+/// Operator-rain analogue of [`DynamicUiHover`]: the rain panel shows a single
+/// widget at a time, so only the panel id and expiry are needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixWidgetHover {
+    pub panel_id: String,
+    pub until: Instant,
 }
 
 pub struct App {
@@ -671,6 +688,12 @@ pub struct App {
     pub dynamic_ui_selected: HashSet<(String, String)>,
     /// Widgets temporarily shown after create/update. Hover extends this deadline.
     pub dynamic_ui_temporary_until: HashMap<(String, String), Instant>,
+    /// Widget previewed purely because the cursor is over its title square (or
+    /// the widget body). At most one across the fleet — the pointer is over one
+    /// square at a time. Kept apart from `dynamic_ui_temporary_until` so a
+    /// preview switches instantly between squares and uses the short hover grace
+    /// rather than the 15s auto-reveal.
+    pub dynamic_ui_hover: Option<DynamicUiHover>,
     /// The one widget panel currently focused for keyboard handling.
     pub dynamic_ui_focused: Option<(String, String)>,
     /// Per-session scroll offset for the stacked dynamic UI widget panel.
@@ -697,10 +720,13 @@ pub struct App {
     /// Matrix-rain drop cycle keys that already spawned. Intensity decay stops
     /// future cycles from entering this set; existing drops finish their fall.
     pub matrix_rain_active_drops: HashMap<u64, u16>,
-    /// Transient viewport state for the collapsed operator/orchestrator
-    /// widgets rendered inside the Matrix-rain panel.
-    pub matrix_widget_visibility: MatrixWidgetVisibility,
-    pub matrix_widget_selected: Option<String>,
+    /// Operator widget pinned open by a click on its title square. Persistent
+    /// until clicked again (or the panel is deleted) — survives the cursor
+    /// leaving the rain panel, unlike a hover preview.
+    pub matrix_widget_pinned: Option<String>,
+    /// Operator widget shown transiently on hover. Takes visual precedence over
+    /// `matrix_widget_pinned` while live, then reverts to the pin when it lapses.
+    pub matrix_widget_hover: Option<MatrixWidgetHover>,
     /// User-hidden Matrix-rain panel. Toggle with `/rain`; close with the
     /// panel's `x` button.
     pub matrix_rain_hidden: bool,
@@ -1657,6 +1683,7 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
             })
             .collect(),
         dynamic_ui_temporary_until: HashMap::new(),
+        dynamic_ui_hover: None,
         dynamic_ui_focused: None,
         dynamic_ui_scroll_offsets: HashMap::new(),
         image_resize_cache: Vec::new(),
@@ -1667,8 +1694,8 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
         matrix_rain_intensity_updated_at: now,
         matrix_rain_foreground_epoch: now,
         matrix_rain_active_drops: HashMap::new(),
-        matrix_widget_visibility: MatrixWidgetVisibility::Hidden,
-        matrix_widget_selected: None,
+        matrix_widget_pinned: None,
+        matrix_widget_hover: None,
         matrix_rain_hidden: persisted.matrix_rain_hidden,
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
@@ -3563,9 +3590,10 @@ impl App {
                                     if self.orchestrator_id.as_deref()
                                         == Some(payload.session_id.as_str())
                                     {
-                                        self.matrix_widget_selected = Some(panel.id.clone());
-                                        self.matrix_widget_visibility =
-                                            MatrixWidgetVisibility::Auto { until };
+                                        self.matrix_widget_hover = Some(MatrixWidgetHover {
+                                            panel_id: panel.id.clone(),
+                                            until,
+                                        });
                                     }
                                 }
                             }
@@ -3579,15 +3607,29 @@ impl App {
                                 let key = (payload.session_id.clone(), id.clone());
                                 self.dynamic_ui_selected.remove(&key);
                                 self.dynamic_ui_temporary_until.remove(&key);
+                                if self
+                                    .dynamic_ui_hover
+                                    .as_ref()
+                                    .is_some_and(|h| h.session_id == key.0 && h.panel_id == key.1)
+                                {
+                                    self.dynamic_ui_hover = None;
+                                }
                                 if self.dynamic_ui_focused.as_ref() == Some(&key) {
                                     self.dynamic_ui_focused = None;
                                 }
                                 if self.orchestrator_id.as_deref()
                                     == Some(payload.session_id.as_str())
-                                    && self.matrix_widget_selected.as_deref() == Some(id.as_str())
                                 {
-                                    self.matrix_widget_selected = None;
-                                    self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+                                    if self.matrix_widget_pinned.as_deref() == Some(id.as_str()) {
+                                        self.matrix_widget_pinned = None;
+                                    }
+                                    if self
+                                        .matrix_widget_hover
+                                        .as_ref()
+                                        .is_some_and(|h| h.panel_id == *id)
+                                    {
+                                        self.matrix_widget_hover = None;
+                                    }
                                 }
                             }
                             _ => {}
@@ -4541,6 +4583,15 @@ impl App {
             } else {
                 self.dynamic_ui_selected.insert(key.clone());
                 self.dynamic_ui_temporary_until.remove(&key);
+            }
+            // The click outcome is authoritative; drop any hover preview of this
+            // widget so the rendered state reflects the pin toggle immediately.
+            if self
+                .dynamic_ui_hover
+                .as_ref()
+                .is_some_and(|h| h.session_id == key.0 && h.panel_id == key.1)
+            {
+                self.dynamic_ui_hover = None;
             }
             return true;
         }
@@ -5711,11 +5762,19 @@ impl App {
 
     pub fn dynamic_ui_panel_visible(&self, session_id: &str, panel_id: &str) -> bool {
         let key = (session_id.to_string(), panel_id.to_string());
-        self.dynamic_ui_selected.contains(&key)
-            || self
-                .dynamic_ui_temporary_until
-                .get(&key)
-                .is_some_and(|until| *until > Instant::now())
+        if self.dynamic_ui_selected.contains(&key) {
+            return true;
+        }
+        if self
+            .dynamic_ui_temporary_until
+            .get(&key)
+            .is_some_and(|until| *until > Instant::now())
+        {
+            return true;
+        }
+        self.dynamic_ui_hover.as_ref().is_some_and(|h| {
+            h.session_id == session_id && h.panel_id == panel_id && h.until > Instant::now()
+        })
     }
 
     pub fn orchestrator_widget_panels(&self) -> Vec<agentd_protocol::UiPanel> {
@@ -5738,47 +5797,64 @@ impl App {
         panels
     }
 
+    /// Whether the operator-rain widget viewport should render this frame.
+    /// Side effect: expires a lapsed hover preview and clears all widget state
+    /// when there's no orchestrator / no panels to show.
     pub fn matrix_widget_visible(&mut self, now: Instant) -> bool {
         if self.orchestrator_id.is_none() || self.orchestrator_widget_panels().is_empty() {
-            self.matrix_widget_selected = None;
-            self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+            self.matrix_widget_pinned = None;
+            self.matrix_widget_hover = None;
             return false;
         }
-        match self.matrix_widget_visibility {
-            MatrixWidgetVisibility::Hidden => false,
-            MatrixWidgetVisibility::Auto { until } => {
-                if until > now {
-                    true
-                } else {
-                    self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
-                    false
-                }
-            }
-            MatrixWidgetVisibility::Browsing => true,
+        if self
+            .matrix_widget_hover
+            .as_ref()
+            .is_some_and(|h| h.until <= now)
+        {
+            self.matrix_widget_hover = None;
         }
+        self.matrix_widget_hover.is_some() || self.matrix_widget_pinned.is_some()
+    }
+
+    /// The operator widget to render in the rain viewport: a live hover preview
+    /// takes precedence over the pinned widget; with neither, nothing shows.
+    pub fn matrix_widget_shown(&self, now: Instant) -> Option<String> {
+        if let Some(h) = self.matrix_widget_hover.as_ref() {
+            if h.until > now {
+                return Some(h.panel_id.clone());
+            }
+        }
+        self.matrix_widget_pinned.clone()
     }
 
     pub fn toggle_matrix_widget_panel(&mut self, panel_id: String) {
         let panels = self.orchestrator_widget_panels();
         if !panels.iter().any(|panel| panel.id == panel_id) {
-            self.matrix_widget_selected = None;
-            self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+            self.matrix_widget_pinned = None;
+            self.matrix_widget_hover = None;
             return;
         }
-        let already_visible = self.matrix_widget_visible(Instant::now())
-            && self.matrix_widget_selected.as_deref() == Some(panel_id.as_str());
-        if already_visible {
-            self.matrix_widget_visibility = MatrixWidgetVisibility::Hidden;
+        if self.matrix_widget_pinned.as_deref() == Some(panel_id.as_str()) {
+            self.matrix_widget_pinned = None;
         } else {
-            self.matrix_widget_selected = Some(panel_id);
-            self.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
+            self.matrix_widget_pinned = Some(panel_id);
         }
+        // The click outcome is authoritative; drop any hover preview so the
+        // rendered widget reflects the pin toggle immediately.
+        self.matrix_widget_hover = None;
     }
 
     fn hide_dynamic_ui_panel(&mut self, session_id: String, panel_id: String) {
         let key = (session_id, panel_id);
         self.dynamic_ui_selected.remove(&key);
         self.dynamic_ui_temporary_until.remove(&key);
+        if self
+            .dynamic_ui_hover
+            .as_ref()
+            .is_some_and(|h| h.session_id == key.0 && h.panel_id == key.1)
+        {
+            self.dynamic_ui_hover = None;
+        }
         if self.dynamic_ui_focused.as_ref() == Some(&key) {
             self.dynamic_ui_focused = None;
         }
@@ -7795,6 +7871,7 @@ mod tests {
             dynamic_ui_popover_open: None,
             dynamic_ui_selected: HashSet::new(),
             dynamic_ui_temporary_until: HashMap::new(),
+            dynamic_ui_hover: None,
             dynamic_ui_focused: None,
             dynamic_ui_scroll_offsets: HashMap::new(),
             image_resize_cache: Vec::new(),
@@ -7805,8 +7882,8 @@ mod tests {
             matrix_rain_intensity_updated_at: now,
             matrix_rain_foreground_epoch: now,
             matrix_rain_active_drops: HashMap::new(),
-            matrix_widget_visibility: MatrixWidgetVisibility::Hidden,
-            matrix_widget_selected: None,
+            matrix_widget_pinned: None,
+            matrix_widget_hover: None,
             matrix_rain_hidden: false,
             hide_pane_side_borders: true,
             frame_text: Vec::new(),
@@ -9322,8 +9399,7 @@ mod tests {
         app.sessions.push(orch);
         app.refresh_orchestrator_id();
         app.matrix_rain_hidden = false;
-        app.matrix_widget_visibility = MatrixWidgetVisibility::Browsing;
-        app.matrix_widget_selected = Some("fleet-pulse".into());
+        app.matrix_widget_pinned = Some("fleet-pulse".into());
         app.ui_panels.insert(
             "orch".into(),
             HashMap::from([
@@ -9378,6 +9454,94 @@ mod tests {
             !text.contains("2/3"),
             "widget viewport title should not include widget count"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn matrix_widget_hover_previews_over_pin_then_reverts() {
+        use agentd_protocol::{UiPanel, UiPlacement};
+        use std::time::{Duration, Instant};
+
+        let (mut app, _dir, server) = captured_app().await;
+        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        orch.id = "orch".into();
+        app.sessions.push(orch);
+        app.refresh_orchestrator_id();
+        let panel = |id: &str, at: u64| {
+            (
+                id.to_string(),
+                UiPanel {
+                    id: id.into(),
+                    source: Some(format!("{id}.md")),
+                    title: Some(id.into()),
+                    created_at_ms: at,
+                    placement: UiPlacement::Sticky,
+                    markdown: format!("# {id}"),
+                },
+            )
+        };
+        app.ui_panels.insert(
+            "orch".into(),
+            HashMap::from([panel("alpha", 1), panel("beta", 2)]),
+        );
+
+        let now = Instant::now();
+        // Click pins alpha — persistent, no expiry.
+        app.toggle_matrix_widget_panel("alpha".into());
+        assert_eq!(app.matrix_widget_pinned.as_deref(), Some("alpha"));
+        assert_eq!(app.matrix_widget_shown(now).as_deref(), Some("alpha"));
+
+        // Hovering beta previews it over the pinned alpha.
+        app.matrix_widget_hover = Some(MatrixWidgetHover {
+            panel_id: "beta".into(),
+            until: now + Duration::from_millis(DYNAMIC_UI_HOVER_GRACE_MS),
+        });
+        assert_eq!(app.matrix_widget_shown(now).as_deref(), Some("beta"));
+        assert!(app.matrix_widget_visible(now));
+
+        // Once the grace lapses, it reverts to the pinned alpha, and the lapsed
+        // hover is cleared as a side effect of the visibility check.
+        let later = now + Duration::from_secs(2);
+        assert!(app.matrix_widget_visible(later));
+        assert_eq!(app.matrix_widget_shown(later).as_deref(), Some("alpha"));
+        assert!(app.matrix_widget_hover.is_none());
+
+        // Clicking alpha again unpins it — nothing shown, viewport hidden.
+        app.toggle_matrix_widget_panel("alpha".into());
+        assert!(app.matrix_widget_pinned.is_none());
+        assert!(!app.matrix_widget_visible(later));
+        assert!(app.matrix_widget_shown(later).is_none());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dynamic_ui_hover_reveals_only_the_hovered_session_panel() {
+        use std::time::{Duration, Instant};
+
+        let (mut app, _dir, server) = captured_app().await;
+        // Nothing pinned / temporarily revealed → hidden.
+        assert!(!app.dynamic_ui_panel_visible("s1", "w1"));
+
+        let now = Instant::now();
+        app.dynamic_ui_hover = Some(DynamicUiHover {
+            session_id: "s1".into(),
+            panel_id: "w1".into(),
+            until: now + Duration::from_millis(DYNAMIC_UI_HOVER_GRACE_MS),
+        });
+        // Visible for exactly the hovered (session, panel), nothing else.
+        assert!(app.dynamic_ui_panel_visible("s1", "w1"));
+        assert!(!app.dynamic_ui_panel_visible("s1", "w2"));
+        assert!(!app.dynamic_ui_panel_visible("s2", "w1"));
+
+        // A lapsed hover stops revealing the panel.
+        app.dynamic_ui_hover = Some(DynamicUiHover {
+            session_id: "s1".into(),
+            panel_id: "w1".into(),
+            until: now.checked_sub(Duration::from_millis(1)).unwrap_or(now),
+        });
+        assert!(!app.dynamic_ui_panel_visible("s1", "w1"));
+
         server.abort();
     }
 
