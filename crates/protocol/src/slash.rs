@@ -378,6 +378,9 @@ pub const MODEL_COMPLETIONS: &[&str] = &[
     // Local Ollama examples.
     "ollama:llama3.1",
     "ollama:qwen3-coder",
+    // Grok / xAI OAuth path.
+    "grok-oauth:grok-4.3",
+    "grok-oauth:grok-build-0.1",
 ];
 
 /// Completion rows for the current `/model` input buffer.
