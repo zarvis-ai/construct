@@ -2078,8 +2078,34 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
     } else {
         "operator"
     };
+
+    // Play/pause toggle for the operator ambient loop.
+    // ▶ = loop is paused (click to enable); ⏸ = loop is running (click to disable).
+    let loop_disabled = app.operator_loop_disabled();
+    let loop_icon = if loop_disabled { "▶" } else { "⏸" };
+    let loop_icon_width = UnicodeWidthStr::width(loop_icon) as u16;
+    let loop_icon_x = area.x.saturating_add(1);
+    let loop_icon_end = loop_icon_x.saturating_add(loop_icon_width);
+    let loop_icon_hovered = app
+        .mouse_pos
+        .is_some_and(|(mx, my)| my == area.y && mx >= loop_icon_x && mx < loop_icon_end);
+    let loop_icon_style = if loop_icon_hovered {
+        Style::default()
+            .fg(app.theme.matrix_flash_good)
+            .add_modifier(Modifier::BOLD)
+    } else if loop_disabled {
+        Style::default().fg(app.theme.dim)
+    } else {
+        Style::default().fg(app.theme.accent)
+    };
+    f.buffer_mut()
+        .set_string(loop_icon_x, area.y, loop_icon, loop_icon_style);
+    app.layout.matrix_operator_loop_hit = Some((loop_icon_x, loop_icon_end, area.y));
+
+    // Operator label renders after the icon; the leading space in " operator "
+    // provides the visual gap between icon and text.
     let label = format!(" {operator_text} ");
-    let label_x = area.x.saturating_add(1);
+    let label_x = loop_icon_end;
     let operator_start = label_x.saturating_add(1);
     let operator_end = operator_start.saturating_add(UnicodeWidthStr::width(operator_text) as u16);
     let operator_hovered = app
@@ -5911,6 +5937,7 @@ fn chat_event_kind(ev: &SessionEvent) -> ChatEventKind {
         | SessionEvent::ClientCommand { .. }
         | SessionEvent::ToolApprovalResolved { .. }
         | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::OperatorLoopChanged { .. }
         | SessionEvent::ModelChanged { .. }
         | SessionEvent::AgentStatus(_) => ChatEventKind::Hidden,
         SessionEvent::Message { role, text } if should_render_chat_message(*role, text) => {
@@ -6031,6 +6058,7 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
         | SessionEvent::ClientCommand { .. }
         | SessionEvent::ToolApprovalResolved { .. }
         | SessionEvent::ApprovalModeChanged { .. }
+        | SessionEvent::OperatorLoopChanged { .. }
         | SessionEvent::ModelChanged { .. }
         | SessionEvent::AgentStatus(_) => Vec::new(),
         SessionEvent::Message { role, text } => {
@@ -6762,6 +6790,9 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
         SessionEvent::ToolApprovalRequest { tool, .. } => format!("approve? {tool}"),
         SessionEvent::ApprovalModeChanged { mode } => {
             format!("approval-mode {}", mode.badge().unwrap_or("manual"))
+        }
+        SessionEvent::OperatorLoopChanged { enabled } => {
+            format!("operator-loop {}", if *enabled { "enabled" } else { "disabled" })
         }
         SessionEvent::ModelChanged { model } => format!("model {model}"),
         SessionEvent::TaskStart { tool, call_id, .. } => format!("task-start {tool} {call_id}"),
