@@ -9,7 +9,7 @@ Scope: Smith user-defined model endpoints declared in config and switched at run
 
 Smith supports user-defined **model profiles**: named entries in the shared
 `config.toml` that each bind a wire protocol (OpenAI / Anthropic / Gemini /
-Ollama) to its own base URL, credential, and default model. A profile is
+Ollama / Grok) to its own base URL, credential, and default model. A profile is
 referenced with an explicit `@<name>` prefix (optionally `@<name>:<model>` to
 override the model), usable anywhere a model spec is accepted — `--model`,
 `CONSTRUCT_SMITH_MODEL`, and the `/model` slash command.
@@ -35,9 +35,10 @@ endpoint's URL and credential declared in one place.
 - A profile's underlying wire protocol remains the key for context-window
   heuristics and learned token limits; the `@name` is only a user-facing label.
   Internal keying must not switch to the label.
-- OAuth-backed providers (`codex-oauth`, `claude-oauth`) are not expressible as
-  profiles: they have no base-URL/credential surface and keep their explicit
-  prefixes. Declaring one in a profile is a configuration error.
+- OAuth-backed providers (`codex-oauth`, `claude-oauth`, `grok-oauth`) are not
+  expressible as profiles: they have no base-URL/credential surface and keep
+  their explicit prefixes.
+  Declaring one in a profile is a configuration error.
 - Credentials should be referenced indirectly (an env var name) rather than
   written inline, though inline is accepted. When neither is given, the wire
   protocol's standard env var(s) are the fallback.

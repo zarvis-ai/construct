@@ -9,9 +9,9 @@ use crate::provider::{self, Content, LlmProvider, Message, Role, StopReason, Tex
 use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
 use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{MessageRole, SessionEvent, SessionStartParams, SessionState, ToolRisk};
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -68,6 +68,7 @@ const APPROVAL_HISTORY_LIMIT: usize = 20;
 /// harness nudges the model to change approach instead of thrashing.
 /// Purely a function of observed progress — model- and provider-agnostic.
 const NONPRODUCTIVE_STREAK_LIMIT: usize = 4;
+const GROK_BASE_URL: &str = "https://api.x.ai/v1";
 
 fn record_approval_history(
     history: &mut VecDeque<ApprovalHistoryEntry>,
@@ -1415,6 +1416,8 @@ impl ResolvedModel {
             provider::routing::Provider::Anthropic => "anthropic",
             provider::routing::Provider::Gemini => "gemini",
             provider::routing::Provider::Ollama => "ollama",
+            provider::routing::Provider::Grok => "grok",
+            provider::routing::Provider::GrokOauth => "grok-oauth",
             provider::routing::Provider::CodexOauth => "codex-oauth",
             provider::routing::Provider::ClaudeOauth => "claude-oauth",
         }
@@ -1481,6 +1484,18 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
         }
         provider::routing::Provider::Gemini => Box::new(provider::gemini::Gemini::from_env()?),
         provider::routing::Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
+        provider::routing::Provider::Grok => {
+            Box::new(provider::openai::OpenAi::with_config(
+                Some(GROK_BASE_URL.to_string()),
+                grok_api_key()?,
+            )?)
+        }
+        provider::routing::Provider::GrokOauth => {
+            Box::new(provider::openai::OpenAi::with_config(
+                Some(GROK_BASE_URL.to_string()),
+                grok_oauth_token()?,
+            )?)
+        }
         provider::routing::Provider::CodexOauth => {
             Box::new(provider::codex_oauth::CodexOauth::from_env()?)
         }
@@ -1530,7 +1545,8 @@ fn build_profile_model(
         "anthropic" => provider::routing::Provider::Anthropic,
         "gemini" => provider::routing::Provider::Gemini,
         "ollama" => provider::routing::Provider::Ollama,
-        "codex-oauth" | "claude-oauth" | "claude-code-oauth" => anyhow::bail!(
+        "grok" => provider::routing::Provider::Grok,
+        "codex-oauth" | "claude-oauth" | "claude-code-oauth" | "grok-oauth" => anyhow::bail!(
             "profile `{name}`: provider `{}` is OAuth-backed and has no \
              configurable endpoint — use the `{}:` model prefix directly",
             profile.provider,
@@ -1538,7 +1554,7 @@ fn build_profile_model(
         ),
         other => anyhow::bail!(
             "profile `{name}`: unknown provider `{other}` \
-             (expected openai | anthropic | gemini | ollama)"
+             (expected openai | anthropic | gemini | ollama | grok)"
         ),
     };
 
@@ -1570,7 +1586,11 @@ fn build_profile_model(
         provider::routing::Provider::Ollama => {
             Box::new(provider::ollama::Ollama::with_config(base_url)?)
         }
-        // codex-oauth / claude-oauth rejected above.
+        provider::routing::Provider::Grok => Box::new(provider::openai::OpenAi::with_config(
+            base_url.or_else(|| Some(GROK_BASE_URL.to_string())),
+            profile_api_key(profile, name, &["GROK_API_KEY", "XAI_API_KEY"])?,
+        )?),
+        // codex-oauth / claude-oauth / grok-oauth rejected above.
         _ => unreachable!("oauth providers rejected above"),
     };
 
@@ -1610,10 +1630,91 @@ fn profile_api_key(
     )
 }
 
+fn grok_api_key() -> Result<String> {
+    std::env::var("GROK_API_KEY")
+        .or_else(|_| std::env::var("XAI_API_KEY"))
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "grok provider requires GROK_API_KEY or XAI_API_KEY"
+            )
+        })
+}
+
+fn grok_auth_path() -> Result<PathBuf> {
+    if let Ok(home) = std::env::var("GROK_HOME") {
+        if !home.trim().is_empty() {
+            return Ok(PathBuf::from(home).join(".grok").join("auth.json"));
+        }
+    }
+    let home = std::env::var("HOME")
+        .map_err(|_| anyhow::anyhow!("$HOME is not set; cannot locate ~/.grok/auth.json"))?;
+    Ok(PathBuf::from(home).join(".grok").join("auth.json"))
+}
+
+fn parse_expires_at(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(ts).ok().map(|v| v.with_timezone(&chrono::Utc))
+}
+
+pub(crate) fn grok_oauth_token() -> Result<String> {
+    let path = grok_auth_path()?;
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read {}", path.display()))
+        .context("load grok auth token from auth.json")?;
+    let entries: BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
+
+    let now = chrono::Utc::now();
+    let mut selected_token: Option<(Option<chrono::DateTime<chrono::Utc>>, String)> = None;
+    let mut seen_expired = false;
+
+    for entry in entries.values() {
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let Some(token) = obj.get("key").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            continue;
+        }
+
+        let expiry = obj.get("expires_at").and_then(|v| v.as_str()).and_then(parse_expires_at);
+        if let Some(expiry) = expiry {
+            if expiry > now {
+                match selected_token {
+                    Some((Some(current_expiry), _)) if expiry <= current_expiry => {}
+                    _ => selected_token = Some((Some(expiry), token)),
+                }
+            } else {
+                seen_expired = true;
+            }
+        } else if selected_token.is_none() {
+            selected_token = Some((None, token));
+        }
+    }
+
+    if let Some((_, token)) = selected_token {
+        return Ok(token);
+    }
+    if seen_expired {
+        return Err(anyhow!(
+            "grok auth token in {} is expired; run `grok login` or set GROK_API_KEY/XAI_API_KEY.",
+            path.display()
+        ));
+    }
+    Err(anyhow!(
+        "no usable `key` field found in {}. Run `grok login` or set GROK_API_KEY/XAI_API_KEY.",
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use provider::config::ModelProfile;
+    use std::env;
+    use std::fs;
 
     fn profile(provider: &str, model: Option<&str>) -> ModelProfile {
         ModelProfile {
@@ -1651,6 +1752,23 @@ mod tests {
     #[test]
     fn profile_rejects_oauth_providers() {
         let e = build_profile_model("x", &profile("codex-oauth", Some("gpt-5")), None)
+            .err()
+            .expect("expected error")
+            .to_string();
+        assert!(e.contains("OAuth-backed"), "got: {e}");
+    }
+
+    #[test]
+    fn profile_supports_grok_provider() {
+        let r = build_profile_model("x", &profile("grok", Some("grok-2-latest")), None)
+            .expect("build");
+        assert_eq!(r.provider_name(), "grok");
+        assert_eq!(r.kind, provider::routing::Provider::Grok);
+    }
+
+    #[test]
+    fn profile_rejects_grok_oauth_provider() {
+        let e = build_profile_model("x", &profile("grok-oauth", Some("grok-2-latest")), None)
             .err()
             .expect("expected error")
             .to_string();
@@ -1801,5 +1919,111 @@ mod tests {
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("pipes read-only output"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("broad/unscoped paths"));
         assert!(AUTO_REVIEW_SYSTEM_PROMPT.contains("secrets or credentials"));
+    }
+
+    #[test]
+    fn grok_oauth_token_selects_latest_unexpired() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let grok_home = tmp.path().join("grok");
+        fs::create_dir_all(grok_home.join(".grok")).expect("mkdir");
+        let auth_path = grok_home.join(".grok").join("auth.json");
+        fs::write(
+            &auth_path,
+            serde_json::json!({
+                "expired": { "key": "old", "expires_at": "2020-01-01T00:00:00Z" },
+                "older": { "key": "first", "expires_at": "2060-01-01T00:00:00Z" },
+                "newer": { "key": "second", "expires_at": "2099-01-01T00:00:00Z" },
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let old_home = env::var_os("HOME");
+        let old_grok_home = env::var_os("GROK_HOME");
+        env::set_var("HOME", "/does/not/matter");
+        env::set_var("GROK_HOME", grok_home);
+        let token = grok_oauth_token().expect("token");
+        if let Some(v) = old_grok_home {
+            env::set_var("GROK_HOME", v);
+        } else {
+            env::remove_var("GROK_HOME");
+        }
+        if let Some(v) = old_home {
+            env::set_var("HOME", v);
+        } else {
+            env::remove_var("HOME");
+        }
+        assert_eq!(token, "second");
+    }
+
+    #[test]
+    fn grok_oauth_token_rejects_expired_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let grok_home = tmp.path().join("grok");
+        fs::create_dir_all(grok_home.join(".grok")).expect("mkdir");
+        let auth_path = grok_home.join(".grok").join("auth.json");
+        fs::write(
+            &auth_path,
+            serde_json::json!({
+                "expired": { "key": "old", "expires_at": "2020-01-01T00:00:00Z" },
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let old_home = env::var_os("HOME");
+        let old_grok_home = env::var_os("GROK_HOME");
+        env::set_var("HOME", "/does/not/matter");
+        env::set_var("GROK_HOME", grok_home);
+        let err = grok_oauth_token().unwrap_err().to_string();
+        if let Some(v) = old_grok_home {
+            env::set_var("GROK_HOME", v);
+        } else {
+            env::remove_var("GROK_HOME");
+        }
+        if let Some(v) = old_home {
+            env::set_var("HOME", v);
+        } else {
+            env::remove_var("HOME");
+        }
+
+        assert!(err.contains("expired"));
+    }
+
+    #[test]
+    fn resolve_model_from_spec_grok_oauth_reads_auth_json_token() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let grok_home = tmp.path().join("grok");
+        fs::create_dir_all(grok_home.join(".grok")).expect("mkdir");
+        let auth_path = grok_home.join(".grok").join("auth.json");
+        fs::write(
+            &auth_path,
+            serde_json::json!({
+                "default": { "key": "runtime-token", "expires_at": "2099-01-01T00:00:00Z" },
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let old_home = env::var_os("HOME");
+        let old_grok_home = env::var_os("GROK_HOME");
+        env::set_var("HOME", "/does/not/matter");
+        env::set_var("GROK_HOME", grok_home);
+
+        let resolved =
+            resolve_model_from_spec("grok-oauth:grok-2-latest").expect("resolve");
+        if let Some(v) = old_grok_home {
+            env::set_var("GROK_HOME", v);
+        } else {
+            env::remove_var("GROK_HOME");
+        }
+        if let Some(v) = old_home {
+            env::set_var("HOME", v);
+        } else {
+            env::remove_var("HOME");
+        }
+
+        assert_eq!(resolved.model, "grok-2-latest");
+        assert_eq!(resolved.provider_name(), "grok-oauth");
     }
 }

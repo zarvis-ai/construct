@@ -1,10 +1,11 @@
 # smith built-in agent
 
 `smith` is the built-in agent that ships with construct. It talks to OpenAI,
-Anthropic, Google Gemini, or a local Ollama directly, and can also delegate
-subscription auth to Codex or Claude Code. Smith runs its own agent loop with
-shell + filesystem + construct-control tools. Many PRs for the construct
-repository have already been made from smith sessions running inside construct.
+Anthropic, Google Gemini, xAI Grok, or a local Ollama directly, and can also
+delegate subscription auth to Codex, Claude Code, or the Grok CLI token store.
+Smith runs its own agent loop with shell + filesystem + construct-control
+tools. Many PRs for the construct repository have already been made from smith
+sessions running inside construct.
 
 ### Quick start
 
@@ -13,8 +14,10 @@ repository have already been made from smith sessions running inside construct.
 export ANTHROPIC_API_KEY=sk-ant-...
 # or  export OPENAI_API_KEY=sk-...
 # or  export GEMINI_API_KEY=...        # (or GOOGLE_API_KEY)
+# or  export GROK_API_KEY=...          # (or XAI_API_KEY)
 # or  codex login, then use --model codex-oauth:gpt-5
 # or  claude login, then use --model claude-oauth:sonnet
+# or  grok login, then use --model grok-oauth:grok-2-latest
 # or  run a local ollama (default http://localhost:11434)
 
 construct new smith "list the rust files in this repo and summarize what each crate does"
@@ -29,14 +32,16 @@ The spec is one of:
 - `anthropic:<name>` — e.g. `anthropic:claude-haiku-4-5`
 - `claude-oauth:<name>` — e.g. `claude-oauth:sonnet` (alias: `claude-code-oauth:`)
 - `gemini:<name>` — e.g. `gemini:gemini-2.5-pro`
+- `grok:<name>` — e.g. `grok:grok-2-latest` using `GROK_API_KEY` or `XAI_API_KEY`
+- `grok-oauth:<name>` — e.g. `grok-oauth:grok-2-latest` using the Grok CLI auth file
 - `ollama:<name>` — e.g. `ollama:llama3.1`
 - `codex-oauth:<name>` — e.g. `codex-oauth:gpt-5-codex`
 - `@<name>` — a named endpoint profile (see [Model profiles](#model-profiles)),
   e.g. `@deepseek` or `@deepseek:deepseek-reasoner` to override its model
 
 Bare names auto-detect: `gpt-*` / `o[1-5]*` → OpenAI, `claude-*` →
-Anthropic, `gemini-*` → Gemini, anything else → Ollama. When in doubt,
-use the explicit prefix.
+Anthropic, `gemini-*` → Gemini, `grok*` → Grok, anything else → Ollama.
+When in doubt, use the explicit prefix.
 
 `claude-oauth:` delegates model access to the installed `claude` CLI, so run
 `claude login` first and keep `claude` on `PATH` (or set `CONSTRUCT_CLAUDE_BIN`
@@ -46,6 +51,12 @@ tool approvals and transcript persistence still apply. The child CLI process
 does not inherit `ANTHROPIC_API_KEY` or third-party Claude provider env vars on
 this path, so the explicit `claude-oauth:` prefix does not silently become API
 key billing.
+
+`grok-oauth:` uses the same OpenAI-compatible xAI API endpoint as `grok:`, but
+loads a bearer token from the Grok CLI auth file instead of `GROK_API_KEY` /
+`XAI_API_KEY`. Run `grok login` first. Smith reads
+`$GROK_HOME/.grok/auth.json` when `GROK_HOME` is set, otherwise
+`~/.grok/auth.json`, and chooses the newest unexpired `key` entry.
 
 If you don't pass a model and `CONSTRUCT_SMITH_MODEL` isn't set, smith
 picks: `ANTHROPIC_API_KEY` → `claude-opus-4-8`, else `OPENAI_API_KEY`
@@ -62,8 +73,9 @@ OpenAI plus two OpenAI-compatible vendors — declare named profiles in
 
 Each `[smith.models.<name>]` entry sets:
 
-- `provider` — wire protocol to speak: `openai`, `anthropic`, `gemini`, or
-  `ollama`. (OAuth providers can't be profiled — use their prefixes directly.)
+- `provider` — wire protocol to speak: `openai`, `anthropic`, `gemini`,
+  `grok`, or `ollama`. (OAuth providers can't be profiled — use their prefixes
+  directly.)
 - `base_url` — endpoint URL (defaults to the protocol's public endpoint).
 - `api_key_env` — name of the env var holding the key (preferred). Or
   `api_key = "..."` inline (discouraged). If neither is set, the protocol's
@@ -82,6 +94,11 @@ provider    = "openai"
 base_url    = "https://api.groq.com/openai/v1"
 api_key_env = "GROQ_API_KEY"
 model       = "llama-3.3-70b-versatile"
+
+[smith.models.xai]
+provider    = "grok"
+api_key_env = "XAI_API_KEY"
+model       = "grok-2-latest"
 ```
 
 ```text
@@ -154,6 +171,10 @@ two most-recent.
   used by `claude-oauth:`.
 - `GEMINI_API_KEY` / `GOOGLE_API_KEY` — Gemini credentials (either is
   accepted).
+- `GROK_API_KEY` / `XAI_API_KEY` — xAI Grok API credentials (either is
+  accepted).
+- `GROK_HOME` — override the base directory used by `grok-oauth:` token lookup;
+  Smith reads `$GROK_HOME/.grok/auth.json` instead of `~/.grok/auth.json`.
 - `OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` / `GEMINI_BASE_URL` /
   `OLLAMA_HOST` — point at alternate endpoints. Pointing `OPENAI_BASE_URL`
   at an OpenAI-compatible vendor (OpenRouter, DeepSeek, Groq, xAI,
