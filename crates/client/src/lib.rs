@@ -997,7 +997,9 @@ fn render_fork_seed(
                 lines.push(format!("{who}: {t}"));
             }
             SessionEvent::ToolUse { tool, .. } => lines.push(format!("[tool: {tool}]")),
-            SessionEvent::ToolResult { tool, ok, output } => {
+            SessionEvent::ToolResult {
+                tool, ok, output, ..
+            } => {
                 let status = if *ok { "ok" } else { "error" };
                 lines.push(format!(
                     "[tool result: {tool} ({status})] {}",
@@ -1087,11 +1089,13 @@ mod fork_tests {
             ev(SessionEvent::ToolUse {
                 tool: "edit_file".into(),
                 args: serde_json::json!({}),
+                call_id: None,
             }),
             ev(SessionEvent::ToolResult {
                 tool: "edit_file".into(),
                 ok: true,
                 output: "patched".into(),
+                call_id: None,
             }),
             ev(SessionEvent::Message {
                 role: MessageRole::Assistant,
