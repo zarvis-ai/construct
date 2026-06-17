@@ -44,8 +44,8 @@ pub fn context_window_tokens(provider: &str, model: &str) -> usize {
         // will tighten if the subscription tier enforces something
         // lower in practice.
         ("codex-oauth", _) => 400_000,
-        // Claude Code OAuth delegates to the local `claude` CLI, which
-        // uses the normal Claude Code model/context limits.
+        // Claude Code OAuth hits the Anthropic API directly with the
+        // subscription token; same 200k context as the `anthropic:` path.
         ("claude-oauth", _) => 200_000,
         _ => 8_000,
     }

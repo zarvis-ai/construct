@@ -21,9 +21,10 @@ and operational failure modes than direct API-key usage. A model string like
 
 Future Smith OAuth providers need their own explicit prefixes and provider
 labels. Provider implementations may delegate credential handling to official
-local CLIs, but Smith still owns tool execution, approval semantics, and
-conversation persistence unless a user intentionally chooses a separate CLI
-harness.
+local CLIs, or read those CLIs' stored credentials and call the API directly
+(see 0031 for the `claude-oauth` direct-API transport), but Smith still owns
+tool execution, approval semantics, and conversation persistence unless a user
+intentionally chooses a separate CLI harness.
 
 ## Non-Goals
 

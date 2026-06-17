@@ -16,9 +16,9 @@
 //! bare-name fallback for it — users must opt in explicitly because the
 //! billing path is different.
 //!
-//! `claude-oauth:` is the Claude Code OAuth path, delegated through the
-//! installed `claude` CLI so Smith can use the user's Claude Code login
-//! without reading credentials directly. It is distinct from `anthropic:`,
+//! `claude-oauth:` uses the user's Claude Code subscription: it reads the
+//! Claude Code login credentials and calls the Anthropic API directly with the
+//! subscription OAuth token (see spec 0031). It is distinct from `anthropic:`,
 //! which uses `ANTHROPIC_API_KEY`.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +34,8 @@ pub enum Provider {
     /// OAuth-backed Codex backend; reads `~/.codex/auth.json`, bills
     /// against the user's ChatGPT subscription.
     CodexOauth,
-    /// OAuth-backed Claude Code CLI path; delegates auth to `claude`.
+    /// Claude Code subscription path; reads the Claude Code OAuth
+    /// credentials and calls the Anthropic API directly (spec 0031).
     ClaudeOauth,
 }
 
