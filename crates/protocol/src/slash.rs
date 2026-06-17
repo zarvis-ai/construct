@@ -478,7 +478,10 @@ mod tests {
         assert!(model_completion_matches("/model").is_empty());
 
         let matches = model_completion_matches("/model codex-oauth:gpt-5.");
-        assert_eq!(matches, vec!["/model codex-oauth:gpt-5.5"]);
+        assert_eq!(
+            matches,
+            vec!["/model codex-oauth:gpt-5.5", "/model codex-oauth:gpt-5.4-mini"]
+        );
 
         let matches = model_completion_matches("/model claude-oauth:");
         assert!(matches.contains(&"/model claude-oauth:sonnet".to_string()));
