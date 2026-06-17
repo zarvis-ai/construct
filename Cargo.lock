@@ -562,6 +562,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "toml",
  "tracing",
  "unicode-width",
  "uuid",

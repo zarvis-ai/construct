@@ -24,8 +24,14 @@ impl Anthropic {
     pub fn from_env() -> Result<Self> {
         let api_key =
             std::env::var("ANTHROPIC_API_KEY").map_err(|_| anyhow!("ANTHROPIC_API_KEY not set"))?;
-        let base_url = std::env::var("ANTHROPIC_BASE_URL")
-            .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string())
+        Self::with_config(std::env::var("ANTHROPIC_BASE_URL").ok(), api_key)
+    }
+
+    /// Build with an explicit base URL (None → public Anthropic) and key.
+    /// Used by named `[smith.models.*]` profiles.
+    pub fn with_config(base_url: Option<String>, api_key: String) -> Result<Self> {
+        let base_url = base_url
+            .unwrap_or_else(|| "https://api.anthropic.com/v1".to_string())
             .trim_end_matches('/')
             .to_string();
         Ok(Self {

@@ -25,8 +25,15 @@ impl OpenAi {
     pub fn from_env() -> Result<Self> {
         let api_key =
             std::env::var("OPENAI_API_KEY").map_err(|_| anyhow!("OPENAI_API_KEY not set"))?;
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+        Self::with_config(std::env::var("OPENAI_BASE_URL").ok(), api_key)
+    }
+
+    /// Build with an explicit base URL (None → public OpenAI) and key.
+    /// Used by named `[smith.models.*]` profiles so several OpenAI-compatible
+    /// endpoints can coexist in one session, independent of `OPENAI_BASE_URL`.
+    pub fn with_config(base_url: Option<String>, api_key: String) -> Result<Self> {
+        let base_url = base_url
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
             .trim_end_matches('/')
             .to_string();
         Ok(Self {
