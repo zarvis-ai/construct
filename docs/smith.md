@@ -17,7 +17,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # or  export GROK_API_KEY=...          # (or XAI_API_KEY)
 # or  codex login, then use --model codex-oauth:gpt-5
 # or  claude login, then use --model claude-oauth:sonnet
-# or  grok login, then use --model grok-oauth:grok-2-latest
+# or  grok login, then use --model grok-oauth:grok-4.3
 # or  run a local ollama (default http://localhost:11434)
 
 construct new smith "list the rust files in this repo and summarize what each crate does"
@@ -32,8 +32,8 @@ The spec is one of:
 - `anthropic:<name>` — e.g. `anthropic:claude-haiku-4-5`
 - `claude-oauth:<name>` — e.g. `claude-oauth:sonnet` (alias: `claude-code-oauth:`)
 - `gemini:<name>` — e.g. `gemini:gemini-2.5-pro`
-- `grok:<name>` — e.g. `grok:grok-2-latest` using `GROK_API_KEY` or `XAI_API_KEY`
-- `grok-oauth:<name>` — e.g. `grok-oauth:grok-2-latest` using the Grok CLI auth file
+- `grok:<name>` — e.g. `grok:grok-4.3` using `GROK_API_KEY` or `XAI_API_KEY`
+- `grok-oauth:<name>` — e.g. `grok-oauth:grok-4.3` using the Grok CLI auth file
 - `ollama:<name>` — e.g. `ollama:llama3.1`
 - `codex-oauth:<name>` — e.g. `codex-oauth:gpt-5-codex`
 - `@<name>` — a named endpoint profile (see [Model profiles](#model-profiles)),
@@ -102,7 +102,7 @@ model       = "llama-3.3-70b-versatile"
 [smith.models.xai]
 provider    = "grok"
 api_key_env = "XAI_API_KEY"
-model       = "grok-2-latest"
+model       = "grok-4.3"
 ```
 
 ```text
