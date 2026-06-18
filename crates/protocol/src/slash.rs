@@ -372,8 +372,7 @@ pub fn popup_names() -> impl Iterator<Item = &'static str> {
 pub const MODEL_COMPLETIONS: &[&str] = &[
     // ChatGPT subscription / Codex CLI OAuth path.
     "codex-oauth:gpt-5.5",
-    "codex-oauth:gpt-5-codex",
-    "codex-oauth:gpt-5",
+    "codex-oauth:gpt-5.4-mini",
     // OpenAI platform API path.
     "openai:gpt-5.5",
     "openai:gpt-5",
@@ -492,7 +491,10 @@ mod tests {
         assert!(model_completion_matches("/model").is_empty());
 
         let matches = model_completion_matches("/model codex-oauth:gpt-5.");
-        assert_eq!(matches, vec!["/model codex-oauth:gpt-5.5"]);
+        assert_eq!(
+            matches,
+            vec!["/model codex-oauth:gpt-5.5", "/model codex-oauth:gpt-5.4-mini"]
+        );
 
         let matches = model_completion_matches("/model claude-oauth:");
         assert!(matches.contains(&"/model claude-oauth:sonnet".to_string()));

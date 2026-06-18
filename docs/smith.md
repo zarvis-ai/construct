@@ -15,7 +15,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 # or  export OPENAI_API_KEY=sk-...
 # or  export GEMINI_API_KEY=...        # (or GOOGLE_API_KEY)
 # or  export GROK_API_KEY=...          # (or XAI_API_KEY)
-# or  codex login, then use --model codex-oauth:gpt-5
+# or  codex login, then use --model codex-oauth:gpt-5.4-mini
 # or  claude login, then use --model claude-oauth:sonnet
 # or  grok login, then use --model grok-oauth:grok-4.3
 # or  run a local ollama (default http://localhost:11434)
@@ -35,7 +35,7 @@ The spec is one of:
 - `grok:<name>` — e.g. `grok:grok-4.3` using `GROK_API_KEY` or `XAI_API_KEY`
 - `grok-oauth:<name>` — e.g. `grok-oauth:grok-4.3` using the Grok CLI auth file
 - `ollama:<name>` — e.g. `ollama:llama3.1`
-- `codex-oauth:<name>` — e.g. `codex-oauth:gpt-5-codex`
+- `codex-oauth:<name>` — e.g. `codex-oauth:gpt-5.4-mini`
 - `@<name>` — a named endpoint profile (see [Model profiles](#model-profiles)),
   e.g. `@deepseek` or `@deepseek:deepseek-reasoner` to override its model
 
@@ -43,18 +43,13 @@ Bare names auto-detect: `gpt-*` / `o[1-5]*` → OpenAI, `claude-*` →
 Anthropic, `gemini-*` → Gemini, `grok*` → Grok, anything else → Ollama.
 When in doubt, use the explicit prefix.
 
-`claude-oauth:` uses your Claude Code subscription login: run `claude login`
-once so the credentials are stored (macOS keychain, or
-`~/.claude/.credentials.json`), and smith reads them from there and calls the
-Anthropic API directly with the subscription OAuth token — the `claude` CLI
-does not need to stay on `PATH` at runtime (override the credential location
-with `CONSTRUCT_CLAUDE_OAUTH_CREDENTIALS`). Smith passes its own tools natively,
-so construct's normal tool approvals and transcript persistence apply. This path
-uses your subscription, not `ANTHROPIC_API_KEY` (that's the separate
-`anthropic:` path). Note: it routes the subscription token straight at the API
-rather than through `claude -p` / the Agent SDK — your own subscription on your
-own machine, but not the surface Anthropic documents for subscription use. See
-`specs/0031-claude-oauth-direct-api.md`.
+`codex-oauth:` uses your Codex CLI subscription login: run `codex login`
+once so the credentials are stored, and smith reads them from there and calls
+the OpenAI-compatible API directly with the subscription OAuth token. The
+`codex` CLI does not need to stay on `PATH` at runtime. Smith passes its own
+tools natively, so construct's normal tool approvals and transcript persistence
+apply. This path uses your subscription, not `OPENAI_API_KEY` (that's the
+separate `openai:` path).
 
 `grok-oauth:` uses the same OpenAI-compatible xAI API endpoint as `grok:`, but
 loads a bearer token from the Grok CLI auth file instead of `GROK_API_KEY` /
