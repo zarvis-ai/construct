@@ -596,6 +596,17 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
+    if let Some((xs, xe, y)) = app.layout.matrix_operator_loop_hit {
+        if my == y && mx >= xs && mx < xe {
+            let label = if app.operator_loop_disabled() {
+                " Resume operator loop "
+            } else {
+                " Pause operator loop "
+            };
+            render_button_tooltip(f, &app.theme, label, xs, y.saturating_add(2));
+            return;
+        }
+    }
     if let Some((xs, xe, y)) = app.layout.matrix_operator_title_hit {
         if my == y && mx >= xs && mx < xe {
             render_button_tooltip(
