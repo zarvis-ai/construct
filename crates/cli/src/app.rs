@@ -6277,7 +6277,7 @@ impl App {
                 Selection::Session(id) => {
                     self.minibuffer = Some(Minibuffer {
                         prompt: format!(
-                            "Session {}: [d] delete (drop transcript + worktree) / [a] archive (terminate, keep, hide) / [N] cancel: ",
+                            "Session {}: [d] delete (drop transcript + worktree) / [y/a] archive (terminate, keep, hide) / [N] cancel: ",
                             short_id(&id)
                         ),
                         input: String::new(),
@@ -12145,19 +12145,18 @@ pub fn parse_group_delete_choice(input: &str) -> GroupDeleteChoice {
 pub enum SessionEndChoice {
     /// `d` / `delete` — drop the transcript, worktree, and all on-disk state.
     Delete,
-    /// `a` / `archive` — terminate the adapter but keep the session; it's
+    /// `a` / `y` / `archive` — terminate the adapter but keep the session; it's
     /// hidden from the list until the "show archived" toggle is on, and can be
     /// restarted later.
     Archive,
-    /// Anything else (including `y`, `n`, empty Enter) — do nothing.
+    /// Anything else (`n`, empty Enter) — do nothing.
     Cancel,
 }
 
 pub fn parse_session_end_choice(input: &str) -> SessionEndChoice {
     match input.trim().to_lowercase().as_str() {
         "d" | "delete" => SessionEndChoice::Delete,
-        "a" | "archive" => SessionEndChoice::Archive,
-        // No `y` alias: delete is destructive, so require an explicit `d`.
+        "a" | "y" | "archive" => SessionEndChoice::Archive,
         _ => SessionEndChoice::Cancel,
     }
 }
@@ -12239,8 +12238,8 @@ mod session_end_prompt_tests {
     }
 
     #[test]
-    fn a_or_archive_archives() {
-        for s in ["a", "A", "  a  ", "archive", "ARCHIVE", " Archive "] {
+    fn a_or_y_or_archive_archives() {
+        for s in ["a", "A", "  a  ", "y", "Y", "  y  ", "archive", "ARCHIVE", " Archive "] {
             assert_eq!(
                 parse_session_end_choice(s),
                 SessionEndChoice::Archive,
@@ -12249,11 +12248,9 @@ mod session_end_prompt_tests {
         }
     }
 
-    /// `y`/`yes` no longer mean delete — the destructive action requires an
-    /// explicit `d`, so a reflexive `y` cancels rather than deletes.
     #[test]
-    fn y_and_anything_else_cancels() {
-        for s in ["", " ", "y", "Y", "yes", "n", "N", "no", "x", "1"] {
+    fn anything_else_cancels() {
+        for s in ["", " ", "n", "N", "no", "x", "1"] {
             assert_eq!(
                 parse_session_end_choice(s),
                 SessionEndChoice::Cancel,
