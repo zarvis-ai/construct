@@ -16,7 +16,7 @@
 //! full command prefix, falling back to `CONSTRUCT_CODEX_BIN` for a binary path.
 
 use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use agentd_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
 use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
@@ -31,8 +31,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let metadata = InitializeResult {
         name: "codex".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -43,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     };
-    run(metadata, |params, ctx| async move {
+    adapter_run(metadata, |params, ctx| async move {
         match resolve_mode(&params) {
             Mode::Interactive => run_interactive(params, ctx).await,
             Mode::Headless => run_session(params, ctx).await,

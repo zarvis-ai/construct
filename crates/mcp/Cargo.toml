@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "MCP stdio server for agentd: lets an agent inside an agentd session control the daemon"
 
-[[bin]]
-name = "construct-mcp"
-path = "src/main.rs"
+[lib]
+name = "construct_mcp"
+path = "src/lib.rs"
 
 [dependencies]
 agentd-protocol = { workspace = true }

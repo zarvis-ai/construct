@@ -12,15 +12,18 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# construct configuration
 # to override.
 
 # [adapters.shell]
-# binary = "construct-adapter-shell"
+# binary = "construct"
+# args = ["__adapter", "shell"]
 # description = "Generic shell command runner"
 
 # [adapters.claude]
-# binary = "construct-adapter-claude"
+# binary = "construct"
+# args = ["__adapter", "claude"]
 # description = "Claude Code"
 
 # [adapters.codex]
-# binary = "construct-adapter-codex"
+# binary = "construct"
+# args = ["__adapter", "codex"]
 # description = "OpenAI Codex"
 
 # [adapters.smith.env]
@@ -135,33 +138,39 @@ pub struct Defaults {
 pub struct BuiltinAdapter {
     pub name: &'static str,
     pub binary: &'static str,
+    pub args: &'static [&'static str],
     pub description: &'static str,
 }
 
 pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
     BuiltinAdapter {
         name: "shell",
-        binary: "construct-adapter-shell",
+        binary: "construct",
+        args: &["__adapter", "shell"],
         description: "Generic shell command runner",
     },
     BuiltinAdapter {
         name: "claude",
-        binary: "construct-adapter-claude",
+        binary: "construct",
+        args: &["__adapter", "claude"],
         description: "Claude Code (wraps the `claude` CLI)",
     },
     BuiltinAdapter {
         name: "codex",
-        binary: "construct-adapter-codex",
+        binary: "construct",
+        args: &["__adapter", "codex"],
         description: "OpenAI Codex (wraps the `codex` CLI)",
     },
     BuiltinAdapter {
         name: "antigravity",
-        binary: "construct-adapter-antigravity",
+        binary: "construct",
+        args: &["__adapter", "antigravity"],
         description: "Google Antigravity (wraps the `agy` CLI)",
     },
     BuiltinAdapter {
         name: "smith",
-        binary: "construct-adapter-smith",
+        binary: "construct",
+        args: &["__adapter", "smith"],
         description: "Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)",
     },
 ];
@@ -189,6 +198,9 @@ impl Config {
             let entry = cfg.adapters.entry(b.name.to_string()).or_default();
             if entry.binary.is_none() {
                 entry.binary = Some(b.binary.to_string());
+            }
+            if entry.args.is_empty() {
+                entry.args = b.args.iter().map(|s| s.to_string()).collect();
             }
             if entry.description.is_none() {
                 entry.description = Some(b.description.to_string());
@@ -259,6 +271,9 @@ mod tests {
             if entry.binary.is_none() {
                 entry.binary = Some(b.binary.to_string());
             }
+            if entry.args.is_empty() {
+                entry.args = b.args.iter().map(|s| s.to_string()).collect();
+            }
             if entry.description.is_none() {
                 entry.description = Some(b.description.to_string());
             }
@@ -266,7 +281,7 @@ mod tests {
         let smith = cfg.adapters.get("smith").expect("smith adapter");
         assert_eq!(
             smith.binary.as_deref(),
-            Some("construct-adapter-smith"),
+            Some("construct"),
             "user-supplied [adapters.smith] with only `env` set must still pick up the built-in binary path",
         );
         // And the user's env stays in place.

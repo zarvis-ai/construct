@@ -23,7 +23,7 @@ mod tasks;
 mod title_mode;
 mod tools;
 
-use agentd_protocol::adapter::run;
+use agentd_protocol::adapter::run as adapter_run;
 use agentd_protocol::{Capabilities, InitializeResult, SessionEvent, SessionStartParams};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,26 +51,7 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    // CLI sub-mode: `construct-adapter-smith --title-mode "<prompt>"` runs
-    // one LLM completion that returns a short conversation title on
-    // stdout. Used by the daemon to auto-name sessions on first input.
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() >= 2 && args[1] == "--title-mode" {
-        let prompt = args.get(2).cloned().unwrap_or_default();
-        match title_mode::suggest_title(&prompt).await {
-            Ok(title) => {
-                println!("{title}");
-                return Ok(());
-            }
-            Err(e) => {
-                eprintln!("title-mode failed: {e}");
-                std::process::exit(1);
-            }
-        }
-    }
-
+pub async fn run() -> anyhow::Result<()> {
     let metadata = InitializeResult {
         name: "smith".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -83,7 +64,7 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     };
-    run(metadata, |params, ctx| async move {
+    adapter_run(metadata, |params, ctx| async move {
         let resolved = match agent::resolve_model(&params) {
             Ok(r) => r,
             Err(e) => {
@@ -109,4 +90,11 @@ async fn main() -> anyhow::Result<()> {
         }
     })
     .await
+}
+
+pub async fn run_title_mode(prompt: &str) -> anyhow::Result<()> {
+    match title_mode::suggest_title(prompt).await {
+        Ok(title) => { println!("{title}"); Ok(()) }
+        Err(e) => { eprintln!("title-mode failed: {e}"); std::process::exit(1); }
+    }
 }

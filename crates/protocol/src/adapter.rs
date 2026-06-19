@@ -198,12 +198,12 @@ pub fn maybe_inject_codex_mcp_args(session_id: &str) -> Vec<String> {
     if std::env::var("CONSTRUCT_INJECT_MCP").as_deref() == Ok("0") {
         return Vec::new();
     }
-    let Some(bin) = paths::locate_sibling_binary("construct-mcp") else {
+    let Some(bin) = paths::locate_sibling_binary("construct") else {
         return Vec::new();
     };
     let bin_lit = toml_quote(&bin.to_string_lossy());
     let env_lit = mcp_env_toml(session_id);
-    let inline = format!("{{ command = {bin_lit}, args = [], env = {env_lit} }}");
+    let inline = format!("{{ command = {bin_lit}, args = [\"__mcp\"], env = {env_lit} }}");
     vec!["-c".into(), format!("mcp_servers.construct={inline}")]
 }
 
@@ -250,7 +250,7 @@ pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
     if std::env::var("CONSTRUCT_INJECT_MCP").as_deref() == Ok("0") {
         return None;
     }
-    let mcp_bin = paths::locate_sibling_binary("construct-mcp")?;
+    let mcp_bin = paths::locate_sibling_binary("construct")?;
     let paths = paths::Paths::discover();
     let dir = paths.state_dir.join("mcp");
     if let Err(e) = std::fs::create_dir_all(&dir) {
@@ -272,7 +272,7 @@ pub fn maybe_inject_mcp_config(session_id: &str) -> Option<PathBuf> {
         "mcpServers": {
             "construct": {
                 "command": mcp_bin.to_string_lossy(),
-                "args": [],
+                "args": ["__mcp"],
                 "env": env,
             }
         }

@@ -143,24 +143,8 @@ impl Daemon {
             std::fs::copy(&src, &dst)
                 .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
             copy_executable_perms(&dst)?;
-            // Best-effort copy of sibling adapter binaries.
-            if let Some(src_dir) = src.parent() {
-                for name in [
-                    "construct-adapter-shell",
-                    "construct-adapter-claude",
-                    "construct-adapter-codex",
-                    "construct-adapter-smith",
-                    "construct-mcp",
-                ] {
-                    let from = src_dir.join(name);
-                    if from.exists() {
-                        let to = bin_dir.join(name);
-                        if std::fs::copy(&from, &to).is_ok() {
-                            let _ = copy_executable_perms(&to);
-                        }
-                    }
-                }
-            }
+            // No sibling adapter binaries needed — all adapters and the MCP
+            // server are built into the single `construct` binary.
             dst
         } else {
             construct_bin_path()?

@@ -25,8 +25,7 @@ mod tools;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
-#[tokio::main]
-async fn main() -> Result<()> {
+pub async fn run() -> Result<()> {
     let socket = std::env::var("CONSTRUCT_SOCKET")
         .ok()
         .map(PathBuf::from)
@@ -44,10 +43,10 @@ async fn main() -> Result<()> {
         }
     };
 
-    run(client, session_id).await
+    run_inner(client, session_id).await
 }
 
-async fn run(client: Arc<Client>, session_id: Option<String>) -> Result<()> {
+async fn run_inner(client: Arc<Client>, session_id: Option<String>) -> Result<()> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
 

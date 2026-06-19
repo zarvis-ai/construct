@@ -134,9 +134,9 @@ cargo build --workspace
 Debug binaries land in `target/debug/`:
 
 - `target/debug/construct` — TUI, control CLI, **the daemon**
-  (`construct daemon run`), and ACP stdio server (`construct acp`)
-- `target/debug/construct-mcp` — MCP bridge for agents
-- `target/debug/construct-adapter-*` — harness adapters
+  (`construct daemon run`), ACP stdio server (`construct acp`),
+  MCP bridge (`construct __mcp`, internal), and all harness adapters
+  (`construct __adapter <name>`, internal)
 
 For an optimized build, use `cargo build --workspace --release` and replace
 `target/debug` with `target/release`.

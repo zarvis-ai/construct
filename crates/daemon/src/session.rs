@@ -2486,7 +2486,8 @@ impl SessionManager {
         let binary_spec = smith_adapter
             .binary
             .clone()
-            .unwrap_or_else(|| "construct-adapter-smith".to_string());
+            .unwrap_or_else(|| "construct".to_string());
+        let prefix_args = smith_adapter.args.clone();
         let Some(binary) = locate_binary(&binary_spec) else {
             return;
         };
@@ -2501,7 +2502,7 @@ impl SessionManager {
         let storage = self.storage.clone();
         let broadcast_tx = self.broadcast.clone();
         tokio::spawn(async move {
-            generate_auto_title(binary, entry, prompt, storage, broadcast_tx).await;
+            generate_auto_title(binary, prefix_args, entry, prompt, storage, broadcast_tx).await;
         });
     }
 
@@ -3569,6 +3570,7 @@ impl SessionManager {
 /// empty output) leaves the session's title unset.
 async fn generate_auto_title(
     binary: PathBuf,
+    prefix_args: Vec<String>,
     entry: Arc<SessionEntry>,
     prompt: String,
     storage: Arc<Storage>,
@@ -3576,6 +3578,7 @@ async fn generate_auto_title(
 ) {
     use std::process::Stdio;
     let output = tokio::process::Command::new(&binary)
+        .args(&prefix_args)
         .arg("--title-mode")
         .arg(&prompt)
         .stdin(Stdio::null())

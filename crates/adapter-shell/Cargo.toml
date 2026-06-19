@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Generic shell command adapter for agentd"
 
-[[bin]]
-name = "construct-adapter-shell"
-path = "src/main.rs"
+[lib]
+name = "construct_adapter_shell"
+path = "src/lib.rs"
 
 [dependencies]
 agentd-protocol = { workspace = true, features = ["pty"] }

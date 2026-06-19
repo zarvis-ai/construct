@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Built-in multi-provider agent harness for agentd (talks to OpenAI, Anthropic, Ollama directly)"
 
-[[bin]]
-name = "construct-adapter-smith"
-path = "src/main.rs"
+[lib]
+name = "construct_adapter_smith"
+path = "src/lib.rs"
 
 [dependencies]
 agentd-protocol = { workspace = true }

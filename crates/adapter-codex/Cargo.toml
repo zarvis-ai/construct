@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "OpenAI Codex adapter for agentd (wraps the `codex` CLI)"
 
-[[bin]]
-name = "construct-adapter-codex"
-path = "src/main.rs"
+[lib]
+name = "construct_adapter_codex"
+path = "src/lib.rs"
 
 [dependencies]
 agentd-protocol = { workspace = true, features = ["pty"] }

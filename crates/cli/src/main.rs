@@ -159,6 +159,15 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+    /// Run the MCP stdio server (internal).
+    #[command(name = "__mcp", hide = true)]
+    Mcp,
+    /// Run an adapter (internal, spawned by the daemon).
+    #[command(name = "__adapter", hide = true)]
+    Adapter {
+        #[command(subcommand)]
+        adapter: AdapterCommand,
+    },
 }
 
 /// Subcommands of `construct daemon`.
@@ -170,6 +179,24 @@ enum DaemonCommand {
     Paths,
     /// Print the embedded default config and exit.
     DefaultConfig,
+}
+
+#[derive(Debug, Subcommand)]
+enum AdapterCommand {
+    #[command(hide = true)]
+    Shell,
+    #[command(hide = true)]
+    Claude,
+    #[command(hide = true)]
+    Codex,
+    #[command(hide = true)]
+    Antigravity,
+    #[command(hide = true)]
+    Smith {
+        /// Auto-title mode: generate a short title for the given prompt.
+        #[arg(long)]
+        title_mode: Option<String>,
+    },
 }
 
 fn init_tracing() {
@@ -457,6 +484,36 @@ async fn main() -> Result<()> {
             ensure_daemon_running(&socket).await;
             acp::run(socket, harness, model, cwd).await
         }
+        Command::Mcp => {
+            construct_mcp::run().await?;
+            Ok(())
+        }
+        Command::Adapter { adapter } => match adapter {
+            AdapterCommand::Shell => {
+                construct_adapter_shell::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Claude => {
+                construct_adapter_claude::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Codex => {
+                construct_adapter_codex::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Antigravity => {
+                construct_adapter_antigravity::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Smith { title_mode: Some(prompt) } => {
+                construct_adapter_smith::run_title_mode(&prompt).await?;
+                Ok(())
+            }
+            AdapterCommand::Smith { title_mode: None } => {
+                construct_adapter_smith::run().await?;
+                Ok(())
+            }
+        },
     }
 }
 

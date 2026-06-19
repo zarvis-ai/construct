@@ -11,12 +11,11 @@
 //! `CONSTRUCT_SHELL_BIN`, then `$SHELL`, then `/bin/bash`.
 
 use agentd_protocol::adapter::pty::{run_session, PtySpec};
-use agentd_protocol::adapter::run;
+use agentd_protocol::adapter::run as adapter_run;
 use agentd_protocol::{Capabilities, InitializeResult, PtySize, SessionState};
 use std::path::PathBuf;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let metadata = InitializeResult {
         name: "shell".into(),
         version: env!("CARGO_PKG_VERSION").into(),
@@ -27,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
             ..Default::default()
         },
     };
-    run(metadata, |params, ctx| async move {
+    adapter_run(metadata, |params, ctx| async move {
         let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
         let command = agentd_protocol::adapter::resolve_command_override(
             "CONSTRUCT_SHELL_CMD",

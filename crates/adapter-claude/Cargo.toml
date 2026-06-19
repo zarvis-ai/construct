@@ -8,9 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Claude Code adapter for agentd (wraps the `claude` CLI)"
 
-[[bin]]
-name = "construct-adapter-claude"
-path = "src/main.rs"
+[lib]
+name = "construct_adapter_claude"
+path = "src/lib.rs"
 
 [dependencies]
 agentd-protocol = { workspace = true, features = ["pty"] }
