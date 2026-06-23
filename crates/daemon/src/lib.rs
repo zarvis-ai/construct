@@ -73,6 +73,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     std::fs::create_dir_all(&paths.data_dir).ok();
     std::fs::create_dir_all(&paths.runtime_dir).ok();
     std::fs::create_dir_all(&paths.config_dir).ok();
+    config::write_template(&paths);
 
     // Resolve the socket path early so the single-instance lock can key off
     // it: two daemons on the *same* socket must not coexist (the second would
