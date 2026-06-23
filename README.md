@@ -87,7 +87,15 @@ construct daemon run
 ```
 
 It owns sessions, persists state, and exposes the local IPC socket used by
-clients.
+clients. Lifecycle helpers are also available for background daemons:
+
+```sh
+construct daemon start
+construct daemon stop             # stops adapters; sessions resume on next start
+construct daemon stop --sessions  # explicit spelling of the same session-safe stop
+construct daemon restart
+construct daemon restart --sessions
+```
 
 ### 4. Start crack the matrix
 

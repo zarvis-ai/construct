@@ -3,7 +3,7 @@
 Status: accepted
 Date: 2026-06-23
 Area: cli
-Scope: How `construct daemon start | stop | restart [--sessions]` map onto daemon and session lifecycle.
+Scope: How `construct daemon start | stop [--sessions] | restart [--sessions]` map onto daemon and session lifecycle.
 
 ## Decision
 
@@ -19,6 +19,9 @@ foreground `run`:
   Sessions are left **resumable**: they are neither archived nor deleted, so the
   next `start` (or `run`) resumes them where they left off. Idempotent — a no-op
   success when no daemon is running.
+- **`stop --sessions`** is accepted as an explicit spelling of the default
+  `stop` behavior. It exists for operator clarity and symmetry with
+  `restart --sessions`; it does not archive or delete sessions.
 - **`restart`** restarts the running daemon **in place** (re-exec, PID
   preserved), or starts one if none is running. Sessions, their harness/adapter
   processes, and each session's `construct-mcp` child **survive and reattach** —

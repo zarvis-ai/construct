@@ -180,7 +180,13 @@ enum DaemonCommand {
     Start,
     /// Stop the running daemon. Adapters are stopped but sessions stay
     /// resumable on the next start.
-    Stop,
+    Stop {
+        /// Explicitly stop session adapters before daemon exit. This is the
+        /// default `daemon stop` behavior; the flag is accepted for symmetry
+        /// with `daemon restart --sessions`.
+        #[arg(long)]
+        sessions: bool,
+    },
     /// Restart the running daemon in place (or start one if none is
     /// running). Sessions are preserved and resume after the restart.
     Restart {
@@ -244,7 +250,7 @@ async fn main() -> Result<()> {
         return match daemon_cmd.unwrap_or(DaemonCommand::Run) {
             DaemonCommand::Run => agentd::run(cli.socket).await,
             DaemonCommand::Start => daemon_start(cli.socket).await,
-            DaemonCommand::Stop => daemon_stop(cli.socket).await,
+            DaemonCommand::Stop { sessions } => daemon_stop(cli.socket, sessions).await,
             DaemonCommand::Restart { sessions } => daemon_restart_cmd(cli.socket, sessions).await,
             DaemonCommand::Paths => {
                 agentd::print_paths();
@@ -671,9 +677,11 @@ async fn daemon_start(socket_override: Option<PathBuf>) -> Result<()> {
 }
 
 /// `construct daemon stop`: ask the running daemon to stop its adapters
-/// (leaving sessions resumable on the next start) and exit. Idempotent —
-/// succeeds as a no-op when no daemon is running.
-async fn daemon_stop(socket_override: Option<PathBuf>) -> Result<()> {
+/// (leaving sessions resumable on the next start) and exit. `--sessions` is
+/// accepted for symmetry with `daemon restart --sessions`; stop already drains
+/// adapters either way. Idempotent — succeeds as a no-op when no daemon is
+/// running.
+async fn daemon_stop(socket_override: Option<PathBuf>, sessions: bool) -> Result<()> {
     let socket = resolve_socket(socket_override);
     if !socket_is_live(&socket) {
         println!("construct daemon is not running ({})", socket.display());
@@ -691,7 +699,14 @@ async fn daemon_stop(socket_override: Option<PathBuf>) -> Result<()> {
     // daemon is actually gone. Adapter teardown is bounded but can be slow
     // (a few seconds per wedged adapter), so allow a generous window.
     if poll_socket(&socket, false, 200).await {
-        println!("construct daemon stopped ({})", socket.display());
+        if sessions {
+            println!(
+                "construct daemon stopped; sessions are resumable ({})",
+                socket.display()
+            );
+        } else {
+            println!("construct daemon stopped ({})", socket.display());
+        }
         Ok(())
     } else {
         anyhow::bail!("construct daemon shutdown requested but it is still running after 20s")
