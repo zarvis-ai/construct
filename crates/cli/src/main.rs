@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-mod app;
 mod acp;
+mod app;
 mod keymap;
 mod matrix_rain;
 mod pty_render;
@@ -225,6 +226,7 @@ fn init_tracing() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Tui);
 
@@ -234,7 +236,10 @@ async fn main() -> Result<()> {
     // rather than connecting to it). The daemon's restart self-`exec()`
     // replays this argv (`construct daemon run …`) verbatim, so picking up an
     // upgraded binary keeps working.
-    if let Command::Daemon { command: daemon_cmd } = command {
+    if let Command::Daemon {
+        command: daemon_cmd,
+    } = command
+    {
         agentd::init_tracing();
         return match daemon_cmd.unwrap_or(DaemonCommand::Run) {
             DaemonCommand::Run => agentd::run(cli.socket).await,
@@ -254,6 +259,12 @@ async fn main() -> Result<()> {
 
     init_tracing();
     let socket = cli.socket.unwrap_or_else(|| Paths::discover().socket());
+
+    if command_allows_upgrade_prompt(&command) {
+        if let Some(exe) = upgrade::prompt_and_upgrade_if_available(&socket).await? {
+            return reexec_upgraded_construct(exe, &raw_args);
+        }
+    }
 
     match command {
         Command::Tui => run_tui(socket).await,
@@ -524,7 +535,9 @@ async fn main() -> Result<()> {
                 construct_adapter_antigravity::run().await?;
                 Ok(())
             }
-            AdapterCommand::Smith { title_mode: Some(prompt) } => {
+            AdapterCommand::Smith {
+                title_mode: Some(prompt),
+            } => {
                 construct_adapter_smith::run_title_mode(&prompt).await?;
                 Ok(())
             }
@@ -534,6 +547,35 @@ async fn main() -> Result<()> {
             }
         },
     }
+}
+
+fn command_allows_upgrade_prompt(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Daemon { .. }
+            | Command::Upgrade { .. }
+            | Command::Acp { .. }
+            | Command::AskGate
+            | Command::Mcp
+            | Command::Adapter { .. }
+    )
+}
+
+#[cfg(unix)]
+fn reexec_upgraded_construct(exe: PathBuf, args: &[OsString]) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    let err = std::process::Command::new(&exe).args(args).exec();
+    Err(anyhow::Error::new(err).context(format!("re-exec upgraded construct at {}", exe.display())))
+}
+
+#[cfg(not(unix))]
+fn reexec_upgraded_construct(exe: PathBuf, _args: &[OsString]) -> Result<()> {
+    println!(
+        "Upgraded. Run {} again to continue with the new binary.",
+        exe.display()
+    );
+    Ok(())
 }
 
 async fn connect(socket: &std::path::Path) -> Result<std::sync::Arc<Client>> {

@@ -8,6 +8,7 @@
 //! shows on startup.
 
 use anyhow::{anyhow, Context, Result};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use agentd_client::Client;
 use agentd_protocol::paths::Paths;
 
 /// GitHub `owner/repo` the release assets and installer come from.
-const REPO: &str = "smith-ai/agentd";
+const REPO: &str = "zarvis-ai/construct";
 /// The installer, baked in at build time so `construct upgrade` and `install.sh`
 /// can never drift apart.
 const INSTALL_SH: &str = include_str!("../../../install.sh");
@@ -24,6 +25,10 @@ const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
+}
+
+fn update_check_disabled() -> bool {
+    std::env::var_os("CONSTRUCT_NO_UPDATE_CHECK").is_some()
 }
 
 /// Parse a `MAJOR.MINOR.PATCH` (optionally `v`-prefixed, optionally with a
@@ -132,7 +137,7 @@ async fn refresh_cache() {
 ///
 /// Must be called from within a Tokio runtime (it may spawn the refresh).
 pub fn cached_update_notice() -> Option<String> {
-    if std::env::var_os("CONSTRUCT_NO_UPDATE_CHECK").is_some() {
+    if update_check_disabled() {
         return None;
     }
     let cache = read_cache().unwrap_or_default();
@@ -146,6 +151,56 @@ pub fn cached_update_notice() -> Option<String> {
 /// not strictly newer (or unparseable).
 fn notice_for(latest: &str, current: &str) -> Option<String> {
     is_newer(latest, current).then(|| format!("↑ construct {latest} · construct upgrade"))
+}
+
+// --- interactive startup check -----------------------------------------------
+
+fn release_tag(latest: &str) -> String {
+    if latest.trim_start().starts_with('v') {
+        latest.trim().to_string()
+    } else {
+        format!("v{}", latest.trim())
+    }
+}
+
+fn wants_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Check for a newer release and, when running interactively, ask whether to
+/// upgrade now. Returns the original executable path after a successful upgrade
+/// so the caller can re-exec and continue under the newly installed binary.
+pub async fn prompt_and_upgrade_if_available(socket: &Path) -> Result<Option<PathBuf>> {
+    if update_check_disabled() || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        return Ok(None);
+    }
+
+    let current = current_version();
+    let Some(latest) = fetch_latest().await else {
+        return Ok(None);
+    };
+    write_cache(&UpdateCache {
+        checked_at_ms: now_ms(),
+        latest: Some(latest.clone()),
+    });
+
+    if !is_newer(&latest, current) {
+        return Ok(None);
+    }
+
+    print!(
+        "construct {latest} is available (you have {current}). Upgrade now and restart the daemon if it is running? [y/N] "
+    );
+    let _ = io::stdout().flush();
+
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() || !wants_yes(&answer) {
+        return Ok(None);
+    }
+
+    let exe = std::env::current_exe().context("resolve current executable before upgrade")?;
+    run(Some(release_tag(&latest)), None, true, false, socket).await?;
+    Ok(Some(exe))
 }
 
 // --- `construct upgrade` -------------------------------------------------------
@@ -269,5 +324,21 @@ mod tests {
         );
         assert_eq!(notice_for("0.1.0", "0.1.0"), None);
         assert_eq!(notice_for("0.1.0", "0.2.0"), None);
+    }
+
+    #[test]
+    fn yes_prompt_accepts_only_affirmative_answers() {
+        assert!(wants_yes("y"));
+        assert!(wants_yes("YES\n"));
+        assert!(!wants_yes(""));
+        assert!(!wants_yes("n"));
+        assert!(!wants_yes("sure"));
+    }
+
+    #[test]
+    fn release_tag_adds_v_prefix_once() {
+        assert_eq!(release_tag("0.11.2"), "v0.11.2");
+        assert_eq!(release_tag("v0.11.2"), "v0.11.2");
+        assert_eq!(release_tag(" 0.11.2 "), "v0.11.2");
     }
 }
