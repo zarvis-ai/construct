@@ -35,6 +35,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+const MAX_CLAUDE_INITIAL_PROMPT_ARG_BYTES: usize = 3500;
+
 pub async fn run() -> anyhow::Result<()> {
     let metadata = InitializeResult {
         name: "claude".into(),
@@ -177,7 +179,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // conversation we're rejoining.
     if !resuming {
         if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
-            args.push(prompt.clone());
+            args.push(interactive_initial_prompt_arg(prompt));
         }
     }
     // Surface the session id to the child's env so agents that aren't using
@@ -210,6 +212,41 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
         status_detail: Some(format!("{label} (interactive)")),
     };
     let _ = run_pty(spec, ctx).await;
+}
+
+fn interactive_initial_prompt_arg(prompt: &str) -> String {
+    if prompt.len() <= MAX_CLAUDE_INITIAL_PROMPT_ARG_BYTES {
+        return prompt.to_string();
+    }
+
+    match write_oversize_initial_prompt(prompt) {
+        Some(path) => format!(
+            "Read the initial prompt and any forked session context from `{}` before taking \
+             action. Continue from that context.",
+            path.display()
+        ),
+        None => truncate_initial_prompt_arg(prompt),
+    }
+}
+
+fn write_oversize_initial_prompt(prompt: &str) -> Option<PathBuf> {
+    let dir = std::env::var_os("CONSTRUCT_SESSION_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("claude-initial-prompt.md");
+    std::fs::write(&path, prompt).ok()?;
+    Some(path)
+}
+
+fn truncate_initial_prompt_arg(prompt: &str) -> String {
+    let suffix = "\n\n[Initial prompt truncated before launch because it exceeded Claude's terminal metadata limit.]";
+    let budget = MAX_CLAUDE_INITIAL_PROMPT_ARG_BYTES.saturating_sub(suffix.len());
+    let mut end = budget.min(prompt.len());
+    while end > 0 && !prompt.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &prompt[..end], suffix)
 }
 
 fn spawn_interactive_transcript_watcher(
@@ -753,6 +790,43 @@ mod tests {
             claude_project_slug(Path::new("/Users/moon/agentd/.claude/worktrees/test")),
             "-Users-moon-agentd--claude-worktrees-test"
         );
+    }
+
+    #[test]
+    fn short_initial_prompt_stays_inline() {
+        let prompt = "continue from here";
+        assert_eq!(interactive_initial_prompt_arg(prompt), prompt);
+    }
+
+    #[test]
+    fn oversize_initial_prompt_spills_to_session_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "construct-claude-prompt-spill-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        std::env::set_var("CONSTRUCT_SESSION_DATA_DIR", &dir);
+
+        let prompt = format!(
+            "objective\n{}",
+            "x".repeat(MAX_CLAUDE_INITIAL_PROMPT_ARG_BYTES + 1)
+        );
+        let arg = interactive_initial_prompt_arg(&prompt);
+
+        assert!(
+            arg.len() < MAX_CLAUDE_INITIAL_PROMPT_ARG_BYTES,
+            "launch arg should stay below Claude metadata limit: {}",
+            arg.len()
+        );
+        assert!(arg.contains("claude-initial-prompt.md"));
+        let path = dir.join("claude-initial-prompt.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("spilled prompt"),
+            prompt
+        );
+
+        std::env::remove_var("CONSTRUCT_SESSION_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
