@@ -491,6 +491,29 @@ impl ItemHistory {
         self.cached.as_ref().map(|c| (c.cols, c.rows))
     }
 
+    /// Whether the child currently has DEC bracketed-paste mode
+    /// (`ESC[?2004h`) enabled, per the live parser. Used to decide
+    /// whether forwarded pastes should be wrapped in the
+    /// `ESC[200~` / `ESC[201~` markers a real terminal would send, so
+    /// the harness runs its own paste handling — claude code's
+    /// image-path drag detection, multiline-paste guard, etc. — instead
+    /// of seeing the text as ordinary typed keystrokes.
+    ///
+    /// Reads the persistent parser kept by the non-tool-block fast path
+    /// (`replay_cached`), which is the one alive for the interactive
+    /// harnesses that enable mode 2004 (claude / codex / shell). The
+    /// `ESC[?2004h` toggle is a CSI sequence, so `feed_byte` lets it flow
+    /// into `pending_chunk` and the parser tracks it like any real
+    /// terminal. Returns `false` before the first replay or for synth
+    /// (smith) sessions with no cached parser — a safe raw-passthrough
+    /// fallback matching the prior behavior.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.cached
+            .as_ref()
+            .map(|c| c.parser.screen().bracketed_paste())
+            .unwrap_or(false)
+    }
+
     /// Feed a raw PTY byte chunk. Parses inline OSC `7700` markers
     /// out, drops the bytes between paired markers, and accumulates
     /// the rest into `Item::PtyChunk` entries.
@@ -3052,6 +3075,35 @@ mod tests {
         let _ = h.replay(80, 24, 0);
         let out = h.replay(120, 30, 0);
         assert!(!out.blocks.is_empty(), "smith blocks survive resize");
+    }
+
+    /// The live parser tracks the child's DEC bracketed-paste mode
+    /// (`ESC[?2004h` / `ESC[?2004l`) so forwarded pastes can be wrapped
+    /// only when the harness asked for it. Claude code enables mode 2004
+    /// on startup; this is what lets a dragged image path reach its
+    /// drag-detection as a paste instead of typed text.
+    #[test]
+    fn tracks_child_bracketed_paste_mode() {
+        let mut h = ItemHistory::new();
+        // No parser yet → safe raw-passthrough default.
+        assert!(!h.bracketed_paste_enabled());
+
+        // Child enables mode 2004 (a CSI sequence, so it flows through
+        // feed_byte into the parser, unlike OSC sequences).
+        h.feed_pty(b"\x1b[?2004h");
+        let _ = h.replay(80, 24, 0);
+        assert!(
+            h.bracketed_paste_enabled(),
+            "ESC[?2004h should enable bracketed-paste tracking"
+        );
+
+        // Child disables it again.
+        h.feed_pty(b"\x1b[?2004l");
+        let _ = h.replay(80, 24, 0);
+        assert!(
+            !h.bracketed_paste_enabled(),
+            "ESC[?2004l should disable bracketed-paste tracking"
+        );
     }
 
     /// Regression: when the smith editor pane grows (user types
