@@ -8044,10 +8044,32 @@ fn open_url(url: &str) -> Result<()> {
 }
 
 fn copy_to_clipboard(text: &str) -> Result<()> {
+    // `pbcopy` writes to the clipboard of the host construct runs on; OSC 52
+    // travels back through the controlling terminal to the clipboard of the
+    // machine the user is actually sitting at. Over SSH those differ — pbcopy
+    // would land on the remote host, and on a remote macOS host it *succeeds*
+    // against the wrong pasteboard, so the OSC 52 fallback never fires and the
+    // selection never reaches the user's clipboard. Prefer OSC 52 when we
+    // detect a remote session; keep pbcopy first locally, where it's the
+    // reliable path (e.g. Terminal.app honors no OSC 52).
+    if is_remote_session() {
+        if copy_with_osc52(text).is_ok() {
+            return Ok(());
+        }
+        return copy_with_pbcopy(text);
+    }
     if copy_with_pbcopy(text).is_ok() {
         return Ok(());
     }
     copy_with_osc52(text)
+}
+
+/// True when the process appears to be running inside an SSH session, where
+/// local pasteboard tools (`pbcopy`) would target the remote host rather than
+/// the machine the user is sitting at.
+fn is_remote_session() -> bool {
+    std::env::var_os("SSH_TTY").is_some_and(|v| !v.is_empty())
+        || std::env::var_os("SSH_CONNECTION").is_some_and(|v| !v.is_empty())
 }
 
 fn copy_with_pbcopy(text: &str) -> Result<()> {
@@ -8067,11 +8089,18 @@ fn copy_with_pbcopy(text: &str) -> Result<()> {
     }
 }
 
-fn copy_with_osc52(text: &str) -> Result<()> {
+/// Build the OSC 52 clipboard-write escape sequence for `text`: the terminal
+/// that receives it copies the (base64-encoded) payload to the system
+/// clipboard of the machine the terminal runs on.
+fn osc52_sequence(text: &str) -> String {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{encoded}\x07")
+}
+
+fn copy_with_osc52(text: &str) -> Result<()> {
     let mut stdout = std::io::stdout();
-    write!(stdout, "\x1b]52;c;{encoded}\x07")?;
+    write!(stdout, "{}", osc52_sequence(text))?;
     stdout.flush()?;
     Ok(())
 }
@@ -8087,6 +8116,13 @@ fn byte_pos(s: &str, char_idx: usize) -> usize {
 mod tests {
     use super::*;
     use ratatui::layout::Rect;
+
+    #[test]
+    fn osc52_sequence_wraps_base64_in_clipboard_escape() {
+        // ESC ] 52 ; c ; <base64> BEL — base64("hi") == "aGk=".
+        assert_eq!(osc52_sequence("hi"), "\x1b]52;c;aGk=\u{7}");
+        assert_eq!(osc52_sequence(""), "\x1b]52;c;\u{7}");
+    }
 
     #[test]
     fn operator_monolog_text_filters_noise() {
