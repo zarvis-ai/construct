@@ -2443,7 +2443,8 @@ impl App {
             Some(MinibufferIntent::Orchestrator) => {
                 if let Some(orch_id) = self.orchestrator_id.clone() {
                     self.orchestrator_scrollback = 0;
-                    self.queue_pty_input(orch_id, text.into_bytes(), "orchestrator pty_input");
+                    let bytes = self.encode_paste_for_pty(&orch_id, text);
+                    self.queue_pty_input(orch_id, bytes, "orchestrator pty_input");
                 }
             }
             Some(_) => {
@@ -2455,11 +2456,46 @@ impl App {
                 let active_window = Some(self.active_window_id);
                 self.set_scrollback_for_window(active_window, 0);
                 if let Some(id) = self.selected_id() {
-                    self.queue_pty_input(id, text.into_bytes(), "pty_input");
+                    let bytes = self.encode_paste_for_pty(&id, text);
+                    self.queue_pty_input(id, bytes, "pty_input");
                 }
             }
             None => {}
         }
+    }
+
+    /// Encode pasted text for forwarding to a child PTY. If the child has
+    /// DEC bracketed-paste mode enabled, wrap the payload in the
+    /// `ESC[200~` / `ESC[201~` markers a real terminal would send, so the
+    /// harness runs its own paste handling — claude code's image-path drag
+    /// detection (a dragged image becomes `[image #N]` instead of a raw
+    /// path), its multiline-paste guard, shell readline's "don't execute
+    /// until Enter", etc. Without the markers the harness sees the bytes as
+    /// ordinary typed keystrokes, which is why a dragged image path used to
+    /// land as literal text.
+    ///
+    /// The closing marker is stripped from the payload first so an embedded
+    /// `ESC[201~` can't terminate the paste early — the same paste-injection
+    /// guard real terminals apply. When the child has not enabled mode 2004
+    /// (or we have no parser yet) the text is forwarded raw, preserving the
+    /// prior behavior.
+    fn encode_paste_for_pty(&self, session_id: &str, text: String) -> Vec<u8> {
+        let bracketed = self
+            .histories
+            .get(session_id)
+            .map(|h| h.bracketed_paste_enabled())
+            .unwrap_or(false);
+        if !bracketed {
+            return text.into_bytes();
+        }
+        const START: &[u8] = b"\x1b[200~";
+        const END: &[u8] = b"\x1b[201~";
+        let sanitized = text.replace("\x1b[201~", "");
+        let mut out = Vec::with_capacity(START.len() + sanitized.len() + END.len());
+        out.extend_from_slice(START);
+        out.extend_from_slice(sanitized.as_bytes());
+        out.extend_from_slice(END);
+        out
     }
 
     pub fn start_session_transition(&mut self) {
@@ -10752,6 +10788,38 @@ mod tests {
             app.minibuffer.as_ref().map(|mb| mb.input.as_str()),
             Some("see [#file:/tmp/clipboard.txt]")
         );
+
+        server.abort();
+    }
+
+    /// A paste forwarded to a PTY child is wrapped in `ESC[200~` /
+    /// `ESC[201~` only when that child has DEC bracketed-paste mode
+    /// enabled — the framing a real terminal supplies. This is what lets
+    /// claude code recognize a dragged image path as a paste (→ `[image
+    /// #N]`) instead of literal typed text. Children that never enable
+    /// mode 2004 still get raw bytes, preserving the prior behavior.
+    #[tokio::test]
+    async fn paste_wraps_in_bracketed_markers_only_when_child_enables_mode_2004() {
+        let (mut app, _dir, server) = captured_app().await;
+
+        // Child has not enabled bracketed paste yet → forwarded raw.
+        let raw = app.encode_paste_for_pty("s1", "/tmp/cat.png".into());
+        assert_eq!(raw, b"/tmp/cat.png".to_vec());
+
+        // Child enables DEC mode 2004 (claude code does this on startup).
+        let h = app
+            .histories
+            .entry("s1".into())
+            .or_insert_with(crate::pty_render::ItemHistory::new);
+        h.feed_pty(b"\x1b[?2004h");
+        let _ = h.replay(80, 24, 0);
+
+        let wrapped = app.encode_paste_for_pty("s1", "/tmp/cat.png".into());
+        assert_eq!(wrapped, b"\x1b[200~/tmp/cat.png\x1b[201~".to_vec());
+
+        // An embedded end-marker is stripped so it can't end the paste early.
+        let injected = app.encode_paste_for_pty("s1", "a\x1b[201~b".into());
+        assert_eq!(injected, b"\x1b[200~ab\x1b[201~".to_vec());
 
         server.abort();
     }
