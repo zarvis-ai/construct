@@ -32,6 +32,17 @@ projects/<project-id>/
 Legacy `groups/<project-id>.json` files are migrated to
 `projects/<project-id>/meta.json` when loaded.
 
+## Upgrade Checks
+
+Interactive client commands check GitHub for newer releases before running. If
+one is available, `construct` asks whether to upgrade now; accepting upgrades
+the installed binary, restarts a running daemon, and resumes the original
+command under the new binary. Daemon, adapter, ACP stdio, and other internal
+invocations skip this prompt, as do non-interactive runs.
+
+Set `CONSTRUCT_NO_UPDATE_CHECK=1` to disable both the interactive prompt and
+the TUI's cached update-available notice.
+
 ## Local web UI
 
 The daemon always serves a browser UI on localhost (no auth — this is local-only;

@@ -107,8 +107,10 @@ construct upgrade --restart  # upgrade, then restart a running daemon to apply
 `--version vX.Y.Z`); re-running the install one-liner does the same thing. A
 running daemon keeps the old code until it restarts — pass `--restart`, or run
 `/construct restart` in the TUI, to pick up the upgrade without losing sessions.
-The TUI also surfaces a one-line notice when a newer release is available
-(disable with `CONSTRUCT_NO_UPDATE_CHECK=1`).
+Interactive client commands also ask whether to upgrade when a newer release is
+available; saying yes upgrades in place, restarts a running daemon, and resumes
+the original command under the new binary. The TUI still surfaces a one-line
+notice from the cached check. Disable both with `CONSTRUCT_NO_UPDATE_CHECK=1`.
 
 ## ACP (Agent Client Protocol) server
 
