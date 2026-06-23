@@ -4753,9 +4753,9 @@ function appendOptimisticUserMessage(sessionId, text) {
 }
 
 function markOptimisticMessageSent(entry) {
+  if (!entry) return;
   ensureThinkingBanner(entry.sessionId);
-
-  if (!entry || !entry.row) return;
+  if (!entry.row) return;
   entry.row.classList.remove("optimistic");
 }
 
