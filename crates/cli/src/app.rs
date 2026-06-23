@@ -3289,8 +3289,15 @@ impl App {
             self.selection = selection;
             self.focus = PaneFocus::View;
             if changed_selection {
-                self.transcript.clear();
-                self.transcript_session = None;
+                // Only clear the transcript when switching to a real session.
+                // Focusing a welcome-screen pane (Selection::None) has no
+                // session to hydrate, so clearing here leaves other split
+                // panes with an empty transcript and the "No structured chat
+                // events" message until focus moves away again.
+                if self.selection.session_id().is_some() {
+                    self.transcript.clear();
+                    self.transcript_session = None;
+                }
                 if !self.is_split_layout() {
                     self.view_scrollback = 0;
                 }
