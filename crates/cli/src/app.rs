@@ -1993,115 +1993,122 @@ async fn run_loop(
             terminal.draw(|f| ui::render(f, app))?;
         }
 
-        // A session switch should stay interactive while history-sized
-        // work runs. Selection handlers only mark the transcript as
-        // stale; after the frame above has painted the new list highlight
-        // / placeholder view, start transcript + PTY hydration in the
-        // background. If the user switches again, keep the old hydration
-        // running so its history is warm if they switch back.
-        if app.selected_needs_hydration() {
-            if let Some(req) = app.selected_hydration_request() {
-                if hydration_sessions.insert(req.session_id.clone()) {
-                    app.hydrating_sessions.insert(req.session_id.clone());
-                    hydration_tasks.spawn(async move {
-                        let session_id = req.session_id.clone();
-                        let loaded = load_session_hydration(req).await;
-                        (session_id, loaded)
-                    });
-                }
-            }
-        }
-
-        let selected_hydrating = &hydration_sessions;
-        for id in app
-            .main_window_sessions_needing_hydration()
-            .into_iter()
-            .chain(app.pinned_sessions_needing_hydration())
-            .chain(app.orchestrator_session_needing_hydration())
-        {
-            if selected_hydrating.contains(&id)
-                || pinned_hydration_session.as_deref() == Some(id.as_str())
-                || pinned_hydration_queue.iter().any(|queued| queued == &id)
-            {
-                continue;
-            }
-            app.hydrating_sessions.insert(id.clone());
-            pinned_hydration_queue.push_back(id);
-        }
-        if pinned_hydration_task.is_none() {
-            while let Some(id) = pinned_hydration_queue.pop_front() {
-                if selected_hydrating.contains(&id) || app.histories.contains_key(&id) {
-                    app.hydrating_sessions.remove(&id);
-                    continue;
-                }
-                let req = app.session_hydration_request(&id, true);
-                pinned_hydration_session = Some(id);
-                pinned_hydration_task = Some(tokio::spawn(load_session_hydration(req)));
-                break;
-            }
-        }
-
-        // Right pane (main session) resize — debounced fire. Also
-        // refires if the *selected* session changed since last sent.
-        let cur = app.active_pane_size();
-        let split_sizes = app.window_session_pane_sizes();
-        let cur_session = app.selected_id();
-        let session_changed = cur_session != last_session_sent;
-        if cur.0 > 0 && cur.1 > 0 && (cur != last_size_sent || session_changed) {
-            match pending_size {
-                Some((p, _)) if p == cur && !session_changed => {}
-                _ => pending_size = Some((cur, Instant::now())),
-            }
-        } else {
-            pending_size = None;
-        }
-        if let Some((size, at)) = pending_size {
-            if at.elapsed() >= resize_debounce || session_changed {
-                if split_sizes.is_empty() {
-                    app.notify_pane_size(size.0, size.1).await;
-                } else {
-                    let sessions = app.sessions.clone();
-                    for (id, (cols, rows)) in &split_sizes {
-                        if sessions
-                            .iter()
-                            .any(|s| s.id == *id && s.has_pty && !s.state.is_terminal())
-                        {
-                            let _ = app.client.pty_resize(id, *cols, *rows).await;
-                        }
+        // A PTY-passthrough keystroke has already queued bytes to the input
+        // pump and deliberately skipped the stale immediate draw. Keep that
+        // fast path focused on input/output readiness: the visible update is
+        // the child PTY echo, so do not spend this iteration walking hydration
+        // queues or resize debounce state before polling notifications again.
+        if !skip_draw {
+            // A session switch should stay interactive while history-sized
+            // work runs. Selection handlers only mark the transcript as
+            // stale; after the frame above has painted the new list highlight
+            // / placeholder view, start transcript + PTY hydration in the
+            // background. If the user switches again, keep the old hydration
+            // running so its history is warm if they switch back.
+            if app.selected_needs_hydration() {
+                if let Some(req) = app.selected_hydration_request() {
+                    if hydration_sessions.insert(req.session_id.clone()) {
+                        app.hydrating_sessions.insert(req.session_id.clone());
+                        hydration_tasks.spawn(async move {
+                            let session_id = req.session_id.clone();
+                            let loaded = load_session_hydration(req).await;
+                            (session_id, loaded)
+                        });
                     }
                 }
-                last_size_sent = size;
-                last_session_sent = cur_session;
-                pending_size = None;
             }
-        }
-        // Orchestrator panel resize — same debounce, separate target.
-        if let Some(orch_size) = app.orchestrator_desired_size {
-            if orch_size != last_orch_sent && orch_size.0 > 0 && orch_size.1 > 0 {
-                match pending_orch {
-                    Some((p, _)) if p == orch_size => {}
-                    _ => pending_orch = Some((orch_size, Instant::now())),
+
+            let selected_hydrating = &hydration_sessions;
+            for id in app
+                .main_window_sessions_needing_hydration()
+                .into_iter()
+                .chain(app.pinned_sessions_needing_hydration())
+                .chain(app.orchestrator_session_needing_hydration())
+            {
+                if selected_hydrating.contains(&id)
+                    || pinned_hydration_session.as_deref() == Some(id.as_str())
+                    || pinned_hydration_queue.iter().any(|queued| queued == &id)
+                {
+                    continue;
+                }
+                app.hydrating_sessions.insert(id.clone());
+                pinned_hydration_queue.push_back(id);
+            }
+            if pinned_hydration_task.is_none() {
+                while let Some(id) = pinned_hydration_queue.pop_front() {
+                    if selected_hydrating.contains(&id) || app.histories.contains_key(&id) {
+                        app.hydrating_sessions.remove(&id);
+                        continue;
+                    }
+                    let req = app.session_hydration_request(&id, true);
+                    pinned_hydration_session = Some(id);
+                    pinned_hydration_task = Some(tokio::spawn(load_session_hydration(req)));
+                    break;
+                }
+            }
+
+            // Right pane (main session) resize — debounced fire. Also
+            // refires if the *selected* session changed since last sent.
+            let cur = app.active_pane_size();
+            let split_sizes = app.window_session_pane_sizes();
+            let cur_session = app.selected_id();
+            let session_changed = cur_session != last_session_sent;
+            if cur.0 > 0 && cur.1 > 0 && (cur != last_size_sent || session_changed) {
+                match pending_size {
+                    Some((p, _)) if p == cur && !session_changed => {}
+                    _ => pending_size = Some((cur, Instant::now())),
                 }
             } else {
-                pending_orch = None;
+                pending_size = None;
             }
-        }
-        if let Some((size, at)) = pending_orch {
-            if at.elapsed() >= resize_debounce {
-                if let Some(orch_id) = app.orchestrator_id.clone() {
-                    // Fire-and-forget: the adapter may still be in its startup
-                    // health-check when the panel first opens (model broken,
-                    // OAuth refresh in flight, etc.).  Awaiting it directly
-                    // here — before tokio::select! — blocks the entire render
-                    // loop (matrix rain, notifications, keystrokes) for up to
-                    // the 60 s adapter.request timeout and freezes the TUI.
-                    let client = app.client.clone();
-                    tokio::spawn(async move {
-                        let _ = client.pty_resize(&orch_id, size.0, size.1).await;
-                    });
+            if let Some((size, at)) = pending_size {
+                if at.elapsed() >= resize_debounce || session_changed {
+                    if split_sizes.is_empty() {
+                        app.notify_pane_size(size.0, size.1).await;
+                    } else {
+                        let sessions = app.sessions.clone();
+                        for (id, (cols, rows)) in &split_sizes {
+                            if sessions
+                                .iter()
+                                .any(|s| s.id == *id && s.has_pty && !s.state.is_terminal())
+                            {
+                                let _ = app.client.pty_resize(id, *cols, *rows).await;
+                            }
+                        }
+                    }
+                    last_size_sent = size;
+                    last_session_sent = cur_session;
+                    pending_size = None;
                 }
-                last_orch_sent = size;
-                pending_orch = None;
+            }
+            // Orchestrator panel resize — same debounce, separate target.
+            if let Some(orch_size) = app.orchestrator_desired_size {
+                if orch_size != last_orch_sent && orch_size.0 > 0 && orch_size.1 > 0 {
+                    match pending_orch {
+                        Some((p, _)) if p == orch_size => {}
+                        _ => pending_orch = Some((orch_size, Instant::now())),
+                    }
+                } else {
+                    pending_orch = None;
+                }
+            }
+            if let Some((size, at)) = pending_orch {
+                if at.elapsed() >= resize_debounce {
+                    if let Some(orch_id) = app.orchestrator_id.clone() {
+                        // Fire-and-forget: the adapter may still be in its startup
+                        // health-check when the panel first opens (model broken,
+                        // OAuth refresh in flight, etc.).  Awaiting it directly
+                        // here — before tokio::select! — blocks the entire render
+                        // loop (matrix rain, notifications, keystrokes) for up to
+                        // the 60 s adapter.request timeout and freezes the TUI.
+                        let client = app.client.clone();
+                        tokio::spawn(async move {
+                            let _ = client.pty_resize(&orch_id, size.0, size.1).await;
+                        });
+                    }
+                    last_orch_sent = size;
+                    pending_orch = None;
+                }
             }
         }
         tokio::select! {
@@ -8394,6 +8401,33 @@ mod tests {
         assert!(
             body.contains("drain_started"),
             "notification drain must measure elapsed time from the batch start"
+        );
+    }
+
+    #[test]
+    fn pty_skip_redraw_path_skips_housekeeping_before_select() {
+        let src = include_str!("app.rs");
+        let skip_at = src
+            .find("let skip_draw = std::mem::take(&mut app.skip_redraw_after_event);")
+            .expect("run_loop should consume skip_redraw_after_event");
+        let select_at = src[skip_at..]
+            .find("tokio::select! {")
+            .map(|idx| skip_at + idx)
+            .expect("run_loop should select after draw/maintenance");
+        let body = &src[skip_at..select_at];
+        let guard_at = body
+            .find("if !skip_draw {")
+            .expect("maintenance must be gated by skip_draw");
+        let hydration_at = body
+            .find("app.selected_needs_hydration()")
+            .expect("selected hydration maintenance should remain in run_loop");
+        let resize_at = body
+            .find("app.active_pane_size()")
+            .expect("resize maintenance should remain in run_loop");
+        assert!(
+            guard_at < hydration_at && guard_at < resize_at,
+            "PTY passthrough skip-redraw should return to select! before \
+             hydration/resize housekeeping can delay PTY echo handling"
         );
     }
 
