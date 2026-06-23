@@ -78,7 +78,7 @@
     opacity: 0.70;
   }
   header {
-    --header-h: 36px;
+    --header-h: 44px;
     flex: 0 0 auto;
     display: flex;
     align-items: center;
@@ -381,6 +381,30 @@
   .session-list .item.is-subagent {
     opacity: 0.92;
     padding-left: 40px;
+  }
+  .session-list .item.is-archived {
+    opacity: 0.55;
+  }
+  .session-list .archived-row {
+    padding: 3px 12px;
+    color: var(--fg-dim);
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  .session-list .archived-row:hover { background: var(--bg-elev-2); }
+  .session-list .archived-row.indent { padding-left: 20px; }
+  .session-list .archived-glyph {
+    flex: 0 0 20px;
+    width: 20px;
+    color: var(--fg-faint);
+    font-size: 14px;
+    line-height: 1;
+    text-align: center;
   }
   .session-list .item .disclosure {
     flex: 0 0 20px;
@@ -1708,6 +1732,25 @@
     </form>
   </div>
 
+  <!--
+    Close-session sheet. Offers Archive (terminate + hide, keep history)
+    or Delete (permanent) so users aren't forced to hard-delete just to
+    tidy the list — matching the TUI's [d]elete / [a]rchive prompt.
+  -->
+  <div id="closeSessionSheet" class="approval-sheet" hidden role="dialog" aria-modal="true">
+    <div class="approval-card" id="closeSessionCard">
+      <div class="approval-head">
+        <div class="approval-tool-name">Close session</div>
+      </div>
+      <div class="approval-body" id="closeSessionLabel" style="padding: 0 0 12px; color: var(--fg-dim); font-size: 13px;"></div>
+      <div class="approval-actions">
+        <button type="button" class="btn-deny" id="closeSessionCancel">Cancel</button>
+        <button type="button" class="btn-deny" id="closeSessionDelete">Delete</button>
+        <button type="button" class="btn-approve" id="closeSessionArchive">Archive</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 "use strict";
 
@@ -1803,6 +1846,8 @@ const state = {
   harnesses: [],
   groups: [],   // [{id, name, position, collapsed}], TUI-style ordering
   subagentCollapsed: new Set(),
+  showArchivedUngrouped: false,
+  showArchivedGroups: new Set(),
   currentId: null,
   // Per-session transcript items (the rows we've rendered). Keyed by
   // session_id so switching sessions is just a re-render of cached
@@ -2417,25 +2462,43 @@ function orderedItems() {
     }
   }
 
-  const ungrouped = userSessions
+  const ungroupedAll = userSessions
     .filter((s) => !s.group_id)
     .slice()
     .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  const ungrouped = ungroupedAll.filter((s) => !s.archived);
+  const archivedUngrouped = ungroupedAll.filter((s) => s.archived);
   const groups = state.groups
     .slice()
     .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   const items = [];
   if (operator) items.push({ kind: "session", session: operator, isOperator: true });
   for (const s of ungrouped) pushSession(items, s);
+  if (archivedUngrouped.length > 0) {
+    const expanded = state.showArchivedUngrouped;
+    items.push({ kind: "archived-row", section: "ungrouped", count: archivedUngrouped.length, expanded });
+    if (expanded) {
+      for (const s of archivedUngrouped) pushSession(items, s);
+    }
+  }
   for (const g of groups) {
     items.push({ kind: "group", group: g });
     if (g.collapsed) continue;
-    const members = userSessions
+    const membersAll = userSessions
       .filter((s) => s.group_id === g.id)
       .slice()
       .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
-    for (const s of members) {
+    const activeMembers = membersAll.filter((s) => !s.archived);
+    const archivedMembers = membersAll.filter((s) => s.archived);
+    for (const s of activeMembers) {
       pushSession(items, s, true);
+    }
+    if (archivedMembers.length > 0) {
+      const expanded = state.showArchivedGroups.has(g.id);
+      items.push({ kind: "archived-row", section: g.id, count: archivedMembers.length, expanded, indented: true });
+      if (expanded) {
+        for (const s of archivedMembers) pushSession(items, s, true);
+      }
     }
   }
   return items;
@@ -2513,6 +2576,11 @@ function bindSessionListClicks() {
       toggleSubagentCollapsed(disclosure.dataset.parentId);
       return;
     }
+    const archivedRow = t.closest(".archived-row");
+    if (archivedRow) {
+      toggleArchivedSection(archivedRow.dataset.archivedSection);
+      return;
+    }
     const group = t.closest(".group-header");
     if (group) {
       toggleGroupCollapsed(group.dataset.groupId);
@@ -2528,6 +2596,18 @@ function bindSessionListClicks() {
  *  selection change (class only) never rebuilds a row's status element
  *  (which would restart its statusPulse animation). */
 function sessionRowDescriptor(item) {
+  if (item.kind === "archived-row") {
+    const glyph = item.expanded ? "▾" : "▸";
+    return {
+      key: "ar:" + item.section,
+      datasetKey: "archivedSection",
+      datasetVal: item.section,
+      className: "archived-row" + (item.indented ? " indent" : ""),
+      inner:
+        `<span class="archived-glyph">${glyph}</span>` +
+        `<span class="archived-label">${item.count} archived</span>`,
+    };
+  }
   if (item.kind === "group") {
     const g = item.group;
     const glyph = g.collapsed ? "▸" : "▾";
@@ -2573,7 +2653,8 @@ function sessionRowDescriptor(item) {
       "item" + active +
       (item.indented ? " indent" : "") +
       (item.isSubagent ? " is-subagent" : "") +
-      (s.pinned ? " is-pinned" : ""),
+      (s.pinned ? " is-pinned" : "") +
+      (s.archived ? " is-archived" : ""),
     inner:
       disclosure + pin + sessionStatusHtml(s) +
       `<div class="row-main"><div class="name-line"><div class="name">${escape(sessionDisplayTitle(s))}</div></div>${harness}</div>`,
@@ -2736,6 +2817,17 @@ function toggleSubagentCollapsed(parentId) {
   renderSessions();
 }
 
+function toggleArchivedSection(section) {
+  if (!section) return;
+  if (section === "ungrouped") {
+    state.showArchivedUngrouped = !state.showArchivedUngrouped;
+  } else {
+    if (state.showArchivedGroups.has(section)) state.showArchivedGroups.delete(section);
+    else state.showArchivedGroups.add(section);
+  }
+  renderSessions();
+}
+
 /** Dispatch a session action by name. Wired up to the shared
  *  list toolbar (acts on `state.currentId`). Rename hands off
  *  to a slide-up sheet because it needs text input; delete asks
@@ -2765,9 +2857,8 @@ async function handleRowAction(action, sessionId) {
     return;
   }
   if (action === "delete") {
-    const s = state.sessions.find((x) => x.id === sessionId);
-    const label = (s && sessionDisplayTitle(s)) || sessionId.slice(0, 8);
-    if (!window.confirm(`Delete session “${label}”? This cannot be undone.`)) return;
+    openCloseSessionDialog(sessionId);
+    return;
   }
   try {
     if (action === "restart") {
@@ -2776,8 +2867,6 @@ async function handleRowAction(action, sessionId) {
       await rpc("session.move", { session_id: sessionId, direction: "up" });
     } else if (action === "move-down") {
       await rpc("session.move", { session_id: sessionId, direction: "down" });
-    } else if (action === "delete") {
-      await rpc("session.delete", { session_id: sessionId });
     }
   } catch (e) {
     appendError(`${action} failed: ${e.message}`);
@@ -6108,6 +6197,58 @@ renameFormEl.addEventListener("submit", submitRename);
 renameSheetEl.addEventListener("click", (ev) => {
   // Click on the backdrop (the sheet itself, not the card) closes.
   if (ev.target === renameSheetEl) closeRenameDialog();
+});
+
+// --- Close-session dialog -----------------------------------------------
+//
+// Offers Archive (terminate + hide, keep history) or Delete (permanent),
+// matching the TUI's [d]elete / [a]rchive / [N]cancel prompt.
+
+const closeSessionSheetEl = $("closeSessionSheet");
+const closeSessionLabelEl = $("closeSessionLabel");
+const closeSessionCancelBtn = $("closeSessionCancel");
+const closeSessionDeleteBtn = $("closeSessionDelete");
+const closeSessionArchiveBtn = $("closeSessionArchive");
+
+function openCloseSessionDialog(sessionId) {
+  const s = state.sessions.find((x) => x.id === sessionId);
+  if (!s) return;
+  closeSessionSheetEl.dataset.sessionId = sessionId;
+  const label = sessionDisplayTitle(s) || sessionId.slice(0, 8);
+  closeSessionLabelEl.textContent = `"${label}"`;
+  closeSessionSheetEl.hidden = false;
+}
+
+function closeCloseSessionDialog() {
+  closeSessionSheetEl.hidden = true;
+  delete closeSessionSheetEl.dataset.sessionId;
+}
+
+closeSessionCancelBtn.addEventListener("click", closeCloseSessionDialog);
+closeSessionSheetEl.addEventListener("click", (ev) => {
+  if (ev.target === closeSessionSheetEl) closeCloseSessionDialog();
+});
+
+closeSessionArchiveBtn.addEventListener("click", async () => {
+  const sessionId = closeSessionSheetEl.dataset.sessionId;
+  closeCloseSessionDialog();
+  if (!sessionId) return;
+  try {
+    await rpc("session.archive", { session_id: sessionId });
+  } catch (e) {
+    appendError(`archive failed: ${e.message}`);
+  }
+});
+
+closeSessionDeleteBtn.addEventListener("click", async () => {
+  const sessionId = closeSessionSheetEl.dataset.sessionId;
+  closeCloseSessionDialog();
+  if (!sessionId) return;
+  try {
+    await rpc("session.delete", { session_id: sessionId });
+  } catch (e) {
+    appendError(`delete failed: ${e.message}`);
+  }
 });
 
 // Shared list toolbar — delegate the click to the same
