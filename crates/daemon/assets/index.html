@@ -1857,6 +1857,13 @@ const state = {
   // mounted avoids repainting long headless sessions from the beginning when
   // the user switches away and back.
   transcriptPaneById: new Map(),
+  // One resumable older-history backfill per transcript pane. Backfill pauses
+  // when chat is not the visible surface because hidden panes do not have
+  // reliable layout metrics for scroll anchoring.
+  transcriptHistoryLoadById: new Map(),
+  // Scroll anchor captured before leaving chat view. Restored when the cached
+  // pane is shown again so background history prepends do not move the reader.
+  transcriptViewportById: new Map(),
   // User messages rendered immediately from the web composer before the
   // daemon's canonical transcript event round-trips back. The live event
   // reconciles these rows so chat mode feels instant without duplicates.
@@ -2938,7 +2945,7 @@ async function switchCurrentViewMode(mode) {
   } else {
     rememberActiveTerminalState();
     enterChatMode();
-    await loadTranscript(id, { force: true });
+    await loadTranscript(id);
   }
   setComposerEnabled(!!(state.ws && state.ws.readyState === 1 && state.currentId));
   reportView();
@@ -2949,6 +2956,7 @@ async function selectSession(id, { replaceUrl = false } = {}) {
     setLocationSessionId(id, { replace: replaceUrl });
     return;
   }
+  if (state.mode === "chat") rememberTranscriptViewport(state.currentId);
   const focusTerminalAfterSwitch = shouldFocusTerminalAfterSessionSwitch();
   state.currentId = id;
   setLocationSessionId(id, { replace: replaceUrl });
@@ -3009,10 +3017,11 @@ function blurActiveTerminalInput() {
 
 function enterChatMode() {
   state.mode = "chat";
-  showTranscriptPane(state.currentId);
+  const pane = showTranscriptPane(state.currentId);
   transcriptEl.hidden = false;
   composerEl.hidden = false;
   terminalWrapEl.hidden = true;
+  if (pane && pane.dataset.loaded === "true") restoreTranscriptViewport(state.currentId);
   terminalEl.classList.remove("hide-xterm-cursor");
   terminalScrollOverlayEl.hidden = true;
   renderWidgets();
@@ -3069,6 +3078,7 @@ function resetTerminalReplay(handle) {
 }
 
 async function enterTerminalMode(id, options = {}) {
+  if (state.mode === "chat") rememberTranscriptViewport(id);
   rememberActiveTerminalState();
   state.mode = "terminal";
   activeTranscriptEl = null;
@@ -4168,17 +4178,34 @@ function showTranscriptPane(id) {
 }
 
 function clearTranscriptPane(id) {
+  cancelTranscriptHistoryLoad(id);
   const pane = state.transcriptPaneById.get(id);
   if (pane) {
     pane.innerHTML = "";
     delete pane.dataset.loaded;
+    delete pane.dataset.historyComplete;
+    delete pane.dataset.historyLoaded;
+    delete pane.dataset.historyTotal;
+    delete pane.dataset.historyMinTailSeq;
+    delete pane.dataset.historyNextFrom;
+    pane._historyTailAnchor = null;
   }
+  state.transcriptViewportById.delete(id);
   state.optimisticMessagesById.delete(id);
 }
 
 function markTranscriptStale(id) {
+  cancelTranscriptHistoryLoad(id);
   const pane = state.transcriptPaneById.get(id);
-  if (pane) delete pane.dataset.loaded;
+  if (pane) {
+    delete pane.dataset.loaded;
+    delete pane.dataset.historyComplete;
+    delete pane.dataset.historyLoaded;
+    delete pane.dataset.historyTotal;
+    delete pane.dataset.historyMinTailSeq;
+    delete pane.dataset.historyNextFrom;
+    pane._historyTailAnchor = null;
+  }
 }
 
 function transcriptTarget(sessionId = state.currentId) {
@@ -4204,6 +4231,65 @@ function transcriptSkeletonEl() {
 // the tail. Both sized for ~1 frame of render budget at typical event size.
 const TRANSCRIPT_TAIL_PAGE = 500;
 const TRANSCRIPT_OLDER_PAGE = 500;
+
+function rememberTranscriptViewport(id = state.currentId) {
+  if (!id) return;
+  const pane = state.transcriptPaneById.get(id);
+  if (!pane) return;
+  state.transcriptViewportById.set(id, {
+    atBottom: pane._atBottom !== false,
+    fromBottom: Math.max(0, pane.scrollHeight - pane.scrollTop),
+  });
+}
+
+function restoreTranscriptViewport(id = state.currentId) {
+  if (!id) return;
+  const pane = state.transcriptPaneById.get(id);
+  const viewport = state.transcriptViewportById.get(id);
+  if (!pane || !viewport) return;
+  if (viewport.atBottom) {
+    pane.scrollTop = pane.scrollHeight;
+    pane._atBottom = true;
+  } else {
+    pane.scrollTop = Math.max(0, pane.scrollHeight - viewport.fromBottom);
+  }
+}
+
+function cancelTranscriptHistoryLoad(id) {
+  const job = state.transcriptHistoryLoadById.get(id);
+  if (!job) return;
+  job.cancelled = true;
+  if (job.banner && job.banner.isConnected) job.banner.remove();
+  state.transcriptHistoryLoadById.delete(id);
+}
+
+function transcriptHistoryIncomplete(pane) {
+  return !!(
+    pane &&
+    pane.dataset.loaded === "true" &&
+    pane.dataset.historyComplete === "false"
+  );
+}
+
+function transcriptPaneIsVisible(id, pane) {
+  return !!(
+    pane &&
+    state.currentId === id &&
+    state.mode === "chat" &&
+    !transcriptEl.hidden &&
+    !pane.hidden
+  );
+}
+
+function mutateTranscriptPreservingViewport(id, pane, mutate) {
+  if (!transcriptPaneIsVisible(id, pane)) {
+    mutate();
+    return;
+  }
+  const fromBottom = pane.scrollHeight - pane.scrollTop;
+  mutate();
+  pane.scrollTop = pane.scrollHeight - fromBottom;
+}
 
 function renderEventsInto(targetEl, events) {
   const prevActive = activeTranscriptEl;
@@ -4234,8 +4320,13 @@ function updateTranscriptProgressBanner(el, loaded, total) {
 
 async function loadTranscript(id, opts = {}) {
   const pane = showTranscriptPane(id);
-  if (opts.force) delete pane.dataset.loaded;
-  if (pane.dataset.loaded === "true") return; // already built — instant re-select
+  if (opts.force) markTranscriptStale(id);
+  if (pane.dataset.loaded === "true") {
+    restoreTranscriptViewport(id);
+    if (transcriptHistoryIncomplete(pane)) backgroundLoadOlderTranscript(id, pane);
+    return; // already built - instant re-select
+  }
+  cancelTranscriptHistoryLoad(id);
   // Delayed skeleton: only show it if the fetch is slow enough to notice
   // (avoids a skeleton flash on fast local loads). The pane is otherwise
   // left as-is for the first ~150ms.
@@ -4277,71 +4368,115 @@ async function loadTranscript(id, opts = {}) {
   renderEventsInto(build, tailEvents);
   pane.replaceChildren(...build.childNodes);
   pane.dataset.loaded = "true";
+  pane._historyTailAnchor = pane.firstChild || null;
   pane.scrollTop = pane.scrollHeight;
   pane._atBottom = true;
 
   // Background-load older pages if there's more history above the tail.
   const minTailSeq = tailEvents.length > 0 ? tailEvents[0].seq : 0;
+  pane.dataset.historyLoaded = String(tailEvents.length);
+  pane.dataset.historyTotal = String(total);
+  pane.dataset.historyMinTailSeq = String(minTailSeq);
+  pane.dataset.historyNextFrom = "0";
+  pane.dataset.historyComplete = total > tailEvents.length && minTailSeq > 0 ? "false" : "true";
   if (total > tailEvents.length && minTailSeq > 0) {
     backgroundLoadOlderTranscript(id, pane, minTailSeq, tailEvents.length, total);
   }
 }
 
 async function backgroundLoadOlderTranscript(id, pane, minTailSeq, alreadyLoaded, total) {
+  if (!id || !pane || pane.dataset.historyComplete !== "false") return;
+  const existing = state.transcriptHistoryLoadById.get(id);
+  if (existing && !existing.cancelled) return existing.promise;
+  const job = { cancelled: false, banner: null, promise: null };
+  state.transcriptHistoryLoadById.set(id, job);
+
   // Sticky banner pinned to the top of the pane so the user sees progress
   // whether they're sitting on the latest tail or scrolling up through
   // history. New older events are inserted just below it.
-  const banner = transcriptProgressBanner(alreadyLoaded, total);
-  pane.insertBefore(banner, pane.firstChild);
+  minTailSeq = Number(minTailSeq ?? pane.dataset.historyMinTailSeq ?? 0);
+  let from = Number(pane.dataset.historyNextFrom || 0);
+  let loaded = Number(alreadyLoaded ?? pane.dataset.historyLoaded ?? 0);
+  total = Number(total ?? pane.dataset.historyTotal ?? loaded);
+  const banner = transcriptProgressBanner(loaded, total);
+  job.banner = banner;
+  mutateTranscriptPreservingViewport(id, pane, () => {
+    pane.insertBefore(banner, pane.firstChild);
+  });
 
-  let from = 0;
-  let loaded = alreadyLoaded;
-  try {
-    while (loaded < total && state.currentId === id) {
-      let result;
-      try {
-        result = await rpc("session.transcript", {
-          session_id: id,
-          from,
-          limit: TRANSCRIPT_OLDER_PAGE,
-        });
-      } catch (e) {
-        // Older-page fetch failed: the tail is still visible, so just
-        // silently stop trying to fill history rather than tearing down
-        // what the user is reading.
-        return;
-      }
-      if (state.currentId !== id) return;
-      const chunk = (result && result.events) || [];
-      if (chunk.length === 0) return;
-      // Drop anything that overlaps the tail page we already rendered.
-      // (Strictly older = seq < minTailSeq.)
-      const older = chunk.filter((te) => te.seq < minTailSeq);
-      if (older.length > 0) {
-        const build = document.createElement("div");
-        renderEventsInto(build, older);
-        // Preserve the user's scroll position relative to the BOTTOM so
-        // newly-prepended history doesn't feel like the view is jumping.
-        const fromBottom = pane.scrollHeight - pane.scrollTop;
-        const insertionPoint = banner.nextSibling;
-        while (build.firstChild) {
-          pane.insertBefore(build.firstChild, insertionPoint);
+  job.promise = (async () => {
+    try {
+      while (
+        loaded < total &&
+        !job.cancelled &&
+        state.currentId === id &&
+        state.mode === "chat"
+      ) {
+        let result;
+        try {
+          result = await rpc("session.transcript", {
+            session_id: id,
+            from,
+            limit: TRANSCRIPT_OLDER_PAGE,
+          });
+        } catch (e) {
+          // Older-page fetch failed: the tail is still visible, so just
+          // silently stop trying to fill history rather than tearing down
+          // what the user is reading.
+          return;
         }
-        pane.scrollTop = pane.scrollHeight - fromBottom;
-        loaded += older.length;
-        updateTranscriptProgressBanner(banner, loaded, total);
+        if (job.cancelled || state.currentId !== id || state.mode !== "chat") return;
+        const chunk = (result && result.events) || [];
+        if (chunk.length === 0) {
+          pane.dataset.historyComplete = "true";
+          return;
+        }
+        // Drop anything that overlaps the tail page we already rendered.
+        // (Strictly older = seq < minTailSeq.)
+        const older = chunk.filter((te) => te.seq < minTailSeq);
+        if (older.length > 0) {
+          const build = document.createElement("div");
+          renderEventsInto(build, older);
+          // Preserve the user's viewport while prepending. The tail anchor is
+          // the first node from the initial recent page, so older pages fetched
+          // from the beginning stay in chronological order above it.
+          mutateTranscriptPreservingViewport(id, pane, () => {
+            const insertionPoint = pane._historyTailAnchor || banner.nextSibling;
+            while (build.firstChild) {
+              pane.insertBefore(build.firstChild, insertionPoint);
+            }
+          });
+          loaded += older.length;
+          pane.dataset.historyLoaded = String(loaded);
+          updateTranscriptProgressBanner(banner, loaded, total);
+        }
+        const lastSeq = chunk[chunk.length - 1].seq;
+        // We've walked into the tail's range - no more older events exist.
+        if (lastSeq >= minTailSeq) {
+          pane.dataset.historyComplete = "true";
+          return;
+        }
+        from = lastSeq + 1;
+        pane.dataset.historyNextFrom = String(from);
+        if (loaded >= total) {
+          pane.dataset.historyComplete = "true";
+          return;
+        }
+        // Yield to the event loop so the page stays responsive and the
+        // browser can paint partial progress.
+        await new Promise((resolve) => requestAnimationFrame(resolve));
       }
-      const lastSeq = chunk[chunk.length - 1].seq;
-      // We've walked into the tail's range — no more older events exist.
-      if (lastSeq >= minTailSeq) return;
-      from = lastSeq + 1;
-      // Yield to the event loop so the page stays responsive and the
-      // browser can paint partial progress.
-      await new Promise((resolve) => requestAnimationFrame(resolve));
+      if (loaded >= total) pane.dataset.historyComplete = "true";
+    } finally {
+      if (banner.isConnected) {
+        mutateTranscriptPreservingViewport(id, pane, () => banner.remove());
+      }
+      if (state.transcriptHistoryLoadById.get(id) === job) {
+        state.transcriptHistoryLoadById.delete(id);
+      }
     }
-  } finally {
-    banner.remove();
-  }
+  })();
+  return job.promise;
 }
 
 function handleNotification(method, params) {

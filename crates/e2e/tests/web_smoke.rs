@@ -282,6 +282,233 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(fast_open["afterInitialHidden"], false);
     assert_eq!(fast_open["afterOlderHidden"], true);
 
+    // Chat-history regression: switching a semantic PTY session from chat to
+    // terminal while older transcript pages are still loading must pause that
+    // backfill, then resume it without refetching the tail or moving the chat
+    // viewport. Once the older history is complete, terminal->chat must be an
+    // instant cached reveal.
+    let chat_history_toggle: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const id = 's-chat-history-toggle';
+              const saved = {
+                currentId: state.currentId,
+                sessions: state.sessions,
+                mode: state.mode,
+                viewModeById: state.viewModeById,
+                ws: state.ws,
+                terminalById: state.terminalById,
+                term: state.term,
+                fitAddon: state.fitAddon,
+                ptyBuffer: state.ptyBuffer,
+                ptyBuffering: state.ptyBuffering,
+                lastReportedSize: state.lastReportedSize,
+                waitForXterm,
+                initTerminalForSession,
+                showTerminalForSession,
+                activateTerminalHandle,
+                refitTerminal,
+                renderVirtualKeyboard,
+                shouldFocusTerminalAfterSessionSwitch,
+                setComposerEnabled,
+              };
+              const calls = [];
+              const pendingOlder = [];
+              const makeEvents = (start, count) =>
+                Array.from({ length: count }, (_, i) => ({
+                  seq: start + i,
+                  at: null,
+                  event: {
+                    type: 'message',
+                    role: 'assistant',
+                    text: `message ${start + i} ${'x'.repeat(80)}`,
+                  },
+                }));
+              const tick = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              const renderedMessageCount = (pane) => (pane.textContent.match(/message \d+/g) || []).length;
+              const waitForOlderRequest = async () => {
+                for (let i = 0; i < 30 && pendingOlder.length === 0; i++) await tick();
+                if (pendingOlder.length === 0) throw new Error('expected pending older transcript request');
+              };
+              const resolveNextOlder = () => {
+                const pending = pendingOlder.shift();
+                if (!pending) throw new Error('expected pending older transcript request');
+                pending.resolve({ events: makeEvents(0, 500), total: 1000 });
+              };
+
+              try {
+                state.sessions = [{
+                  id,
+                  cwd: '/tmp',
+                  harness: 'codex',
+                  has_pty: true,
+                  mode: 'interactive',
+                  kind: 'user',
+                }];
+                state.currentId = id;
+                state.mode = 'chat';
+                state.viewModeById = new Map([[id, 'chat']]);
+                state.terminalById = new Map();
+                state.term = null;
+                state.fitAddon = null;
+                waitForXterm = async () => true;
+                initTerminalForSession = (sessionId) => ({
+                  id: sessionId,
+                  host: document.createElement('div'),
+                  loaded: true,
+                  ptyBuffer: [],
+                  ptyBuffering: false,
+                  lastReportedSize: { cols: 0, rows: 0 },
+                  term: {
+                    cols: 80,
+                    rows: 24,
+                    focus: () => {},
+                    resize: () => {},
+                    write: () => {},
+                  },
+                  fitAddon: { fit: () => {} },
+                });
+                showTerminalForSession = () => initTerminalForSession(id);
+                activateTerminalHandle = (handle) => {
+                  state.term = handle.term;
+                  state.fitAddon = handle.fitAddon;
+                  state.ptyBuffer = handle.ptyBuffer;
+                  state.ptyBuffering = handle.ptyBuffering;
+                  state.lastReportedSize = handle.lastReportedSize;
+                };
+                refitTerminal = () => {};
+                renderVirtualKeyboard = () => {};
+                shouldFocusTerminalAfterSessionSwitch = () => false;
+                setComposerEnabled = () => {};
+                state.ws = {
+                  readyState: 1,
+                  send(raw) {
+                    const msg = JSON.parse(raw);
+                    calls.push(msg);
+                    const pending = state.pending.get(msg.id);
+                    state.pending.delete(msg.id);
+                    if (msg.method === 'session.transcript' && msg.params.tail) {
+                      queueMicrotask(() => pending.resolve({ events: makeEvents(500, 500), total: 1000 }));
+                    } else if (msg.method === 'session.transcript') {
+                      pendingOlder.push({ msg, resolve: pending.resolve });
+                    } else {
+                      queueMicrotask(() => pending.resolve({}));
+                    }
+                  },
+                };
+
+                await loadTranscript(id);
+                const pane = transcriptPaneForSession(id);
+                const messagesAfterTail = renderedMessageCount(pane);
+                pane.scrollTop = pane.scrollHeight;
+                pane._atBottom = true;
+
+                await waitForOlderRequest();
+                await switchCurrentViewMode('terminal');
+                resolveNextOlder();
+                await tick();
+                const messagesWhileTerminal = renderedMessageCount(pane);
+
+                await switchCurrentViewMode('chat');
+                await waitForOlderRequest();
+                resolveNextOlder();
+                await tick();
+                const messagesAfterResume = renderedMessageCount(pane);
+                const fromBottomAfterResume = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
+                const historyCompleteAfterResume = pane.dataset.historyComplete;
+
+                await switchCurrentViewMode('terminal');
+                await switchCurrentViewMode('chat');
+                await tick();
+
+                return {
+                  messagesAfterTail,
+                  messagesWhileTerminal,
+                  messagesAfterResume,
+                  fromBottomAfterResume,
+                  historyCompleteAfterResume,
+                  tailCalls: calls.filter((c) => c.method === 'session.transcript' && c.params.tail).length,
+                  olderCalls: calls.filter((c) => c.method === 'session.transcript' && !c.params.tail).length,
+                  pendingOlder: pendingOlder.length,
+                };
+              } finally {
+                cancelTranscriptHistoryLoad(id);
+                const pane = state.transcriptPaneById.get(id);
+                if (pane) pane.remove();
+                state.transcriptPaneById.delete(id);
+                state.transcriptViewportById.delete(id);
+                state.currentId = saved.currentId;
+                state.sessions = saved.sessions;
+                state.mode = saved.mode;
+                state.viewModeById = saved.viewModeById;
+                state.ws = saved.ws;
+                state.terminalById = saved.terminalById;
+                state.term = saved.term;
+                state.fitAddon = saved.fitAddon;
+                state.ptyBuffer = saved.ptyBuffer;
+                state.ptyBuffering = saved.ptyBuffering;
+                state.lastReportedSize = saved.lastReportedSize;
+                waitForXterm = saved.waitForXterm;
+                initTerminalForSession = saved.initTerminalForSession;
+                showTerminalForSession = saved.showTerminalForSession;
+                activateTerminalHandle = saved.activateTerminalHandle;
+                refitTerminal = saved.refitTerminal;
+                renderVirtualKeyboard = saved.renderVirtualKeyboard;
+                shouldFocusTerminalAfterSessionSwitch = saved.shouldFocusTerminalAfterSessionSwitch;
+                setComposerEnabled = saved.setComposerEnabled;
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate chat history toggle")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(
+        chat_history_toggle["messagesAfterTail"].as_u64(),
+        Some(500),
+        "tail should render first: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["messagesWhileTerminal"].as_u64(),
+        Some(500),
+        "hidden terminal mode must not insert older chat rows: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["messagesAfterResume"].as_u64(),
+        Some(1000),
+        "chat return should resume older history: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["historyCompleteAfterResume"].as_str(),
+        Some("true"),
+        "history should complete after resumed backfill: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["tailCalls"].as_u64(),
+        Some(1),
+        "terminal->chat should not refetch the tail after completion: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["olderCalls"].as_u64(),
+        Some(2),
+        "one paused older request and one resumed older request expected: {chat_history_toggle:?}"
+    );
+    assert!(
+        chat_history_toggle["fromBottomAfterResume"]
+            .as_f64()
+            .unwrap_or_default()
+            .abs()
+            < 2.0,
+        "viewport should remain at latest message: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["pendingOlder"].as_u64(),
+        Some(0),
+        "no dangling mocked older requests: {chat_history_toggle:?}"
+    );
+
     // Connection state is rendered as a tiny matrix canvas rather than
     // a static "connected" text label. The accessible label remains
     // for screen readers.

@@ -17,6 +17,8 @@ Terminal view preserves the live interactive surface for PTY harnesses, while ch
 
 The selected view is user-facing state and may be remembered by the web client. Returning from chat view to terminal view must refresh or otherwise reconcile the terminal surface so it does not miss PTY or structured events that arrived while chat view was active. Sessions that only produce raw terminal output should remain terminal-only in the web UI.
 
+Returning from terminal view to a previously loaded chat view should reveal the cached transcript without refetching completed history. If chat history is still backfilling, the web client should preserve the reader's viewport, pause work that depends on visible layout while chat is hidden, and resume older-history loading when chat becomes visible again.
+
 ## Non-Goals
 
 This does not require every client to expose the same control, and it does not make headless or non-PTY sessions terminal-capable.
