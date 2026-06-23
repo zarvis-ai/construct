@@ -207,6 +207,9 @@ async fn web_client_loads_and_websocket_connects() {
                 fitAddon: state.fitAddon,
               };
               const calls = [];
+              const pendingInitialReplay = [];
+              const tailText = Array.from({ length: 80 }, (_, i) => `tail line ${i}`).join('\r\n') + '\r\n';
+              const tick = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
               try {
                 state.sessions = [{
                   id: 's-fast-pty',
@@ -227,19 +230,33 @@ async fn web_client_loads_and_websocket_connects() {
                     let result = null;
                     if (msg.method === 'session.pty_replay') {
                       result = {
-                        data: '',
+                        data: msg.params.before_offset ? '' : btoa(tailText),
                         start_offset: msg.params.before_offset ? 0 : 1048576,
                         end_offset: msg.params.before_offset || 1179648,
                         total_bytes: 1179648,
                         size: { cols: 80, rows: 24 },
                       };
+                      if (!msg.params.before_offset) {
+                        pendingInitialReplay.push({ resolve: pending.resolve, result });
+                        return;
+                      }
                     } else if (msg.method === 'session.pty_resize') {
                       result = {};
                     }
                     queueMicrotask(() => pending.resolve(result));
                   },
                 };
-                await enterTerminalMode('s-fast-pty', { forceReload: true });
+                const enterPromise = enterTerminalMode('s-fast-pty', { forceReload: true });
+                for (let i = 0; i < 30 && pendingInitialReplay.length === 0; i++) await tick();
+                const handleDuringReplay = terminalHandleForSession('s-fast-pty');
+                const hiddenDuringInitialReplay = !!(handleDuringReplay && handleDuringReplay.host.hidden);
+                const loadingDuringInitialReplay = !terminalLoadingEl.classList.contains('gone');
+                const pending = pendingInitialReplay.shift();
+                if (!pending) throw new Error('expected pending initial pty_replay');
+                pending.resolve(pending.result);
+                await enterPromise;
+                const handleAfterReplay = terminalHandleForSession('s-fast-pty');
+                const active = handleAfterReplay.term.buffer.active;
                 const afterInitialHidden = terminalHistoryBtn.hidden;
                 await maybeLoadOlderPtyReplay('s-fast-pty', { force: true });
                 const replayCalls = calls.filter((c) => c.method === 'session.pty_replay');
@@ -247,6 +264,11 @@ async fn web_client_loads_and_websocket_connects() {
                   replayCalls: replayCalls.map((c) => c.params),
                   afterInitialHidden,
                   afterOlderHidden: terminalHistoryBtn.hidden,
+                  hiddenDuringInitialReplay,
+                  loadingDuringInitialReplay,
+                  visibleAfterInitialReplay: !handleAfterReplay.host.hidden,
+                  loadingGoneAfterInitialReplay: terminalLoadingEl.classList.contains('gone'),
+                  initialViewportAtBottom: active.viewportY === active.baseY,
                 };
               } finally {
                 state.sessions = saved.sessions;
@@ -257,6 +279,7 @@ async fn web_client_loads_and_websocket_connects() {
                 state.term = saved.term;
                 state.fitAddon = saved.fitAddon;
                 terminalHistoryBtn.hidden = true;
+                hideTerminalLoading();
               }
             })()
             "#,
@@ -281,6 +304,26 @@ async fn web_client_loads_and_websocket_connects() {
     );
     assert_eq!(fast_open["afterInitialHidden"], false);
     assert_eq!(fast_open["afterOlderHidden"], true);
+    assert_eq!(
+        fast_open["hiddenDuringInitialReplay"], true,
+        "initial terminal replay should hydrate offscreen: {fast_open:?}"
+    );
+    assert_eq!(
+        fast_open["loadingDuringInitialReplay"], true,
+        "loading overlay should cover hidden initial replay: {fast_open:?}"
+    );
+    assert_eq!(
+        fast_open["visibleAfterInitialReplay"], true,
+        "terminal should reveal after initial replay: {fast_open:?}"
+    );
+    assert_eq!(
+        fast_open["loadingGoneAfterInitialReplay"], true,
+        "loading overlay should hide after initial replay: {fast_open:?}"
+    );
+    assert_eq!(
+        fast_open["initialViewportAtBottom"], true,
+        "initial terminal replay should land at the latest page: {fast_open:?}"
+    );
 
     // Chat-history regression: switching a semantic PTY session from chat to
     // terminal while older transcript pages are still loading must pause that
@@ -1851,7 +1894,7 @@ async fn web_client_loads_and_websocket_connects() {
     let replay: String = page
         .evaluate(
             r#"
-            (() => {
+            (async () => {
               const calls = [];
               // Mimic xterm: decode byte chunks (Uint8Array) to text the
               // way the real terminal's UTF-8 decoder would.
@@ -1862,7 +1905,7 @@ async fn web_client_loads_and_websocket_connects() {
                 resize: () => {},
               };
               state.currentId = 'sH';
-              replayTranscriptToTerm([
+              await replayTranscriptToTerm([
                 { event: { type: 'pty', data: btoa('hello from agent\r\n') } },
                 { event: { type: 'tool_use', tool: 'shell', args: { command: 'echo hi' } } },
                 { event: { type: 'tool_result', tool: 'c1', ok: true, output: 'hi there' } },

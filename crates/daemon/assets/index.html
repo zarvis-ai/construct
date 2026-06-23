@@ -3038,10 +3038,11 @@ function terminalHandleForSession(id) {
   return state.terminalById.get(id) || null;
 }
 
-function showTerminalForSession(id) {
+function showTerminalForSession(id, options = {}) {
+  const reveal = options.reveal !== false;
   const handle = terminalHandleForSession(id);
   for (const [sessionId, h] of state.terminalById.entries()) {
-    h.host.hidden = sessionId !== id;
+    h.host.hidden = sessionId !== id || (sessionId === id && !reveal);
   }
   if (handle) {
     state.term = handle.term;
@@ -3109,12 +3110,13 @@ async function enterTerminalMode(id, options = {}) {
       "xterm.js failed to load (check daemon log)";
     return;
   }
-  terminalLoadingEl.classList.add("gone");
-
   const handle = initTerminalForSession(id);
-  showTerminalForSession(id);
-  activateTerminalHandle(handle);
   if (options.forceReload) resetTerminalReplay(handle);
+  const hydrating = !handle.loaded;
+  showTerminalForSession(id, { reveal: !hydrating });
+  activateTerminalHandle(handle);
+  if (hydrating) setTerminalLoadingMessage("loading terminal history...");
+  else hideTerminalLoading();
 
   if (!handle.loaded) {
     // Buffer PTY events that arrive while we're waiting on the
@@ -3130,7 +3132,7 @@ async function enterTerminalMode(id, options = {}) {
         // (which are never written to the PTY) appear, interleaved with
         // prose. pty_replay alone would omit them.
         const t = await rpc("session.transcript", { session_id: id, from: 0 });
-        replayTranscriptToTerm((t && t.events) || []);
+        await replayTranscriptToTerm((t && t.events) || []);
         renderEditorStateForSession(id);
       } else {
         const r = await rpc("session.pty_replay", {
@@ -3147,22 +3149,36 @@ async function enterTerminalMode(id, options = {}) {
         updateTerminalHistoryButton(handle);
         await replayPtyChunks(handle);
       }
+      handle.term.scrollToBottom();
       handle.loaded = true;
+      const stillCurrentTerminal = state.currentId === id && state.mode === "terminal";
+      if (stillCurrentTerminal) {
+        showTerminalForSession(id);
+        hideTerminalLoading();
+      }
       // If a click tried to focus/claim during hydrate, complete it now.
       if (state.pendingTerminalFocusId === id) {
         state.pendingTerminalFocusId = null;
-        noteWebPtyEngagement();
-        refitTerminal({ claim: true, immediate: true });
-        const h = terminalHandleForSession(id);
-        if (h && h.term) h.term.focus();
+        if (stillCurrentTerminal) {
+          noteWebPtyEngagement();
+          refitTerminal({ claim: true, immediate: true });
+          const h = terminalHandleForSession(id);
+          if (h && h.term) h.term.focus();
+        }
       }
-      updateTerminalHistoryButton(handle);
+      if (stillCurrentTerminal) updateTerminalHistoryButton(handle);
     } catch (e) {
-      state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
+      if (state.currentId === id && state.mode === "terminal") {
+        showTerminalForSession(id);
+        hideTerminalLoading();
+        state.term.write(`\r\n\x1b[31mreplay failed: ${escape(e.message)}\x1b[0m\r\n`);
+      }
     }
 
     // Flush any live PTY events that buffered during the replay.
-    for (const chunk of state.ptyBuffer) state.term.write(chunk);
+    if (state.currentId === id && state.mode === "terminal") {
+      for (const chunk of state.ptyBuffer) state.term.write(chunk);
+    }
     state.ptyBuffer = [];
     state.ptyBuffering = false;
   }
@@ -3471,9 +3487,24 @@ function rememberPtyReplayChunk(handle, result) {
   handle.ptyReplayTotalBytes = Number(result.total_bytes || handle.ptyReplayEndOffset || 0);
 }
 
+function writeTermData(term, data) {
+  if (!term || !data || !data.length) return Promise.resolve();
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    term.write(data, finish);
+    // Unit-test doubles often implement the one-argument xterm.write shape.
+    // Treat those synchronous captures as complete immediately.
+    if (term.write.length < 2) finish();
+  });
+}
+
 function writeTermBytes(term, bytes) {
-  if (!term || !bytes || !bytes.length) return Promise.resolve();
-  return new Promise((resolve) => term.write(bytes, resolve));
+  return writeTermData(term, bytes);
 }
 
 async function replayPtyChunks(handle) {
@@ -4999,29 +5030,36 @@ function resetTermToolGroup() {
   termToolGroup.results = [];
 }
 
-function writeToolUseToTerm(tool, args, opts = {}) {
+function toolUseGroupedLine(tool, args) {
   const name = String(tool || "tool");
   if (termToolGroup.tool && termToolGroup.tool === name) {
     termToolGroup.count += 1;
     const summary = summarizeToolArgs(args);
     if (summary) termToolGroup.summaries.push(summary);
     const note = summarizeToolGroupForTerm(termToolGroup);
-    const line = `\r\n\x1b[1;32m→ ${sanitizeForTerm(name)}\x1b[0m\x1b[2m × ${termToolGroup.count}${note ? ` · ${note}` : ""}\x1b[0m\r\n`;
-    return opts.direct ? state.term.write(line) : writeToTerm(line);
+    return `\r\n\x1b[1;32m→ ${sanitizeForTerm(name)}\x1b[0m\x1b[2m × ${termToolGroup.count}${note ? ` · ${note}` : ""}\x1b[0m\r\n`;
   }
   resetTermToolGroup();
   termToolGroup.tool = name;
   termToolGroup.count = 1;
   const summary = summarizeToolArgs(args);
   if (summary) termToolGroup.summaries.push(summary);
-  const line = toolUseLine(tool, args);
+  return toolUseLine(tool, args);
+}
+
+function writeToolUseToTerm(tool, args, opts = {}) {
+  const line = toolUseGroupedLine(tool, args);
   return opts.direct ? state.term.write(line) : writeToTerm(line);
 }
 
 function writeToolResultToTerm(ok, output, opts = {}) {
-  if (termToolGroup.tool) termToolGroup.results.push({ ok, output });
-  const line = toolResultLines(ok, output);
+  const line = toolResultGroupedLine(ok, output);
   return opts.direct ? state.term.write(line) : writeToTerm(line);
+}
+
+function toolResultGroupedLine(ok, output) {
+  if (termToolGroup.tool) termToolGroup.results.push({ ok, output });
+  return toolResultLines(ok, output);
 }
 
 function summarizeToolGroupForTerm(group) {
@@ -5057,7 +5095,7 @@ function writeToTerm(s) {
 // `ptyBuffer` (which is flushed afterwards). Prose-bearing structured
 // events (message / reasoning) are skipped: their text is already in
 // the PTY events.
-function replayTranscriptToTerm(events) {
+async function replayTranscriptToTerm(events) {
   if (!state.term) return;
   for (const te of events) {
     const e = te && te.event;
@@ -5065,13 +5103,13 @@ function replayTranscriptToTerm(events) {
     switch (e.type) {
       case "pty":
         resetTermToolGroup();
-        state.term.write(decodeBase64ToBytes(e.data || ""));
+        await writeTermBytes(state.term, decodeBase64ToBytes(e.data || ""));
         break;
       case "tool_use":
-        writeToolUseToTerm(e.tool, e.args, { direct: true });
+        await writeTermData(state.term, toolUseGroupedLine(e.tool, e.args));
         break;
       case "tool_result":
-        writeToolResultToTerm(e.ok, e.output, { direct: true });
+        await writeTermData(state.term, toolResultGroupedLine(e.ok, e.output));
         break;
       case "editor_state":
         state.editorById.set(state.currentId, e);
