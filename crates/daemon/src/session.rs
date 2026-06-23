@@ -1382,7 +1382,8 @@ impl SessionManager {
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: params.kind,
             archived: false,
-            operator_loop_disabled: false,
+            operator_loop_disabled: params.kind
+                == agentd_protocol::SessionKind::Orchestrator,
         };
         self.storage.save_summary(&summary)?;
 

@@ -1735,6 +1735,11 @@ mod tests {
     use provider::config::ModelProfile;
     use std::env;
     use std::fs;
+    use std::sync::Mutex;
+
+    // Serialize tests that mutate GROK_HOME / HOME to prevent env var races
+    // when the test harness runs them in parallel.
+    static GROK_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn profile(provider: &str, model: Option<&str>) -> ModelProfile {
         ModelProfile {
@@ -1943,6 +1948,7 @@ mod tests {
 
     #[test]
     fn grok_oauth_token_selects_latest_unexpired() {
+        let _lock = GROK_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let grok_home = tmp.path().join("grok");
         fs::create_dir_all(grok_home.join(".grok")).expect("mkdir");
@@ -1978,6 +1984,7 @@ mod tests {
 
     #[test]
     fn grok_oauth_token_rejects_expired_only() {
+        let _lock = GROK_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let grok_home = tmp.path().join("grok");
         fs::create_dir_all(grok_home.join(".grok")).expect("mkdir");
@@ -2012,6 +2019,7 @@ mod tests {
 
     #[test]
     fn resolve_model_from_spec_grok_oauth_reads_auth_json_token() {
+        let _lock = GROK_ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().expect("tempdir");
         let grok_home = tmp.path().join("grok");
         fs::create_dir_all(grok_home.join(".grok")).expect("mkdir");

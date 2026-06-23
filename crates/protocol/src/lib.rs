@@ -967,7 +967,8 @@ pub struct SessionSummary {
     #[serde(default)]
     pub archived: bool,
     /// Operator ambient loop is disabled (`/operator disable`). Only meaningful
-    /// for the orchestrator session; false for all other sessions.
+    /// for the orchestrator session; true (disabled) by default on fresh create,
+    /// false for all other session kinds.
     #[serde(default)]
     pub operator_loop_disabled: bool,
 }
