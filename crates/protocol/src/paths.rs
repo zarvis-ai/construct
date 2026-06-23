@@ -87,6 +87,10 @@ impl Paths {
         self.config_dir.join("config.toml")
     }
 
+    pub fn config_template_file(&self) -> PathBuf {
+        self.config_dir.join("config.toml.template")
+    }
+
     pub fn keymap_file(&self) -> PathBuf {
         self.config_dir.join("keymap.toml")
     }
