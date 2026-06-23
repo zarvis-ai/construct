@@ -3488,6 +3488,39 @@ impl App {
 
     /// After any list mutation, make sure `self.selection` still refers to
     /// an item we know about. Fall back to the first list item if not.
+    /// If `id` is the currently-selected session, move focus to its nearest
+    /// visible neighbor in the list. Must be called *before* the session is
+    /// removed from or hidden in `list_items()` (i.e. before removing it from
+    /// `self.sessions` or marking it archived).
+    fn focus_neighbor_of(&mut self, id: &str) {
+        if self.selection != Selection::Session(id.to_string()) {
+            return;
+        }
+        let items = self.list_items();
+        let Some(pos) = items.iter().position(|it| {
+            matches!(it, ListItem::Session { summary, .. } if summary.id == id)
+        }) else {
+            return;
+        };
+        let pick_active = |it: &ListItem| -> Option<Selection> {
+            match it {
+                ListItem::Session { summary, .. } if !summary.archived => {
+                    Some(Selection::Session(summary.id.clone()))
+                }
+                ListItem::GroupHeader { group, .. } => Some(Selection::Group(group.id.clone())),
+                _ => None,
+            }
+        };
+        let candidate = items[pos + 1..].iter().find_map(pick_active).or_else(|| {
+            items[..pos].iter().rev().find_map(pick_active)
+        });
+        if let Some(sel) = candidate {
+            self.selection = sel;
+        }
+        // If no candidate found, leave selection as-is; ensure_selection_valid()
+        // will clear it once the session is gone from the list.
+    }
+
     fn ensure_selection_valid(&mut self) {
         let items = self.list_items();
         if items.iter().any(|it| it.matches(&self.selection)) {
@@ -3911,6 +3944,11 @@ impl App {
                             .unwrap_or(false);
                         let now_pinned = payload.session.pinned;
                         let has_pty = payload.session.has_pty;
+                        // Move focus before the session is hidden behind the
+                        // archive disclosure row.
+                        if payload.session.archived {
+                            self.focus_neighbor_of(&id);
+                        }
                         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
                             self.sessions[i] = payload.session;
                         } else {
@@ -4143,6 +4181,7 @@ impl App {
     }
 
     async fn on_session_deleted(&mut self, id: &str) {
+        self.focus_neighbor_of(id);
         if let Some(i) = self.sessions.iter().position(|s| s.id == id) {
             self.sessions.remove(i);
         }

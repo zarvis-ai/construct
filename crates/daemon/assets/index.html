@@ -4394,18 +4394,41 @@ function handleNotification(method, params) {
   } else if (method === "session/state") {
     const { session } = params;
     if (!session) return;
-    // Patch the cached summary so the list re-renders with new
-    // state. Update in place rather than refetching.
+    // When the current session is being archived, move focus to the nearest
+    // non-archived neighbor before updating state (so position is still valid).
+    let archiveNeighborId = null;
+    if (session.archived && session.id === state.currentId) {
+      const ordered = orderedSessions();
+      const idx = ordered.findIndex((s) => s.id === session.id);
+      if (idx >= 0) {
+        const after = ordered.slice(idx + 1).find((s) => !s.archived);
+        const before = ordered.slice(0, idx).reverse().find((s) => !s.archived);
+        archiveNeighborId = (after || before || null)?.id ?? null;
+      }
+    }
+    // Patch the cached summary so the list re-renders with new state.
     const i = state.sessions.findIndex((s) => s.id === session.id);
     if (i >= 0) state.sessions[i] = session;
     else state.sessions.push(session);
     scheduleRenderSessions();
-    if (session.id === state.currentId) {
+    if (archiveNeighborId) {
+      selectSession(archiveNeighborId);
+    } else if (session.id === state.currentId) {
       sessionTitleEl.textContent = sessionViewTitle(session);
       renderViewModeToggle(session);
       hydrateWidgets(session.id);
     }
   } else if (method === "session/deleted") {
+    // Pick neighbor before removing from the list so position is still valid.
+    let neighborId = null;
+    if (params.session_id === state.currentId) {
+      const ordered = orderedSessions();
+      const idx = ordered.findIndex((s) => s.id === params.session_id);
+      if (idx >= 0) {
+        const next = ordered[idx + 1] || ordered[idx - 1] || null;
+        neighborId = next ? next.id : null;
+      }
+    }
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
     scheduleRenderSessions();
     state.editorById.delete(params.session_id);
@@ -4424,6 +4447,7 @@ function handleNotification(method, params) {
       sessionTitleEl.textContent = "";
       viewModeToggleEl.hidden = true;
       refreshListToolbar();
+      if (neighborId) selectSession(neighborId);
     }
   } else if (method === "group/state" || method === "project/state") {
     const group = params.group || params.project;
