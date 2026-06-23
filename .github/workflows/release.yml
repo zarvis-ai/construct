@@ -18,10 +18,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # The binaries that make up a release. The daemon resolves adapters as
-  # siblings of its own path (see `locate_binary`), so all of these must
-  # ship together and land in the same directory.
-  BINS: "construct construct-mcp construct-adapter-shell construct-adapter-claude construct-adapter-codex construct-adapter-antigravity construct-adapter-smith"
+  # The binaries that make up a release. The adapters and MCP server are now
+  # built into the single `construct` binary (invoked as `construct __adapter
+  # <name>` / `construct __mcp`), so the release ships just one binary.
+  BINS: "construct"
 
 jobs:
   verify:
@@ -85,10 +85,7 @@ jobs:
           CC_aarch64_unknown_linux_gnu: ${{ matrix.cc }}
         run: |
           cargo build --release --locked --target "${{ matrix.target }}" \
-            -p agentd-cli -p construct-mcp \
-            -p construct-adapter-shell -p construct-adapter-claude \
-            -p construct-adapter-codex -p construct-adapter-antigravity \
-            -p construct-adapter-smith
+            --bin construct
 
       - name: Package tarball + checksum
         run: |
