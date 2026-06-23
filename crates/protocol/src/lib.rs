@@ -840,6 +840,12 @@ pub mod ipc_method {
     /// connection is closed by the kernel during exec(), so clients
     /// detect the restart as a socket close and reconnect.
     pub const DAEMON_RESTART: &str = "daemon.restart";
+    /// Ask the running daemon to shut down gracefully: stop every
+    /// session's adapter (leaving session state resumable on the next
+    /// start) and exit. The IPC connection is closed by the kernel as
+    /// the process exits, so clients detect the shutdown as a socket
+    /// close — same as `daemon.restart`, minus the re-exec.
+    pub const DAEMON_SHUTDOWN: &str = "daemon.shutdown";
     /// Dev tooling: point the running daemon at a directory of web-UI
     /// assets (`index.html`, `static/*`) to serve from disk instead of
     /// the binary's embedded copies, and inject a live-reload poller so
@@ -1397,6 +1403,15 @@ pub struct RemoteStopResult {
 pub struct DaemonRestartParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exe: Option<String>,
+    /// When true, also bounce every session's adapter as part of the
+    /// restart: each adapter is gracefully stopped before the daemon
+    /// re-execs, so the new daemon respawns a fresh adapter process
+    /// (and its session-scoped `construct-mcp` child) for each session.
+    /// Sessions are preserved/resumed from on-disk state — neither
+    /// archived nor deleted. When false (the default) adapters survive
+    /// the exec and reattach, so MCP children are *not* restarted.
+    #[serde(default)]
+    pub restart_sessions: bool,
 }
 
 /// Result of `daemon.restart`. Echoed back to the caller right
@@ -1414,6 +1429,20 @@ pub struct DaemonRestartResult {
     /// tunnel. Lets the CLI emit "remote URL preserved" vs
     /// "remote URL will rotate" in the status line.
     pub tunnel_preserved: bool,
+}
+
+/// Params for `daemon.shutdown`. No options today — the daemon always
+/// stops adapters gracefully (leaving sessions resumable) and exits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DaemonShutdownParams {}
+
+/// Result of `daemon.shutdown`. Echoed back to the caller right before
+/// the daemon stops its adapters and exits; clients see this reply,
+/// then observe the IPC socket close as the process goes away.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonShutdownResult {
+    /// PID of the daemon that is shutting down.
+    pub pid: u32,
 }
 
 /// A user-created group used to organize sessions in the list view.

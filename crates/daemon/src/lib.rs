@@ -264,7 +264,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     }
 
     // Race the IPC accept loop against shutdown signals + the
-    // restart channel:
+    // lifecycle channel:
     //
     //   - SIGTERM/SIGINT: drain adapters first (flush state), then
     //     exit normally.
@@ -278,6 +278,12 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     //     one is spawned by the new daemon if `/remote-control`
     //     is re-issued — URL preservation across restart is
     //     follow-up work, see issue #90 comments.
+    //   - daemon.restart RPC with `restart_sessions`: same exec, but
+    //     stop every adapter first so the new daemon respawns each
+    //     session (and its MCP child) fresh instead of reattaching.
+    //   - daemon.shutdown RPC: stop adapters (leaving sessions
+    //     resumable) and exit without re-exec'ing — the `daemon stop`
+    //     command.
     let outcome = tokio::select! {
         result = server::serve(manager.clone(), socket_path) => MainOutcome::Server(result),
         signal = shutdown_signal() => MainOutcome::Signal(signal),
@@ -295,6 +301,24 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
             Ok(())
         }
         MainOutcome::Restart(cmd) => {
+            use crate::session::RestartAction;
+            // For RestartSessions / Stop, gracefully stop every adapter
+            // first. `shutdown_adapters` sets the shutting-down flag so
+            // each adapter's exit is treated as expected and its
+            // persisted session state is left resumable (not marked
+            // Done/Errored) — the restart path then respawns it, and the
+            // stop path leaves it for the next `daemon start` to resume.
+            if matches!(cmd.action, RestartAction::RestartSessions | RestartAction::Stop) {
+                tracing::info!(
+                    action = ?cmd.action,
+                    "stopping adapters before daemon lifecycle action"
+                );
+                manager.shutdown_adapters().await;
+            }
+            if cmd.action == RestartAction::Stop {
+                tracing::info!("daemon shutdown requested; exiting");
+                return Ok(());
+            }
             tracing::info!(exe = %cmd.exe.display(), "daemon restart requested; exec self");
             // exec() replaces the process image in place — kernel
             // closes any FDs marked CLOEXEC (which tokio sockets

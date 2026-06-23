@@ -1430,11 +1430,18 @@ async fn dispatch(
             // when exec() replaces the process image. Clients detect
             // that as a disconnect and reconnect.
             // Params are optional; older clients send `null` (no exe
-            // override), which fails to deserialize — treat that as None.
-            let exe = parse_params::<agentd_protocol::DaemonRestartParams>(req.params.clone())
-                .ok()
-                .and_then(|p| p.exe);
-            match manager.request_daemon_restart(exe.map(std::path::PathBuf::from)) {
+            // override), which fails to deserialize — treat that as
+            // None / default.
+            let params = parse_params::<agentd_protocol::DaemonRestartParams>(req.params.clone())
+                .unwrap_or_default();
+            let action = if params.restart_sessions {
+                crate::session::RestartAction::RestartSessions
+            } else {
+                crate::session::RestartAction::Restart
+            };
+            match manager
+                .request_daemon_restart(params.exe.map(std::path::PathBuf::from), action)
+            {
                 Ok(cmd) => {
                     // Cloudflared survives the daemon's exec()
                     // because it's spawned in a separate process
@@ -1457,6 +1464,19 @@ async fn dispatch(
                     };
                     ok!(&r)
                 }
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::DAEMON_SHUTDOWN => {
+            // Hand off to main's lifecycle arm with the Stop action: it
+            // gracefully stops every adapter (leaving sessions resumable
+            // on the next start) and exits without re-exec'ing. Like
+            // restart, the reply races the kernel — we send it back here,
+            // then the IPC socket closes as the process exits.
+            match manager.request_daemon_restart(None, crate::session::RestartAction::Stop) {
+                Ok(_) => ok!(&agentd_protocol::DaemonShutdownResult {
+                    pid: std::process::id(),
+                }),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }

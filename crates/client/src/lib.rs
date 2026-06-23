@@ -253,13 +253,32 @@ impl Client {
     /// and re-attempt connect with backoff.
     /// `exe: Some(path)` execs that binary instead of the daemon's own
     /// (e.g. a freshly-built one); `None` re-execs in place.
+    /// `restart_sessions: true` also bounces every session's adapter so
+    /// the new daemon respawns each one (and its MCP child) fresh,
+    /// instead of letting the survivors reattach.
     pub async fn daemon_restart(
         &self,
         exe: Option<String>,
+        restart_sessions: bool,
     ) -> Result<agentd_protocol::DaemonRestartResult> {
         self.request(
             ipc_method::DAEMON_RESTART,
-            &agentd_protocol::DaemonRestartParams { exe },
+            &agentd_protocol::DaemonRestartParams {
+                exe,
+                restart_sessions,
+            },
+        )
+        .await
+    }
+    /// Stop the daemon gracefully: it stops every session's adapter
+    /// (leaving sessions resumable on the next start) and exits. Like
+    /// [`Self::daemon_restart`], the IPC connection closes as the
+    /// process exits, so callers should treat a `BrokenPipe`-style
+    /// error as "shutdown in flight".
+    pub async fn daemon_shutdown(&self) -> Result<agentd_protocol::DaemonShutdownResult> {
+        self.request(
+            ipc_method::DAEMON_SHUTDOWN,
+            &agentd_protocol::DaemonShutdownParams {},
         )
         .await
     }

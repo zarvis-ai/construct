@@ -615,14 +615,32 @@ pub struct SessionManager {
     conn_views: std::sync::Mutex<HashMap<u64, (String, ClientView)>>,
 }
 
-/// Payload of a `daemon.restart` request, sent from the IPC
-/// handler to the main loop. Main resolves the exe path + args
-/// before the runtime tear-down so the reply can echo what's
-/// about to load.
+/// What the main loop should do when it receives a [`RestartCommand`].
+/// All three variants flow through the same channel so the IPC handler
+/// can resolve the exe + reply before the runtime tears down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartAction {
+    /// Re-exec the daemon in place. Adapters survive the exec and
+    /// reattach, so their session-scoped MCP children keep running.
+    Restart,
+    /// Gracefully stop every adapter (leaving sessions resumable),
+    /// then re-exec. The new daemon respawns a fresh adapter — and a
+    /// fresh `construct-mcp` child — for each session.
+    RestartSessions,
+    /// Gracefully stop every adapter (leaving sessions resumable) and
+    /// exit without re-exec'ing. Used by `daemon stop`.
+    Stop,
+}
+
+/// Payload of a daemon lifecycle request (`daemon.restart` /
+/// `daemon.shutdown`), sent from the IPC handler to the main loop.
+/// Main resolves the exe path + args before the runtime tear-down so
+/// the reply can echo what's about to load.
 #[derive(Debug, Clone)]
 pub struct RestartCommand {
     pub exe: PathBuf,
     pub args: Vec<String>,
+    pub action: RestartAction,
 }
 
 /// Executable path captured once at daemon startup, before any
@@ -918,14 +936,22 @@ impl SessionManager {
         self.remote_snapshot_path.clone()
     }
 
-    /// Request a daemon restart. Resolves the exe path + args,
-    /// sends a `RestartCommand` to main's restart channel, and
-    /// returns the command so the IPC handler can echo it back to
-    /// the caller before the runtime tears down. Returns `Err` if
-    /// the exe path can't be resolved or the receiver was dropped
-    /// (which shouldn't happen — main holds it for the daemon's
-    /// lifetime).
-    pub fn request_daemon_restart(&self, exe_override: Option<PathBuf>) -> Result<RestartCommand> {
+    /// Request a daemon lifecycle action (restart / restart-with-sessions
+    /// / stop). Resolves the exe path + args, sends a `RestartCommand` to
+    /// main's lifecycle channel, and returns the command so the IPC
+    /// handler can echo it back to the caller before the runtime tears
+    /// down. Returns `Err` if the exe path can't be resolved or the
+    /// receiver was dropped (which shouldn't happen — main holds it for
+    /// the daemon's lifetime).
+    ///
+    /// The exe is resolved even for [`RestartAction::Stop`] (where it
+    /// goes unused) so the command shape stays uniform; resolving it is
+    /// cheap and validating a caller-supplied path early can't hurt.
+    pub fn request_daemon_restart(
+        &self,
+        exe_override: Option<PathBuf>,
+        action: RestartAction,
+    ) -> Result<RestartCommand> {
         let exe = match exe_override {
             // Validate a caller-supplied binary BEFORE tearing the
             // daemon down — exec()ing a bad path would never come back.
@@ -933,7 +959,7 @@ impl SessionManager {
             None => restart_exe_path().context("resolve restart exe")?,
         };
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let cmd = RestartCommand { exe, args };
+        let cmd = RestartCommand { exe, args, action };
         self.restart_tx
             .send(cmd.clone())
             .map_err(|_| anyhow::anyhow!("restart channel closed"))?;

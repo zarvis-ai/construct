@@ -175,6 +175,22 @@ enum Command {
 enum DaemonCommand {
     /// Run the daemon in the foreground (default).
     Run,
+    /// Start the daemon in the background, if not already running.
+    Start,
+    /// Stop the running daemon. Adapters are stopped but sessions stay
+    /// resumable on the next start.
+    Stop,
+    /// Restart the running daemon in place (or start one if none is
+    /// running). Sessions are preserved and resume after the restart.
+    Restart {
+        /// Also restart every session's adapter process (and its
+        /// `construct-mcp` child). Sessions are preserved/resumed —
+        /// they are neither archived nor deleted. Without this flag the
+        /// adapters survive the restart and reattach, so their MCP
+        /// children are not restarted.
+        #[arg(long)]
+        sessions: bool,
+    },
     /// Print resolved paths and exit.
     Paths,
     /// Print the embedded default config and exit.
@@ -222,6 +238,9 @@ async fn main() -> Result<()> {
         agentd::init_tracing();
         return match daemon_cmd.unwrap_or(DaemonCommand::Run) {
             DaemonCommand::Run => agentd::run(cli.socket).await,
+            DaemonCommand::Start => daemon_start(cli.socket).await,
+            DaemonCommand::Stop => daemon_stop(cli.socket).await,
+            DaemonCommand::Restart { sessions } => daemon_restart_cmd(cli.socket, sessions).await,
             DaemonCommand::Paths => {
                 agentd::print_paths();
                 Ok(())
@@ -568,4 +587,103 @@ async fn ensure_daemon_running(socket: &std::path::Path) {
 /// (the daemon is gone) fails to connect, so this correctly reports "not live".
 fn socket_is_live(socket: &std::path::Path) -> bool {
     std::os::unix::net::UnixStream::connect(socket).is_ok()
+}
+
+/// Resolve the daemon socket the same way the client commands do: honor
+/// `--socket`, else the discovered default.
+fn resolve_socket(socket_override: Option<PathBuf>) -> PathBuf {
+    socket_override.unwrap_or_else(|| Paths::discover().socket())
+}
+
+/// Poll `socket_is_live` until it reaches `want`, up to `tries` attempts
+/// spaced 100ms apart. Returns true if the desired state was reached.
+async fn poll_socket(socket: &std::path::Path, want: bool, tries: u32) -> bool {
+    use std::time::Duration;
+    for _ in 0..tries {
+        if socket_is_live(socket) == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    socket_is_live(socket) == want
+}
+
+/// `construct daemon start`: spawn a detached background daemon if one
+/// isn't already listening, then wait for it to bind the socket.
+/// Idempotent — succeeds as a no-op when a daemon already owns the socket.
+async fn daemon_start(socket_override: Option<PathBuf>) -> Result<()> {
+    let socket = resolve_socket(socket_override);
+    if socket_is_live(&socket) {
+        println!("construct daemon already running ({})", socket.display());
+        return Ok(());
+    }
+    agentd::spawn_detached_daemon(Some(&socket))
+        .with_context(|| format!("spawn detached daemon for {}", socket.display()))?;
+    // The daemon binds the socket early in startup; poll for readiness (~5s).
+    if poll_socket(&socket, true, 50).await {
+        println!("construct daemon started ({})", socket.display());
+        Ok(())
+    } else {
+        anyhow::bail!("construct daemon did not become ready within 5s; check the daemon log")
+    }
+}
+
+/// `construct daemon stop`: ask the running daemon to stop its adapters
+/// (leaving sessions resumable on the next start) and exit. Idempotent —
+/// succeeds as a no-op when no daemon is running.
+async fn daemon_stop(socket_override: Option<PathBuf>) -> Result<()> {
+    let socket = resolve_socket(socket_override);
+    if !socket_is_live(&socket) {
+        println!("construct daemon is not running ({})", socket.display());
+        return Ok(());
+    }
+    let client = connect(&socket).await?;
+    // The daemon closes the IPC connection as it exits, so a broken-pipe
+    // error here means the shutdown is in flight — both outcomes count as
+    // success.
+    match client.daemon_shutdown().await {
+        Ok(r) => tracing::debug!(pid = r.pid, "daemon acknowledged shutdown"),
+        Err(e) => tracing::debug!(error = %e, "shutdown reply lost (daemon already exiting)"),
+    }
+    // Wait for the socket to go dead so the command only returns once the
+    // daemon is actually gone. Adapter teardown is bounded but can be slow
+    // (a few seconds per wedged adapter), so allow a generous window.
+    if poll_socket(&socket, false, 200).await {
+        println!("construct daemon stopped ({})", socket.display());
+        Ok(())
+    } else {
+        anyhow::bail!("construct daemon shutdown requested but it is still running after 20s")
+    }
+}
+
+/// `construct daemon restart`: restart the running daemon in place, or
+/// start one if none is running. With `sessions = true`, every session's
+/// adapter (and its `construct-mcp` child) is also restarted; sessions are
+/// preserved and resume either way.
+async fn daemon_restart_cmd(socket_override: Option<PathBuf>, sessions: bool) -> Result<()> {
+    let socket = resolve_socket(socket_override);
+    if !socket_is_live(&socket) {
+        println!("no construct daemon running; starting one");
+        return daemon_start(Some(socket)).await;
+    }
+    let client = connect(&socket).await?;
+    // The daemon re-execs and drops this connection, so a broken-pipe
+    // error here means the restart is in flight — both count as success.
+    match client.daemon_restart(None, sessions).await {
+        Ok(r) => tracing::debug!(exe = %r.exe, pid = r.pid, "daemon acknowledged restart"),
+        Err(e) => tracing::debug!(error = %e, "restart reply lost (daemon already re-exec'ing)"),
+    }
+    // The daemon re-execs in place on the same socket. With `--sessions`
+    // it stops every adapter first (bounded but slow), so poll generously
+    // until a daemon is reachable again.
+    if poll_socket(&socket, true, 200).await {
+        println!(
+            "construct daemon restarted{} ({})",
+            if sessions { " (sessions bounced)" } else { "" },
+            socket.display()
+        );
+        Ok(())
+    } else {
+        anyhow::bail!("construct daemon did not come back within 20s after restart")
+    }
 }

@@ -7385,7 +7385,7 @@ impl App {
                 match sub {
                     "restart" => {
                         let exe = (!rest.is_empty()).then(|| rest.to_string());
-                        match self.client.daemon_restart(exe).await {
+                        match self.client.daemon_restart(exe, false).await {
                     Ok(r) => self.set_status(format!(
                                 "construct: restart requested (exe={}, pid={}) — reconnect when ready",
                                 r.exe, r.pid

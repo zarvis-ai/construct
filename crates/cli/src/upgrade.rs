@@ -224,7 +224,7 @@ pub async fn run(
                 // The daemon re-execs and drops this connection, so a
                 // broken-pipe error here means the restart is in flight —
                 // both outcomes count as success.
-                let _ = c.daemon_restart(None).await;
+                let _ = c.daemon_restart(None, false).await;
                 println!("Requested daemon restart — the upgrade is now live.");
             }
             Err(_) => println!("Upgraded. (No running daemon to restart.)"),
