@@ -259,6 +259,20 @@ impl MainWindowTree {
         }
     }
 
+    fn replace_session_selection(&mut self, target_id: &str, replacement: &Selection) {
+        match self {
+            Self::Leaf { selection, .. } => {
+                if selection.session_id() == Some(target_id) {
+                    *selection = replacement.clone();
+                }
+            }
+            Self::Split { first, second, .. } => {
+                first.replace_session_selection(target_id, replacement);
+                second.replace_session_selection(target_id, replacement);
+            }
+        }
+    }
+
     /// Session IDs of every visible leaf pane (all split halves included).
     pub fn visible_session_ids(&self) -> Vec<&str> {
         let mut ids = Vec::new();
@@ -3558,18 +3572,16 @@ impl App {
 
     /// After any list mutation, make sure `self.selection` still refers to
     /// an item we know about. Fall back to the first list item if not.
-    /// If `id` is the currently-selected session, move focus to its nearest
+    /// If `id` is selected or visible in a split pane, move it to its nearest
     /// visible neighbor in the list. Must be called *before* the session is
     /// removed from or hidden in `list_items()` (i.e. before removing it from
     /// `self.sessions` or marking it archived).
     fn focus_neighbor_of(&mut self, id: &str) {
-        if self.selection != Selection::Session(id.to_string()) {
-            return;
-        }
         let items = self.list_items();
-        let Some(pos) = items.iter().position(|it| {
-            matches!(it, ListItem::Session { summary, .. } if summary.id == id)
-        }) else {
+        let Some(pos) = items
+            .iter()
+            .position(|it| matches!(it, ListItem::Session { summary, .. } if summary.id == id))
+        else {
             return;
         };
         let pick_active = |it: &ListItem| -> Option<Selection> {
@@ -3581,14 +3593,26 @@ impl App {
                 _ => None,
             }
         };
-        let candidate = items[pos + 1..].iter().find_map(pick_active).or_else(|| {
-            items[..pos].iter().rev().find_map(pick_active)
-        });
-        if let Some(sel) = candidate {
-            self.selection = sel;
+        let candidate = items[pos + 1..]
+            .iter()
+            .find_map(pick_active)
+            .or_else(|| items[..pos].iter().rev().find_map(pick_active));
+        let replacement = candidate.unwrap_or(Selection::None);
+        self.main_windows
+            .replace_session_selection(id, &replacement);
+        if self.selection == Selection::Session(id.to_string()) {
+            self.selection = replacement;
+            self.transcript.clear();
+            self.transcript_session = None;
+            self.transcript_scroll = u16::MAX;
+            let active_window = Some(self.active_window_id);
+            self.set_scrollback_for_window(active_window, 0);
+            self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
+                ViewMode::Terminal
+            } else {
+                ViewMode::Chat
+            };
         }
-        // If no candidate found, leave selection as-is; ensure_selection_valid()
-        // will clear it once the session is gone from the list.
     }
 
     fn ensure_selection_valid(&mut self) {
@@ -8733,6 +8757,91 @@ mod tests {
         assert_eq!(
             app.selection_for_window(1),
             Some(Selection::Session("s1".into()))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn focus_neighbor_updates_split_leaf_when_selected_session_disappears() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.position = 1;
+        second.has_pty = false;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        app.active_window_id = 2;
+        app.selection = Selection::Session("s1".into());
+        app.view = ViewMode::Terminal;
+        app.transcript_session = Some("s1".into());
+        app.transcript.push(TimestampedEvent {
+            seq: 1,
+            at: chrono::Utc::now(),
+            event: SessionEvent::Done { exit_code: 0 },
+        });
+        app.window_scrollback.insert(2, 10);
+
+        app.focus_neighbor_of("s1");
+
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        assert_eq!(
+            app.selection_for_window(1),
+            Some(Selection::Session("s2".into()))
+        );
+        assert_eq!(
+            app.selection_for_window(2),
+            Some(Selection::Session("s2".into()))
+        );
+        assert_eq!(app.view, ViewMode::Chat);
+        assert!(app.transcript.is_empty());
+        assert_eq!(app.transcript_session, None);
+        assert_eq!(app.scrollback_for_window(Some(2)), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn focus_neighbor_replaces_inactive_split_without_stealing_focus() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.position = 1;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 2;
+        app.selection = Selection::Session("s2".into());
+
+        app.focus_neighbor_of("s1");
+
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        assert_eq!(
+            app.selection_for_window(1),
+            Some(Selection::Session("s2".into()))
+        );
+        assert_eq!(
+            app.selection_for_window(2),
+            Some(Selection::Session("s2".into()))
         );
         server.abort();
     }
