@@ -1,7 +1,7 @@
 #!/bin/sh
 # construct installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/zarvis-ai/agentd/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/zarvis-ai/construct/main/install.sh | sh
 #
 # Downloads the prebuilt binaries for your platform from a GitHub Release,
 # verifies their SHA-256 checksum, and drops them all into one directory on
@@ -16,7 +16,7 @@
 #                       <base>/constructd-<target>.tar.gz and <base>/SHA256SUMS.
 set -eu
 
-REPO="zarvis-ai/agentd"
+REPO="zarvis-ai/construct"
 VERSION="${CONSTRUCT_VERSION:-latest}"
 BIN_DIR="${CONSTRUCT_BIN_DIR:-$HOME/.local/bin}"
 BINS="construct"
