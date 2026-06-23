@@ -24,6 +24,13 @@ BINS="construct"
 say() { printf '%s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+abs_path() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    *) printf '%s/%s\n' "$(pwd -P)" "$1" ;;
+  esac
+}
+
 # --- detect platform ------------------------------------------------------
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -126,6 +133,23 @@ case ":${PATH}:" in
     say "    echo 'export PATH=\"${BIN_DIR}:\$PATH\"' >> ~/.profile   # or ~/.zshrc, ~/.bashrc"
     ;;
 esac
+
+# --- config guidance ------------------------------------------------------
+if [ -n "${CONSTRUCT_CONFIG_DIR:-}" ]; then
+  config_dir="${CONSTRUCT_CONFIG_DIR}"
+elif [ -n "${XDG_CONFIG_HOME:-}" ]; then
+  config_dir="${XDG_CONFIG_HOME%/}/construct"
+else
+  config_dir="${HOME}/.config/construct"
+fi
+config_dir="$(abs_path "$config_dir")"
+
+say ""
+say "Config directory: ${config_dir}"
+say "Configure construct by copying the generated template to config.toml:"
+say "  cp \"${config_dir}/config.toml.template\" \"${config_dir}/config.toml\""
+say "  \${EDITOR:-vi} \"${config_dir}/config.toml\""
+say "If config.toml.template is not there yet, run construct once to let the daemon create it."
 
 say ""
 say "Done. Try:  construct"
