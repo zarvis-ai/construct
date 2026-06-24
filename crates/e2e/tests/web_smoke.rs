@@ -325,6 +325,135 @@ async fn web_client_loads_and_websocket_connects() {
         "initial terminal replay should land at the latest page: {fast_open:?}"
     );
 
+    // Claude Code's full-screen mode enters the terminal alternate screen
+    // (`ESC[?1049h`). xterm.js treats that buffer as having no scrollback, so
+    // the web client strips those toggles before writing PTY bytes. The live
+    // fullscreen redraw still appears, but normal terminal scrollback remains
+    // reachable.
+    let alt_screen_scrollback: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const id = 's-alt-screen-scrollback';
+              const saved = {
+                sessions: state.sessions,
+                currentId: state.currentId,
+                mode: state.mode,
+                ws: state.ws,
+                terminalById: state.terminalById,
+                term: state.term,
+                fitAddon: state.fitAddon,
+              };
+              const calls = [];
+              const tick = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              const visibleText = (term) => {
+                const b = term.buffer.active;
+                const rows = [];
+                for (let row = 0; row < term.rows; row++) {
+                  rows.push(b.getLine(b.viewportY + row)?.translateToString(true) || '');
+                }
+                return rows.join('\n');
+              };
+              const prelude = Array.from({ length: 80 }, (_, i) => `pre-fullscreen history ${i}`).join('\r\n') + '\r\n';
+              const payload = prelude + '\x1b[?1049h' + 'fullscreen claude code\r\n';
+              try {
+                state.sessions = [{
+                  id,
+                  cwd: '/tmp',
+                  harness: 'claude',
+                  has_pty: true,
+                  kind: 'user',
+                }];
+                state.currentId = id;
+                state.terminalById = new Map();
+                state.ws = {
+                  readyState: 1,
+                  send(raw) {
+                    const msg = JSON.parse(raw);
+                    calls.push(msg);
+                    const pending = state.pending.get(msg.id);
+                    state.pending.delete(msg.id);
+                    let result = {};
+                    if (msg.method === 'session.pty_replay') {
+                      result = {
+                        data: btoa(payload),
+                        start_offset: 0,
+                        end_offset: payload.length,
+                        total_bytes: payload.length,
+                        size: { cols: 80, rows: 24 },
+                      };
+                    }
+                    queueMicrotask(() => pending.resolve(result));
+                  },
+                };
+                await enterTerminalMode(id, { forceReload: true });
+                const handle = terminalHandleForSession(id);
+                await tick();
+                cancelResizeFollowBottom();
+                const viewport = handle.host.querySelector('.xterm-viewport');
+                viewport.scrollTop = 0;
+                viewport.dispatchEvent(new Event('scroll'));
+                await tick();
+                const topText = visibleText(handle.term);
+                handle.term.scrollToBottom();
+                await tick();
+                const bottomText = visibleText(handle.term);
+
+                handle.ptyAltScreenFilterCarry = new Uint8Array(0);
+                const first = filterTerminalAltScreenBytes(new Uint8Array([0x1b, 0x5b, 0x3f, 0x31]));
+                const second = filterTerminalAltScreenBytes(new Uint8Array([0x30, 0x34, 0x39, 0x68, 0x41]));
+                return {
+                  topText,
+                  bottomText,
+                  baseY: handle.term.buffer.active.baseY,
+                  firstSplitLength: first.length,
+                  secondSplitText: new TextDecoder().decode(second),
+                  replayCalls: calls.filter((c) => c.method === 'session.pty_replay').length,
+                };
+              } finally {
+                const handle = terminalHandleForSession(id);
+                if (handle) {
+                  try { handle.term.dispose(); } catch (_) {}
+                  try { handle.host.remove(); } catch (_) {}
+                }
+                state.sessions = saved.sessions;
+                state.currentId = saved.currentId;
+                state.mode = saved.mode;
+                state.ws = saved.ws;
+                state.terminalById = saved.terminalById;
+                state.term = saved.term;
+                state.fitAddon = saved.fitAddon;
+                hideTerminalLoading();
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate alt-screen terminal scrollback")
+        .into_value()
+        .expect("json");
+    assert!(
+        alt_screen_scrollback["topText"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pre-fullscreen history 0"),
+        "scrolling to top should expose pre-fullscreen history: {alt_screen_scrollback:?}"
+    );
+    assert!(
+        alt_screen_scrollback["bottomText"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fullscreen claude code"),
+        "live terminal should still show fullscreen output: {alt_screen_scrollback:?}"
+    );
+    assert!(
+        alt_screen_scrollback["baseY"].as_u64().unwrap_or_default() > 0,
+        "normal-buffer scrollback should remain populated: {alt_screen_scrollback:?}"
+    );
+    assert_eq!(alt_screen_scrollback["firstSplitLength"], 0);
+    assert_eq!(alt_screen_scrollback["secondSplitText"], "A");
+    assert_eq!(alt_screen_scrollback["replayCalls"], 1);
+
     // Chat-history regression: switching a semantic PTY session from chat to
     // terminal while older transcript pages are still loading must pause that
     // backfill, then resume it without refetching the tail or moving the chat

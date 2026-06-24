@@ -3074,6 +3074,7 @@ function resetTerminalReplay(handle) {
   handle.ptyReplayTotalBytes = 0;
   handle.ptyReplayNextBytes = PTY_REPLAY_INITIAL_BYTES;
   handle.ptyReplayLoadingOlder = false;
+  handle.ptyAltScreenFilterCarry = new Uint8Array(0);
   updateTerminalHistoryButton(handle);
   if (handle.term) handle.term.reset();
 }
@@ -3177,7 +3178,7 @@ async function enterTerminalMode(id, options = {}) {
 
     // Flush any live PTY events that buffered during the replay.
     if (state.currentId === id && state.mode === "terminal") {
-      for (const chunk of state.ptyBuffer) state.term.write(chunk);
+      for (const chunk of state.ptyBuffer) writeLivePtyToTerm(chunk);
     }
     state.ptyBuffer = [];
     state.ptyBuffering = false;
@@ -3408,6 +3409,7 @@ function createTerminalHandle(id) {
     ptyReplayTotalBytes: 0,
     ptyReplayNextBytes: PTY_REPLAY_INITIAL_BYTES,
     ptyReplayLoadingOlder: false,
+    ptyAltScreenFilterCarry: new Uint8Array(0),
     lastReportedSize: { cols: 0, rows: 0 },
   };
   state.terminalById.set(id, handle);
@@ -3504,12 +3506,13 @@ function writeTermData(term, data) {
 }
 
 function writeTermBytes(term, bytes) {
-  return writeTermData(term, bytes);
+  return writeTermData(term, filterTerminalAltScreenBytes(bytes));
 }
 
 async function replayPtyChunks(handle) {
   if (!handle || !handle.term) return;
   handle.term.reset();
+  handle.ptyAltScreenFilterCarry = new Uint8Array(0);
   for (const chunk of handle.ptyReplayChunks) {
     await writeTermBytes(handle.term, chunk.bytes);
   }
@@ -3749,8 +3752,92 @@ function shouldSuppressComposerRowResize() {
   return performance.now() <= state.composerResizeSuppressPtyResizeUntil;
 }
 
+const TERMINAL_ALT_SCREEN_SEQUENCES = [
+  [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x39, 0x68], // ESC[?1049h
+  [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x39, 0x6c], // ESC[?1049l
+  [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x37, 0x68], // ESC[?1047h
+  [0x1b, 0x5b, 0x3f, 0x31, 0x30, 0x34, 0x37, 0x6c], // ESC[?1047l
+  [0x1b, 0x5b, 0x3f, 0x34, 0x37, 0x68],             // ESC[?47h
+  [0x1b, 0x5b, 0x3f, 0x34, 0x37, 0x6c],             // ESC[?47l
+];
+
+function terminalAltSeqMatch(bytes, offset, seq) {
+  if (bytes.length - offset < seq.length) return false;
+  for (let i = 0; i < seq.length; i++) {
+    if (bytes[offset + i] !== seq[i]) return false;
+  }
+  return true;
+}
+
+function terminalAltSeqPrefix(bytes, offset, seq) {
+  const remaining = bytes.length - offset;
+  if (remaining >= seq.length) return false;
+  for (let i = 0; i < remaining; i++) {
+    if (bytes[offset + i] !== seq[i]) return false;
+  }
+  return true;
+}
+
+function concatTerminalBytes(a, b) {
+  if (!a || !a.length) return b;
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+function filterTerminalAltScreenBytes(data) {
+  if (!data || !data.length) return data;
+  if (typeof data === "string") {
+    return data.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, "");
+  }
+  const handle = state.currentId ? terminalHandleForSession(state.currentId) : null;
+  const carry = handle && handle.ptyAltScreenFilterCarry && handle.ptyAltScreenFilterCarry.length
+    ? handle.ptyAltScreenFilterCarry
+    : null;
+  let bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  let hasEsc = !!carry;
+  if (!hasEsc) {
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] === 0x1b) {
+        hasEsc = true;
+        break;
+      }
+    }
+  }
+  if (!hasEsc) return data;
+  bytes = concatTerminalBytes(carry, bytes);
+  const out = [];
+  let changed = !!carry;
+  for (let i = 0; i < bytes.length;) {
+    let matched = null;
+    for (const seq of TERMINAL_ALT_SCREEN_SEQUENCES) {
+      if (terminalAltSeqMatch(bytes, i, seq)) {
+        matched = seq;
+        break;
+      }
+      if (handle && terminalAltSeqPrefix(bytes, i, seq)) {
+        if (handle) handle.ptyAltScreenFilterCarry = bytes.slice(i);
+        const filtered = new Uint8Array(out);
+        return changed || filtered.length !== data.length ? filtered : data;
+      }
+    }
+    if (matched) {
+      i += matched.length;
+      changed = true;
+      continue;
+    }
+    out.push(bytes[i]);
+    i++;
+  }
+  if (handle) handle.ptyAltScreenFilterCarry = new Uint8Array(0);
+  return changed ? new Uint8Array(out) : data;
+}
+
 function writeLivePtyToTerm(bytes) {
   if (!state.term) return;
+  bytes = filterTerminalAltScreenBytes(bytes);
+  if (!bytes || !bytes.length) return;
   const term = state.term;
   const followBottom = shouldFollowResizeBottom();
   if (!followBottom) {
