@@ -1501,7 +1501,7 @@
     </div>
     <div class="conn" id="conn" data-state="connecting" aria-label="connecting">
       <canvas class="mini-matrix" id="miniMatrix" width="192" height="84"
-              aria-label="agentd connecting" role="img"></canvas>
+              aria-label="construct connecting" role="img"></canvas>
     </div>
   </header>
   <main>
@@ -2044,7 +2044,7 @@ function initMiniMatrix() {
   if (!canvas || !ctx) return;
 
   const glyphs = "01:|/\\{}[]<>+$#@*=-zrvshcodxgit";
-  const revealText = "agentd";
+  const revealText = "construct";
   const tickMs = 120;
   let grid = null;
   let lastTick = 0;
@@ -2254,7 +2254,7 @@ function initMiniMatrix() {
 function setConnState(s, label) {
   connEl.dataset.state = s;
   connEl.setAttribute("aria-label", label);
-  if (miniMatrixEl) miniMatrixEl.setAttribute("aria-label", `agentd ${label}`);
+  if (miniMatrixEl) miniMatrixEl.setAttribute("aria-label", `construct ${label}`);
   setComposerEnabled(s === "open" && !!state.currentId);
 }
 
