@@ -274,6 +274,19 @@ impl MainWindowTree {
         }
     }
 
+    fn find_window_with_session_except(&self, target_id: &str, except_id: u64) -> Option<u64> {
+        match self {
+            Self::Leaf {
+                id,
+                selection: Selection::Session(session_id),
+            } if *id != except_id && session_id == target_id => Some(*id),
+            Self::Leaf { .. } => None,
+            Self::Split { first, second, .. } => first
+                .find_window_with_session_except(target_id, except_id)
+                .or_else(|| second.find_window_with_session_except(target_id, except_id)),
+        }
+    }
+
     fn replace_session_selection(&mut self, target_id: &str, replacement: &Selection) {
         match self {
             Self::Leaf { selection, .. } => {
@@ -3337,29 +3350,21 @@ impl App {
     }
 
     fn sync_active_window_selection(&mut self) {
-        fn update(node: &mut MainWindowTree, id: u64, selection: &Selection) -> bool {
-            match node {
-                MainWindowTree::Leaf {
-                    id: leaf_id,
-                    selection: leaf_selection,
-                } => {
-                    if *leaf_id == id {
-                        *leaf_selection = selection.clone();
-                        true
-                    } else {
-                        false
-                    }
-                }
-                MainWindowTree::Split { first, second, .. } => {
-                    update(first, id, selection) || update(second, id, selection)
+        let active_id = self.active_window_id;
+        let replacement = self.selection.clone();
+        let previous = self.selection_for_window(active_id);
+        if let (Some(previous), Selection::Session(next_session_id)) = (&previous, &replacement) {
+            if previous.session_id() != Some(next_session_id.as_str()) {
+                if let Some(other_id) = self
+                    .main_windows
+                    .find_window_with_session_except(next_session_id, active_id)
+                {
+                    self.main_windows.set_selection(other_id, previous.clone());
+                    self.set_scrollback_for_window(Some(other_id), 0);
                 }
             }
         }
-        update(
-            &mut self.main_windows,
-            self.active_window_id,
-            &self.selection,
-        );
+        self.main_windows.set_selection(active_id, replacement);
     }
 
     fn selection_for_window(&self, target: u64) -> Option<Selection> {
@@ -9049,6 +9054,84 @@ mod tests {
         );
         assert_eq!(
             app.selection_for_window(1),
+            Some(Selection::Session("s1".into()))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mouse_list_click_swaps_session_already_visible_in_another_split() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.position = 1;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.selection = Selection::Session("s1".into());
+        app.layout = test_layout();
+        app.layout.list_row_count = app.list_items().len();
+        app.layout.list_items_area = Some(Rect::new(1, 1, 18, 8));
+        app.window_scrollback.insert(2, 8);
+
+        app.click_list(Rect::new(0, 0, 20, 10), 5, 2).await;
+
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        assert_eq!(
+            app.selection_for_window(1),
+            Some(Selection::Session("s2".into()))
+        );
+        assert_eq!(
+            app.selection_for_window(2),
+            Some(Selection::Session("s1".into()))
+        );
+        assert_eq!(app.scrollback_for_window(Some(2)), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn switch_session_swaps_session_already_visible_in_another_split() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.position = 1;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.selection = Selection::Session("s1".into());
+
+        app.select_session("s2".into());
+        app.sync_active_window_selection();
+
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        assert_eq!(
+            app.selection_for_window(1),
+            Some(Selection::Session("s2".into()))
+        );
+        assert_eq!(
+            app.selection_for_window(2),
             Some(Selection::Session("s1".into()))
         );
         server.abort();
