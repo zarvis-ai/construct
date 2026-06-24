@@ -12,7 +12,9 @@ is provided, it creates the session in interactive mode, starts the daemon if
 needed, and opens the TUI focused on the new session.
 
 Scripts and integrations that need create-and-exit behavior must request a
-non-interactive mode explicitly, such as `--mode headless`.
+non-attaching flow explicitly. `--no-tui` creates an interactive session, prints
+its id, and exits. `--mode headless` creates a headless session, prints its id,
+and exits.
 
 ## Reason
 
@@ -24,7 +26,7 @@ are created inside the TUI.
 ## Consequences
 
 Future CLI changes should keep the default `construct new` flow attached to the
-interactive UI. New one-shot creation behavior should be explicit so it remains
+interactive UI. One-shot creation behavior should remain explicit so it remains
 safe for scripts to choose it deliberately.
 
 Removing or hiding individual one-shot commands does not remove the underlying

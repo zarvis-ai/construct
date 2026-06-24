@@ -29,7 +29,9 @@ construct new codex "implement the failing test"
 
 By default, `construct new ...` creates an interactive session and opens the TUI
 focused on it. Pass `--mode headless` when you want a script-friendly command
-that creates the session, prints its id, and exits.
+that creates a headless session, prints its id, and exits. Pass `--no-tui` when
+you want to create an interactive session, print its id, and stay in the current
+terminal.
 
 CLI-backed harnesses require the matching CLI to be installed and discoverable on
 `PATH`. Use the `*_BIN` or `*_CMD` environment variables below when you need to
@@ -108,6 +110,7 @@ Pass `--mode` to choose explicitly (optionally alongside a seed prompt):
 
 ```sh
 construct new claude
+construct new --no-tui claude
 construct new smith --mode headless "summarize the last run"
 ```
 

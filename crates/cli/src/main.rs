@@ -64,10 +64,12 @@ enum Command {
         model: Option<String>,
         #[arg(long)]
         title: Option<String>,
-        /// Session mode hint. Defaults to "interactive" and opens the TUI;
-        /// "headless" creates the session, prints its id, and exits.
+        /// Session mode hint. Defaults to "interactive".
         #[arg(long)]
         mode: Option<String>,
+        /// Create the session, print its id, and exit instead of opening the TUI.
+        #[arg(long, default_value_t = false)]
+        no_tui: bool,
         #[arg(long, default_value_t = false)]
         worktree: bool,
     },
@@ -332,10 +334,11 @@ async fn main() -> Result<()> {
             model,
             title,
             mode,
+            no_tui,
             worktree,
         } => {
             let mode = mode.unwrap_or_else(|| "interactive".to_string());
-            let open_tui = mode == "interactive";
+            let open_tui = mode == "interactive" && !no_tui;
             ensure_daemon_running(&socket).await;
             let c = connect(&socket).await?;
             let cwd = std::fs::canonicalize(&cwd)
