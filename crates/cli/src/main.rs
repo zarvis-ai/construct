@@ -50,7 +50,6 @@ enum Command {
     /// List registered harnesses.
     Harnesses,
     /// List sessions.
-    #[command(visible_alias = "ls")]
     List,
     /// Create a new interactive session and open the TUI.
     New {
@@ -123,7 +122,6 @@ enum Command {
     /// Force-kill a session (SIGKILL the adapter; keeps the record errored).
     Kill { session_id: String },
     /// Delete a session entirely (kill if running, remove transcript + worktree).
-    #[command(visible_alias = "rm")]
     Delete { session_id: String },
     /// Rename a session — sets the user-facing title (shown instead of the
     /// session hash). Pass `--clear` to remove the title and fall back to
