@@ -260,6 +260,20 @@ impl MainWindowTree {
         }
     }
 
+    fn set_selection(&mut self, target: u64, replacement: Selection) -> bool {
+        match self {
+            Self::Leaf { id, selection } if *id == target => {
+                *selection = replacement;
+                true
+            }
+            Self::Leaf { .. } => false,
+            Self::Split { first, second, .. } => {
+                first.set_selection(target, replacement.clone())
+                    || second.set_selection(target, replacement)
+            }
+        }
+    }
+
     fn replace_session_selection(&mut self, target_id: &str, replacement: &Selection) {
         match self {
             Self::Leaf { selection, .. } => {
@@ -1630,6 +1644,20 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
 }
 
 pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
+    run_with_socket_initial_selection(socket, None).await
+}
+
+pub async fn run_with_socket_selected(
+    socket: std::path::PathBuf,
+    session_id: String,
+) -> Result<()> {
+    run_with_socket_initial_selection(socket, Some(session_id)).await
+}
+
+async fn run_with_socket_initial_selection(
+    socket: std::path::PathBuf,
+    initial_session_id: Option<String>,
+) -> Result<()> {
     let client = Client::connect(&socket).await?;
     let profile = Profile::from_env();
     let keymap = keymap::default_for(profile);
@@ -1650,19 +1678,30 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
     // Restore the previously-selected session if it still exists,
     // else fall back to the first non-orchestrator session.
     let persisted = crate::tui_state::load();
-    let initial_zoom = persisted.zoom;
+    let requested_initial_sel = initial_session_id.as_ref().and_then(|id| {
+        sessions
+            .iter()
+            .find(|s| s.id == *id && is_user_list_session(s))
+            .map(|s| Selection::Session(s.id.clone()))
+    });
+    let initial_zoom = if requested_initial_sel.is_some() {
+        ZoomMode::None
+    } else {
+        persisted.zoom
+    };
     let initial_focus = match initial_zoom {
         ZoomMode::List => PaneFocus::List,
         ZoomMode::View | ZoomMode::None => PaneFocus::View,
     };
-    let initial_sel = persisted
-        .last_selected_session_id
-        .as_ref()
-        .and_then(|id| {
-            sessions
-                .iter()
-                .find(|s| s.id == *id && is_user_list_session(s))
-                .map(|s| Selection::Session(s.id.clone()))
+    let initial_sel = requested_initial_sel
+        .clone()
+        .or_else(|| {
+            persisted.last_selected_session_id.as_ref().and_then(|id| {
+                sessions
+                    .iter()
+                    .find(|s| s.id == *id && is_user_list_session(s))
+                    .map(|s| Selection::Session(s.id.clone()))
+            })
         })
         .or_else(|| {
             sessions
@@ -1671,19 +1710,27 @@ pub async fn run_with_socket(socket: std::path::PathBuf) -> Result<()> {
                 .map(|s| Selection::Session(s.id.clone()))
         })
         .unwrap_or(Selection::None);
-    let initial_main_windows = persisted
+    let mut initial_main_windows = persisted
         .main_windows
         .clone()
         .map(|tree| prune_window_tree(tree, &sessions, &groups, &initial_sel))
         .unwrap_or_else(|| MainWindowTree::single(1, initial_sel.clone()));
-    let initial_active_window_id = persisted
+    let mut initial_active_window_id = persisted
         .active_window_id
         .filter(|id| initial_main_windows.find_selection(*id).is_some())
         .unwrap_or_else(|| initial_main_windows.first_leaf_id().unwrap_or(1));
-    let initial_window_sel = initial_main_windows
-        .find_selection(initial_active_window_id)
-        .cloned()
-        .unwrap_or_else(|| initial_sel.clone());
+    let initial_window_sel = if let Some(sel) = requested_initial_sel {
+        if !initial_main_windows.set_selection(initial_active_window_id, sel.clone()) {
+            initial_active_window_id = 1;
+            initial_main_windows = MainWindowTree::single(initial_active_window_id, sel.clone());
+        }
+        sel
+    } else {
+        initial_main_windows
+            .find_selection(initial_active_window_id)
+            .cloned()
+            .unwrap_or_else(|| initial_sel.clone())
+    };
 
     let now = Instant::now();
     let socket = client.socket_path().to_path_buf();

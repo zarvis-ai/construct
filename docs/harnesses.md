@@ -23,9 +23,15 @@ Create a session with:
 
 ```sh
 construct new smith "review this repo"
-construct new shell ""
+construct new shell
 construct new codex "implement the failing test"
 ```
+
+By default, `construct new ...` creates an interactive session and opens the TUI
+focused on it. Pass `--mode headless` when you want a script-friendly command
+that creates a headless session, prints its id, and exits. Pass `--no-tui` when
+you want to create an interactive session, print its id, and stay in the current
+terminal.
 
 CLI-backed harnesses require the matching CLI to be installed and discoverable on
 `PATH`. Use the `*_BIN` or `*_CMD` environment variables below when you need to
@@ -86,26 +92,25 @@ Most harnesses can run in two modes:
   This is useful for automation and non-PTY clients.
 
 **How the mode is chosen.** An explicit `--mode` always wins. Otherwise the mode
-is *interactive* when the creating client supplied a PTY size and *headless* when
-it did not. The TUI always supplies one, so TUI sessions default to interactive.
-The `construct new` CLI never supplies one, so **every `construct new` session is headless
-unless you pass `--mode interactive`** — regardless of the prompt.
+is *interactive* when the creating client supplied a PTY size or used the
+`construct new` CLI, and *headless* when it did not. The TUI always supplies one,
+so TUI sessions default to interactive.
 
 **The initial prompt does not pick the mode.** `construct new <harness> "<prompt>"`
-and `construct new <harness> ""` are both headless from the CLI; the prompt only
-decides what the session does once it starts:
+and `construct new <harness>` both create interactive sessions unless you pass
+`--mode headless`; the prompt only decides what the session does once it starts:
 
 - A non-empty prompt is recorded as the first user turn and run immediately. For
-  non-PTY clients this is the headless, structured-output path (for example,
-  `shell` runs `$SHELL -lc "<prompt>"` once and exits).
+  headless clients this is the structured-output path (for example, `shell`
+  runs `$SHELL -lc "<prompt>"` once and exits).
 - An empty prompt launches the harness's interactive program (for example,
-  `shell` runs `$SHELL -il`), which you can attach to and type into — even though
-  the session's mode label is still `headless`.
+  `shell` runs `$SHELL -il`), which you can attach to and type into.
 
 Pass `--mode` to choose explicitly (optionally alongside a seed prompt):
 
 ```sh
-construct new claude --mode interactive ""
+construct new claude
+construct new --no-tui claude
 construct new smith --mode headless "summarize the last run"
 ```
 

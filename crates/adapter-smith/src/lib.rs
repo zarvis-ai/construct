@@ -44,8 +44,8 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
         Some("interactive") => Mode::Interactive,
         Some("headless") => Mode::Headless,
         // Default: interactive when the client supplied a PTY size (the
-        // TUI always does), else headless (so `construct new smith "..."`
-        // from a non-TUI client gets the structured stream).
+        // TUI always does), else headless. The `construct new` CLI passes an
+        // explicit mode, so this fallback is for other IPC clients.
         _ if params.pty_size.is_some() => Mode::Interactive,
         _ => Mode::Headless,
     }
