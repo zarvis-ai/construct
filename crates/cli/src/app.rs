@@ -4427,6 +4427,23 @@ impl App {
         // Track every event's cell so hover-aware rendering (diamond
         // tooltip, etc.) has a current position to render against.
         self.mouse_pos = Some((ev.column, ev.row));
+        // If the cursor is over a pane whose child has grabbed the mouse
+        // (e.g. Claude Code in fullscreen), forward the event into that PTY and
+        // stop — construct becomes a transparent mouse pipe for the pane, so
+        // the child's own scroll/click/selection handling works. Skipped while
+        // a construct-owned drag gesture (pane/list resize, scrollbar, text
+        // selection) is in flight so those finish under our control.
+        if self.resizing_list.is_none()
+            && self.resizing_pin_strip.is_none()
+            && self.resizing_orchestrator_panel.is_none()
+            && self.resizing_matrix_rain.is_none()
+            && self.resizing_main_window.is_none()
+            && self.dragging_terminal_scrollbar.is_none()
+            && self.text_selection.is_none()
+            && self.forward_mouse_to_child(&ev)
+        {
+            return;
+        }
         match ev.kind {
             MouseEventKind::ScrollUp => {
                 if !self.adjust_mouse_dynamic_ui_scroll(ev.column, ev.row, -LIST_STEP)
@@ -5785,6 +5802,55 @@ impl App {
             self.list_items().len(),
             visible_h,
         );
+    }
+
+    /// Forward a mouse event into the child PTY of the pane under the cursor,
+    /// if that child has requested mouse tracking. Returns `true` when the
+    /// event was consumed (encoded and queued for the child), `false` when no
+    /// such pane is under the cursor or the child isn't tracking the mouse —
+    /// in which case the caller handles the event with construct's own logic.
+    fn forward_mouse_to_child(&mut self, ev: &MouseEvent) -> bool {
+        // Which pane's content area is the cursor over? Borders are excluded
+        // (`inner_area`), so divider drags and frame clicks fall through.
+        let Some(hit) = self
+            .layout
+            .main_window_areas
+            .iter()
+            .find(|h| Self::rect_contains(h.inner_area, ev.column, ev.row))
+            .copied()
+        else {
+            return false;
+        };
+        // Which session is shown there?
+        let Some(session_id) = self
+            .main_windows
+            .find_selection(hit.id)
+            .and_then(|sel| sel.session_id())
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        // Has that session's child grabbed the mouse, and how does it want
+        // the report framed?
+        let Some(history) = self.histories.get(&session_id) else {
+            return false;
+        };
+        let mode = history.mouse_protocol_mode();
+        if mode == vt100::MouseProtocolMode::None {
+            return false;
+        }
+        let encoding = history.mouse_protocol_encoding();
+        // Translate to 1-based coordinates local to the child's screen.
+        let col = ev.column.saturating_sub(hit.inner_area.x) + 1;
+        let row = ev.row.saturating_sub(hit.inner_area.y) + 1;
+        let Some(bytes) = crate::mouse_forward::encode(ev, col, row, mode, encoding) else {
+            // Child tracks the mouse but doesn't report this event kind under
+            // its mode (e.g. plain motion in press/release mode). Let construct
+            // keep its own handling rather than swallowing it silently.
+            return false;
+        };
+        self.queue_pty_input(session_id, bytes, "mouse");
+        true
     }
 
     pub(crate) fn adjust_mouse_scrollback(&mut self, col: u16, row: u16, delta: i32) {
