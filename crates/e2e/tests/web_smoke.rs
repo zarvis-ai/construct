@@ -130,6 +130,63 @@ async fn web_client_loads_and_websocket_connects() {
         "expected 'session(s)' in rendered body, got:\n{body}"
     );
 
+    // Operational canvas should be a document surface, not a native
+    // textarea: chips render inline while the saved/operator-facing value
+    // remains markdown text.
+    let operational_canvas: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const previous = localStorage.getItem(OP_CANVAS_DOC_KEY);
+              try {
+                openOperationalCanvas();
+                const doc = [
+                  '# Canvas Test',
+                  '',
+                  '- [ ] Ask @codex about README.md',
+                  '- Track @session:s123',
+                ].join('\n');
+                setOperationalCanvasText(doc);
+                saveOperationalCanvasText();
+                renderOperationalCanvas();
+                const editor = document.getElementById('opCanvasEditor');
+                const chips = Array.from(editor.querySelectorAll('.op-doc-chip'));
+                const tasks = Array.from(editor.querySelectorAll('.op-doc-taskbox'));
+                return {
+                  tag: editor.tagName,
+                  editable: editor.getAttribute('contenteditable'),
+                  raw: operationalCanvasText(),
+                  stored: localStorage.getItem(OP_CANVAS_DOC_KEY),
+                  chipCount: chips.length,
+                  taskCount: tasks.length,
+                  firstChipRaw: chips[0]?.dataset.raw || '',
+                  firstChipEditable: chips[0]?.getAttribute('contenteditable') || '',
+                  scope: currentOperationalCanvasScope().label,
+                };
+              } finally {
+                if (previous == null) localStorage.removeItem(OP_CANVAS_DOC_KEY);
+                else localStorage.setItem(OP_CANVAS_DOC_KEY, previous);
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate operational canvas")
+        .into_value()
+        .expect("operational canvas value");
+    assert_eq!(operational_canvas["tag"], "DIV");
+    assert_eq!(operational_canvas["editable"], "true");
+    assert_eq!(operational_canvas["chipCount"], 3);
+    assert_eq!(operational_canvas["taskCount"], 1);
+    assert_eq!(operational_canvas["firstChipRaw"], "@codex");
+    assert_eq!(operational_canvas["firstChipEditable"], "false");
+    let raw = operational_canvas["raw"].as_str().unwrap_or_default();
+    assert!(
+        raw.contains("@codex") && raw.contains("README.md") && raw.contains("@session:s123"),
+        "canvas markdown should preserve raw chip tokens: {operational_canvas:?}"
+    );
+    assert_eq!(operational_canvas["stored"], operational_canvas["raw"]);
+
     // Creating a session while viewing a session inside a project should
     // inherit that project, matching the TUI's new-session semantics.
     let inherited_project: serde_json::Value = page

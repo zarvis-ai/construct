@@ -29,6 +29,12 @@ The visible document is the semantic contract. If behavior matters, it must be
 visible in the document as text, chips, comments, diagrams, or other editable
 content.
 
+The canvas should use a document-capable editor surface, not a native textarea
+as the durable UX. Markdown can remain the interchange and persistence format,
+but the rendered surface must support inline smart chips, status affordances,
+generated regions, comments, selection-aware actions, and eventually richer
+layout primitives such as boxes or arrows.
+
 Execution is explicit. Editing text never launches agents, mutates files,
 cancels sessions, or submits prompts by itself. Actions happen through a
 contextual action affordance, direct user command, accepted operator proposal,
@@ -52,6 +58,11 @@ Users should be able to shape the canvas around their own workflow: kanban-like
 sections, release boards, ad hoc checklists, diagrams, matrices, notes, or
 hybrid structures. Construct can augment that document without taking ownership
 away from the user.
+
+A textarea can prove the submission plumbing, but it cannot make chips,
+operator-written status, or generated regions feel native. A document surface
+lets Construct keep the content editable while giving recognized entities their
+own behavior and presentation.
 
 Keeping semantics visible avoids brittle hidden state. If Construct stored
 document-local selectors such as "items under heading X form a workflow", a

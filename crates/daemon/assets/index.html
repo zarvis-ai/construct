@@ -915,7 +915,6 @@
     flex: 1 1 0;
     min-height: 0;
     width: 100%;
-    resize: none;
     border: 0;
     border-right: 1px solid var(--border);
     border-radius: 0;
@@ -926,9 +925,72 @@
     outline: none;
     scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
     scrollbar-width: thin;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .op-canvas-editor[contenteditable="true"] {
+    cursor: text;
+    -webkit-user-select: text;
+    user-select: text;
   }
   .op-canvas-editor:focus {
     box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .op-canvas-line {
+    min-height: 1.55em;
+    padding: 1px 0;
+  }
+  .op-canvas-line.is-heading {
+    margin: 0.65em 0 0.2em;
+    color: var(--accent);
+    font-weight: 700;
+  }
+  .op-canvas-line.is-heading-1 { font-size: 18px; }
+  .op-canvas-line.is-heading-2 { font-size: 16px; }
+  .op-canvas-line.is-heading-3 { font-size: 15px; }
+  .op-doc-chip,
+  .op-doc-taskbox {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    margin: 0 2px;
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    background: rgba(2, 8, 5, 0.86);
+    color: var(--fg);
+    font-size: 0.86em;
+    line-height: 1.35;
+    vertical-align: 0.08em;
+    white-space: nowrap;
+  }
+  .op-doc-chip.is-active,
+  .op-doc-taskbox.is-done {
+    border-color: color-mix(in srgb, var(--ok) 70%, var(--border));
+  }
+  .op-doc-chip.is-missing {
+    border-color: color-mix(in srgb, var(--warn) 70%, var(--border));
+  }
+  .op-doc-chip .chip-kind {
+    color: var(--fg-dim);
+    font-size: 0.76em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .op-doc-chip .chip-status {
+    color: var(--fg-faint);
+    font-size: 0.76em;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .op-doc-chip.is-active .chip-status,
+  .op-doc-taskbox.is-done {
+    color: var(--ok);
+  }
+  .op-doc-chip.is-missing .chip-status,
+  .op-doc-taskbox.is-pending {
+    color: var(--warn);
   }
   .op-canvas-inspector {
     min-width: 0;
@@ -1810,10 +1872,12 @@
         </div>
         <div class="op-canvas-body">
           <div class="op-canvas-editor-wrap">
-            <textarea id="opCanvasEditor" class="op-canvas-editor"
-                      spellcheck="true"
-                      autocomplete="off"
-                      aria-label="operational markdown document"></textarea>
+            <div id="opCanvasEditor" class="op-canvas-editor"
+                 contenteditable="true"
+                 spellcheck="true"
+                 role="textbox"
+                 aria-multiline="true"
+                 aria-label="operational markdown document"></div>
           </div>
           <aside class="op-canvas-inspector" id="opCanvasInspector" aria-label="canvas inspector">
             <div class="op-canvas-panel">
@@ -2325,7 +2389,7 @@ function loadOperationalCanvasPendingUpdate() {
 
 function saveOperationalCanvasText() {
   if (!opCanvasEditorEl) return;
-  localStorage.setItem(OP_CANVAS_DOC_KEY, opCanvasEditorEl.value || "");
+  localStorage.setItem(OP_CANVAS_DOC_KEY, operationalCanvasText());
 }
 
 function saveOperationalCanvasPendingUpdate(text) {
@@ -2368,35 +2432,192 @@ function operationalCanvasSlug(text) {
   return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
 }
 
+function operationalCanvasTokenMeta(raw) {
+  const token = String(raw || "");
+  if (/^@session(?::|\s+)/.test(token)) {
+    const label = token.replace(/^@session(?::|\s+)/, "");
+    const s = sessionReferenceForName(label);
+    return {
+      kind: "session",
+      label,
+      status: s ? sessionStatusLabel(s) : "missing",
+      className: s ? "" : "is-missing",
+    };
+  }
+  if (/^@[A-Za-z]/.test(token)) {
+    const label = token.slice(1);
+    const harnesses = harnessNamesFromState();
+    if (harnesses.has(label)) {
+      const active = state.sessions.some((s) => s.harness === label && sessionStatusLabel(s) === "running");
+      return {
+        kind: "harness",
+        label,
+        status: active ? "active" : "known",
+        className: active ? "is-active" : "",
+      };
+    }
+    const s = sessionReferenceForName(label);
+    return {
+      kind: s ? "session" : "ref",
+      label,
+      status: s ? sessionStatusLabel(s) : "unresolved",
+      className: s ? "" : "is-missing",
+    };
+  }
+  if (/^#[A-Za-z]/.test(token)) {
+    return { kind: "tag", label: token, status: "visible", className: "" };
+  }
+  return { kind: "file", label: token, status: "context", className: "" };
+}
+
+function operationalCanvasChipHtml(raw) {
+  const meta = operationalCanvasTokenMeta(raw);
+  return `
+    <span class="op-doc-chip ${attr(meta.className)}" data-raw="${attr(raw)}" contenteditable="false">
+      <span class="chip-kind">${escape(meta.kind)}</span>
+      <span>${escape(meta.label)}</span>
+      <span class="chip-status">${escape(meta.status)}</span>
+    </span>
+  `;
+}
+
+function operationalCanvasTaskboxHtml(raw) {
+  const value = String(raw || "");
+  let label = "[ ]";
+  let className = "is-pending";
+  if (/^\[[xX]\]$/.test(value)) {
+    label = "[x]";
+    className = "is-done";
+  } else if (/^\[(~|-)\]$/.test(value)) {
+    label = value;
+    className = "is-running";
+  }
+  return `<span class="op-doc-taskbox ${attr(className)}" data-raw="${attr(value)}" contenteditable="false">${escape(label)}</span>`;
+}
+
+function operationalCanvasInlineHtml(text) {
+  const raw = String(text || "");
+  const tokenRe = /(@session(?::|\s+)[A-Za-z0-9_.:-]+|@[A-Za-z][A-Za-z0-9_-]*|#[A-Za-z][A-Za-z0-9_-]*|[A-Za-z0-9_./-]+\.(?:rs|md|toml|json|yaml|yml|js|ts|html|css|sh)|\[(?: |x|X|~|-)\])/g;
+  let html = "";
+  let last = 0;
+  for (const match of raw.matchAll(tokenRe)) {
+    html += escape(raw.slice(last, match.index));
+    const token = match[0];
+    html += token.startsWith("[") ? operationalCanvasTaskboxHtml(token) : operationalCanvasChipHtml(token);
+    last = match.index + token.length;
+  }
+  html += escape(raw.slice(last));
+  return html || "<br>";
+}
+
+function operationalCanvasLineHtml(line) {
+  const raw = String(line || "");
+  const heading = markdownHeadingLevel(raw);
+  const classes = ["op-canvas-line"];
+  if (heading > 0) {
+    classes.push("is-heading", `is-heading-${Math.min(heading, 3)}`);
+  }
+  return `<div class="${classes.join(" ")}" data-raw="${attr(raw)}">${operationalCanvasInlineHtml(raw)}</div>`;
+}
+
+function setOperationalCanvasText(text) {
+  if (!opCanvasEditorEl) return;
+  const lines = String(text || "").split("\n");
+  opCanvasEditorEl.innerHTML = lines.map(operationalCanvasLineHtml).join("");
+}
+
+function rawTextFromCanvasNode(node) {
+  if (!node) return "";
+  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || "";
+  if (node.nodeType !== Node.ELEMENT_NODE) return "";
+  const el = node;
+  if (el.dataset && el.dataset.raw != null && el.contentEditable === "false") {
+    return el.dataset.raw;
+  }
+  if (el.tagName === "BR") return "";
+  let text = "";
+  for (const child of el.childNodes) text += rawTextFromCanvasNode(child);
+  return text;
+}
+
+function operationalCanvasBlocks() {
+  if (!opCanvasEditorEl) return [];
+  const blocks = Array.from(opCanvasEditorEl.childNodes).filter((node) => {
+    if (node.nodeType === Node.TEXT_NODE) return !!node.nodeValue;
+    if (node.nodeType !== Node.ELEMENT_NODE) return false;
+    return node.tagName === "DIV" || node.tagName === "P" || node.classList.contains("op-canvas-line");
+  });
+  return blocks.length ? blocks : [opCanvasEditorEl];
+}
+
+function operationalCanvasText() {
+  if (!opCanvasEditorEl) return "";
+  return operationalCanvasBlocks().map(rawTextFromCanvasNode).join("\n");
+}
+
+function renderOperationalCanvasDocument() {
+  if (!opCanvasEditorEl) return;
+  const text = operationalCanvasText() || defaultOperationalCanvasText();
+  const scrollTop = opCanvasEditorEl.scrollTop;
+  setOperationalCanvasText(text);
+  opCanvasEditorEl.scrollTop = scrollTop;
+}
+
+function selectionInsideOperationalCanvas() {
+  if (!opCanvasEditorEl) return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  const anchor = sel.anchorNode;
+  const focus = sel.focusNode;
+  if (!opCanvasEditorEl.contains(anchor) || !opCanvasEditorEl.contains(focus)) return null;
+  return sel;
+}
+
+function currentOperationalCanvasLineInfo() {
+  const sel = selectionInsideOperationalCanvas();
+  if (!sel) return null;
+  let node = sel.anchorNode;
+  if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+  const block = node && node.closest ? node.closest(".op-canvas-line, div, p") : null;
+  if (!block || !opCanvasEditorEl.contains(block)) return null;
+  const blocks = operationalCanvasBlocks();
+  const index = blocks.indexOf(block);
+  return {
+    block,
+    index,
+    text: rawTextFromCanvasNode(block),
+  };
+}
+
 function currentOperationalCanvasScope() {
-  const text = opCanvasEditorEl ? opCanvasEditorEl.value || "" : "";
-  const start = opCanvasEditorEl ? opCanvasEditorEl.selectionStart || 0 : 0;
-  const end = opCanvasEditorEl ? opCanvasEditorEl.selectionEnd || start : start;
-  if (end > start) {
+  const text = operationalCanvasText();
+  const sel = selectionInsideOperationalCanvas();
+  if (sel && !sel.isCollapsed) {
     return {
       kind: "selection",
       label: "Selection",
-      text: text.slice(start, end),
-      start,
-      end,
+      text: sel.toString(),
+      start: 0,
+      end: 0,
     };
   }
 
-  const lineStart = text.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
-  let lineEnd = text.indexOf("\n", start);
-  if (lineEnd < 0) lineEnd = text.length;
-  const line = text.slice(lineStart, lineEnd);
-  if (line.trim()) {
+  const line = currentOperationalCanvasLineInfo();
+  if (line && line.text.trim()) {
     return {
       kind: "line",
       label: "Current line",
-      text: line,
-      start: lineStart,
-      end: lineEnd,
+      text: line.text,
+      start: 0,
+      end: 0,
     };
   }
 
-  const section = currentOperationalCanvasSection(text, start);
+  const lines = String(text || "").split("\n");
+  const lineIndex = line && line.index >= 0 ? line.index : 0;
+  let pos = 0;
+  for (let i = 0; i < lineIndex && i < lines.length; i += 1) pos += lines[i].length + 1;
+  const section = currentOperationalCanvasSection(text, pos);
   if (section) return section;
   return {
     kind: "document",
@@ -2475,7 +2696,8 @@ function renderOperationalCanvas() {
   if (opCanvasSubtitleEl) {
     opCanvasSubtitleEl.textContent = scope.label + " -> operator" + (op ? "" : " unavailable");
   }
-  if (opCanvasActBtn) opCanvasActBtn.disabled = !op || !(opCanvasEditorEl.value || "").trim();
+  refreshOperationalCanvasInlineChips();
+  if (opCanvasActBtn) opCanvasActBtn.disabled = !op || !operationalCanvasText().trim();
   if (opCanvasInsertBtn) opCanvasInsertBtn.disabled = !state.currentId;
   if (opCanvasApplyBtn) {
     opCanvasApplyBtn.disabled = !pendingOperationalCanvasUpdate;
@@ -2488,7 +2710,7 @@ function renderOperationalCanvas() {
 
 function renderOperationalCanvasChips() {
   if (!opCanvasChipsEl || !opCanvasEditorEl) return;
-  const text = opCanvasEditorEl.value || "";
+  const text = operationalCanvasText();
   const chips = [];
   const seen = new Set();
   const harnesses = harnessNamesFromState();
@@ -2567,9 +2789,23 @@ function maybeCaptureOperationalCanvasUpdate(sessionId, event) {
   setOperationalCanvasStatus("Operator proposed a canvas update. Review it in the operator response, then Apply update.");
 }
 
+function refreshOperationalCanvasInlineChips() {
+  if (!opCanvasEditorEl) return;
+  for (const chip of opCanvasEditorEl.querySelectorAll(".op-doc-chip[data-raw]")) {
+    const raw = chip.dataset.raw || "";
+    const meta = operationalCanvasTokenMeta(raw);
+    chip.className = `op-doc-chip ${meta.className || ""}`;
+    chip.innerHTML = `
+      <span class="chip-kind">${escape(meta.kind)}</span>
+      <span>${escape(meta.label)}</span>
+      <span class="chip-status">${escape(meta.status)}</span>
+    `;
+  }
+}
+
 function applyPendingOperationalCanvasUpdate() {
   if (!opCanvasEditorEl || !pendingOperationalCanvasUpdate) return;
-  opCanvasEditorEl.value = pendingOperationalCanvasUpdate;
+  setOperationalCanvasText(pendingOperationalCanvasUpdate);
   saveOperationalCanvasText();
   saveOperationalCanvasPendingUpdate(null);
   renderOperationalCanvas();
@@ -2584,7 +2820,7 @@ async function submitOperationalCanvasAction() {
     return;
   }
   const scope = currentOperationalCanvasScope();
-  const doc = opCanvasEditorEl.value || "";
+  const doc = operationalCanvasText();
   const prompt = [
     "OBSERVATION: operational_canvas.action",
     "",
@@ -2629,16 +2865,16 @@ function insertCurrentSessionIntoCanvas() {
   if (!s) return;
   const label = operationalCanvasSlug(sessionDisplayTitle(s)) || s.id;
   const insert = `@session:${label}`;
-  const start = opCanvasEditorEl.selectionStart || 0;
-  const end = opCanvasEditorEl.selectionEnd || start;
-  const before = opCanvasEditorEl.value.slice(0, start);
-  const after = opCanvasEditorEl.value.slice(end);
-  const prefix = before && !/\s$/.test(before) ? " " : "";
-  const suffix = after && !/^\s/.test(after) ? " " : "";
-  opCanvasEditorEl.value = before + prefix + insert + suffix + after;
-  const pos = before.length + prefix.length + insert.length;
   opCanvasEditorEl.focus();
-  opCanvasEditorEl.setSelectionRange(pos, pos);
+  const sel = selectionInsideOperationalCanvas();
+  if (sel && sel.rangeCount) {
+    document.execCommand("insertText", false, insert);
+  } else {
+    const text = operationalCanvasText();
+    setOperationalCanvasText(text ? `${text}\n${insert}` : insert);
+  }
+  renderOperationalCanvasDocument();
+  opCanvasEditorEl.focus();
   saveOperationalCanvasText();
   renderOperationalCanvas();
 }
@@ -2659,7 +2895,7 @@ function openOperationalCanvas() {
   viewModeToggleEl.hidden = true;
   canvasToggleBtn.setAttribute("aria-pressed", "true");
   sessionTitleEl.textContent = "operational canvas";
-  if (!opCanvasEditorEl.value) opCanvasEditorEl.value = loadOperationalCanvasText();
+  if (!operationalCanvasText().trim()) setOperationalCanvasText(loadOperationalCanvasText());
   renderOperationalCanvas();
   setTimeout(() => opCanvasEditorEl.focus(), 0);
 }
@@ -2682,20 +2918,25 @@ async function closeOperationalCanvas() {
 
 function initOperationalCanvas() {
   if (!opCanvasEditorEl) return;
-  opCanvasEditorEl.value = loadOperationalCanvasText();
+  setOperationalCanvasText(loadOperationalCanvasText());
   opCanvasEditorEl.addEventListener("input", () => {
     saveOperationalCanvasText();
     renderOperationalCanvas();
   });
   opCanvasEditorEl.addEventListener("keyup", renderOperationalCanvas);
   opCanvasEditorEl.addEventListener("mouseup", renderOperationalCanvas);
-  opCanvasEditorEl.addEventListener("select", renderOperationalCanvas);
+  opCanvasEditorEl.addEventListener("blur", renderOperationalCanvasDocument);
+  opCanvasEditorEl.addEventListener("paste", (ev) => {
+    ev.preventDefault();
+    const text = ev.clipboardData ? ev.clipboardData.getData("text/plain") : "";
+    document.execCommand("insertText", false, text);
+  });
   opCanvasActBtn.addEventListener("click", submitOperationalCanvasAction);
   opCanvasInsertBtn.addEventListener("click", insertCurrentSessionIntoCanvas);
   opCanvasApplyBtn.addEventListener("click", applyPendingOperationalCanvasUpdate);
   opCanvasResetBtn.addEventListener("click", () => {
     if (!confirm("Reset the operational canvas starter text?")) return;
-    opCanvasEditorEl.value = defaultOperationalCanvasText();
+    setOperationalCanvasText(defaultOperationalCanvasText());
     saveOperationalCanvasText();
     renderOperationalCanvas();
   });
