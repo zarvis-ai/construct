@@ -191,6 +191,31 @@
     background: var(--bg-elev-2);
     color: var(--fg);
   }
+  .canvas-toggle {
+    flex: 0 0 auto;
+    appearance: none;
+    border: 1px solid var(--border);
+    border-radius: 0;
+    padding: 5px 8px;
+    background: rgba(2, 8, 5, 0.44);
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .canvas-toggle:hover {
+    background: var(--bg-elev-2);
+    color: var(--fg);
+  }
+  .canvas-toggle[aria-pressed="true"] {
+    background: var(--accent);
+    color: #06160c;
+    text-shadow: none;
+  }
   .conn {
     margin-left: auto;
     display: inline-flex;
@@ -800,6 +825,212 @@
   .browser-preview-close:hover { background: rgba(0, 0, 0, 0.8); }
   @media (max-width: 720px) {
     .browser-preview { width: min(70vw, 320px); }
+  }
+
+  .op-canvas {
+    flex: 1 1 0;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    background:
+      linear-gradient(90deg, rgba(57, 255, 136, 0.035), transparent 42%),
+      radial-gradient(circle at 88% 8%, rgba(92, 225, 255, 0.045), transparent 34%),
+      #020805;
+    border-top: 1px solid var(--border);
+  }
+  .op-canvas[hidden] { display: none; }
+  .op-canvas-toolbar {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 10px;
+    align-items: center;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-elev) 88%, transparent);
+  }
+  .op-canvas-title {
+    min-width: 0;
+    color: var(--accent);
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .op-canvas-subtitle {
+    margin-top: 2px;
+    color: var(--fg-dim);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    font-weight: 400;
+  }
+  .op-canvas-actions {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+  .op-canvas-actions button {
+    appearance: none;
+    border: 1px solid var(--border);
+    border-radius: 0;
+    padding: 7px 10px;
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .op-canvas-actions button.primary {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #06160c;
+    font-weight: 700;
+    text-shadow: none;
+  }
+  .op-canvas-actions button:hover:not(:disabled) {
+    box-shadow: var(--glow-hard);
+  }
+  .op-canvas-actions button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    box-shadow: none;
+  }
+  .op-canvas-body {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(220px, 320px);
+  }
+  .op-canvas-editor-wrap {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .op-canvas-editor {
+    flex: 1 1 0;
+    min-height: 0;
+    width: 100%;
+    resize: none;
+    border: 0;
+    border-right: 1px solid var(--border);
+    border-radius: 0;
+    padding: 18px 20px 24px;
+    background: rgba(2, 8, 5, 0.62);
+    color: var(--fg);
+    font: 14px/1.55 var(--mono);
+    outline: none;
+    scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
+    scrollbar-width: thin;
+  }
+  .op-canvas-editor:focus {
+    box-shadow: inset 0 0 0 1px var(--accent);
+  }
+  .op-canvas-inspector {
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+    padding: 12px 12px 16px;
+    background: rgba(6, 21, 12, 0.62);
+    scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
+    scrollbar-width: thin;
+  }
+  .op-canvas-panel + .op-canvas-panel {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border-faint);
+  }
+  .op-canvas-panel-title {
+    color: var(--accent);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 8px;
+  }
+  .op-canvas-chip-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .op-canvas-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    max-width: 100%;
+    border: 1px solid var(--border);
+    background: rgba(2, 8, 5, 0.74);
+    color: var(--fg);
+    padding: 4px 7px;
+    font-size: 12px;
+    line-height: 1.25;
+  }
+  .op-canvas-chip .chip-kind {
+    color: var(--fg-dim);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.05em;
+  }
+  .op-canvas-chip .chip-status {
+    color: var(--fg-faint);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .op-canvas-chip.is-active .chip-status { color: var(--ok); }
+  .op-canvas-chip.is-missing .chip-status { color: var(--warn); }
+  .op-canvas-scope {
+    min-height: 4.5em;
+    max-height: 14em;
+    overflow: auto;
+    padding: 8px;
+    border: 1px solid var(--border-faint);
+    background: rgba(2, 8, 5, 0.64);
+    color: var(--fg-dim);
+    font-size: 12px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .op-canvas-status {
+    min-height: 1.4em;
+    padding: 6px 10px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-dim);
+    background: color-mix(in srgb, var(--bg-elev) 82%, transparent);
+    font-size: 12px;
+  }
+  @media (max-width: 900px) {
+    .op-canvas-body {
+      grid-template-columns: 1fr;
+      grid-template-rows: minmax(0, 1fr) auto;
+    }
+    .op-canvas-editor {
+      border-right: 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .op-canvas-inspector {
+      max-height: 32vh;
+    }
+  }
+  @media (max-width: 720px) {
+    .op-canvas-toolbar {
+      grid-template-columns: 1fr;
+      align-items: stretch;
+    }
+    .op-canvas-actions {
+      overflow-x: auto;
+      padding-bottom: 2px;
+    }
+    .op-canvas-actions button {
+      flex: 0 0 auto;
+    }
+    .op-canvas-editor {
+      padding: 14px 12px 18px;
+      font-size: 16px;
+    }
   }
 
   .editor-state {
@@ -1499,6 +1730,9 @@
       <button type="button" id="viewModeChat" data-view-mode="chat"
               aria-pressed="false">Chat</button>
     </div>
+    <button type="button" class="canvas-toggle" id="canvasToggle"
+            aria-pressed="false"
+            title="Open operational canvas">Canvas</button>
     <div class="conn" id="conn" data-state="connecting" aria-label="connecting">
       <canvas class="mini-matrix" id="miniMatrix" width="192" height="84"
               aria-label="construct connecting" role="img"></canvas>
@@ -1558,6 +1792,41 @@
         Mutual exclusion is via the `hidden` attribute set in
         `enterChatMode` / `enterTerminalMode`.
       -->
+      <section class="op-canvas" id="opCanvas" hidden aria-label="operational canvas">
+        <div class="op-canvas-toolbar">
+          <div>
+            <div class="op-canvas-title">Operational canvas</div>
+            <div class="op-canvas-subtitle" id="opCanvasSubtitle">
+              Edit freely. Select text or place the cursor, then ask the operator.
+            </div>
+          </div>
+          <div class="op-canvas-actions">
+            <button type="button" id="opCanvasResetBtn" title="Restore starter canvas">Reset</button>
+            <button type="button" id="opCanvasInsertBtn" title="Insert selected session as context">+ Session</button>
+            <button type="button" id="opCanvasActBtn" class="primary"
+                    title="Ask the operator about the selected text or current block">Act</button>
+          </div>
+        </div>
+        <div class="op-canvas-body">
+          <div class="op-canvas-editor-wrap">
+            <textarea id="opCanvasEditor" class="op-canvas-editor"
+                      spellcheck="true"
+                      autocomplete="off"
+                      aria-label="operational markdown document"></textarea>
+          </div>
+          <aside class="op-canvas-inspector" id="opCanvasInspector" aria-label="canvas inspector">
+            <div class="op-canvas-panel">
+              <div class="op-canvas-panel-title">Recognized</div>
+              <div class="op-canvas-chip-list" id="opCanvasChips"></div>
+            </div>
+            <div class="op-canvas-panel">
+              <div class="op-canvas-panel-title">Action scope</div>
+              <div class="op-canvas-scope" id="opCanvasScope"></div>
+            </div>
+          </aside>
+        </div>
+        <div class="op-canvas-status" id="opCanvasStatus"></div>
+      </section>
       <div class="transcript" id="transcript"></div>
       <div class="terminal-wrap" id="terminalWrap" hidden>
         <div class="terminal-host" id="terminal"></div>
@@ -1770,6 +2039,7 @@ const sessionTitleEl = $("sessionTitle");
 const viewModeToggleEl = $("viewModeToggle");
 const viewModeTerminalBtn = $("viewModeTerminal");
 const viewModeChatBtn = $("viewModeChat");
+const canvasToggleBtn = $("canvasToggle");
 const connEl = $("conn");
 const miniMatrixEl = $("miniMatrix");
 const composerEl = $("composer");
@@ -1791,6 +2061,15 @@ const browserPreviewEl = $("browserPreview");
 const browserPreviewImgEl = $("browserPreviewImg");
 const browserPreviewCaptionEl = $("browserPreviewCaption");
 const browserPreviewCloseEl = $("browserPreviewClose");
+const opCanvasEl = $("opCanvas");
+const opCanvasSubtitleEl = $("opCanvasSubtitle");
+const opCanvasEditorEl = $("opCanvasEditor");
+const opCanvasChipsEl = $("opCanvasChips");
+const opCanvasScopeEl = $("opCanvasScope");
+const opCanvasStatusEl = $("opCanvasStatus");
+const opCanvasActBtn = $("opCanvasActBtn");
+const opCanvasResetBtn = $("opCanvasResetBtn");
+const opCanvasInsertBtn = $("opCanvasInsertBtn");
 /** Autohide timer for the browser-preview overlay (mirrors the TUI's
  *  ~7s timeout). Hover pins it (clears the timer); the × dismisses. */
 let browserPreviewHideTimer = null;
@@ -1894,6 +2173,10 @@ const state = {
   // or "terminal" (xterm.js mounted to a PTY-backed session). Set by
   // `selectSession` based on `has_pty` plus the session mode.
   mode: "chat",
+  // Operational canvas is a document-level surface above individual session
+  // inspection. It borrows the operator session for actions but does not own a
+  // PTY/chat surface itself.
+  canvasOpen: false,
   // Explicit per-session view preference for PTY-capable sessions.
   // Absent means "terminal", preserving the existing default.
   viewModeById: loadViewModePrefs(),
@@ -1966,6 +2249,7 @@ const WIDGET_AUTOHIDE_MS = 15000;
 const PTY_REPLAY_INITIAL_BYTES = 128 * 1024;
 const PTY_REPLAY_MAX_BYTES = 1024 * 1024;
 const PTY_REPLAY_TOP_THRESHOLD_ROWS = 20;
+const OP_CANVAS_DOC_KEY = "agentd.web.operationalCanvas.doc";
 let widgetAutohideTimer = null;
 
 function loadViewModePrefs() {
@@ -1988,6 +2272,369 @@ function saveViewModePrefs() {
     if (mode === "chat" || mode === "terminal") obj[id] = mode;
   }
   localStorage.setItem(VIEW_MODE_PREFS_KEY, JSON.stringify(obj));
+}
+
+function defaultOperationalCanvasText() {
+  return [
+    "# Operational Canvas",
+    "",
+    "This document is editable operating state. Write naturally, select text or",
+    "place the cursor near work, then use Act to ask the operator.",
+    "",
+    "## Workflow",
+    "",
+    "Move items left to right when that is useful:",
+    "Ideas -> Doing -> Review -> Done",
+    "",
+    "## Ideas",
+    "",
+    "- Sketch the next Construct workflow here.",
+    "- Mention @codex, @claude, @shell, session names, file paths, PRs, or diffs.",
+    "",
+    "## Doing",
+    "",
+    "- [ ] Ask @codex to inspect the current operator architecture.",
+    "",
+    "## Review",
+    "",
+    "## Done",
+    "",
+  ].join("\n");
+}
+
+function loadOperationalCanvasText() {
+  try {
+    const raw = localStorage.getItem(OP_CANVAS_DOC_KEY);
+    if (typeof raw === "string" && raw.trim()) return raw;
+  } catch (_) {}
+  return defaultOperationalCanvasText();
+}
+
+function saveOperationalCanvasText() {
+  if (!opCanvasEditorEl) return;
+  localStorage.setItem(OP_CANVAS_DOC_KEY, opCanvasEditorEl.value || "");
+}
+
+function operatorSession() {
+  return state.sessions.find((s) => s.kind === "orchestrator") || null;
+}
+
+function harnessNamesFromState() {
+  const names = new Set();
+  for (const h of state.harnesses || []) {
+    if (h && h.name) names.add(h.name);
+  }
+  for (const s of state.sessions || []) {
+    if (s && s.harness) names.add(s.harness);
+  }
+  return names;
+}
+
+function sessionReferenceForName(name) {
+  const needle = String(name || "").trim().toLowerCase();
+  if (!needle) return null;
+  return state.sessions.find((s) => {
+    const title = sessionDisplayTitle(s).toLowerCase();
+    const slug = operationalCanvasSlug(title);
+    return s.id.toLowerCase() === needle || s.id.toLowerCase().startsWith(needle) || title === needle || slug === needle;
+  }) || null;
+}
+
+function operationalCanvasSlug(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+}
+
+function currentOperationalCanvasScope() {
+  const text = opCanvasEditorEl ? opCanvasEditorEl.value || "" : "";
+  const start = opCanvasEditorEl ? opCanvasEditorEl.selectionStart || 0 : 0;
+  const end = opCanvasEditorEl ? opCanvasEditorEl.selectionEnd || start : start;
+  if (end > start) {
+    return {
+      kind: "selection",
+      label: "Selection",
+      text: text.slice(start, end),
+      start,
+      end,
+    };
+  }
+
+  const lineStart = text.lastIndexOf("\n", Math.max(0, start - 1)) + 1;
+  let lineEnd = text.indexOf("\n", start);
+  if (lineEnd < 0) lineEnd = text.length;
+  const line = text.slice(lineStart, lineEnd);
+  if (line.trim()) {
+    return {
+      kind: "line",
+      label: "Current line",
+      text: line,
+      start: lineStart,
+      end: lineEnd,
+    };
+  }
+
+  const section = currentOperationalCanvasSection(text, start);
+  if (section) return section;
+  return {
+    kind: "document",
+    label: "Whole document",
+    text,
+    start: 0,
+    end: text.length,
+  };
+}
+
+function markdownHeadingLevel(line) {
+  const m = /^(#{1,6})\s+\S/.exec(line || "");
+  return m ? m[1].length : 0;
+}
+
+function currentOperationalCanvasSection(text, pos) {
+  const lines = String(text || "").split("\n");
+  let offset = 0;
+  let currentLine = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const next = offset + lines[i].length + 1;
+    if (pos < next) {
+      currentLine = i;
+      break;
+    }
+    offset = next;
+  }
+  let headingLine = -1;
+  let headingLevel = 0;
+  for (let i = currentLine; i >= 0; i -= 1) {
+    const level = markdownHeadingLevel(lines[i]);
+    if (level > 0) {
+      headingLine = i;
+      headingLevel = level;
+      break;
+    }
+  }
+  if (headingLine < 0) return null;
+  let start = 0;
+  for (let i = 0; i < headingLine; i += 1) start += lines[i].length + 1;
+  let end = text.length;
+  let scanOffset = start + lines[headingLine].length + 1;
+  for (let i = headingLine + 1; i < lines.length; i += 1) {
+    const level = markdownHeadingLevel(lines[i]);
+    if (level > 0 && level <= headingLevel) {
+      end = scanOffset - 1;
+      break;
+    }
+    scanOffset += lines[i].length + 1;
+  }
+  return {
+    kind: "section",
+    label: "Current section",
+    text: text.slice(start, end),
+    start,
+    end,
+  };
+}
+
+function trimForOperator(text, maxChars = 18000) {
+  const s = String(text || "");
+  if (s.length <= maxChars) return s;
+  const head = Math.floor(maxChars * 0.55);
+  const tail = maxChars - head;
+  return s.slice(0, head) + "\n\n...(" + (s.length - maxChars) + " chars omitted)...\n\n" + s.slice(-tail);
+}
+
+function renderOperationalCanvas() {
+  if (!opCanvasEditorEl) return;
+  const op = operatorSession();
+  const scope = currentOperationalCanvasScope();
+  if (opCanvasScopeEl) {
+    opCanvasScopeEl.textContent = scope.text.trim() || "(empty scope)";
+    opCanvasScopeEl.setAttribute("aria-label", scope.label);
+  }
+  if (opCanvasSubtitleEl) {
+    opCanvasSubtitleEl.textContent = scope.label + " -> operator" + (op ? "" : " unavailable");
+  }
+  if (opCanvasActBtn) opCanvasActBtn.disabled = !op || !(opCanvasEditorEl.value || "").trim();
+  if (opCanvasInsertBtn) opCanvasInsertBtn.disabled = !state.currentId;
+  renderOperationalCanvasChips();
+}
+
+function renderOperationalCanvasChips() {
+  if (!opCanvasChipsEl || !opCanvasEditorEl) return;
+  const text = opCanvasEditorEl.value || "";
+  const chips = [];
+  const seen = new Set();
+  const harnesses = harnessNamesFromState();
+  const pushChip = (kind, label, status, className = "") => {
+    const key = `${kind}:${label}:${status}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    chips.push({ kind, label, status, className });
+  };
+
+  for (const match of text.matchAll(/@session(?::|\s+)([A-Za-z0-9_.:-]+)/g)) {
+    const ref = match[1];
+    const s = sessionReferenceForName(ref);
+    pushChip("session", ref, s ? sessionStatusLabel(s) : "missing", s ? "" : "is-missing");
+  }
+  for (const match of text.matchAll(/@([A-Za-z][A-Za-z0-9_-]*)/g)) {
+    const name = match[1];
+    if (name === "session") continue;
+    if (harnesses.has(name)) {
+      const active = state.sessions.some((s) => s.harness === name && sessionStatusLabel(s) === "running");
+      pushChip("harness", name, active ? "active" : "known", active ? "is-active" : "");
+    } else {
+      const s = sessionReferenceForName(name);
+      if (s) pushChip("session", name, sessionStatusLabel(s));
+      else pushChip("ref", name, "unresolved", "is-missing");
+    }
+  }
+  for (const match of text.matchAll(/(?:^|\s)([A-Za-z0-9_./-]+\.(?:rs|md|toml|json|yaml|yml|js|ts|html|css|sh))(?=\s|$)/g)) {
+    pushChip("file", match[1], "context");
+  }
+  for (const match of text.matchAll(/#([A-Za-z][A-Za-z0-9_-]*)/g)) {
+    pushChip("tag", "#" + match[1], "visible");
+  }
+
+  if (!chips.length) {
+    opCanvasChipsEl.innerHTML = `<span class="op-canvas-chip is-missing"><span class="chip-kind">none</span><span>Add @harness, @session, files, or #tags</span></span>`;
+    return;
+  }
+  opCanvasChipsEl.innerHTML = chips
+    .slice(0, 32)
+    .map((chip) => `
+      <span class="op-canvas-chip ${attr(chip.className)}">
+        <span class="chip-kind">${escape(chip.kind)}</span>
+        <span>${escape(chip.label)}</span>
+        <span class="chip-status">${escape(chip.status)}</span>
+      </span>
+    `)
+    .join("");
+}
+
+function setOperationalCanvasStatus(text, isError = false) {
+  if (!opCanvasStatusEl) return;
+  opCanvasStatusEl.textContent = text || "";
+  opCanvasStatusEl.style.color = isError ? "var(--err)" : "var(--fg-dim)";
+}
+
+async function submitOperationalCanvasAction() {
+  const op = operatorSession();
+  if (!op || !opCanvasEditorEl) {
+    setOperationalCanvasStatus("No operator session is available.", true);
+    return;
+  }
+  const scope = currentOperationalCanvasScope();
+  const doc = opCanvasEditorEl.value || "";
+  const prompt = [
+    "OBSERVATION: operational_canvas.action",
+    "",
+    "The user clicked Act in the web operational canvas.",
+    "Interpret only the visible document and selected scope below. The document is freely editable; do not assume hidden workflow rules.",
+    "If the selected scope is a clear runnable request, carry it out using normal Construct tools and approval policy. If it is ambiguous, propose a concise plan or ask a clarifying question.",
+    "",
+    `Scope: ${scope.label}`,
+    "",
+    "Selected/current scope:",
+    "```md",
+    trimForOperator(scope.text, 6000),
+    "```",
+    "",
+    "Full canvas:",
+    "```md",
+    trimForOperator(doc),
+    "```",
+  ].join("\n");
+
+  setOperationalCanvasStatus("Sending canvas scope to operator...");
+  opCanvasActBtn.disabled = true;
+  try {
+    await rpc("session.input", { session_id: op.id, text: prompt });
+    setOperationalCanvasStatus("Sent to operator. Open the operator session for the response, or keep editing here.");
+  } catch (e) {
+    setOperationalCanvasStatus(`Operator action failed: ${e.message}`, true);
+  } finally {
+    renderOperationalCanvas();
+  }
+}
+
+function insertCurrentSessionIntoCanvas() {
+  if (!opCanvasEditorEl || !state.currentId) return;
+  const s = state.sessions.find((x) => x.id === state.currentId);
+  if (!s) return;
+  const label = operationalCanvasSlug(sessionDisplayTitle(s)) || s.id;
+  const insert = `@session:${label}`;
+  const start = opCanvasEditorEl.selectionStart || 0;
+  const end = opCanvasEditorEl.selectionEnd || start;
+  const before = opCanvasEditorEl.value.slice(0, start);
+  const after = opCanvasEditorEl.value.slice(end);
+  const prefix = before && !/\s$/.test(before) ? " " : "";
+  const suffix = after && !/^\s/.test(after) ? " " : "";
+  opCanvasEditorEl.value = before + prefix + insert + suffix + after;
+  const pos = before.length + prefix.length + insert.length;
+  opCanvasEditorEl.focus();
+  opCanvasEditorEl.setSelectionRange(pos, pos);
+  saveOperationalCanvasText();
+  renderOperationalCanvas();
+}
+
+function openOperationalCanvas() {
+  state.canvasOpen = true;
+  rememberActiveTerminalState();
+  if (state.mode === "chat") rememberTranscriptViewport(state.currentId);
+  opCanvasEl.hidden = false;
+  transcriptEl.hidden = true;
+  terminalWrapEl.hidden = true;
+  editorStateEl.hidden = true;
+  composerEl.hidden = true;
+  vkbdEl.hidden = true;
+  terminalScrollOverlayEl.hidden = true;
+  sessionWidgetsEl.hidden = true;
+  inlineWidgetBackdropEl.hidden = true;
+  viewModeToggleEl.hidden = true;
+  canvasToggleBtn.setAttribute("aria-pressed", "true");
+  sessionTitleEl.textContent = "operational canvas";
+  if (!opCanvasEditorEl.value) opCanvasEditorEl.value = loadOperationalCanvasText();
+  renderOperationalCanvas();
+  setTimeout(() => opCanvasEditorEl.focus(), 0);
+}
+
+async function closeOperationalCanvas() {
+  state.canvasOpen = false;
+  opCanvasEl.hidden = true;
+  canvasToggleBtn.setAttribute("aria-pressed", "false");
+  const s = state.sessions.find((x) => x.id === state.currentId);
+  sessionTitleEl.textContent = s ? sessionViewTitle(s) : "";
+  renderViewModeToggle(s);
+  if (!state.currentId) return;
+  if (preferredViewModeForSession(s) === "terminal") {
+    await enterTerminalMode(state.currentId, { focusTerminal: false });
+  } else {
+    enterChatMode();
+    await loadTranscript(state.currentId);
+  }
+}
+
+function initOperationalCanvas() {
+  if (!opCanvasEditorEl) return;
+  opCanvasEditorEl.value = loadOperationalCanvasText();
+  opCanvasEditorEl.addEventListener("input", () => {
+    saveOperationalCanvasText();
+    renderOperationalCanvas();
+  });
+  opCanvasEditorEl.addEventListener("keyup", renderOperationalCanvas);
+  opCanvasEditorEl.addEventListener("mouseup", renderOperationalCanvas);
+  opCanvasEditorEl.addEventListener("select", renderOperationalCanvas);
+  opCanvasActBtn.addEventListener("click", submitOperationalCanvasAction);
+  opCanvasInsertBtn.addEventListener("click", insertCurrentSessionIntoCanvas);
+  opCanvasResetBtn.addEventListener("click", () => {
+    if (!confirm("Reset the operational canvas starter text?")) return;
+    opCanvasEditorEl.value = defaultOperationalCanvasText();
+    saveOperationalCanvasText();
+    renderOperationalCanvas();
+  });
+  canvasToggleBtn.addEventListener("click", () => {
+    if (state.canvasOpen) closeOperationalCanvas();
+    else openOperationalCanvas();
+  });
+  renderOperationalCanvas();
 }
 
 const miniMatrixActivity = {
@@ -2262,6 +2909,13 @@ function setConnState(s, label) {
 }
 
 function setComposerEnabled(on) {
+  if (state.canvasOpen) {
+    inputEl.disabled = true;
+    inputEl.hidden = true;
+    insertBtn.hidden = true;
+    enterBtn.hidden = true;
+    return;
+  }
   const blocked = !!(state.currentId && state.widgetsById && currentInlineWidget(state.currentId));
   inputEl.disabled = blocked;
   const terminal = state.mode === "terminal" && currentSessionHasPty();
@@ -2298,6 +2952,7 @@ function connect() {
     // between the snapshot and the subscription (e.g. a rename from the
     // TUI) isn't lost in the gap (#272).
     rpc("subscribe.events", { session_id: null }).catch(() => {});
+    refreshHarnesses();
     refreshSessions();
     refreshCurrentSessionAfterReconnect();
   });
@@ -2383,6 +3038,18 @@ function rpc(method, params) {
   });
 }
 
+async function refreshHarnesses({ quiet = true } = {}) {
+  try {
+    const harnesses = await rpc("harness.list", null);
+    state.harnesses = Array.isArray(harnesses) ? harnesses : [];
+    renderOperationalCanvas();
+  } catch (e) {
+    if (!quiet) throw e;
+    // Harness availability is advisory for chips and the new-session sheet.
+    // Session references still render from `session.list` if this fails.
+  }
+}
+
 // --- Sessions list -------------------------------------------------------
 
 async function refreshSessions() {
@@ -2406,6 +3073,7 @@ async function refreshSessions() {
     // top — `orderedItems` pins it ahead of everything else.
     state.groups = Array.isArray(groups) ? groups : [];
     renderSessions();
+    renderOperationalCanvas();
     // Auto-select the first *user* session; operator is shown but
     // shouldn't be the default landing — most phone visits are
     // to look at a real workload, not the dispatcher. Fall back
@@ -2955,8 +3623,15 @@ async function switchCurrentViewMode(mode) {
 }
 
 async function selectSession(id, { replaceUrl = false } = {}) {
+  const closingCanvas = state.canvasOpen;
+  if (closingCanvas) {
+    state.canvasOpen = false;
+    opCanvasEl.hidden = true;
+    canvasToggleBtn.setAttribute("aria-pressed", "false");
+  }
   if (state.currentId === id) {
     setLocationSessionId(id, { replace: replaceUrl });
+    if (closingCanvas) await closeOperationalCanvas();
     return;
   }
   if (state.mode === "chat") rememberTranscriptViewport(state.currentId);
@@ -4644,6 +5319,7 @@ function handleNotification(method, params) {
         state.agentStatusById.delete(session_id);
         state.chatWorkingById.delete(session_id);
       }
+      renderOperationalCanvas();
     }
     if (eventInvalidatesCachedTranscript(event) && !(session_id === state.currentId && state.mode === "chat")) {
       markTranscriptStale(session_id);
@@ -4678,6 +5354,7 @@ function handleNotification(method, params) {
     }
     syncThinkingBanner(session.id);
     scheduleRenderSessions();
+    renderOperationalCanvas();
     if (archiveNeighborId) {
       selectSession(archiveNeighborId);
     } else if (session.id === state.currentId) {
@@ -4698,6 +5375,7 @@ function handleNotification(method, params) {
     }
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
     scheduleRenderSessions();
+    renderOperationalCanvas();
     state.editorById.delete(params.session_id);
     state.agentStatusById.delete(params.session_id);
     state.chatWorkingById.delete(params.session_id);
@@ -4724,10 +5402,12 @@ function handleNotification(method, params) {
     if (i >= 0) state.groups[i] = group;
     else state.groups.push(group);
     scheduleRenderSessions();
+    renderOperationalCanvas();
   } else if (method === "group/deleted" || method === "project/deleted") {
     const deletedId = params.group_id || params.project_id;
     state.groups = state.groups.filter((g) => g.id !== deletedId);
     scheduleRenderSessions();
+    renderOperationalCanvas();
   }
 }
 
@@ -6359,10 +7039,8 @@ async function openNewSessionDialog() {
   // Populate the harness dropdown from `harness.list`. Filtered to
   // available harnesses so the user can't pick one that the daemon
   // would reject.
-  let harnesses = [];
   try {
-    harnesses = await rpc("harness.list", null);
-    state.harnesses = Array.isArray(harnesses) ? harnesses : [];
+    await refreshHarnesses({ quiet: false });
   } catch (e) {
     newSessionErrorEl.textContent = `harness.list failed: ${e.message}`;
     newSessionErrorEl.hidden = false;
@@ -6759,6 +7437,7 @@ window.addEventListener("popstate", () => {
 
 initMiniMatrix();
 initPullToRefresh();
+initOperationalCanvas();
 connect();
 </script>
 </body>
