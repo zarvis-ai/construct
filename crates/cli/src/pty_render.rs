@@ -514,6 +514,30 @@ impl ItemHistory {
             .unwrap_or(false)
     }
 
+    /// The mouse-tracking mode the child has requested (DECSET `?9h`/`?1000h`/
+    /// `?1002h`/`?1003h`), or [`vt100::MouseProtocolMode::None`] when it hasn't
+    /// grabbed the mouse. Reads the same persistent cached parser as
+    /// [`Self::bracketed_paste_enabled`]; returns `None` before the first
+    /// replay or for synth sessions with no cached parser. The TUI consults
+    /// this to decide whether to forward mouse events into the PTY (e.g. so
+    /// scroll/click reach a fullscreen child) instead of handling them itself.
+    pub fn mouse_protocol_mode(&self) -> vt100::MouseProtocolMode {
+        self.cached
+            .as_ref()
+            .map(|c| c.parser.screen().mouse_protocol_mode())
+            .unwrap_or(vt100::MouseProtocolMode::None)
+    }
+
+    /// The encoding the child expects its mouse reports in (default single-byte,
+    /// UTF-8 `?1005h`, or SGR `?1006h`). Only meaningful when
+    /// [`Self::mouse_protocol_mode`] is not `None`.
+    pub fn mouse_protocol_encoding(&self) -> vt100::MouseProtocolEncoding {
+        self.cached
+            .as_ref()
+            .map(|c| c.parser.screen().mouse_protocol_encoding())
+            .unwrap_or(vt100::MouseProtocolEncoding::Default)
+    }
+
     /// Feed a raw PTY byte chunk. Parses inline OSC `7700` markers
     /// out, drops the bytes between paired markers, and accumulates
     /// the rest into `Item::PtyChunk` entries.
