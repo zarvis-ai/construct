@@ -8184,14 +8184,17 @@ fn open_url(url: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardCopyOutcome {
     Copied,
-    Requested,
+    Requested(Osc52Mode),
 }
 
 impl ClipboardCopyOutcome {
     fn status(self, chars: usize) -> String {
         match self {
             Self::Copied => format!("copied {chars} chars"),
-            Self::Requested => format!("sent copy request for {chars} chars"),
+            Self::Requested(mode) => format!(
+                "sent copy request for {chars} chars via OSC 52 {}",
+                mode.label()
+            ),
         }
     }
 }
@@ -8206,8 +8209,9 @@ fn copy_to_clipboard(text: &str) -> Result<ClipboardCopyOutcome> {
     // detect a remote session; keep pbcopy first locally, where it's the
     // reliable path (e.g. Terminal.app honors no OSC 52).
     if is_remote_session() {
-        if copy_with_osc52(text).is_ok() {
-            return Ok(ClipboardCopyOutcome::Requested);
+        let mode = osc52_mode();
+        if copy_with_osc52_mode(text, mode).is_ok() {
+            return Ok(ClipboardCopyOutcome::Requested(mode));
         }
         copy_with_pbcopy(text)?;
         return Ok(ClipboardCopyOutcome::Copied);
@@ -8215,8 +8219,9 @@ fn copy_to_clipboard(text: &str) -> Result<ClipboardCopyOutcome> {
     if copy_with_pbcopy(text).is_ok() {
         return Ok(ClipboardCopyOutcome::Copied);
     }
-    copy_with_osc52(text)?;
-    Ok(ClipboardCopyOutcome::Requested)
+    let mode = osc52_mode();
+    copy_with_osc52_mode(text, mode)?;
+    Ok(ClipboardCopyOutcome::Requested(mode))
 }
 
 /// True when the process appears to be running inside an SSH session, where
@@ -8252,6 +8257,16 @@ enum Osc52Mode {
     Direct,
     Tmux,
     Screen,
+}
+
+impl Osc52Mode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Tmux => "tmux",
+            Self::Screen => "screen",
+        }
+    }
 }
 
 fn osc52_mode() -> Osc52Mode {
@@ -8301,7 +8316,10 @@ fn osc52_mode_from_vars(
 fn osc52_direct_sequence(text: &str) -> String {
     use base64::Engine;
     let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    format!("\x1b]52;c;{encoded}\x07")
+    // Emit both standard OSC terminators. Most terminals accept BEL, but ST is
+    // legal too and helps stricter terminal paths without changing the target
+    // clipboard value.
+    format!("\x1b]52;c;{encoded}\x07\x1b]52;c;{encoded}\x1b\\")
 }
 
 fn tmux_passthrough_sequence(sequence: &str) -> String {
@@ -8326,13 +8344,9 @@ fn osc52_sequence_for_mode(text: &str, mode: Osc52Mode) -> String {
     }
 }
 
-fn osc52_sequence(text: &str) -> String {
-    osc52_sequence_for_mode(text, osc52_mode())
-}
-
-fn copy_with_osc52(text: &str) -> Result<()> {
+fn copy_with_osc52_mode(text: &str, mode: Osc52Mode) -> Result<()> {
     let mut stdout = std::io::stdout();
-    write!(stdout, "{}", osc52_sequence(text))?;
+    write!(stdout, "{}", osc52_sequence_for_mode(text, mode))?;
     stdout.flush()?;
     Ok(())
 }
@@ -8351,27 +8365,28 @@ mod tests {
 
     #[test]
     fn osc52_sequence_wraps_base64_in_clipboard_escape() {
-        // ESC ] 52 ; c ; <base64> BEL — base64("hi") == "aGk=".
+        // ESC ] 52 ; c ; <base64> with both legal OSC terminators:
+        // BEL and ST. base64("hi") == "aGk=".
         assert_eq!(
             osc52_sequence_for_mode("hi", Osc52Mode::Direct),
-            "\x1b]52;c;aGk=\u{7}"
+            "\x1b]52;c;aGk=\u{7}\x1b]52;c;aGk=\x1b\\"
         );
         assert_eq!(
             osc52_sequence_for_mode("", Osc52Mode::Direct),
-            "\x1b]52;c;\u{7}"
+            "\x1b]52;c;\u{7}\x1b]52;c;\x1b\\"
         );
     }
 
     #[test]
     fn osc52_sequence_wraps_for_terminal_multiplexers() {
-        let direct = "\x1b]52;c;aGk=\u{7}";
+        let direct = "\x1b]52;c;aGk=\u{7}\x1b]52;c;aGk=\x1b\\";
         assert_eq!(
             osc52_sequence_for_mode("hi", Osc52Mode::Tmux),
-            format!("\x1bPtmux;\x1b{direct}\x1b\\{direct}")
+            format!("{}{}", tmux_passthrough_sequence(direct), direct)
         );
         assert_eq!(
             osc52_sequence_for_mode("hi", Osc52Mode::Screen),
-            format!("\x1bP{direct}\x1b\\{direct}")
+            format!("{}{}", screen_passthrough_sequence(direct), direct)
         );
     }
 
@@ -8438,8 +8453,12 @@ mod tests {
     fn clipboard_copy_outcome_status_distinguishes_requests() {
         assert_eq!(ClipboardCopyOutcome::Copied.status(7), "copied 7 chars");
         assert_eq!(
-            ClipboardCopyOutcome::Requested.status(7),
-            "sent copy request for 7 chars"
+            ClipboardCopyOutcome::Requested(Osc52Mode::Direct).status(7),
+            "sent copy request for 7 chars via OSC 52 direct"
+        );
+        assert_eq!(
+            ClipboardCopyOutcome::Requested(Osc52Mode::Tmux).status(7),
+            "sent copy request for 7 chars via OSC 52 tmux"
         );
     }
 
