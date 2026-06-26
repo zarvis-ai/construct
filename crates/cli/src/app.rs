@@ -9142,12 +9142,21 @@ fn wrapped_text_with_positions(
 ) -> (String, Vec<ScreenPoint>) {
     let mut text = String::new();
     let mut positions = Vec::new();
+    // Reused per-row char buffer. The previous form indexed each cell with
+    // `line.chars().nth(col)`, re-decoding the line from the start for every
+    // column — O(width^2) UTF-8 decoding per row. Since this runs on every
+    // frame the mouse hovers the view (hovered-URL hit test in `finish_frame`),
+    // that quadratic dominated the render loop on wide terminals. Decode each
+    // line once into `line_chars` and index it in O(1) instead.
+    let mut line_chars: Vec<char> = Vec::new();
     for row in bounds.top()..bounds.bottom() {
         let Some(line) = frame_text.get(row as usize) else {
             continue;
         };
+        line_chars.clear();
+        line_chars.extend(line.chars());
         for col in bounds.left()..bounds.right() {
-            let ch = line.chars().nth(col as usize).unwrap_or(' ');
+            let ch = line_chars.get(col as usize).copied().unwrap_or(' ');
             text.push(ch);
             positions.push(ScreenPoint { col, row });
         }
