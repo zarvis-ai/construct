@@ -7,7 +7,7 @@ Scope: Per-session canvas documents used to orchestrate task execution.
 
 ## Decision
 
-Every user-facing session may have one durable canvas: a Markdown document owned by that session and editable by both humans and the underlying agent. Canvas execution routes to the owning session as a submitted instruction turn to interpret the document or selected Markdown fragment as orchestration state. For PTY-backed interactive sessions, execution must deliver the prompt through the session's normal input path so the target harness receives a submitted turn, not pasted editor text.
+Every user-facing session may have one durable canvas: a Markdown document owned by that session and editable by both humans and the underlying agent. Canvas execution routes to the owning session as a submitted instruction turn to interpret the document or selected Markdown fragment as orchestration state. For PTY-backed interactive sessions, execution must submit the prompt to the PTY with terminal newline semantics rather than staging it in the session editor.
 
 Smart clips are persisted as Markdown-native typed references, using inline `@{type:target clip_id=instance}` references for compact clips and fenced `:::clip type ... :::` blocks for larger embeds. The `target` identifies the referenced session, harness, or object; `clip_id` uniquely identifies that smart clip instance within the canvas document so repeated references to the same target remain distinguishable. Renderers may present these references as rich chips or blocks, but the stored document remains plain Markdown.
 

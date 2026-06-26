@@ -481,15 +481,12 @@ fn should_record_pty_user_message(harness: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanvasExecutionDelivery {
     AdapterInput,
-    SessionInput,
     PtySubmit,
 }
 
 fn canvas_execution_delivery(summary: &agentd_protocol::SessionSummary) -> CanvasExecutionDelivery {
     if !summary.has_pty {
         CanvasExecutionDelivery::AdapterInput
-    } else if matches!(summary.harness.as_str(), "claude" | "codex" | "antigravity") {
-        CanvasExecutionDelivery::SessionInput
     } else {
         CanvasExecutionDelivery::PtySubmit
     }
@@ -1401,12 +1398,9 @@ impl SessionManager {
             canvas_execution_delivery(&*summary)
         };
         match delivery {
-            CanvasExecutionDelivery::SessionInput => {
-                self.send_input(&params.session_id, prompt.clone()).await?;
-            }
             CanvasExecutionDelivery::PtySubmit => {
                 let mut bytes = prompt.clone().into_bytes();
-                bytes.push(b'\r');
+                bytes.push(b'\n');
                 self.pty_input(&params.session_id, bytes).await?;
             }
             CanvasExecutionDelivery::AdapterInput => {
@@ -3949,13 +3943,13 @@ mod tests {
     }
 
     #[test]
-    fn canvas_execution_uses_session_input_for_external_agent_pty_sessions() {
+    fn canvas_execution_submits_to_external_agent_pty_sessions() {
         let mut summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
         summary.harness = "claude".to_string();
 
         assert_eq!(
             canvas_execution_delivery(&summary),
-            CanvasExecutionDelivery::SessionInput
+            CanvasExecutionDelivery::PtySubmit
         );
     }
 
