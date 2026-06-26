@@ -945,24 +945,10 @@ fn render_view_canvas_toggle_tooltip(f: &mut Frame, app: &App) {
     } else {
         " Chat mode: click to open canvas "
     };
-    let total = f.area();
     let inner_w = UnicodeWidthStr::width(label) as u16;
     let w = inner_w + 2;
     let h: u16 = 3;
-    let mut tx = cx.saturating_sub(w.saturating_sub(3));
-    let mut ty = cy + 1;
-    if tx + w > total.x + total.width {
-        tx = total.x + total.width.saturating_sub(w);
-    }
-    if ty + h > total.y + total.height {
-        ty = total.y + total.height.saturating_sub(h);
-    }
-    let rect = Rect {
-        x: tx,
-        y: ty,
-        width: w,
-        height: h,
-    };
+    let rect = view_canvas_toggle_tooltip_rect(view_area, f.area(), cx, cy, w, h);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border));
@@ -971,6 +957,37 @@ fn render_view_canvas_toggle_tooltip(f: &mut Frame, app: &App) {
         .style(Style::default().fg(app.theme.text));
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
+}
+
+fn view_canvas_toggle_tooltip_rect(
+    view_area: Rect,
+    total: Rect,
+    anchor_x: u16,
+    anchor_y: u16,
+    width: u16,
+    height: u16,
+) -> Rect {
+    let view_right = view_area.x.saturating_add(view_area.width);
+    let total_right = total.x.saturating_add(total.width);
+    let max_right = view_right.min(total_right);
+    let min_x = view_area.x.max(total.x);
+    let mut x = anchor_x.saturating_add(2).max(min_x);
+    if x.saturating_add(width) > max_right {
+        x = max_right.saturating_sub(width).max(min_x);
+    }
+
+    let total_bottom = total.y.saturating_add(total.height);
+    let mut y = anchor_y.saturating_add(1);
+    if y.saturating_add(height) > total_bottom {
+        y = total_bottom.saturating_sub(height);
+    }
+
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 fn render_browser_preview_close_tooltip(f: &mut Frame, app: &App) {
@@ -8285,6 +8302,23 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn view_canvas_toggle_tooltip_stays_inside_session_view() {
+        let view = Rect::new(30, 0, 90, 40);
+        let total = Rect::new(0, 0, 120, 40);
+        let (anchor_x, _, anchor_y) = view_canvas_toggle_button_range(view);
+        let rect = view_canvas_toggle_tooltip_rect(view, total, anchor_x, anchor_y, 40, 3);
+
+        assert!(
+            rect.x >= view.x,
+            "tooltip must not spill over the session list: {rect:?}"
+        );
+        assert!(
+            rect.x.saturating_add(rect.width) <= view.x.saturating_add(view.width),
+            "tooltip should fit within the session view when there is room: {rect:?}"
+        );
     }
 
     #[test]
