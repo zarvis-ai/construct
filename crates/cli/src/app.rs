@@ -10206,7 +10206,7 @@ mod tests {
         let text = rendered_text(term.backend().buffer());
 
         assert!(text.contains("▶"), "title run icon should render: {text:?}");
-        assert!(text.contains("◉"), "canvas mode toggle should render: {text:?}");
+        assert!(text.contains("▣"), "canvas mode toggle should render: {text:?}");
         assert!(
             !text.contains("<canvas>"),
             "title should no longer render a literal canvas label: {text:?}"
@@ -10284,7 +10284,7 @@ mod tests {
         term.draw(|f| crate::ui::render(f, &mut app))
             .expect("session title should render");
         let text = rendered_text(term.backend().buffer());
-        assert!(text.contains("○"), "chat mode toggle should render: {text:?}");
+        assert!(text.contains("●"), "chat mode should keep the status glyph: {text:?}");
         let view = app.layout.view_area.expect("view area");
         let (x_start, _x_end, y) = crate::ui::view_canvas_toggle_button_range(view);
 

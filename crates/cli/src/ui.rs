@@ -2877,13 +2877,17 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     let canvas_open = summary
         .as_ref()
         .is_some_and(|s| app.open_canvas_session_ids().iter().any(|id| id == &s.id));
+    let mode_glyph = summary.as_ref().map(|s| {
+        if canvas_open {
+            canvas_mode_glyph()
+        } else {
+            session_status_glyph(app, s)
+        }
+    });
     // Label budget = total − 2 corners − right-side blocks − fixed
     // title scaffolding (` <glyph> <label> ` is 3 spaces + glyph
     // width + label).
-    let glyph_w = summary
-        .as_ref()
-        .map(|_| UnicodeWidthStr::width(canvas_mode_glyph(canvas_open)))
-        .unwrap_or(0);
+    let glyph_w = mode_glyph.map(UnicodeWidthStr::width).unwrap_or(0);
     let label_budget = total
         .saturating_sub(2)
         .saturating_sub(harness_w)
@@ -2892,7 +2896,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     let title = match (summary.as_ref(), group.as_ref()) {
         (Some(s), _) => format!(
             " {} {} ",
-            canvas_mode_glyph(canvas_open),
+            mode_glyph.unwrap_or(""),
             truncate_to_width(&primary_label(s), label_budget),
         ),
         (None, Some(g)) => format!(" project: {} ", g.name),
@@ -7326,7 +7330,7 @@ fn canvas_title_line<'a>(
     let harness_w = summary
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
-    let toggle_glyph = canvas_mode_glyph(true);
+    let toggle_glyph = canvas_mode_glyph();
     let label_budget = (rect.width as usize)
         .saturating_sub(2)
         .saturating_sub(harness_w)
@@ -7377,8 +7381,8 @@ fn canvas_title_marker_width(dirty: bool) -> usize {
     }
 }
 
-fn canvas_mode_glyph(open: bool) -> &'static str {
-    if open { "◉" } else { "○" }
+fn canvas_mode_glyph() -> &'static str {
+    "▣"
 }
 
 fn canvas_toggle_style(
@@ -7423,7 +7427,7 @@ fn canvas_title_toggle_button_range(
     summary: Option<&agentd_protocol::SessionSummary>,
     rect: Rect,
 ) -> Option<(u16, u16, u16)> {
-    let toggle_w = UnicodeWidthStr::width(canvas_mode_glyph(true)) as u16;
+    let toggle_w = UnicodeWidthStr::width(canvas_mode_glyph()) as u16;
     if toggle_w == 0 || rect.width < toggle_w.saturating_add(2) {
         return None;
     }
@@ -7570,7 +7574,7 @@ fn canvas_title_marker_ranges(
     let harness_w = summary
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
-    let toggle_w = UnicodeWidthStr::width(canvas_mode_glyph(true));
+    let toggle_w = UnicodeWidthStr::width(canvas_mode_glyph());
     let label_budget = (rect.width as usize)
         .saturating_sub(2)
         .saturating_sub(harness_w)
