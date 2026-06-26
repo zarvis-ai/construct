@@ -5849,6 +5849,16 @@ impl App {
             // keep its own handling rather than swallowing it silently.
             return false;
         };
+        // A button press is a deliberate intent to interact with this pane, so
+        // move construct's keyboard focus here before forwarding — otherwise a
+        // click inside a mouse-grabbing child (e.g. Claude Code in fullscreen)
+        // reaches the child but never focuses the pane, and keystrokes keep
+        // going elsewhere. Focus is construct-side only and leaves the report
+        // sent down the PTY untouched, so the pass-through stays faithful. Wheel
+        // and motion events forward without stealing focus.
+        if matches!(ev.kind, MouseEventKind::Down(_)) {
+            self.focus_main_window(hit.id);
+        }
         self.queue_pty_input(session_id, bytes, "mouse");
         true
     }
@@ -10799,6 +10809,67 @@ mod tests {
         })
         .await;
         assert!(!app.is_orchestrator_panel_open());
+        server.abort();
+    }
+
+    // Regression: PR #480 forwards mouse events into a pane whose child grabbed
+    // the mouse (e.g. Claude Code fullscreen), returning early from `on_mouse`.
+    // That early return skipped construct's click-to-focus, so clicking inside
+    // such a pane reached the child but never moved keyboard focus there — only
+    // clicking the title bar (a border, never forwarded) would. A button press
+    // must focus the pane *and* forward.
+    #[tokio::test]
+    async fn click_in_mouse_grabbing_pane_still_focuses_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut app, _dir, server) = captured_app().await;
+        app.view = ViewMode::Terminal;
+
+        // The child enables mouse press tracking (DECSET ?1000h); replay caches
+        // the parser so `mouse_protocol_mode()` reflects it.
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"\x1b[?1000h");
+        let _ = history.replay(80, 24, 0);
+        app.histories.insert("s1".into(), history);
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("terminal view should render");
+
+        // Precondition: the pane's child is tracking the mouse, so the click
+        // takes the forwarding path (not construct's normal click handling).
+        assert_ne!(
+            app.histories.get("s1").unwrap().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "test setup must put the pane's child in a mouse-tracking mode"
+        );
+        let inner = app
+            .layout
+            .main_window_areas
+            .first()
+            .expect("rendered session pane")
+            .inner_area;
+        assert!(inner.width > 0 && inner.height > 0, "pane has a content area");
+
+        // Focus the list, then click in the middle of the pane's content area.
+        app.focus = PaneFocus::List;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + inner.width / 2,
+            row: inner.y + inner.height / 2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        // Even though the click was forwarded into the child, focus followed it.
+        assert_eq!(
+            app.focus,
+            PaneFocus::View,
+            "a click inside a mouse-grabbing pane must focus the pane"
+        );
+        assert_eq!(app.active_window_id, 1);
+
         server.abort();
     }
 
