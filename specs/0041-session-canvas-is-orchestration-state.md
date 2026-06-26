@@ -15,6 +15,8 @@ Canvas updates use optimistic concurrency. Writers may pass the version they rea
 
 Terminal clients expose canvas through a terminal-deliverable command path rather than modifier-only key gestures. Browser or desktop clients may add richer gestures, but the TUI must keep an explicit keyboard command and palette command for canvas access. That command opens a focused canvas-specific surface that renders Markdown and smart clips, accepts typing/click cursor placement, and saves through the canvas update protocol; raw external-editor workflows are secondary affordances, not the default canvas UI. Opening and closing the surface should use the same reveal/erase visual language as transient browser previews.
 
+Client-local canvas visibility is UI state and should survive normal client relaunch. A restarted TUI should reopen the same session canvases by re-reading their documents from the daemon, not by treating its prior render buffer as canonical content.
+
 ## Reason
 
 Canvas is an alternative orchestration surface, not an output preview. Keeping Markdown as the source of truth makes the state inspectable, editable with ordinary tools, and resilient across clients. Routing execution through the owning session preserves the existing session/subagent model instead of creating a second workflow engine.
@@ -26,6 +28,8 @@ Optimistic concurrency is simpler than a CRDT and matches the expected conflict 
 Clients must treat canvas rendering as a projection of Markdown, not as canonical state. A rich UI can show smart clips, live session status, and action affordances, but it must save back to Markdown.
 
 The daemon owns canvas persistence, versioning, and execution routing. Agents should use canvas tools to update the document rather than writing session storage files directly.
+
+Clients may persist which session canvases were open, but document contents stay daemon-owned. Clean client shutdown should flush dirty human edits before recording the open state.
 
 Template selection copies Markdown into the session canvas. Templates are not live-linked after selection.
 

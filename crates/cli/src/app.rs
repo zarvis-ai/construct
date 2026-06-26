@@ -1900,6 +1900,8 @@ async fn run_with_socket_initial_selection(
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
         app.view = ViewMode::Terminal;
     }
+    app.restore_open_canvas_popups(&persisted.open_canvas_session_ids)
+        .await;
 
     // Subscribe to all session events.
     if let Err(e) = client.subscribe(None).await {
@@ -1967,6 +1969,8 @@ async fn run_with_socket_initial_selection(
     );
     terminal.show_cursor().ok();
 
+    app.save_open_canvas_popups().await;
+
     let mut widgets: HashMap<String, crate::tui_state::WidgetState> = HashMap::new();
     for (session_id, panel_id) in &app.dynamic_ui_selected {
         widgets
@@ -1991,6 +1995,7 @@ async fn run_with_socket_initial_selection(
         hide_pane_side_borders: app.hide_pane_side_borders,
         main_windows: Some(app.main_windows.clone()),
         active_window_id: Some(app.active_window_id),
+        open_canvas_session_ids: app.open_canvas_session_ids(),
         widgets,
     });
 
@@ -6526,20 +6531,9 @@ impl App {
         match self.client.canvas_get(&session_id).await {
             Ok(result) => {
                 let version = result.canvas.version;
-                let markdown = result.canvas.markdown.clone();
                 let now = Instant::now();
                 self.canvas_popups.remove(&result.canvas.session_id);
-                self.canvas_popup = Some(CanvasPopup {
-                    canvas: result.canvas,
-                    buffer: markdown.clone(),
-                    saved_markdown: markdown,
-                    cursor: 0,
-                    preferred_col: None,
-                    selection: None,
-                    revealed_at: now,
-                    hide_after: now + Duration::from_secs(365 * 24 * 60 * 60),
-                    closing: false,
-                });
+                self.canvas_popup = Some(canvas_popup_from_document(result.canvas, now));
                 self.set_status(format!("canvas opened at version {version}"));
             }
             Err(e) => {
@@ -6554,6 +6548,56 @@ impl App {
         } else {
             self.open_canvas_popup().await;
         }
+    }
+
+    async fn restore_open_canvas_popups(&mut self, session_ids: &[String]) {
+        let mut seen = HashSet::new();
+        let live_sessions: HashSet<String> = self
+            .sessions
+            .iter()
+            .filter(|s| is_user_list_session(s))
+            .map(|s| s.id.clone())
+            .collect();
+        let selected_id = self.selection.session_id().map(str::to_string);
+        let now = Instant::now();
+        for session_id in session_ids {
+            if !seen.insert(session_id.clone()) || !live_sessions.contains(session_id) {
+                continue;
+            }
+            match self.client.canvas_get(session_id).await {
+                Ok(result) => {
+                    let popup = canvas_popup_from_document(result.canvas, now);
+                    if selected_id.as_deref() == Some(session_id.as_str()) {
+                        self.canvas_popup = Some(popup);
+                    } else {
+                        self.canvas_popups.insert(session_id.clone(), popup);
+                    }
+                }
+                Err(e) => {
+                    self.status = Some((
+                        format!("canvas restore failed for {}: {e}", short_id(session_id)),
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn open_canvas_session_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(popup) = self.canvas_popup.as_ref() {
+            if !popup.closing && seen.insert(popup.canvas.session_id.clone()) {
+                ids.push(popup.canvas.session_id.clone());
+            }
+        }
+        for popup in self.canvas_popups.values() {
+            if !popup.closing && seen.insert(popup.canvas.session_id.clone()) {
+                ids.push(popup.canvas.session_id.clone());
+            }
+        }
+        ids.sort();
+        ids
     }
 
     pub fn sync_canvas_popup_with_selection(&mut self) {
@@ -6583,12 +6627,12 @@ impl App {
         }
     }
 
-    async fn save_canvas_popup(&mut self) -> bool {
-        let Some(popup) = self.canvas_popup.as_ref() else {
-            return true;
-        };
+    async fn save_canvas_popup_document(
+        &self,
+        popup: &CanvasPopup,
+    ) -> Result<Option<agentd_protocol::CanvasDocument>> {
         if popup.buffer == popup.saved_markdown {
-            return true;
+            return Ok(None);
         }
         let params = agentd_protocol::CanvasUpdateParams {
             session_id: popup.canvas.session_id.clone(),
@@ -6598,16 +6642,66 @@ impl App {
             template_id: popup.canvas.template_id.clone(),
             note: None,
         };
-        match self.client.canvas_update(params).await {
-            Ok(result) => {
+        Ok(Some(self.client.canvas_update(params).await?.canvas))
+    }
+
+    async fn save_open_canvas_popups(&mut self) {
+        let active = self.canvas_popup.clone();
+        if let Some(popup) = active.as_ref() {
+            match self.save_canvas_popup_document(popup).await {
+                Ok(Some(canvas)) => {
+                    if let Some(active) = self.canvas_popup.as_mut() {
+                        active.canvas = canvas.clone();
+                        active.buffer = canvas.markdown.clone();
+                        active.saved_markdown = canvas.markdown;
+                        active.cursor = active.cursor.min(active.buffer.chars().count());
+                        active.preferred_col = None;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self.status = Some((format!("canvas save failed: {e}"), Instant::now())),
+            }
+        }
+
+        let cached: Vec<(String, CanvasPopup)> = self
+            .canvas_popups
+            .iter()
+            .map(|(id, popup)| (id.clone(), popup.clone()))
+            .collect();
+        for (session_id, popup) in cached {
+            match self.save_canvas_popup_document(&popup).await {
+                Ok(Some(canvas)) => {
+                    if let Some(cached) = self.canvas_popups.get_mut(&session_id) {
+                        cached.canvas = canvas.clone();
+                        cached.buffer = canvas.markdown.clone();
+                        cached.saved_markdown = canvas.markdown;
+                        cached.cursor = cached.cursor.min(cached.buffer.chars().count());
+                        cached.preferred_col = None;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => self.status = Some((format!("canvas save failed: {e}"), Instant::now())),
+            }
+        }
+    }
+
+    async fn save_canvas_popup(&mut self) -> bool {
+        let Some(popup) = self.canvas_popup.as_ref() else {
+            return true;
+        };
+        match self.save_canvas_popup_document(popup).await {
+            Ok(Some(canvas)) => {
                 if let Some(popup) = self.canvas_popup.as_mut() {
-                    popup.canvas = result.canvas.clone();
-                    popup.buffer = result.canvas.markdown.clone();
-                    popup.saved_markdown = result.canvas.markdown;
+                    popup.canvas = canvas.clone();
+                    popup.buffer = canvas.markdown.clone();
+                    popup.saved_markdown = canvas.markdown;
                     popup.cursor = popup.cursor.min(popup.buffer.chars().count());
                     popup.preferred_col = None;
                 }
-                self.set_status(format!("canvas saved version {}", result.canvas.version));
+                self.set_status(format!("canvas saved version {}", canvas.version));
+                true
+            }
+            Ok(None) => {
                 true
             }
             Err(e) => {
@@ -8994,6 +9088,24 @@ fn canvas_cursor_at_modal_point(
     Some(canvas_cursor_for_line_col(buffer, target_line, target_col))
 }
 
+fn canvas_popup_from_document(
+    canvas: agentd_protocol::CanvasDocument,
+    now: Instant,
+) -> CanvasPopup {
+    let markdown = canvas.markdown.clone();
+    CanvasPopup {
+        canvas,
+        buffer: markdown.clone(),
+        saved_markdown: markdown,
+        cursor: 0,
+        preferred_col: None,
+        selection: None,
+        revealed_at: now,
+        hide_after: now + Duration::from_secs(365 * 24 * 60 * 60),
+        closing: false,
+    }
+}
+
 fn canvas_line_col(s: &str, cursor: usize) -> (usize, usize) {
     let mut line = 0usize;
     let mut col = 0usize;
@@ -9529,6 +9641,20 @@ mod tests {
         assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abf");
         app.insert_canvas_text("XY");
         assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abXYf");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn open_canvas_session_ids_include_active_and_cached_canvases() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s2", "active", 0));
+        app.canvas_popups
+            .insert("s1".into(), canvas_popup_for_test("s1", "cached", 0));
+        let mut closing = canvas_popup_for_test("s3", "closing", 0);
+        closing.closing = true;
+        app.canvas_popups.insert("s3".into(), closing);
+
+        assert_eq!(app.open_canvas_session_ids(), vec!["s1", "s2"]);
         server.abort();
     }
 

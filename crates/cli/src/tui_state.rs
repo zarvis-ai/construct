@@ -48,6 +48,8 @@ pub struct TuiState {
     #[serde(default)]
     pub active_window_id: Option<u64>,
     #[serde(default)]
+    pub open_canvas_session_ids: Vec<String>,
+    #[serde(default)]
     pub widgets: HashMap<String, WidgetState>,
 }
 
@@ -65,6 +67,7 @@ impl Default for TuiState {
             hide_pane_side_borders: default_hide_pane_side_borders(),
             main_windows: None,
             active_window_id: None,
+            open_canvas_session_ids: Vec::new(),
             widgets: HashMap::new(),
         }
     }
@@ -90,5 +93,36 @@ pub fn save(state: &TuiState) {
     }
     if let Ok(json) = serde_json::to_vec_pretty(state) {
         let _ = std::fs::write(&path, json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_state_defaults_open_canvas_ids() {
+        let state: TuiState = serde_json::from_str(
+            r#"{
+                "last_selected_session_id": "s1",
+                "hide_pane_side_borders": true
+            }"#,
+        )
+        .expect("legacy state should deserialize");
+
+        assert!(state.open_canvas_session_ids.is_empty());
+    }
+
+    #[test]
+    fn state_round_trips_open_canvas_ids() {
+        let state = TuiState {
+            open_canvas_session_ids: vec!["s1".into(), "s2".into()],
+            ..TuiState::default()
+        };
+
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.open_canvas_session_ids, vec!["s1", "s2"]);
     }
 }
