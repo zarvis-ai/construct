@@ -142,6 +142,23 @@ fn prune_window_tree(
     }
 }
 
+/// Whether any visible split pane's desired PTY size differs from what its
+/// session's child was last told to use. The resize fire in the event loop is
+/// otherwise gated on the *active* pane's size, so a passive pane that changed
+/// size on its own (split created, divider dragged, sibling swapped) would
+/// never be resized — its child keeps emitting at a stale width that the pane
+/// then renders into a different-width grid, garbling until the next active
+/// resize. `visible` is the deduped `(session_id, (cols, rows))` list from
+/// `window_session_pane_sizes`; `last_sent` is the size we last pushed per id.
+fn pane_sizes_diverged(
+    visible: &[(String, (u16, u16))],
+    last_sent: &HashMap<String, (u16, u16)>,
+) -> bool {
+    visible
+        .iter()
+        .any(|(id, size)| last_sent.get(id) != Some(size))
+}
+
 pub(crate) fn list_session_indent_cells(
     s: &SessionSummary,
     indented: bool,
@@ -1995,6 +2012,15 @@ async fn run_loop(
     // without a SIGWINCH, so the focused session needs a fresh resize
     // every time it gains focus.
     let mut last_session_sent: Option<String> = None;
+    // The PTY size we last pushed to each visible session, keyed by id.
+    // The resize fire below is otherwise gated on the *active* pane's
+    // size; a passive split pane whose own size changed (split created,
+    // divider dragged, sibling swapped) without the active pane changing
+    // would never get resized, leaving its child emitting at a stale
+    // width that the pane then renders into a different-width grid —
+    // the garbled split pane that only a window resize cleared. Tracking
+    // per-session sizes lets the gate fire on any pane's divergence.
+    let mut last_pane_sizes_sent: HashMap<String, (u16, u16)> = HashMap::new();
     let mut hydration_tasks: tokio::task::JoinSet<(String, Result<SessionHydration>)> =
         tokio::task::JoinSet::new();
     let mut hydration_sessions: HashSet<String> = HashSet::new();
@@ -2025,6 +2051,7 @@ async fn run_loop(
                         last_size_sent = (0, 0);
                         last_orch_sent = (0, 0);
                         last_session_sent = None;
+                        last_pane_sizes_sent.clear();
                         hydration_sessions.clear();
                         pinned_hydration_session = None;
                         pinned_hydration_queue.clear();
@@ -2110,14 +2137,21 @@ async fn run_loop(
             }
 
             // Right pane (main session) resize — debounced fire. Also
-            // refires if the *selected* session changed since last sent.
+            // refires if the *selected* session changed since last sent,
+            // or if any visible split pane's size diverged from what its
+            // child was last told (a passive pane the active-pane gate
+            // would otherwise miss).
             let cur = app.active_pane_size();
             let split_sizes = app.window_session_pane_sizes();
             let cur_session = app.selected_id();
             let session_changed = cur_session != last_session_sent;
-            if cur.0 > 0 && cur.1 > 0 && (cur != last_size_sent || session_changed) {
+            let pane_sizes_diverged = pane_sizes_diverged(&split_sizes, &last_pane_sizes_sent);
+            if cur.0 > 0
+                && cur.1 > 0
+                && (cur != last_size_sent || session_changed || pane_sizes_diverged)
+            {
                 match pending_size {
-                    Some((p, _)) if p == cur && !session_changed => {}
+                    Some((p, _)) if p == cur && !session_changed && !pane_sizes_diverged => {}
                     _ => pending_size = Some((cur, Instant::now())),
                 }
             } else {
@@ -2135,8 +2169,14 @@ async fn run_loop(
                                 .any(|s| s.id == *id && s.has_pty && !s.state.is_terminal())
                             {
                                 let _ = app.client.pty_resize(id, *cols, *rows).await;
+                                last_pane_sizes_sent.insert(id.clone(), (*cols, *rows));
                             }
                         }
+                        // Forget sizes for sessions no longer visible so a
+                        // stale entry can't suppress a needed resize when
+                        // they reappear, and the map stays bounded.
+                        last_pane_sizes_sent
+                            .retain(|id, _| split_sizes.iter().any(|(vid, _)| vid == id));
                     }
                     last_size_sent = size;
                     last_session_sent = cur_session;
@@ -9028,6 +9068,38 @@ mod tests {
             vec![("s1".to_string(), (38, 18)), ("s2".to_string(), (28, 18))]
         );
         server.abort();
+    }
+
+    /// Regression: a passive split pane whose size changed without the active
+    /// pane changing must still trigger a PTY resize. The event loop gates the
+    /// resize fire on the active pane's size, so the divergence check is what
+    /// catches the passive pane — otherwise its child renders at a stale width
+    /// and garbles until a manual window resize. See the diagnosis in the split
+    /// pane garble investigation.
+    #[test]
+    fn pane_size_divergence_catches_passive_pane() {
+        let visible = vec![
+            ("s1".to_string(), (38u16, 18u16)),
+            ("s2".to_string(), (28u16, 18u16)),
+        ];
+
+        // Nothing sent yet → everything diverges.
+        let mut last_sent: HashMap<String, (u16, u16)> = HashMap::new();
+        assert!(pane_sizes_diverged(&visible, &last_sent));
+
+        // Both panes at their last-sent sizes → quiescent.
+        last_sent.insert("s1".to_string(), (38, 18));
+        last_sent.insert("s2".to_string(), (28, 18));
+        assert!(!pane_sizes_diverged(&visible, &last_sent));
+
+        // The *passive* pane (s1) shrinks while the active pane (s2) is
+        // unchanged. The active-pane gate would miss this; the divergence
+        // check must not.
+        let after_drag = vec![
+            ("s1".to_string(), (20u16, 18u16)),
+            ("s2".to_string(), (28u16, 18u16)),
+        ];
+        assert!(pane_sizes_diverged(&after_drag, &last_sent));
     }
 
     /// Regression: in a single-pane (non-split) layout the render path still
