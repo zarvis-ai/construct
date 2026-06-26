@@ -48,7 +48,13 @@ const PTY_REPLAY_CAP: usize = 8 * 1024 * 1024;
 const RESPAWN_REDRAW_POLL: Duration = Duration::from_millis(100);
 const RESPAWN_REDRAW_SETTLE: Duration = Duration::from_millis(400);
 const RESPAWN_REDRAW_MAX_WAIT: Duration = Duration::from_secs(6);
-const CANVAS_EXTERNAL_PTY_TYPED_CHUNK_DELAY: Duration = Duration::from_millis(12);
+/// After delivering a canvas prompt as a bracketed paste to an external
+/// agent TUI, wait this long before sending the submit Enter. The paste is
+/// explicitly delimited by its `ESC[201~` end marker, so the harness has
+/// already finalized the multi-line body into its input box; this short
+/// settle lets its render/state update land so the trailing `\r` is read as
+/// a clean submit keypress rather than being coalesced into the paste.
+const CANVAS_EXTERNAL_PTY_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 
 /// Whether the post-resume force-redraw should fire now: the child has
 /// produced PTY output and then gone quiet for [`RESPAWN_REDRAW_SETTLE`],
@@ -494,6 +500,22 @@ fn canvas_execution_delivery(summary: &agentd_protocol::SessionSummary) -> Canva
     } else {
         CanvasExecutionDelivery::PtySubmit
     }
+}
+
+/// Frame a canvas prompt as a bracketed paste for delivery to an external
+/// agent TUI. The body is wrapped in the `ESC[200~` / `ESC[201~` markers a
+/// real terminal sends around a paste; any embedded `ESC[201~` is stripped
+/// first so it can't terminate the paste early (the same paste-injection
+/// guard real terminals apply).
+fn canvas_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
+    const START: &[u8] = b"\x1b[200~";
+    const END: &[u8] = b"\x1b[201~";
+    let sanitized = prompt.replace("\x1b[201~", "");
+    let mut bytes = Vec::with_capacity(START.len() + sanitized.len() + END.len());
+    bytes.extend_from_slice(START);
+    bytes.extend_from_slice(sanitized.as_bytes());
+    bytes.extend_from_slice(END);
+    bytes
 }
 
 impl SessionEntry {
@@ -2662,11 +2684,18 @@ impl SessionManager {
     }
 
     async fn canvas_submit_typed_prompt(&self, id: &str, prompt: &str) -> Result<()> {
-        for chunk in prompt.split_inclusive('\n') {
-            self.pty_input_without_capture(id, chunk.as_bytes().to_vec())
-                .await?;
-            tokio::time::sleep(CANVAS_EXTERNAL_PTY_TYPED_CHUNK_DELAY).await;
-        }
+        // Deliver the prompt as a bracketed paste (`ESC[200~` … `ESC[201~`)
+        // rather than raw keystrokes. External agent TUIs (claude/codex/
+        // antigravity) enable DEC mode 2004 and only run their multiline
+        // guard on a real bracketed paste: framed this way they buffer the
+        // whole multi-line body as one input instead of submitting on the
+        // first embedded newline. Crucially the `ESC[201~` end marker tells
+        // the harness exactly where the paste stops, so the Enter we send
+        // afterward is read as a submit keypress — without it the prompt
+        // landed in the input box but never submitted.
+        self.pty_input_without_capture(id, canvas_bracketed_paste_bytes(prompt))
+            .await?;
+        tokio::time::sleep(CANVAS_EXTERNAL_PTY_SUBMIT_DELAY).await;
         self.pty_input_without_capture(id, vec![b'\r']).await?;
         Ok(())
     }
@@ -3972,6 +4001,24 @@ mod tests {
         assert_eq!(
             canvas_execution_delivery(&summary),
             CanvasExecutionDelivery::ExternalPtyTypedSubmit
+        );
+    }
+
+    #[test]
+    fn canvas_bracketed_paste_frames_and_sanitizes_body() {
+        // A plain multi-line body is wrapped in the paste markers a real
+        // terminal sends, so the external agent TUI buffers it as one paste
+        // (its multiline guard fires) instead of submitting on the first
+        // newline.
+        assert_eq!(
+            canvas_bracketed_paste_bytes("line one\nline two"),
+            b"\x1b[200~line one\nline two\x1b[201~".to_vec()
+        );
+        // An embedded end marker is stripped so a malicious / accidental
+        // `ESC[201~` in the canvas can't terminate the paste early.
+        assert_eq!(
+            canvas_bracketed_paste_bytes("a\x1b[201~b"),
+            b"\x1b[200~ab\x1b[201~".to_vec()
         );
     }
 
