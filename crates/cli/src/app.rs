@@ -2865,7 +2865,13 @@ impl App {
             socket: self.client.socket_path().to_path_buf(),
             session_id: id.to_string(),
             needs_history,
-            terminal_pane_size: self.active_pane_size(),
+            // Hydrate at the session's *own* pane width when it's visible in a
+            // split — not the active pane's — so its parser grid matches the
+            // width it will render at. Falls back to the active pane for a
+            // session not currently in a window leaf (e.g. pinned-strip).
+            terminal_pane_size: self
+                .session_pane_size(id)
+                .unwrap_or_else(|| self.active_pane_size()),
             is_headless,
         }
     }
@@ -2946,7 +2952,11 @@ impl App {
 
         if let Some(history) = hydration.history {
             self.histories.insert(session_id.clone(), history);
-            let (cols, rows) = self.terminal_pane_size;
+            // Resize this session's child to its own pane width, not the whole
+            // detail area — a passive split pane is narrower than that.
+            let (cols, rows) = self
+                .session_pane_size(&session_id)
+                .unwrap_or(self.terminal_pane_size);
             let _ = self.client.pty_resize(&session_id, cols, rows).await;
         }
         if let Some(state) = hydration.editor_state {
@@ -3352,8 +3362,11 @@ impl App {
             self.ui_panels.insert(id.to_string(), replayed_ui_panels);
         }
         self.histories.insert(id.to_string(), history);
-        // Tell the daemon what size we'd like.
-        let (cols, rows) = self.active_pane_size();
+        // Tell the daemon what size we'd like — this session's own pane width
+        // when it's visible in a split, not the active pane's.
+        let (cols, rows) = self
+            .session_pane_size(id)
+            .unwrap_or_else(|| self.active_pane_size());
         let _ = self.client.pty_resize(id, cols, rows).await;
     }
 
@@ -6073,6 +6086,21 @@ impl App {
             .get(&self.active_window_id)
             .copied()
             .unwrap_or(self.terminal_pane_size)
+    }
+
+    /// The pane size a session is currently rendered at, if it occupies a
+    /// visible window leaf. Distinct from [`Self::active_pane_size`]: in a
+    /// split, a passive pane's session is rendered at *its* width, not the
+    /// active pane's. Hydrating or resizing a specific session must use this —
+    /// sizing a passive pane's parser to the active pane's width builds the
+    /// vt100 grid at the wrong width, so an alt-screen harness (claude), whose
+    /// content `set_size` never reflows, renders garbled until the pane is
+    /// re-hydrated at its true width (which a focus-switch happens to force).
+    pub fn session_pane_size(&self, id: &str) -> Option<(u16, u16)> {
+        self.window_session_pane_sizes()
+            .into_iter()
+            .find(|(sid, _)| sid == id)
+            .map(|(_, size)| size)
     }
 
     pub fn window_session_pane_sizes(&self) -> Vec<(String, (u16, u16))> {
@@ -10828,6 +10856,16 @@ mod tests {
             app.window_session_pane_sizes(),
             vec![("s1".to_string(), (38, 18)), ("s2".to_string(), (28, 18))]
         );
+
+        // Each session resolves to its OWN pane size, not the active pane's.
+        // s2 is active (28×18); the passive pane s1 must still report 38×18 so
+        // hydration builds its parser at the width it renders at — otherwise an
+        // alt-screen child garbles until a focus-switch re-hydrates it.
+        assert_eq!(app.session_pane_size("s1"), Some((38, 18)));
+        assert_eq!(app.session_pane_size("s2"), Some((28, 18)));
+        // A session not in any visible pane has no pane size (callers fall back
+        // to the active pane).
+        assert_eq!(app.session_pane_size("nope"), None);
         server.abort();
     }
 
