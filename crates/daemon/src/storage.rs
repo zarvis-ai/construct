@@ -15,7 +15,8 @@
 //! ```
 
 use agentd_protocol::{
-    GroupSummary, SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
+    CanvasDocument, CanvasRevision, CanvasTemplate, CanvasUpdateActor, GroupSummary,
+    SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
 };
 use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
@@ -26,11 +27,32 @@ const GLOBAL_MEMORY_TEMPLATE: &str =
     "# Global Memory\n\n## Preferences\n\n## Workflows\n\n## Pitfalls\n";
 const PROJECT_MEMORY_TEMPLATE: &str =
     "# Project Memory\n\n## Overview\n\n## Architecture\n\n## Workflows\n\n## Decisions\n\n## Pitfalls\n";
+const CANVAS_REVISION_LIMIT: usize = 50;
+const BLANK_CANVAS: &str = "";
+const KANBAN_CANVAS: &str = "# Todo\n\n- \n\n# Progress\n\n# Done\n";
+const INVESTIGATION_CANVAS: &str =
+    "# Question\n\n\n# Context\n\n\n# Plan\n\n- \n\n# Findings\n\n\n# Done\n";
 
 #[derive(Debug, Default)]
 struct WidgetFrontmatter {
     placement: Option<UiPlacement>,
     title: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct CanvasMeta {
+    #[serde(default)]
+    version: u64,
+    #[serde(default)]
+    updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    template_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct CanvasTemplateFrontmatter {
+    name: Option<String>,
+    description: Option<String>,
 }
 
 pub struct Storage {
@@ -191,6 +213,213 @@ impl Storage {
 
     pub fn widgets_dir(&self, id: &str) -> PathBuf {
         self.session_dir(id).join("widgets")
+    }
+
+    pub fn canvas_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("canvas.md")
+    }
+
+    pub fn canvas_meta_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("canvas.json")
+    }
+
+    pub fn canvas_revisions_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("canvas-revisions.jsonl")
+    }
+
+    pub fn canvas_templates_dir(&self) -> PathBuf {
+        self.data_dir.join("canvas").join("templates")
+    }
+
+    pub fn read_canvas(&self, id: &str) -> Result<CanvasDocument> {
+        self.ensure_session_dir(id)?;
+        let markdown = std::fs::read_to_string(self.canvas_path(id)).unwrap_or_default();
+        let meta = self.read_canvas_meta(id).unwrap_or_default();
+        Ok(CanvasDocument {
+            session_id: id.to_string(),
+            markdown,
+            version: meta.version,
+            updated_at_ms: meta.updated_at_ms,
+            template_id: meta.template_id,
+        })
+    }
+
+    pub fn update_canvas(
+        &self,
+        id: &str,
+        markdown: String,
+        actor: CanvasUpdateActor,
+        base_version: Option<u64>,
+        template_id: Option<String>,
+        note: Option<String>,
+    ) -> Result<CanvasDocument> {
+        let current = self.read_canvas(id)?;
+        if let Some(base) = base_version {
+            if base != current.version {
+                anyhow::bail!(
+                    "canvas conflict: current version is {}, attempted base version is {}",
+                    current.version,
+                    base
+                );
+            }
+        }
+        if actor == CanvasUpdateActor::Agent && current.version > 0 {
+            self.append_canvas_revision(
+                id,
+                CanvasRevision {
+                    version: current.version,
+                    actor,
+                    at_ms: current.updated_at_ms,
+                    markdown: current.markdown,
+                    note: note.clone(),
+                },
+            )?;
+        }
+        self.ensure_session_dir(id)?;
+        let next = CanvasDocument {
+            session_id: id.to_string(),
+            markdown,
+            version: current.version.saturating_add(1),
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+            template_id: template_id.or(current.template_id),
+        };
+        let canvas_tmp = self.canvas_path(id).with_extension("md.tmp");
+        std::fs::write(&canvas_tmp, &next.markdown)
+            .with_context(|| format!("write {}", canvas_tmp.display()))?;
+        std::fs::rename(&canvas_tmp, self.canvas_path(id))
+            .with_context(|| format!("rename {}", self.canvas_path(id).display()))?;
+        self.save_canvas_meta(&next)?;
+        Ok(next)
+    }
+
+    pub fn read_canvas_revisions(&self, id: &str) -> Result<Vec<CanvasRevision>> {
+        let path = self.canvas_revisions_path(id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let f = std::fs::File::open(&path)?;
+        let reader = std::io::BufReader::new(f);
+        let mut revisions = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<CanvasRevision>(&line) {
+                Ok(revision) => revisions.push(revision),
+                Err(e) => tracing::warn!(session = %id, error = %e, "skip bad canvas revision"),
+            }
+        }
+        Ok(revisions)
+    }
+
+    pub fn canvas_templates(&self) -> Result<Vec<CanvasTemplate>> {
+        let mut templates = vec![
+            CanvasTemplate {
+                id: "blank".to_string(),
+                name: "Blank".to_string(),
+                description: Some("Start with an empty orchestration canvas".to_string()),
+                markdown: BLANK_CANVAS.to_string(),
+                built_in: true,
+            },
+            CanvasTemplate {
+                id: "kanban".to_string(),
+                name: "Kanban".to_string(),
+                description: Some(
+                    "Todo, progress, and done sections for delegated work".to_string(),
+                ),
+                markdown: KANBAN_CANVAS.to_string(),
+                built_in: true,
+            },
+            CanvasTemplate {
+                id: "investigation".to_string(),
+                name: "Investigation".to_string(),
+                description: Some("Question, context, plan, findings, and done".to_string()),
+                markdown: INVESTIGATION_CANVAS.to_string(),
+                built_in: true,
+            },
+        ];
+        let dir = self.canvas_templates_dir();
+        if dir.exists() {
+            for entry in
+                std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let raw = match std::fs::read_to_string(&path) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = ?e, "skip unreadable canvas template");
+                        continue;
+                    }
+                };
+                let (frontmatter, markdown) = parse_canvas_template_frontmatter(&raw);
+                templates.push(CanvasTemplate {
+                    id: stem.to_string(),
+                    name: frontmatter
+                        .name
+                        .unwrap_or_else(|| stem.replace(['-', '_'], " ")),
+                    description: frontmatter.description,
+                    markdown,
+                    built_in: false,
+                });
+            }
+        }
+        templates.sort_by(|a, b| {
+            a.built_in
+                .cmp(&b.built_in)
+                .reverse()
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Ok(templates)
+    }
+
+    fn read_canvas_meta(&self, id: &str) -> Result<CanvasMeta> {
+        let path = self.canvas_meta_path(id);
+        if !path.exists() {
+            return Ok(CanvasMeta::default());
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
+    }
+
+    fn save_canvas_meta(&self, canvas: &CanvasDocument) -> Result<()> {
+        self.ensure_session_dir(&canvas.session_id)?;
+        let meta = CanvasMeta {
+            version: canvas.version,
+            updated_at_ms: canvas.updated_at_ms,
+            template_id: canvas.template_id.clone(),
+        };
+        let path = self.canvas_meta_path(&canvas.session_id);
+        let tmp = path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(&meta)?;
+        std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+        Ok(())
+    }
+
+    fn append_canvas_revision(&self, id: &str, revision: CanvasRevision) -> Result<()> {
+        self.ensure_session_dir(id)?;
+        let mut revisions = self.read_canvas_revisions(&id)?;
+        revisions.push(revision);
+        let start = revisions.len().saturating_sub(CANVAS_REVISION_LIMIT);
+        let path = self.canvas_revisions_path(&id);
+        let tmp = path.with_extension("jsonl.tmp");
+        let mut f =
+            std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        for rev in &revisions[start..] {
+            let line = serde_json::to_string(rev)?;
+            f.write_all(line.as_bytes())?;
+            f.write_all(b"\n")?;
+        }
+        std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
+        Ok(())
     }
 
     pub fn ensure_widgets_dir(&self, id: &str) -> Result<PathBuf> {
@@ -625,6 +854,47 @@ fn parse_widget_frontmatter_fields(frontmatter: &str) -> WidgetFrontmatter {
     parsed
 }
 
+fn parse_canvas_template_frontmatter(raw: &str) -> (CanvasTemplateFrontmatter, String) {
+    let Some(rest) = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+    else {
+        return (CanvasTemplateFrontmatter::default(), raw.to_string());
+    };
+    let mut byte_offset = raw.len().saturating_sub(rest.len());
+    let mut frontmatter = String::new();
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        byte_offset += line.len();
+        if trimmed == "---" {
+            let parsed = parse_canvas_template_frontmatter_fields(&frontmatter);
+            return (parsed, raw[byte_offset..].to_string());
+        }
+        frontmatter.push_str(line);
+    }
+    (CanvasTemplateFrontmatter::default(), raw.to_string())
+}
+
+fn parse_canvas_template_frontmatter_fields(frontmatter: &str) -> CanvasTemplateFrontmatter {
+    let mut parsed = CanvasTemplateFrontmatter::default();
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim().trim_matches(['"', '\'']);
+        match key.trim() {
+            "name" if !value.is_empty() => parsed.name = Some(value.to_string()),
+            "description" if !value.is_empty() => parsed.description = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    parsed
+}
+
 fn ensure_memory_file(path: &Path, template: &str) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -835,6 +1105,63 @@ mod pty_range_tests {
         assert_eq!(start, 0);
         assert_eq!(end, 6);
         assert_eq!(total, 6);
+    }
+}
+
+#[cfg(test)]
+mod canvas_tests {
+    use super::*;
+
+    #[test]
+    fn canvas_update_rejects_stale_base_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let first = storage
+            .update_canvas(
+                "s1",
+                "# Todo\n".into(),
+                agentd_protocol::CanvasUpdateActor::Human,
+                Some(0),
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.version, 1);
+
+        let err = storage
+            .update_canvas(
+                "s1",
+                "# Changed\n".into(),
+                agentd_protocol::CanvasUpdateActor::Agent,
+                Some(0),
+                None,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("canvas conflict"));
+    }
+
+    #[test]
+    fn canvas_templates_include_user_markdown_with_frontmatter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let dir = storage.canvas_templates_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("review.md"),
+            "---\nname: Review Board\ndescription: Review active work\n---\n# Review\n",
+        )
+        .unwrap();
+
+        let templates = storage.canvas_templates().unwrap();
+        let review = templates.iter().find(|t| t.id == "review").unwrap();
+
+        assert_eq!(review.name, "Review Board");
+        assert_eq!(review.description.as_deref(), Some("Review active work"));
+        assert_eq!(review.markdown, "# Review\n");
+        assert!(!review.built_in);
+        assert!(templates.iter().any(|t| t.id == "kanban" && t.built_in));
     }
 }
 

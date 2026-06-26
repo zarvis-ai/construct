@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::PathBuf;
 
 mod acp;
@@ -114,6 +115,11 @@ enum Command {
     },
     /// Send input to a session.
     Send { session_id: String, text: String },
+    /// Manage a session's orchestration canvas.
+    Canvas {
+        #[command(subcommand)]
+        command: CanvasCommand,
+    },
     /// Internal: `PreToolUse` hook body for the AskUserQuestion chat-gate.
     /// Reads the hook payload on stdin; if a chat viewer is active for
     /// `$CONSTRUCT_SESSION_ID`, prints a `deny` decision that degrades Claude's
@@ -198,6 +204,40 @@ enum DaemonCommand {
     Paths,
     /// Print the embedded default config and exit.
     DefaultConfig,
+}
+
+#[derive(Debug, Subcommand)]
+enum CanvasCommand {
+    /// Print the canvas Markdown and metadata.
+    Get { session_id: String },
+    /// Replace the canvas from a file, stdin, or template.
+    Set {
+        session_id: String,
+        /// Read Markdown from this file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Read Markdown from stdin.
+        #[arg(long)]
+        stdin: bool,
+        /// Use a built-in or user template id.
+        #[arg(long)]
+        template: Option<String>,
+        /// Optional optimistic base version.
+        #[arg(long)]
+        base_version: Option<u64>,
+    },
+    /// Edit the canvas in $EDITOR and save it back.
+    Edit { session_id: String },
+    /// Ask the owning session to execute the full canvas or selected Markdown.
+    Execute {
+        session_id: String,
+        #[arg(long)]
+        selection: Option<String>,
+        #[arg(long)]
+        base_version: Option<u64>,
+    },
+    /// List available canvas templates.
+    Templates,
 }
 
 #[derive(Debug, Subcommand)]
@@ -405,6 +445,10 @@ async fn main() -> Result<()> {
             c.send_input(&session_id, text).await?;
             Ok(())
         }
+        Command::Canvas { command } => {
+            let c = connect(&socket).await?;
+            run_canvas_command(&c, command).await
+        }
         Command::AskGate => {
             // Drain stdin (the PreToolUse payload) so the hook's pipe closes
             // cleanly, then resolve the session id from the adapter-set env
@@ -545,10 +589,131 @@ fn command_allows_upgrade_prompt(command: &Command) -> bool {
         Command::Daemon { .. }
             | Command::Upgrade { .. }
             | Command::Acp { .. }
+            | Command::Canvas { .. }
             | Command::AskGate
             | Command::Mcp
             | Command::Adapter { .. }
     )
+}
+
+async fn run_canvas_command(client: &Client, command: CanvasCommand) -> Result<()> {
+    match command {
+        CanvasCommand::Get { session_id } => {
+            let result = client.canvas_get(&session_id).await?;
+            eprintln!(
+                "session={} version={} updated_at_ms={} template={}",
+                result.canvas.session_id,
+                result.canvas.version,
+                result.canvas.updated_at_ms,
+                result.canvas.template_id.as_deref().unwrap_or("(none)")
+            );
+            print!("{}", result.canvas.markdown);
+            Ok(())
+        }
+        CanvasCommand::Set {
+            session_id,
+            file,
+            stdin,
+            template,
+            base_version,
+        } => {
+            let mut sources = 0;
+            sources += usize::from(file.is_some());
+            sources += usize::from(stdin);
+            sources += usize::from(template.is_some());
+            if sources != 1 {
+                anyhow::bail!("choose exactly one of --file, --stdin, or --template");
+            }
+            let (markdown, template_id) = if let Some(path) = file {
+                (std::fs::read_to_string(&path)?, None)
+            } else if stdin {
+                let mut markdown = String::new();
+                std::io::stdin().read_to_string(&mut markdown)?;
+                (markdown, None)
+            } else {
+                let template_id = template.expect("template source counted above");
+                let templates = client.canvas_templates().await?.templates;
+                let Some(found) = templates.into_iter().find(|t| t.id == template_id) else {
+                    anyhow::bail!("unknown canvas template: {template_id}");
+                };
+                (found.markdown, Some(found.id))
+            };
+            let result = client
+                .canvas_update(agentd_protocol::CanvasUpdateParams {
+                    session_id,
+                    markdown,
+                    base_version,
+                    actor: agentd_protocol::CanvasUpdateActor::Human,
+                    template_id,
+                    note: None,
+                })
+                .await?;
+            println!("updated canvas version {}", result.canvas.version);
+            Ok(())
+        }
+        CanvasCommand::Edit { session_id } => {
+            let current = client.canvas_get(&session_id).await?.canvas;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("canvas.md");
+            std::fs::write(&path, &current.markdown)?;
+            let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+            let status = std::process::Command::new(editor).arg(&path).status()?;
+            if !status.success() {
+                anyhow::bail!("editor exited with status {status}");
+            }
+            let markdown = std::fs::read_to_string(&path)?;
+            if markdown == current.markdown {
+                println!("canvas unchanged at version {}", current.version);
+                return Ok(());
+            }
+            let result = client
+                .canvas_update(agentd_protocol::CanvasUpdateParams {
+                    session_id,
+                    markdown,
+                    base_version: Some(current.version),
+                    actor: agentd_protocol::CanvasUpdateActor::Human,
+                    template_id: current.template_id,
+                    note: None,
+                })
+                .await?;
+            println!("updated canvas version {}", result.canvas.version);
+            Ok(())
+        }
+        CanvasCommand::Execute {
+            session_id,
+            selection,
+            base_version,
+        } => {
+            let result = client
+                .canvas_execute(agentd_protocol::CanvasExecuteParams {
+                    session_id,
+                    selection,
+                    base_version,
+                })
+                .await?;
+            println!(
+                "execution prompt sent from canvas version {}",
+                result.canvas.version
+            );
+            Ok(())
+        }
+        CanvasCommand::Templates => {
+            for template in client.canvas_templates().await?.templates {
+                let source = if template.built_in {
+                    "built-in"
+                } else {
+                    "user"
+                };
+                match template.description {
+                    Some(description) => {
+                        println!("{}\t{}\t{}", template.id, source, description);
+                    }
+                    None => println!("{}\t{}", template.id, source),
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(unix)]

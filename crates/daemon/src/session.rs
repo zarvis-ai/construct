@@ -5,7 +5,9 @@ use crate::config::Config;
 use crate::storage::Storage;
 use crate::worktree;
 use agentd_protocol::{
-    ahp_method, ClientView, CreateSessionParams, DeletedNotificationPayload,
+    ahp_method, CanvasDocument, CanvasExecuteParams, CanvasExecuteResult, CanvasGetResult,
+    CanvasListTemplatesResult, CanvasStateNotificationPayload, CanvasUpdateParams,
+    CanvasUpdateResult, ClientView, CreateSessionParams, DeletedNotificationPayload,
     EventNotificationPayload, GroupDeletedNotificationPayload, GroupStateNotificationPayload,
     GroupSummary, HarnessInfo, MessageRole, MoveDirection, PtyReplayResult, PtySize,
     SessionAttachClipboardParams, SessionAttachClipboardResult, SessionDetail,
@@ -291,6 +293,7 @@ pub enum BroadcastMsg {
     Deleted(DeletedNotificationPayload),
     GroupState(GroupStateNotificationPayload),
     GroupDeleted(GroupDeletedNotificationPayload),
+    CanvasState(CanvasStateNotificationPayload),
     /// Aggregate state for the remote WS transport. Emitted by
     /// `server::handle_ws_connection` on every accept/drop so the
     /// local TUI can show a "remote attached" badge.
@@ -1319,6 +1322,77 @@ impl SessionManager {
         Ok(String::new())
     }
 
+    pub async fn canvas_get(&self, session_id: &str) -> Result<CanvasGetResult> {
+        self.get_entry(session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
+        Ok(CanvasGetResult {
+            canvas: self.storage.read_canvas(session_id)?,
+            revisions: self.storage.read_canvas_revisions(session_id)?,
+        })
+    }
+
+    pub async fn canvas_update(&self, params: CanvasUpdateParams) -> Result<CanvasUpdateResult> {
+        self.get_entry(&params.session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
+        let canvas = self.storage.update_canvas(
+            &params.session_id,
+            params.markdown,
+            params.actor,
+            params.base_version,
+            params.template_id,
+            params.note,
+        )?;
+        self.broadcast_canvas_state(canvas.clone());
+        Ok(CanvasUpdateResult { canvas })
+    }
+
+    pub async fn canvas_execute(&self, params: CanvasExecuteParams) -> Result<CanvasExecuteResult> {
+        let result = self.canvas_get(&params.session_id).await?;
+        if let Some(base) = params.base_version {
+            if base != result.canvas.version {
+                anyhow::bail!(
+                    "canvas conflict: current version is {}, attempted base version is {}",
+                    result.canvas.version,
+                    base
+                );
+            }
+        }
+        let body = params
+            .selection
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| result.canvas.markdown.trim());
+        if body.is_empty() {
+            anyhow::bail!("canvas is empty");
+        }
+        let prompt = format!(
+            "Execute the following construct canvas instructions. Treat the Markdown as orchestration state. Resolve smart clips written as @{{type:id}} references when possible, create subagent sessions for harness clips when appropriate, and update the canvas with construct_canvas_update when task state changes.\n\n```markdown\n{}\n```",
+            body
+        );
+        self.send_input(&params.session_id, prompt.clone()).await?;
+        Ok(CanvasExecuteResult {
+            canvas: result.canvas,
+            prompt,
+        })
+    }
+
+    pub fn canvas_templates(&self) -> Result<CanvasListTemplatesResult> {
+        Ok(CanvasListTemplatesResult {
+            templates: self.storage.canvas_templates()?,
+        })
+    }
+
+    fn broadcast_canvas_state(&self, canvas: CanvasDocument) {
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::CanvasState(CanvasStateNotificationPayload {
+                canvas,
+            }));
+    }
+
     pub async fn create(self: &Arc<Self>, params: CreateSessionParams) -> Result<String> {
         let harness = params.harness.as_str();
         let adapter_cfg = self
@@ -1408,8 +1482,7 @@ impl SessionManager {
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: params.kind,
             archived: false,
-            operator_loop_disabled: params.kind
-                == agentd_protocol::SessionKind::Orchestrator,
+            operator_loop_disabled: params.kind == agentd_protocol::SessionKind::Orchestrator,
         };
         self.storage.save_summary(&summary)?;
 
@@ -1710,7 +1783,11 @@ impl SessionManager {
         );
         let (project_id, current_model, operator_loop_disabled) = {
             let s = entry.summary.read().await;
-            (s.group_id.clone(), s.model.clone(), s.operator_loop_disabled)
+            (
+                s.group_id.clone(),
+                s.model.clone(),
+                s.operator_loop_disabled,
+            )
         };
         // The summary's model is the live source of truth — it tracks any
         // mid-session `/model` switch (via `ModelChanged`), whereas the start
@@ -1722,9 +1799,10 @@ impl SessionManager {
         // Re-inject the operator loop toggle so the resumed adapter starts
         // with the same enabled/disabled state the user left it in.
         if operator_loop_disabled {
-            start_params
-                .env
-                .insert("CONSTRUCT_OPERATOR_LOOP_DISABLED".to_string(), "1".to_string());
+            start_params.env.insert(
+                "CONSTRUCT_OPERATOR_LOOP_DISABLED".to_string(),
+                "1".to_string(),
+            );
         } else {
             start_params.env.remove("CONSTRUCT_OPERATOR_LOOP_DISABLED");
         }

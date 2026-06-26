@@ -751,6 +751,10 @@ impl SessionState {
 pub mod ipc_method {
     pub const PING: &str = "ping";
     pub const HARNESS_LIST: &str = "harness.list";
+    pub const CANVAS_GET: &str = "canvas.get";
+    pub const CANVAS_UPDATE: &str = "canvas.update";
+    pub const CANVAS_EXECUTE: &str = "canvas.execute";
+    pub const CANVAS_LIST_TEMPLATES: &str = "canvas.list_templates";
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_GET: &str = "session.get";
@@ -859,6 +863,7 @@ pub mod ipc_method {
 pub mod ipc_notif {
     pub const EVENT: &str = "session/event";
     pub const STATE: &str = "session/state";
+    pub const CANVAS_STATE: &str = "canvas/state";
     pub const DELETED: &str = "session/deleted";
     pub const GROUP_STATE: &str = "group/state";
     pub const GROUP_DELETED: &str = "group/deleted";
@@ -870,6 +875,106 @@ pub mod ipc_notif {
     /// "● remote attached" badge as a visible signal that another
     /// surface is also driving the daemon.
     pub const REMOTE_STATE: &str = "remote/state";
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasUpdateActor {
+    Human,
+    Agent,
+}
+
+impl Default for CanvasUpdateActor {
+    fn default() -> Self {
+        Self::Human
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasDocument {
+    pub session_id: String,
+    pub markdown: String,
+    pub version: u64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasRevision {
+    pub version: u64,
+    pub actor: CanvasUpdateActor,
+    pub at_ms: i64,
+    pub markdown: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasTemplate {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub markdown: String,
+    #[serde(default)]
+    pub built_in: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasGetParams {
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasGetResult {
+    pub canvas: CanvasDocument,
+    #[serde(default)]
+    pub revisions: Vec<CanvasRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasUpdateParams {
+    pub session_id: String,
+    pub markdown: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<u64>,
+    #[serde(default)]
+    pub actor: CanvasUpdateActor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasUpdateResult {
+    pub canvas: CanvasDocument,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasExecuteParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasExecuteResult {
+    pub canvas: CanvasDocument,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasListTemplatesResult {
+    pub templates: Vec<CanvasTemplate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CanvasStateNotificationPayload {
+    pub canvas: CanvasDocument,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

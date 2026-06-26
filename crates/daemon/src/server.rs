@@ -5,10 +5,11 @@ use crate::remote::RemoteState;
 use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
-    ipc_method, ipc_notif, transport, ChatViewerActiveResult, CreateSessionParams, ErrorObject,
-    GroupCreateParams, GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
-    GroupSetCollapsedParams, Notification, PingResult, ProjectCreateParams, ProjectCreateResult,
-    ProjectDeleteParams, ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
+    ipc_method, ipc_notif, transport, CanvasExecuteParams, CanvasGetParams, CanvasUpdateParams,
+    ChatViewerActiveResult, CreateSessionParams, ErrorObject, GroupCreateParams, GroupCreateResult,
+    GroupDeleteParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, Notification,
+    PingResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
     ProjectSetCollapsedParams, ProjectStateNotificationPayload, PtyReplayParams, Request, Response,
     SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
@@ -920,6 +921,7 @@ fn forward_broadcast(
             BroadcastMsg::Event(e) => e.session_id == *f,
             BroadcastMsg::State(s) => s.session.id == *f,
             BroadcastMsg::Deleted(d) => d.session_id == *f,
+            BroadcastMsg::CanvasState(c) => c.canvas.session_id == *f,
             // Group + remote-state notifications aren't session-
             // specific; always forward even when a session filter
             // is set so the local TUI's remote badge stays accurate
@@ -954,6 +956,13 @@ fn forward_broadcast(
                 Err(_) => return,
             };
             Notification::new(ipc_notif::DELETED, Some(p))
+        }
+        BroadcastMsg::CanvasState(c) => {
+            let p = match serde_json::to_value(&c) {
+                Ok(v) => v,
+                Err(_) => return,
+            };
+            Notification::new(ipc_notif::CANVAS_STATE, Some(p))
         }
         BroadcastMsg::GroupState(g) => {
             let p = match serde_json::to_value(&g) {
@@ -1039,6 +1048,31 @@ async fn dispatch(
             version: IPC_VERSION.to_string(),
         }),
         m if m == ipc_method::HARNESS_LIST => ok!(&manager.harnesses()),
+        m if m == ipc_method::CANVAS_GET => {
+            let p = params!(CanvasGetParams);
+            match manager.canvas_get(&p.session_id).await {
+                Ok(result) => ok!(&result),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::CANVAS_UPDATE => {
+            let p = params!(CanvasUpdateParams);
+            match manager.canvas_update(p).await {
+                Ok(result) => ok!(&result),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::CANVAS_EXECUTE => {
+            let p = params!(CanvasExecuteParams);
+            match manager.canvas_execute(p).await {
+                Ok(result) => ok!(&result),
+                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+            }
+        }
+        m if m == ipc_method::CANVAS_LIST_TEMPLATES => match manager.canvas_templates() {
+            Ok(result) => ok!(&result),
+            Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+        },
         m if m == ipc_method::SESSION_LIST => ok!(&manager.list().await),
         m if m == ipc_method::SESSION_CREATE => {
             let p = params!(CreateSessionParams);
@@ -1439,9 +1473,7 @@ async fn dispatch(
             } else {
                 crate::session::RestartAction::Restart
             };
-            match manager
-                .request_daemon_restart(params.exe.map(std::path::PathBuf::from), action)
-            {
+            match manager.request_daemon_restart(params.exe.map(std::path::PathBuf::from), action) {
                 Ok(cmd) => {
                     // Cloudflared survives the daemon's exec()
                     // because it's spawned in a separate process

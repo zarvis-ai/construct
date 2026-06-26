@@ -2,8 +2,10 @@
 
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
-    ipc_method, transport, ChatViewerActiveResult, ClientView, CreateSessionParams, DiffResult,
-    ErrorObject, GroupCreateParams, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
+    ipc_method, transport, CanvasExecuteParams, CanvasExecuteResult, CanvasGetParams,
+    CanvasGetResult, CanvasListTemplatesResult, CanvasUpdateParams, CanvasUpdateResult,
+    ChatViewerActiveResult, ClientView, CreateSessionParams, DiffResult, ErrorObject,
+    GroupCreateParams, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, GroupSummary, HarnessInfo, MoveDirection, Notification, PingResult,
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams, ProjectMoveParams,
     ProjectRenameParams, ProjectSetCollapsedParams, ProjectSummary, PtyReplayResult, PtySize,
@@ -202,6 +204,25 @@ impl Client {
     }
     pub async fn harnesses(&self) -> Result<Vec<HarnessInfo>> {
         self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null)
+            .await
+    }
+    pub async fn canvas_get(&self, id: &str) -> Result<CanvasGetResult> {
+        self.request(
+            ipc_method::CANVAS_GET,
+            &CanvasGetParams {
+                session_id: id.to_string(),
+            },
+        )
+        .await
+    }
+    pub async fn canvas_update(&self, params: CanvasUpdateParams) -> Result<CanvasUpdateResult> {
+        self.request(ipc_method::CANVAS_UPDATE, &params).await
+    }
+    pub async fn canvas_execute(&self, params: CanvasExecuteParams) -> Result<CanvasExecuteResult> {
+        self.request(ipc_method::CANVAS_EXECUTE, &params).await
+    }
+    pub async fn canvas_templates(&self) -> Result<CanvasListTemplatesResult> {
+        self.request(ipc_method::CANVAS_LIST_TEMPLATES, &serde_json::Value::Null)
             .await
     }
     /// Start (or look up) the daemon's remote WS listener and

@@ -66,7 +66,44 @@ pub fn catalog() -> Vec<Value> {
             "List the session's tool-call task registry: running, backgrounded, and recently-completed entries. Each entry includes call_id, tool, args_summary, state, started_at_ms, optionally backgrounded_at_ms / ended_at_ms / output_preview. Use this to discover what a session is currently working on, including long-running tools that have been auto-promoted to the background.",
             schema_obj(&[("session_id", "string", true)]),
         ),
+        tool(
+            "construct_canvas_get",
+            "Fetch a session's canvas Markdown document, version, and retained revisions. Defaults to the current session when `session_id` is omitted.",
+            schema_obj(&[("session_id", "string", false)]),
+        ),
+        tool(
+            "construct_canvas_list_templates",
+            "List built-in and user canvas templates. User templates live under the daemon data directory at `canvas/templates/*.md`.",
+            schema_empty(),
+        ),
         // ----- Write -----
+        tool(
+            "construct_canvas_update",
+            "Replace a session's canvas Markdown. Pass `base_version` from construct_canvas_get for optimistic conflict detection. Agent updates are allowed without user confirmation; on conflict, re-read the canvas and retry with a resolved document.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "markdown": { "type": "string" },
+                    "base_version": { "type": "integer", "minimum": 0 },
+                    "template_id": { "type": "string" },
+                    "note": { "type": "string" }
+                },
+                "required": ["markdown"]
+            }),
+        ),
+        tool(
+            "construct_canvas_execute",
+            "Ask the owning session to execute the full canvas or a selected Markdown fragment. Defaults to the current session when `session_id` is omitted.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "selection": { "type": "string" },
+                    "base_version": { "type": "integer", "minimum": 0 }
+                }
+            }),
+        ),
         tool(
             "construct_create_session",
             "Spawn a new top-level/visible session in the fleet. Use this when the user asks for a new session or independent session. If the user says subagent, use construct_subagent_create instead so the child is parented to the current session. `harness` must match an available harness name (see construct_list_harnesses). `cwd` defaults to the caller's cwd when provided by the adapter, otherwise the daemon's process cwd. Set `worktree:true` to start the session in an isolated git worktree.",
@@ -373,7 +410,35 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             let tasks = client.list_tasks(&sid).await?;
             json!({ "tasks": tasks })
         }
+        "construct_canvas_get" => {
+            let sid = optional_session_arg(&args, session_id)?;
+            serde_json::to_value(client.canvas_get(&sid).await?)?
+        }
+        "construct_canvas_list_templates" => {
+            serde_json::to_value(client.canvas_templates().await?)?
+        }
         // ----- Write -----
+        "construct_canvas_update" => {
+            let sid = optional_session_arg(&args, session_id)?;
+            let params = agentd_protocol::CanvasUpdateParams {
+                session_id: sid,
+                markdown: arg_str(&args, "markdown")?,
+                base_version: args.get("base_version").and_then(|v| v.as_u64()),
+                actor: agentd_protocol::CanvasUpdateActor::Agent,
+                template_id: arg_str(&args, "template_id").ok(),
+                note: arg_str(&args, "note").ok(),
+            };
+            serde_json::to_value(client.canvas_update(params).await?)?
+        }
+        "construct_canvas_execute" => {
+            let sid = optional_session_arg(&args, session_id)?;
+            let params = agentd_protocol::CanvasExecuteParams {
+                session_id: sid,
+                selection: arg_str(&args, "selection").ok(),
+                base_version: args.get("base_version").and_then(|v| v.as_u64()),
+            };
+            serde_json::to_value(client.canvas_execute(params).await?)?
+        }
         "construct_create_session" => {
             let harness = arg_str(&args, "harness")?;
             let cwd = arg_str(&args, "cwd").unwrap_or_else(|_| {
@@ -633,6 +698,10 @@ fn require_session_id(session_id: Option<&str>) -> Result<String> {
         .ok_or_else(|| anyhow!("subagent tools require CONSTRUCT_SESSION_ID"))
 }
 
+fn optional_session_arg(args: &Value, session_id: Option<&str>) -> Result<String> {
+    arg_str(args, "session_id").or_else(|_| require_session_id(session_id))
+}
+
 async fn owned_subagent_detail(
     client: &Arc<Client>,
     session_id: Option<&str>,
@@ -730,6 +799,27 @@ mod tests {
             "construct_subagent_enqueue",
             "construct_subagent_cancel",
             "construct_subagent_delete",
+        ] {
+            assert!(names.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn catalog_includes_canvas_tools() {
+        let names: std::collections::HashSet<String> = catalog()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(|name| name.as_str())
+                    .map(|name| name.to_string())
+            })
+            .collect();
+
+        for expected in [
+            "construct_canvas_get",
+            "construct_canvas_list_templates",
+            "construct_canvas_update",
+            "construct_canvas_execute",
         ] {
             assert!(names.contains(expected), "missing {expected}");
         }
