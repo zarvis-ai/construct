@@ -48,6 +48,7 @@ const PTY_REPLAY_CAP: usize = 8 * 1024 * 1024;
 const RESPAWN_REDRAW_POLL: Duration = Duration::from_millis(100);
 const RESPAWN_REDRAW_SETTLE: Duration = Duration::from_millis(400);
 const RESPAWN_REDRAW_MAX_WAIT: Duration = Duration::from_secs(6);
+const CANVAS_EXTERNAL_PTY_TYPED_CHUNK_DELAY: Duration = Duration::from_millis(12);
 
 /// Whether the post-resume force-redraw should fire now: the child has
 /// produced PTY output and then gone quiet for [`RESPAWN_REDRAW_SETTLE`],
@@ -481,12 +482,15 @@ fn should_record_pty_user_message(harness: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CanvasExecutionDelivery {
     AdapterInput,
+    ExternalPtyTypedSubmit,
     PtySubmit,
 }
 
 fn canvas_execution_delivery(summary: &agentd_protocol::SessionSummary) -> CanvasExecutionDelivery {
     if !summary.has_pty {
         CanvasExecutionDelivery::AdapterInput
+    } else if matches!(summary.harness.as_str(), "claude" | "codex" | "antigravity") {
+        CanvasExecutionDelivery::ExternalPtyTypedSubmit
     } else {
         CanvasExecutionDelivery::PtySubmit
     }
@@ -1398,6 +1402,10 @@ impl SessionManager {
             canvas_execution_delivery(&*summary)
         };
         match delivery {
+            CanvasExecutionDelivery::ExternalPtyTypedSubmit => {
+                self.canvas_submit_typed_prompt(&params.session_id, &prompt)
+                    .await?;
+            }
             CanvasExecutionDelivery::PtySubmit => {
                 let mut bytes = prompt.clone().into_bytes();
                 bytes.push(b'\n');
@@ -2647,6 +2655,20 @@ impl SessionManager {
 
     pub async fn pty_input(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
         self.pty_input_inner(id, bytes, true).await
+    }
+
+    async fn pty_input_without_capture(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
+        self.pty_input_inner(id, bytes, false).await
+    }
+
+    async fn canvas_submit_typed_prompt(&self, id: &str, prompt: &str) -> Result<()> {
+        for chunk in prompt.split_inclusive('\n') {
+            self.pty_input_without_capture(id, chunk.as_bytes().to_vec())
+                .await?;
+            tokio::time::sleep(CANVAS_EXTERNAL_PTY_TYPED_CHUNK_DELAY).await;
+        }
+        self.pty_input_without_capture(id, vec![b'\r']).await?;
+        Ok(())
     }
 
     async fn pty_input_inner(&self, id: &str, bytes: Vec<u8>, capture: bool) -> Result<()> {
@@ -3943,13 +3965,13 @@ mod tests {
     }
 
     #[test]
-    fn canvas_execution_submits_to_external_agent_pty_sessions() {
+    fn canvas_execution_typed_submit_for_external_agent_pty_sessions() {
         let mut summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
         summary.harness = "claude".to_string();
 
         assert_eq!(
             canvas_execution_delivery(&summary),
-            CanvasExecutionDelivery::PtySubmit
+            CanvasExecutionDelivery::ExternalPtyTypedSubmit
         );
     }
 
