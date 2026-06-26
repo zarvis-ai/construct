@@ -7217,11 +7217,14 @@ impl App {
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
-        let len = popup.buffer.chars().count();
         if delta < 0 {
-            popup.cursor = popup.cursor.saturating_sub(delta.unsigned_abs());
+            for _ in 0..delta.unsigned_abs() {
+                popup.cursor = canvas_cursor_left(&popup.buffer, popup.cursor);
+            }
         } else {
-            popup.cursor = (popup.cursor + delta as usize).min(len);
+            for _ in 0..delta as usize {
+                popup.cursor = canvas_cursor_right(&popup.buffer, popup.cursor);
+            }
         }
         popup.preferred_col = None;
         Self::update_canvas_selection_head(popup);
@@ -7255,10 +7258,19 @@ impl App {
         if popup.cursor == 0 {
             return;
         }
-        let start = byte_pos(&popup.buffer, popup.cursor - 1);
-        let end = byte_pos(&popup.buffer, popup.cursor);
+        let (char_start, char_end) =
+            if let Some(range) = canvas_smart_clip_range_before_or_containing(
+                &popup.buffer,
+                popup.cursor,
+            ) {
+                (range.start, range.end)
+            } else {
+                (popup.cursor - 1, popup.cursor)
+            };
+        let start = byte_pos(&popup.buffer, char_start);
+        let end = byte_pos(&popup.buffer, char_end);
         popup.buffer.replace_range(start..end, "");
-        popup.cursor -= 1;
+        popup.cursor = char_start;
         popup.preferred_col = None;
         popup.selection = None;
         Self::update_canvas_smart_clip_after_cursor_move(popup);
@@ -7274,9 +7286,19 @@ impl App {
         if popup.cursor >= popup.buffer.chars().count() {
             return;
         }
-        let start = byte_pos(&popup.buffer, popup.cursor);
-        let end = byte_pos(&popup.buffer, popup.cursor + 1);
+        let (char_start, char_end) =
+            if let Some(range) = canvas_smart_clip_range_at_or_containing(
+                &popup.buffer,
+                popup.cursor,
+            ) {
+                (range.start, range.end)
+            } else {
+                (popup.cursor, popup.cursor + 1)
+            };
+        let start = byte_pos(&popup.buffer, char_start);
+        let end = byte_pos(&popup.buffer, char_end);
         popup.buffer.replace_range(start..end, "");
+        popup.cursor = char_start;
         popup.preferred_col = None;
         popup.selection = None;
         Self::update_canvas_smart_clip_after_cursor_move(popup);
@@ -9319,6 +9341,69 @@ fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<
     Some(query)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanvasSmartClipRange {
+    start: usize,
+    end: usize,
+}
+
+fn canvas_cursor_left(buffer: &str, cursor: usize) -> usize {
+    canvas_smart_clip_range_before_or_containing(buffer, cursor)
+        .map(|range| range.start)
+        .unwrap_or_else(|| cursor.saturating_sub(1))
+}
+
+fn canvas_cursor_right(buffer: &str, cursor: usize) -> usize {
+    let len = buffer.chars().count();
+    canvas_smart_clip_range_at_or_containing(buffer, cursor)
+        .map(|range| range.end)
+        .unwrap_or_else(|| (cursor + 1).min(len))
+}
+
+fn canvas_smart_clip_range_at_or_containing(
+    buffer: &str,
+    cursor: usize,
+) -> Option<CanvasSmartClipRange> {
+    canvas_smart_clip_ranges(buffer)
+        .into_iter()
+        .find(|range| cursor >= range.start && cursor < range.end)
+}
+
+fn canvas_smart_clip_range_before_or_containing(
+    buffer: &str,
+    cursor: usize,
+) -> Option<CanvasSmartClipRange> {
+    canvas_smart_clip_ranges(buffer)
+        .into_iter()
+        .find(|range| cursor > range.start && cursor <= range.end)
+}
+
+fn canvas_smart_clip_ranges(buffer: &str) -> Vec<CanvasSmartClipRange> {
+    let chars: Vec<char> = buffer.chars().collect();
+    let mut ranges = Vec::new();
+    let mut idx = 0usize;
+    while idx + 1 < chars.len() {
+        if chars[idx] != '@' || chars[idx + 1] != '{' {
+            idx += 1;
+            continue;
+        }
+        let mut end = idx + 2;
+        while end < chars.len() && chars[end] != '}' {
+            end += 1;
+        }
+        if end < chars.len() {
+            ranges.push(CanvasSmartClipRange {
+                start: idx,
+                end: end + 1,
+            });
+            idx = end + 1;
+        } else {
+            idx += 2;
+        }
+    }
+    ranges
+}
+
 fn canvas_popup_from_document(
     canvas: agentd_protocol::CanvasDocument,
     now: Instant,
@@ -9960,6 +10045,77 @@ mod tests {
         let popup = app.canvas_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "@abc ");
         assert!(popup.smart_clip.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_cursor_moves_over_smart_clip_as_one_unit() {
+        let (mut app, _dir, server) = empty_app().await;
+        let clip = "@{harness:codex}";
+        let before = "a ";
+        app.canvas_popup = Some(canvas_popup_for_test(
+            "s1",
+            &format!("{before}{clip} z"),
+            before.chars().count(),
+        ));
+
+        app.move_canvas_cursor(1);
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            before.chars().count() + clip.chars().count()
+        );
+
+        app.move_canvas_cursor(-1);
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            before.chars().count()
+        );
+
+        app.canvas_popup.as_mut().unwrap().cursor = before.chars().count() + 3;
+        app.move_canvas_cursor(1);
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            before.chars().count() + clip.chars().count()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_delete_removes_smart_clip_as_one_unit() {
+        let (mut app, _dir, server) = empty_app().await;
+        let clip = "@{harness:codex}";
+        let before = "a ";
+        let initial = format!("{before}{clip} z");
+        app.canvas_popup = Some(canvas_popup_for_test(
+            "s1",
+            &initial,
+            before.chars().count() + clip.chars().count(),
+        ));
+
+        app.delete_canvas_back();
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "a  z");
+        assert_eq!(popup.cursor, before.chars().count());
+
+        app.canvas_popup = Some(canvas_popup_for_test(
+            "s1",
+            &initial,
+            before.chars().count(),
+        ));
+        app.delete_canvas_forward();
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "a  z");
+        assert_eq!(popup.cursor, before.chars().count());
+
+        app.canvas_popup = Some(canvas_popup_for_test(
+            "s1",
+            &initial,
+            before.chars().count() + 3,
+        ));
+        app.delete_canvas_forward();
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "a  z");
+        assert_eq!(popup.cursor, before.chars().count());
         server.abort();
     }
 
