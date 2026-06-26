@@ -7155,32 +7155,27 @@ fn render_canvas_popup_at(
         ..base_rect
     };
 
-    let template = popup
-        .canvas
-        .template_id
-        .as_deref()
-        .map(|id| format!(" · {id}"))
-        .unwrap_or_default();
-    let dirty = if popup.buffer == popup.saved_markdown {
-        ""
-    } else {
-        " · modified"
-    };
-    let focus_label = if active { "focused" } else { "open" };
-    let title = format!(
-        " canvas {focus_label} — {} · v{}{}{} — C-s save · Esc close ",
-        short_id(&popup.canvas.session_id),
-        popup.canvas.version,
-        template,
-        dirty
-    );
+    let summary = app
+        .sessions
+        .iter()
+        .find(|s| s.id == popup.canvas.session_id);
+    let title = canvas_title_line(app, popup, summary, rect, active);
+    let harness_right = summary.map(|s| {
+        Line::from(Span::styled(
+            format!(" {} ", harness_label(s)),
+            canvas_border_style(&app.theme, active),
+        ))
+        .alignment(ratatui::layout::Alignment::Right)
+    });
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(canvas_border_style(&app.theme, active))
-        .title(Line::from(Span::styled(
-            title,
-            canvas_title_style(&app.theme, active),
-        )));
+        .title(title);
+    let block = if let Some(h) = harness_right {
+        block.title(h)
+    } else {
+        block
+    };
     let inner = block.inner(rect).inner(Margin {
         horizontal: CANVAS_CONTENT_PADDING_X,
         vertical: CANVAS_CONTENT_PADDING_Y,
@@ -7205,6 +7200,7 @@ fn render_canvas_popup_at(
             render_canvas_smart_clip_picker(f, app, popup, pos, inner);
         }
     }
+    render_canvas_title_tooltip(f, app, popup, summary, rect);
 }
 
 fn canvas_border_style(theme: &Theme, active: bool) -> Style {
@@ -7217,13 +7213,147 @@ fn canvas_border_style(theme: &Theme, active: bool) -> Style {
     }
 }
 
-fn canvas_title_style(theme: &Theme, active: bool) -> Style {
-    if active {
-        Style::default()
-            .fg(theme.accent_alt)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.muted)
+fn canvas_title_line<'a>(
+    app: &App,
+    popup: &crate::app::CanvasPopup,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    rect: Rect,
+    active: bool,
+) -> Line<'a> {
+    let dirty = popup.buffer != popup.saved_markdown;
+    let marker_w = canvas_title_marker_width(dirty);
+    let harness_w = summary
+        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
+        .unwrap_or(0);
+    let glyph_w = summary
+        .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
+        .unwrap_or(0);
+    let label_budget = (rect.width as usize)
+        .saturating_sub(2)
+        .saturating_sub(harness_w)
+        .saturating_sub(3 + glyph_w + marker_w);
+    let border_style = canvas_border_style(&app.theme, active);
+    let canvas_style = Style::default()
+        .fg(app.theme.accent_alt)
+        .add_modifier(Modifier::BOLD);
+    let modified_style = Style::default()
+        .fg(app.theme.warning)
+        .add_modifier(Modifier::BOLD);
+
+    match summary {
+        Some(s) => {
+            let mut spans = vec![
+                Span::styled(" ", border_style),
+                Span::styled(session_status_glyph(app, s).to_string(), border_style),
+                Span::styled(" ", border_style),
+                Span::styled(
+                    truncate_to_width(&primary_label(s), label_budget),
+                    border_style,
+                ),
+                Span::styled(" ", border_style),
+                Span::styled("<canvas>", canvas_style),
+            ];
+            if dirty {
+                spans.push(Span::styled(" * ", border_style));
+                spans.push(Span::styled("modified", modified_style));
+            }
+            spans.push(Span::styled(" ", border_style));
+            Line::from(spans)
+        }
+        None => Line::from(vec![
+            Span::styled(" ", border_style),
+            Span::styled(short_id(&popup.canvas.session_id).to_string(), border_style),
+            Span::styled(" ", border_style),
+            Span::styled("<canvas>", canvas_style),
+            if dirty {
+                Span::styled(" * modified ", modified_style)
+            } else {
+                Span::styled(" ", border_style)
+            },
+        ]),
+    }
+}
+
+fn canvas_title_marker_width(dirty: bool) -> usize {
+    UnicodeWidthStr::width(" <canvas>")
+        + if dirty {
+            UnicodeWidthStr::width(" * modified")
+        } else {
+            0
+        }
+}
+
+fn render_canvas_title_tooltip(
+    f: &mut Frame,
+    app: &App,
+    popup: &crate::app::CanvasPopup,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    rect: Rect,
+) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    if my != rect.y {
+        return;
+    }
+    let dirty = popup.buffer != popup.saved_markdown;
+    let marker_ranges = canvas_title_marker_ranges(app, popup, summary, rect, dirty);
+    if mx >= marker_ranges.canvas.0 && mx < marker_ranges.canvas.1 {
+        render_button_tooltip(f, &app.theme, " C-x Space ", mx, my);
+    } else if let Some((start, end)) = marker_ranges.modified {
+        if mx >= start && mx < end {
+            render_button_tooltip(f, &app.theme, " C-s save ", mx, my);
+        }
+    }
+}
+
+struct CanvasTitleMarkerRanges {
+    canvas: (u16, u16),
+    modified: Option<(u16, u16)>,
+}
+
+fn canvas_title_marker_ranges(
+    app: &App,
+    popup: &crate::app::CanvasPopup,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    rect: Rect,
+    dirty: bool,
+) -> CanvasTitleMarkerRanges {
+    let marker_w = canvas_title_marker_width(dirty);
+    let harness_w = summary
+        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
+        .unwrap_or(0);
+    let glyph_w = summary
+        .map(|s| UnicodeWidthStr::width(session_status_glyph(app, s)))
+        .unwrap_or(0);
+    let label_budget = (rect.width as usize)
+        .saturating_sub(2)
+        .saturating_sub(harness_w)
+        .saturating_sub(3 + glyph_w + marker_w);
+    let prefix_w = match summary {
+        Some(s) => {
+            UnicodeWidthStr::width(" ")
+                + glyph_w
+                + UnicodeWidthStr::width(" ")
+                + UnicodeWidthStr::width(truncate_to_width(&primary_label(s), label_budget).as_str())
+                + UnicodeWidthStr::width(" ")
+        }
+        None => {
+            UnicodeWidthStr::width(" ")
+                + UnicodeWidthStr::width(short_id(&popup.canvas.session_id))
+                + UnicodeWidthStr::width(" ")
+        }
+    };
+    let canvas_start = rect.x.saturating_add(1).saturating_add(prefix_w as u16);
+    let canvas_end = canvas_start.saturating_add(UnicodeWidthStr::width("<canvas>") as u16);
+    let modified = dirty.then(|| {
+        let start = canvas_end.saturating_add(UnicodeWidthStr::width(" * ") as u16);
+        let end = start.saturating_add(UnicodeWidthStr::width("modified") as u16);
+        (start, end)
+    });
+    CanvasTitleMarkerRanges {
+        canvas: (canvas_start, canvas_end),
+        modified,
     }
 }
 

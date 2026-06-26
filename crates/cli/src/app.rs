@@ -6846,7 +6846,6 @@ impl App {
             KeyCode::Char('s') if ctrl => {
                 self.save_canvas_popup().await;
             }
-            KeyCode::Char('g') if ctrl => self.close_canvas_popup().await,
             KeyCode::Char(' ') if ctrl => self.begin_canvas_selection(),
             KeyCode::Char('a') if ctrl => {
                 if let Some(popup) = self.canvas_popup.as_mut() {
@@ -9959,6 +9958,19 @@ mod tests {
         assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abf");
         app.insert_canvas_text("XY");
         assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abXYf");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_ctrl_g_does_not_close_popup() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+
+        assert!(app.canvas_popup.is_some());
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
         server.abort();
     }
 
