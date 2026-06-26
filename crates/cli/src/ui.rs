@@ -1,9 +1,10 @@
 //! Ratatui rendering for the TUI.
 
 use crate::app::{
-    App, HarnessHit, HintZone, ListItem as AppListItem, MainWindowTree, Minibuffer,
-    MinibufferIntent, PaneFocus, ScreenPoint, Selection, TextSelectionRange, ViewMode,
-    WindowDividerHit, WindowPaneHit, WindowSplitDirection, ZoomMode,
+    App, CANVAS_CONTENT_PADDING_X, CANVAS_CONTENT_PADDING_Y, HarnessHit, HintZone,
+    ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferIntent, PaneFocus, ScreenPoint,
+    Selection, TextSelectionRange, ViewMode, WindowDividerHit, WindowPaneHit,
+    WindowSplitDirection, ZoomMode,
 };
 use crate::keymap::KeyAction;
 use crate::theme::Theme;
@@ -28,7 +29,7 @@ const MATRIX_WALLPAPER_DIM: f32 = 0.22;
 /// appear, and the top-to-bottom erase on disappear. Applies to both the
 /// terminal-view overlay and the matrix-rain wallpaper.
 const PREVIEW_REVEAL_SECS: f32 = 1.0;
-const CANVAS_REVEAL_SECS: f32 = 0.18;
+const CANVAS_REVEAL_SECS: f32 = 0.24;
 
 /// Row-fraction range `[start, end)` of a preview image to paint this
 /// frame. On appear the image fills from the top over `PREVIEW_REVEAL_SECS`
@@ -7150,12 +7151,14 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
                 .fg(app.theme.accent_alt)
                 .add_modifier(Modifier::BOLD),
         )));
-    let inner = block.inner(rect);
+    let inner = block.inner(rect).inner(Margin {
+        horizontal: CANVAS_CONTENT_PADDING_X,
+        vertical: CANVAS_CONTENT_PADDING_Y,
+    });
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let markdown = canvas_buffer_with_cursor(popup);
-    let mut lines = render_canvas_markdown_lines(app, &markdown);
+    let mut lines = render_canvas_markdown_lines(app, &popup.buffer);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "Type Markdown here. Use @{session:id}, @{harness:codex}, or :::clip blocks.",
@@ -7165,23 +7168,69 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
     let visible: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
     let para = Paragraph::new(visible).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
-}
-
-fn canvas_buffer_with_cursor(popup: &crate::app::CanvasPopup) -> String {
-    if popup.closing {
-        return popup.buffer.clone();
+    if !popup.closing {
+        if let Some(pos) = canvas_cursor_position(&popup.buffer, popup.cursor, inner) {
+            render_editor_cursor(f, pos, &app.theme);
+        }
     }
-    let mut out = popup.buffer.clone();
-    let pos = byte_pos_for_chars(&out, popup.cursor);
-    out.insert(pos, '▌');
-    out
 }
 
-fn byte_pos_for_chars(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map(|(b, _)| b)
-        .unwrap_or(s.len())
+fn canvas_cursor_position(markdown: &str, cursor: usize, area: Rect) -> Option<Position> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let (line, col) = canvas_line_col(markdown, cursor);
+    let visual_col = canvas_visual_col_for_line(markdown.lines().nth(line).unwrap_or(""), col);
+    let width = area.width as usize;
+    let visual_row = line.saturating_add(visual_col / width);
+    if visual_row >= area.height as usize {
+        return None;
+    }
+    Some(Position {
+        x: area.x.saturating_add((visual_col % width) as u16),
+        y: area.y.saturating_add(visual_row as u16),
+    })
+}
+
+fn canvas_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
+    let mut line = 0usize;
+    let mut col = 0usize;
+    for (idx, ch) in markdown.chars().enumerate() {
+        if idx >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+fn canvas_visual_col_for_line(raw: &str, raw_col: usize) -> usize {
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    let trimmed = raw.trim();
+    let col = raw_col.saturating_sub(leading);
+    if let Some(rest) = trimmed.strip_prefix("### ") {
+        let prefix = trimmed.chars().count() - rest.chars().count();
+        col.saturating_sub(prefix)
+    } else if let Some(rest) = trimmed.strip_prefix("## ") {
+        let prefix = trimmed.chars().count() - rest.chars().count();
+        col.saturating_sub(prefix)
+    } else if let Some(rest) = trimmed.strip_prefix("# ") {
+        let prefix = trimmed.chars().count() - rest.chars().count();
+        col.saturating_sub(prefix)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        let prefix = trimmed.chars().count() - rest.chars().count();
+        4 + col.saturating_sub(prefix)
+    } else {
+        raw_col
+    }
 }
 
 fn render_canvas_markdown_lines<'a>(app: &App, markdown: &'a str) -> Vec<Line<'a>> {
@@ -7558,6 +7607,24 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn canvas_cursor_position_targets_current_character_cell() {
+        let area = Rect::new(10, 2, 20, 4);
+        assert_eq!(
+            canvas_cursor_position("abc", 1, area),
+            Some(Position { x: 11, y: 2 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_accounts_for_wrapped_lines() {
+        let area = Rect::new(10, 2, 5, 4);
+        assert_eq!(
+            canvas_cursor_position("abcdef", 6, area),
+            Some(Position { x: 11, y: 3 })
+        );
     }
 
     #[test]

@@ -47,6 +47,8 @@ pub const SCROLLBACK_MAX: usize = 5_000;
 pub const MINIBUFFER_PANEL_H_DEFAULT: u16 = 13;
 pub const MINIBUFFER_PANEL_H_MIN: u16 = 3;
 pub const MINIBUFFER_PANEL_H_MAX: u16 = 80;
+pub(crate) const CANVAS_CONTENT_PADDING_X: u16 = 1;
+pub(crate) const CANVAS_CONTENT_PADDING_Y: u16 = 1;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
 
 /// A row in the rendered list view. Sessions and group headers share the
@@ -6014,6 +6016,9 @@ impl App {
             }
         }
         if self.canvas_popup.is_some() {
+            if self.handle_canvas_global_key(key).await {
+                return;
+            }
             self.handle_canvas_key(key).await;
             return;
         }
@@ -6554,8 +6559,14 @@ impl App {
             return;
         };
         popup.closing = false;
-        let inner_x = modal.x.saturating_add(1);
-        let inner_y = modal.y.saturating_add(1);
+        let inner_x = modal
+            .x
+            .saturating_add(1)
+            .saturating_add(CANVAS_CONTENT_PADDING_X);
+        let inner_y = modal
+            .y
+            .saturating_add(1)
+            .saturating_add(CANVAS_CONTENT_PADDING_Y);
         if row < inner_y {
             popup.cursor = 0;
             return;
@@ -6589,6 +6600,8 @@ impl App {
             }
             KeyCode::Char('b') if ctrl => self.move_canvas_cursor(-1),
             KeyCode::Char('f') if ctrl => self.move_canvas_cursor(1),
+            KeyCode::Char('p') if ctrl => self.move_canvas_cursor_vertical(-1),
+            KeyCode::Char('n') if ctrl => self.move_canvas_cursor_vertical(1),
             KeyCode::Char('d') if ctrl => self.delete_canvas_forward(),
             KeyCode::Char('h') if ctrl => self.delete_canvas_back(),
             KeyCode::Char('k') if ctrl => self.kill_canvas_line(),
@@ -6612,6 +6625,30 @@ impl App {
             KeyCode::Char(c) if !ctrl && !alt => self.insert_canvas_text(&c.to_string()),
             _ => {}
         }
+    }
+
+    async fn handle_canvas_global_key(&mut self, key: KeyEvent) -> bool {
+        let chord_active = !self.chord_state.is_empty();
+        let is_ctrl_x =
+            matches!(key.code, KeyCode::Char('x')) && key.modifiers.contains(KeyModifiers::CONTROL);
+        if !chord_active && !is_ctrl_x {
+            return false;
+        }
+        let res = self.chord_state.handle(key, &self.keymap);
+        self.chord_label = self.chord_state.label();
+        match res {
+            KeymapResult::Action(action) => {
+                self.chord_label.clear();
+                self.run_action(action).await;
+            }
+            KeymapResult::Pending(label) => {
+                self.chord_label = label;
+            }
+            KeymapResult::Unhandled => {
+                self.chord_label.clear();
+            }
+        }
+        true
     }
 
     fn insert_canvas_text(&mut self, text: &str) {
