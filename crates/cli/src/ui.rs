@@ -7202,6 +7202,7 @@ fn render_canvas_popup_at(
     if active && !popup.closing {
         if let Some(pos) = canvas_cursor_position(&popup.buffer, popup.cursor, inner) {
             render_editor_cursor(f, pos, &app.theme);
+            render_canvas_smart_clip_picker(f, app, popup, pos, inner);
         }
     }
 }
@@ -7224,6 +7225,87 @@ fn canvas_title_style(theme: &Theme, active: bool) -> Style {
     } else {
         Style::default().fg(theme.muted)
     }
+}
+
+fn render_canvas_smart_clip_picker(
+    f: &mut Frame,
+    app: &App,
+    popup: &crate::app::CanvasPopup,
+    cursor_pos: Position,
+    canvas_area: Rect,
+) {
+    let Some(search) = popup.smart_clip.as_ref() else {
+        return;
+    };
+    if canvas_area.width == 0 || canvas_area.height < 3 {
+        return;
+    }
+    let candidates = app.canvas_smart_clip_candidates(popup);
+    let max_rows = canvas_area.height.saturating_sub(2).min(8);
+    let row_count = (candidates.len().max(1) as u16).min(max_rows);
+    let width = 42u16.min(canvas_area.width.max(1));
+    let x = cursor_pos
+        .x
+        .min(canvas_area.x.saturating_add(canvas_area.width.saturating_sub(width)));
+    let below_y = cursor_pos.y.saturating_add(1);
+    let above_y = cursor_pos.y.saturating_sub(row_count.saturating_add(2));
+    let y = if below_y.saturating_add(row_count).saturating_add(2)
+        <= canvas_area.y.saturating_add(canvas_area.height)
+    {
+        below_y
+    } else {
+        above_y.max(canvas_area.y)
+    };
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height: row_count.saturating_add(2),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent_alt))
+        .title(Line::from(Span::styled(
+            " smart clip ",
+            Style::default()
+                .fg(app.theme.accent_alt)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let mut lines = Vec::new();
+    if candidates.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No matches",
+            Style::default().fg(app.theme.dim),
+        )));
+    } else {
+        for (idx, candidate) in candidates.iter().take(row_count as usize).enumerate() {
+            let selected = idx == search.selected.min(candidates.len().saturating_sub(1));
+            let style = if selected {
+                Style::default()
+                    .fg(app.theme.highlight_fg)
+                    .bg(app.theme.highlight_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+            let detail_style = if selected {
+                style
+            } else {
+                Style::default().fg(app.theme.muted)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{} ", if selected { ">" } else { " " }), style),
+                Span::styled(candidate.label.clone(), style),
+                Span::styled("  ", style),
+                Span::styled(candidate.detail.clone(), detail_style),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn canvas_cursor_position(markdown: &str, cursor: usize, area: Rect) -> Option<Position> {

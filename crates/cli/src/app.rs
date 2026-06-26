@@ -1265,6 +1265,7 @@ pub struct CanvasPopup {
     pub cursor: usize,
     pub preferred_col: Option<usize>,
     pub selection: Option<CanvasSelection>,
+    pub smart_clip: Option<CanvasSmartClipSearch>,
     pub revealed_at: Instant,
     pub hide_after: Instant,
     pub closing: bool,
@@ -1275,6 +1276,19 @@ pub struct CanvasSelection {
     pub anchor: usize,
     pub head: usize,
     pub dragged: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanvasSmartClipSearch {
+    pub trigger_start: usize,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasSmartClipCandidate {
+    pub clip: String,
+    pub label: String,
+    pub detail: String,
 }
 
 /// Live state of the `/remote-control` (or `/remote-control-debug`)
@@ -6731,6 +6745,7 @@ impl App {
         popup.cursor = canvas_cursor_at_modal_point(&popup.buffer, modal, col, row).unwrap_or(0);
         popup.preferred_col = None;
         popup.selection = None;
+        popup.smart_clip = None;
     }
 
     async fn handle_canvas_mouse(&mut self, ev: &MouseEvent) -> bool {
@@ -6762,6 +6777,7 @@ impl App {
                     head: cursor,
                     dragged: false,
                 });
+                popup.smart_clip = None;
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -6802,7 +6818,15 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            KeyCode::Esc if self.canvas_smart_clip_active() => self.cancel_canvas_smart_clip(),
             KeyCode::Esc => self.close_canvas_popup().await,
+            KeyCode::Enter if self.canvas_smart_clip_active() => self.accept_canvas_smart_clip(),
+            KeyCode::Up if self.canvas_smart_clip_active() => {
+                self.move_canvas_smart_clip_selection(-1)
+            }
+            KeyCode::Down if self.canvas_smart_clip_active() => {
+                self.move_canvas_smart_clip_selection(1)
+            }
             KeyCode::Char('s') if ctrl => {
                 self.save_canvas_popup().await;
             }
@@ -6813,6 +6837,7 @@ impl App {
                     popup.cursor = canvas_line_start(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
                     Self::update_canvas_selection_head(popup);
+                    Self::update_canvas_smart_clip_after_cursor_move(popup);
                 }
             }
             KeyCode::Char('e') if ctrl => {
@@ -6820,10 +6845,17 @@ impl App {
                     popup.cursor = canvas_line_end(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
                     Self::update_canvas_selection_head(popup);
+                    Self::update_canvas_smart_clip_after_cursor_move(popup);
                 }
             }
             KeyCode::Char('b') if ctrl => self.move_canvas_cursor(-1),
             KeyCode::Char('f') if ctrl => self.move_canvas_cursor(1),
+            KeyCode::Char('p') if ctrl && self.canvas_smart_clip_active() => {
+                self.move_canvas_smart_clip_selection(-1)
+            }
+            KeyCode::Char('n') if ctrl && self.canvas_smart_clip_active() => {
+                self.move_canvas_smart_clip_selection(1)
+            }
             KeyCode::Char('p') if ctrl => self.move_canvas_cursor_vertical(-1),
             KeyCode::Char('n') if ctrl => self.move_canvas_cursor_vertical(1),
             KeyCode::Char('v') if ctrl => self.paste_canvas_clipboard(),
@@ -6844,6 +6876,7 @@ impl App {
                     popup.cursor = canvas_line_start(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
                     Self::update_canvas_selection_head(popup);
+                    Self::update_canvas_smart_clip_after_cursor_move(popup);
                 }
             }
             KeyCode::End => {
@@ -6851,6 +6884,7 @@ impl App {
                     popup.cursor = canvas_line_end(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
                     Self::update_canvas_selection_head(popup);
+                    Self::update_canvas_smart_clip_after_cursor_move(popup);
                 }
             }
             KeyCode::Char(c) if !ctrl && !alt => self.insert_canvas_text(&c.to_string()),
@@ -6886,12 +6920,149 @@ impl App {
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
+        popup.smart_clip = None;
         popup.selection = Some(CanvasSelection {
             anchor: popup.cursor,
             head: popup.cursor,
             dragged: false,
         });
         self.set_status("canvas selection started".to_string());
+    }
+
+    fn canvas_smart_clip_active(&self) -> bool {
+        self.canvas_popup
+            .as_ref()
+            .and_then(|popup| popup.smart_clip.as_ref())
+            .is_some()
+    }
+
+    fn cancel_canvas_smart_clip(&mut self) {
+        if let Some(popup) = self.canvas_popup.as_mut() {
+            popup.smart_clip = None;
+        }
+    }
+
+    fn move_canvas_smart_clip_selection(&mut self, delta: isize) {
+        let candidate_count = self
+            .canvas_popup
+            .as_ref()
+            .map(|popup| self.canvas_smart_clip_candidates(popup).len())
+            .unwrap_or(0);
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        let Some(search) = popup.smart_clip.as_mut() else {
+            return;
+        };
+        if candidate_count == 0 {
+            search.selected = 0;
+            return;
+        }
+        let selected = search.selected.min(candidate_count - 1);
+        search.selected = if delta < 0 {
+            selected
+                .saturating_add(candidate_count)
+                .saturating_sub(delta.unsigned_abs() % candidate_count)
+                % candidate_count
+        } else {
+            (selected + delta as usize) % candidate_count
+        };
+    }
+
+    fn accept_canvas_smart_clip(&mut self) {
+        let (trigger_start, candidate) = {
+            let Some(popup) = self.canvas_popup.as_ref() else {
+                return;
+            };
+            let Some(search) = popup.smart_clip.as_ref() else {
+                return;
+            };
+            let candidates = self.canvas_smart_clip_candidates(popup);
+            let Some(candidate) = candidates
+                .get(search.selected.min(candidates.len().saturating_sub(1)))
+                .cloned()
+            else {
+                return;
+            };
+            (search.trigger_start, candidate)
+        };
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        if popup.cursor < trigger_start {
+            popup.smart_clip = None;
+            return;
+        }
+        let start_b = byte_pos(&popup.buffer, trigger_start);
+        let end_b = byte_pos(&popup.buffer, popup.cursor);
+        popup.buffer.replace_range(start_b..end_b, &candidate.clip);
+        popup.cursor = trigger_start + candidate.clip.chars().count();
+        popup.preferred_col = None;
+        popup.selection = None;
+        popup.smart_clip = None;
+    }
+
+    fn update_canvas_smart_clip_after_cursor_move(popup: &mut CanvasPopup) {
+        let Some(search) = popup.smart_clip.as_ref() else {
+            return;
+        };
+        if canvas_smart_clip_query(popup, search.trigger_start).is_none() {
+            popup.smart_clip = None;
+        }
+    }
+
+    pub(crate) fn canvas_smart_clip_candidates(
+        &self,
+        popup: &CanvasPopup,
+    ) -> Vec<CanvasSmartClipCandidate> {
+        let query = popup
+            .smart_clip
+            .as_ref()
+            .and_then(|search| canvas_smart_clip_query(popup, search.trigger_start))
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut out = Vec::new();
+        for session in self.sessions.iter().filter(|s| is_user_list_session(s)) {
+            let title = session
+                .title
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| short_id(&session.id).to_string());
+            let haystack = format!(
+                "{} {} {} {}",
+                title, session.id, session.harness, session.state.label()
+            )
+            .to_ascii_lowercase();
+            if query.is_empty() || haystack.contains(&query) {
+                out.push(CanvasSmartClipCandidate {
+                    clip: format!("@{{session:{}}}", session.id),
+                    label: title,
+                    detail: format!("session · {} · {}", session.harness, session.state.label()),
+                });
+            }
+        }
+        for harness in &self.harnesses {
+            let haystack = format!(
+                "{} {}",
+                harness.name,
+                harness.description.as_deref().unwrap_or_default()
+            )
+            .to_ascii_lowercase();
+            if query.is_empty() || haystack.contains(&query) {
+                let detail = if harness.available {
+                    "harness".to_string()
+                } else {
+                    "harness · unavailable".to_string()
+                };
+                out.push(CanvasSmartClipCandidate {
+                    clip: format!("@{{harness:{}}}", harness.name),
+                    label: harness.name.clone(),
+                    detail,
+                });
+            }
+        }
+        out.truncate(8);
+        out
     }
 
     fn update_canvas_selection_head(popup: &mut CanvasPopup) {
@@ -6924,6 +7095,7 @@ impl App {
         popup.cursor = start;
         popup.preferred_col = None;
         popup.selection = None;
+        popup.smart_clip = None;
         Some(deleted)
     }
 
@@ -6985,6 +7157,7 @@ impl App {
         popup.buffer.replace_range(start..end, "");
         popup.preferred_col = None;
         popup.selection = None;
+        popup.smart_clip = None;
         if !cut.is_empty() {
             self.copy_canvas_text(&cut, "cut");
         }
@@ -7002,11 +7175,24 @@ impl App {
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
+        let trigger_start = if text == "@" {
+            Some(popup.cursor)
+        } else {
+            None
+        };
         let pos = byte_pos(&popup.buffer, popup.cursor);
         popup.buffer.insert_str(pos, text);
         popup.cursor += text.chars().count();
         popup.preferred_col = None;
         popup.selection = None;
+        if let Some(trigger_start) = trigger_start {
+            popup.smart_clip = Some(CanvasSmartClipSearch {
+                trigger_start,
+                selected: 0,
+            });
+        } else if popup.smart_clip.is_some() {
+            Self::update_canvas_smart_clip_after_cursor_move(popup);
+        }
     }
 
     fn move_canvas_cursor(&mut self, delta: isize) {
@@ -7021,6 +7207,7 @@ impl App {
         }
         popup.preferred_col = None;
         Self::update_canvas_selection_head(popup);
+        Self::update_canvas_smart_clip_after_cursor_move(popup);
     }
 
     fn move_canvas_cursor_vertical(&mut self, delta: isize) {
@@ -7037,6 +7224,7 @@ impl App {
         popup.cursor = canvas_cursor_for_line_col(&popup.buffer, next_line, target_col);
         popup.preferred_col = Some(target_col);
         Self::update_canvas_selection_head(popup);
+        Self::update_canvas_smart_clip_after_cursor_move(popup);
     }
 
     fn delete_canvas_back(&mut self) {
@@ -7055,6 +7243,7 @@ impl App {
         popup.cursor -= 1;
         popup.preferred_col = None;
         popup.selection = None;
+        Self::update_canvas_smart_clip_after_cursor_move(popup);
     }
 
     fn delete_canvas_forward(&mut self) {
@@ -7072,6 +7261,7 @@ impl App {
         popup.buffer.replace_range(start..end, "");
         popup.preferred_col = None;
         popup.selection = None;
+        Self::update_canvas_smart_clip_after_cursor_move(popup);
     }
 
     async fn run_action(&mut self, action: KeyAction) {
@@ -9088,6 +9278,29 @@ fn canvas_cursor_at_modal_point(
     Some(canvas_cursor_for_line_col(buffer, target_line, target_col))
 }
 
+fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<String> {
+    if popup.cursor <= trigger_start {
+        return None;
+    }
+    let trigger = popup.buffer.chars().nth(trigger_start)?;
+    if trigger != '@' {
+        return None;
+    }
+    let mut query = String::new();
+    for ch in popup
+        .buffer
+        .chars()
+        .skip(trigger_start + 1)
+        .take(popup.cursor.saturating_sub(trigger_start + 1))
+    {
+        if ch.is_whitespace() || matches!(ch, '{' | '}' | '[' | ']' | '(' | ')' | ',' | ';') {
+            return None;
+        }
+        query.push(ch);
+    }
+    Some(query)
+}
+
 fn canvas_popup_from_document(
     canvas: agentd_protocol::CanvasDocument,
     now: Instant,
@@ -9100,6 +9313,7 @@ fn canvas_popup_from_document(
         cursor: 0,
         preferred_col: None,
         selection: None,
+        smart_clip: None,
         revealed_at: now,
         hide_after: now + Duration::from_secs(365 * 24 * 60 * 60),
         closing: false,
@@ -9600,6 +9814,7 @@ mod tests {
             cursor,
             preferred_col: None,
             selection: None,
+            smart_clip: None,
             revealed_at: now,
             hide_after: now + Duration::from_secs(60),
             closing: false,
@@ -9655,6 +9870,50 @@ mod tests {
         app.canvas_popups.insert("s3".into(), closing);
 
         assert_eq!(app.open_canvas_session_ids(), vec!["s1", "s2"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_at_trigger_filters_and_accepts_harness_smart_clip() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.harnesses = vec![agentd_protocol::HarnessInfo {
+            name: "codex".to_string(),
+            available: true,
+            binary: None,
+            description: Some("coding agent".to_string()),
+            capabilities: Default::default(),
+        }];
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+
+        app.insert_canvas_text("@");
+        assert!(app.canvas_popup.as_ref().unwrap().smart_clip.is_some());
+        app.insert_canvas_text("co");
+        let candidates = app.canvas_smart_clip_candidates(app.canvas_popup.as_ref().unwrap());
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].clip, "@{harness:codex}");
+
+        app.accept_canvas_smart_clip();
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "@{harness:codex}");
+        assert_eq!(popup.cursor, "@{harness:codex}".chars().count());
+        assert!(popup.smart_clip.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_smart_clip_search_cancels_on_separator() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+
+        app.insert_canvas_text("@");
+        app.insert_canvas_text("abc");
+        assert!(app.canvas_popup.as_ref().unwrap().smart_clip.is_some());
+        app.insert_canvas_text(" ");
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "@abc ");
+        assert!(popup.smart_clip.is_none());
         server.abort();
     }
 
