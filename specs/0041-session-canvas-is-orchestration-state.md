@@ -9,7 +9,7 @@ Scope: Per-session canvas documents used to orchestrate task execution.
 
 Every user-facing session may have one durable canvas: a Markdown document owned by that session and editable by both humans and the underlying agent. Canvas execution routes to the owning session as a submitted instruction turn to interpret the document or selected Markdown fragment as orchestration state. For PTY-backed interactive sessions, execution must submit the prompt to the PTY rather than merely staging text in the session editor.
 
-Smart clips are persisted as Markdown-native typed references, using inline `@{type:id}` references for compact clips and fenced `:::clip type ... :::` blocks for larger embeds. Renderers may present these references as rich chips or blocks, but the stored document remains plain Markdown.
+Smart clips are persisted as Markdown-native typed references, using inline `@{type:target clip_id=instance}` references for compact clips and fenced `:::clip type ... :::` blocks for larger embeds. The `target` identifies the referenced session, harness, or object; `clip_id` uniquely identifies that smart clip instance within the canvas document so repeated references to the same target remain distinguishable. Renderers may present these references as rich chips or blocks, but the stored document remains plain Markdown.
 
 Rich canvas editors should treat a typed `@` as an inline smart clip trigger. The trigger opens a cursor-anchored picker, filters as the user types, and inserts the selected Markdown-native typed reference without changing the surrounding prose.
 
@@ -48,17 +48,17 @@ The canvas is not a general-purpose task scheduler. Execution creates a request 
 ```md
 # Todo
 
-- resolve issue #132 @{harness:codex}
+- resolve issue #132 @{harness:codex clip_id=clip_1}
 
 # Progress
 
-- summarize results with @{harness:claude}
+- summarize results with @{harness:claude clip_id=clip_2}
 
 # Done
 ```
 
 ```md
-Current worker: @{session:s_123 label="issue #132"}
+Current worker: @{session:s_123 clip_id=clip_3 label="issue #132"}
 
 :::clip session-response
 session="s_123"

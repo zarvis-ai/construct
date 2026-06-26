@@ -1390,7 +1390,7 @@ impl SessionManager {
             anyhow::bail!("canvas is empty");
         }
         let prompt = format!(
-            "Execute the following construct canvas instructions. Treat the Markdown as orchestration state. Resolve smart clips written as @{{type:id}} references when possible, create subagent sessions for harness clips when appropriate, and update the canvas with construct_canvas_update when task state changes.\n\n```markdown\n{}\n```",
+            "Execute the following construct canvas instructions. Treat the Markdown as orchestration state. Resolve smart clips written as @{{type:id ...}} references when possible, create subagent sessions for harness clips when appropriate, and update the canvas with construct_canvas_update when task state changes.\n\n```markdown\n{}\n```",
             body
         );
         let delivery = {

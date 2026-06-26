@@ -6665,12 +6665,13 @@ impl App {
         &self,
         popup: &CanvasPopup,
     ) -> Result<Option<agentd_protocol::CanvasDocument>> {
-        if popup.buffer == popup.saved_markdown {
+        let markdown = canvas_normalize_smart_clip_instance_ids(&popup.buffer);
+        if markdown == popup.saved_markdown {
             return Ok(None);
         }
         let params = agentd_protocol::CanvasUpdateParams {
             session_id: popup.canvas.session_id.clone(),
-            markdown: popup.buffer.clone(),
+            markdown,
             base_version: Some(popup.canvas.version),
             actor: agentd_protocol::CanvasUpdateActor::Human,
             template_id: popup.canvas.template_id.clone(),
@@ -6758,7 +6759,9 @@ impl App {
         let dirty = self
             .canvas_popup
             .as_ref()
-            .is_some_and(|popup| popup.buffer != popup.saved_markdown);
+            .is_some_and(|popup| {
+                canvas_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
+            });
         if dirty && !self.save_canvas_popup().await {
             return false;
         }
@@ -6767,6 +6770,9 @@ impl App {
             .canvas_popup
             .as_ref()
             .map(|popup| popup.canvas.version);
+        let selection = selection.map(|selection| {
+            canvas_normalize_smart_clip_instance_ids(&selection)
+        });
         let is_selection = selection.is_some();
         let params = agentd_protocol::CanvasExecuteParams {
             session_id,
@@ -7072,10 +7078,11 @@ impl App {
             popup.smart_clip = None;
             return;
         }
+        let clip = canvas_smart_clip_with_instance_id(&candidate.clip, &popup.buffer);
         let start_b = byte_pos(&popup.buffer, trigger_start);
         let end_b = byte_pos(&popup.buffer, popup.cursor);
-        popup.buffer.replace_range(start_b..end_b, &candidate.clip);
-        popup.cursor = trigger_start + candidate.clip.chars().count();
+        popup.buffer.replace_range(start_b..end_b, &clip);
+        popup.cursor = trigger_start + clip.chars().count();
         popup.preferred_col = None;
         popup.selection = None;
         popup.smart_clip = None;
@@ -9407,6 +9414,101 @@ fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<
     Some(query)
 }
 
+fn canvas_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
+    if canvas_smart_clip_instance_id(clip).is_some() {
+        return clip.to_string();
+    }
+    let Some(body) = clip.strip_prefix("@{").and_then(|s| s.strip_suffix('}')) else {
+        return clip.to_string();
+    };
+    format!("@{{{} clip_id={}}}", body, canvas_next_smart_clip_id(buffer))
+}
+
+fn canvas_normalize_smart_clip_instance_ids(markdown: &str) -> String {
+    let ranges = canvas_smart_clip_ranges(markdown);
+    if ranges.is_empty() {
+        return markdown.to_string();
+    }
+
+    let mut max = 0usize;
+    for range in &ranges {
+        let start_b = byte_pos(markdown, range.start + 2);
+        let end_b = byte_pos(markdown, range.end.saturating_sub(1));
+        if let Some(id) = canvas_smart_clip_instance_id(&markdown[start_b..end_b]) {
+            if let Some(num) = id.strip_prefix("clip_").and_then(|s| s.parse::<usize>().ok()) {
+                max = max.max(num);
+            }
+        }
+    }
+
+    let mut used = HashSet::new();
+    let mut next = max + 1;
+    let mut normalized = String::with_capacity(markdown.len());
+    let mut last_b = 0usize;
+    for range in ranges {
+        let clip_start_b = byte_pos(markdown, range.start);
+        let body_start_b = byte_pos(markdown, range.start + 2);
+        let body_end_b = byte_pos(markdown, range.end.saturating_sub(1));
+        let clip_end_b = byte_pos(markdown, range.end);
+        normalized.push_str(&markdown[last_b..clip_start_b]);
+
+        let body = &markdown[body_start_b..body_end_b];
+        let existing = canvas_smart_clip_instance_id(body).map(str::to_string);
+        if existing.as_ref().is_some_and(|id| used.insert(id.clone())) {
+            normalized.push_str(&markdown[clip_start_b..clip_end_b]);
+        } else {
+            let id = loop {
+                let candidate = format!("clip_{next}");
+                next += 1;
+                if used.insert(candidate.clone()) {
+                    break candidate;
+                }
+            };
+            let body_without_id = canvas_smart_clip_body_without_instance_id(body);
+            normalized.push_str("@{");
+            normalized.push_str(&body_without_id);
+            if !body_without_id.is_empty() {
+                normalized.push(' ');
+            }
+            normalized.push_str("clip_id=");
+            normalized.push_str(&id);
+            normalized.push('}');
+        }
+        last_b = clip_end_b;
+    }
+    normalized.push_str(&markdown[last_b..]);
+    normalized
+}
+
+fn canvas_next_smart_clip_id(buffer: &str) -> String {
+    let mut max = 0usize;
+    for range in canvas_smart_clip_ranges(buffer) {
+        let start_b = byte_pos(buffer, range.start + 2);
+        let end_b = byte_pos(buffer, range.end.saturating_sub(1));
+        if let Some(id) = canvas_smart_clip_instance_id(&buffer[start_b..end_b]) {
+            if let Some(num) = id.strip_prefix("clip_").and_then(|s| s.parse::<usize>().ok()) {
+                max = max.max(num);
+            }
+        }
+    }
+    format!("clip_{}", max + 1)
+}
+
+fn canvas_smart_clip_instance_id(raw_clip: &str) -> Option<&str> {
+    raw_clip.split_whitespace().find_map(|part| {
+        part.strip_prefix("clip_id=")
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn canvas_smart_clip_body_without_instance_id(raw_clip: &str) -> String {
+    raw_clip
+        .split_whitespace()
+        .filter(|part| !part.starts_with("clip_id="))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CanvasSmartClipRange {
     start: usize,
@@ -10219,9 +10321,40 @@ mod tests {
         app.accept_canvas_smart_clip();
 
         let popup = app.canvas_popup.as_ref().unwrap();
-        assert_eq!(popup.buffer, "@{harness:codex}");
-        assert_eq!(popup.cursor, "@{harness:codex}".chars().count());
+        assert_eq!(popup.buffer, "@{harness:codex clip_id=clip_1}");
+        assert_eq!(
+            popup.cursor,
+            "@{harness:codex clip_id=clip_1}".chars().count()
+        );
         assert!(popup.smart_clip.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn accepted_canvas_smart_clips_get_unique_instance_ids() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.harnesses = vec![agentd_protocol::HarnessInfo {
+            name: "codex".to_string(),
+            available: true,
+            binary: None,
+            description: Some("coding agent".to_string()),
+            capabilities: Default::default(),
+        }];
+        app.canvas_popup = Some(canvas_popup_for_test(
+            "s1",
+            "@{harness:codex clip_id=clip_1} ",
+            "@{harness:codex clip_id=clip_1} ".chars().count(),
+        ));
+
+        app.insert_canvas_text("@");
+        app.insert_canvas_text("co");
+        app.accept_canvas_smart_clip();
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.buffer,
+            "@{harness:codex clip_id=clip_1} @{harness:codex clip_id=clip_2}"
+        );
         server.abort();
     }
 
@@ -10299,6 +10432,18 @@ mod tests {
             before.chars().count() + clip.chars().count()
         );
         server.abort();
+    }
+
+    #[test]
+    fn canvas_normalizes_missing_and_duplicate_smart_clip_instance_ids() {
+        let normalized = canvas_normalize_smart_clip_instance_ids(
+            "a @{harness:codex} b @{harness:claude clip_id=clip_7} c @{harness:codex clip_id=clip_7}",
+        );
+
+        assert_eq!(
+            normalized,
+            "a @{harness:codex clip_id=clip_8} b @{harness:claude clip_id=clip_7} c @{harness:codex clip_id=clip_9}"
+        );
     }
 
     #[tokio::test]
