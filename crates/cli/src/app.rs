@@ -1587,6 +1587,10 @@ pub struct LayoutSnapshot {
     pub canvas_title_run_hit: Option<(u16, u16, u16)>,
     /// Canvas title-bar mode toggle bounds: `(x_start, x_end, y)`.
     pub canvas_title_toggle_hit: Option<(u16, u16, u16)>,
+    /// Canvas title-bar close button bounds: `(x_start, x_end, y)`.
+    pub canvas_title_close_hit: Option<(u16, u16, u16)>,
+    /// Canvas title-bar session-widget indicator hitboxes from the last frame.
+    pub canvas_title_widget_hits: Vec<DynamicUiWidgetHit>,
     /// Canvas selected-text context Run button bounds: `(x_start, x_end, y)`.
     pub canvas_selection_run_hit: Option<(u16, u16, u16)>,
     /// Bounds of the browser preview overlay rendered in the terminal view.
@@ -5156,22 +5160,7 @@ impl App {
             .find(|hit| hit.contains(col, row))
             .cloned()
         {
-            let key = (hit.session_id, hit.panel_id);
-            if self.dynamic_ui_selected.contains(&key) {
-                self.dynamic_ui_selected.remove(&key);
-            } else {
-                self.dynamic_ui_selected.insert(key.clone());
-                self.dynamic_ui_temporary_until.remove(&key);
-            }
-            // The click outcome is authoritative; drop any hover preview of this
-            // widget so the rendered state reflects the pin toggle immediately.
-            if self
-                .dynamic_ui_hover
-                .as_ref()
-                .is_some_and(|h| h.session_id == key.0 && h.panel_id == key.1)
-            {
-                self.dynamic_ui_hover = None;
-            }
+            self.toggle_dynamic_ui_widget_pin(hit.session_id, hit.panel_id);
             return true;
         }
         for (x_start, x_end, y, session_id) in self.layout.dynamic_ui_triggers.clone() {
@@ -6496,6 +6485,27 @@ impl App {
             .is_some_and(|until| *until > Instant::now())
     }
 
+    /// Toggle a widget's pinned/selected state from a title-bar indicator
+    /// click. Shared by the session pane title bar and the canvas title bar.
+    pub fn toggle_dynamic_ui_widget_pin(&mut self, session_id: String, panel_id: String) {
+        let key = (session_id, panel_id);
+        if self.dynamic_ui_selected.contains(&key) {
+            self.dynamic_ui_selected.remove(&key);
+        } else {
+            self.dynamic_ui_selected.insert(key.clone());
+            self.dynamic_ui_temporary_until.remove(&key);
+        }
+        // The click outcome is authoritative; drop any hover preview of this
+        // widget so the rendered state reflects the pin toggle immediately.
+        if self
+            .dynamic_ui_hover
+            .as_ref()
+            .is_some_and(|h| h.session_id == key.0 && h.panel_id == key.1)
+        {
+            self.dynamic_ui_hover = None;
+        }
+    }
+
     /// Returns true if the widget body should be rendered (pinned OR hover preview).
     pub fn dynamic_ui_panel_visible(&self, session_id: &str, panel_id: &str) -> bool {
         if self.dynamic_ui_panel_pinned(session_id, panel_id) {
@@ -6928,16 +6938,21 @@ impl App {
         }
         let title_run_hit = self.layout.canvas_title_run_hit;
         let title_toggle_hit = self.layout.canvas_title_toggle_hit;
+        let title_close_hit = self.layout.canvas_title_close_hit;
         let selection_run_hit = self.layout.canvas_selection_run_hit;
         let hit_title_toggle = title_toggle_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_title_run = title_run_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
+        let hit_title_close = title_close_hit
+            .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_selection_run = selection_run_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
-        if hit_title_toggle || hit_title_run || hit_selection_run {
+        if hit_title_toggle || hit_title_run || hit_title_close || hit_selection_run {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                if hit_title_toggle {
+                // The close button and the mode toggle both dismiss the canvas
+                // (same path as `C-x Space` / the existing toggle).
+                if hit_title_toggle || hit_title_close {
                     self.close_canvas_popup().await;
                 } else {
                     let selection = hit_selection_run
@@ -6949,6 +6964,20 @@ impl App {
                         .flatten();
                     self.execute_canvas_popup(selection).await;
                 }
+            }
+            return true;
+        }
+        // Clicking a title-bar widget indicator pins/unpins that widget,
+        // mirroring the same affordance in the session pane title bar.
+        if let Some(hit) = self
+            .layout
+            .canvas_title_widget_hits
+            .iter()
+            .find(|hit| hit.contains(ev.column, ev.row))
+            .cloned()
+        {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.toggle_dynamic_ui_widget_pin(hit.session_id, hit.panel_id);
             }
             return true;
         }
@@ -10011,6 +10040,8 @@ mod tests {
             modal_area: None,
             canvas_title_run_hit: None,
             canvas_title_toggle_hit: None,
+            canvas_title_close_hit: None,
+            canvas_title_widget_hits: Vec::new(),
             canvas_selection_run_hit: None,
             browser_preview_area: None,
             browser_preview_close: None,
@@ -10335,6 +10366,142 @@ mod tests {
         assert!(app.layout.canvas_title_run_hit.is_some());
         assert!(app.layout.canvas_title_toggle_hit.is_some());
         assert!(app.layout.canvas_selection_run_hit.is_some());
+        server.abort();
+    }
+
+    /// Seed `app` with one selected session that owns a single sticky widget,
+    /// plus a fully-revealed canvas popup over it. Returns the keep-alive dir
+    /// and mock-daemon handle.
+    async fn canvas_with_widget_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+        use agentd_protocol::{UiPanel, UiPlacement};
+        let (mut app, dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.ui_panels.insert(
+            "s1".into(),
+            HashMap::from([(
+                "w1".into(),
+                UiPanel {
+                    id: "w1".into(),
+                    source: Some("w1.md".into()),
+                    title: Some("W1".into()),
+                    created_at_ms: 10,
+                    placement: UiPlacement::Sticky,
+                    markdown: "# W1".into(),
+                },
+            )]),
+        );
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
+        app.canvas_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        (app, dir, server)
+    }
+
+    #[tokio::test]
+    async fn canvas_title_renders_close_button_and_widget_icons() {
+        let (mut app, _dir, server) = canvas_with_widget_app().await;
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+        let buf = term.backend().buffer();
+
+        // Close button registered, and its `x` glyph paints inside its range.
+        let close = app
+            .layout
+            .canvas_title_close_hit
+            .expect("close hit registered");
+        let close_text: String = (close.0..close.1)
+            .filter_map(|x| buf.cell((x, close.2)).map(|c| c.symbol().to_string()))
+            .collect();
+        assert!(
+            close_text.contains('x'),
+            "close button glyph should paint within its hit range: {close_text:?}"
+        );
+
+        // The single sticky widget renders one indicator, and a rectangle
+        // glyph paints exactly at the registered hit cell.
+        assert_eq!(
+            app.layout.canvas_title_widget_hits.len(),
+            1,
+            "one title-bar indicator per sticky widget"
+        );
+        let w = &app.layout.canvas_title_widget_hits[0];
+        assert_eq!(w.panel_id, "w1");
+        let glyph = buf
+            .cell((w.start_col, w.row))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert!(
+            glyph == "□" || glyph == "■",
+            "widget icon glyph should paint at its hit cell: {glyph:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_title_close_button_click_dismisses_canvas() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = canvas_with_widget_app().await;
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+        let close = app
+            .layout
+            .canvas_title_close_hit
+            .expect("close hit registered");
+
+        // Clicking the close button starts the canvas dismissal animation,
+        // exactly like the mode toggle / `C-x Space`.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: close.0 + 1,
+            row: close.2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert!(
+            app.canvas_popup.as_ref().is_some_and(|p| p.closing),
+            "clicking the close button should begin dismissing the canvas"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_title_widget_icon_click_toggles_pin() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = canvas_with_widget_app().await;
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+        let hit = app
+            .layout
+            .canvas_title_widget_hits
+            .first()
+            .cloned()
+            .expect("widget hit registered");
+        assert!(!app.dynamic_ui_panel_pinned("s1", "w1"));
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.start_col,
+            row: hit.row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert!(
+            app.dynamic_ui_panel_pinned("s1", "w1"),
+            "clicking the title-bar widget indicator should pin the widget"
+        );
         server.abort();
     }
 
