@@ -5746,7 +5746,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             "zoomed: view — ",
             vec![
                 ("C-x x operator", KeyAction::OpenCommandPalette),
-                ("C-x e canvas", KeyAction::OpenCanvas),
+                ("C-x Space canvas", KeyAction::OpenCanvas),
                 ("C-x z unzoom", KeyAction::ToggleZoom),
                 ("C-x o list", KeyAction::SwitchFocus),
             ],
@@ -5755,7 +5755,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             "zoomed: list — ",
             vec![
                 ("C-x x operator", KeyAction::OpenCommandPalette),
-                ("C-x e canvas", KeyAction::OpenCanvas),
+                ("C-x Space canvas", KeyAction::OpenCanvas),
                 ("C-x z unzoom", KeyAction::ToggleZoom),
                 ("C-x o view", KeyAction::SwitchFocus),
             ],
@@ -5764,7 +5764,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             "",
             vec![
                 ("C-x x operator", KeyAction::OpenCommandPalette),
-                ("C-x e canvas", KeyAction::OpenCanvas),
+                ("C-x Space canvas", KeyAction::OpenCanvas),
                 ("C-x z zoom", KeyAction::ToggleZoom),
             ],
         ),
@@ -5890,7 +5890,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x b           switch focused window to an existing session
     C-x i           send input to selected session
     C-x k           delete selected session (confirms; kills if running)
-    C-x e           open selected session's canvas
+    C-x Space       open selected session's canvas
     C-x d           show diff
     C-x r           rename selected session (clears title on empty submit)
     C-x f           fork selected session into a new harness (seeded w/ history)
