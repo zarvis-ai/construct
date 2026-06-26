@@ -7166,8 +7166,9 @@ fn render_canvas_popup_at(
     } else {
         " · modified"
     };
+    let focus_label = if active { "focused" } else { "open" };
     let title = format!(
-        " canvas — {} · v{}{}{} — C-s save · Esc close ",
+        " canvas {focus_label} — {} · v{}{}{} — C-s save · Esc close ",
         short_id(&popup.canvas.session_id),
         popup.canvas.version,
         template,
@@ -7175,12 +7176,10 @@ fn render_canvas_popup_at(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.border_focused))
+        .border_style(canvas_border_style(&app.theme, active))
         .title(Line::from(Span::styled(
             title,
-            Style::default()
-                .fg(app.theme.accent_alt)
-                .add_modifier(Modifier::BOLD),
+            canvas_title_style(&app.theme, active),
         )));
     let inner = block.inner(rect).inner(Margin {
         horizontal: CANVAS_CONTENT_PADDING_X,
@@ -7204,6 +7203,26 @@ fn render_canvas_popup_at(
         if let Some(pos) = canvas_cursor_position(&popup.buffer, popup.cursor, inner) {
             render_editor_cursor(f, pos, &app.theme);
         }
+    }
+}
+
+fn canvas_border_style(theme: &Theme, active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(theme.accent_alt)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.border)
+    }
+}
+
+fn canvas_title_style(theme: &Theme, active: bool) -> Style {
+    if active {
+        Style::default()
+            .fg(theme.accent_alt)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
     }
 }
 
@@ -7760,6 +7779,18 @@ mod tests {
                 None
             )),
             "## Progress"
+        );
+    }
+
+    #[test]
+    fn canvas_focus_styles_are_distinct_from_session_focus() {
+        let theme = Theme::default();
+        assert_eq!(pane_border_style(&theme, true).fg, Some(theme.border_focused));
+        assert_eq!(canvas_border_style(&theme, true).fg, Some(theme.accent_alt));
+        assert_eq!(canvas_border_style(&theme, false).fg, Some(theme.border));
+        assert_ne!(
+            canvas_border_style(&theme, true).fg,
+            pane_border_style(&theme, true).fg
         );
     }
 
