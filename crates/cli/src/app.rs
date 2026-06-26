@@ -2744,6 +2744,11 @@ impl App {
         } else {
             ViewMode::Chat
         };
+        // The canvas is a per-session surface: keep it attached to whatever
+        // session is now selected. The outgoing session's canvas is stashed
+        // and the incoming one revealed (if it has a canvas open). Navigation
+        // never *closes* a canvas — only its title-glyph toggle / C-x Space do.
+        self.sync_canvas_popup_with_selection();
     }
 
     /// Tell the daemon which surface we're showing the focused session through
@@ -3580,6 +3585,10 @@ impl App {
                     ViewMode::Chat
                 };
             }
+            // Keep the canvas attached to the focused pane's session (stash
+            // the outgoing one, reveal the incoming). A no-op when the
+            // selection didn't actually change.
+            self.sync_canvas_popup_with_selection();
         }
     }
 
@@ -5213,30 +5222,24 @@ impl App {
             return;
         }
         if let Some(modal) = self.layout.modal_area {
-            if !contains(modal, col, row) {
-                if self.canvas_popup.is_some() {
-                    if self
-                        .layout
-                        .main_window_areas
-                        .iter()
-                        .any(|hit| hit.id != self.active_window_id && contains(hit.area, col, row))
-                    {
-                        self.stash_active_canvas_popup();
-                    } else {
-                        self.close_canvas_popup().await;
-                        return;
-                    }
-                } else {
-                    self.dismiss_modal();
+            if self.canvas_popup.is_some() {
+                if contains(modal, col, row) {
+                    self.place_canvas_cursor(modal, col, row);
                     return;
                 }
-            } else if self.canvas_popup.is_some() {
-                self.place_canvas_cursor(modal, col, row);
+                // A click outside the canvas never closes it. The canvas is a
+                // per-session surface dismissed only via its title-glyph
+                // toggle or C-x Space. Fall through so the click still selects
+                // a session / focuses a pane; the canvas then follows the new
+                // selection (the prior canvas is stashed, not destroyed) via
+                // sync_canvas_popup_with_selection.
+            } else if !contains(modal, col, row) {
+                self.dismiss_modal();
                 return;
             } else {
-                // The current modals are informational/read-only. Clicks
-                // inside them are consumed so they don't focus or activate
-                // controls in panes underneath the modal.
+                // Other modals are informational/read-only. Clicks inside
+                // them are consumed so they don't focus or activate controls
+                // in panes underneath the modal.
                 return;
             }
         }
@@ -7005,7 +7008,11 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc if self.canvas_smart_clip_active() => self.cancel_canvas_smart_clip(),
-            KeyCode::Esc => self.close_canvas_popup().await,
+            // Esc only cancels the transient smart-clip picker (above); it is
+            // intentionally NOT a canvas-hide affordance. Show/hide is C-x
+            // Space (and the title-glyph toggle) only, so a reflexive Esc
+            // while editing canvas prose doesn't blow away the surface.
+            KeyCode::Esc => {}
             KeyCode::Enter if self.canvas_smart_clip_active() => self.accept_canvas_smart_clip(),
             KeyCode::Up if self.canvas_smart_clip_active() => {
                 self.move_canvas_smart_clip_selection(-1)
@@ -10244,6 +10251,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canvas_esc_does_not_close_popup() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        // Esc is not a canvas-hide affordance — the surface stays open and
+        // its buffer is untouched. Show/hide is C-x Space only.
+        assert!(app.canvas_popup.is_some());
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_esc_still_cancels_smart_clip_picker() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        // Type the smart-clip trigger so the inline picker is active.
+        app.insert_canvas_text("@");
+        assert!(
+            app.canvas_smart_clip_active(),
+            "typing @ should open the smart-clip picker"
+        );
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        // Esc dismisses just the picker; the canvas surface remains open.
+        assert!(!app.canvas_smart_clip_active(), "Esc should cancel the picker");
+        assert!(app.canvas_popup.is_some(), "Esc must not close the canvas");
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn canvas_ctrl_s_is_not_a_save_shortcut() {
         let (mut app, _dir, server) = empty_app().await;
         app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
@@ -11087,6 +11129,70 @@ mod tests {
             app.selection_for_window(1),
             Some(Selection::Session("s1".into()))
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_stays_open_when_clicking_selected_session_in_list() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s1.position = 0;
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        s2.position = 1;
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.layout = test_layout();
+        app.layout.list_row_count = app.list_items().len();
+        app.layout.list_items_area = Some(Rect::new(1, 1, 18, 8));
+        // The canvas modal sits over the view pane; the click lands in the list.
+        app.layout.modal_area = Some(Rect::new(20, 0, 40, 20));
+
+        // Click the already-selected session's row in the list.
+        app.handle_left_click(10, 1).await;
+
+        // A list click neither closes nor hides the canvas of the selected
+        // session — only the title-glyph toggle / C-x Space do.
+        let popup = app
+            .canvas_popup
+            .as_ref()
+            .expect("canvas stays open after a list click");
+        assert!(!popup.closing, "list click must not start closing the canvas");
+        assert_eq!(popup.buffer, "draft");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clicking_another_session_in_list_stashes_canvas_not_closes() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s1.position = 0;
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        s2.position = 1;
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.layout = test_layout();
+        app.layout.list_row_count = app.list_items().len();
+        app.layout.list_items_area = Some(Rect::new(1, 1, 18, 8));
+        app.layout.modal_area = Some(Rect::new(20, 0, 40, 20));
+
+        // Click a *different* session's row in the list.
+        app.handle_left_click(10, 2).await;
+
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        // The prior session's canvas is preserved (stashed), not destroyed —
+        // it reappears on return. A list click is never a close gesture.
+        let stashed = app
+            .canvas_popups
+            .get("s1")
+            .expect("the prior session's canvas is stashed, not closed");
+        assert!(!stashed.closing, "a list click must never close the canvas");
+        assert_eq!(stashed.buffer, "draft");
         server.abort();
     }
 

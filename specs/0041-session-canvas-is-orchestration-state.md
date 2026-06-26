@@ -41,6 +41,8 @@ Template selection copies Markdown into the session canvas. Templates are not li
 
 Terminal shortcuts must avoid bindings that are easy to confuse with quit or interrupt chords.
 
+Closing the canvas is reserved to the same affordance that opens it: the canvas command / C-x Space and the title-glyph toggle. No incidental gesture closes it. In particular, Esc is not a canvas-hide affordance (it only cancels transient in-canvas pickers such as the smart-clip picker), and clicking outside the canvas — including in the session list — never closes it. Because the canvas is per-session, selecting another session (by list click, pane focus, or keyboard navigation) makes the visible canvas follow the new selection: the outgoing session's canvas is stashed and preserved, the incoming session's canvas is revealed if it has one open. A stashed canvas is restored on return and only ever discarded by the explicit close affordance, so a reflexive click or keystroke can never destroy canvas content or lose unsaved edits.
+
 ## Non-Goals
 
 The canvas is not a general-purpose task scheduler. Execution creates a request for the owning session to act; subagents, moves between sections, and progress annotations are agent behavior layered on top of the document.
