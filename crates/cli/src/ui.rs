@@ -31,6 +31,8 @@ const MATRIX_WALLPAPER_DIM: f32 = 0.22;
 const PREVIEW_REVEAL_SECS: f32 = 1.0;
 const CANVAS_REVEAL_SECS: f32 = CANVAS_REVEAL_MS as f32 / 1000.0;
 const CANVAS_RUN_BUTTON: &str = " ▶ ";
+const CANVAS_CLIP_HOVER_PREVIEW_ROWS: u16 = 4;
+const CANVAS_CLIP_HOVER_PREVIEW_LABEL: &str = " session output ";
 const CANVAS_SELECTION_RUN_MENU_W: u16 = 9;
 const CANVAS_SELECTION_RUN_MENU_H: u16 = 3;
 
@@ -7482,7 +7484,7 @@ fn render_canvas_popup_at(
 /// resolves the hovered session, and paints a compact card (glyph + name,
 /// harness · model, status, last prompt) anchored to the hovered chip. Clears
 /// its own area, so it overlays the canvas body without disturbing it.
-fn render_canvas_clip_hover(f: &mut Frame, app: &App, modal: Rect) {
+fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
@@ -7532,6 +7534,29 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &App, modal: Rect) {
         )));
     }
 
+    let mut preview_output = if let Some(history) = app.histories.get_mut(&s.id) {
+        Some(
+            history.replay(
+                modal.width.saturating_sub(2).max(1),
+                CANVAS_CLIP_HOVER_PREVIEW_ROWS,
+                0,
+            ),
+        )
+    } else {
+        None
+    };
+    let has_preview = match preview_output {
+        Some(ref out) => non_empty_row_span(out.screen) > 0,
+        None => false,
+    };
+    if has_preview {
+        lines.push(Line::from(Span::styled(
+            CANVAS_CLIP_HOVER_PREVIEW_LABEL,
+            Style::default().fg(app.theme.text).add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::from(""));
+    }
+
     // Size the card around its content, bounded by the canvas modal.
     let max_w = modal.width.saturating_sub(2).clamp(1, 48);
     let content_w = lines
@@ -7545,7 +7570,13 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &App, modal: Rect) {
         .max()
         .unwrap_or(0);
     let width = content_w.saturating_add(2).clamp(3, max_w);
-    let height = (lines.len() as u16).saturating_add(2);
+    let height = (lines.len() as u16)
+        .saturating_add(2)
+        .saturating_add(if has_preview {
+            CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1)
+        } else {
+            0
+        });
     if modal.height < height || modal.width < width {
         return;
     }
@@ -7590,7 +7621,48 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &App, modal: Rect) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    let text_area = Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: if has_preview {
+            inner
+                .height
+                .saturating_sub(CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1))
+        } else {
+            inner.height
+        },
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);
+    if has_preview {
+        let out = preview_output.take().expect("preview output while rendering");
+        let preview_area = Rect {
+            x: inner.x,
+            y: text_area.y.saturating_add(text_area.height),
+            width: inner.width,
+            height: CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1),
+        };
+        f.render_widget(
+            Paragraph::new("─".repeat(preview_area.width as usize)),
+            Rect {
+                x: inner.x,
+                y: preview_area.y,
+                width: inner.width,
+                height: 1,
+            },
+        );
+        render_pty_tail(
+            f,
+            Rect {
+                x: inner.x,
+                y: preview_area.y.saturating_add(1),
+                width: inner.width,
+                height: preview_area.height.saturating_sub(1),
+            },
+            out.screen,
+            &app.theme,
+        );
+    }
 }
 
 /// Paint a slim vertical scroll thumb on the canvas popup's right border when
@@ -7777,7 +7849,12 @@ fn canvas_title_line<'a>(
     // Run button sits in the left cluster, between the session name and the
     // dirty marker (rendered only when it actually fits the pane).
     if left.run.is_some() {
-        spans.push(Span::styled(CANVAS_RUN_BUTTON, run_style));
+        let run_button = if run_started.is_some() {
+            format!(" {} ", app.spinner_frame())
+        } else {
+            CANVAS_RUN_BUTTON.to_string()
+        };
+        spans.push(Span::styled(run_button, run_style));
     } else {
         spans.push(Span::styled(" ", border_style));
     }

@@ -11631,6 +11631,85 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn canvas_run_button_spins_while_running() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta", 0));
+        {
+            let popup = app.canvas_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        }
+
+        app.start_canvas_run("s1", "alpha beta", false, "");
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+        let run = app
+            .layout
+            .canvas_title_run_hit
+            .expect("run hit registered");
+        let run_glyph = term
+            .backend()
+            .buffer()
+            .cell((run.0.saturating_add(1), run.2))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert_eq!(run_glyph, app.spinner_frame().to_string());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_session_hover_card_shows_session_output() {
+        use crate::pty_render::ItemHistory;
+
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s2.id = "s2".into();
+        s2.title = Some("Worker".into());
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "talk @{session:s2}", 0));
+        app.canvas_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+
+        let mut history = ItemHistory::new();
+        history.feed_pty(b"SESS_PREVIEW_MARKER\nsecond line");
+        app.histories.insert("s2".into(), history);
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+        let hit = app
+            .layout
+            .canvas_clip_hits
+            .first()
+            .cloned()
+            .expect("clip hit for s2");
+        app.mouse_pos = Some((hit.col_start, hit.row));
+
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas hover card should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("session output"),
+            "preview card should include hover label"
+        );
+        assert!(
+            text.contains("SESS_PREVIEW_"),
+            "session output preview should include session marker"
+        );
+        server.abort();
+    }
+
     /// Seed `app` with one selected session that owns a single sticky widget,
     /// plus a fully-revealed canvas popup over it. Returns the keep-alive dir
     /// and mock-daemon handle.
