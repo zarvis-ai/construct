@@ -561,6 +561,24 @@ impl MatrixRevealHit {
     }
 }
 
+/// On-screen cell range of a session smart-clip (`@{session:id}`) rendered in
+/// the canvas body, captured each frame so a hover/click can map a cell back to
+/// its session id. A clip that word-wraps across rows contributes one hit per
+/// row segment. `col_end` is exclusive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasClipHit {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub row: u16,
+    pub session_id: String,
+}
+
+impl CanvasClipHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.col_start && col < self.col_end
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MatrixWidgetHitKind {
     Select { panel_id: String },
@@ -1639,6 +1657,9 @@ pub struct LayoutSnapshot {
     /// Cursor-move handlers and the mouse wheel read its width/height to keep
     /// the caret on-screen and to bound scrolling; `None` when no canvas is open.
     pub canvas_inner_area: Option<ratatui::layout::Rect>,
+    /// Session smart-clip hitboxes in the active canvas body from the last
+    /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
+    pub canvas_clip_hits: Vec<CanvasClipHit>,
     /// Bounds of the browser preview overlay rendered in the terminal view.
     pub browser_preview_area: Option<ratatui::layout::Rect>,
     /// Top-right close button bounds for the browser preview overlay: `(x_start, x_end, y)`.
@@ -6927,6 +6948,17 @@ impl App {
         ids
     }
 
+    /// The session id of the canvas smart-clip occupying the cell at
+    /// `(col, row)`, if any. Reads the hitboxes captured during the last canvas
+    /// render; used for clip click-to-focus and hover-preview.
+    pub fn canvas_clip_session_at(&self, col: u16, row: u16) -> Option<String> {
+        self.layout
+            .canvas_clip_hits
+            .iter()
+            .find(|hit| hit.contains(col, row))
+            .map(|hit| hit.session_id.clone())
+    }
+
     pub fn sync_canvas_popup_with_selection(&mut self) {
         let selected_id = self.selection.session_id().map(str::to_string);
         let active_id = self
@@ -7231,6 +7263,18 @@ impl App {
                 self.toggle_dynamic_ui_widget_pin(hit.session_id, hit.panel_id);
             }
             return true;
+        }
+        // Clicking a session smart-clip focuses that session, just like clicking
+        // its row in the session list. The canvas follows selection, so the
+        // clicked session's canvas reveals in place.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(session_id) = self.canvas_clip_session_at(ev.column, ev.row) {
+                if self.sessions.iter().any(|s| s.id == session_id) {
+                    self.focus = PaneFocus::List;
+                    self.select_session(session_id);
+                }
+                return true;
+            }
         }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -10547,6 +10591,7 @@ mod tests {
             canvas_title_widget_hits: Vec::new(),
             canvas_selection_run_hit: None,
             canvas_inner_area: None,
+            canvas_clip_hits: Vec::new(),
             browser_preview_area: None,
             browser_preview_close: None,
             terminal_scrollbar: None,
@@ -10765,6 +10810,35 @@ mod tests {
         app.canvas_popup.as_mut().unwrap().cursor = 0;
         app.follow_canvas_scroll();
         assert_eq!(app.canvas_popup.as_ref().unwrap().scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn canvas_clip_click_resolves_and_focuses_session() {
+        let (mut app, _dir, _server) = empty_app().await;
+        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+
+        // Pretend the last canvas render captured a clip for s2 at row 3, cols 4..16.
+        app.layout.canvas_clip_hits = vec![CanvasClipHit {
+            col_start: 4,
+            col_end: 16,
+            row: 3,
+            session_id: "s2".into(),
+        }];
+
+        // A cell inside the chip resolves to its session; outside it does not.
+        assert_eq!(app.canvas_clip_session_at(10, 3), Some("s2".to_string()));
+        assert_eq!(app.canvas_clip_session_at(2, 3), None);
+        assert_eq!(app.canvas_clip_session_at(10, 4), None);
+
+        // Resolving + focusing (what the click handler does) selects that session.
+        let target = app.canvas_clip_session_at(10, 3).expect("clip resolves");
+        app.focus = PaneFocus::List;
+        app.select_session(target);
+        assert_eq!(app.selection.session_id(), Some("s2"));
     }
 
     #[tokio::test]

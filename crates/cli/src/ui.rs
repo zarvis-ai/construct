@@ -7180,6 +7180,7 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
     app.layout.canvas_title_widget_hits.clear();
     app.layout.canvas_selection_run_hit = None;
     app.layout.canvas_inner_area = None;
+    app.layout.canvas_clip_hits.clear();
     if app
         .canvas_popup
         .as_ref()
@@ -7424,6 +7425,14 @@ fn render_canvas_popup_at(
         total_rows,
         viewport_rows,
     );
+    // Capture session-clip hitboxes for the active canvas so hover/click can map
+    // a cell → session id. Only the active canvas is interactive; the same
+    // `scroll_offset` applied to the paragraph is applied here so the hitboxes
+    // track the visible (scrolled) rows.
+    if active {
+        let hits = canvas_session_clip_hits(Some(app), &popup.buffer, scroll_offset, inner);
+        app.layout.canvas_clip_hits = hits;
+    }
     if active && !popup.closing {
         if let Some(pos) =
             canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, inner)
@@ -7436,6 +7445,125 @@ fn render_canvas_popup_at(
         render_canvas_selection_context_menu(f, app, popup, scroll_offset, inner);
     }
     render_canvas_title_tooltip(f, app, popup, summary_ref, rect);
+    if active && !popup.closing {
+        render_canvas_clip_hover(f, app, rect);
+    }
+}
+
+/// Mini session-preview popover shown while the mouse hovers a `@{session:id}`
+/// smart-clip in the canvas body. Reads the freshly captured clip hitboxes,
+/// resolves the hovered session, and paints a compact card (glyph + name,
+/// harness · model, status, last prompt) anchored to the hovered chip. Clears
+/// its own area, so it overlays the canvas body without disturbing it.
+fn render_canvas_clip_hover(f: &mut Frame, app: &App, modal: Rect) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    let Some(hit) = app
+        .layout
+        .canvas_clip_hits
+        .iter()
+        .find(|hit| hit.contains(mx, my))
+    else {
+        return;
+    };
+    let Some(s) = app.sessions.iter().find(|s| s.id == hit.session_id) else {
+        return;
+    };
+
+    let glyph_style = state_style(&app.theme, s.state);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", s.state.glyph()), glyph_style),
+            Span::styled(
+                primary_label(s),
+                Style::default()
+                    .fg(app.theme.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "{} · {}",
+                harness_label(s),
+                s.model.as_deref().unwrap_or("—")
+            ),
+            Style::default().fg(app.theme.dim),
+        )),
+        Line::from(Span::styled(s.state.label(), glyph_style)),
+    ];
+    if let Some(prompt) = s
+        .last_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let one_line: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(Line::from(Span::styled(
+            one_line,
+            Style::default().fg(app.theme.muted),
+        )));
+    }
+
+    // Size the card around its content, bounded by the canvas modal.
+    let max_w = modal.width.saturating_sub(2).clamp(1, 48);
+    let content_w = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|sp| UnicodeWidthStr::width(sp.content.as_ref()))
+                .sum::<usize>() as u16
+        })
+        .max()
+        .unwrap_or(0);
+    let width = content_w.saturating_add(2).clamp(3, max_w);
+    let height = (lines.len() as u16).saturating_add(2);
+    if modal.height < height || modal.width < width {
+        return;
+    }
+
+    // Anchor below the chip when there's room, otherwise above it; keep the box
+    // fully inside the canvas modal horizontally and vertically.
+    let modal_bottom = modal.y.saturating_add(modal.height);
+    let modal_right = modal.x.saturating_add(modal.width);
+    let y = if hit.row.saturating_add(1).saturating_add(height) <= modal_bottom {
+        hit.row.saturating_add(1)
+    } else {
+        hit.row.saturating_sub(height)
+    };
+    let y = y.clamp(modal.y, modal_bottom.saturating_sub(height));
+    let x = hit
+        .col_start
+        .min(modal_right.saturating_sub(width))
+        .max(modal.x);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.accent_alt))
+            .title(Span::styled(
+                " session ",
+                Style::default()
+                    .fg(app.theme.accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        area,
+    );
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 /// Paint a slim vertical scroll thumb on the canvas popup's right border when
@@ -8292,6 +8420,162 @@ fn canvas_inline_rendered_text(app: Option<&App>, text: &str) -> String {
     out
 }
 
+/// One smart-clip located within a rendered canvas line: its display-column
+/// `visual_start` (counting collapsed break-whitespace, before word-wrap), its
+/// `visual_width`, and the raw clip body so the kind/id can be resolved.
+struct LineClip {
+    visual_start: usize,
+    visual_width: usize,
+    raw_clip: String,
+}
+
+/// Like [`canvas_inline_rendered_text`] but also reports each smart-clip's
+/// display-column span within the produced text. `base` is the visual column at
+/// which `text` begins on the rendered line (e.g. a bullet's `  • ` prefix), so
+/// the returned spans are in the same coordinate space as
+/// [`canvas_wrap_row_starts`]. The produced string is byte-for-byte what
+/// `canvas_inline_rendered_text` returns.
+fn canvas_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (String, Vec<LineClip>) {
+    let mut out = String::new();
+    let mut clips = Vec::new();
+    let mut visual = base;
+    let mut rest = text;
+    while let Some(start) = rest.find("@{") {
+        let before = &rest[..start];
+        out.push_str(before);
+        visual += before.chars().count();
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find('}') else {
+            out.push_str(&rest[start..]);
+            return (out, clips);
+        };
+        let raw_clip = &after_marker[..end];
+        let width = canvas_smart_clip_visual_width(app, raw_clip);
+        let (_, label) = canvas_smart_clip_label(app, raw_clip);
+        clips.push(LineClip {
+            visual_start: visual,
+            visual_width: width,
+            raw_clip: raw_clip.to_string(),
+        });
+        out.push(' ');
+        out.push_str(&label);
+        out.push(' ');
+        visual += width;
+        rest = &after_marker[end + 1..];
+    }
+    out.push_str(rest);
+    (out, clips)
+}
+
+/// The plain text the canvas body paints for one logical line (identical to
+/// [`canvas_rendered_line_text`]) paired with the display-column spans of every
+/// smart-clip in it. Computing both from one pass keeps the clip offsets and the
+/// wrapped text perfectly consistent for hit-testing.
+fn canvas_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec<LineClip>) {
+    let trimmed = raw.trim();
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    if trimmed.is_empty() {
+        (String::new(), Vec::new())
+    } else if canvas_heading_level(trimmed).is_some() {
+        canvas_inline_with_clips(app, trimmed, 0)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        let (body, clips) = canvas_inline_with_clips(app, rest, 4);
+        (format!("  • {body}"), clips)
+    } else {
+        let body = raw
+            .char_indices()
+            .nth(leading)
+            .map(|(idx, _)| &raw[idx..])
+            .unwrap_or("");
+        let lead: String = raw.chars().take(leading).collect();
+        let (body_text, clips) = canvas_inline_with_clips(app, body, leading);
+        (format!("{lead}{body_text}"), clips)
+    }
+}
+
+/// On-screen cell ranges of every session smart-clip in `markdown`, laid out in
+/// `area` with the same word-wrap as [`canvas_cursor_position`] (ratatui's
+/// `Wrap { trim: false }`). Each session clip maps to one or more
+/// [`CanvasClipHit`]s (one per wrapped-row segment) so the mouse handler can
+/// resolve a cell → session id for hover-preview and click-to-focus. Clips of
+/// other kinds (harness, response) are skipped.
+fn canvas_session_clip_hits(
+    app: Option<&App>,
+    markdown: &str,
+    scroll_offset: usize,
+    area: Rect,
+) -> Vec<crate::app::CanvasClipHit> {
+    let mut hits = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    let width = area.width as usize;
+    // The body paints wrapped rows `[scroll_offset, viewport_end)`. Rows above
+    // the fold are counted (to advance the row base) but produce no hits.
+    let viewport_end = scroll_offset.saturating_add(area.height as usize);
+    let mut visual_row_base = 0usize;
+    for raw in markdown.lines() {
+        if visual_row_base >= viewport_end {
+            break;
+        }
+        let (rendered, clips) = canvas_rendered_line_with_clips(app, raw);
+        let starts = canvas_wrap_row_starts(&rendered, width);
+        for clip in &clips {
+            let (kind, id) = canvas_smart_clip_target(&clip.raw_clip);
+            if kind != "session" {
+                continue;
+            }
+            // Walk the clip's display columns, mapping each to a wrapped row and
+            // merging contiguous same-row cells into one hit.
+            let mut segment: Option<(u16, u16, u16)> = None; // (row, start, end)
+            for vcol in clip.visual_start..clip.visual_start.saturating_add(clip.visual_width) {
+                let (row_in_line, col_in_row) = canvas_wrap_locate(&starts, vcol, width);
+                let abs_row = visual_row_base.saturating_add(row_in_line);
+                if abs_row < scroll_offset {
+                    continue; // above the fold (rows grow with the column)
+                }
+                if abs_row >= viewport_end {
+                    break; // below the fold; later cells only sit lower
+                }
+                let screen_row = area.y.saturating_add((abs_row - scroll_offset) as u16);
+                let screen_col = area.x.saturating_add(col_in_row as u16);
+                match segment.as_mut() {
+                    // A collapsed break-whitespace cell can map back onto a column
+                    // already inside the current segment — leave it covered.
+                    Some((r, s, e)) if *r == screen_row && screen_col >= *s && screen_col < *e => {}
+                    Some((r, _s, e)) if *r == screen_row && *e == screen_col => {
+                        *e = screen_col.saturating_add(1);
+                    }
+                    _ => {
+                        if let Some((row, col_start, col_end)) = segment.take() {
+                            hits.push(crate::app::CanvasClipHit {
+                                col_start,
+                                col_end,
+                                row,
+                                session_id: id.to_string(),
+                            });
+                        }
+                        segment = Some((screen_row, screen_col, screen_col.saturating_add(1)));
+                    }
+                }
+            }
+            if let Some((row, col_start, col_end)) = segment.take() {
+                hits.push(crate::app::CanvasClipHit {
+                    col_start,
+                    col_end,
+                    row,
+                    session_id: id.to_string(),
+                });
+            }
+        }
+        visual_row_base = visual_row_base.saturating_add(starts.len());
+    }
+    hits
+}
+
 fn canvas_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
     let mut line = 0usize;
     let mut col = 0usize;
@@ -8559,24 +8843,31 @@ fn canvas_smart_clip_visual_width(app: Option<&App>, raw_clip: &str) -> usize {
     label.chars().count() + 2
 }
 
-fn canvas_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
+/// Parse a smart-clip body (`session:abc`, `harness:codex`, or
+/// `session:abc clip_id=3`) into its `(kind, id)`. The kind selects the chip
+/// styling and label; the id resolves the referenced session/harness.
+fn canvas_smart_clip_target(raw_clip: &str) -> (&str, &str) {
     let first = raw_clip.split_whitespace().next().unwrap_or(raw_clip);
-    let (kind, id) = first.split_once(':').unwrap_or(("clip", first));
+    first.split_once(':').unwrap_or(("clip", first))
+}
+
+/// The chip label for a session smart-clip: `<glyph> <name> · <harness>`.
+/// Mirrors the session list's leading lifecycle glyph and name; shows the
+/// harness (not the model) and drops the redundant "session" prefix and the
+/// status word.
+fn canvas_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
+    format!("{} {} · {}", s.state.glyph(), primary_label(s), harness_label(s))
+}
+
+fn canvas_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
+    let (kind, id) = canvas_smart_clip_target(raw_clip);
     let label = match kind {
         "session" => app
             .and_then(|app| {
                 app.sessions
                     .iter()
                     .find(|s| s.id == id)
-                    .map(|s| {
-                        let model = s.model.as_deref().unwrap_or(s.harness.as_str());
-                        format!(
-                            "session {} · {} · {}",
-                            primary_label(s),
-                            model,
-                            s.state.label()
-                        )
-                    })
+                    .map(canvas_session_clip_label)
             })
             .unwrap_or_else(|| format!("session {id}")),
         "harness" => app
@@ -8891,6 +9182,139 @@ mod tests {
                 y: 2,
             })
         );
+    }
+
+    fn clip_test_session(
+        id: &str,
+        title: Option<&str>,
+        harness: &str,
+        state: SessionState,
+    ) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            harness: harness.into(),
+            cwd: "/tmp".into(),
+            title: title.map(|t| t.to_string()),
+            state,
+            created_at: chrono::Utc::now(),
+            last_event_at: None,
+            cost_usd: None,
+            model: None,
+            worktree: None,
+            pending_input: false,
+            last_prompt: None,
+            event_count: 0,
+            has_pty: false,
+            mode: None,
+            pinned: false,
+            position: 0,
+            group_id: None,
+            parent_session_id: None,
+            last_pty_at_ms: None,
+            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            kind: agentd_protocol::SessionKind::User,
+            archived: false,
+            operator_loop_disabled: false,
+        }
+    }
+
+    #[test]
+    fn canvas_session_clip_label_shows_glyph_name_and_harness() {
+        let s = clip_test_session("abc123", Some("My Task"), "codex", SessionState::Running);
+        // `<glyph> <name> · <harness>` — no "session" prefix, no model, no status word.
+        assert_eq!(canvas_session_clip_label(&s), "● My Task · codex");
+        let label = canvas_session_clip_label(&s);
+        assert!(!label.contains("session"), "dropped the session prefix: {label}");
+        assert!(!label.contains("running"), "dropped the status word: {label}");
+    }
+
+    #[test]
+    fn canvas_session_clip_label_used_by_smart_clip_label() {
+        // The chip label routes through the shared session-label helper when the
+        // session resolves against the app.
+        let s = clip_test_session("s9", Some("Build"), "claude", SessionState::Done);
+        let (kind, label) = (
+            canvas_smart_clip_target("session:s9").0,
+            canvas_session_clip_label(&s),
+        );
+        assert_eq!(kind, "session");
+        assert_eq!(label, "✓ Build · claude");
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_map_cells_to_session_ids() {
+        // Two session clips with a harness clip between them: only the session
+        // clips produce hits, each over the chip's painted cells (incl. padding).
+        let area = Rect::new(0, 0, 80, 6);
+        let md = "@{session:s1} mid @{harness:codex} @{session:s2}";
+        let hits = canvas_session_clip_hits(None, md, 0, area);
+        assert_eq!(
+            hits,
+            vec![
+                crate::app::CanvasClipHit {
+                    col_start: 0,
+                    col_end: 12,
+                    row: 0,
+                    session_id: "s1".into(),
+                },
+                crate::app::CanvasClipHit {
+                    col_start: 33,
+                    col_end: 45,
+                    row: 0,
+                    session_id: "s2".into(),
+                },
+            ]
+        );
+        // A cell inside the first chip resolves to s1; the gap between chips does not.
+        assert!(hits.iter().any(|h| h.contains(5, 0) && h.session_id == "s1"));
+        assert!(!hits.iter().any(|h| h.contains(20, 0)));
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_span_wrapped_rows() {
+        // A chip wider than the body wraps; the clip still maps entirely to its
+        // session across every row it occupies, with no foreign ids.
+        let area = Rect::new(0, 0, 8, 6);
+        let hits = canvas_session_clip_hits(None, "@{session:s1}", 0, area);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h.session_id == "s1"));
+        let rows: std::collections::BTreeSet<u16> = hits.iter().map(|h| h.row).collect();
+        assert!(
+            rows.len() >= 2,
+            "a chip wider than the body should wrap across rows: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_empty_without_clips() {
+        let area = Rect::new(0, 0, 40, 4);
+        assert!(canvas_session_clip_hits(None, "just prose, no clips", 0, area).is_empty());
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_track_scroll_offset() {
+        // A clip on the third logical row (abs visual row 2) shifts up by the
+        // scroll offset so its hitbox follows the visible viewport.
+        let area = Rect::new(0, 0, 80, 6);
+        let md = "l0\nl1\n@{session:s1}\nl3";
+        let unscrolled = canvas_session_clip_hits(None, md, 0, area);
+        assert_eq!(unscrolled.len(), 1);
+        assert_eq!(unscrolled[0].row, 2);
+        assert_eq!(unscrolled[0].session_id, "s1");
+
+        let scrolled = canvas_session_clip_hits(None, md, 2, area);
+        assert_eq!(
+            scrolled,
+            vec![crate::app::CanvasClipHit {
+                col_start: 0,
+                col_end: 12,
+                row: 0,
+                session_id: "s1".into(),
+            }]
+        );
+
+        // Scrolled entirely past the clip: no hit remains.
+        assert!(canvas_session_clip_hits(None, md, 3, area).is_empty());
     }
 
     #[test]
