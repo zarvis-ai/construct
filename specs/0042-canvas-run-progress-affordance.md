@@ -13,6 +13,8 @@ Pressing Run on a canvas must give immediate, continuous visual feedback that th
 
 - **Narrow (best-effort).** The shimmer is tracked per *block* — a contiguous run of non-blank Markdown lines. A block stays shimmering only while its content is unchanged from when the run started. Any change to a block's content removes it from the shimmer, whether the change comes from the agent writing progress back or from the user editing. As the agent resolves parts of the document, those parts settle out of the animation; untouched parts keep shimmering.
 
+- **Re-running preserves prior narrowing.** Running again while a run is still in flight must not re-shimmer the whole document and discard the progress the agent already showed. A re-Run re-shimmers only the blocks the user changed since the last synced version plus the blocks that were still pending; blocks the agent had already settled stay calm. A first run, or a run scoped to an explicit selection, shimmers its whole executed region.
+
 - **Stop (authoritative).** The shimmer for a session clears when the canvas-originating turn completes — observed as the owning session returning to an idle state (awaiting input, done, or errored) after it was seen running. A hard time cap also clears it, so a missed completion signal can never strand the animation on screen.
 
 Editing during a run is never blocked: the canvas is co-editable, and a run does not lock it. Because editing a block changes its content, editing inherently takes that block out of the shimmer — touching a block transfers it from "agent is working here" to "the user owns this now." This falls out of block-content tracking; no separate edit gesture is required.
@@ -44,3 +46,4 @@ The shimmer is not a progress bar, an ETA, or a per-task status. It does not rep
 - A user runs a whole todo canvas on an idle session. The entire document shimmers immediately. As the agent moves items into a Done section, each rewritten item stops shimmering. When the agent finishes its turn, the remaining shimmer clears.
 - A user selects one section and runs it. Only that section shimmers; the rest of the document is static.
 - While a run shimmers, the user starts editing one paragraph. That paragraph stops shimmering as soon as its text changes; the other blocks keep shimmering. The edit is preserved and reconciled by the normal canvas save/merge path; it does not alter what the current run is doing.
+- The agent has settled two of three todo items, so only the third still shimmers. The user edits a different item and presses Run again. The two settled items stay calm; the edited item and the still-unsettled item shimmer. The whole document does not light up again.
