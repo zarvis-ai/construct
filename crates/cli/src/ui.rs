@@ -8831,6 +8831,14 @@ fn canvas_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> u
 }
 
 fn canvas_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> usize {
+    // Display width of the first `n` chars of `s`, counting wide chars (emoji, CJK) as 2.
+    fn chars_display_width(s: &str, n: usize) -> usize {
+        s.chars()
+            .take(n)
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum()
+    }
+
     let mut visual = 0usize;
     let mut raw = 0usize;
     let mut rest = text;
@@ -8838,14 +8846,15 @@ fn canvas_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> 
         let before = &rest[..start_b];
         let before_len = before.chars().count();
         if raw_col <= raw + before_len {
-            return visual + raw_col.saturating_sub(raw);
+            return visual + chars_display_width(before, raw_col - raw);
         }
-        visual += before_len;
+        visual += UnicodeWidthStr::width(before);
         raw += before_len;
 
         let after_marker = &rest[start_b + 2..];
         let Some(end_b) = after_marker.find('}') else {
-            return visual + raw_col.saturating_sub(raw);
+            // Malformed @{ without closing }: treat remainder as plain text.
+            return visual + chars_display_width(&rest[start_b..], raw_col.saturating_sub(raw));
         };
         let raw_clip = &after_marker[..end_b];
         let clip_len = 2 + raw_clip.chars().count() + 1;
@@ -8856,7 +8865,7 @@ fn canvas_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> 
         raw += clip_len;
         rest = &after_marker[end_b + 1..];
     }
-    visual + raw_col.saturating_sub(raw)
+    visual + chars_display_width(rest, raw_col.saturating_sub(raw))
 }
 
 fn canvas_selection_range(popup: &crate::app::CanvasPopup) -> Option<(usize, usize)> {
@@ -9731,6 +9740,53 @@ mod tests {
         assert_eq!(
             glyph, "f",
             "computed cursor {pos:?} should sit on the painted 'f' starting the wrapped row"
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_accounts_for_wide_emoji() {
+        // ⏳ (U+23F3, HOURGLASS WITH FLOWING SAND) is a double-width character
+        // (display width 2). The cursor placed just after it must sit at column 2,
+        // not column 1, and the character after it must sit at column 3, not 2.
+        let area = Rect::new(10, 2, 40, 4);
+        let markdown = "⏳abc";
+
+        // Cursor at char index 0 (before ⏳) → display col 0.
+        assert_eq!(
+            canvas_cursor_position(None, markdown, 0, 0, area),
+            Some(Position { x: 10, y: 2 }),
+            "cursor before ⏳ should be at col 0"
+        );
+        // Cursor at char index 1 (after ⏳) → display col 2 (emoji is 2 wide).
+        assert_eq!(
+            canvas_cursor_position(None, markdown, 1, 0, area),
+            Some(Position { x: 12, y: 2 }),
+            "cursor after ⏳ should be at col 2 (emoji is double-width)"
+        );
+        // Cursor at char index 2 (after ⏳ + 'a') → display col 3.
+        assert_eq!(
+            canvas_cursor_position(None, markdown, 2, 0, area),
+            Some(Position { x: 13, y: 2 }),
+            "cursor after ⏳a should be at col 3"
+        );
+    }
+
+    #[test]
+    fn canvas_visual_to_cursor_accounts_for_wide_emoji() {
+        // Inverse: clicking at display column 2 on a line starting with ⏳ should
+        // resolve to char offset 1 (just after the emoji), not char offset 2.
+        let markdown = "⏳abc";
+        // Display col 2 on row 0 (just after ⏳) → char offset 1.
+        assert_eq!(
+            canvas_visual_to_cursor(None, markdown, 0, 2, 40),
+            1,
+            "click at display col 2 should land at char offset 1 (after ⏳)"
+        );
+        // Display col 3 on row 0 (after 'a') → char offset 2.
+        assert_eq!(
+            canvas_visual_to_cursor(None, markdown, 0, 3, 40),
+            2,
+            "click at display col 3 should land at char offset 2 (after ⏳a)"
         );
     }
 
