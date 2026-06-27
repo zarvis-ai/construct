@@ -43,10 +43,10 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    run_inner(client, session_id).await
+    run_inner(socket, client, session_id).await
 }
 
-async fn run_inner(client: Arc<Client>, session_id: Option<String>) -> Result<()> {
+async fn run_inner(socket: PathBuf, mut client: Arc<Client>, session_id: Option<String>) -> Result<()> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
 
@@ -65,6 +65,11 @@ async fn run_inner(client: Arc<Client>, session_id: Option<String>) -> Result<()
                     Ok(r) => r,
                     Err(_) => continue,
                 };
+                if client.is_disconnected() {
+                    if let Ok(new_client) = Client::connect(&socket).await {
+                        client = new_client;
+                    }
+                }
                 let resp = handle_request(&client, session_id.as_deref(), req).await;
                 let v = match serde_json::to_value(&resp) {
                     Ok(v) => v,
