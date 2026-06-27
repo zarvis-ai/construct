@@ -7819,7 +7819,7 @@ fn canvas_title_line<'a>(
     let run_started = app
         .canvas_runs
         .get(&popup.canvas.session_id)
-        .filter(|run| now < run.deadline)
+        .filter(|run| now < run.deadline && !run.first_output_seen)
         .map(|run| run.started_at);
     let run_style = if run_hovered {
         Style::default()

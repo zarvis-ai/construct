@@ -15,10 +15,9 @@ Pressing Run on a canvas must give immediate, continuous visual feedback that th
 
 - **Re-running preserves prior narrowing.** Running again while a run is still in flight must not re-shimmer the whole document and discard the progress the agent already showed. A re-Run re-shimmers only the blocks the user changed since the last synced version plus the blocks that were still pending; blocks the agent had already settled stay calm. A first run, or a run scoped to an explicit selection, shimmers its whole executed region.
 
-- **Stop (authoritative).** The shimmer for a session clears on the first canvas-relevant
-  output signal from that session: tool call, reasoning, or other assistant-visible
-  content. A hard time cap also clears it, so a missed output signal can never strand
-  the animation on screen.
+- **Stop (authoritative).** The shimmer for a session clears when the canvas-originating turn completes — observed as the owning session returning to an idle state (awaiting input, done, or errored) after it was seen running. A hard time cap also clears it, so a missed status event can never strand the animation on screen.
+
+- **Run Button Spinner.** The pulsing Run glyph in the title bar is a secondary indicator that stops pulsing early on the first canvas-relevant output signal (tool call, reasoning, or other assistant-visible content) to signal that the agent has started active work, even while the canvas shimmer continues.
 
 Editing during a run is never blocked: the canvas is co-editable, and a run does not lock it. Because editing a block changes its content, editing inherently takes that block out of the shimmer — touching a block transfers it from "agent is working here" to "the user owns this now." This falls out of block-content tracking; no separate edit gesture is required.
 
@@ -36,8 +35,8 @@ The instruction the agent receives is a point-in-time snapshot taken at Run. Edi
 
 - The affordance is shared transient canvas state owned by the daemon, with an optimistic client-side start for the initiating TUI. The daemon publishes the active run's start time, expiry, and pending block signatures in canvas get/state payloads so other TUIs and restarted TUIs can render the same shimmer. It is not persisted into the Markdown and does not participate in canvas versioning or optimistic concurrency.
 - The daemon starts shared run state only after the Run prompt has been delivered to the owning session. The initiating client still starts optimistically before the round trip returns, but daemon-owned shared state must not be clearable by prompt echo or other delivery artifacts.
-- Narrowing is best-effort. A block the agent never rewrites keeps shimmering until the first observed output; that is acceptable and is bounded by the stop signal. Two blocks with identical text are indistinguishable and settle together.
-- Session status transitions are intentionally ignored as stop signals; they do not uniquely identify canvas-originating activity and can arrive in the absence of output. Until the daemon has an explicit canvas-turn id, it clears shared run state on first observed agent-visible output. A hard time cap remains as a backstop for silent runs.
+- Narrowing is best-effort. A block the agent never rewrites keeps shimmering until the turn completes; that is acceptable and is bounded by the stop signal. Two blocks with identical text are indistinguishable and settle together.
+- Session status transitions are the authoritative stop signals for the shimmer: the daemon clears shared run state when the session transitions back to idle after being seen running. A hard time cap remains as a backstop for silent runs. The first observed agent-visible output stops only the Run button's pulsing indicator.
 - Raw PTY bytes are not a canvas-run stop signal. PTY-backed harnesses can emit prompt echo, screen redraws, bracketed-paste artifacts, or other delivery noise around Run submission, and those bytes are not distinguishable enough to clear canvas progress. Canvas edits still narrow or clear the run, and structured agent-visible events may clear it for harnesses that provide them.
 - Clients do not independently clear shared run state from session output events. They render optimistic/local state until the daemon reports active or cleared canvas run state through canvas get/state payloads.
 - Once every executed block has settled but the turn is still running, the body animation has nothing left to shimmer. Clients may keep a small secondary running indicator to cover that window, but must not block input or imply the canvas is locked.

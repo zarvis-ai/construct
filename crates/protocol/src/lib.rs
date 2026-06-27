@@ -908,6 +908,10 @@ pub struct CanvasRunProgress {
     pub expires_at_ms: i64,
     #[serde(default)]
     pub pending_block_signatures: Vec<String>,
+    #[serde(default)]
+    pub seen_running: bool,
+    #[serde(default)]
+    pub first_output_seen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
