@@ -8586,7 +8586,11 @@ fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
     {
-        format!("  • {}", canvas_inline_rendered_text(app, rest))
+        format!(
+            "{}  • {}",
+            " ".repeat(leading),
+            canvas_inline_rendered_text(app, rest)
+        )
     } else {
         // Normal line: the renderer keeps the raw leading whitespace and
         // expands any inline chips in the remainder.
@@ -8688,8 +8692,8 @@ fn canvas_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
     {
-        let (body, clips) = canvas_inline_with_clips(app, rest, 4);
-        (format!("  • {body}"), clips)
+        let (body, clips) = canvas_inline_with_clips(app, rest, leading + 4);
+        (format!("{}  • {body}", " ".repeat(leading)), clips)
     } else {
         let body = raw
             .char_indices()

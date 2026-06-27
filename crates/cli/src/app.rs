@@ -8600,7 +8600,10 @@ impl App {
                     target_col,
                     width,
                 );
-                (cursor, target_col)
+                (
+                    canvas_normalize_canvas_cursor(&popup.buffer, cursor),
+                    target_col,
+                )
             })
         };
         let Some((cursor, target_col)) = computed else {
@@ -11041,16 +11044,29 @@ struct CanvasSmartClipRange {
 }
 
 fn canvas_cursor_left(buffer: &str, cursor: usize) -> usize {
-    canvas_smart_clip_range_before_or_containing(buffer, cursor)
-        .map(|range| range.start)
-        .unwrap_or_else(|| cursor.saturating_sub(1))
+    let cursor = canvas_normalize_canvas_cursor(buffer, cursor);
+    if let Some(marker_start) = canvas_list_marker_cursor(buffer, cursor) {
+        if cursor <= marker_start {
+            return marker_start;
+        }
+    }
+    canvas_normalize_canvas_cursor(
+        buffer,
+        canvas_smart_clip_range_before_or_containing(buffer, cursor)
+            .map(|range| range.start)
+            .unwrap_or_else(|| cursor.saturating_sub(1)),
+    )
 }
 
 fn canvas_cursor_right(buffer: &str, cursor: usize) -> usize {
     let len = buffer.chars().count();
-    canvas_smart_clip_range_at_or_containing(buffer, cursor)
-        .map(|range| range.end)
-        .unwrap_or_else(|| (cursor + 1).min(len))
+    let cursor = canvas_normalize_canvas_cursor(buffer, cursor);
+    canvas_normalize_canvas_cursor(
+        buffer,
+        canvas_smart_clip_range_at_or_containing(buffer, cursor)
+            .map(|range| range.end)
+            .unwrap_or_else(|| (cursor + 1).min(len)),
+    )
 }
 
 fn canvas_smart_clip_range_at_or_containing(
@@ -13613,6 +13629,35 @@ mod tests {
             "single-step right should behave like Ctrl-F from list content start"
         );
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_horizontal_motion_skips_hidden_list_marker_offsets() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "* alpha", 0));
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 6, 12));
+
+        app.move_canvas_cursor(1);
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            3,
+            "right from the rendered list start should not stop inside hidden '* '"
+        );
+
+        app.move_canvas_cursor(-1);
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            2,
+            "left from the first content char should land on content start, not hidden marker"
+        );
+
+        app.move_canvas_cursor(-1);
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            2,
+            "left at list content start should stay visible instead of entering '* '"
+        );
         server.abort();
     }
 
