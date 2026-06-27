@@ -30,6 +30,9 @@ pub enum KeyAction {
     /// Save the selected session's in-TUI canvas surface. Bound to
     /// `C-x C-s`, matching the editor-style save chord.
     SaveCanvas,
+    /// Undo the selected canvas edit. Bound to `C-x u` for consistency with
+    /// emacs-style history commands.
+    UndoCanvas,
     OpenDiff,
     Interrupt,
     OpenCommandPalette,
@@ -229,6 +232,7 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('k')]), OpenDeleteConfirm),
         (Chord(vec![ctrl('x'), ch(' ')]), OpenCanvas),
         (Chord(vec![ctrl('x'), ctrl('s')]), SaveCanvas),
+        (Chord(vec![ctrl('x'), ch('u')]), UndoCanvas),
         (Chord(vec![ctrl('x'), ch('d')]), OpenDiff),
         (Chord(vec![ctrl('x'), ch('i')]), OpenSendInput),
         // `C-x r` opens the rename minibuffer (with current title pre-filled).
@@ -291,6 +295,7 @@ fn vim() -> Keymap {
         (Chord(vec![shift('K')]), OpenDeleteConfirm),
         (Chord(vec![ctrl('x'), ch(' ')]), OpenCanvas),
         (Chord(vec![ctrl('x'), ctrl('s')]), SaveCanvas),
+        (Chord(vec![ctrl('x'), ch('u')]), UndoCanvas),
         (Chord(vec![ch('d')]), OpenDiff),
         (Chord(vec![ctrl('c')]), Interrupt),
         // `r` opens the rename minibuffer; refresh moved to M-x refresh.
@@ -503,6 +508,20 @@ mod tests {
                     KeymapResult::Action(KeyAction::SaveCanvas)
                 ),
                 "C-x C-s should save canvas in {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_x_u_undo_canvas() {
+        for profile in [Profile::Emacs, Profile::Vim] {
+            let km = default_for(profile);
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), ch('u')]),
+                    KeymapResult::Action(KeyAction::UndoCanvas)
+                ),
+                "C-x u should trigger UndoCanvas in {profile:?}"
             );
         }
     }

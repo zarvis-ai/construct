@@ -56,6 +56,7 @@ pub(crate) const CANVAS_CONTENT_PADDING_Y: u16 = 1;
 pub(crate) const CANVAS_RUN_MAX_MS: u64 = 10 * 60 * 1000;
 /// Wrapped rows the canvas body scrolls per mouse-wheel notch.
 pub(crate) const CANVAS_WHEEL_SCROLL_ROWS: usize = 3;
+const CANVAS_UNDO_STACK_LIMIT: usize = 100;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
 
 /// A row in the rendered list view. Sessions and group headers share the
@@ -1331,6 +1332,7 @@ pub struct CanvasPopup {
     pub canvas: agentd_protocol::CanvasDocument,
     pub buffer: String,
     pub saved_markdown: String,
+    pub undo_stack: Vec<CanvasUndoState>,
     pub cursor: usize,
     pub preferred_col: Option<usize>,
     pub selection: Option<CanvasSelection>,
@@ -1459,6 +1461,16 @@ pub struct CanvasSelection {
     pub anchor: usize,
     pub head: usize,
     pub dragged: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CanvasUndoState {
+    buffer: String,
+    cursor: usize,
+    preferred_col: Option<usize>,
+    selection: Option<CanvasSelection>,
+    smart_clip: Option<CanvasSmartClipSearch>,
+    scroll_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -4651,6 +4663,7 @@ impl App {
         popup.canvas = canvas;
         popup.cursor = popup.cursor.min(popup.buffer.chars().count());
         popup.preferred_col = None;
+        popup.undo_stack.clear();
     }
 
     /// Open the approval prompt if there's no other minibuffer in flight.
@@ -7663,6 +7676,7 @@ impl App {
             KeyCode::Char('w') if ctrl => self.cut_canvas_selection(),
             // M-w is emacs kill-ring-save: copy the selection, never delete.
             KeyCode::Char('w') if alt => self.copy_canvas_selection_and_deactivate(),
+            KeyCode::Char('/') if ctrl => self.undo_canvas_edit(),
             // Cmd-C / Ctrl-C also copy, but only when a selection exists so we
             // don't disturb existing behavior otherwise (plain C-c stays a
             // no-op here; the C-x C-c quit chord is consumed earlier in
@@ -7729,7 +7743,7 @@ impl App {
     /// selected / under the cursor after the shift.
     fn shift_canvas_indent(&mut self, outdent: bool) {
         const CANVAS_INDENT_UNIT: usize = 2;
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.canvas_popup.as_ref() else {
             return;
         };
         let lines: Vec<String> = popup.buffer.split('\n').map(str::to_string).collect();
@@ -7799,6 +7813,10 @@ impl App {
             head: remap(sel.head),
             dragged: sel.dragged,
         });
+        self.push_canvas_undo_state();
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
         popup.buffer = new_lines.join("\n");
         popup.cursor = new_cursor;
         popup.selection = new_selection;
@@ -7884,34 +7902,36 @@ impl App {
     }
 
     fn accept_canvas_smart_clip(&mut self) {
-        let (trigger_start, candidate) = {
-            let Some(popup) = self.canvas_popup.as_ref() else {
-                return;
-            };
-            let Some(search) = popup.smart_clip.as_ref() else {
-                return;
-            };
-            let candidates = self.canvas_smart_clip_candidates(popup);
-            let Some(candidate) = candidates
-                .get(search.selected.min(candidates.len().saturating_sub(1)))
-                .cloned()
-            else {
-                return;
-            };
-            (search.trigger_start, candidate)
-        };
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.canvas_popup.as_ref() else {
             return;
         };
-        if popup.cursor < trigger_start {
+        let Some(search) = popup.smart_clip.as_ref() else {
+            return;
+        };
+        let candidates = self.canvas_smart_clip_candidates(popup);
+        let Some(candidate) = candidates
+            .get(search.selected.min(candidates.len().saturating_sub(1)))
+            .cloned()
+        else {
+            return;
+        };
+        if popup.cursor < search.trigger_start {
+            let Some(popup) = self.canvas_popup.as_mut() else {
+                return;
+            };
             popup.smart_clip = None;
             return;
         }
         let clip = canvas_smart_clip_with_instance_id(&candidate.clip, &popup.buffer);
-        let start_b = byte_pos(&popup.buffer, trigger_start);
+        let start_b = byte_pos(&popup.buffer, search.trigger_start);
         let end_b = byte_pos(&popup.buffer, popup.cursor);
+        let new_cursor = search.trigger_start + clip.chars().count();
+        self.push_canvas_undo_state();
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
         popup.buffer.replace_range(start_b..end_b, &clip);
-        popup.cursor = trigger_start + clip.chars().count();
+        popup.cursor = new_cursor;
         popup.preferred_col = None;
         popup.selection = None;
         popup.smart_clip = None;
@@ -8002,6 +8022,41 @@ impl App {
         Some(popup.buffer[start_b..end_b].to_string())
     }
 
+    fn push_canvas_undo_state(&mut self) {
+        let popup = match self.canvas_popup.as_mut() {
+            Some(popup) => popup,
+            None => return,
+        };
+        popup.undo_stack.push(CanvasUndoState {
+            buffer: popup.buffer.clone(),
+            cursor: popup.cursor,
+            preferred_col: popup.preferred_col,
+            selection: popup.selection.clone(),
+            smart_clip: popup.smart_clip.clone(),
+            scroll_offset: popup.scroll_offset,
+        });
+        while popup.undo_stack.len() > CANVAS_UNDO_STACK_LIMIT {
+            popup.undo_stack.remove(0);
+        }
+    }
+
+    fn undo_canvas_edit(&mut self) {
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        let Some(state) = popup.undo_stack.pop() else {
+            return;
+        };
+        popup.buffer = state.buffer;
+        popup.cursor = state.cursor;
+        popup.preferred_col = state.preferred_col;
+        popup.selection = state.selection;
+        popup.smart_clip = state.smart_clip;
+        popup.scroll_offset = state.scroll_offset;
+        Self::update_canvas_smart_clip_after_cursor_move(popup);
+        self.follow_canvas_scroll();
+    }
+
     fn delete_canvas_selection(&mut self) -> Option<String> {
         let popup = self.canvas_popup.as_mut()?;
         let (start, end) = Self::canvas_selection_range(popup)?;
@@ -8049,6 +8104,15 @@ impl App {
     }
 
     fn cut_canvas_selection(&mut self) {
+        if !self
+            .canvas_popup
+            .as_ref()
+            .and_then(Self::canvas_selection_range)
+            .is_some()
+        {
+            return;
+        }
+        self.push_canvas_undo_state();
         let Some(text) = self.delete_canvas_selection() else {
             return;
         };
@@ -8072,7 +8136,7 @@ impl App {
     }
 
     fn cut_canvas_line(&mut self) {
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.canvas_popup.as_ref() else {
             return;
         };
         let start = byte_pos(&popup.buffer, popup.cursor);
@@ -8082,6 +8146,13 @@ impl App {
             end += 1;
         }
         let cut = popup.buffer[start..end].to_string();
+        if cut.is_empty() {
+            return;
+        }
+        self.push_canvas_undo_state();
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
         popup.buffer.replace_range(start..end, "");
         popup.preferred_col = None;
         popup.selection = None;
@@ -8092,12 +8163,19 @@ impl App {
     }
 
     fn insert_canvas_text(&mut self, text: &str) {
-        if self
+        if text.is_empty() {
+            return;
+        }
+        if self.canvas_popup.is_none() {
+            return;
+        }
+        let had_selection = self
             .canvas_popup
             .as_ref()
             .and_then(Self::canvas_selection_range)
-            .is_some()
-        {
+            .is_some();
+        self.push_canvas_undo_state();
+        if had_selection {
             self.delete_canvas_selection();
         }
         let Some(popup) = self.canvas_popup.as_mut() else {
@@ -8274,10 +8352,17 @@ impl App {
     }
 
     fn delete_canvas_back(&mut self) {
-        if self.delete_canvas_selection().is_some() {
+        let has_selection = self
+            .canvas_popup
+            .as_ref()
+            .and_then(Self::canvas_selection_range)
+            .is_some();
+        if has_selection {
+            self.push_canvas_undo_state();
+            let _ = self.delete_canvas_selection();
             return;
         }
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.canvas_popup.as_ref() else {
             return;
         };
         if popup.cursor == 0 {
@@ -8292,20 +8377,35 @@ impl App {
             } else {
                 (popup.cursor - 1, popup.cursor)
             };
-        let start = byte_pos(&popup.buffer, char_start);
-        let end = byte_pos(&popup.buffer, char_end);
+        let (start, end) = {
+            let start = byte_pos(&popup.buffer, char_start);
+            let end = byte_pos(&popup.buffer, char_end);
+            (start, end)
+        };
+        self.push_canvas_undo_state();
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
         popup.buffer.replace_range(start..end, "");
         popup.cursor = char_start;
         popup.preferred_col = None;
         popup.selection = None;
+        popup.smart_clip = None;
         Self::update_canvas_smart_clip_after_cursor_move(popup);
     }
 
     fn delete_canvas_forward(&mut self) {
-        if self.delete_canvas_selection().is_some() {
+        let has_selection = self
+            .canvas_popup
+            .as_ref()
+            .and_then(Self::canvas_selection_range)
+            .is_some();
+        if has_selection {
+            self.push_canvas_undo_state();
+            let _ = self.delete_canvas_selection();
             return;
         }
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.canvas_popup.as_ref() else {
             return;
         };
         if popup.cursor >= popup.buffer.chars().count() {
@@ -8320,12 +8420,20 @@ impl App {
             } else {
                 (popup.cursor, popup.cursor + 1)
             };
-        let start = byte_pos(&popup.buffer, char_start);
-        let end = byte_pos(&popup.buffer, char_end);
+        let (start, end) = {
+            let start = byte_pos(&popup.buffer, char_start);
+            let end = byte_pos(&popup.buffer, char_end);
+            (start, end)
+        };
+        self.push_canvas_undo_state();
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
         popup.buffer.replace_range(start..end, "");
         popup.cursor = char_start;
         popup.preferred_col = None;
         popup.selection = None;
+        popup.smart_clip = None;
         Self::update_canvas_smart_clip_after_cursor_move(popup);
     }
 
@@ -8471,6 +8579,9 @@ impl App {
             },
             OpenCanvas => {
                 self.toggle_canvas_popup().await;
+            }
+            UndoCanvas => {
+                self.undo_canvas_edit();
             }
             SaveCanvas => {
                 self.save_canvas_popup().await;
@@ -10557,6 +10668,7 @@ fn canvas_popup_from_document(
         canvas,
         buffer: markdown.clone(),
         saved_markdown: markdown,
+        undo_stack: Vec::new(),
         cursor: 0,
         preferred_col: None,
         selection: None,
@@ -11043,17 +11155,18 @@ mod tests {
 
     fn canvas_popup_for_test(session_id: &str, markdown: &str, cursor: usize) -> CanvasPopup {
         let now = Instant::now();
-        CanvasPopup {
-            canvas: agentd_protocol::CanvasDocument {
-                session_id: session_id.to_string(),
-                markdown: markdown.to_string(),
-                version: 1,
-                updated_at_ms: 0,
-                template_id: None,
-            },
-            buffer: markdown.to_string(),
-            saved_markdown: markdown.to_string(),
-            cursor,
+    CanvasPopup {
+        canvas: agentd_protocol::CanvasDocument {
+            session_id: session_id.to_string(),
+            markdown: markdown.to_string(),
+            version: 1,
+            updated_at_ms: 0,
+            template_id: None,
+        },
+        buffer: markdown.to_string(),
+        saved_markdown: markdown.to_string(),
+        undo_stack: Vec::new(),
+        cursor,
             preferred_col: None,
             selection: None,
             smart_clip: None,
@@ -11296,6 +11409,89 @@ mod tests {
         let popup = app.canvas_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "abcdef", "Cmd-C must not mutate the buffer");
         assert!(popup.selection.is_none(), "Cmd-C deactivates the selection");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_ctrl_slash_undo_reverts_last_edit() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft!");
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_c_x_u_undo_reverts_last_edit() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().buffer,
+            "draft",
+            "with no edits, C-x u is currently a no-op"
+        );
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft!");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().buffer,
+            "draft",
+            "C-x u should undo the previous canvas edit"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_c_x_u_undo_reverts_multiple_edits_in_order() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().buffer,
+            "draft!?",
+            "both edits should be appended"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().buffer,
+            "draft!",
+            "first C-x u should undo only the most recent edit"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().buffer,
+            "draft",
+            "second C-x u should undo the next edit"
+        );
         server.abort();
     }
 
