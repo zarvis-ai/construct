@@ -6,11 +6,9 @@
 //! (`daily-cloudcode-pa.googleapis.com/...:streamGenerateContent`).
 //!
 //! This is the subscription-backed path, distinct from the public Gemini API
-//! (`gemini:` / `GEMINI_API_KEY`). Model strings use the explicit prefix:
-//!
-//!     antigravity-oauth:gemini-2.5-pro
-//!
-//! (or short aliases once we map them).
+//! (`gemini:` / `GEMINI_API_KEY`). Model strings use the explicit prefix
+//! `antigravity-oauth:...` (e.g. `antigravity-oauth:gemini-2.5-pro`, or short
+//! aliases once we map them).
 //!
 //! Smith owns the agent loop, tools, approvals, and persistence — we only
 //! borrow the OAuth token and the wire format from the agy client.
