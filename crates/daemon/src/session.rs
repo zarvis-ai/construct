@@ -526,6 +526,13 @@ fn canvas_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
     bytes
 }
 
+fn canvas_execution_prompt(body: &str) -> String {
+    format!(
+        "Execute the following construct canvas as an autonomous run. Treat the Markdown as free-form instructions and state for this turn, not as a request for a one-shot status report. Infer the user's intended objective from the document structure and prose, then keep taking useful next actions while there is actionable work you can do. Do not ask the user to run the canvas again; if the document still implies useful work you can perform, continue in this turn. Resolve smart clips written as @{{type:id ...}} references when possible, create or resume subagent sessions when the canvas calls for delegated work, and record meaningful state changes or results on the canvas with construct_canvas_edit (anchored find/replace edits that merge with concurrent human edits; use construct_canvas_update only for a wholesale rewrite). If blocked, write the blocker and next required external action on the canvas before ending.\n\n```markdown\n{}\n```",
+        body
+    )
+}
+
 impl SessionEntry {
     pub fn is_deleted(&self) -> bool {
         self.deleted.load(Ordering::SeqCst)
@@ -1435,10 +1442,7 @@ impl SessionManager {
         if body.is_empty() {
             anyhow::bail!("canvas is empty");
         }
-        let prompt = format!(
-            "Execute the following construct canvas instructions. Treat the Markdown as orchestration state. Resolve smart clips written as @{{type:id ...}} references when possible, create subagent sessions for harness clips when appropriate, and record task state changes on the canvas with construct_canvas_edit (anchored find/replace edits that merge with concurrent human edits; use construct_canvas_update only for a wholesale rewrite).\n\n```markdown\n{}\n```",
-            body
-        );
+        let prompt = canvas_execution_prompt(body);
         let delivery = {
             let summary = entry.summary.read().await;
             canvas_execution_delivery(&*summary)
@@ -4064,6 +4068,19 @@ mod tests {
             canvas_bracketed_paste_bytes("a\x1b[201~b"),
             b"\x1b[200~ab\x1b[201~".to_vec()
         );
+    }
+
+    #[test]
+    fn canvas_execution_prompt_requires_autonomous_run() {
+        let prompt = canvas_execution_prompt("# Research brief\n\nCompare options and summarize findings.\n");
+
+        assert!(prompt.contains("autonomous run"));
+        assert!(prompt.contains("free-form instructions and state"));
+        assert!(prompt.contains("Infer the user's intended objective"));
+        assert!(prompt.contains("keep taking useful next actions"));
+        assert!(prompt.contains("Do not ask the user to run the canvas again"));
+        assert!(prompt.contains("If blocked, write the blocker"));
+        assert!(prompt.contains("Compare options and summarize findings."));
     }
 
     #[test]
