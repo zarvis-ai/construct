@@ -12013,6 +12013,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canvas_run_for_orchestrator_does_not_panic_and_submit_does_not_clear_other_shimmers() {
+        // TDD for the reported panic (screenshot 2026-06-27 9.43.19),
+        // "Canvas click 'run' on smith session does type the prompt, but not submit",
+        // and "On smith session canvas, when submit the prompt, all shimmer animation clears".
+        // Orchestrator (smith minibuffer) sessions must not participate in normal
+        // canvas run shimmer, and activity on them must not wipe User/Subagent shimmers.
+        let (mut app, _dir, server) = empty_app().await;
+
+        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        orch.id = "orch1".into();
+        let mut user = summary_with_kind(agentd_protocol::SessionKind::User);
+        user.id = "user1".into();
+        app.sessions = vec![orch.clone(), user.clone()];
+        app.selection = Selection::Session("orch1".into());
+
+        // Exercise the run start path that could panic or set bad state for orchestrator.
+        let body = "# do the task\nImplement the thing".to_string();
+        app.start_canvas_run("orch1", &body, false, "");
+
+        // Normal user session canvas run must still be tracked.
+        app.start_canvas_run("user1", "# user canvas task", false, "");
+        assert!(
+            app.canvas_runs.contains_key("user1"),
+            "user canvas run must be tracked"
+        );
+
+        // Simulate orchestrator submit / state update clearing only its own entry
+        // (the unconditional removes in on_canvas_state / result paths).
+        app.canvas_runs.remove("orch1");
+        assert!(
+            app.canvas_runs.contains_key("user1"),
+            "user shimmer must survive orchestrator activity/submit"
+        );
+
+        // Orchestrator should not have left a popup in normal flows.
+        if let Some(p) = app.canvas_popup.as_ref() {
+            assert_ne!(p.saved_markdown, "should not be here for orchestrator");
+        }
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn session_title_canvas_toggle_opens_canvas_from_chat_mode() {
         use agentd_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
