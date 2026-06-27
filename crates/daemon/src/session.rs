@@ -3326,16 +3326,22 @@ impl SessionManager {
         // Gracefully terminate the live adapter, if there is one. The adapter's
         // Closed event clears `entry.adapter` so a later restart sees no live
         // adapter. Tolerate sessions that are already terminal (no adapter).
-        if let Some(adapter) = entry.adapter.lock().await.clone() {
+        //
+        // IMPORTANT: spawn the potentially-slow stop/shutdown so the caller
+        // (TUI / CLI) returns immediately after the state flip + broadcast.
+        // This prevents archive from hanging the UI for up to ~13s.
+        if let Some(adapter) = entry.adapter.lock().await.take() {
             let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
                 session_id: id.to_string(),
             })?;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(10),
-                adapter.request(ahp_method::SESSION_STOP, params),
-            )
-            .await;
-            let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    adapter.request(ahp_method::SESSION_STOP, params),
+                )
+                .await;
+                let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
+            });
         }
         Ok(())
     }
@@ -3362,44 +3368,52 @@ impl SessionManager {
             adapter.kill();
         }
 
-        // Give the drain task a moment to observe the Closed event and exit
-        // cleanly. With is_deleted set, it won't touch storage either way.
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Remove the worktree if there is one. Best effort.
-        let summary = entry.summary.read().await.clone();
-        if let Some(wt) = summary.worktree.as_deref() {
-            let wt_path = PathBuf::from(wt);
-            if let Err(e) = worktree::remove_worktree(&wt_path).await {
-                tracing::warn!(%id, error = %e, "remove_worktree failed");
-            }
-        }
-
-        // Loops are attached to the session — drop them from the
-        // in-memory registry. The on-disk loops.json sits inside
-        // sessions/<id>/ so it goes with the next call.
-        self.loops.drop_session(id).await;
-
-        // Drop the on-disk record. Best effort.
-        if let Err(e) = self.storage.remove_session(id) {
-            tracing::warn!(%id, error = ?e, "remove_session failed");
-        }
-
-        // Best-effort: remove the per-session MCP config the adapter may
-        // have written for an injected `construct-mcp` server.
-        let mcp_path = agentd_protocol::paths::Paths::discover()
-            .state_dir
-            .join("mcp")
-            .join(format!("{id}.json"));
-        if mcp_path.exists() {
-            let _ = std::fs::remove_file(&mcp_path);
-        }
-
+        // Broadcast deletion immediately so clients (TUI) see the effect
+        // without waiting for slow fs/storage work.
         let _ = self
             .broadcast
             .send(BroadcastMsg::Deleted(DeletedNotificationPayload {
                 session_id: id.to_string(),
             }));
+
+        // The rest (sleep, worktree remove, storage, loops, mcp file) can be
+        // slow. Spawn it so delete() returns promptly and does not hang the TUI.
+        // Best-effort cleanup; errors are only logged.
+        let storage = self.storage.clone();
+        let loops = self.loops.clone();
+        let id_owned = id.to_string();
+        let summary = entry.summary.read().await.clone();
+        tokio::spawn(async move {
+            // Give the drain task a moment to observe the Closed event.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Remove the worktree if there is one. Best effort.
+            if let Some(wt) = summary.worktree.as_deref() {
+                let wt_path = PathBuf::from(wt);
+                if let Err(e) = worktree::remove_worktree(&wt_path).await {
+                    tracing::warn!(%id_owned, error = %e, "remove_worktree failed");
+                }
+            }
+
+            // Loops are attached to the session — drop them from the
+            // in-memory registry.
+            loops.drop_session(&id_owned).await;
+
+            // Drop the on-disk record. Best effort.
+            if let Err(e) = storage.remove_session(&id_owned) {
+                tracing::warn!(%id_owned, error = ?e, "remove_session failed");
+            }
+
+            // Best-effort: remove the per-session MCP config.
+            let mcp_path = agentd_protocol::paths::Paths::discover()
+                .state_dir
+                .join("mcp")
+                .join(format!("{}.json", id_owned));
+            if mcp_path.exists() {
+                let _ = std::fs::remove_file(&mcp_path);
+            }
+        });
+
         Ok(())
     }
 
@@ -5616,6 +5630,46 @@ mod tests {
                 rows: 50
             })
         );
+    }
+
+    #[tokio::test]
+    async fn archive_and_delete_return_quickly_without_blocking_caller() {
+        // TDD test: before the spawn change these would block on slow adapter
+        // stop / worktree remove. After the change the public methods return
+        // promptly (state is updated + broadcast sent; slow work is spawned).
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "s-fast-archive";
+        mgr.sessions.write().await.insert(
+            id.into(),
+            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+        );
+
+        let start = std::time::Instant::now();
+        // No adapter attached → fast path only.
+        mgr.archive(id).await.expect("archive fast");
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(500), "archive must return quickly (was {elapsed:?})");
+
+        // Re-insert for delete test (previous archive removed it from map in some paths).
+        let id2 = "s-fast-delete";
+        mgr.sessions.write().await.insert(
+            id2.into(),
+            synthetic_entry(id2, agentd_protocol::SessionKind::User, 0),
+        );
+        let start2 = std::time::Instant::now();
+        mgr.delete(id2).await.expect("delete fast");
+        let elapsed2 = start2.elapsed();
+        assert!(elapsed2 < Duration::from_millis(500), "delete must return quickly (was {elapsed2:?})");
     }
 
     #[tokio::test]
