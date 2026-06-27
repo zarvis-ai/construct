@@ -888,6 +888,26 @@ impl LlmProvider for CodexOauth {
         // is an optional operator override (handy for mirroring
         // Codex CLI exactly with the upstream prompt).
         let instructions = resolve_instructions(system)?;
+        // Defense in depth against `400 "No tool output found for function
+        // call ..."`: an orphaned function_call (assistant tool call with
+        // no matching tool result) anywhere in `input` rejects the entire
+        // request and wedges the session. The resume path already heals the
+        // persisted history; repair here too so a stray orphan from any
+        // source can't brick a live turn. The clone happens only when an
+        // orphan is actually present — normally never.
+        let repaired;
+        let messages: &[Message] = if crate::context::needs_tool_pairing_repair(messages) {
+            let mut owned = messages.to_vec();
+            let n = crate::context::sanitize_tool_pairing(&mut owned);
+            tracing::warn!(
+                repaired = n,
+                "codex-oauth: repaired orphaned tool-call pairing before request"
+            );
+            repaired = owned;
+            &repaired
+        } else {
+            messages
+        };
         let body = build_responses_body(model, &instructions, messages, tools);
 
         // Take the auth lock for the duration of the request so

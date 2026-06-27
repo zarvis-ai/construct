@@ -143,6 +143,124 @@ fn find_first_user_run_end(messages: &[Message]) -> usize {
     messages.len()
 }
 
+/// Placeholder a synthetic [`Content::ToolResult`] carries when
+/// [`sanitize_tool_pairing`] back-fills an orphaned tool call. Worded so
+/// the model understands the result is missing (not empty) and shouldn't
+/// treat the placeholder as real output.
+pub const ORPHAN_TOOL_RESULT_PLACEHOLDER: &str =
+    "(no tool result was recorded — the previous turn was interrupted before this tool finished)";
+
+/// Cheap scan: does `messages` contain an orphaned tool call (an
+/// `AssistantToolCalls` whose call id has no matching `ToolResult`) or a
+/// stray result (a `ToolResult` with no issuing call)? Lets hot paths
+/// skip the allocating repair when the history is already well-formed.
+pub fn needs_tool_pairing_repair(messages: &[Message]) -> bool {
+    let mut call_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut result_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in messages {
+        match &m.content {
+            Content::AssistantToolCalls { calls, .. } => {
+                for c in calls {
+                    call_ids.insert(c.id.as_str());
+                }
+            }
+            Content::ToolResult { call_id, .. } => {
+                result_ids.insert(call_id.as_str());
+            }
+            _ => {}
+        }
+    }
+    call_ids.iter().any(|id| !result_ids.contains(id))
+        || result_ids.iter().any(|id| !call_ids.contains(id))
+}
+
+/// Repair tool-call/result pairing in a (typically just-loaded) history.
+///
+/// Every `function_call` an `AssistantToolCalls` carries must have a
+/// matching `function_call_output` (`ToolResult`), or the OpenAI / codex
+/// Responses backend rejects the *entire* request with
+/// `400 "No tool output found for function call ..."` (Anthropic 400s the
+/// same way on an orphan `tool_use` id). The agent loop always appends a
+/// result for every call, but it persists the `AssistantToolCalls` line
+/// to `smith.jsonl` *before* running the tools — so a torn write (daemon
+/// restart, SIGKILL on a turn timeout, or two adapters briefly sharing
+/// one `smith.jsonl`) can leave an orphaned call on disk. Replayed
+/// verbatim on resume, that one bad record wedges the session forever:
+/// every subsequent turn rebuilds the same poisoned request and 400s.
+///
+/// This makes the history well-formed again by:
+///   * back-filling a synthetic error `ToolResult` (immediately after the
+///     issuing `AssistantToolCalls`) for any call with no result, and
+///   * dropping any stray `ToolResult` whose call was lost.
+///
+/// Back-filling rather than deleting the call keeps partial parallel
+/// tool batches intact — only the missing legs get a placeholder, the
+/// ones that completed keep their real output. Returns the number of
+/// repairs (synthetic results added + stray results dropped); `0` leaves
+/// `messages` untouched.
+pub fn sanitize_tool_pairing(messages: &mut Vec<Message>) -> usize {
+    if !needs_tool_pairing_repair(messages) {
+        return 0;
+    }
+    let mut call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in messages.iter() {
+        match &m.content {
+            Content::AssistantToolCalls { calls, .. } => {
+                for c in calls {
+                    call_ids.insert(c.id.clone());
+                }
+            }
+            Content::ToolResult { call_id, .. } => {
+                result_ids.insert(call_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut repairs = 0usize;
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + 1);
+    for m in messages.drain(..) {
+        match &m.content {
+            Content::AssistantToolCalls { calls, .. } => {
+                // Snapshot which of this message's calls lack a result
+                // before we move `m` into `out`.
+                let orphans: Vec<String> = calls
+                    .iter()
+                    .filter(|c| !result_ids.contains(&c.id))
+                    .map(|c| c.id.clone())
+                    .collect();
+                out.push(m);
+                for id in orphans {
+                    // Mark satisfied so a (pathological) duplicate call id
+                    // later isn't back-filled twice.
+                    result_ids.insert(id.clone());
+                    out.push(Message {
+                        role: Role::Tool,
+                        content: Content::ToolResult {
+                            call_id: id,
+                            output: ORPHAN_TOOL_RESULT_PLACEHOLDER.to_string(),
+                            is_error: true,
+                        },
+                    });
+                    repairs += 1;
+                }
+            }
+            Content::ToolResult { call_id, .. } => {
+                if call_ids.contains(call_id) {
+                    out.push(m);
+                } else {
+                    // Stray result with no issuing call — drop it.
+                    repairs += 1;
+                }
+            }
+            _ => out.push(m),
+        }
+    }
+    *messages = out;
+    repairs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +304,125 @@ mod tests {
         assert!(pruned >= 1);
         // Final messages should still contain the recent ones.
         assert!(matches!(ms.last().map(|m| m.role), Some(Role::Assistant)));
+    }
+
+    fn tool_calls(ids: &[&str]) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: Content::AssistantToolCalls {
+                text: None,
+                calls: ids
+                    .iter()
+                    .map(|id| crate::provider::ToolCall {
+                        id: (*id).into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({}),
+                    })
+                    .collect(),
+            },
+        }
+    }
+    fn tool_result(call_id: &str) -> Message {
+        Message {
+            role: Role::Tool,
+            content: Content::ToolResult {
+                call_id: call_id.into(),
+                output: "ok".into(),
+                is_error: false,
+            },
+        }
+    }
+    fn result_call_id(m: &Message) -> Option<&str> {
+        match &m.content {
+            Content::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn sanitize_noop_when_well_formed() {
+        let mut ms = vec![
+            user("go"),
+            tool_calls(&["c1"]),
+            tool_result("c1"),
+            asst("done"),
+        ];
+        let before = ms.len();
+        assert!(!needs_tool_pairing_repair(&ms));
+        assert_eq!(sanitize_tool_pairing(&mut ms), 0);
+        assert_eq!(ms.len(), before);
+    }
+
+    #[test]
+    fn sanitize_backfills_orphaned_call() {
+        // Mirrors the real wedge: an AssistantToolCalls persisted without
+        // its ToolResult (a torn write), surrounded by valid pairs.
+        let mut ms = vec![
+            user("go"),
+            tool_calls(&["c1"]),
+            tool_result("c1"),
+            tool_calls(&["orphan-155"]), // no result was ever persisted
+            tool_calls(&["c2"]),
+            tool_result("c2"),
+        ];
+        assert!(needs_tool_pairing_repair(&ms));
+        assert_eq!(sanitize_tool_pairing(&mut ms), 1);
+        assert!(!needs_tool_pairing_repair(&ms));
+        // The synthetic result lands immediately after the orphaned call.
+        let idx = ms
+            .iter()
+            .position(|m| matches!(&m.content,
+                Content::AssistantToolCalls { calls, .. } if calls[0].id == "orphan-155"))
+            .unwrap();
+        match &ms[idx + 1].content {
+            Content::ToolResult {
+                call_id,
+                is_error,
+                output,
+            } => {
+                assert_eq!(call_id, "orphan-155");
+                assert!(is_error);
+                assert_eq!(output, ORPHAN_TOOL_RESULT_PLACEHOLDER);
+            }
+            other => panic!("expected synthetic ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_backfills_only_missing_leg_of_parallel_batch() {
+        // Parallel tool batch where one leg's result was lost: keep the
+        // real result, back-fill only the orphan.
+        let mut ms = vec![
+            user("go"),
+            tool_calls(&["a", "b"]),
+            tool_result("a"), // b's result is missing
+            asst("next"),
+        ];
+        assert_eq!(sanitize_tool_pairing(&mut ms), 1);
+        assert!(!needs_tool_pairing_repair(&ms));
+        let real = ms
+            .iter()
+            .find(|m| result_call_id(m) == Some("a"))
+            .unwrap();
+        assert!(matches!(&real.content, Content::ToolResult { is_error, .. } if !*is_error));
+        let synth = ms
+            .iter()
+            .find(|m| result_call_id(m) == Some("b"))
+            .unwrap();
+        assert!(matches!(&synth.content, Content::ToolResult { is_error, .. } if *is_error));
+    }
+
+    #[test]
+    fn sanitize_drops_stray_result() {
+        let mut ms = vec![
+            user("go"),
+            tool_result("ghost"), // result with no issuing call
+            asst("done"),
+        ];
+        assert!(needs_tool_pairing_repair(&ms));
+        assert_eq!(sanitize_tool_pairing(&mut ms), 1);
+        assert!(!needs_tool_pairing_repair(&ms));
+        assert!(ms.iter().all(|m| result_call_id(m).is_none()));
+        assert_eq!(ms.len(), 2);
     }
 }

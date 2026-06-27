@@ -2139,6 +2139,27 @@ pub async fn run(
     } else {
         Vec::new()
     };
+    // Heal any orphaned tool call / stray tool result in the loaded
+    // history before the first provider request. A torn write (crash,
+    // turn-timeout SIGKILL, or two adapters briefly sharing one
+    // smith.jsonl) can persist an assistant tool-call line without its
+    // result; replayed verbatim that one record 400s every codex/openai
+    // request and wedges the session permanently. Rewrite the on-disk
+    // copy too so the repair sticks across future resumes.
+    {
+        let repaired = context::sanitize_tool_pairing(&mut messages);
+        if repaired > 0 {
+            tracing::warn!(
+                repaired,
+                "smith resume: repaired orphaned tool-call pairing in loaded history"
+            );
+            if let Some(p) = persist.as_mut() {
+                if let Err(e) = p.rewrite(&messages) {
+                    tracing::warn!(error = ?e, "smith resume: persist rewrite after repair failed");
+                }
+            }
+        }
+    }
     // Intentionally silent on resume — the prior PTY state is still
     // visible to the user; no need for a meta-narration line.
     let _ = resuming; // referenced above
