@@ -7217,6 +7217,7 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let super_mod = key.modifiers.contains(KeyModifiers::SUPER);
         match key.code {
             KeyCode::Esc if self.canvas_smart_clip_active() => self.cancel_canvas_smart_clip(),
             // Esc only cancels the transient smart-clip picker (above); it is
@@ -7232,6 +7233,16 @@ impl App {
                 self.move_canvas_smart_clip_selection(1)
             }
             KeyCode::Char(' ') if ctrl => self.begin_canvas_selection(),
+            KeyCode::Char('g') if ctrl => {
+                // C-g cancels: dismiss the transient smart-clip picker and
+                // clear any active C-Space selection mark. No-op when neither
+                // is active. Like Esc, it is deliberately NOT a canvas-hide
+                // affordance — it never closes or mutates the surface.
+                self.cancel_canvas_smart_clip();
+                if let Some(popup) = self.canvas_popup.as_mut() {
+                    popup.selection = None;
+                }
+            }
             KeyCode::Char('a') if ctrl => {
                 if let Some(popup) = self.canvas_popup.as_mut() {
                     popup.cursor = canvas_line_start(&popup.buffer, popup.cursor);
@@ -7261,6 +7272,22 @@ impl App {
             KeyCode::Char('v') if ctrl => self.paste_canvas_clipboard(),
             KeyCode::Char('y') if ctrl => self.paste_canvas_clipboard(),
             KeyCode::Char('w') if ctrl => self.cut_canvas_selection(),
+            // M-w is emacs kill-ring-save: copy the selection, never delete.
+            KeyCode::Char('w') if alt => self.copy_canvas_selection_and_deactivate(),
+            // Cmd-C / Ctrl-C also copy, but only when a selection exists so we
+            // don't disturb existing behavior otherwise (plain C-c stays a
+            // no-op here; the C-x C-c quit chord is consumed earlier in
+            // handle_canvas_global_key, and bare Cmd-C still self-inserts 'c').
+            KeyCode::Char('c')
+                if (ctrl || super_mod)
+                    && self
+                        .canvas_popup
+                        .as_ref()
+                        .and_then(Self::canvas_selection_range)
+                        .is_some() =>
+            {
+                self.copy_canvas_selection_and_deactivate()
+            }
             KeyCode::Char('d') if ctrl => self.delete_canvas_forward(),
             KeyCode::Char('h') if ctrl => self.delete_canvas_back(),
             KeyCode::Char('k') if ctrl => self.cut_canvas_line(),
@@ -7520,6 +7547,17 @@ impl App {
         };
         if !text.is_empty() {
             self.copy_canvas_text(&text, "copy");
+        }
+    }
+
+    /// Keyboard copy chords (M-w, Cmd-C, Ctrl-C). Copies the active selection
+    /// to both the system clipboard and the internal `canvas_clipboard` exactly
+    /// like the mouse-drag path, then clears the mark — emacs `kill-ring-save`.
+    /// The buffer is never mutated; a no-op when there is no selection.
+    fn copy_canvas_selection_and_deactivate(&mut self) {
+        self.copy_canvas_selection();
+        if let Some(popup) = self.canvas_popup.as_mut() {
+            popup.selection = None;
         }
     }
 
@@ -10470,6 +10508,113 @@ mod tests {
 
         assert!(app.canvas_popup.is_some());
         assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_ctrl_g_clears_active_selection() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
+        app.begin_canvas_selection();
+        app.move_canvas_cursor(3);
+        assert!(
+            app.canvas_popup.as_ref().unwrap().selection.is_some(),
+            "selection should be active before C-g"
+        );
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert!(popup.selection.is_none(), "C-g should clear the selection");
+        // Cancelling the mark must not mutate the buffer or move text around.
+        assert_eq!(popup.buffer, "abcdef");
+        assert_eq!(app.canvas_clipboard, None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_ctrl_g_dismisses_smart_clip_picker() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        // Typing the trigger opens the inline smart-clip picker.
+        app.insert_canvas_text("@");
+        assert!(app.canvas_smart_clip_active(), "typing @ opens the picker");
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+
+        assert!(!app.canvas_smart_clip_active(), "C-g dismisses the picker");
+        assert!(app.canvas_popup.is_some(), "C-g must not close the canvas");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_meta_w_copies_selection_without_mutating() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
+        app.begin_canvas_selection();
+        app.move_canvas_cursor(3);
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT))
+            .await;
+
+        // M-w is kill-ring-save: it copies but never deletes.
+        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "abcdef", "M-w must not mutate the buffer");
+        assert!(popup.selection.is_none(), "M-w deactivates the selection");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_ctrl_c_copies_selection_like_meta_w() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
+        app.begin_canvas_selection();
+        app.move_canvas_cursor(3);
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await;
+
+        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "abcdef", "C-c must not mutate the buffer");
+        assert!(popup.selection.is_none(), "C-c deactivates the selection");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_super_c_copies_selection_like_meta_w() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
+        app.begin_canvas_selection();
+        app.move_canvas_cursor(3);
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .await;
+
+        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "abcdef", "Cmd-C must not mutate the buffer");
+        assert!(popup.selection.is_none(), "Cmd-C deactivates the selection");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_copy_with_no_selection_is_noop() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
+
+        // No active selection: M-w and C-c must not panic, must not copy, and
+        // must leave the buffer untouched.
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await;
+
+        assert_eq!(app.canvas_clipboard, None, "nothing should be copied");
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abcdef");
         server.abort();
     }
 
