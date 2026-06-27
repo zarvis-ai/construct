@@ -373,6 +373,7 @@ pub const MODEL_COMPLETIONS: &[&str] = &[
     // ChatGPT subscription / Codex CLI OAuth path.
     "codex-oauth:gpt-5.5",
     "codex-oauth:gpt-5.4-mini",
+    "codex-oauth:gpt-5.3-codex-spark",
     // OpenAI platform API path.
     "openai:gpt-5.5",
     "openai:gpt-5",
@@ -493,7 +494,7 @@ mod tests {
         let matches = model_completion_matches("/model codex-oauth:gpt-5.");
         assert_eq!(
             matches,
-            vec!["/model codex-oauth:gpt-5.5", "/model codex-oauth:gpt-5.4-mini"]
+            vec!["/model codex-oauth:gpt-5.5", "/model codex-oauth:gpt-5.4-mini", "/model codex-oauth:gpt-5.3-codex-spark"]
         );
 
         let matches = model_completion_matches("/model claude-oauth:");
