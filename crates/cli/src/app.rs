@@ -1335,6 +1335,7 @@ pub struct CanvasPopup {
     pub preferred_col: Option<usize>,
     pub selection: Option<CanvasSelection>,
     pub smart_clip: Option<CanvasSmartClipSearch>,
+    pub search: Option<CanvasSearch>,
     pub revealed_at: Instant,
     pub hide_after: Instant,
     pub closing: bool,
@@ -1464,6 +1465,14 @@ pub struct CanvasSelection {
 #[derive(Debug, Clone)]
 pub struct CanvasSmartClipSearch {
     pub trigger_start: usize,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct CanvasSearch {
+    pub anchor_cursor: usize,
+    pub query: String,
+    pub matches: Vec<(usize, usize)>,
     pub selected: usize,
 }
 
@@ -7607,6 +7616,22 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let super_mod = key.modifiers.contains(KeyModifiers::SUPER);
+        if self.canvas_search_active() {
+            match key.code {
+                KeyCode::Esc => self.cancel_canvas_search(),
+                KeyCode::Char('g') if ctrl => self.cancel_canvas_search(),
+                KeyCode::Char('s') if ctrl => self.move_canvas_search_match(1),
+                KeyCode::Char('r') if ctrl => self.move_canvas_search_match(-1),
+                KeyCode::Enter => self.accept_canvas_search(),
+                KeyCode::Backspace => self.delete_canvas_search_query_char(),
+                KeyCode::Char(c) if !ctrl && !alt && !super_mod => {
+                    self.append_canvas_search_query_char(c)
+                }
+                _ => {}
+            }
+            self.follow_canvas_scroll();
+            return;
+        }
         match key.code {
             KeyCode::Esc if self.canvas_smart_clip_active() => self.cancel_canvas_smart_clip(),
             // Esc only cancels the transient smart-clip picker (above); it is
@@ -7640,6 +7665,7 @@ impl App {
                     Self::update_canvas_smart_clip_after_cursor_move(popup);
                 }
             }
+            KeyCode::Char('s') if ctrl => self.begin_canvas_search(),
             KeyCode::Char('e') if ctrl => {
                 if let Some(popup) = self.canvas_popup.as_mut() {
                     popup.cursor = canvas_line_end(&popup.buffer, popup.cursor);
@@ -7841,6 +7867,115 @@ impl App {
             dragged: false,
         });
         self.set_status("canvas selection started".to_string());
+    }
+
+    fn canvas_search_active(&self) -> bool {
+        self.canvas_popup
+            .as_ref()
+            .and_then(|popup| popup.search.as_ref())
+            .is_some()
+    }
+
+    fn begin_canvas_search(&mut self) {
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        popup.search = Some(CanvasSearch {
+            anchor_cursor: popup.cursor,
+            query: String::new(),
+            matches: Vec::new(),
+            selected: 0,
+        });
+        popup.smart_clip = None;
+        popup.selection = None;
+    }
+
+    fn append_canvas_search_query_char(&mut self, ch: char) {
+        {
+            let Some(popup) = self.canvas_popup.as_mut() else {
+                return;
+            };
+            let Some(search) = popup.search.as_mut() else {
+                return;
+            };
+            search.query.push(ch);
+        }
+        self.update_canvas_search_after_edit();
+    }
+
+    fn delete_canvas_search_query_char(&mut self) {
+        {
+            let Some(popup) = self.canvas_popup.as_mut() else {
+                return;
+            };
+            let Some(search) = popup.search.as_mut() else {
+                return;
+            };
+            search.query.pop();
+        }
+        self.update_canvas_search_after_edit();
+    }
+
+    fn update_canvas_search_after_edit(&mut self) {
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        let Some(search) = popup.search.as_mut() else {
+            return;
+        };
+        search.matches = if search.query.is_empty() {
+            Vec::new()
+        } else {
+            canvas_search_matches(&popup.buffer, &search.query)
+        };
+        if search.matches.is_empty() {
+            search.selected = 0;
+            popup.cursor = search.anchor_cursor;
+        } else {
+            let anchor_match = search
+                .matches
+                .iter()
+                .position(|(start, _)| *start >= search.anchor_cursor);
+            search.selected = anchor_match.unwrap_or(0);
+            popup.cursor = search.matches[search.selected].0;
+        }
+        popup.preferred_col = None;
+    }
+
+    fn move_canvas_search_match(&mut self, delta: isize) {
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        let Some(search) = popup.search.as_mut() else {
+            return;
+        };
+        if search.matches.is_empty() {
+            popup.cursor = search.anchor_cursor;
+            return;
+        }
+        let count = search.matches.len() as isize;
+        let selected = (search.selected as isize + delta).rem_euclid(count) as usize;
+        popup.cursor = search.matches[selected].0;
+        search.selected = selected;
+        popup.preferred_col = None;
+    }
+
+    fn accept_canvas_search(&mut self) {
+        if let Some(popup) = self.canvas_popup.as_mut() {
+            popup.search = None;
+            popup.smart_clip = None;
+        }
+    }
+
+    fn cancel_canvas_search(&mut self) {
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        if let Some(search) = popup.search.take() {
+            popup.cursor = search.anchor_cursor;
+            popup.preferred_col = None;
+            popup.smart_clip = None;
+        }
     }
 
     fn canvas_smart_clip_active(&self) -> bool {
@@ -10390,6 +10525,30 @@ fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<
     Some(query)
 }
 
+fn canvas_search_matches(buffer: &str, query: &str) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query_chars = query.chars().count();
+    let query_bytes = query.len();
+    let mut out = Vec::new();
+    let mut start_b = 0usize;
+    while start_b <= buffer.len() {
+        let Some(slice) = buffer.get(start_b..) else {
+            break;
+        };
+        let Some(offset) = slice.find(query) else {
+            break;
+        };
+        let match_start_b = start_b + offset;
+        let match_end_b = match_start_b + query_bytes;
+        let char_start = buffer[..match_start_b].chars().count();
+        out.push((char_start, char_start + query_chars));
+        start_b = match_end_b;
+    }
+    out
+}
+
 fn canvas_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
     if canvas_smart_clip_instance_id(clip).is_some() {
         return clip.to_string();
@@ -10561,6 +10720,7 @@ fn canvas_popup_from_document(
         preferred_col: None,
         selection: None,
         smart_clip: None,
+        search: None,
         revealed_at: now,
         hide_after: now + Duration::from_secs(365 * 24 * 60 * 60),
         closing: false,
@@ -11057,6 +11217,7 @@ mod tests {
             preferred_col: None,
             selection: None,
             smart_clip: None,
+            search: None,
             revealed_at: now,
             hide_after: now + Duration::from_secs(60),
             closing: false,
@@ -11458,7 +11619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_s_is_not_a_save_shortcut() {
+    async fn canvas_ctrl_s_starts_canvas_search() {
         let (mut app, _dir, server) = empty_app().await;
         app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
         app.canvas_popup.as_mut().unwrap().buffer = "draft changed".to_string();
@@ -11473,6 +11634,109 @@ mod tests {
         let popup = app.canvas_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "draft changed");
         assert_eq!(popup.saved_markdown, "draft");
+        assert!(popup.search.is_some(), "C-s starts canvas search");
+        assert_eq!(popup.search.as_ref().unwrap().query, "");
+        assert!(popup.search.as_ref().unwrap().matches.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_incremental_search_navigates_matches() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta alpha", 0));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        let search = popup.search.as_ref().expect("search active");
+        assert_eq!(search.query, "alpha");
+        assert_eq!(search.matches, vec![(0, 5), (11, 16)]);
+        assert_eq!(search.selected, 0);
+        assert_eq!(popup.cursor, 0);
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await;
+        let popup = app.canvas_popup.as_ref().unwrap();
+        let search = popup.search.as_ref().expect("search still active");
+        assert_eq!(search.selected, 1);
+        assert_eq!(popup.cursor, 11);
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+            .await;
+        let popup = app.canvas_popup.as_ref().unwrap();
+        let search = popup.search.as_ref().expect("search still active");
+        assert_eq!(search.selected, 0);
+        assert_eq!(popup.cursor, 0);
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert!(app.canvas_popup.as_ref().unwrap().search.is_none());
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_incremental_search_starts_at_or_after_anchor_cursor() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "one alpha two alpha", 10));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        let search = popup.search.as_ref().expect("search active");
+        assert_eq!(search.query, "alpha");
+        assert_eq!(search.matches, vec![(4, 9), (14, 19)]);
+        assert_eq!(search.selected, 1);
+        assert_eq!(popup.cursor, 14);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_incremental_search_cancel_restores_anchor_cursor() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha alpha", 6));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+            .await;
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 0);
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert!(popup.search.is_none(), "C-g exits search");
+        assert_eq!(popup.cursor, 6);
         server.abort();
     }
 

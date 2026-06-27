@@ -5640,7 +5640,28 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         String::new()
     };
-    let status = app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or("");
+    let mut search_status = None;
+    if let Some(search) = app.canvas_popup.as_ref().and_then(|popup| popup.search.as_ref()) {
+        let selected = if search.matches.is_empty() {
+            0
+        } else {
+            search.selected.min(search.matches.len().saturating_sub(1)) + 1
+        };
+        search_status = Some(if search.matches.is_empty() {
+            if search.query.is_empty() {
+                "I-search: ".to_string()
+            } else {
+                format!("Failing I-search: {}", search.query)
+            }
+        } else if search.query.is_empty() {
+            format!("I-search ({selected}/{})", search.matches.len())
+        } else {
+            format!("I-search: {} ({selected}/{})", search.query, search.matches.len())
+        });
+    }
+    let status = search_status
+        .as_deref()
+        .unwrap_or_else(|| app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or(""));
     let empty_hint = if s.is_none() && app.list_items().is_empty() && status.is_empty() {
         "new: C-x C-f  help: ?  palette: C-x x"
     } else {
@@ -7412,7 +7433,16 @@ fn render_canvas_popup_at(
     f.render_widget(block, rect);
 
     let selection = canvas_selection_range(popup);
-    let mut lines = render_canvas_markdown_lines(app, &popup.buffer, selection);
+    let search = popup.search.as_ref().filter(|search| !search.matches.is_empty());
+    let search_matches = search.map(|search| search.matches.as_slice());
+    let search_selected = search.map(|search| search.selected);
+    let mut lines = render_canvas_markdown_lines(
+        app,
+        &popup.buffer,
+        selection,
+        search_matches,
+        search_selected,
+    );
     // Run shimmer (spec 0042): while a canvas Run is executing for this session,
     // sweep a highlight through the blocks that have not settled yet.
     if let Some(shimmer) = canvas_run_shimmer(app, popup, now) {
@@ -8760,6 +8790,8 @@ fn render_canvas_markdown_lines<'a>(
     app: &App,
     markdown: &'a str,
     selection: Option<(usize, usize)>,
+    search_matches: Option<&'a [(usize, usize)]>,
+    search_selected: Option<usize>,
 ) -> Vec<Line<'a>> {
     let mut out = Vec::new();
     let mut line_start = 0usize;
@@ -8775,6 +8807,8 @@ fn render_canvas_markdown_lines<'a>(
                 trimmed,
                 line_start + leading,
                 selection,
+                search_matches,
+                search_selected,
             ));
         } else if let Some(rest) = trimmed
             .strip_prefix("- ")
@@ -8790,6 +8824,8 @@ fn render_canvas_markdown_lines<'a>(
                 rest,
                 line_start + leading + 2,
                 selection,
+                search_matches,
+                search_selected,
             ));
             out.push(Line::from(spans));
         } else if let Some(rest) = trimmed.strip_prefix(":::clip") {
@@ -8808,7 +8844,12 @@ fn render_canvas_markdown_lines<'a>(
             )));
         } else {
             out.push(Line::from(render_canvas_inline_spans(
-                app, raw, line_start, selection,
+                app,
+                raw,
+                line_start,
+                selection,
+                search_matches,
+                search_selected,
             )));
         }
         line_start += raw.chars().count() + 1;
@@ -8828,20 +8869,30 @@ fn canvas_heading_level(trimmed: &str) -> Option<u8> {
     }
 }
 
-fn render_canvas_heading_line(
+fn render_canvas_heading_line<'a>(
     theme: &Theme,
     level: u8,
-    text: &str,
+    text: &'a str,
     base: usize,
     selection: Option<(usize, usize)>,
-) -> Line<'static> {
+    search_matches: Option<&'a [(usize, usize)]>,
+    search_selected: Option<usize>,
+) -> Line<'a> {
     let fg = match level {
         1 => theme.accent,
         2 => theme.accent_alt,
         _ => theme.info,
     };
     let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
-    Line::from(canvas_text_spans(theme, text, base, style, selection))
+    Line::from(canvas_text_spans(
+        theme,
+        text,
+        base,
+        style,
+        selection,
+        search_matches,
+        search_selected,
+    ))
 }
 
 fn render_canvas_inline_spans<'a>(
@@ -8849,6 +8900,8 @@ fn render_canvas_inline_spans<'a>(
     text: &'a str,
     base: usize,
     selection: Option<(usize, usize)>,
+    search_matches: Option<&'a [(usize, usize)]>,
+    search_selected: Option<usize>,
 ) -> Vec<Span<'a>> {
     let mut spans = Vec::new();
     let mut rest = text;
@@ -8862,6 +8915,8 @@ fn render_canvas_inline_spans<'a>(
                 base + offset,
                 Style::default().fg(app.theme.text),
                 selection,
+                search_matches,
+                search_selected,
             ));
         }
         let after_marker = &after_start[2..];
@@ -8872,6 +8927,8 @@ fn render_canvas_inline_spans<'a>(
                 base + offset + before.chars().count(),
                 Style::default().fg(app.theme.text),
                 selection,
+                search_matches,
+                search_selected,
             ));
             return spans;
         };
@@ -8883,11 +8940,13 @@ fn render_canvas_inline_spans<'a>(
     if !rest.is_empty() {
         spans.extend(canvas_text_spans(
             &app.theme,
-            rest,
-            base + offset,
-            Style::default().fg(app.theme.text),
-            selection,
-        ));
+        rest,
+        base + offset,
+        Style::default().fg(app.theme.text),
+        selection,
+        search_matches,
+        search_selected,
+    ));
     }
     spans
 }
@@ -8898,33 +8957,83 @@ fn canvas_text_spans<'a>(
     base: usize,
     style: Style,
     selection: Option<(usize, usize)>,
+    search_matches: Option<&'a [(usize, usize)]>,
+    search_selected: Option<usize>,
 ) -> Vec<Span<'a>> {
-    let Some((sel_start, sel_end)) = selection else {
-        return vec![Span::styled(text.to_string(), style)];
-    };
     let mut spans = Vec::new();
     let mut chunk = String::new();
     let mut chunk_selected: Option<bool> = None;
+    let mut chunk_in_match: Option<bool> = None;
+    let mut chunk_in_active_match: Option<bool> = None;
     for (idx, ch) in text.chars().enumerate() {
-        let selected = base + idx >= sel_start && base + idx < sel_end;
-        if chunk_selected.is_some_and(|current| current != selected) {
-            let mut chunk_style = style;
-            if chunk_selected == Some(true) {
-                chunk_style = chunk_style.bg(theme.inactive_highlight_bg);
+        let absolute_idx = base + idx;
+        let match_idx = search_matches.and_then(|matches| canvas_search_match_index(matches, absolute_idx));
+        let in_match = Some(match_idx.is_some());
+        let in_active_match = Some(search_selected.is_some_and(|selected| Some(selected) == match_idx));
+        let selected = selection.map(|(sel_start, sel_end)| absolute_idx >= sel_start && absolute_idx < sel_end);
+        if chunk_selected.is_some_and(|current| Some(current) != selected)
+            || chunk_in_match.is_some_and(|current| Some(current) != in_match)
+            || chunk_in_active_match.is_some_and(|current| Some(current) != in_active_match)
+        {
+            if !chunk.is_empty() {
+                spans.push(Span::styled(
+                    std::mem::take(&mut chunk),
+                    canvas_text_span_style(
+                        theme,
+                        style,
+                        chunk_selected,
+                        chunk_in_match,
+                        chunk_in_active_match,
+                    ),
+                ));
             }
-            spans.push(Span::styled(std::mem::take(&mut chunk), chunk_style));
         }
-        chunk_selected = Some(selected);
+        chunk_selected = selected;
+        chunk_in_match = in_match;
+        chunk_in_active_match = in_active_match;
         chunk.push(ch);
     }
     if !chunk.is_empty() {
-        let mut chunk_style = style;
-        if chunk_selected == Some(true) {
-            chunk_style = chunk_style.bg(theme.inactive_highlight_bg);
-        }
-        spans.push(Span::styled(chunk, chunk_style));
+        spans.push(Span::styled(
+            chunk,
+            canvas_text_span_style(
+                theme,
+                style,
+                chunk_selected,
+                chunk_in_match,
+                chunk_in_active_match,
+            ),
+        ));
     }
     spans
+}
+
+fn canvas_text_span_style(
+    theme: &Theme,
+    mut style: Style,
+    selected: Option<bool>,
+    in_match: Option<bool>,
+    in_active_match: Option<bool>,
+) -> Style {
+    if in_active_match.unwrap_or(false) {
+        style = style
+            .fg(theme.highlight_fg)
+            .bg(theme.highlight_bg)
+            .add_modifier(Modifier::BOLD);
+    } else if in_match.unwrap_or(false) {
+        style = style.bg(theme.highlight_bg);
+    }
+    if selected.unwrap_or(false) {
+        style = style.bg(theme.inactive_highlight_bg);
+    }
+    style
+}
+
+fn canvas_search_match_index(matches: &[(usize, usize)], idx: usize) -> Option<usize> {
+    matches
+        .iter()
+        .enumerate()
+        .find_map(|(i, &(start, end))| (idx >= start && idx < end).then_some(i))
 }
 
 fn canvas_smart_clip_span<'a>(app: &App, raw_clip: &str) -> Span<'a> {
@@ -9594,7 +9703,7 @@ mod tests {
     fn canvas_heading_rendering_keeps_markdown_marker() {
         let theme = Theme::default();
         assert_eq!(
-            line_text(&render_canvas_heading_line(&theme, 1, "# Todo", 0, None)),
+            line_text(&render_canvas_heading_line(&theme, 1, "# Todo", 0, None, None, None)),
             "# Todo"
         );
         assert_eq!(
@@ -9603,10 +9712,40 @@ mod tests {
                 2,
                 "## Progress",
                 0,
+                None,
+                None,
                 None
             )),
             "## Progress"
         );
+    }
+
+    #[test]
+    fn canvas_text_spans_highlights_search_matches() {
+        let theme = Theme::default();
+        let spans = canvas_text_spans(
+            &theme,
+            "alpha alpha",
+            0,
+            Style::default().fg(theme.text),
+            None,
+            Some(&[(0, 5), (6, 11)]),
+            Some(1),
+        );
+        let mut inactive_highlight = false;
+        let mut active_highlight = false;
+        for span in spans {
+            if span.content.as_ref() != "alpha" {
+                continue;
+            }
+            if span.style.bg == Some(theme.highlight_bg) && span.style.fg == Some(theme.highlight_fg) {
+                active_highlight = true;
+            } else if span.style.bg == Some(theme.highlight_bg) {
+                inactive_highlight = true;
+            }
+        }
+        assert!(active_highlight, "selected match should be bold + highlighted");
+        assert!(inactive_highlight, "non-active match should still be highlighted");
     }
 
     #[test]
