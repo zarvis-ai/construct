@@ -79,11 +79,13 @@ pub enum ListItem {
 }
 
 /// A region of the session list whose archived sessions can be revealed
-/// independently: the ungrouped top-level run, or a specific project.
+/// independently: the ungrouped top-level run, a specific project, or one
+/// parent session's subagents.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ArchiveSection {
     Ungrouped,
     Group(String),
+    Subagents(String),
 }
 
 fn is_user_list_session(s: &SessionSummary) -> bool {
@@ -105,14 +107,21 @@ fn selection_is_valid_for_sessions(
             .iter()
             .any(|s| s.id == *id && is_user_list_session(s)),
         Selection::Group(id) => groups.iter().any(|g| g.id == *id),
-        Selection::ArchivedRow(section) => sessions.iter().any(|s| {
-            is_user_list_session(s)
-                && s.archived
-                && match section {
-                    ArchiveSection::Ungrouped => s.group_id.is_none(),
-                    ArchiveSection::Group(id) => s.group_id.as_deref() == Some(id.as_str()),
-                }
-        }),
+        Selection::ArchivedRow(section) => match section {
+            ArchiveSection::Ungrouped => sessions
+                .iter()
+                .any(|s| is_user_list_session(s) && s.archived && s.group_id.is_none()),
+            ArchiveSection::Group(id) => sessions.iter().any(|s| {
+                is_user_list_session(s)
+                    && s.archived
+                    && s.group_id.as_deref() == Some(id.as_str())
+            }),
+            ArchiveSection::Subagents(parent_id) => sessions.iter().any(|s| {
+                is_subagent_session(s)
+                    && s.archived
+                    && s.parent_session_id.as_deref() == Some(parent_id.as_str())
+            }),
+        },
     }
 }
 
@@ -884,6 +893,9 @@ pub struct App {
     /// each project's "N archived" row. Ephemeral, like
     /// [`Self::show_archived_ungrouped`].
     pub show_archived_groups: HashSet<String>,
+    /// Parent session ids whose archived subagents are currently revealed.
+    /// Ephemeral, like the other archived disclosure state.
+    pub show_archived_subagents: HashSet<String>,
     /// Hide left, right, and bottom border lines for list/view/pin panes.
     pub hide_pane_side_borders: bool,
     /// Last rendered frame, one string per terminal row. Mouse drag
@@ -1966,6 +1978,7 @@ async fn run_with_socket_initial_selection(
         matrix_rain_hidden: persisted.matrix_rain_hidden,
         show_archived_ungrouped: false,
         show_archived_groups: HashSet::new(),
+        show_archived_subagents: HashSet::new(),
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
         text_selection: None,
@@ -3071,13 +3084,37 @@ impl App {
             });
             if children_expanded {
                 if let Some(children) = children {
-                    for child in children {
+                    let (active_children, archived_children): (
+                        Vec<&SessionSummary>,
+                        Vec<&SessionSummary>,
+                    ) = children.iter().copied().partition(|child| !child.archived);
+                    for child in active_children {
                         out.push(ListItem::Session {
-                            summary: (*child).clone(),
+                            summary: child.clone(),
                             indented: true,
                             has_children: false,
                             children_expanded: false,
                         });
+                    }
+                    if !archived_children.is_empty() {
+                        let section = ArchiveSection::Subagents(s.id.clone());
+                        let expanded = self.show_archived_subagents.contains(&s.id);
+                        out.push(ListItem::ArchivedRow {
+                            section,
+                            count: archived_children.len(),
+                            expanded,
+                            indented: true,
+                        });
+                        if expanded {
+                            for child in archived_children {
+                                out.push(ListItem::Session {
+                                    summary: child.clone(),
+                                    indented: true,
+                                    has_children: false,
+                                    children_expanded: false,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -3165,6 +3202,7 @@ impl App {
         match section {
             ArchiveSection::Ungrouped => self.show_archived_ungrouped,
             ArchiveSection::Group(id) => self.show_archived_groups.contains(id),
+            ArchiveSection::Subagents(id) => self.show_archived_subagents.contains(id),
         }
     }
 
@@ -3182,6 +3220,13 @@ impl App {
                     self.show_archived_groups.insert(id.clone())
                 } else {
                     self.show_archived_groups.remove(id)
+                }
+            }
+            ArchiveSection::Subagents(id) => {
+                if revealed {
+                    self.show_archived_subagents.insert(id.clone())
+                } else {
+                    self.show_archived_subagents.remove(id)
                 }
             }
         }
@@ -8470,7 +8515,10 @@ impl App {
                     // Inherit the archived row's section so a new session
                     // created "inside" a project stays in it.
                     Selection::ArchivedRow(ArchiveSection::Group(gid)) => Some(gid.clone()),
-                    Selection::ArchivedRow(ArchiveSection::Ungrouped) | Selection::None => None,
+                    Selection::ArchivedRow(
+                        ArchiveSection::Ungrouped | ArchiveSection::Subagents(_),
+                    )
+                    | Selection::None => None,
                 };
                 let params = agentd_protocol::CreateSessionParams {
                     harness: harness.clone(),
@@ -10349,6 +10397,7 @@ mod tests {
             matrix_rain_hidden: false,
             show_archived_ungrouped: false,
             show_archived_groups: HashSet::new(),
+            show_archived_subagents: HashSet::new(),
             hide_pane_side_borders: true,
             frame_text: Vec::new(),
             text_selection: None,
@@ -13839,6 +13888,81 @@ mod tests {
             }
             _ => panic!("expected collapsed parent session"),
         }
+    }
+
+    #[tokio::test]
+    async fn archived_subagents_render_under_parent_archived_row() {
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let _server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut parent = summary_with_kind(agentd_protocol::SessionKind::User);
+        parent.id = "sparent".into();
+        parent.position = 0;
+        let mut active_child = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        active_child.id = "sactive-child".into();
+        active_child.parent_session_id = Some("sparent".into());
+        active_child.position = 0;
+        let mut archived_child = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        archived_child.id = "sarchived-child".into();
+        archived_child.parent_session_id = Some("sparent".into());
+        archived_child.position = 1;
+        archived_child.archived = true;
+
+        let mut app = test_app(client, vec![archived_child, active_child, parent]);
+        let items = app.list_items();
+        assert_eq!(items.len(), 3);
+        assert!(
+            matches!(&items[0], ListItem::Session { summary, has_children: true, children_expanded: true, .. } if summary.id == "sparent")
+        );
+        assert!(
+            matches!(&items[1], ListItem::Session { summary, indented: true, .. } if summary.id == "sactive-child"),
+            "active subagent should remain ungrouped under its parent",
+        );
+        match &items[2] {
+            ListItem::ArchivedRow {
+                section,
+                count,
+                expanded,
+                indented,
+            } => {
+                assert_eq!(*section, ArchiveSection::Subagents("sparent".into()));
+                assert_eq!(*count, 1);
+                assert!(!*expanded, "archived subagent row starts collapsed");
+                assert!(*indented, "archived subagent row is nested under parent");
+            }
+            other => panic!("expected archived subagent disclosure row, got {other:?}"),
+        }
+
+        app.focus = PaneFocus::List;
+        app.selection = Selection::ArchivedRow(ArchiveSection::Subagents("sparent".into()));
+        app.run_action(KeyAction::ExpandGroup).await;
+        let expanded = app.list_items();
+        assert_eq!(expanded.len(), 4);
+        assert!(matches!(
+            &expanded[2],
+            ListItem::ArchivedRow { expanded: true, .. }
+        ));
+        assert!(
+            matches!(&expanded[3], ListItem::Session { summary, indented: true, .. } if summary.id == "sarchived-child" && summary.archived),
+            "expanded archived subagent should follow its disclosure row",
+        );
+
+        app.run_action(KeyAction::CollapseGroup).await;
+        assert_eq!(app.list_items().len(), 3);
+        assert_eq!(
+            app.selection,
+            Selection::ArchivedRow(ArchiveSection::Subagents("sparent".into()))
+        );
     }
 
     #[tokio::test]

@@ -1424,16 +1424,20 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     ]))
                 }
                 AppListItem::ArchivedRow {
+                    section,
                     count,
                     expanded,
                     indented,
-                    ..
                 } => {
                     // Expandable footer: "▸ N archived" (collapsed) /
                     // "▾ N archived" (open). Indented to sit under a project's
                     // members; flush-left for the ungrouped section.
                     let disclosure = if *expanded { "▾" } else { "▸" };
-                    let indent = if *indented { "  " } else { "" };
+                    let indent = match section {
+                        crate::app::ArchiveSection::Subagents(_) => "    ",
+                        crate::app::ArchiveSection::Group(_) if *indented => "  ",
+                        _ => "",
+                    };
                     ListItem::new(Line::from(Span::styled(
                         format!("{indent}{disclosure} {count} archived"),
                         Style::default()
