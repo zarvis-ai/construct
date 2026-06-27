@@ -11159,6 +11159,29 @@ mod tests {
             glyph == "□" || glyph == "■",
             "widget icon glyph should paint at its hit cell: {glyph:?}"
         );
+
+        // New right-cluster ordering, left→right: [Run] [widgets] [x]. The
+        // close button is the rightmost control, mirroring the chat view.
+        let run = app
+            .layout
+            .canvas_title_run_hit
+            .expect("run hit registered");
+        assert!(
+            run.1 <= w.start_col,
+            "run {run:?} should sit left of the widget icon at {}",
+            w.start_col
+        );
+        assert!(
+            w.end_col <= close.0,
+            "widget icon (..{}) should sit left of close {close:?}",
+            w.end_col
+        );
+        let modal = app.layout.modal_area.expect("modal area");
+        assert_eq!(
+            close.1,
+            modal.x + modal.width - 1,
+            "close should be the rightmost control: {close:?}"
+        );
         server.abort();
     }
 
@@ -11221,6 +11244,116 @@ mod tests {
         assert!(
             app.dynamic_ui_panel_pinned("s1", "w1"),
             "clicking the title-bar widget indicator should pin the widget"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_title_run_button_click_runs_canvas() {
+        use agentd_protocol::ipc_method;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let _ = seen_tx.send((method.clone(), params.clone()));
+                let canvas = serde_json::json!({
+                    "session_id": "s1",
+                    "markdown": "alpha",
+                    "version": 2,
+                    "updated_at_ms": 0,
+                    "template_id": null,
+                });
+                let result = match method.as_str() {
+                    ipc_method::CANVAS_EXECUTE => {
+                        serde_json::json!({ "canvas": canvas, "prompt": "sent" })
+                    }
+                    ipc_method::CANVAS_UPDATE => serde_json::json!({ "canvas": canvas }),
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut app = test_app(client, Vec::new());
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
+        app.canvas_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+
+        let run = app
+            .layout
+            .canvas_title_run_hit
+            .expect("run hit registered");
+        let close = app
+            .layout
+            .canvas_title_close_hit
+            .expect("close hit registered");
+        // Run sits left of the close button (the rightmost control).
+        assert!(
+            run.1 <= close.0,
+            "run {run:?} should sit left of close {close:?}"
+        );
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: run.0 + 1,
+            row: run.2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        let (method, params) = seen_rx.recv().await.expect("canvas execute request");
+        assert_eq!(
+            method,
+            ipc_method::CANVAS_EXECUTE,
+            "clicking the title Run button should execute the canvas"
+        );
+        assert!(
+            params.get("selection").map(Value::is_null).unwrap_or(true),
+            "the title Run button runs the whole canvas, not a selection: {params:?}"
         );
         server.abort();
     }

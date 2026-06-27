@@ -7264,9 +7264,27 @@ fn render_canvas_popup_at(
         .find(|s| s.id == popup.canvas.session_id)
         .cloned();
     let summary_ref = summary.as_ref();
-    let title = canvas_title_line(app, popup, summary_ref, rect, active);
-    let title_run_hit = canvas_title_run_button_range(rect, summary_ref);
+
+    // Session widget indicators feed the right-cluster geometry: the Run
+    // button (and the harness label) are anchored to the left of them.
+    let widget_session_id = summary_ref.map(|s| s.id.clone()).unwrap_or_default();
+    let widget_panels = summary_ref
+        .map(|s| session_sticky_widget_panels(app, &s.id))
+        .unwrap_or_default();
+    let panel_count = widget_panels.len();
+
+    let title = canvas_title_line(app, popup, summary_ref, rect, active, panel_count);
+
+    // Right cluster, laid out right-to-left so nothing overlaps. Scanning
+    // left→right it reads `[harness] [▶ Run] [widgets] [ x ]`, matching the
+    // chat view: the close button takes the rightmost slot, the harness label
+    // stays visible to the left of Run.
+    let title_close_hit = canvas_title_close_button_range(rect, summary_ref);
+    let title_run_hit = canvas_title_run_button_range(rect, summary_ref, panel_count);
     let title_toggle_hit = canvas_title_toggle_button_range(summary_ref, rect);
+    let widget_icon_ranges = canvas_title_widget_icon_ranges(rect, summary_ref, panel_count);
+    let title_harness_hit = canvas_title_harness_range(rect, summary_ref, panel_count);
+
     let run_hovered = title_run_hit
         .zip(app.mouse_pos)
         .is_some_and(|((xs, xe, y), (mx, my))| my == y && mx >= xs && mx < xe);
@@ -7282,11 +7300,8 @@ fn render_canvas_popup_at(
         };
         Style::default().fg(fg).add_modifier(Modifier::BOLD)
     };
-    let run_right = Line::from(Span::styled(CANVAS_RUN_BUTTON, run_style))
-        .alignment(ratatui::layout::Alignment::Right);
     // Close button — same padded ` x ` glyph and hover/tooltip treatment as
-    // the Run button. Sits one cell left of Run (which is left of harness).
-    let title_close_hit = canvas_title_close_button_range(rect, summary_ref);
+    // the Run button.
     let close_hovered = title_close_hit
         .zip(app.mouse_pos)
         .is_some_and(|((xs, xe, y), (mx, my))| my == y && mx >= xs && mx < xe);
@@ -7303,15 +7318,8 @@ fn render_canvas_popup_at(
         Style::default().fg(fg).add_modifier(Modifier::BOLD)
     };
 
-    // Session widget indicators, rendered as title-bar rectangle icons to
-    // the left of the close button — the same □/■ affordance used for
-    // session widgets in the pane title bar.
-    let widget_session_id = summary_ref.map(|s| s.id.clone()).unwrap_or_default();
-    let widget_panels = summary_ref
-        .map(|s| session_sticky_widget_panels(app, &s.id))
-        .unwrap_or_default();
-    let widget_icon_ranges =
-        canvas_title_widget_icon_ranges(rect, summary_ref, widget_panels.len());
+    // Session widget indicators (□/■), painted to the left of the close button
+    // — the same affordance used for session widgets in the pane title bar.
     let widget_icons: Vec<(crate::app::DynamicUiWidgetHit, &'static str, Style)> = widget_panels
         .iter()
         .zip(widget_icon_ranges.iter())
@@ -7336,23 +7344,10 @@ fn render_canvas_popup_at(
         })
         .collect();
 
-    let harness_right = summary_ref.map(|s| {
-        Line::from(Span::styled(
-            format!(" {} ", harness_label(s)),
-            canvas_border_style(&app.theme, active),
-        ))
-        .alignment(ratatui::layout::Alignment::Right)
-    });
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(canvas_border_style(&app.theme, active))
-        .title(title)
-        .title(run_right);
-    let block = if let Some(h) = harness_right {
-        block.title(h)
-    } else {
-        block
-    };
+        .title(title);
     if active {
         app.layout.canvas_title_run_hit = title_run_hit;
         app.layout.canvas_title_toggle_hit = title_toggle_hit;
@@ -7367,16 +7362,27 @@ fn render_canvas_popup_at(
     });
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
-    // Paint the close button and widget icons directly so each glyph cell
-    // lines up exactly with its hit range. Ratatui right-aligned titles
-    // leave a variable inter-title gap that would offset a 1-cell hit.
-    if let Some((xs, _xe, y)) = title_close_hit {
-        f.buffer_mut()
-            .set_string(xs, y, CANVAS_CLOSE_BUTTON, close_style);
+    // Paint the right cluster directly so each glyph cell lines up exactly with
+    // its hit range. Ratatui right-aligned titles leave a variable inter-title
+    // gap that would offset the 1-cell hit zones.
+    if let (Some((xs, _xe, y)), Some(s)) = (title_harness_hit, summary_ref) {
+        f.buffer_mut().set_string(
+            xs,
+            y,
+            format!(" {} ", harness_label(s)),
+            canvas_border_style(&app.theme, active),
+        );
+    }
+    if let Some((xs, _xe, y)) = title_run_hit {
+        f.buffer_mut().set_string(xs, y, CANVAS_RUN_BUTTON, run_style);
     }
     for (hit, glyph, style) in &widget_icons {
         f.buffer_mut()
             .set_string(hit.start_col, hit.row, glyph, *style);
+    }
+    if let Some((xs, _xe, y)) = title_close_hit {
+        f.buffer_mut()
+            .set_string(xs, y, CANVAS_CLOSE_BUTTON, close_style);
     }
 
     let selection = canvas_selection_range(popup);
@@ -7418,17 +7424,26 @@ fn canvas_title_line<'a>(
     summary: Option<&agentd_protocol::SessionSummary>,
     rect: Rect,
     active: bool,
+    panel_count: usize,
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
     let marker_w = canvas_title_marker_width(dirty);
-    let harness_w = summary
-        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
-        .unwrap_or(0);
     let toggle_glyph = canvas_mode_glyph();
-    let label_budget = (rect.width as usize)
-        .saturating_sub(2)
-        .saturating_sub(harness_w)
-        .saturating_sub(3 + marker_w);
+    let glyph_w = UnicodeWidthStr::width(toggle_glyph);
+    // Reserve the whole right-side cluster ([harness][Run][widgets][x]) by
+    // deriving the label budget from the cluster's actual left edge, so the
+    // left-aligned session label can never overrun any right control.
+    let cluster_left = canvas_title_harness_range(rect, summary, panel_count)
+        .or_else(|| canvas_title_run_button_range(rect, summary, panel_count))
+        .or_else(|| canvas_title_close_button_range(rect, summary))
+        .map(|(xs, _, _)| xs)
+        .unwrap_or_else(|| rect.x.saturating_add(rect.width).saturating_sub(1));
+    // Left scaffolding before the label is ` <glyph> ` (2 spaces + glyph), the
+    // optional ` * modified` marker trails the label; keep a one-column gap.
+    let label_budget = (cluster_left.saturating_sub(rect.x) as usize)
+        .saturating_sub(2 + glyph_w)
+        .saturating_sub(marker_w)
+        .saturating_sub(1);
     let border_style = canvas_border_style(&app.theme, active);
     let canvas_style = canvas_toggle_style(app, popup, active);
     let modified_style = Style::default()
@@ -7494,27 +7509,42 @@ fn canvas_toggle_style(
     style.add_modifier(Modifier::BOLD)
 }
 
+/// Run-button geometry on the canvas title bar. Sits to the left of the
+/// widget-indicator strip (or the close button when there are no widgets), so
+/// the right cluster reads `[Run][widgets][x]` left-to-right. Returns
+/// `(x_start, x_end_exclusive, y)`.
 fn canvas_title_run_button_range(
     rect: Rect,
     summary: Option<&agentd_protocol::SessionSummary>,
+    panel_count: usize,
 ) -> Option<(u16, u16, u16)> {
     if rect.width < 8 {
         return None;
     }
     let run_w = UnicodeWidthStr::width(CANVAS_RUN_BUTTON) as u16;
-    let harness_w = summary
-        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()) as u16)
-        .unwrap_or(0);
-    let x_end = rect
-        .x
-        .saturating_add(rect.width)
-        .saturating_sub(1)
-        .saturating_sub(harness_w);
+    let cluster_left = canvas_title_widget_strip_left(rect, summary, panel_count)?;
+    // One-column gap before the widgets/close cluster.
+    let x_end = cluster_left.saturating_sub(1);
     let x_start = x_end.saturating_sub(run_w);
     if x_start <= rect.x {
         return None;
     }
     Some((x_start, x_end, rect.y))
+}
+
+/// Leftmost column of the `[widgets][x]` portion of the right cluster: the
+/// first widget icon if any, otherwise the close button's left edge. Anchors
+/// the Run button (and, transitively, the harness label) to the left of
+/// everything pinned at the right corner.
+fn canvas_title_widget_strip_left(
+    rect: Rect,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    panel_count: usize,
+) -> Option<u16> {
+    if let Some(first) = canvas_title_widget_icon_ranges(rect, summary, panel_count).first() {
+        return Some(first.0);
+    }
+    canvas_title_close_button_range(rect, summary).map(|(xs, _, _)| xs)
 }
 
 fn canvas_title_toggle_button_range(
@@ -7541,22 +7571,24 @@ fn canvas_title_toggle_button_range(
     Some((x_start, x_end, rect.y))
 }
 
-/// Close-button geometry on the canvas title bar. Sits one cell to the
-/// left of the Run button (ratatui leaves a 1-col gap between stacked
-/// right-aligned titles), which itself sits left of the harness label at
-/// the corner. Returns `(x_start, x_end_exclusive, y)`.
+/// Close-button geometry on the canvas title bar — the rightmost control, a
+/// 3-cell ` x ` inset one column from the right corner. Mirrors the session
+/// chat view's `view_close_button_range` so the affordance reads the same
+/// across views. Returns `(x_start, x_end_exclusive, y)`.
 fn canvas_title_close_button_range(
     rect: Rect,
-    summary: Option<&agentd_protocol::SessionSummary>,
+    _summary: Option<&agentd_protocol::SessionSummary>,
 ) -> Option<(u16, u16, u16)> {
-    let (run_x_start, _run_x_end, y) = canvas_title_run_button_range(rect, summary)?;
+    if rect.width < 8 {
+        return None;
+    }
     let close_w = UnicodeWidthStr::width(CANVAS_CLOSE_BUTTON) as u16;
-    let x_end = run_x_start.saturating_sub(1);
-    let x_start = x_end.saturating_sub(close_w);
+    let x_start = rect.x.saturating_add(rect.width.saturating_sub(close_w + 1));
+    let x_end = rect.x.saturating_add(rect.width.saturating_sub(1));
     if x_start <= rect.x {
         return None;
     }
-    Some((x_start, x_end, y))
+    Some((x_start, x_end, rect.y))
 }
 
 /// One hit range per available session widget, rendered as rectangle icons
@@ -7589,6 +7621,27 @@ fn canvas_title_widget_icon_ranges(
             (glyph_x, glyph_x + 1, y)
         })
         .collect()
+}
+
+/// Harness-label geometry on the canvas title bar. Sits to the left of the
+/// Run button so the harness stays visible without crowding the right cluster.
+/// Returns `(x_start, x_end_exclusive, y)` spanning the ` <harness> ` label;
+/// `None` when there is no session or it would collide with the left edge.
+fn canvas_title_harness_range(
+    rect: Rect,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    panel_count: usize,
+) -> Option<(u16, u16, u16)> {
+    let s = summary?;
+    let label_w = (2 + UnicodeWidthStr::width(harness_label(s).as_str())) as u16;
+    let (run_x_start, _run_x_end, y) = canvas_title_run_button_range(rect, summary, panel_count)?;
+    // One-column gap before the Run button.
+    let x_end = run_x_start.saturating_sub(1);
+    let x_start = x_end.saturating_sub(label_w);
+    if x_start <= rect.x {
+        return None;
+    }
+    Some((x_start, x_end, y))
 }
 
 fn render_canvas_title_tooltip(
@@ -8854,60 +8907,118 @@ mod tests {
     }
 
     #[test]
-    fn canvas_title_close_button_sits_in_title_bar_disjoint_from_other_controls() {
+    fn canvas_title_close_button_matches_chat_view_geometry() {
+        // The canvas close button must sit in the exact same spot as the
+        // session chat view's close button: the rightmost ` x ` slot, inset
+        // one column from the right corner.
         let rect = Rect::new(0, 0, 100, 12);
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
         let close = canvas_title_close_button_range(rect, summary_ref)
             .expect("close button range should be produced at this width");
-        let run = canvas_title_run_button_range(rect, summary_ref).expect("run range");
-        let toggle = canvas_title_toggle_button_range(summary_ref, rect).expect("toggle range");
-
-        // Lives on the top border row.
+        assert_eq!(
+            close,
+            view_close_button_range(rect),
+            "canvas close must mirror the chat-view close geometry"
+        );
+        // Rightmost control: lives on the top border row and ends one column
+        // inset from the right corner.
         assert_eq!(close.2, rect.y);
-        // Valid, non-empty range strictly inside the block's left/right borders.
-        assert!(close.0 < close.1, "close range must be non-empty: {close:?}");
-        assert!(close.0 > rect.x, "close must clear the left border: {close:?}");
-        assert!(
-            close.1 < rect.x + rect.width,
-            "close must clear the right border: {close:?}"
-        );
-
-        // Disjoint from the Run button, the mode toggle, and (by construction)
-        // the harness label that sits at the far-right corner.
-        let disjoint =
-            |a: (u16, u16, u16), b: (u16, u16, u16)| a.2 != b.2 || a.1 <= b.0 || b.1 <= a.0;
-        assert!(disjoint(close, run), "close {close:?} overlaps run {run:?}");
-        assert!(
-            disjoint(close, toggle),
-            "close {close:?} overlaps toggle {toggle:?}"
-        );
-
-        // Close sits left of the Run button.
-        assert!(close.1 <= run.0, "close should be left of the run button");
+        assert_eq!(close.1, rect.x + rect.width - 1);
     }
 
     #[test]
-    fn canvas_title_widget_icons_produced_left_of_close_button() {
+    fn canvas_title_right_cluster_orders_run_widgets_close_left_to_right() {
+        // Scanning left→right, the right cluster must read
+        // `[harness] [Run] [widgets] [x]`, every range disjoint, with the
+        // mode toggle sitting far left of all of them.
+        let rect = Rect::new(0, 0, 100, 12);
+        let summary = summary_with_mode("smith", Some("interactive"));
+        let summary_ref = Some(&summary);
+        let count = 2usize;
+
+        let close = canvas_title_close_button_range(rect, summary_ref).expect("close range");
+        let widgets = canvas_title_widget_icon_ranges(rect, summary_ref, count);
+        let run = canvas_title_run_button_range(rect, summary_ref, count).expect("run range");
+        let harness =
+            canvas_title_harness_range(rect, summary_ref, count).expect("harness range");
+        let toggle = canvas_title_toggle_button_range(summary_ref, rect).expect("toggle range");
+
+        assert_eq!(widgets.len(), count, "one icon range per widget: {widgets:?}");
+        for r in [close, run, harness, toggle] {
+            assert_eq!(r.2, rect.y, "control must live on the top border row");
+            assert!(r.0 < r.1, "control range must be non-empty: {r:?}");
+        }
+
+        let widgets_min = widgets.iter().map(|w| w.0).min().unwrap();
+        let widgets_max = widgets.iter().map(|w| w.1).max().unwrap();
+
+        // Close is the rightmost control; widgets, then Run, then harness step
+        // left from it.
+        assert!(
+            widgets_max <= close.0,
+            "widgets {widgets:?} must sit left of close {close:?}"
+        );
+        assert!(
+            run.1 <= widgets_min,
+            "run {run:?} must sit left of the leftmost widget"
+        );
+        assert!(
+            harness.1 <= run.0,
+            "harness {harness:?} must sit left of run {run:?}"
+        );
+        assert!(
+            toggle.1 <= harness.0,
+            "toggle {toggle:?} must sit left of harness {harness:?}"
+        );
+
+        // No overlaps among any of close / widgets / run / harness / toggle.
+        let mut ranges = vec![close, run, harness, toggle];
+        ranges.extend(widgets.iter().copied());
+        for i in 0..ranges.len() {
+            for j in (i + 1)..ranges.len() {
+                let a = ranges[i];
+                let b = ranges[j];
+                assert!(
+                    a.2 != b.2 || a.1 <= b.0 || b.1 <= a.0,
+                    "controls overlap: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_title_widget_icons_sit_between_run_and_close() {
         let rect = Rect::new(0, 0, 100, 12);
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        // No widgets → no icon ranges.
+        // No widgets → no icon ranges, and Run falls back to sitting just left
+        // of the close button.
         assert!(canvas_title_widget_icon_ranges(rect, summary_ref, 0).is_empty());
+        let close = canvas_title_close_button_range(rect, summary_ref).expect("close range");
+        let run_no_widgets =
+            canvas_title_run_button_range(rect, summary_ref, 0).expect("run range");
+        assert!(
+            run_no_widgets.1 <= close.0,
+            "with no widgets, run {run_no_widgets:?} sits left of close {close:?}"
+        );
 
-        // Two widgets → two icon ranges, ordered left-to-right, all to the
-        // left of the close button and mutually disjoint.
+        // Two widgets → ordered left-to-right, between Run and close, disjoint.
         let icons = canvas_title_widget_icon_ranges(rect, summary_ref, 2);
         assert_eq!(icons.len(), 2, "one hit range per widget: {icons:?}");
-        let close = canvas_title_close_button_range(rect, summary_ref).expect("close range");
+        let run = canvas_title_run_button_range(rect, summary_ref, 2).expect("run range");
         for icon in &icons {
             assert_eq!(icon.2, rect.y);
             assert!(icon.0 < icon.1, "icon range must be non-empty: {icon:?}");
             assert!(
                 icon.1 <= close.0,
                 "icon {icon:?} should sit left of close {close:?}"
+            );
+            assert!(
+                run.1 <= icon.0,
+                "icon {icon:?} should sit right of run {run:?}"
             );
         }
         assert!(
