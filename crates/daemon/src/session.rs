@@ -898,6 +898,8 @@ impl SessionManager {
             started_at_ms: now_ms,
             expires_at_ms: now_ms + CANVAS_RUN_MAX_MS,
             pending_block_signatures: pending.into_iter().collect(),
+            seen_running: false,
+            first_output_seen: false,
         };
         if let Ok(mut runs) = self.canvas_runs.lock() {
             runs.insert(session_id.to_string(), run.clone());
@@ -920,14 +922,53 @@ impl SessionManager {
         }
     }
 
-    fn clear_canvas_run_for_output(&self, session_id: &str) {
-        let removed = self
-            .canvas_runs
-            .lock()
-            .ok()
-            .and_then(|mut runs| runs.remove(session_id))
-            .is_some();
-        if removed {
+    fn mark_canvas_run_output_seen(&self, session_id: &str) {
+        let mut updated = false;
+        if let Ok(mut runs) = self.canvas_runs.lock() {
+            if let Some(run) = runs.get_mut(session_id) {
+                if !run.first_output_seen {
+                    run.first_output_seen = true;
+                    updated = true;
+                }
+            }
+        }
+        if updated {
+            if let Ok(canvas) = self.storage.read_canvas(session_id) {
+                self.broadcast_canvas_state(canvas);
+            }
+        }
+    }
+
+    fn note_session_state_for_canvas_run(
+        &self,
+        session_id: &str,
+        state: agentd_protocol::SessionState,
+    ) {
+        use agentd_protocol::SessionState;
+        let mut clear = false;
+        let mut updated = false;
+        if let Ok(mut runs) = self.canvas_runs.lock() {
+            if let Some(run) = runs.get_mut(session_id) {
+                match state {
+                    SessionState::Running => {
+                        if !run.seen_running {
+                            run.seen_running = true;
+                            updated = true;
+                        }
+                    }
+                    SessionState::AwaitingInput | SessionState::Done | SessionState::Errored => {
+                        if run.seen_running {
+                            clear = true;
+                        }
+                    }
+                    SessionState::Pending | SessionState::Paused => {}
+                }
+            }
+            if clear {
+                runs.remove(session_id);
+            }
+        }
+        if clear || updated {
             if let Ok(canvas) = self.storage.read_canvas(session_id) {
                 self.broadcast_canvas_state(canvas);
             }
@@ -2716,8 +2757,14 @@ impl SessionManager {
             drop(s);
             let _ = self.storage.save_summary(&snapshot);
         }
+        let new_state = {
+            let s = entry.summary.read().await;
+            s.state
+        };
+        self.note_session_state_for_canvas_run(&entry.id, new_state);
+
         if session_event_is_canvas_output(&event) {
-            self.clear_canvas_run_for_output(&entry.id);
+            self.mark_canvas_run_output_seen(&entry.id);
         }
         // Update the per-session task registry from lifecycle events
         // so `session.list_tasks` has live state to return.
@@ -5617,5 +5664,69 @@ mod tests {
             bytes[extra..],
             "replay must be the tail of the file (most recent bytes), not the head"
         );
+    }
+
+    #[tokio::test]
+    async fn test_canvas_run_lifecycle_daemon() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "scanvasrun";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+
+        // Start a canvas run
+        let body = "# Todo\n- a\n";
+        let run = mgr.start_canvas_run(id, body, false).expect("start_canvas_run");
+        assert!(!run.seen_running);
+        assert!(!run.first_output_seen);
+
+        // Transition session state to Running
+        mgr.handle_event(
+            &entry,
+            SessionEvent::Status {
+                state: SessionState::Running,
+                detail: None,
+            },
+        )
+        .await;
+
+        let run = mgr.canvas_run_snapshot(id).expect("run snapshot");
+        assert!(run.seen_running);
+        assert!(!run.first_output_seen);
+
+        // Send canvas output (reasoning)
+        mgr.handle_event(
+            &entry,
+            SessionEvent::Reasoning {
+                text: "thinking".into(),
+            },
+        )
+        .await;
+
+        // Run is NOT cleared, but first_output_seen is set to true
+        let run = mgr.canvas_run_snapshot(id).expect("run snapshot");
+        assert!(run.seen_running);
+        assert!(run.first_output_seen);
+
+        // Transition session state back to idle (AwaitingInput)
+        mgr.handle_event(
+            &entry,
+            SessionEvent::Status {
+                state: SessionState::AwaitingInput,
+                detail: None,
+            },
+        )
+        .await;
+
+        // Run should now be cleared
+        assert!(mgr.canvas_run_snapshot(id).is_none());
     }
 }

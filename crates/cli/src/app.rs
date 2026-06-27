@@ -1358,6 +1358,8 @@ pub struct CanvasRun {
     pub pending: HashSet<String>,
     /// Absolute backstop: clear no later than this regardless of signals.
     pub deadline: Instant,
+    /// Whether the first output has been observed.
+    pub first_output_seen: bool,
 }
 
 impl CanvasRun {
@@ -1380,6 +1382,7 @@ impl CanvasRun {
             started_at,
             pending: progress.pending_block_signatures.into_iter().collect(),
             deadline,
+            first_output_seen: progress.first_output_seen,
         })
     }
 }
@@ -7390,6 +7393,7 @@ impl App {
                 started_at: now,
                 pending,
                 deadline: now + Duration::from_millis(CANVAS_RUN_MAX_MS),
+                first_output_seen: false,
             },
         );
     }
