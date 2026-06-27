@@ -847,6 +847,10 @@ pub struct App {
     /// Terminal.app, which ignores `\x1b[?1003h` even though crossterm
     /// requests it).
     pub mouse_pos: Option<(u16, u16)>,
+    /// When the pointer last changed cells. Drives self-dismissing hovers (e.g.
+    /// the canvas shimmer-text preview, which disappears once the cursor has
+    /// been still for ~1s). `None` until the first motion event arrives.
+    pub last_mouse_move: Option<Instant>,
     /// Whether terminal mouse capture is enabled. When false, agentd
     /// stops receiving mouse events so the user's terminal can perform
     /// native drag selection/copy.
@@ -2163,6 +2167,7 @@ async fn run_with_socket_initial_selection(
         layout: LayoutSnapshot::default(),
         session_title_menu: None,
         mouse_pos: None,
+        last_mouse_move: None,
         mouse_capture_enabled: true,
         orchestrator_id: initial_orch_id,
         list_panel_w: persisted.list_panel_w.unwrap_or(LIST_PANEL_W_DEFAULT),
@@ -5071,8 +5076,14 @@ impl App {
         const LIST_STEP: i32 = 3;
         let scrollback_step = self.mouse_scrollback_step();
         // Track every event's cell so hover-aware rendering (diamond
-        // tooltip, etc.) has a current position to render against.
-        self.mouse_pos = Some((ev.column, ev.row));
+        // tooltip, etc.) has a current position to render against. Record the
+        // wall-clock of an actual cell change so self-dismissing hovers (the
+        // canvas shimmer-text preview) can hide once the pointer is still.
+        let next_pos = (ev.column, ev.row);
+        if self.mouse_pos != Some(next_pos) {
+            self.last_mouse_move = Some(Instant::now());
+        }
+        self.mouse_pos = Some(next_pos);
         // If the cursor is over a pane whose child has grabbed the mouse
         // (e.g. Claude Code in fullscreen), forward the event into that PTY and
         // stop — construct becomes a transparent mouse pipe for the pane, so
@@ -11496,6 +11507,7 @@ mod tests {
             layout: LayoutSnapshot::default(),
             session_title_menu: None,
             mouse_pos: None,
+            last_mouse_move: None,
             mouse_capture_enabled: true,
             orchestrator_id: None,
             list_panel_w: LIST_PANEL_W_DEFAULT,

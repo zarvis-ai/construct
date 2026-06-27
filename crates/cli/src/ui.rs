@@ -33,6 +33,10 @@ const CANVAS_REVEAL_SECS: f32 = CANVAS_REVEAL_MS as f32 / 1000.0;
 const CANVAS_RUN_BUTTON: &str = " ▶ ";
 const CANVAS_CLIP_HOVER_PREVIEW_ROWS: u16 = 4;
 const CANVAS_CLIP_HOVER_PREVIEW_LABEL: &str = " session output ";
+/// How long the canvas shimmer-text preview lingers after the pointer stops
+/// moving before it self-dismisses. The clip-chip preview, by contrast, stays
+/// up for as long as the chip is hovered.
+const CANVAS_SHIMMER_HOVER_IDLE: Duration = Duration::from_secs(1);
 const CANVAS_SELECTION_RUN_MENU_W: u16 = 9;
 const CANVAS_SELECTION_RUN_MENU_H: u16 = 3;
 
@@ -7579,27 +7583,70 @@ fn render_canvas_popup_at(
     render_canvas_title_tooltip(f, app, popup, summary_ref, rect);
     if active && !popup.closing {
         render_canvas_clip_hover(f, app, rect);
+        render_canvas_shimmer_hover(f, app, popup, rect, scroll_offset, inner, now);
     }
 }
 
 /// Mini session-preview popover shown while the mouse hovers a `@{session:id}`
 /// smart-clip in the canvas body. Reads the freshly captured clip hitboxes,
-/// resolves the hovered session, and paints a compact card (glyph + name,
-/// harness · model, status, last prompt) anchored to the hovered chip. Clears
-/// its own area, so it overlays the canvas body without disturbing it.
+/// resolves the hovered session, and paints the shared session card anchored to
+/// the hovered chip. Persists for as long as the chip is hovered.
 fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
-    let Some(hit) = app
+    let Some((session_id, col, row)) = app
         .layout
         .canvas_clip_hits
         .iter()
         .find(|hit| hit.contains(mx, my))
+        .map(|hit| (hit.session_id.clone(), hit.col_start, hit.row))
     else {
         return;
     };
-    let Some(s) = app.sessions.iter().find(|s| s.id == hit.session_id) else {
+    render_session_hover_card(f, app, modal, &session_id, col, row);
+}
+
+/// Lay out the floating session hover card so it reads as a landscape tile: its
+/// width always exceeds its height when the available `max_w` allows. Returns
+/// `(width, height)` including borders. `line_count` is the number of text rows
+/// (which already includes the preview label + spacer when `has_preview`).
+fn session_hover_card_size(
+    content_w: u16,
+    line_count: u16,
+    has_preview: bool,
+    max_w: u16,
+) -> (u16, u16) {
+    let preview = if has_preview {
+        CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1)
+    } else {
+        0
+    };
+    let height = line_count.saturating_add(2).saturating_add(preview);
+    let cap = max_w.max(3);
+    let base = content_w.saturating_add(2).clamp(3, cap);
+    // Force landscape: at least one column wider than the card is tall, bounded
+    // by the room available. When the modal is too narrow to satisfy this the
+    // caller's fit check drops the card entirely.
+    let width = base.max(height.saturating_add(1)).min(cap);
+    (width, height)
+}
+
+/// Render the floating session hover card — glyph + name, harness · model,
+/// status, last prompt, and a live tail of the session's PTY output — anchored
+/// just below `(anchor_col, anchor_row)` (or above it when there's no room) and
+/// kept inside `modal`. Clears its own area so it overlays the canvas body
+/// without disturbing it. Shared by the clip-chip hover and the shimmer-text
+/// hover; always laid out wider than it is tall.
+fn render_session_hover_card(
+    f: &mut Frame,
+    app: &mut App,
+    modal: Rect,
+    session_id: &str,
+    anchor_col: u16,
+    anchor_row: u16,
+) {
+    let Some(s) = app.sessions.iter().find(|s| s.id == session_id) else {
         return;
     };
 
@@ -7637,17 +7684,14 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
         )));
     }
 
-    let mut preview_output = if let Some(history) = app.histories.get_mut(&s.id) {
-        Some(
-            history.replay(
-                modal.width.saturating_sub(2).max(1),
-                CANVAS_CLIP_HOVER_PREVIEW_ROWS,
-                0,
-            ),
-        )
-    } else {
-        None
-    };
+    // A wider cap than the clip card used to use so the live output reads as a
+    // landscape strip. The PTY tail is replayed at the modal width and clipped
+    // into the (narrower) card by `render_pty_tail`.
+    let max_w = modal.width.saturating_sub(2).clamp(1, 64);
+    let mut preview_output = app
+        .histories
+        .get_mut(session_id)
+        .map(|history| history.replay(max_w.max(1), CANVAS_CLIP_HOVER_PREVIEW_ROWS, 0));
     let has_preview = match preview_output {
         Some(ref out) => non_empty_row_span(out.screen) > 0,
         None => false,
@@ -7660,8 +7704,6 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
         lines.push(Line::from(""));
     }
 
-    // Size the card around its content, bounded by the canvas modal.
-    let max_w = modal.width.saturating_sub(2).clamp(1, 48);
     let content_w = lines
         .iter()
         .map(|l| {
@@ -7672,30 +7714,23 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
         })
         .max()
         .unwrap_or(0);
-    let width = content_w.saturating_add(2).clamp(3, max_w);
-    let height = (lines.len() as u16)
-        .saturating_add(2)
-        .saturating_add(if has_preview {
-            CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1)
-        } else {
-            0
-        });
+    let (width, height) =
+        session_hover_card_size(content_w, lines.len() as u16, has_preview, max_w);
     if modal.height < height || modal.width < width {
         return;
     }
 
-    // Anchor below the chip when there's room, otherwise above it; keep the box
-    // fully inside the canvas modal horizontally and vertically.
+    // Anchor below the cursor/chip when there's room, otherwise above it; keep
+    // the box fully inside the canvas modal horizontally and vertically.
     let modal_bottom = modal.y.saturating_add(modal.height);
     let modal_right = modal.x.saturating_add(modal.width);
-    let y = if hit.row.saturating_add(1).saturating_add(height) <= modal_bottom {
-        hit.row.saturating_add(1)
+    let y = if anchor_row.saturating_add(1).saturating_add(height) <= modal_bottom {
+        anchor_row.saturating_add(1)
     } else {
-        hit.row.saturating_sub(height)
+        anchor_row.saturating_sub(height)
     };
     let y = y.clamp(modal.y, modal_bottom.saturating_sub(height));
-    let x = hit
-        .col_start
+    let x = anchor_col
         .min(modal_right.saturating_sub(width))
         .max(modal.x);
     let area = Rect {
@@ -7766,6 +7801,134 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
             &app.theme,
         );
     }
+}
+
+/// Session-preview popover shown while the mouse hovers *shimmering* canvas text
+/// — a block still running under a canvas Run. Resolves the session clip inside
+/// the shimmering block under the cursor and paints the shared session card with
+/// that session's live output. Unlike the clip-chip hover, it self-dismisses
+/// once the pointer has been still for [`CANVAS_SHIMMER_HOVER_IDLE`].
+fn render_canvas_shimmer_hover(
+    f: &mut Frame,
+    app: &mut App,
+    popup: &crate::app::CanvasPopup,
+    modal: Rect,
+    scroll_offset: usize,
+    body: Rect,
+    now: Instant,
+) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    // Transient preview: only while the pointer is actively moving. Once it has
+    // been still for the idle window, hide it.
+    let moved_recently = app
+        .last_mouse_move
+        .is_some_and(|t| now.saturating_duration_since(t) < CANVAS_SHIMMER_HOVER_IDLE);
+    if !moved_recently {
+        return;
+    }
+    // A clip chip under the cursor is owned by `render_canvas_clip_hover`; don't
+    // double-render the card on top of it.
+    if app
+        .layout
+        .canvas_clip_hits
+        .iter()
+        .any(|hit| hit.contains(mx, my))
+    {
+        return;
+    }
+    let Some(shimmer) = canvas_run_shimmer(app, popup, now) else {
+        return;
+    };
+    let line_sessions =
+        canvas_shimmer_line_sessions(Some(app), &popup.buffer, &shimmer.active_lines);
+    let Some(session_id) = canvas_shimmer_session_at(
+        Some(app),
+        &popup.buffer,
+        &line_sessions,
+        scroll_offset,
+        body,
+        mx,
+        my,
+    ) else {
+        return;
+    };
+    render_session_hover_card(f, app, modal, &session_id, mx, my);
+}
+
+/// For each source line of `markdown`, the session id of the shimmering block it
+/// belongs to (resolved from the first `@{session:…}` clip in that block), or
+/// `None` for lines outside a shimmering block and shimmering blocks with no
+/// session clip. A block "shimmers" when any of its lines is set in
+/// `active_lines` (the per-source-line mask from [`canvas_run_shimmer`]).
+fn canvas_shimmer_line_sessions(
+    app: Option<&App>,
+    markdown: &str,
+    active_lines: &[bool],
+) -> Vec<Option<String>> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut out = vec![None; lines.len()];
+    for block in crate::app::canvas_blocks(markdown) {
+        let shimmering = (block.start_line..block.end_line)
+            .any(|li| active_lines.get(li).copied().unwrap_or(false));
+        if !shimmering {
+            continue;
+        }
+        let sid = (block.start_line..block.end_line).find_map(|li| {
+            let raw = lines.get(li)?;
+            let (_rendered, clips) = canvas_rendered_line_with_clips(app, raw);
+            clips.iter().find_map(|clip| {
+                let (kind, id) = canvas_smart_clip_target(&clip.raw_clip);
+                (kind == "session").then(|| id.to_string())
+            })
+        });
+        if let Some(id) = sid {
+            for li in block.start_line..block.end_line {
+                if let Some(slot) = out.get_mut(li) {
+                    *slot = Some(id.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Resolve a screen cell over the canvas body to the session id of the
+/// shimmering block under it, or `None` when the cell isn't on a shimmering
+/// block that references a session. Mirrors the wrap/scroll math of
+/// [`canvas_session_clip_hits`] so hover targets line up with what's painted.
+fn canvas_shimmer_session_at(
+    app: Option<&App>,
+    markdown: &str,
+    line_sessions: &[Option<String>],
+    scroll_offset: usize,
+    area: Rect,
+    col: u16,
+    row: u16,
+) -> Option<String> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    if col < area.x || col >= area.x.saturating_add(area.width) {
+        return None;
+    }
+    if row < area.y || row >= area.y.saturating_add(area.height) {
+        return None;
+    }
+    let target_abs_row = scroll_offset.saturating_add((row - area.y) as usize);
+    let width = area.width as usize;
+    let mut visual_row_base = 0usize;
+    for (i, raw) in markdown.lines().enumerate() {
+        let (rendered, _clips) = canvas_rendered_line_with_clips(app, raw);
+        let rows = canvas_wrap_row_starts(&rendered, width).len();
+        let next_base = visual_row_base.saturating_add(rows);
+        if target_abs_row >= visual_row_base && target_abs_row < next_base {
+            return line_sessions.get(i).cloned().flatten();
+        }
+        visual_row_base = next_base;
+    }
+    None
 }
 
 /// Paint a slim vertical scroll thumb on the canvas popup's right border when
@@ -9432,6 +9595,81 @@ mod tests {
         assert!(
             rect.x.saturating_add(rect.width) <= view.x.saturating_add(view.width),
             "tooltip should fit within the session view when there is room: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn session_hover_card_size_is_landscape() {
+        // Short content + a preview: width is forced past height so the card
+        // reads as a landscape tile rather than a portrait sliver.
+        let (w, h) = session_hover_card_size(8, 6, true, 64);
+        assert!(w > h, "expected landscape card, got {w}x{h}");
+        // Wide content drives the width but stays bounded by the cap.
+        let (w, h) = session_hover_card_size(200, 6, true, 64);
+        assert_eq!(w, 64);
+        assert!(w > h, "capped width should still exceed height: {w}x{h}");
+        // No preview: a shorter card, still wider than tall.
+        let (w, h) = session_hover_card_size(4, 3, false, 64);
+        assert!(w > h, "expected landscape card without preview, got {w}x{h}");
+    }
+
+    #[test]
+    fn canvas_shimmer_line_sessions_maps_block_to_its_session() {
+        // Two blocks; only the first shimmers. Every line of the shimmering
+        // block resolves to the session its clip references; the settled block
+        // and the blank separator resolve to nothing.
+        let md = "- working @{session:s1}\n- detail line\n\n- idle @{session:s2}";
+        let active = [true, true, false, false];
+        let got = canvas_shimmer_line_sessions(None, md, &active);
+        assert_eq!(
+            got,
+            vec![Some("s1".to_string()), Some("s1".to_string()), None, None]
+        );
+    }
+
+    #[test]
+    fn canvas_shimmer_line_sessions_ignores_blocks_without_a_session_clip() {
+        // A shimmering block with no session clip yields no hover target.
+        let md = "just running prose\nmore prose";
+        let active = [true, true];
+        assert_eq!(
+            canvas_shimmer_line_sessions(None, md, &active),
+            vec![None, None]
+        );
+    }
+
+    #[test]
+    fn canvas_shimmer_session_at_resolves_cursor_to_block_session() {
+        let area = Rect::new(0, 0, 80, 6);
+        let md = "- working @{session:s1}\n- detail line\n\n- idle @{session:s2}";
+        let line_sessions = vec![Some("s1".to_string()), Some("s1".to_string()), None, None];
+        // Both lines of the shimmering block resolve to s1.
+        assert_eq!(
+            canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 5, 0),
+            Some("s1".to_string())
+        );
+        assert_eq!(
+            canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 1),
+            Some("s1".to_string())
+        );
+        // The settled block and out-of-body cells resolve to nothing.
+        assert_eq!(canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 3), None);
+        assert_eq!(canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 99), None);
+    }
+
+    #[test]
+    fn canvas_shimmer_session_at_tracks_scroll_offset() {
+        // A target on the third logical row follows the viewport when scrolled.
+        let area = Rect::new(0, 0, 80, 6);
+        let md = "l0\nl1\n@{session:s2}";
+        let line_sessions = vec![None, None, Some("s2".to_string())];
+        assert_eq!(
+            canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 2),
+            Some("s2".to_string())
+        );
+        assert_eq!(
+            canvas_shimmer_session_at(None, md, &line_sessions, 2, area, 0, 0),
+            Some("s2".to_string())
         );
     }
 
