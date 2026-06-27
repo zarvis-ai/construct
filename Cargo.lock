@@ -52,6 +52,7 @@ dependencies = [
  "construct-adapter-antigravity",
  "construct-adapter-claude",
  "construct-adapter-codex",
+ "construct-adapter-grok",
  "construct-adapter-shell",
  "construct-adapter-smith",
  "construct-mcp",
@@ -539,6 +540,18 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "construct-adapter-grok"
+version = "0.11.5"
+dependencies = [
+ "agentd-protocol",
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

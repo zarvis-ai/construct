@@ -10,6 +10,7 @@ members = [
     "crates/adapter-claude",
     "crates/adapter-codex",
     "crates/adapter-antigravity",
+    "crates/adapter-grok",
     "crates/adapter-smith",
     "crates/e2e",
 ]

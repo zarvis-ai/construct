@@ -492,7 +492,7 @@ struct PtyInputCapture {
 }
 
 fn should_record_pty_user_message(harness: &str) -> bool {
-    matches!(harness, "claude" | "antigravity")
+    matches!(harness, "claude" | "antigravity" | "grok")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,7 +505,7 @@ enum CanvasExecutionDelivery {
 fn canvas_execution_delivery(summary: &agentd_protocol::SessionSummary) -> CanvasExecutionDelivery {
     if !summary.has_pty {
         CanvasExecutionDelivery::AdapterInput
-    } else if matches!(summary.harness.as_str(), "claude" | "codex" | "antigravity") {
+    } else if matches!(summary.harness.as_str(), "claude" | "codex" | "antigravity" | "grok") {
         CanvasExecutionDelivery::ExternalPtyTypedSubmit
     } else {
         CanvasExecutionDelivery::PtySubmit

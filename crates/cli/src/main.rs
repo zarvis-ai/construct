@@ -251,6 +251,8 @@ enum AdapterCommand {
     #[command(hide = true)]
     Antigravity,
     #[command(hide = true)]
+    Grok,
+    #[command(hide = true)]
     Smith {
         /// Auto-title mode: generate a short title for the given prompt.
         #[arg(long)]
@@ -567,6 +569,10 @@ async fn main() -> Result<()> {
             }
             AdapterCommand::Antigravity => {
                 construct_adapter_antigravity::run().await?;
+                Ok(())
+            }
+            AdapterCommand::Grok => {
+                construct_adapter_grok::run().await?;
                 Ok(())
             }
             AdapterCommand::Smith {

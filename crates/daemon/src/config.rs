@@ -337,6 +337,12 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         description: "Google Antigravity (wraps the `agy` CLI)",
     },
     BuiltinAdapter {
+        name: "grok",
+        binary: "construct",
+        args: &["__adapter", "grok"],
+        description: "Grok CLI (wraps the `grok` CLI)",
+    },
+    BuiltinAdapter {
         name: "smith",
         binary: "construct",
         args: &["__adapter", "smith"],
