@@ -537,6 +537,7 @@ fn canvas_run_instructions() -> Vec<String> {
         "Record meaningful state changes or results on the canvas with construct_canvas_edit (anchored find/replace edits that merge with concurrent human edits; use construct_canvas_update only for a wholesale rewrite).".to_string(),
         "If blocked, write the blocker and next required external action on the canvas before ending.".to_string(),
         "Smart clips are Markdown-native typed references. The clip_id attribute identifies a specific clip instance, not the target itself; preserve clip_id values when editing existing clips.".to_string(),
+        "When the canvas implies independent subtasks that can run concurrently or in isolation, prefer delegating each to a child agent via `agentd_subagent_create` rather than executing them inline in this session; this keeps the canvas session as an orchestrator and lets smart clips reference each subagent's live output via `@{session:<id>}`.".to_string(),
     ]
 }
 
