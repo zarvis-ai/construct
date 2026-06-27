@@ -50,6 +50,10 @@ pub const MINIBUFFER_PANEL_H_MAX: u16 = 80;
 pub(crate) const CANVAS_REVEAL_MS: u64 = 240;
 pub(crate) const CANVAS_CONTENT_PADDING_X: u16 = 1;
 pub(crate) const CANVAS_CONTENT_PADDING_Y: u16 = 1;
+/// Hard cap on how long a canvas Run shimmer animates without an observed turn
+/// completion. A missed status transition must never strand the animation, so
+/// the run state is reaped once it has been active this long. See spec 0042.
+pub(crate) const CANVAS_RUN_MAX_MS: u64 = 10 * 60 * 1000;
 /// Wrapped rows the canvas body scrolls per mouse-wheel notch.
 pub(crate) const CANVAS_WHEEL_SCROLL_ROWS: usize = 3;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
@@ -833,6 +837,10 @@ pub struct App {
     /// Presence means the canvas should be restored when that session is
     /// focused again, including unsaved draft text and cursor state.
     pub canvas_popups: HashMap<String, CanvasPopup>,
+    /// In-flight canvas Run animations, keyed by session id (spec 0042). An
+    /// entry means a canvas Run is believed to still be executing for that
+    /// session; it drives the shimmer over the executed Markdown.
+    pub canvas_runs: HashMap<String, CanvasRun>,
     pub canvas_clipboard: Option<String>,
     /// Live `/remote-control` modal — URL + QR for the active
     /// remote-WS deployment. `Some` while open, `None` otherwise.
@@ -1334,6 +1342,81 @@ pub struct CanvasPopup {
     /// rows skipped off the top so the body can scroll when it overflows the
     /// viewport. Cursor moves follow the caret; the mouse wheel scrolls freely.
     pub scroll_offset: usize,
+}
+
+/// In-flight canvas Run animation state for one session (spec 0042). Present
+/// while a canvas Run this client issued is believed to still be executing in
+/// the owning session; drives the "shimmer" over the executed Markdown.
+#[derive(Debug, Clone)]
+pub struct CanvasRun {
+    /// When Run was pressed. The shimmer wave is a function of elapsed time.
+    pub started_at: Instant,
+    /// Content signatures of blocks still considered running (shimmering). A
+    /// block shimmers while its current normalized text is in this set; any
+    /// edit — by the agent writing back or the user typing — changes the
+    /// block's text and drops it from the shimmer.
+    pub pending: HashSet<String>,
+    /// Set once the owning session has been observed `Running` since this run
+    /// started. Guards against a stale pre-run idle snapshot clearing the
+    /// shimmer before the turn actually begins.
+    pub seen_running: bool,
+    /// Absolute backstop: clear no later than this regardless of signals.
+    pub deadline: Instant,
+}
+
+/// A canvas "block": a maximal run of consecutive non-blank Markdown lines,
+/// identified by its normalized text. The unit of Run shimmer — a block
+/// shimmers as a whole and settles as a whole (spec 0042).
+pub(crate) struct CanvasBlock {
+    /// Source-line index range `[start_line, end_line)` into `markdown.lines()`.
+    pub start_line: usize,
+    pub end_line: usize,
+    /// Normalized content signature: trimmed lines joined by `\n`.
+    pub signature: String,
+}
+
+/// Split Markdown into blocks (runs of consecutive non-blank lines). Both the
+/// Run start (which records the executed blocks' signatures) and the renderer
+/// (which decides which source lines shimmer) derive from this so their notion
+/// of a block stays identical.
+pub(crate) fn canvas_blocks(markdown: &str) -> Vec<CanvasBlock> {
+    let mut blocks = Vec::new();
+    let mut cur: Option<(usize, Vec<String>)> = None;
+    let mut total = 0usize;
+    for (i, raw) in markdown.lines().enumerate() {
+        total = i + 1;
+        if raw.trim().is_empty() {
+            if let Some((start, lines)) = cur.take() {
+                blocks.push(CanvasBlock {
+                    start_line: start,
+                    end_line: i,
+                    signature: lines.join("\n"),
+                });
+            }
+        } else {
+            cur.get_or_insert_with(|| (i, Vec::new()))
+                .1
+                .push(raw.trim().to_string());
+        }
+    }
+    if let Some((start, lines)) = cur.take() {
+        blocks.push(CanvasBlock {
+            start_line: start,
+            end_line: total,
+            signature: lines.join("\n"),
+        });
+    }
+    blocks
+}
+
+/// Signatures of the blocks contained in `body` — the set of blocks that a Run
+/// over `body` should shimmer. For a full-canvas run `body` is the whole
+/// document; for a selection run it is the selected text.
+pub(crate) fn canvas_run_pending_signatures(body: &str) -> HashSet<String> {
+    canvas_blocks(body)
+        .into_iter()
+        .map(|b| b.signature)
+        .collect()
 }
 
 /// Result of flushing a canvas popup's buffer to the daemon.
@@ -1943,6 +2026,7 @@ async fn run_with_socket_initial_selection(
         tasks_popup: None,
         canvas_popup: None,
         canvas_popups: HashMap::new(),
+        canvas_runs: HashMap::new(),
         canvas_clipboard: None,
         remote_control_popup: None,
         remote_control_task: None,
@@ -2563,6 +2647,7 @@ async fn run_loop(
                     }
                 }
                 app.update_browser_preview_hover_and_expiry();
+                app.expire_canvas_runs(Instant::now());
             }
         }
     }
@@ -4396,6 +4481,7 @@ impl App {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<StateNotificationPayload>(p) {
                         let id = payload.session.id.clone();
+                        let new_state = payload.session.state;
                         let was_pinned = self
                             .sessions
                             .iter()
@@ -4417,6 +4503,9 @@ impl App {
                                 .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                         }
                         self.refresh_orchestrator_id();
+                        // Clear the canvas Run shimmer when this session's
+                        // canvas-originating turn completes (spec 0042).
+                        self.note_session_state_for_canvas_run(&id, new_state);
                         // Newly pinned PTY session: bootstrap so its tile
                         // populates immediately, even when the pin came from
                         // outside this TUI process.
@@ -7140,6 +7229,15 @@ impl App {
             return false;
         };
 
+        // Snapshot the last daemon-synced content *before* saving, so a re-Run
+        // can tell which blocks the user changed (vs. ones the agent settled,
+        // which are already folded into `saved_markdown`). See spec 0042.
+        let prev_saved = self
+            .canvas_popup
+            .as_ref()
+            .map(|popup| popup.saved_markdown.clone())
+            .unwrap_or_default();
+
         let dirty = self
             .canvas_popup
             .as_ref()
@@ -7158,8 +7256,21 @@ impl App {
             canvas_normalize_smart_clip_instance_ids(&selection)
         });
         let is_selection = selection.is_some();
+        // Optimistic feedback (spec 0042): start the Run shimmer the instant
+        // Run is pressed, before the execute round trip, so the affordance
+        // covers the agent's latency rather than the request's. The executed
+        // body is the selection if present, else the whole (now-saved) buffer.
+        let run_body = match selection.as_deref() {
+            Some(sel) => sel.to_string(),
+            None => self
+                .canvas_popup
+                .as_ref()
+                .map(|popup| popup.buffer.clone())
+                .unwrap_or_default(),
+        };
+        self.start_canvas_run(&session_id, &run_body, is_selection, &prev_saved);
         let params = agentd_protocol::CanvasExecuteParams {
-            session_id,
+            session_id: session_id.clone(),
             selection,
             base_version,
         };
@@ -7173,10 +7284,97 @@ impl App {
                 true
             }
             Err(e) => {
+                // The request never landed — retract the optimistic shimmer.
+                self.canvas_runs.remove(&session_id);
                 self.set_status(format!("canvas run failed: {e}"));
                 false
             }
         }
+    }
+
+    /// Begin (or refresh) the Run shimmer for `session_id` over `body` — the
+    /// executed Markdown (full canvas or selection). Records the block
+    /// signatures to shimmer; they settle as their content changes and the run
+    /// clears when the owning turn completes. See spec 0042.
+    ///
+    /// A re-Run while a run is still active preserves the narrowing the agent
+    /// established: it re-shimmers only the blocks the user changed since the
+    /// last daemon sync (`prev_saved`) plus blocks that were still pending —
+    /// blocks the agent already settled stay calm. A fresh run, or any
+    /// selection run the user explicitly scoped, shimmers its whole region.
+    fn start_canvas_run(
+        &mut self,
+        session_id: &str,
+        body: &str,
+        is_selection: bool,
+        prev_saved: &str,
+    ) {
+        let body_sigs = canvas_run_pending_signatures(body);
+        if body_sigs.is_empty() {
+            // Empty body has nothing to shimmer; drop any stale run.
+            self.canvas_runs.remove(session_id);
+            return;
+        }
+        let pending: HashSet<String> = match self.canvas_runs.get(session_id) {
+            // Re-Run mid-flight: union of the user's fresh edits (blocks present
+            // now but not in the last synced content) and blocks that never
+            // settled under the prior run. Agent-settled blocks are in
+            // `prev_saved` and absent from `old.pending`, so both terms skip
+            // them and they stop re-shimmering.
+            Some(old) if !is_selection => {
+                let prev_sigs = canvas_run_pending_signatures(prev_saved);
+                body_sigs
+                    .difference(&prev_sigs)
+                    .chain(body_sigs.intersection(&old.pending))
+                    .cloned()
+                    .collect()
+            }
+            // Fresh run, or a selection run scoped by the user: shimmer it all.
+            _ => body_sigs,
+        };
+        let now = Instant::now();
+        self.canvas_runs.insert(
+            session_id.to_string(),
+            CanvasRun {
+                started_at: now,
+                pending,
+                seen_running: false,
+                deadline: now + Duration::from_millis(CANVAS_RUN_MAX_MS),
+            },
+        );
+    }
+
+    /// Fold a session status change into its Run shimmer, if any (spec 0042).
+    /// The shimmer clears when the canvas-originating turn completes — observed
+    /// as a return to an idle state after the session was seen running.
+    fn note_session_state_for_canvas_run(
+        &mut self,
+        session_id: &str,
+        state: agentd_protocol::SessionState,
+    ) {
+        use agentd_protocol::SessionState;
+        let clear = match self.canvas_runs.get_mut(session_id) {
+            Some(run) => match state {
+                SessionState::Running => {
+                    run.seen_running = true;
+                    false
+                }
+                SessionState::AwaitingInput | SessionState::Done | SessionState::Errored => {
+                    run.seen_running
+                }
+                SessionState::Pending | SessionState::Paused => false,
+            },
+            None => false,
+        };
+        if clear {
+            self.canvas_runs.remove(session_id);
+        }
+    }
+
+    /// Reap Run shimmers that have outlived their backstop deadline, so a
+    /// missed completion signal can never strand the animation (spec 0042).
+    fn expire_canvas_runs(&mut self, now: Instant) {
+        self.canvas_runs.retain(|_, run| now < run.deadline);
     }
 
     async fn close_canvas_popup(&mut self) {
@@ -10703,6 +10901,7 @@ mod tests {
             tasks_popup: None,
             canvas_popup: None,
             canvas_popups: HashMap::new(),
+            canvas_runs: HashMap::new(),
             canvas_clipboard: None,
             remote_control_popup: None,
             remote_control_task: None,
@@ -11782,6 +11981,117 @@ mod tests {
         assert_eq!(popup.canvas.version, 2);
         assert_eq!(popup.buffer, "# Todo\n- a\n- agent added\n");
         assert_eq!(popup.saved_markdown, "# Todo\n- a\n- agent added\n");
+        server.abort();
+    }
+
+    #[test]
+    fn canvas_blocks_split_on_blank_lines() {
+        let md = "# Todo\n- a\n- b\n\n# Done\n";
+        let blocks = canvas_blocks(md);
+        assert_eq!(blocks.len(), 2);
+        // First block spans source lines 0..3 ("# Todo", "- a", "- b").
+        assert_eq!((blocks[0].start_line, blocks[0].end_line), (0, 3));
+        assert_eq!(blocks[0].signature, "# Todo\n- a\n- b");
+        // Second block is the "# Done" heading after the blank line.
+        assert_eq!(blocks[1].start_line, 4);
+        assert_eq!(blocks[1].signature, "# Done");
+    }
+
+    #[test]
+    fn canvas_blocks_normalize_indentation_in_signature() {
+        // Signatures trim each line so cosmetic indentation does not change a
+        // block's identity (keeps shimmer stable across whitespace-only edits).
+        let blocks = canvas_blocks("  - a\n    - b\n");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].signature, "- a\n- b");
+    }
+
+    #[test]
+    fn canvas_run_pending_signatures_cover_each_block() {
+        let sigs = canvas_run_pending_signatures("# Todo\n- a\n\n# Done\n");
+        assert_eq!(sigs.len(), 2);
+        assert!(sigs.contains("# Todo\n- a"));
+        assert!(sigs.contains("# Done"));
+        // An empty body has nothing to shimmer.
+        assert!(canvas_run_pending_signatures("   \n").is_empty());
+    }
+
+    #[tokio::test]
+    async fn canvas_run_clears_only_after_turn_completes() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.start_canvas_run("s1", "# Todo\n- a\n", false, "");
+        assert!(app.canvas_runs.contains_key("s1"));
+        // A stale idle snapshot arriving before the turn starts must NOT clear
+        // the shimmer — otherwise a pre-run AwaitingInput ends it instantly.
+        app.note_session_state_for_canvas_run("s1", agentd_protocol::SessionState::AwaitingInput);
+        assert!(
+            app.canvas_runs.contains_key("s1"),
+            "shimmer cleared before the turn was ever seen running"
+        );
+        // Turn starts, runs, then completes.
+        app.note_session_state_for_canvas_run("s1", agentd_protocol::SessionState::Running);
+        assert!(app.canvas_runs.contains_key("s1"));
+        app.note_session_state_for_canvas_run("s1", agentd_protocol::SessionState::AwaitingInput);
+        assert!(
+            !app.canvas_runs.contains_key("s1"),
+            "shimmer should clear once the canvas-originating turn completes"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_run_expires_at_deadline() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.start_canvas_run("s1", "# Todo\n", false, "");
+        // A missed completion signal must never strand the animation.
+        app.canvas_runs.get_mut("s1").unwrap().deadline =
+            Instant::now() - Duration::from_millis(1);
+        app.expire_canvas_runs(Instant::now());
+        assert!(!app.canvas_runs.contains_key("s1"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_rerun_preserves_agent_progress() {
+        let (mut app, _dir, server) = empty_app().await;
+        // Run 1 over a list where each item is its own block (blank-separated):
+        // every block shimmers.
+        let original = "# Todo\n\n- alpha\n\n- beta\n\n- gamma\n";
+        app.start_canvas_run("s1", original, false, "");
+        let pending1 = &app.canvas_runs["s1"].pending;
+        assert!(pending1.contains("- alpha"));
+        assert!(pending1.contains("- beta"));
+        assert!(pending1.contains("- gamma"));
+
+        // The agent settled the "alpha" block (rewrote it) — that's now the
+        // last daemon-synced content. The user then edits "gamma" and re-Runs.
+        let after_agent = "# Todo\n\n- alpha done\n\n- beta\n\n- gamma\n";
+        let after_user_edit = "# Todo\n\n- alpha done\n\n- beta\n\n- gamma rework\n";
+        app.start_canvas_run("s1", after_user_edit, false, after_agent);
+
+        let pending2 = &app.canvas_runs["s1"].pending;
+        // The agent's settled block does NOT re-shimmer.
+        assert!(
+            !pending2.contains("- alpha done"),
+            "a block the agent already settled must not re-shimmer on re-Run"
+        );
+        // The user's fresh edit shimmers (new instruction).
+        assert!(pending2.contains("- gamma rework"));
+        // A block that was still pending and untouched keeps shimmering.
+        assert!(pending2.contains("- beta"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_selection_run_shimmers_whole_selection() {
+        // A selection run is explicitly scoped by the user, so even mid-flight
+        // it shimmers its whole region rather than preserving prior narrowing.
+        let (mut app, _dir, server) = empty_app().await;
+        app.start_canvas_run("s1", "# Todo\n\n- alpha\n", false, "");
+        app.start_canvas_run("s1", "- alpha\n\n- beta\n", true, "- alpha\n");
+        let pending = &app.canvas_runs["s1"].pending;
+        assert!(pending.contains("- alpha"));
+        assert!(pending.contains("- beta"));
         server.abort();
     }
 

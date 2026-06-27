@@ -7223,6 +7223,94 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// Temporal speed of the canvas Run shimmer wave, in radians/sec.
+const CANVAS_SHIMMER_SPEED: f32 = 4.2;
+/// Spatial frequency of the shimmer wave, in radians per character. The bright
+/// band spans roughly `2π / DENSITY` characters, so ~0.18 gives a highlight
+/// band ~35 chars wide travelling through the running region.
+const CANVAS_SHIMMER_DENSITY: f32 = 0.18;
+
+/// Which source lines of a canvas are shimmering, plus the wave phase (spec
+/// 0042). Derived from the session's `CanvasRun` at render time.
+struct CanvasShimmer {
+    /// Indexed by source-line; `true` => the line is in a still-running block.
+    active_lines: Vec<bool>,
+    /// Phase of the travelling highlight wave, in radians.
+    phase: f32,
+}
+
+/// Build the shimmer overlay for a popup from its session's `CanvasRun`, or
+/// `None` if no run is active, it has lapsed, or every block has settled. A
+/// block shimmers while its current text still matches a pending signature, so
+/// agent rewrites and user edits both take blocks out of the animation.
+fn canvas_run_shimmer(
+    app: &App,
+    popup: &crate::app::CanvasPopup,
+    now: Instant,
+) -> Option<CanvasShimmer> {
+    let run = app.canvas_runs.get(&popup.canvas.session_id)?;
+    if now >= run.deadline {
+        return None;
+    }
+    let mut active_lines = vec![false; popup.buffer.lines().count()];
+    let mut any = false;
+    for block in crate::app::canvas_blocks(&popup.buffer) {
+        if run.pending.contains(&block.signature) {
+            for slot in active_lines
+                .iter_mut()
+                .take(block.end_line)
+                .skip(block.start_line)
+            {
+                *slot = true;
+                any = true;
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let phase =
+        now.saturating_duration_since(run.started_at).as_secs_f32() * CANVAS_SHIMMER_SPEED;
+    Some(CanvasShimmer { active_lines, phase })
+}
+
+/// Overlay the Run shimmer onto already-rendered canvas lines: for each active
+/// line, re-emit its text character-by-character with a brightness drawn from a
+/// travelling wave, so a highlight band sweeps through the running region. The
+/// global character index advances across active lines so the band is
+/// continuous down the document. Spans carrying a background (smart-clip chips,
+/// selection) are left intact but still advance the wave so its spacing holds.
+fn apply_canvas_shimmer(lines: &mut [Line], shimmer: &CanvasShimmer, theme: &Theme) {
+    let mut gidx: usize = 0;
+    for (i, line) in lines.iter_mut().enumerate() {
+        if !shimmer.active_lines.get(i).copied().unwrap_or(false) {
+            continue;
+        }
+        let mut new_spans = Vec::new();
+        for span in std::mem::take(&mut line.spans) {
+            if span.style.bg.is_some() {
+                gidx += span.content.chars().count();
+                new_spans.push(span);
+                continue;
+            }
+            let style = span.style;
+            for ch in span.content.chars() {
+                let w = (shimmer.phase - gidx as f32 * CANVAS_SHIMMER_DENSITY).sin();
+                // 0..1, eased so most of the region rests dim and the crest pops.
+                let t = (0.5 + 0.5 * w).clamp(0.0, 1.0);
+                let eased = t * t * (3.0 - 2.0 * t);
+                let mut st = style.fg(blend_color(theme.muted, theme.text, eased));
+                if eased > 0.85 {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                new_spans.push(Span::styled(ch.to_string(), st));
+                gidx += 1;
+            }
+        }
+        line.spans = new_spans;
+    }
+}
+
 fn render_canvas_popup_at(
     f: &mut Frame,
     app: &mut App,
@@ -7290,9 +7378,23 @@ fn render_canvas_popup_at(
     let run_hovered = title_run_hit
         .zip(app.mouse_pos)
         .is_some_and(|((xs, xe, y), (mx, my))| my == y && mx >= xs && mx < xe);
+    // A run in flight pulses the Run glyph, so there's a running cue even once
+    // every block has settled but the owning turn is still going (spec 0042).
+    let run_started = app
+        .canvas_runs
+        .get(&popup.canvas.session_id)
+        .filter(|run| now < run.deadline)
+        .map(|run| run.started_at);
     let run_style = if run_hovered {
         Style::default()
             .fg(app.theme.text)
+            .add_modifier(Modifier::BOLD)
+    } else if let Some(started) = run_started {
+        let phase =
+            now.saturating_duration_since(started).as_secs_f32() * CANVAS_SHIMMER_SPEED;
+        let t = (0.5 + 0.5 * phase.sin()).clamp(0.0, 1.0);
+        Style::default()
+            .fg(blend_color(app.theme.accent, app.theme.text, t))
             .add_modifier(Modifier::BOLD)
     } else {
         let fg = if active {
@@ -7389,6 +7491,11 @@ fn render_canvas_popup_at(
 
     let selection = canvas_selection_range(popup);
     let mut lines = render_canvas_markdown_lines(app, &popup.buffer, selection);
+    // Run shimmer (spec 0042): while a canvas Run is executing for this session,
+    // sweep a highlight through the blocks that have not settled yet.
+    if let Some(shimmer) = canvas_run_shimmer(app, popup, now) {
+        apply_canvas_shimmer(&mut lines, &shimmer, &app.theme);
+    }
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "Type Markdown here. Use @{session:id}, @{harness:codex}, or :::clip blocks.",
