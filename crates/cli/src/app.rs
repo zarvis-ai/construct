@@ -5851,7 +5851,7 @@ impl App {
                     self.toggle_canvas_popup().await;
                     return;
                 }
-                if self.selected_session().is_some()
+                if self.selected_id().is_some()
                     && row == close_y
                     && col >= close_x_start
                     && col < close_x_end
@@ -7616,6 +7616,21 @@ impl App {
         if self.canvas_popup.is_none() {
             return false;
         }
+        if let Some(menu) = self.session_title_menu.clone() {
+            if let Some(action) = menu.item_at(ev.column, ev.row) {
+                if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.run_session_title_menu_action(menu.session_id, action)
+                        .await;
+                }
+                return true;
+            }
+            if menu.contains(ev.column, ev.row) {
+                return true;
+            }
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.session_title_menu = None;
+            }
+        }
         let contains = ev.column >= modal.x
             && ev.column < modal.x.saturating_add(modal.width)
             && ev.row >= modal.y
@@ -7637,10 +7652,16 @@ impl App {
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         if hit_title_toggle || hit_title_run || hit_title_close || hit_selection_run {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                // The close button and the mode toggle both dismiss the canvas
-                // (same path as `C-x Space` / the existing toggle).
-                if hit_title_toggle || hit_title_close {
+                if hit_title_toggle {
                     self.close_canvas_popup().await;
+                } else if hit_title_close {
+                    if let Some(session_id) = self
+                        .canvas_popup
+                        .as_ref()
+                        .map(|popup| popup.canvas.session_id.clone())
+                    {
+                        self.open_session_title_menu(session_id, modal);
+                    }
                 } else {
                     let selection = hit_selection_run
                         .then(|| {

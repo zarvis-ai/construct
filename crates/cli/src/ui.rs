@@ -7467,7 +7467,7 @@ fn render_canvas_popup_at(
         .border_style(canvas_border_style(&app.theme, active))
         .title(title);
     let block =
-        apply_pane_title_right_cluster(app, rect, summary_ref, active, show_close, false, block);
+        apply_pane_title_right_cluster(app, rect, summary_ref, active, show_close, true, block);
     if active {
         // Run lives in the left cluster; the close button and widget icons reuse
         // the shared session-view geometry (`view_close_button_range` and
@@ -8023,7 +8023,7 @@ fn render_canvas_title_tooltip(
     }
     if let Some((xs, xe, y)) = app.layout.canvas_title_close_hit {
         if my == y && mx >= xs && mx < xe {
-            render_button_tooltip(f, &app.theme, " Close canvas. C-x Space ", mx, my);
+            render_button_tooltip(f, &app.theme, " Session actions ", mx, my);
             return;
         }
     }
