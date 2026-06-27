@@ -7874,39 +7874,219 @@ fn canvas_cursor_position(
     let width = area.width as usize;
     let (line, col) = canvas_line_col(markdown, cursor);
 
-    // Accumulate the visual rows consumed by every logical line BEFORE the
-    // cursor's line. The canvas body is rendered with `Wrap { trim: false }`,
-    // so a preceding line whose rendered width exceeds the area occupies
-    // `ceil(width / area.width)` visual rows (minimum 1) — not exactly one.
-    // Using the same width logic as the cursor column math keeps the row
-    // count and the intra-line offset below consistent with each other.
+    // The canvas body is rendered with `Wrap { trim: false }`, which WORD-wraps
+    // at whitespace (and hard-breaks words longer than the width) rather than
+    // slicing every `width` characters. A logical line containing spaces breaks
+    // earlier than naive char-division predicts, so the cursor must reuse the
+    // same word-wrap — both to count the rows consumed by every line BEFORE the
+    // cursor's line and to place the cursor within its own line. Anything else
+    // drifts the moment a line wraps mid-word and compounds for lines below.
     let mut visual_row = 0usize;
     for raw in markdown.lines().take(line) {
-        let rendered_width = canvas_visual_col_for_line(app, raw, raw.chars().count());
-        visual_row = visual_row.saturating_add(canvas_wrapped_rows(rendered_width, width));
+        let text = canvas_rendered_line_text(app, raw);
+        visual_row = visual_row.saturating_add(canvas_wrap_row_starts(&text, width).len());
     }
 
-    let visual_col = canvas_visual_col_for_line(app, markdown.lines().nth(line).unwrap_or(""), col);
-    let visual_row = visual_row.saturating_add(visual_col / width);
+    let cur_raw = markdown.lines().nth(line).unwrap_or("");
+    let visual_col = canvas_visual_col_for_line(app, cur_raw, col);
+    let starts = canvas_wrap_row_starts(&canvas_rendered_line_text(app, cur_raw), width);
+    let (row_in_line, col_in_row) = canvas_wrap_locate(&starts, visual_col, width);
+    let visual_row = visual_row.saturating_add(row_in_line);
     if visual_row >= area.height as usize {
         return None;
     }
     Some(Position {
-        x: area.x.saturating_add((visual_col % width) as u16),
+        x: area.x.saturating_add(col_in_row as u16),
         y: area.y.saturating_add(visual_row as u16),
     })
 }
 
-/// Number of visual rows a rendered line of `rendered_width` columns occupies
-/// when wrapped at `width` columns, matching `Wrap { trim: false }`: at least
-/// one row, and `ceil(rendered_width / width)` once it exceeds the area width.
-fn canvas_wrapped_rows(rendered_width: usize, width: usize) -> usize {
-    if width == 0 {
-        return 1;
+/// Locate a display column `visual_col` within a word-wrapped line: return the
+/// `(row, col)` of the wrapped row that holds it, given the per-row starting
+/// display offsets from [`canvas_wrap_row_starts`]. The row is the last one
+/// whose start is at or before `visual_col`; the column is the remainder. A
+/// cursor parked exactly at the right edge of a full row (or inside a run of
+/// collapsed break-whitespace) is rolled onto the next row so it never paints
+/// past the editor edge.
+fn canvas_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let mut row = 0usize;
+    for (idx, &start) in starts.iter().enumerate() {
+        if start <= visual_col {
+            row = idx;
+        } else {
+            break;
+        }
     }
-    (rendered_width / width)
-        .saturating_add(usize::from(rendered_width % width != 0))
-        .max(1)
+    let start = starts.get(row).copied().unwrap_or(0);
+    let col = visual_col.saturating_sub(start);
+    (row.saturating_add(col / width), col % width)
+}
+
+/// Word-wrap `text` exactly as ratatui's `Wrap { trim: false }` does and return,
+/// for each resulting visual row, the display-column offset (within the
+/// unwrapped line, counting collapsed break-whitespace) at which that row's
+/// first painted cell begins. The number of entries is the visual row count.
+///
+/// This is a faithful port of ratatui's `WordWrapper` for the `trim == false`
+/// path: a finished word (or a word that on its own overflows the width) is
+/// flushed onto the pending row together with the whitespace that preceded it;
+/// once the row is full the whitespace sitting at the break is dropped so the
+/// next word starts the following row. Reusing the renderer's wrap rule keeps
+/// the cursor's row count and intra-line column on the same glyphs the body
+/// paints. Verified against ratatui's `TestBackend` output for word breaks,
+/// hard breaks, trailing/leading whitespace, and collapsed multi-space runs.
+fn canvas_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
+    let max = width.max(1);
+    // Each buffered glyph carries `(origin, glyph_width)` where `origin` is its
+    // display offset in the unwrapped line, so a finished row reports where it
+    // started even after break-whitespace between words is dropped.
+    let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut pending_line: Vec<(usize, usize)> = Vec::new();
+    let mut line_width = 0usize;
+    let mut pending_word: Vec<(usize, usize)> = Vec::new();
+    let mut word_width = 0usize;
+    let mut pending_ws: std::collections::VecDeque<(usize, usize)> =
+        std::collections::VecDeque::new();
+    let mut ws_width = 0usize;
+    let mut non_ws_previous = false;
+    let mut origin = 0usize;
+
+    for ch in text.chars() {
+        let sw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let here = origin;
+        origin = origin.saturating_add(sw);
+        // ratatui ignores glyphs wider than the whole line.
+        if sw > max {
+            continue;
+        }
+        let is_ws = ch.is_whitespace();
+
+        let word_found = non_ws_previous && is_ws;
+        let untrimmed_overflow = pending_line.is_empty() && word_width + ws_width + sw > max;
+
+        // A segment finished (word boundary) or the buffered word can no longer
+        // share a row: commit the pending whitespace + word onto the row.
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_ws.drain(..));
+            line_width += ws_width;
+            ws_width = 0;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= max;
+        let pending_word_overflow = sw > 0 && line_width + ws_width + word_width >= max;
+        if line_full || pending_word_overflow {
+            let mut remaining = max.saturating_sub(line_width);
+            rows.push(std::mem::take(&mut pending_line));
+            line_width = 0;
+            // Drop whitespace that ran up to the row's edge — it does not carry
+            // over as leading space on the next row.
+            while let Some(&(_, w)) = pending_ws.front() {
+                if w > remaining {
+                    break;
+                }
+                ws_width -= w;
+                remaining -= w;
+                pending_ws.pop_front();
+            }
+            // The break whitespace itself is consumed, not re-counted.
+            if is_ws && pending_ws.is_empty() {
+                continue;
+            }
+        }
+
+        if is_ws {
+            ws_width += sw;
+            pending_ws.push_back((here, sw));
+        } else {
+            word_width += sw;
+            pending_word.push((here, sw));
+        }
+        non_ws_previous = !is_ws;
+    }
+
+    // Flush whatever is left into a final row (trim == false keeps trailing ws).
+    pending_line.extend(pending_ws.drain(..));
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() {
+        rows.push(pending_line);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+
+    // Convert each row to its starting display offset; an empty row (no painted
+    // glyph) inherits the previous row's end so offsets stay monotonic.
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut carry = 0usize;
+    for row in &rows {
+        let start = row.first().map(|&(o, _)| o).unwrap_or(carry);
+        starts.push(start);
+        if let Some(&(o, w)) = row.last() {
+            carry = o.saturating_add(w);
+        }
+    }
+    starts
+}
+
+/// The plain text the canvas body paints for one logical markdown line, before
+/// ratatui word-wraps it. Mirrors the per-line transformation in
+/// [`render_canvas_markdown_lines`] / [`canvas_visual_col_for_line`] — kept
+/// heading markers, the `  • ` list prefix, and expanded smart-clip chips — so
+/// the cursor's wrap math sees exactly the glyphs (and their spaces) ratatui
+/// wraps.
+fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
+    let trimmed = raw.trim();
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    if trimmed.is_empty() {
+        String::new()
+    } else if canvas_heading_level(trimmed).is_some() {
+        canvas_inline_rendered_text(app, trimmed)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        format!("  • {}", canvas_inline_rendered_text(app, rest))
+    } else {
+        // Normal line: the renderer keeps the raw leading whitespace and
+        // expands any inline chips in the remainder.
+        let body = raw
+            .char_indices()
+            .nth(leading)
+            .map(|(idx, _)| &raw[idx..])
+            .unwrap_or("");
+        let mut out: String = raw.chars().take(leading).collect();
+        out.push_str(&canvas_inline_rendered_text(app, body));
+        out
+    }
+}
+
+/// Expand inline smart-clip chips (`@{…}`) in `text` to the ` label ` form the
+/// renderer paints, leaving the surrounding text untouched. The label comes
+/// from the same source as [`canvas_smart_clip_visual_width`], so the rendered
+/// text and the cursor column stay width-consistent.
+fn canvas_inline_rendered_text(app: Option<&App>, text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("@{") {
+        out.push_str(&rest[..start]);
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let raw_clip = &after_marker[..end];
+        let (_, label) = canvas_smart_clip_label(app, raw_clip);
+        out.push(' ');
+        out.push_str(&label);
+        out.push(' ');
+        rest = &after_marker[end + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn canvas_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
@@ -8548,6 +8728,92 @@ mod tests {
         assert_eq!(
             canvas_cursor_position(None, markdown, cursor, area),
             Some(Position { x: 12, y: 5 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_word_wraps_line_with_spaces() {
+        // The canvas body renders with `Wrap { trim: false }`, which WORD-wraps
+        // at spaces. "hello world foo" at width 8 lays out as three rows
+        // ("hello" / "world" / "foo"), so a cursor before "foo" sits at the
+        // start of the third row. Naive char-division (col / width) would put
+        // it at row 1 col 4 — inside "world" — which is the residual bug.
+        let area = Rect::new(10, 2, 8, 6);
+        let markdown = "hello world foo";
+        let cursor = "hello world ".chars().count();
+
+        assert_eq!(
+            canvas_cursor_position(None, markdown, cursor, area),
+            Some(Position { x: 10, y: 4 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_word_wrapped_line_offsets_following_line() {
+        // A word-wrapped line consumes the right number of visual rows, so a
+        // normal line below it lands on the correct row. "hello world foo" at
+        // width 8 is three rows; "next" starts on the fourth. Char-division
+        // (ceil(15/8) = 2) would undercount and pull the line up a row.
+        let area = Rect::new(10, 2, 8, 8);
+        let markdown = "hello world foo\nnext";
+        let cursor = "hello world foo\n".chars().count();
+
+        assert_eq!(
+            canvas_cursor_position(None, markdown, cursor, area),
+            Some(Position { x: 10, y: 5 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_hard_break_then_space_no_phantom_row() {
+        // "abcd efgh" at width 4: "abcd" exactly fills row 0, the space is the
+        // break point (consumed), and "efgh" is row 1 — two rows, not three.
+        // A cursor before 'e' sits at row 1 col 0. (A naive `wrap_to_width`
+        // reuse would emit a spurious empty middle row here and also misplace
+        // the column; ratatui collapses the break space instead.)
+        let area = Rect::new(10, 2, 4, 8);
+        let markdown = "abcd efgh";
+        let cursor = "abcd ".chars().count();
+
+        assert_eq!(
+            canvas_cursor_position(None, markdown, cursor, area),
+            Some(Position { x: 10, y: 3 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_matches_painted_glyph_on_wrapped_line() {
+        // Cross-check the computed cursor cell against the glyph ratatui
+        // actually paints, using the exact `Paragraph::wrap(Wrap{trim:false})`
+        // the canvas body uses. The cursor before "foo" must land on the
+        // painted 'f' at the start of the wrapped row — not somewhere in the
+        // middle of "world" as char-division would compute.
+        let w = 8u16;
+        let h = 6u16;
+        let area = Rect::new(0, 0, w, h);
+        let markdown = "hello world foo";
+        let cursor = "hello world ".chars().count();
+
+        let pos = canvas_cursor_position(None, markdown, cursor, area).expect("cursor pos");
+
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            // Plain markdown renders one Line == the raw text, so this matches
+            // what `render_canvas_popup_at` feeds the Paragraph for this input.
+            let para = Paragraph::new(markdown).wrap(Wrap { trim: false });
+            f.render_widget(para, area);
+        })
+        .expect("draw");
+        let buf = term.backend().buffer();
+        let glyph = buf
+            .cell((pos.x, pos.y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+
+        assert_eq!(
+            glyph, "f",
+            "computed cursor {pos:?} should sit on the painted 'f' starting the wrapped row"
         );
     }
 
