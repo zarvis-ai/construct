@@ -12,7 +12,7 @@ Canvas markdown editing uses Emacs-style incremental search with `C-s` to enter 
 - `Enter` accepts the current match and closes search mode.
 - `C-g` cancels search mode and restores the cursor to the pre-search anchor.
 
-While search is active, every typed character extends the query and updates match ranges. Search highlights are visible in the canvas body and the active match is visually distinguished from non-active matches.
+While search is active, every typed character extends the query and updates match ranges. Pasted text is also consumed by the search prompt as query text rather than inserted into the canvas document. Search highlights are visible in the canvas body and the active match is visually distinguished from non-active matches.
 
 ## Reason
 
@@ -22,6 +22,7 @@ Canvas editing is now a primary markdown editing surface; it needs the same disc
 
 - Search state is tracked on the canvas popup and does not interfere with smart-clip suggestions or selection gestures.
 - Search mode can be re-entered and edited from the current cursor position without closing the canvas.
+- Paste routing checks active canvas search before ordinary canvas editing so a pasted search term cannot mutate the document under the prompt.
 - The modeline should prefer search status text while search mode is active so users can tell whether a query is empty, failing, or positioned.
 - Search highlights must preserve existing canvas visuals (selection, smart-clip spans, and running-shimmer overlay) and remain compatible with wrapped rows.
 - Cancelling search restores the original cursor anchor; accepting search keeps the current cursor position.

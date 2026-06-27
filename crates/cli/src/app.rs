@@ -2975,6 +2975,11 @@ impl App {
             return;
         }
 
+        if self.canvas_search_active() {
+            self.append_canvas_search_query_text(&text);
+            return;
+        }
+
         // Mirror the keystroke routing precedence (see `on_key`): pasted
         // text lands in the canvas only when no minibuffer/palette overlay is
         // capturing input. With an overlay open, `dispatch_paste_text` below
@@ -8112,6 +8117,10 @@ impl App {
     }
 
     fn append_canvas_search_query_char(&mut self, ch: char) {
+        self.append_canvas_search_query_text(&ch.to_string());
+    }
+
+    fn append_canvas_search_query_text(&mut self, text: &str) {
         {
             let Some(popup) = self.canvas_popup.as_mut() else {
                 return;
@@ -8119,7 +8128,7 @@ impl App {
             let Some(search) = popup.search.as_mut() else {
                 return;
             };
-            search.query.push(ch);
+            search.query.push_str(text);
         }
         self.update_canvas_search_after_edit();
     }
@@ -12209,6 +12218,25 @@ mod tests {
         let popup = app.canvas_popup.as_ref().unwrap();
         assert!(popup.search.is_none(), "C-g exits search");
         assert_eq!(popup.cursor, 6);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_incremental_search_paste_extends_query_not_buffer() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta alpha", 6));
+
+        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .await;
+        app.on_paste("alpha".to_string()).await;
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        let search = popup.search.as_ref().expect("search remains active");
+        assert_eq!(popup.buffer, "alpha beta alpha");
+        assert_eq!(search.query, "alpha");
+        assert_eq!(search.matches, vec![(0, 5), (11, 16)]);
+        assert_eq!(search.selected, 1);
+        assert_eq!(popup.cursor, 11);
         server.abort();
     }
 
