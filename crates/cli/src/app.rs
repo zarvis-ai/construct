@@ -5083,11 +5083,16 @@ impl App {
         // stop — construct becomes a transparent mouse pipe for the pane, so
         // the child's own scroll/click/selection handling works. Skipped while
         // a construct-owned drag gesture (pane/list resize, scrollbar, text
-        // selection) is in flight so those finish under our control.
+        // selection) is in flight so those finish under our control, and while
+        // the session-title menu is open — that overlay paints over the pane
+        // content, so its action rows must take mouse priority over the child
+        // (otherwise a mouse-grabbing child swallows every menu click and the
+        // split/close/rename actions silently do nothing).
         if self.handle_canvas_mouse(&ev).await {
             return;
         }
-        if self.resizing_list.is_none()
+        if self.session_title_menu.is_none()
+            && self.resizing_list.is_none()
             && self.resizing_pin_strip.is_none()
             && self.resizing_orchestrator_panel.is_none()
             && self.resizing_matrix_rain.is_none()
@@ -13940,6 +13945,86 @@ mod tests {
             MainWindowTree::Leaf { .. } => panic!("expected two remaining split panes"),
         }
         assert_eq!(app.leaf_window_ids(), vec![1, 2]);
+        server.abort();
+    }
+
+    /// The session-title menu paints over the pane content. When that pane's
+    /// child has grabbed the mouse (claude-code / vim fullscreen), clicks on the
+    /// menu's action rows must still drive the menu — they must NOT be forwarded
+    /// into the child. Regression for split / close / rename silently doing
+    /// nothing on a pane whose harness tracks the mouse.
+    #[tokio::test]
+    async fn session_menu_action_dispatches_over_mouse_grabbing_child() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
+        app.active_window_id = 1;
+        app.next_window_id = 2;
+        app.selection = Selection::Session("s1".into());
+        app.focus = PaneFocus::View;
+
+        // Give s1 a child that has enabled mouse tracking (DECSET ?1000h).
+        let mut hist = crate::pty_render::ItemHistory::new();
+        hist.feed_pty(b"\x1b[?1000h");
+        let _ = hist.replay(58, 26, 0);
+        assert_ne!(
+            hist.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "precondition: the child grabs the mouse"
+        );
+        app.histories.insert("s1".into(), hist);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+
+        let pane = app
+            .layout
+            .main_window_areas
+            .first()
+            .copied()
+            .expect("single pane registered");
+        let (bx, _, by) = crate::ui::view_close_button_range(pane.area);
+        let click = |kind, col, row| MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+
+        // Click the ☰ button (on the border, never forwarded) to open the menu.
+        app.on_mouse(click(MouseEventKind::Down(MouseButton::Left), bx + 1, by))
+            .await;
+        app.on_mouse(click(MouseEventKind::Up(MouseButton::Left), bx + 1, by))
+            .await;
+        let menu = app
+            .session_title_menu
+            .clone()
+            .expect("clicking the actions button opens the session menu");
+
+        // Click the "split horizontal" row, which sits over the pane content the
+        // child is tracking. With the fix it dispatches; without it, the click
+        // is swallowed by the child and the layout never splits.
+        let idx = SessionTitleMenuAction::ALL
+            .iter()
+            .position(|a| *a == SessionTitleMenuAction::SplitHorizontal)
+            .unwrap();
+        let item_row = menu.area.y + 1 + idx as u16;
+        let item_col = menu.area.x + 2;
+        assert_eq!(
+            menu.item_at(item_col, item_row),
+            Some(SessionTitleMenuAction::SplitHorizontal)
+        );
+        app.on_mouse(click(MouseEventKind::Down(MouseButton::Left), item_col, item_row))
+            .await;
+        app.on_mouse(click(MouseEventKind::Up(MouseButton::Left), item_col, item_row))
+            .await;
+
+        assert!(
+            app.is_split_layout(),
+            "menu split action must fire even over a mouse-grabbing child"
+        );
+        assert_eq!(app.leaf_window_ids().len(), 2);
         server.abort();
     }
 

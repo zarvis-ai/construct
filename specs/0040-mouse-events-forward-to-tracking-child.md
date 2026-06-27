@@ -13,6 +13,8 @@ The report must honor both the child's tracking **mode** (which events are repor
 
 The client tracks the child's mouse mode and encoding from the same byte stream it renders, exactly as it tracks bracketed-paste mode (see [0034](0034-forwarded-pastes-honor-child-bracketed-paste-mode.md)). A child that never enables a mouse mode keeps the client's own mouse handling (wheel scrollback, click-to-focus, drag-to-select). Forwarding is also suppressed while a client-owned drag gesture (pane/list/scrollbar resize, an in-progress text selection) is mid-flight, so those gestures finish under the client's control.
 
+Forwarding is likewise suppressed while a client-owned overlay that paints over pane content is open (e.g. the session-title actions menu, the canvas popup). Such an overlay is a transient modal surface the user is interacting with, so its rows take mouse priority over the child underneath — otherwise a mouse-grabbing child swallows every overlay click and its actions silently do nothing. The overlay's own trigger lives on the pane border (excluded from the content rectangle), so opening it is never forwarded either.
+
 A button-press event is the one gesture the client acts on **in addition to** forwarding it: pressing a mouse button over a pane's content area moves the client's keyboard focus to that pane before the report is written down the PTY. Focus is a client-side concern the child cannot observe, so the report the child receives is identical either way — but without it a click inside a mouse-grabbing child reaches the child while the client's focus (and therefore the keyboard) stays on whatever pane it was on, which no user expects. Wheel and motion events are forwarded without changing focus.
 
 ## Reason
@@ -25,6 +27,7 @@ A child that turns on mouse tracking — Claude Code's fullscreen mode is the mo
 - While a child holds the mouse, the client's own in-pane gestures over that pane are deferred to the child: the wheel scrolls the child rather than the client's scrollback, and drag-to-select no longer originates in that pane. Native terminal selection then requires the user's terminal modifier (Fn / Option / Shift, per the terminal), the same as any full-screen mouse-grabbing app. Click-to-focus is the exception — a button press still focuses the pane (see the Decision) and then forwards, so the pane the user clicked is the one receiving keystrokes.
 - Events the active mode does not report (e.g. plain motion under press/release mode) are not forwarded; the client keeps its own handling of those rather than swallowing them.
 - Coordinates are mapped to the pane's content area, so divider and frame clicks (on borders, outside the content rectangle) continue to drive the client's resize/focus logic and are never forwarded.
+- A client-owned overlay open over a pane (session-title menu, canvas popup) takes mouse priority over the child beneath it. While such an overlay is open the client handles the mouse itself, so the overlay's actions stay clickable even when the pane's harness has grabbed the mouse.
 
 ## Non-Goals
 
