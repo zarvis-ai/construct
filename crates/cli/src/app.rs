@@ -7687,6 +7687,10 @@ impl App {
             KeyCode::Right => self.move_canvas_cursor(1),
             KeyCode::Up => self.move_canvas_cursor_vertical(-1),
             KeyCode::Down => self.move_canvas_cursor_vertical(1),
+            KeyCode::Char('l') if ctrl => {
+                // C-l: center the current cursor row in the canvas viewport (emacs-like).
+                self.center_canvas_cursor();
+            }
             KeyCode::Home => {
                 if let Some(popup) = self.canvas_popup.as_mut() {
                     popup.cursor = canvas_line_start(&popup.buffer, popup.cursor);
@@ -8208,6 +8212,34 @@ impl App {
         let max_scroll = total_rows.saturating_sub(viewport);
         let next = crate::ui::canvas_follow_scroll(popup.scroll_offset, cursor_row, viewport)
             .min(max_scroll);
+        if let Some(popup) = self.canvas_popup.as_mut() {
+            popup.scroll_offset = next;
+        }
+    }
+
+    /// Center the cursor row in the canvas popup viewport (emacs C-l semantics).
+    /// Places the visual cursor row near the middle of the current viewport
+    /// (clamped at the top or bottom when near the edges of the buffer).
+    fn center_canvas_cursor(&mut self) {
+        let Some(inner) = self.layout.canvas_inner_area else {
+            return;
+        };
+        let width = inner.width as usize;
+        let viewport = inner.height as usize;
+        if width == 0 || viewport == 0 {
+            return;
+        }
+        let Some(popup) = self.canvas_popup.as_ref() else {
+            return;
+        };
+        let cursor_row =
+            crate::ui::canvas_cursor_visual_row(Some(self), &popup.buffer, popup.cursor, width);
+        let total_rows = crate::ui::canvas_total_visual_rows(Some(self), &popup.buffer, width);
+        let max_scroll = total_rows.saturating_sub(viewport);
+        let half = viewport / 2;
+        // Aim for the cursor to land roughly in the center of the window.
+        let desired = cursor_row.saturating_sub(half);
+        let next = desired.min(max_scroll);
         if let Some(popup) = self.canvas_popup.as_mut() {
             popup.scroll_offset = next;
         }
@@ -11089,6 +11121,41 @@ mod tests {
         app.focus = PaneFocus::List;
         app.select_session(target);
         assert_eq!(app.selection.session_id(), Some("s2"));
+    }
+
+    #[tokio::test]
+    async fn canvas_c_l_centers_cursor_row_in_viewport() {
+        let (mut app, _dir, _server) = empty_app().await;
+        // 30 short lines into a 7-row viewport.
+        let markdown = (0..30).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        app.canvas_popup = Some(canvas_popup_for_test("s1", &markdown, 0));
+        app.layout.canvas_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 7));
+
+        // Start near top: center should be near 0 (clamped).
+        app.center_canvas_cursor();
+        let off0 = app.canvas_popup.as_ref().unwrap().scroll_offset;
+        assert!(off0 <= 3, "near-top center should keep offset small, got {off0}");
+
+        // Move cursor far down (visual row ~29).
+        let total_chars = markdown.chars().count();
+        app.canvas_popup.as_mut().unwrap().cursor = total_chars;
+        app.center_canvas_cursor();
+        let off = app.canvas_popup.as_ref().unwrap().scroll_offset;
+        let cursor_row = crate::ui::canvas_cursor_visual_row(
+            Some(&app),
+            &markdown,
+            total_chars,
+            40,
+        );
+        // Cursor row should be roughly centered in the 7-row window.
+        // With half=3, we expect offset ~ cursor_row - 3, cursor visible in middle.
+        assert!(
+            (cursor_row >= off + 2) && (cursor_row < off + 7),
+            "after C-l center, cursor row {cursor_row} should be inside viewport [{off}, {})",
+            off + 7
+        );
+        // And not at the very top or bottom of the window for a mid-buffer cursor.
+        assert!(off > 5, "offset should have advanced for deep cursor, got {off}");
     }
 
     #[tokio::test]
