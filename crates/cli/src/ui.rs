@@ -8002,7 +8002,7 @@ fn render_canvas_smart_clip_picker(
 /// [`canvas_wrap_row_starts`] / [`canvas_wrap_locate`]). `width` is the inner
 /// content width in cells; a zero width collapses the whole buffer onto row 0,
 /// column 0.
-fn canvas_cursor_visual_pos(
+pub(crate) fn canvas_cursor_visual_pos(
     app: Option<&App>,
     markdown: &str,
     cursor: usize,
@@ -8078,6 +8078,76 @@ pub(crate) fn canvas_follow_scroll(
     } else {
         scroll_offset
     }
+}
+
+/// Inverse of [`canvas_cursor_visual_pos`]: the buffer char offset whose cursor
+/// paints at absolute visual `(target_row, target_col)` in the word-wrapped
+/// body. Used by vertical navigation (land on a visual row while keeping a
+/// preferred column) and mouse hit-testing (place the cursor where a click fell,
+/// including on a wrapped continuation row). `target_row` is absolute in the
+/// wrapped-row space — the caller folds in any scroll offset before calling.
+///
+/// A `target_row` past the end of the content resolves to the buffer's end; a
+/// `target_col` left of or past a row's content clamps to that row's first or
+/// last offset. Forward visual position is monotonic in char offset, so the
+/// landing offset is the last column on the target row at or before the target.
+pub(crate) fn canvas_visual_to_cursor(
+    app: Option<&App>,
+    markdown: &str,
+    target_row: usize,
+    target_col: usize,
+    width: usize,
+) -> usize {
+    let width = width.max(1);
+
+    // Walk logical lines (split on '\n' so a trailing empty line is kept the
+    // same way the cursor's line math counts it), accumulating each line's
+    // wrapped-row count until the line that owns `target_row` is found.
+    let mut rows_before = 0usize;
+    let mut line_start = 0usize; // char offset of the current line's first char
+    let mut owner: Option<(usize, Vec<usize>, &str, usize)> = None;
+    for raw in markdown.split('\n') {
+        let rendered = canvas_rendered_line_text(app, raw);
+        let starts = canvas_wrap_row_starts(&rendered, width);
+        let row_count = starts.len();
+        if target_row < rows_before + row_count {
+            owner = Some((line_start, starts, raw, rows_before));
+            break;
+        }
+        rows_before += row_count;
+        line_start += raw.chars().count() + 1; // + the '\n'
+    }
+    let Some((line_start, starts, raw, rows_before)) = owner else {
+        // Below all content → end of buffer.
+        return markdown.chars().count();
+    };
+    let row_in_line = target_row - rows_before; // < starts.len() by construction
+
+    // Largest raw column on this line whose forward visual position is at or
+    // before (row_in_line, target_col) in row-major order.
+    let line_len = raw.chars().count();
+    let mut best_col = 0usize;
+    for raw_col in 0..=line_len {
+        let visual_col = canvas_visual_col_for_line(app, raw, raw_col);
+        let (r, c) = canvas_wrap_locate(&starts, visual_col, width);
+        if r < row_in_line || (r == row_in_line && c <= target_col) {
+            best_col = raw_col;
+        } else {
+            break;
+        }
+    }
+    line_start + best_col
+}
+
+/// The inner content width available to the canvas body, derived from the
+/// popup's outer modal rect: the bordered block removes one cell per side and
+/// the content margin removes [`CANVAS_CONTENT_PADDING_X`] more per side. Mouse
+/// hit-testing reuses this so it word-wraps on the exact width
+/// [`render_canvas_popup_at`] paints.
+pub(crate) fn canvas_modal_inner_width(modal: Rect) -> usize {
+    (modal.width as usize)
+        .saturating_sub(2)
+        .saturating_sub(2 * CANVAS_CONTENT_PADDING_X as usize)
 }
 
 fn canvas_cursor_position(

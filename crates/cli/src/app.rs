@@ -7160,13 +7160,26 @@ impl App {
     }
 
     fn place_canvas_cursor(&mut self, modal: ratatui::layout::Rect, col: u16, row: u16) {
+        let cursor = {
+            let app: &App = self;
+            let Some(popup) = app.canvas_popup.as_ref() else {
+                return;
+            };
+            canvas_cursor_at_modal_point(
+                Some(app),
+                &popup.buffer,
+                modal,
+                popup.scroll_offset,
+                col,
+                row,
+            )
+            .unwrap_or(0)
+        };
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
         popup.closing = false;
-        popup.cursor =
-            canvas_cursor_at_modal_point(&popup.buffer, modal, popup.scroll_offset, col, row)
-                .unwrap_or(0);
+        popup.cursor = cursor;
         popup.preferred_col = None;
         popup.selection = None;
         popup.smart_clip = None;
@@ -7234,17 +7247,24 @@ impl App {
         }
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                let cursor = {
+                    let app: &App = self;
+                    let Some(popup) = app.canvas_popup.as_ref() else {
+                        return true;
+                    };
+                    canvas_cursor_at_modal_point(
+                        Some(app),
+                        &popup.buffer,
+                        modal,
+                        popup.scroll_offset,
+                        ev.column,
+                        ev.row,
+                    )
+                    .unwrap_or(0)
+                };
                 let Some(popup) = self.canvas_popup.as_mut() else {
                     return true;
                 };
-                let cursor = canvas_cursor_at_modal_point(
-                    &popup.buffer,
-                    modal,
-                    popup.scroll_offset,
-                    ev.column,
-                    ev.row,
-                )
-                .unwrap_or(0);
                 popup.cursor = cursor;
                 popup.preferred_col = None;
                 popup.selection = Some(CanvasSelection {
@@ -7256,17 +7276,24 @@ impl App {
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                let cursor = {
+                    let app: &App = self;
+                    let Some(popup) = app.canvas_popup.as_ref() else {
+                        return true;
+                    };
+                    canvas_cursor_at_modal_point(
+                        Some(app),
+                        &popup.buffer,
+                        modal,
+                        popup.scroll_offset,
+                        ev.column,
+                        ev.row,
+                    )
+                    .unwrap_or(0)
+                };
                 let Some(popup) = self.canvas_popup.as_mut() else {
                     return true;
                 };
-                let cursor = canvas_cursor_at_modal_point(
-                    &popup.buffer,
-                    modal,
-                    popup.scroll_offset,
-                    ev.column,
-                    ev.row,
-                )
-                .unwrap_or(0);
                 popup.cursor = cursor;
                 popup.preferred_col = None;
                 if let Some(selection) = popup.selection.as_mut() {
@@ -7840,17 +7867,49 @@ impl App {
     }
 
     fn move_canvas_cursor_vertical(&mut self, delta: isize) {
+        // Move by one *visual* (word-wrapped) row, like a normal editor: a
+        // logical line that wraps spans several visual rows, and Up/Down step
+        // through each. Work in the same wrapped-row space the body is laid out
+        // and scrolled in, using the inner content width captured at the last
+        // render — so nav, the cursor-follow scroll, and painting all agree. The
+        // preferred column is tracked in *visual* columns so it survives crossing
+        // wrapped rows onto shorter ones. Without a rendered viewport there is
+        // nothing to navigate; the follow-scroll runs afterward in the caller.
+        let Some(inner) = self.layout.canvas_inner_area else {
+            return;
+        };
+        let width = inner.width as usize;
+        if width == 0 {
+            return;
+        }
+        let computed = {
+            let app: &App = self;
+            app.canvas_popup.as_ref().map(|popup| {
+                let (row, col) =
+                    ui::canvas_cursor_visual_pos(Some(app), &popup.buffer, popup.cursor, width);
+                let target_col = popup.preferred_col.unwrap_or(col);
+                let target_row = if delta < 0 {
+                    row.saturating_sub(delta.unsigned_abs())
+                } else {
+                    row.saturating_add(delta as usize)
+                };
+                let cursor = ui::canvas_visual_to_cursor(
+                    Some(app),
+                    &popup.buffer,
+                    target_row,
+                    target_col,
+                    width,
+                );
+                (cursor, target_col)
+            })
+        };
+        let Some((cursor, target_col)) = computed else {
+            return;
+        };
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
-        let (line, col) = canvas_line_col(&popup.buffer, popup.cursor);
-        let target_col = popup.preferred_col.unwrap_or(col);
-        let next_line = if delta < 0 {
-            line.saturating_sub(delta.unsigned_abs())
-        } else {
-            line.saturating_add(delta as usize)
-        };
-        popup.cursor = canvas_cursor_for_line_col(&popup.buffer, next_line, target_col);
+        popup.cursor = cursor;
         popup.preferred_col = Some(target_col);
         Self::update_canvas_selection_head(popup);
         Self::update_canvas_smart_clip_after_cursor_move(popup);
@@ -9975,6 +10034,7 @@ fn byte_pos(s: &str, char_idx: usize) -> usize {
 }
 
 fn canvas_cursor_at_modal_point(
+    app: Option<&App>,
     buffer: &str,
     modal: ratatui::layout::Rect,
     scroll_offset: usize,
@@ -9992,13 +10052,16 @@ fn canvas_cursor_at_modal_point(
     if row < inner_y {
         return None;
     }
-    // Map the clicked screen row back to a source row, accounting for how far
-    // the body has scrolled. Like the rest of this hit-test it treats screen
-    // rows as logical lines (no intra-line wrap), so it lands exactly on
-    // unwrapped content and approximately when a line wraps.
-    let target_line = (row.saturating_sub(inner_y) as usize).saturating_add(scroll_offset);
+    // Map the clicked cell to an absolute *visual* (word-wrapped) row/col: add
+    // the scroll offset to reach the source row, then resolve it through the
+    // renderer's wrap so a click on a wrapped continuation row lands on the right
+    // offset instead of being treated as a whole logical line.
+    let target_row = (row.saturating_sub(inner_y) as usize).saturating_add(scroll_offset);
     let target_col = col.saturating_sub(inner_x) as usize;
-    Some(canvas_cursor_for_line_col(buffer, target_line, target_col))
+    let width = ui::canvas_modal_inner_width(modal);
+    Some(ui::canvas_visual_to_cursor(
+        app, buffer, target_row, target_col, width,
+    ))
 }
 
 fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<String> {
@@ -10200,46 +10263,6 @@ fn canvas_popup_from_document(
         closing: false,
         scroll_offset: 0,
     }
-}
-
-fn canvas_line_col(s: &str, cursor: usize) -> (usize, usize) {
-    let mut line = 0usize;
-    let mut col = 0usize;
-    for (idx, ch) in s.chars().enumerate() {
-        if idx >= cursor {
-            break;
-        }
-        if ch == '\n' {
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    (line, col)
-}
-
-fn canvas_cursor_for_line_col(s: &str, target_line: usize, target_col: usize) -> usize {
-    let mut line = 0usize;
-    let mut col = 0usize;
-    for (idx, ch) in s.chars().enumerate() {
-        if line == target_line && col >= target_col {
-            return idx;
-        }
-        if line == target_line && ch == '\n' {
-            return idx;
-        }
-        if ch == '\n' {
-            if line == target_line {
-                return idx;
-            }
-            line += 1;
-            col = 0;
-        } else {
-            col += 1;
-        }
-    }
-    s.chars().count()
 }
 
 /// Resolve a char offset into the buffer to its `(line index, column)` where
@@ -11977,6 +12000,101 @@ mod tests {
             app.canvas_popup.as_ref().unwrap().cursor,
             before.chars().count() + clip.chars().count()
         );
+        server.abort();
+    }
+
+    // Vertical cursor navigation and mouse hit-testing must move through the
+    // *visual* (word-wrapped) rows the canvas body paints, not jump over a whole
+    // logical line. With an inner content width of 5 the single-word line
+    // "abcdefghij" wraps into two visual rows: "abcde" (offsets 0–4) and "fghij"
+    // (offsets 5–9). Nav reads the width from the inner area captured at the last
+    // render; hit-testing derives it from the modal rect.
+
+    #[tokio::test]
+    async fn canvas_down_moves_to_next_visual_row_within_logical_line() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij", 2));
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+
+        app.move_canvas_cursor_vertical(1);
+
+        // Down lands on the wrapped continuation row at the same column (offset
+        // 5 + 2 = 7), staying inside the one logical line — not at its end.
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 7);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_up_from_continuation_row_stays_in_logical_line() {
+        let (mut app, _dir, server) = empty_app().await;
+        // Cursor on the second visual row ("fghij") at column 2 → offset 7.
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij", 7));
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+
+        app.move_canvas_cursor_vertical(-1);
+
+        // Up moves to the first visual row of the *same* logical line (offset 2),
+        // rather than doing nothing because there is no logical line above.
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_vertical_nav_preserves_preferred_column_across_wrap() {
+        let (mut app, _dir, server) = empty_app().await;
+        // "abcdefghij" wraps to two visual rows; "XY" is a short line below it.
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij\nXY", 3));
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+
+        // Down crosses the wrapped boundary: row 1 of the logical line, col 3.
+        app.move_canvas_cursor_vertical(1);
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 8);
+        assert_eq!(app.canvas_popup.as_ref().unwrap().preferred_col, Some(3));
+
+        // Down again onto the short "XY" line clamps to its end (offset 13) but
+        // the preferred column is remembered, not overwritten by the clamp.
+        app.move_canvas_cursor_vertical(1);
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 13);
+        assert_eq!(app.canvas_popup.as_ref().unwrap().preferred_col, Some(3));
+
+        // Up returns to the long row and restores column 3 (offset 8).
+        app.move_canvas_cursor_vertical(-1);
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 8);
+        assert_eq!(app.canvas_popup.as_ref().unwrap().preferred_col, Some(3));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_click_on_wrapped_continuation_row_maps_to_offset() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij", 0));
+        // inner content origin = (modal.x + 1 + pad, modal.y + 1 + pad) = (2, 2);
+        // inner width = 9 - 2 border - 2 pad = 5. "fghij" paints at y = 3.
+        let modal = Rect::new(0, 0, 9, 20);
+
+        // Click column 2 of the continuation row (screen col 4, row 3) → offset 7.
+        app.place_canvas_cursor(modal, 4, 3);
+
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 7);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_click_maps_through_scroll_offset_on_wrapped_row() {
+        let (mut app, _dir, server) = empty_app().await;
+        // Three logical lines; the first wraps to two visual rows (0,1), then
+        // "second" is row 2 and "third" is row 3. Scroll one wrapped row off the
+        // top so the viewport starts at visual row 1.
+        let markdown = "abcdefghij\nsecond\nthird";
+        app.canvas_popup = Some(canvas_popup_for_test("s1", markdown, 0));
+        app.canvas_popup.as_mut().unwrap().scroll_offset = 1;
+        let modal = Rect::new(0, 0, 9, 20);
+
+        // Click the top visible screen row (y = 2). With scroll 1 that is visual
+        // row 1 = "fghij" col 0 → offset 5, not the unscrolled row 0.
+        app.place_canvas_cursor(modal, 2, 2);
+
+        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 5);
         server.abort();
     }
 
