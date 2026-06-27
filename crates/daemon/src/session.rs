@@ -528,6 +528,19 @@ fn canvas_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
     bytes
 }
 
+/// Frame a canvas prompt for delivery to a PTY-backed session that runs its
+/// own line editor (smith, shell). The prompt is terminated with CR (`\r`) —
+/// the byte a real terminal's Enter key sends — not LF (`\n`): smith's line
+/// editor submits on CR and treats LF as "insert a newline into the buffer",
+/// so an LF terminator would leave the whole prompt sitting unsubmitted in the
+/// editor. Shell PTYs map CR→LF via the line discipline (ICRNL), so submission
+/// works there too.
+fn canvas_pty_submit_bytes(prompt: &str) -> Vec<u8> {
+    let mut bytes = prompt.as_bytes().to_vec();
+    bytes.push(b'\r');
+    bytes
+}
+
 fn canvas_run_instructions() -> Vec<String> {
     vec![
         "Execute this construct canvas as an autonomous run.".to_string(),
@@ -1718,9 +1731,8 @@ impl SessionManager {
                     .await?;
             }
             CanvasExecutionDelivery::PtySubmit => {
-                let mut bytes = prompt.clone().into_bytes();
-                bytes.push(b'\n');
-                self.pty_input(&params.session_id, bytes).await?;
+                self.pty_input(&params.session_id, canvas_pty_submit_bytes(&prompt))
+                    .await?;
             }
             CanvasExecutionDelivery::AdapterInput => {
                 self.send_input(&params.session_id, prompt.clone()).await?;
@@ -4366,6 +4378,18 @@ mod tests {
             canvas_execution_delivery(&summary),
             CanvasExecutionDelivery::PtySubmit
         );
+    }
+
+    #[test]
+    fn canvas_pty_submit_terminates_with_carriage_return() {
+        // Smith's line editor submits on CR and treats LF as a newline
+        // insertion, so the PtySubmit terminator must be `\r`. An LF here
+        // regresses to the bug where the canvas prompt landed in smith's
+        // input editor but never submitted.
+        let bytes = canvas_pty_submit_bytes("run the canvas");
+        assert_eq!(bytes.last(), Some(&b'\r'));
+        assert!(!bytes.contains(&b'\n'));
+        assert_eq!(&bytes[..bytes.len() - 1], b"run the canvas");
     }
 
     #[test]
