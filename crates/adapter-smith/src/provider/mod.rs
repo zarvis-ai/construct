@@ -459,3 +459,5 @@ pub trait LlmProvider: Send + Sync {
         sink: &mut dyn TextSink,
     ) -> Result<ProviderTurn>;
 }
+
+pub mod antigravity_oauth;
