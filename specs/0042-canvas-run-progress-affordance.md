@@ -35,8 +35,10 @@ The instruction the agent receives is a point-in-time snapshot taken at Run. Edi
 ## Consequences
 
 - The affordance is shared transient canvas state owned by the daemon, with an optimistic client-side start for the initiating TUI. The daemon publishes the active run's start time, expiry, and pending block signatures in canvas get/state payloads so other TUIs and restarted TUIs can render the same shimmer. It is not persisted into the Markdown and does not participate in canvas versioning or optimistic concurrency.
+- The daemon starts shared run state only after the Run prompt has been delivered to the owning session. The initiating client still starts optimistically before the round trip returns, but daemon-owned shared state must not be clearable by prompt echo or other delivery artifacts.
 - Narrowing is best-effort. A block the agent never rewrites keeps shimmering until the first observed output; that is acceptable and is bounded by the stop signal. Two blocks with identical text are indistinguishable and settle together.
 - Session status transitions are intentionally ignored as stop signals; they do not uniquely identify canvas-originating activity and can arrive in the absence of output. Until the daemon has an explicit canvas-turn id, it clears shared run state on first observed agent-visible output. A hard time cap remains as a backstop for silent runs.
+- Clients do not independently clear shared run state from session output events. They render optimistic/local state until the daemon reports active or cleared canvas run state through canvas get/state payloads.
 - Once every executed block has settled but the turn is still running, the body animation has nothing left to shimmer. Clients may keep a small secondary running indicator to cover that window, but must not block input or imply the canvas is locked.
 - Any rich canvas client (web, desktop) should follow the same start / narrow / stop lifecycle so the affordance is consistent across surfaces. Clients render animation locally from the daemon-published run facts; they do not invent independent run state except for the initiating client's optimistic pre-response affordance.
 

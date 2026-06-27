@@ -1606,7 +1606,8 @@ impl SessionManager {
         if body.is_empty() {
             anyhow::bail!("canvas is empty");
         }
-        let active_run = self.start_canvas_run(&params.session_id, body, params.selection.is_some());
+        let run_body = body.to_string();
+        let is_selection = params.selection.is_some();
         let scope = if selected.is_some() {
             "selection"
         } else {
@@ -1633,6 +1634,7 @@ impl SessionManager {
                 self.send_input(&params.session_id, prompt.clone()).await?;
             }
         }
+        let active_run = self.start_canvas_run(&params.session_id, &run_body, is_selection);
         Ok(CanvasExecuteResult {
             canvas: result.canvas,
             prompt,

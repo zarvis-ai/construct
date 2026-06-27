@@ -4106,7 +4106,6 @@ impl App {
             m if m == agentd_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
-                        let mut canvas_output = false;
                         self.matrix_rain.observe_event(
                             &payload.event,
                             self.matrix_rain_intensity,
@@ -4204,9 +4203,6 @@ impl App {
                         if let SessionEvent::Pty { .. } = &payload.event {
                             let now = Instant::now();
                             let bytes = payload.event.pty_bytes();
-                            if bytes.as_ref().is_some_and(|b| !b.is_empty()) {
-                                canvas_output = true;
-                            }
                             if let Some(b) = bytes.as_deref() {
                                 let history = self
                                     .histories
@@ -4237,9 +4233,6 @@ impl App {
                             // still animates the list + rain at ~8fps).
                             self.notification_dirtied_view =
                                 self.session_visible_on_screen(&payload.session_id);
-                            if canvas_output {
-                                self.clear_canvas_run_for_session_output(&payload.session_id);
-                            }
                             return;
                         }
                         // Tool events feed the same history so the
@@ -4264,7 +4257,6 @@ impl App {
                                     .entry(payload.session_id.clone())
                                     .or_default();
                                 history.feed_tool_use(tool.clone(), summarize_tool_args(args));
-                                canvas_output = true;
                             }
                         }
                         // TaskStart is the primary block-creation
@@ -4279,7 +4271,6 @@ impl App {
                             args_summary,
                         } = &payload.event
                         {
-                            canvas_output = true;
                             let history = self
                                 .histories
                                 .entry(payload.session_id.clone())
@@ -4297,7 +4288,6 @@ impl App {
                             call_id,
                         } = &payload.event
                         {
-                            canvas_output = true;
                             let history = self
                                 .histories
                                 .entry(payload.session_id.clone())
@@ -4334,9 +4324,6 @@ impl App {
                             _ => None,
                         };
                         if let Some((kind, text)) = msg {
-                            if !matches!(kind, crate::pty_render::MessageKind::User) {
-                                canvas_output = true;
-                            }
                             let headless = self
                                 .sessions
                                 .iter()
@@ -4387,7 +4374,7 @@ impl App {
                             return;
                         }
                         match &payload.event {
-                            SessionEvent::Diff { .. } => canvas_output = true,
+                            SessionEvent::Diff { .. } => {}
                             SessionEvent::UiPanel(panel) => {
                                 self.ui_panels
                                     .entry(payload.session_id.clone())
@@ -4449,9 +4436,6 @@ impl App {
                                 }
                             }
                             _ => {}
-                        }
-                        if canvas_output {
-                            self.clear_canvas_run_for_session_output(&payload.session_id);
                         }
                         if let SessionEvent::AgentStatus(status) = &payload.event {
                             let is_orchestrator = self.orchestrator_id.as_deref()
@@ -7408,13 +7392,6 @@ impl App {
                 deadline: now + Duration::from_millis(CANVAS_RUN_MAX_MS),
             },
         );
-    }
-
-    /// Stop the canvas Run affordance on first observed output for this session.
-    /// The run is user-scoped, so an explicit session output signal is the
-    /// best proxy for "this specific Run started doing work."
-    fn clear_canvas_run_for_session_output(&mut self, session_id: &str) {
-        self.canvas_runs.remove(session_id);
     }
 
     /// Reap Run shimmers that have outlived their backstop deadline, so a
@@ -12185,7 +12162,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_run_stays_spinning_without_agent_output() {
+    async fn canvas_run_waits_for_daemon_clear_state() {
         let (mut app, _dir, server) = empty_app().await;
         app.start_canvas_run("s1", "# Todo\n- a\n", false, "");
         assert!(app.canvas_runs.contains_key("s1"));
@@ -12207,8 +12184,7 @@ mod tests {
             .await;
         }
 
-        // Session status alone (the old stop signal) must not clear the run;
-        // the new affordance stays visible until output appears.
+        // Session status alone (the old stop signal) must not clear the run.
         feed(
             &mut app,
             "s1",
@@ -12220,7 +12196,9 @@ mod tests {
         .await;
         assert!(app.canvas_runs.contains_key("s1"));
 
-        // The first real output clears it (any agent-visible output type).
+        // Raw session output is not authoritative in the TUI: for PTY-backed
+        // runs it may be prompt echo from delivery. The daemon owns the shared
+        // lifecycle and reports clears through canvas/state.
         feed(
             &mut app,
             "s1",
@@ -12229,9 +12207,29 @@ mod tests {
             },
         )
         .await;
+        assert!(app.canvas_runs.contains_key("s1"));
+
+        app.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::CANVAS_STATE.into(),
+            params: Some(
+                serde_json::to_value(agentd_protocol::CanvasStateNotificationPayload {
+                    canvas: agentd_protocol::CanvasDocument {
+                        session_id: "s1".into(),
+                        markdown: "# Todo\n- a\n".into(),
+                        version: 1,
+                        updated_at_ms: 0,
+                        template_id: None,
+                    },
+                    active_run: None,
+                })
+                .unwrap(),
+            ),
+        })
+        .await;
         assert!(
             !app.canvas_runs.contains_key("s1"),
-            "shimmer should clear once the first agent output appears"
+            "shimmer should clear when daemon canvas state reports no active run"
         );
         server.abort();
     }
