@@ -531,6 +531,7 @@ fn canvas_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
 fn canvas_run_instructions() -> Vec<String> {
     vec![
         "Execute this construct canvas as an autonomous run.".to_string(),
+        "Planning pass — your very first canvas action: before starting any task or creating any subagent, make a construct_canvas_edit that updates every block with your execution plan. Annotate blocks you will execute with a status marker (e.g. '⏳ queued') or the subagent clip you are about to create; mark blocks that need no work as done or not applicable. Editing a block's text changes its signature and immediately clears its shimmer animation, so this single early edit makes the canvas reflect your plan within seconds of the Run trigger instead of after the first task completes.".to_string(),
         "Treat canvas_run.markdown as free-form instructions and state for this turn, not as a request for a one-shot status report or as a fixed task-management schema.".to_string(),
         "Infer the user's intended objective from the document structure and prose, then keep taking useful next actions while there is actionable work you can do.".to_string(),
         "Do not ask the user to run the canvas again; if the document still implies useful work you can perform, continue in this turn.".to_string(),
