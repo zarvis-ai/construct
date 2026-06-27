@@ -11196,6 +11196,73 @@ mod tests {
         server.abort();
     }
 
+    // End-to-end guard for the #488 fix: a session-list click while a canvas
+    // is open must switch sessions. The sibling tests
+    // (`clicking_another_session_in_list_stashes_canvas_not_closes`, …) call
+    // `handle_left_click` directly, which skips the `on_mouse` →
+    // `handle_canvas_mouse` dispatch that decides whether the canvas swallows
+    // the click. This drives a real render (so `modal_area` / `list_items_area`
+    // are live geometry, not hand-set) and the full Down/Up mouse path, so a
+    // regression that re-swallows outside clicks would be caught here even if
+    // `handle_left_click` stayed correct in isolation.
+    #[tokio::test]
+    async fn on_mouse_list_click_switches_session_with_canvas_open() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s1.position = 0;
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        s2.position = 1;
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
+        app.active_window_id = 1;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+
+        // Render the real layout so modal_area / list_items_area reflect the
+        // live geometry the mouse handler will see.
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+
+        let items_area = app.layout.list_items_area.expect("list items area");
+        // s2 is the second session row (s1 at +0, s2 at +1). Click past the
+        // pin/status gutter so it registers as a select, not a pin toggle.
+        let row = items_area.y + 1;
+        let col = items_area.x + items_area.width / 2;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        // The click switched sessions through the full dispatch path...
+        assert_eq!(
+            app.selection,
+            Selection::Session("s2".into()),
+            "clicking s2 in the list while a canvas is open must switch to s2"
+        );
+        // ...and stashed s1's canvas rather than destroying it (navigation
+        // never closes a canvas; only the toggle / C-x Space do).
+        assert!(
+            app.canvas_popups.contains_key("s1"),
+            "s1's canvas must be stashed, not discarded, when the click switches away"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn mouse_list_click_swaps_session_already_visible_in_another_split() {
         let (mut app, _dir, server) = captured_app().await;
