@@ -50,9 +50,9 @@ pub const MINIBUFFER_PANEL_H_MAX: u16 = 80;
 pub(crate) const CANVAS_REVEAL_MS: u64 = 240;
 pub(crate) const CANVAS_CONTENT_PADDING_X: u16 = 1;
 pub(crate) const CANVAS_CONTENT_PADDING_Y: u16 = 1;
-/// Hard cap on how long a canvas Run shimmer animates without an observed turn
-/// completion. A missed status transition must never strand the animation, so
-/// the run state is reaped once it has been active this long. See spec 0042.
+/// Hard cap on how long a canvas Run shimmer animates without an observed
+/// output signal. A missed first-output transition must never strand the
+/// animation; a timeout backstop is mandatory (spec 0042).
 pub(crate) const CANVAS_RUN_MAX_MS: u64 = 10 * 60 * 1000;
 /// Wrapped rows the canvas body scrolls per mouse-wheel notch.
 pub(crate) const CANVAS_WHEEL_SCROLL_ROWS: usize = 3;
@@ -1356,10 +1356,6 @@ pub struct CanvasRun {
     /// edit — by the agent writing back or the user typing — changes the
     /// block's text and drops it from the shimmer.
     pub pending: HashSet<String>,
-    /// Set once the owning session has been observed `Running` since this run
-    /// started. Guards against a stale pre-run idle snapshot clearing the
-    /// shimmer before the turn actually begins.
-    pub seen_running: bool,
     /// Absolute backstop: clear no later than this regardless of signals.
     pub deadline: Instant,
 }
@@ -4088,6 +4084,7 @@ impl App {
             m if m == agentd_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
+                        let mut canvas_output = false;
                         self.matrix_rain.observe_event(
                             &payload.event,
                             self.matrix_rain_intensity,
@@ -4185,6 +4182,9 @@ impl App {
                         if let SessionEvent::Pty { .. } = &payload.event {
                             let now = Instant::now();
                             let bytes = payload.event.pty_bytes();
+                            if bytes.as_ref().is_some_and(|b| !b.is_empty()) {
+                                canvas_output = true;
+                            }
                             if let Some(b) = bytes.as_deref() {
                                 let history = self
                                     .histories
@@ -4215,6 +4215,9 @@ impl App {
                             // still animates the list + rain at ~8fps).
                             self.notification_dirtied_view =
                                 self.session_visible_on_screen(&payload.session_id);
+                            if canvas_output {
+                                self.clear_canvas_run_for_session_output(&payload.session_id);
+                            }
                             return;
                         }
                         // Tool events feed the same history so the
@@ -4239,6 +4242,7 @@ impl App {
                                     .entry(payload.session_id.clone())
                                     .or_default();
                                 history.feed_tool_use(tool.clone(), summarize_tool_args(args));
+                                canvas_output = true;
                             }
                         }
                         // TaskStart is the primary block-creation
@@ -4253,6 +4257,7 @@ impl App {
                             args_summary,
                         } = &payload.event
                         {
+                            canvas_output = true;
                             let history = self
                                 .histories
                                 .entry(payload.session_id.clone())
@@ -4270,6 +4275,7 @@ impl App {
                             call_id,
                         } = &payload.event
                         {
+                            canvas_output = true;
                             let history = self
                                 .histories
                                 .entry(payload.session_id.clone())
@@ -4306,6 +4312,9 @@ impl App {
                             _ => None,
                         };
                         if let Some((kind, text)) = msg {
+                            if !matches!(kind, crate::pty_render::MessageKind::User) {
+                                canvas_output = true;
+                            }
                             let headless = self
                                 .sessions
                                 .iter()
@@ -4356,6 +4365,7 @@ impl App {
                             return;
                         }
                         match &payload.event {
+                            SessionEvent::Diff { .. } => canvas_output = true,
                             SessionEvent::UiPanel(panel) => {
                                 self.ui_panels
                                     .entry(payload.session_id.clone())
@@ -4417,6 +4427,9 @@ impl App {
                                 }
                             }
                             _ => {}
+                        }
+                        if canvas_output {
+                            self.clear_canvas_run_for_session_output(&payload.session_id);
                         }
                         if let SessionEvent::AgentStatus(status) = &payload.event {
                             let is_orchestrator = self.orchestrator_id.as_deref()
@@ -4481,7 +4494,6 @@ impl App {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<StateNotificationPayload>(p) {
                         let id = payload.session.id.clone();
-                        let new_state = payload.session.state;
                         let was_pinned = self
                             .sessions
                             .iter()
@@ -4503,9 +4515,6 @@ impl App {
                                 .sort_by(|a, b| b.created_at.cmp(&a.created_at));
                         }
                         self.refresh_orchestrator_id();
-                        // Clear the canvas Run shimmer when this session's
-                        // canvas-originating turn completes (spec 0042).
-                        self.note_session_state_for_canvas_run(&id, new_state);
                         // Newly pinned PTY session: bootstrap so its tile
                         // populates immediately, even when the pin came from
                         // outside this TUI process.
@@ -7295,7 +7304,7 @@ impl App {
     /// Begin (or refresh) the Run shimmer for `session_id` over `body` — the
     /// executed Markdown (full canvas or selection). Records the block
     /// signatures to shimmer; they settle as their content changes and the run
-    /// clears when the owning turn completes. See spec 0042.
+    /// clears once the first agent output is observed. See spec 0042.
     ///
     /// A re-Run while a run is still active preserves the narrowing the agent
     /// established: it re-shimmers only the blocks the user changed since the
@@ -7338,41 +7347,20 @@ impl App {
             CanvasRun {
                 started_at: now,
                 pending,
-                seen_running: false,
                 deadline: now + Duration::from_millis(CANVAS_RUN_MAX_MS),
             },
         );
     }
 
-    /// Fold a session status change into its Run shimmer, if any (spec 0042).
-    /// The shimmer clears when the canvas-originating turn completes — observed
-    /// as a return to an idle state after the session was seen running.
-    fn note_session_state_for_canvas_run(
-        &mut self,
-        session_id: &str,
-        state: agentd_protocol::SessionState,
-    ) {
-        use agentd_protocol::SessionState;
-        let clear = match self.canvas_runs.get_mut(session_id) {
-            Some(run) => match state {
-                SessionState::Running => {
-                    run.seen_running = true;
-                    false
-                }
-                SessionState::AwaitingInput | SessionState::Done | SessionState::Errored => {
-                    run.seen_running
-                }
-                SessionState::Pending | SessionState::Paused => false,
-            },
-            None => false,
-        };
-        if clear {
-            self.canvas_runs.remove(session_id);
-        }
+    /// Stop the canvas Run affordance on first observed output for this session.
+    /// The run is user-scoped, so an explicit session output signal is the
+    /// best proxy for "this specific Run started doing work."
+    fn clear_canvas_run_for_session_output(&mut self, session_id: &str) {
+        self.canvas_runs.remove(session_id);
     }
 
     /// Reap Run shimmers that have outlived their backstop deadline, so a
-    /// missed completion signal can never strand the animation (spec 0042).
+    /// missed first-output signal can never strand the animation (spec 0042).
     fn expire_canvas_runs(&mut self, now: Instant) {
         self.canvas_runs.retain(|_, run| now < run.deadline);
     }
@@ -12017,24 +12005,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_run_clears_only_after_turn_completes() {
+    async fn canvas_run_stays_spinning_without_agent_output() {
         let (mut app, _dir, server) = empty_app().await;
         app.start_canvas_run("s1", "# Todo\n- a\n", false, "");
         assert!(app.canvas_runs.contains_key("s1"));
-        // A stale idle snapshot arriving before the turn starts must NOT clear
-        // the shimmer — otherwise a pre-run AwaitingInput ends it instantly.
-        app.note_session_state_for_canvas_run("s1", agentd_protocol::SessionState::AwaitingInput);
-        assert!(
-            app.canvas_runs.contains_key("s1"),
-            "shimmer cleared before the turn was ever seen running"
-        );
-        // Turn starts, runs, then completes.
-        app.note_session_state_for_canvas_run("s1", agentd_protocol::SessionState::Running);
+
+        async fn feed(app: &mut App, session: &str, event: SessionEvent) {
+            app.on_notification(Notification {
+                jsonrpc: "2.0".into(),
+                method: agentd_protocol::ipc_notif::EVENT.into(),
+                params: Some(
+                    serde_json::to_value(EventNotificationPayload {
+                        session_id: session.into(),
+                        at: chrono::Utc::now(),
+                        event,
+                        seq: 1,
+                    })
+                    .unwrap(),
+                ),
+            })
+            .await;
+        }
+
+        // Session status alone (the old stop signal) must not clear the run;
+        // the new affordance stays visible until output appears.
+        feed(
+            &mut app,
+            "s1",
+            SessionEvent::Status {
+                state: agentd_protocol::SessionState::AwaitingInput,
+                detail: None,
+            },
+        )
+        .await;
         assert!(app.canvas_runs.contains_key("s1"));
-        app.note_session_state_for_canvas_run("s1", agentd_protocol::SessionState::AwaitingInput);
+
+        // The first real output clears it (any agent-visible output type).
+        feed(
+            &mut app,
+            "s1",
+            SessionEvent::Reasoning {
+                text: "thinking".into(),
+            },
+        )
+        .await;
         assert!(
             !app.canvas_runs.contains_key("s1"),
-            "shimmer should clear once the canvas-originating turn completes"
+            "shimmer should clear once the first agent output appears"
         );
         server.abort();
     }
@@ -12043,7 +12060,7 @@ mod tests {
     async fn canvas_run_expires_at_deadline() {
         let (mut app, _dir, server) = empty_app().await;
         app.start_canvas_run("s1", "# Todo\n", false, "");
-        // A missed completion signal must never strand the animation.
+        // A missed first-output signal must never strand the animation.
         app.canvas_runs.get_mut("s1").unwrap().deadline =
             Instant::now() - Duration::from_millis(1);
         app.expire_canvas_runs(Instant::now());

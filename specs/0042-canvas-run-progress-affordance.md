@@ -15,7 +15,10 @@ Pressing Run on a canvas must give immediate, continuous visual feedback that th
 
 - **Re-running preserves prior narrowing.** Running again while a run is still in flight must not re-shimmer the whole document and discard the progress the agent already showed. A re-Run re-shimmers only the blocks the user changed since the last synced version plus the blocks that were still pending; blocks the agent had already settled stay calm. A first run, or a run scoped to an explicit selection, shimmers its whole executed region.
 
-- **Stop (authoritative).** The shimmer for a session clears when the canvas-originating turn completes — observed as the owning session returning to an idle state (awaiting input, done, or errored) after it was seen running. A hard time cap also clears it, so a missed completion signal can never strand the animation on screen.
+- **Stop (authoritative).** The shimmer for a session clears on the first canvas-relevant
+  output signal from that session: tool call, reasoning, or other assistant-visible
+  content. A hard time cap also clears it, so a missed output signal can never strand
+  the animation on screen.
 
 Editing during a run is never blocked: the canvas is co-editable, and a run does not lock it. Because editing a block changes its content, editing inherently takes that block out of the shimmer — touching a block transfers it from "agent is working here" to "the user owns this now." This falls out of block-content tracking; no separate edit gesture is required.
 
@@ -31,9 +34,9 @@ The instruction the agent receives is a point-in-time snapshot taken at Run. Edi
 
 ## Consequences
 
-- The affordance is client-side presentation state. It is derived from signals the client already receives (the canvas Run it issued, canvas-state updates, and session status transitions); it is not persisted into the Markdown and does not participate in canvas versioning or optimistic concurrency.
-- Narrowing is best-effort. A block the agent never rewrites keeps shimmering until the turn completes; that is acceptable and is bounded by the stop signal. Two blocks with identical text are indistinguishable and settle together.
-- Correlating the stop signal with generic session status is approximate when the session was already busy at Run time. The precise version is a daemon-side tag marking the canvas-originating turn so its completion is unambiguous; until that exists, the client correlates on the next idle transition, with a hard time cap as a backstop. A future tag must not regress the immediate optimistic start.
+- The affordance is client-side presentation state. It is derived from signals the client already receives (the canvas Run it issued and session output events); it is not persisted into the Markdown and does not participate in canvas versioning or optimistic concurrency.
+- Narrowing is best-effort. A block the agent never rewrites keeps shimmering until the first observed output; that is acceptable and is bounded by the stop signal. Two blocks with identical text are indistinguishable and settle together.
+- Session status transitions are intentionally ignored as stop signals; they do not uniquely identify canvas-originating activity and can arrive in the absence of output. A hard time cap remains as a backstop for silent runs.
 - Once every executed block has settled but the turn is still running, the body animation has nothing left to shimmer. Clients may keep a small secondary running indicator to cover that window, but must not block input or imply the canvas is locked.
 - Any rich canvas client (web, desktop) should follow the same start / narrow / stop lifecycle so the affordance is consistent across surfaces. Promoting the run state into broadcast canvas state would let all clients share one definition rather than each re-deriving it.
 
