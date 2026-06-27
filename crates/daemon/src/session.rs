@@ -317,6 +317,14 @@ pub struct SessionEntry {
     /// the drain task and event handler stop writing storage after the
     /// session has been removed.
     deleted: AtomicBool,
+    /// Set by [`SessionManager::archive`] *before* it terminates the adapter,
+    /// so the `drain_adapter` Closed handler — which fires as a result of that
+    /// termination and races the archive bookkeeping — keeps `archived = true`
+    /// in the state it persists and broadcasts. Without it the Closed handler
+    /// can win the race and re-broadcast/persist `archived = false`, leaving
+    /// the session looking merely stopped (the "archive only closes it, needs
+    /// a second archive" bug). Cleared by [`SessionManager::restart`].
+    archived: AtomicBool,
     /// Set the first time we kick off an auto-title generation for this
     /// session. Stops a flurry of user messages from spawning multiple
     /// title-gen processes; a failed title-gen leaves the title unset
@@ -815,6 +823,7 @@ impl SessionManager {
                 adapter: tokio::sync::Mutex::new(None),
                 pty: tokio::sync::Mutex::new(pty_state),
                 deleted: AtomicBool::new(false),
+                archived: AtomicBool::new(s.archived),
                 // A title set on the previous incarnation lives in the
                 // loaded summary; flagging "attempted" here stops the
                 // restart from re-running title-gen for already-titled
@@ -1661,6 +1670,7 @@ impl SessionManager {
                 size: params.pty_size,
             }),
             deleted: AtomicBool::new(false),
+            archived: AtomicBool::new(summary.archived),
             title_gen_attempted: AtomicBool::new(summary.title.is_some()),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
@@ -1921,8 +1931,10 @@ impl SessionManager {
                     s.state = SessionState::Running;
                     s.pending_input = false;
                     // Restarting an archived session brings it back to life:
-                    // it returns to the active list.
+                    // it returns to the active list. Clear the archive-intent
+                    // flag too so a future Closed event doesn't re-archive it.
                     s.archived = false;
+                    entry.archived.store(false, Ordering::SeqCst);
                     s.clone()
                 };
                 let _ = self.storage.save_summary(&snapshot);
@@ -2040,8 +2052,10 @@ impl SessionManager {
             s.state = SessionState::Running;
             s.pending_input = false;
             // Restarting an archived session brings it back to life: it
-            // returns to the active list.
+            // returns to the active list. Clear the archive-intent flag too so
+            // a future Closed event doesn't re-archive it.
             s.archived = false;
+            entry.archived.store(false, Ordering::SeqCst);
             s.clone()
         };
         let _ = self.storage.save_summary(&snapshot);
@@ -2194,6 +2208,15 @@ impl SessionManager {
                         } else {
                             SessionState::Errored
                         };
+                    }
+                    // `archive` records its intent on the entry before
+                    // terminating the adapter — which is what triggered this
+                    // Closed event. Whichever of the two writers lands last,
+                    // keep the session archived so we never persist/broadcast a
+                    // stale `archived = false` and downgrade the row back to a
+                    // plain stopped session (the "needs a second archive" bug).
+                    if entry.archived.load(Ordering::Acquire) {
+                        summary.archived = true;
                     }
                     summary.last_event_at = Some(Utc::now());
                     let snapshot = summary.clone();
@@ -3010,20 +3033,16 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        // Gracefully terminate the live adapter, if there is one. The adapter's
-        // Closed event clears `entry.adapter` so a later restart sees no live
-        // adapter. Tolerate sessions that are already terminal (no adapter).
-        if let Some(adapter) = entry.adapter.lock().await.clone() {
-            let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
-                session_id: id.to_string(),
-            })?;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(10),
-                adapter.request(ahp_method::SESSION_STOP, params),
-            )
-            .await;
-            let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
-        }
+        // Record the archive intent before anything that can yield. Terminating
+        // the adapter (below) makes its `drain_adapter` Closed handler fire on a
+        // separate task and race this bookkeeping; that handler reads this flag
+        // and keeps the session archived, so the close can never downgrade the
+        // row back to a plain stopped session ("archive needs a second press").
+        entry.archived.store(true, Ordering::SeqCst);
+        // Flip + persist + broadcast the archived/terminal state up front,
+        // before terminating the adapter. The UI reflects the archive on the
+        // first action instead of waiting out the graceful-stop timeout, and the
+        // summary the Closed handler later observes already reads as archived.
         let snapshot = {
             let mut s = entry.summary.write().await;
             s.archived = true;
@@ -3041,6 +3060,20 @@ impl SessionManager {
             .send(BroadcastMsg::State(StateNotificationPayload {
                 session: snapshot,
             }));
+        // Gracefully terminate the live adapter, if there is one. The adapter's
+        // Closed event clears `entry.adapter` so a later restart sees no live
+        // adapter. Tolerate sessions that are already terminal (no adapter).
+        if let Some(adapter) = entry.adapter.lock().await.clone() {
+            let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
+                session_id: id.to_string(),
+            })?;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(10),
+                adapter.request(ahp_method::SESSION_STOP, params),
+            )
+            .await;
+            let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
+        }
         Ok(())
     }
 
@@ -4242,6 +4275,7 @@ mod tests {
             adapter: tokio::sync::Mutex::new(None),
             pty: tokio::sync::Mutex::new(PtyState::default()),
             deleted: AtomicBool::new(false),
+            archived: AtomicBool::new(false),
             title_gen_attempted: AtomicBool::new(false),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
@@ -4309,6 +4343,11 @@ mod tests {
             synthetic_entry("s1", agentd_protocol::SessionKind::User, 0),
         );
 
+        // Clients reflect archived state from the broadcast `State` event, so
+        // the emitted event — not just the in-memory/persisted summary — must
+        // carry `archived = true`. Subscribe before archiving so we see it.
+        let mut rx = mgr.subscribe();
+
         mgr.archive("s1").await.expect("archive");
 
         let entry = mgr.get_entry("s1").await.expect("entry still present");
@@ -4329,6 +4368,117 @@ mod tests {
         // The persisted meta.json carries the archived flag across restarts.
         let persisted = mgr.storage.load_summary("s1").expect("load meta");
         assert!(persisted.archived, "archived flag must be persisted");
+
+        // The broadcast `State` event for s1 must report archived + terminal,
+        // so the first archive action makes the row jump to the archived group
+        // in every client without a second action.
+        let mut saw_archived_event = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let BroadcastMsg::State(p) = msg {
+                if p.session.id == "s1" {
+                    assert!(
+                        p.session.archived,
+                        "broadcast State for s1 must carry archived = true",
+                    );
+                    assert!(
+                        p.session.state.is_terminal(),
+                        "broadcast State for s1 must report a terminal state",
+                    );
+                    saw_archived_event = true;
+                }
+            }
+        }
+        assert!(
+            saw_archived_event,
+            "archive must broadcast a State event for the session",
+        );
+    }
+
+    /// Regression for the "archive only closes the session, needs a second
+    /// archive" bug. `archive` terminates the live adapter, which makes the
+    /// `drain_adapter` Closed handler fire on a separate task and race the
+    /// archive bookkeeping. If that handler re-persists/re-broadcasts the
+    /// session with `archived = false`, the row shows up as merely stopped and
+    /// the user has to archive again.
+    ///
+    /// This drives the handler directly with the archive *intent* recorded
+    /// (the `entry.archived` flag set, but the summary not yet flipped — the
+    /// exact window where the Closed event clones a stale, unarchived summary)
+    /// and asserts the handler keeps the session archived in both the persisted
+    /// meta and the emitted event.
+    #[tokio::test]
+    async fn drain_close_after_archive_intent_keeps_archived() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        let manager = Arc::new(mgr);
+
+        // A still-running session whose summary has NOT yet been flipped to
+        // archived — modelling the Closed handler observing the summary before
+        // `archive` writes `archived = true` to it.
+        let entry = synthetic_entry("s_race", agentd_protocol::SessionKind::User, 0);
+        {
+            let mut s = entry.summary.write().await;
+            s.state = SessionState::Running;
+            s.archived = false;
+        }
+        manager
+            .sessions
+            .write()
+            .await
+            .insert("s_race".into(), entry.clone());
+
+        // `archive` records its intent on the entry *before* terminating the
+        // adapter; reproduce just that step.
+        entry.archived.store(true, Ordering::SeqCst);
+
+        let mut rx = manager.subscribe();
+
+        // Drive the drain loop with a single Closed message (what the
+        // terminated adapter emits), then let it run to completion.
+        let (tx, drain_rx) = mpsc::channel::<AdapterMessage>(ADAPTER_DRAIN_CAP);
+        tx.send(AdapterMessage::Closed { exit_code: Some(0) })
+            .await
+            .expect("send Closed");
+        drop(tx);
+        manager.clone().drain_adapter(entry.clone(), drain_rx).await;
+
+        // In-memory summary stays archived.
+        assert!(
+            entry.summary.read().await.archived,
+            "Closed handler must not clear archived when archive intent is set",
+        );
+        // Persisted meta stays archived.
+        let persisted = manager.storage.load_summary("s_race").expect("load meta");
+        assert!(
+            persisted.archived,
+            "persisted meta must keep archived = true after the Closed race",
+        );
+        // The broadcast event stays archived, so no client downgrades the row
+        // back to a plain stopped session.
+        let mut saw_archived_event = false;
+        while let Ok(msg) = rx.try_recv() {
+            if let BroadcastMsg::State(p) = msg {
+                if p.session.id == "s_race" {
+                    assert!(
+                        p.session.archived,
+                        "broadcast State from the Closed handler must keep archived = true",
+                    );
+                    saw_archived_event = true;
+                }
+            }
+        }
+        assert!(
+            saw_archived_event,
+            "Closed handler must broadcast a State event",
+        );
     }
 
     async fn insert_group(mgr: &SessionManager, id: &str, position: i64, collapsed: bool) {
@@ -4814,6 +4964,7 @@ mod tests {
             adapter: tokio::sync::Mutex::new(None),
             pty: tokio::sync::Mutex::new(PtyState::default()),
             deleted: AtomicBool::new(false),
+            archived: AtomicBool::new(false),
             title_gen_attempted: AtomicBool::new(false),
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),

@@ -7179,6 +7179,8 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
     app.layout.canvas_title_close_hit = None;
     app.layout.canvas_title_widget_hits.clear();
     app.layout.canvas_selection_run_hit = None;
+    app.layout.canvas_inner_area = None;
+    app.layout.canvas_clip_hits.clear();
     if app
         .canvas_popup
         .as_ref()
@@ -7352,9 +7354,27 @@ fn render_canvas_popup_at(
         .find(|s| s.id == popup.canvas.session_id)
         .cloned();
     let summary_ref = summary.as_ref();
-    let title = canvas_title_line(app, popup, summary_ref, rect, active);
-    let title_run_hit = canvas_title_run_button_range(rect, summary_ref);
+
+    // Session widget indicators feed the right-cluster geometry: the Run
+    // button (and the harness label) are anchored to the left of them.
+    let widget_session_id = summary_ref.map(|s| s.id.clone()).unwrap_or_default();
+    let widget_panels = summary_ref
+        .map(|s| session_sticky_widget_panels(app, &s.id))
+        .unwrap_or_default();
+    let panel_count = widget_panels.len();
+
+    let title = canvas_title_line(app, popup, summary_ref, rect, active, panel_count);
+
+    // Right cluster, laid out right-to-left so nothing overlaps. Scanning
+    // left→right it reads `[harness] [▶ Run] [widgets] [ x ]`, matching the
+    // chat view: the close button takes the rightmost slot, the harness label
+    // stays visible to the left of Run.
+    let title_close_hit = canvas_title_close_button_range(rect, summary_ref);
+    let title_run_hit = canvas_title_run_button_range(rect, summary_ref, panel_count);
     let title_toggle_hit = canvas_title_toggle_button_range(summary_ref, rect);
+    let widget_icon_ranges = canvas_title_widget_icon_ranges(rect, summary_ref, panel_count);
+    let title_harness_hit = canvas_title_harness_range(rect, summary_ref, panel_count);
+
     let run_hovered = title_run_hit
         .zip(app.mouse_pos)
         .is_some_and(|((xs, xe, y), (mx, my))| my == y && mx >= xs && mx < xe);
@@ -7384,11 +7404,8 @@ fn render_canvas_popup_at(
         };
         Style::default().fg(fg).add_modifier(Modifier::BOLD)
     };
-    let run_right = Line::from(Span::styled(CANVAS_RUN_BUTTON, run_style))
-        .alignment(ratatui::layout::Alignment::Right);
     // Close button — same padded ` x ` glyph and hover/tooltip treatment as
-    // the Run button. Sits one cell left of Run (which is left of harness).
-    let title_close_hit = canvas_title_close_button_range(rect, summary_ref);
+    // the Run button.
     let close_hovered = title_close_hit
         .zip(app.mouse_pos)
         .is_some_and(|((xs, xe, y), (mx, my))| my == y && mx >= xs && mx < xe);
@@ -7405,15 +7422,8 @@ fn render_canvas_popup_at(
         Style::default().fg(fg).add_modifier(Modifier::BOLD)
     };
 
-    // Session widget indicators, rendered as title-bar rectangle icons to
-    // the left of the close button — the same □/■ affordance used for
-    // session widgets in the pane title bar.
-    let widget_session_id = summary_ref.map(|s| s.id.clone()).unwrap_or_default();
-    let widget_panels = summary_ref
-        .map(|s| session_sticky_widget_panels(app, &s.id))
-        .unwrap_or_default();
-    let widget_icon_ranges =
-        canvas_title_widget_icon_ranges(rect, summary_ref, widget_panels.len());
+    // Session widget indicators (□/■), painted to the left of the close button
+    // — the same affordance used for session widgets in the pane title bar.
     let widget_icons: Vec<(crate::app::DynamicUiWidgetHit, &'static str, Style)> = widget_panels
         .iter()
         .zip(widget_icon_ranges.iter())
@@ -7438,23 +7448,10 @@ fn render_canvas_popup_at(
         })
         .collect();
 
-    let harness_right = summary_ref.map(|s| {
-        Line::from(Span::styled(
-            format!(" {} ", harness_label(s)),
-            canvas_border_style(&app.theme, active),
-        ))
-        .alignment(ratatui::layout::Alignment::Right)
-    });
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(canvas_border_style(&app.theme, active))
-        .title(title)
-        .title(run_right);
-    let block = if let Some(h) = harness_right {
-        block.title(h)
-    } else {
-        block
-    };
+        .title(title);
     if active {
         app.layout.canvas_title_run_hit = title_run_hit;
         app.layout.canvas_title_toggle_hit = title_toggle_hit;
@@ -7469,16 +7466,27 @@ fn render_canvas_popup_at(
     });
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
-    // Paint the close button and widget icons directly so each glyph cell
-    // lines up exactly with its hit range. Ratatui right-aligned titles
-    // leave a variable inter-title gap that would offset a 1-cell hit.
-    if let Some((xs, _xe, y)) = title_close_hit {
-        f.buffer_mut()
-            .set_string(xs, y, CANVAS_CLOSE_BUTTON, close_style);
+    // Paint the right cluster directly so each glyph cell lines up exactly with
+    // its hit range. Ratatui right-aligned titles leave a variable inter-title
+    // gap that would offset the 1-cell hit zones.
+    if let (Some((xs, _xe, y)), Some(s)) = (title_harness_hit, summary_ref) {
+        f.buffer_mut().set_string(
+            xs,
+            y,
+            format!(" {} ", harness_label(s)),
+            canvas_border_style(&app.theme, active),
+        );
+    }
+    if let Some((xs, _xe, y)) = title_run_hit {
+        f.buffer_mut().set_string(xs, y, CANVAS_RUN_BUTTON, run_style);
     }
     for (hit, glyph, style) in &widget_icons {
         f.buffer_mut()
             .set_string(hit.start_col, hit.row, glyph, *style);
+    }
+    if let Some((xs, _xe, y)) = title_close_hit {
+        f.buffer_mut()
+            .set_string(xs, y, CANVAS_CLOSE_BUTTON, close_style);
     }
 
     let selection = canvas_selection_range(popup);
@@ -7494,19 +7502,216 @@ fn render_canvas_popup_at(
             Style::default().fg(app.theme.dim),
         )));
     }
-    let visible: Vec<Line> = lines.into_iter().take(inner.height as usize).collect();
-    let para = Paragraph::new(visible).wrap(Wrap { trim: false });
+    // Vertical scroll: the body can exceed `inner.height` wrapped rows. Clamp
+    // the popup's stored offset to the current geometry (content edits or a
+    // resize may have shrunk the scrollable range) and skip that many wrapped
+    // rows when rendering. `Paragraph::scroll` with `Wrap` skips *wrapped* rows,
+    // matching the wrapped-row coordinate space the cursor math uses.
+    let viewport_rows = inner.height as usize;
+    let total_rows = canvas_total_visual_rows(Some(app), &popup.buffer, inner.width as usize);
+    let max_scroll = total_rows.saturating_sub(viewport_rows);
+    let scroll_offset = popup.scroll_offset.min(max_scroll);
+    if active {
+        // Remember the live viewport so cursor-move handlers can keep the caret
+        // visible on the next keystroke, and persist the clamped offset.
+        app.layout.canvas_inner_area = Some(inner);
+        if let Some(real) = app.canvas_popup.as_mut() {
+            real.scroll_offset = scroll_offset;
+        }
+    }
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(para, inner);
+    render_canvas_scroll_indicator(
+        f,
+        &app.theme,
+        rect,
+        inner,
+        scroll_offset,
+        total_rows,
+        viewport_rows,
+    );
+    // Capture session-clip hitboxes for the active canvas so hover/click can map
+    // a cell → session id. Only the active canvas is interactive; the same
+    // `scroll_offset` applied to the paragraph is applied here so the hitboxes
+    // track the visible (scrolled) rows.
+    if active {
+        let hits = canvas_session_clip_hits(Some(app), &popup.buffer, scroll_offset, inner);
+        app.layout.canvas_clip_hits = hits;
+    }
     if active && !popup.closing {
-        if let Some(pos) = canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, inner) {
+        if let Some(pos) =
+            canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, inner)
+        {
             render_editor_cursor(f, pos, &app.theme);
             render_canvas_smart_clip_picker(f, app, popup, pos, inner);
         }
     }
     if active && !popup.closing {
-        render_canvas_selection_context_menu(f, app, popup, inner);
+        render_canvas_selection_context_menu(f, app, popup, scroll_offset, inner);
     }
     render_canvas_title_tooltip(f, app, popup, summary_ref, rect);
+    if active && !popup.closing {
+        render_canvas_clip_hover(f, app, rect);
+    }
+}
+
+/// Mini session-preview popover shown while the mouse hovers a `@{session:id}`
+/// smart-clip in the canvas body. Reads the freshly captured clip hitboxes,
+/// resolves the hovered session, and paints a compact card (glyph + name,
+/// harness · model, status, last prompt) anchored to the hovered chip. Clears
+/// its own area, so it overlays the canvas body without disturbing it.
+fn render_canvas_clip_hover(f: &mut Frame, app: &App, modal: Rect) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    let Some(hit) = app
+        .layout
+        .canvas_clip_hits
+        .iter()
+        .find(|hit| hit.contains(mx, my))
+    else {
+        return;
+    };
+    let Some(s) = app.sessions.iter().find(|s| s.id == hit.session_id) else {
+        return;
+    };
+
+    let glyph_style = state_style(&app.theme, s.state);
+    let mut lines: Vec<Line> = vec![
+        Line::from(vec![
+            Span::styled(format!("{} ", s.state.glyph()), glyph_style),
+            Span::styled(
+                primary_label(s),
+                Style::default()
+                    .fg(app.theme.text)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "{} · {}",
+                harness_label(s),
+                s.model.as_deref().unwrap_or("—")
+            ),
+            Style::default().fg(app.theme.dim),
+        )),
+        Line::from(Span::styled(s.state.label(), glyph_style)),
+    ];
+    if let Some(prompt) = s
+        .last_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let one_line: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        lines.push(Line::from(Span::styled(
+            one_line,
+            Style::default().fg(app.theme.muted),
+        )));
+    }
+
+    // Size the card around its content, bounded by the canvas modal.
+    let max_w = modal.width.saturating_sub(2).clamp(1, 48);
+    let content_w = lines
+        .iter()
+        .map(|l| {
+            l.spans
+                .iter()
+                .map(|sp| UnicodeWidthStr::width(sp.content.as_ref()))
+                .sum::<usize>() as u16
+        })
+        .max()
+        .unwrap_or(0);
+    let width = content_w.saturating_add(2).clamp(3, max_w);
+    let height = (lines.len() as u16).saturating_add(2);
+    if modal.height < height || modal.width < width {
+        return;
+    }
+
+    // Anchor below the chip when there's room, otherwise above it; keep the box
+    // fully inside the canvas modal horizontally and vertically.
+    let modal_bottom = modal.y.saturating_add(modal.height);
+    let modal_right = modal.x.saturating_add(modal.width);
+    let y = if hit.row.saturating_add(1).saturating_add(height) <= modal_bottom {
+        hit.row.saturating_add(1)
+    } else {
+        hit.row.saturating_sub(height)
+    };
+    let y = y.clamp(modal.y, modal_bottom.saturating_sub(height));
+    let x = hit
+        .col_start
+        .min(modal_right.saturating_sub(width))
+        .max(modal.x);
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.accent_alt))
+            .title(Span::styled(
+                " session ",
+                Style::default()
+                    .fg(app.theme.accent_alt)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        area,
+    );
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+}
+
+/// Paint a slim vertical scroll thumb on the canvas popup's right border when
+/// the body overflows its viewport. Like the terminal scrollback bar, it tints
+/// only the cell background so the border glyph underneath stays intact, and it
+/// sits on the border column so it never clobbers body text.
+fn render_canvas_scroll_indicator(
+    f: &mut Frame,
+    theme: &Theme,
+    rect: Rect,
+    inner: Rect,
+    scroll_offset: usize,
+    total_rows: usize,
+    viewport_rows: usize,
+) {
+    if viewport_rows == 0 || inner.height == 0 || rect.width == 0 || total_rows <= viewport_rows {
+        return;
+    }
+    let track_h = inner.height as usize;
+    let max_scroll = total_rows.saturating_sub(viewport_rows);
+    let thumb_h = ((viewport_rows * track_h + total_rows - 1) / total_rows).clamp(1, track_h);
+    let max_thumb_top = track_h.saturating_sub(thumb_h);
+    let thumb_top = if max_scroll == 0 {
+        0
+    } else {
+        (scroll_offset.min(max_scroll) * max_thumb_top) / max_scroll
+    };
+    let x = rect.x + rect.width.saturating_sub(1);
+    let track_color = blend_color(Color::Black, theme.text, 0.30);
+    let thumb_color = blend_color(Color::Black, theme.text, 0.80);
+    for row in 0..track_h {
+        let y = inner.y + row as u16;
+        let color = if row >= thumb_top && row < thumb_top + thumb_h {
+            thumb_color
+        } else {
+            track_color
+        };
+        if let Some(cell) = f.buffer_mut().cell_mut(Position { x, y }) {
+            cell.set_bg(color);
+        }
+    }
 }
 
 fn canvas_border_style(theme: &Theme, active: bool) -> Style {
@@ -7515,7 +7720,9 @@ fn canvas_border_style(theme: &Theme, active: bool) -> Style {
             .fg(theme.accent_alt)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.border)
+        Style::default()
+            .fg(theme.accent_alt)
+            .add_modifier(Modifier::DIM)
     }
 }
 
@@ -7525,17 +7732,26 @@ fn canvas_title_line<'a>(
     summary: Option<&agentd_protocol::SessionSummary>,
     rect: Rect,
     active: bool,
+    panel_count: usize,
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
     let marker_w = canvas_title_marker_width(dirty);
-    let harness_w = summary
-        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
-        .unwrap_or(0);
     let toggle_glyph = canvas_mode_glyph();
-    let label_budget = (rect.width as usize)
-        .saturating_sub(2)
-        .saturating_sub(harness_w)
-        .saturating_sub(3 + marker_w);
+    let glyph_w = UnicodeWidthStr::width(toggle_glyph);
+    // Reserve the whole right-side cluster ([harness][Run][widgets][x]) by
+    // deriving the label budget from the cluster's actual left edge, so the
+    // left-aligned session label can never overrun any right control.
+    let cluster_left = canvas_title_harness_range(rect, summary, panel_count)
+        .or_else(|| canvas_title_run_button_range(rect, summary, panel_count))
+        .or_else(|| canvas_title_close_button_range(rect, summary))
+        .map(|(xs, _, _)| xs)
+        .unwrap_or_else(|| rect.x.saturating_add(rect.width).saturating_sub(1));
+    // Left scaffolding before the label is ` <glyph> ` (2 spaces + glyph), the
+    // optional ` * modified` marker trails the label; keep a one-column gap.
+    let label_budget = (cluster_left.saturating_sub(rect.x) as usize)
+        .saturating_sub(2 + glyph_w)
+        .saturating_sub(marker_w)
+        .saturating_sub(1);
     let border_style = canvas_border_style(&app.theme, active);
     let canvas_style = canvas_toggle_style(app, popup, active);
     let modified_style = Style::default()
@@ -7596,32 +7812,49 @@ fn canvas_toggle_style(
     } else if active {
         Style::default().fg(app.theme.accent_alt)
     } else {
-        Style::default().fg(app.theme.border)
+        Style::default()
+            .fg(app.theme.accent_alt)
+            .add_modifier(Modifier::DIM)
     };
     style.add_modifier(Modifier::BOLD)
 }
 
+/// Run-button geometry on the canvas title bar. Sits to the left of the
+/// widget-indicator strip (or the close button when there are no widgets), so
+/// the right cluster reads `[Run][widgets][x]` left-to-right. Returns
+/// `(x_start, x_end_exclusive, y)`.
 fn canvas_title_run_button_range(
     rect: Rect,
     summary: Option<&agentd_protocol::SessionSummary>,
+    panel_count: usize,
 ) -> Option<(u16, u16, u16)> {
     if rect.width < 8 {
         return None;
     }
     let run_w = UnicodeWidthStr::width(CANVAS_RUN_BUTTON) as u16;
-    let harness_w = summary
-        .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()) as u16)
-        .unwrap_or(0);
-    let x_end = rect
-        .x
-        .saturating_add(rect.width)
-        .saturating_sub(1)
-        .saturating_sub(harness_w);
+    let cluster_left = canvas_title_widget_strip_left(rect, summary, panel_count)?;
+    // One-column gap before the widgets/close cluster.
+    let x_end = cluster_left.saturating_sub(1);
     let x_start = x_end.saturating_sub(run_w);
     if x_start <= rect.x {
         return None;
     }
     Some((x_start, x_end, rect.y))
+}
+
+/// Leftmost column of the `[widgets][x]` portion of the right cluster: the
+/// first widget icon if any, otherwise the close button's left edge. Anchors
+/// the Run button (and, transitively, the harness label) to the left of
+/// everything pinned at the right corner.
+fn canvas_title_widget_strip_left(
+    rect: Rect,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    panel_count: usize,
+) -> Option<u16> {
+    if let Some(first) = canvas_title_widget_icon_ranges(rect, summary, panel_count).first() {
+        return Some(first.0);
+    }
+    canvas_title_close_button_range(rect, summary).map(|(xs, _, _)| xs)
 }
 
 fn canvas_title_toggle_button_range(
@@ -7648,22 +7881,24 @@ fn canvas_title_toggle_button_range(
     Some((x_start, x_end, rect.y))
 }
 
-/// Close-button geometry on the canvas title bar. Sits one cell to the
-/// left of the Run button (ratatui leaves a 1-col gap between stacked
-/// right-aligned titles), which itself sits left of the harness label at
-/// the corner. Returns `(x_start, x_end_exclusive, y)`.
+/// Close-button geometry on the canvas title bar — the rightmost control, a
+/// 3-cell ` x ` inset one column from the right corner. Mirrors the session
+/// chat view's `view_close_button_range` so the affordance reads the same
+/// across views. Returns `(x_start, x_end_exclusive, y)`.
 fn canvas_title_close_button_range(
     rect: Rect,
-    summary: Option<&agentd_protocol::SessionSummary>,
+    _summary: Option<&agentd_protocol::SessionSummary>,
 ) -> Option<(u16, u16, u16)> {
-    let (run_x_start, _run_x_end, y) = canvas_title_run_button_range(rect, summary)?;
+    if rect.width < 8 {
+        return None;
+    }
     let close_w = UnicodeWidthStr::width(CANVAS_CLOSE_BUTTON) as u16;
-    let x_end = run_x_start.saturating_sub(1);
-    let x_start = x_end.saturating_sub(close_w);
+    let x_start = rect.x.saturating_add(rect.width.saturating_sub(close_w + 1));
+    let x_end = rect.x.saturating_add(rect.width.saturating_sub(1));
     if x_start <= rect.x {
         return None;
     }
-    Some((x_start, x_end, y))
+    Some((x_start, x_end, rect.y))
 }
 
 /// One hit range per available session widget, rendered as rectangle icons
@@ -7696,6 +7931,27 @@ fn canvas_title_widget_icon_ranges(
             (glyph_x, glyph_x + 1, y)
         })
         .collect()
+}
+
+/// Harness-label geometry on the canvas title bar. Sits to the left of the
+/// Run button so the harness stays visible without crowding the right cluster.
+/// Returns `(x_start, x_end_exclusive, y)` spanning the ` <harness> ` label;
+/// `None` when there is no session or it would collide with the left edge.
+fn canvas_title_harness_range(
+    rect: Rect,
+    summary: Option<&agentd_protocol::SessionSummary>,
+    panel_count: usize,
+) -> Option<(u16, u16, u16)> {
+    let s = summary?;
+    let label_w = (2 + UnicodeWidthStr::width(harness_label(s).as_str())) as u16;
+    let (run_x_start, _run_x_end, y) = canvas_title_run_button_range(rect, summary, panel_count)?;
+    // One-column gap before the Run button.
+    let x_end = run_x_start.saturating_sub(1);
+    let x_start = x_end.saturating_sub(label_w);
+    if x_start <= rect.x {
+        return None;
+    }
+    Some((x_start, x_end, y))
 }
 
 fn render_canvas_title_tooltip(
@@ -7754,13 +8010,15 @@ fn render_canvas_selection_context_menu(
     f: &mut Frame,
     app: &mut App,
     popup: &crate::app::CanvasPopup,
+    scroll_offset: usize,
     canvas_area: Rect,
 ) {
     if canvas_selection_range(popup).is_none() {
         app.layout.canvas_selection_run_hit = None;
         return;
     }
-    let Some(pos) = canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, canvas_area)
+    let Some(pos) =
+        canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, canvas_area)
     else {
         app.layout.canvas_selection_run_hit = None;
         return;
@@ -7973,51 +8231,526 @@ fn render_canvas_smart_clip_picker(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Absolute wrapped position of the cursor within the canvas body:
+/// `(visual_row, column_within_row)`, both in the `Wrap { trim: false }`
+/// word-wrap coordinate space the body is laid out with (see
+/// [`canvas_wrap_row_starts`] / [`canvas_wrap_locate`]). `width` is the inner
+/// content width in cells; a zero width collapses the whole buffer onto row 0,
+/// column 0.
+pub(crate) fn canvas_cursor_visual_pos(
+    app: Option<&App>,
+    markdown: &str,
+    cursor: usize,
+    width: usize,
+) -> (usize, usize) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let (line, col) = canvas_line_col(markdown, cursor);
+
+    // The canvas body is rendered with `Wrap { trim: false }`, which WORD-wraps
+    // at whitespace (and hard-breaks words longer than the width) rather than
+    // slicing every `width` characters. A logical line containing spaces breaks
+    // earlier than naive char-division predicts, so the cursor must reuse the
+    // same word-wrap — both to count the rows consumed by every line BEFORE the
+    // cursor's line and to place the cursor within its own line. Anything else
+    // drifts the moment a line wraps mid-word and compounds for lines below.
+    let mut visual_row = 0usize;
+    for raw in markdown.lines().take(line) {
+        let text = canvas_rendered_line_text(app, raw);
+        visual_row = visual_row.saturating_add(canvas_wrap_row_starts(&text, width).len());
+    }
+
+    let cur_raw = markdown.lines().nth(line).unwrap_or("");
+    let visual_col = canvas_visual_col_for_line(app, cur_raw, col);
+    let starts = canvas_wrap_row_starts(&canvas_rendered_line_text(app, cur_raw), width);
+    let (row_in_line, col_in_row) = canvas_wrap_locate(&starts, visual_col, width);
+    let visual_row = visual_row.saturating_add(row_in_line);
+    (visual_row, col_in_row)
+}
+
+/// Wrapped visual row of the cursor (see [`canvas_cursor_visual_pos`]). Drives
+/// the cursor-follow scroll so the caret stays inside the visible window.
+pub(crate) fn canvas_cursor_visual_row(
+    app: Option<&App>,
+    markdown: &str,
+    cursor: usize,
+    width: usize,
+) -> usize {
+    canvas_cursor_visual_pos(app, markdown, cursor, width).0
+}
+
+/// Total number of wrapped visual rows the whole buffer occupies at `width`,
+/// including the trailing empty row the cursor can sit on when the buffer ends
+/// in a newline (or is empty). Bounds the scroll offset and drives the scroll
+/// indicator. Defined as "the cursor's row at the very end of the buffer, plus
+/// one" so the last reachable caret row is always `< total`.
+pub(crate) fn canvas_total_visual_rows(app: Option<&App>, markdown: &str, width: usize) -> usize {
+    if width == 0 {
+        return markdown.matches('\n').count() + 1;
+    }
+    canvas_cursor_visual_pos(app, markdown, markdown.chars().count(), width)
+        .0
+        .saturating_add(1)
+}
+
+/// New vertical scroll offset (in wrapped rows) that keeps `cursor_row` inside a
+/// `viewport_height`-row window. Scrolls up so the cursor is the top row when it
+/// sits above the window, and down so it is the bottom row when it sits below;
+/// otherwise the offset is left unchanged.
+pub(crate) fn canvas_follow_scroll(
+    scroll_offset: usize,
+    cursor_row: usize,
+    viewport_height: usize,
+) -> usize {
+    if viewport_height == 0 {
+        return scroll_offset;
+    }
+    if cursor_row < scroll_offset {
+        cursor_row
+    } else if cursor_row >= scroll_offset + viewport_height {
+        cursor_row - viewport_height + 1
+    } else {
+        scroll_offset
+    }
+}
+
+/// Inverse of [`canvas_cursor_visual_pos`]: the buffer char offset whose cursor
+/// paints at absolute visual `(target_row, target_col)` in the word-wrapped
+/// body. Used by vertical navigation (land on a visual row while keeping a
+/// preferred column) and mouse hit-testing (place the cursor where a click fell,
+/// including on a wrapped continuation row). `target_row` is absolute in the
+/// wrapped-row space — the caller folds in any scroll offset before calling.
+///
+/// A `target_row` past the end of the content resolves to the buffer's end; a
+/// `target_col` left of or past a row's content clamps to that row's first or
+/// last offset. Forward visual position is monotonic in char offset, so the
+/// landing offset is the last column on the target row at or before the target.
+pub(crate) fn canvas_visual_to_cursor(
+    app: Option<&App>,
+    markdown: &str,
+    target_row: usize,
+    target_col: usize,
+    width: usize,
+) -> usize {
+    let width = width.max(1);
+
+    // Walk logical lines (split on '\n' so a trailing empty line is kept the
+    // same way the cursor's line math counts it), accumulating each line's
+    // wrapped-row count until the line that owns `target_row` is found.
+    let mut rows_before = 0usize;
+    let mut line_start = 0usize; // char offset of the current line's first char
+    let mut owner: Option<(usize, Vec<usize>, &str, usize)> = None;
+    for raw in markdown.split('\n') {
+        let rendered = canvas_rendered_line_text(app, raw);
+        let starts = canvas_wrap_row_starts(&rendered, width);
+        let row_count = starts.len();
+        if target_row < rows_before + row_count {
+            owner = Some((line_start, starts, raw, rows_before));
+            break;
+        }
+        rows_before += row_count;
+        line_start += raw.chars().count() + 1; // + the '\n'
+    }
+    let Some((line_start, starts, raw, rows_before)) = owner else {
+        // Below all content → end of buffer.
+        return markdown.chars().count();
+    };
+    let row_in_line = target_row - rows_before; // < starts.len() by construction
+
+    // Largest raw column on this line whose forward visual position is at or
+    // before (row_in_line, target_col) in row-major order.
+    let line_len = raw.chars().count();
+    let mut best_col = 0usize;
+    for raw_col in 0..=line_len {
+        let visual_col = canvas_visual_col_for_line(app, raw, raw_col);
+        let (r, c) = canvas_wrap_locate(&starts, visual_col, width);
+        if r < row_in_line || (r == row_in_line && c <= target_col) {
+            best_col = raw_col;
+        } else {
+            break;
+        }
+    }
+    line_start + best_col
+}
+
+/// The inner content width available to the canvas body, derived from the
+/// popup's outer modal rect: the bordered block removes one cell per side and
+/// the content margin removes [`CANVAS_CONTENT_PADDING_X`] more per side. Mouse
+/// hit-testing reuses this so it word-wraps on the exact width
+/// [`render_canvas_popup_at`] paints.
+pub(crate) fn canvas_modal_inner_width(modal: Rect) -> usize {
+    (modal.width as usize)
+        .saturating_sub(2)
+        .saturating_sub(2 * CANVAS_CONTENT_PADDING_X as usize)
+}
+
 fn canvas_cursor_position(
     app: Option<&App>,
     markdown: &str,
     cursor: usize,
+    scroll_offset: usize,
     area: Rect,
 ) -> Option<Position> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
     let width = area.width as usize;
-    let (line, col) = canvas_line_col(markdown, cursor);
-
-    // Accumulate the visual rows consumed by every logical line BEFORE the
-    // cursor's line. The canvas body is rendered with `Wrap { trim: false }`,
-    // so a preceding line whose rendered width exceeds the area occupies
-    // `ceil(width / area.width)` visual rows (minimum 1) — not exactly one.
-    // Using the same width logic as the cursor column math keeps the row
-    // count and the intra-line offset below consistent with each other.
-    let mut visual_row = 0usize;
-    for raw in markdown.lines().take(line) {
-        let rendered_width = canvas_visual_col_for_line(app, raw, raw.chars().count());
-        visual_row = visual_row.saturating_add(canvas_wrapped_rows(rendered_width, width));
-    }
-
-    let visual_col = canvas_visual_col_for_line(app, markdown.lines().nth(line).unwrap_or(""), col);
-    let visual_row = visual_row.saturating_add(visual_col / width);
+    let (visual_row, x) = canvas_cursor_visual_pos(app, markdown, cursor, width);
+    // Translate the absolute wrapped row into a row within the scrolled window;
+    // a cursor scrolled above the top or below the bottom has no on-screen cell.
+    let visual_row = visual_row.checked_sub(scroll_offset)?;
     if visual_row >= area.height as usize {
         return None;
     }
     Some(Position {
-        x: area.x.saturating_add((visual_col % width) as u16),
+        x: area.x.saturating_add(x as u16),
         y: area.y.saturating_add(visual_row as u16),
     })
 }
 
-/// Number of visual rows a rendered line of `rendered_width` columns occupies
-/// when wrapped at `width` columns, matching `Wrap { trim: false }`: at least
-/// one row, and `ceil(rendered_width / width)` once it exceeds the area width.
-fn canvas_wrapped_rows(rendered_width: usize, width: usize) -> usize {
-    if width == 0 {
-        return 1;
+/// Locate a display column `visual_col` within a word-wrapped line: return the
+/// `(row, col)` of the wrapped row that holds it, given the per-row starting
+/// display offsets from [`canvas_wrap_row_starts`]. The row is the last one
+/// whose start is at or before `visual_col`; the column is the remainder. A
+/// cursor parked exactly at the right edge of a full row (or inside a run of
+/// collapsed break-whitespace) is rolled onto the next row so it never paints
+/// past the editor edge.
+fn canvas_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (usize, usize) {
+    let width = width.max(1);
+    let mut row = 0usize;
+    for (idx, &start) in starts.iter().enumerate() {
+        if start <= visual_col {
+            row = idx;
+        } else {
+            break;
+        }
     }
-    (rendered_width / width)
-        .saturating_add(usize::from(rendered_width % width != 0))
-        .max(1)
+    let start = starts.get(row).copied().unwrap_or(0);
+    let col = visual_col.saturating_sub(start);
+    (row.saturating_add(col / width), col % width)
+}
+
+/// Word-wrap `text` exactly as ratatui's `Wrap { trim: false }` does and return,
+/// for each resulting visual row, the display-column offset (within the
+/// unwrapped line, counting collapsed break-whitespace) at which that row's
+/// first painted cell begins. The number of entries is the visual row count.
+///
+/// This is a faithful port of ratatui's `WordWrapper` for the `trim == false`
+/// path: a finished word (or a word that on its own overflows the width) is
+/// flushed onto the pending row together with the whitespace that preceded it;
+/// once the row is full the whitespace sitting at the break is dropped so the
+/// next word starts the following row. Reusing the renderer's wrap rule keeps
+/// the cursor's row count and intra-line column on the same glyphs the body
+/// paints. Verified against ratatui's `TestBackend` output for word breaks,
+/// hard breaks, trailing/leading whitespace, and collapsed multi-space runs.
+fn canvas_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
+    let max = width.max(1);
+    // Each buffered glyph carries `(origin, glyph_width)` where `origin` is its
+    // display offset in the unwrapped line, so a finished row reports where it
+    // started even after break-whitespace between words is dropped.
+    let mut rows: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut pending_line: Vec<(usize, usize)> = Vec::new();
+    let mut line_width = 0usize;
+    let mut pending_word: Vec<(usize, usize)> = Vec::new();
+    let mut word_width = 0usize;
+    let mut pending_ws: std::collections::VecDeque<(usize, usize)> =
+        std::collections::VecDeque::new();
+    let mut ws_width = 0usize;
+    let mut non_ws_previous = false;
+    let mut origin = 0usize;
+
+    for ch in text.chars() {
+        let sw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let here = origin;
+        origin = origin.saturating_add(sw);
+        // ratatui ignores glyphs wider than the whole line.
+        if sw > max {
+            continue;
+        }
+        let is_ws = ch.is_whitespace();
+
+        let word_found = non_ws_previous && is_ws;
+        let untrimmed_overflow = pending_line.is_empty() && word_width + ws_width + sw > max;
+
+        // A segment finished (word boundary) or the buffered word can no longer
+        // share a row: commit the pending whitespace + word onto the row.
+        if word_found || untrimmed_overflow {
+            pending_line.extend(pending_ws.drain(..));
+            line_width += ws_width;
+            ws_width = 0;
+            pending_line.append(&mut pending_word);
+            line_width += word_width;
+            word_width = 0;
+        }
+
+        let line_full = line_width >= max;
+        let pending_word_overflow = sw > 0 && line_width + ws_width + word_width >= max;
+        if line_full || pending_word_overflow {
+            let mut remaining = max.saturating_sub(line_width);
+            rows.push(std::mem::take(&mut pending_line));
+            line_width = 0;
+            // Drop whitespace that ran up to the row's edge — it does not carry
+            // over as leading space on the next row.
+            while let Some(&(_, w)) = pending_ws.front() {
+                if w > remaining {
+                    break;
+                }
+                ws_width -= w;
+                remaining -= w;
+                pending_ws.pop_front();
+            }
+            // The break whitespace itself is consumed, not re-counted.
+            if is_ws && pending_ws.is_empty() {
+                continue;
+            }
+        }
+
+        if is_ws {
+            ws_width += sw;
+            pending_ws.push_back((here, sw));
+        } else {
+            word_width += sw;
+            pending_word.push((here, sw));
+        }
+        non_ws_previous = !is_ws;
+    }
+
+    // Flush whatever is left into a final row (trim == false keeps trailing ws).
+    pending_line.extend(pending_ws.drain(..));
+    pending_line.append(&mut pending_word);
+    if !pending_line.is_empty() {
+        rows.push(pending_line);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+
+    // Convert each row to its starting display offset; an empty row (no painted
+    // glyph) inherits the previous row's end so offsets stay monotonic.
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut carry = 0usize;
+    for row in &rows {
+        let start = row.first().map(|&(o, _)| o).unwrap_or(carry);
+        starts.push(start);
+        if let Some(&(o, w)) = row.last() {
+            carry = o.saturating_add(w);
+        }
+    }
+    starts
+}
+
+/// The plain text the canvas body paints for one logical markdown line, before
+/// ratatui word-wraps it. Mirrors the per-line transformation in
+/// [`render_canvas_markdown_lines`] / [`canvas_visual_col_for_line`] — kept
+/// heading markers, the `  • ` list prefix, and expanded smart-clip chips — so
+/// the cursor's wrap math sees exactly the glyphs (and their spaces) ratatui
+/// wraps.
+fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
+    let trimmed = raw.trim();
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    if trimmed.is_empty() {
+        String::new()
+    } else if canvas_heading_level(trimmed).is_some() {
+        canvas_inline_rendered_text(app, trimmed)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        format!("  • {}", canvas_inline_rendered_text(app, rest))
+    } else {
+        // Normal line: the renderer keeps the raw leading whitespace and
+        // expands any inline chips in the remainder.
+        let body = raw
+            .char_indices()
+            .nth(leading)
+            .map(|(idx, _)| &raw[idx..])
+            .unwrap_or("");
+        let mut out: String = raw.chars().take(leading).collect();
+        out.push_str(&canvas_inline_rendered_text(app, body));
+        out
+    }
+}
+
+/// Expand inline smart-clip chips (`@{…}`) in `text` to the ` label ` form the
+/// renderer paints, leaving the surrounding text untouched. The label comes
+/// from the same source as [`canvas_smart_clip_visual_width`], so the rendered
+/// text and the cursor column stay width-consistent.
+fn canvas_inline_rendered_text(app: Option<&App>, text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("@{") {
+        out.push_str(&rest[..start]);
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let raw_clip = &after_marker[..end];
+        let (_, label) = canvas_smart_clip_label(app, raw_clip);
+        out.push(' ');
+        out.push_str(&label);
+        out.push(' ');
+        rest = &after_marker[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// One smart-clip located within a rendered canvas line: its display-column
+/// `visual_start` (counting collapsed break-whitespace, before word-wrap), its
+/// `visual_width`, and the raw clip body so the kind/id can be resolved.
+struct LineClip {
+    visual_start: usize,
+    visual_width: usize,
+    raw_clip: String,
+}
+
+/// Like [`canvas_inline_rendered_text`] but also reports each smart-clip's
+/// display-column span within the produced text. `base` is the visual column at
+/// which `text` begins on the rendered line (e.g. a bullet's `  • ` prefix), so
+/// the returned spans are in the same coordinate space as
+/// [`canvas_wrap_row_starts`]. The produced string is byte-for-byte what
+/// `canvas_inline_rendered_text` returns.
+fn canvas_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (String, Vec<LineClip>) {
+    let mut out = String::new();
+    let mut clips = Vec::new();
+    let mut visual = base;
+    let mut rest = text;
+    while let Some(start) = rest.find("@{") {
+        let before = &rest[..start];
+        out.push_str(before);
+        visual += before.chars().count();
+        let after_marker = &rest[start + 2..];
+        let Some(end) = after_marker.find('}') else {
+            out.push_str(&rest[start..]);
+            return (out, clips);
+        };
+        let raw_clip = &after_marker[..end];
+        let width = canvas_smart_clip_visual_width(app, raw_clip);
+        let (_, label) = canvas_smart_clip_label(app, raw_clip);
+        clips.push(LineClip {
+            visual_start: visual,
+            visual_width: width,
+            raw_clip: raw_clip.to_string(),
+        });
+        out.push(' ');
+        out.push_str(&label);
+        out.push(' ');
+        visual += width;
+        rest = &after_marker[end + 1..];
+    }
+    out.push_str(rest);
+    (out, clips)
+}
+
+/// The plain text the canvas body paints for one logical line (identical to
+/// [`canvas_rendered_line_text`]) paired with the display-column spans of every
+/// smart-clip in it. Computing both from one pass keeps the clip offsets and the
+/// wrapped text perfectly consistent for hit-testing.
+fn canvas_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec<LineClip>) {
+    let trimmed = raw.trim();
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    if trimmed.is_empty() {
+        (String::new(), Vec::new())
+    } else if canvas_heading_level(trimmed).is_some() {
+        canvas_inline_with_clips(app, trimmed, 0)
+    } else if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
+        let (body, clips) = canvas_inline_with_clips(app, rest, 4);
+        (format!("  • {body}"), clips)
+    } else {
+        let body = raw
+            .char_indices()
+            .nth(leading)
+            .map(|(idx, _)| &raw[idx..])
+            .unwrap_or("");
+        let lead: String = raw.chars().take(leading).collect();
+        let (body_text, clips) = canvas_inline_with_clips(app, body, leading);
+        (format!("{lead}{body_text}"), clips)
+    }
+}
+
+/// On-screen cell ranges of every session smart-clip in `markdown`, laid out in
+/// `area` with the same word-wrap as [`canvas_cursor_position`] (ratatui's
+/// `Wrap { trim: false }`). Each session clip maps to one or more
+/// [`CanvasClipHit`]s (one per wrapped-row segment) so the mouse handler can
+/// resolve a cell → session id for hover-preview and click-to-focus. Clips of
+/// other kinds (harness, response) are skipped.
+fn canvas_session_clip_hits(
+    app: Option<&App>,
+    markdown: &str,
+    scroll_offset: usize,
+    area: Rect,
+) -> Vec<crate::app::CanvasClipHit> {
+    let mut hits = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    let width = area.width as usize;
+    // The body paints wrapped rows `[scroll_offset, viewport_end)`. Rows above
+    // the fold are counted (to advance the row base) but produce no hits.
+    let viewport_end = scroll_offset.saturating_add(area.height as usize);
+    let mut visual_row_base = 0usize;
+    for raw in markdown.lines() {
+        if visual_row_base >= viewport_end {
+            break;
+        }
+        let (rendered, clips) = canvas_rendered_line_with_clips(app, raw);
+        let starts = canvas_wrap_row_starts(&rendered, width);
+        for clip in &clips {
+            let (kind, id) = canvas_smart_clip_target(&clip.raw_clip);
+            if kind != "session" {
+                continue;
+            }
+            // Walk the clip's display columns, mapping each to a wrapped row and
+            // merging contiguous same-row cells into one hit.
+            let mut segment: Option<(u16, u16, u16)> = None; // (row, start, end)
+            for vcol in clip.visual_start..clip.visual_start.saturating_add(clip.visual_width) {
+                let (row_in_line, col_in_row) = canvas_wrap_locate(&starts, vcol, width);
+                let abs_row = visual_row_base.saturating_add(row_in_line);
+                if abs_row < scroll_offset {
+                    continue; // above the fold (rows grow with the column)
+                }
+                if abs_row >= viewport_end {
+                    break; // below the fold; later cells only sit lower
+                }
+                let screen_row = area.y.saturating_add((abs_row - scroll_offset) as u16);
+                let screen_col = area.x.saturating_add(col_in_row as u16);
+                match segment.as_mut() {
+                    // A collapsed break-whitespace cell can map back onto a column
+                    // already inside the current segment — leave it covered.
+                    Some((r, s, e)) if *r == screen_row && screen_col >= *s && screen_col < *e => {}
+                    Some((r, _s, e)) if *r == screen_row && *e == screen_col => {
+                        *e = screen_col.saturating_add(1);
+                    }
+                    _ => {
+                        if let Some((row, col_start, col_end)) = segment.take() {
+                            hits.push(crate::app::CanvasClipHit {
+                                col_start,
+                                col_end,
+                                row,
+                                session_id: id.to_string(),
+                            });
+                        }
+                        segment = Some((screen_row, screen_col, screen_col.saturating_add(1)));
+                    }
+                }
+            }
+            if let Some((row, col_start, col_end)) = segment.take() {
+                hits.push(crate::app::CanvasClipHit {
+                    col_start,
+                    col_end,
+                    row,
+                    session_id: id.to_string(),
+                });
+            }
+        }
+        visual_row_base = visual_row_base.saturating_add(starts.len());
+    }
+    hits
 }
 
 fn canvas_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
@@ -8287,24 +9020,31 @@ fn canvas_smart_clip_visual_width(app: Option<&App>, raw_clip: &str) -> usize {
     label.chars().count() + 2
 }
 
-fn canvas_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
+/// Parse a smart-clip body (`session:abc`, `harness:codex`, or
+/// `session:abc clip_id=3`) into its `(kind, id)`. The kind selects the chip
+/// styling and label; the id resolves the referenced session/harness.
+fn canvas_smart_clip_target(raw_clip: &str) -> (&str, &str) {
     let first = raw_clip.split_whitespace().next().unwrap_or(raw_clip);
-    let (kind, id) = first.split_once(':').unwrap_or(("clip", first));
+    first.split_once(':').unwrap_or(("clip", first))
+}
+
+/// The chip label for a session smart-clip: `<glyph> <name> · <harness>`.
+/// Mirrors the session list's leading lifecycle glyph and name; shows the
+/// harness (not the model) and drops the redundant "session" prefix and the
+/// status word.
+fn canvas_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
+    format!("{} {} · {}", s.state.glyph(), primary_label(s), harness_label(s))
+}
+
+fn canvas_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
+    let (kind, id) = canvas_smart_clip_target(raw_clip);
     let label = match kind {
         "session" => app
             .and_then(|app| {
                 app.sessions
                     .iter()
                     .find(|s| s.id == id)
-                    .map(|s| {
-                        let model = s.model.as_deref().unwrap_or(s.harness.as_str());
-                        format!(
-                            "session {} · {} · {}",
-                            primary_label(s),
-                            model,
-                            s.state.label()
-                        )
-                    })
+                    .map(canvas_session_clip_label)
             })
             .unwrap_or_else(|| format!("session {id}")),
         "harness" => app
@@ -8591,7 +9331,7 @@ mod tests {
     fn canvas_cursor_position_targets_current_character_cell() {
         let area = Rect::new(10, 2, 20, 4);
         assert_eq!(
-            canvas_cursor_position(None, "abc", 1, area),
+            canvas_cursor_position(None, "abc", 1, 0, area),
             Some(Position { x: 11, y: 2 })
         );
     }
@@ -8600,7 +9340,7 @@ mod tests {
     fn canvas_cursor_position_accounts_for_wrapped_lines() {
         let area = Rect::new(10, 2, 5, 4);
         assert_eq!(
-            canvas_cursor_position(None, "abcdef", 6, area),
+            canvas_cursor_position(None, "abcdef", 6, 0, area),
             Some(Position { x: 11, y: 3 })
         );
     }
@@ -8613,12 +9353,145 @@ mod tests {
         let chip_width = " harness codex ".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, area),
+            canvas_cursor_position(None, markdown, cursor, 0, area),
             Some(Position {
                 x: 10 + "run ".chars().count() as u16 + chip_width as u16,
                 y: 2,
             })
         );
+    }
+
+    fn clip_test_session(
+        id: &str,
+        title: Option<&str>,
+        harness: &str,
+        state: SessionState,
+    ) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            harness: harness.into(),
+            cwd: "/tmp".into(),
+            title: title.map(|t| t.to_string()),
+            state,
+            created_at: chrono::Utc::now(),
+            last_event_at: None,
+            cost_usd: None,
+            model: None,
+            worktree: None,
+            pending_input: false,
+            last_prompt: None,
+            event_count: 0,
+            has_pty: false,
+            mode: None,
+            pinned: false,
+            position: 0,
+            group_id: None,
+            parent_session_id: None,
+            last_pty_at_ms: None,
+            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            kind: agentd_protocol::SessionKind::User,
+            archived: false,
+            operator_loop_disabled: false,
+        }
+    }
+
+    #[test]
+    fn canvas_session_clip_label_shows_glyph_name_and_harness() {
+        let s = clip_test_session("abc123", Some("My Task"), "codex", SessionState::Running);
+        // `<glyph> <name> · <harness>` — no "session" prefix, no model, no status word.
+        assert_eq!(canvas_session_clip_label(&s), "● My Task · codex");
+        let label = canvas_session_clip_label(&s);
+        assert!(!label.contains("session"), "dropped the session prefix: {label}");
+        assert!(!label.contains("running"), "dropped the status word: {label}");
+    }
+
+    #[test]
+    fn canvas_session_clip_label_used_by_smart_clip_label() {
+        // The chip label routes through the shared session-label helper when the
+        // session resolves against the app.
+        let s = clip_test_session("s9", Some("Build"), "claude", SessionState::Done);
+        let (kind, label) = (
+            canvas_smart_clip_target("session:s9").0,
+            canvas_session_clip_label(&s),
+        );
+        assert_eq!(kind, "session");
+        assert_eq!(label, "✓ Build · claude");
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_map_cells_to_session_ids() {
+        // Two session clips with a harness clip between them: only the session
+        // clips produce hits, each over the chip's painted cells (incl. padding).
+        let area = Rect::new(0, 0, 80, 6);
+        let md = "@{session:s1} mid @{harness:codex} @{session:s2}";
+        let hits = canvas_session_clip_hits(None, md, 0, area);
+        assert_eq!(
+            hits,
+            vec![
+                crate::app::CanvasClipHit {
+                    col_start: 0,
+                    col_end: 12,
+                    row: 0,
+                    session_id: "s1".into(),
+                },
+                crate::app::CanvasClipHit {
+                    col_start: 33,
+                    col_end: 45,
+                    row: 0,
+                    session_id: "s2".into(),
+                },
+            ]
+        );
+        // A cell inside the first chip resolves to s1; the gap between chips does not.
+        assert!(hits.iter().any(|h| h.contains(5, 0) && h.session_id == "s1"));
+        assert!(!hits.iter().any(|h| h.contains(20, 0)));
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_span_wrapped_rows() {
+        // A chip wider than the body wraps; the clip still maps entirely to its
+        // session across every row it occupies, with no foreign ids.
+        let area = Rect::new(0, 0, 8, 6);
+        let hits = canvas_session_clip_hits(None, "@{session:s1}", 0, area);
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|h| h.session_id == "s1"));
+        let rows: std::collections::BTreeSet<u16> = hits.iter().map(|h| h.row).collect();
+        assert!(
+            rows.len() >= 2,
+            "a chip wider than the body should wrap across rows: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_empty_without_clips() {
+        let area = Rect::new(0, 0, 40, 4);
+        assert!(canvas_session_clip_hits(None, "just prose, no clips", 0, area).is_empty());
+    }
+
+    #[test]
+    fn canvas_session_clip_hits_track_scroll_offset() {
+        // A clip on the third logical row (abs visual row 2) shifts up by the
+        // scroll offset so its hitbox follows the visible viewport.
+        let area = Rect::new(0, 0, 80, 6);
+        let md = "l0\nl1\n@{session:s1}\nl3";
+        let unscrolled = canvas_session_clip_hits(None, md, 0, area);
+        assert_eq!(unscrolled.len(), 1);
+        assert_eq!(unscrolled[0].row, 2);
+        assert_eq!(unscrolled[0].session_id, "s1");
+
+        let scrolled = canvas_session_clip_hits(None, md, 2, area);
+        assert_eq!(
+            scrolled,
+            vec![crate::app::CanvasClipHit {
+                col_start: 0,
+                col_end: 12,
+                row: 0,
+                session_id: "s1".into(),
+            }]
+        );
+
+        // Scrolled entirely past the clip: no hit remains.
+        assert!(canvas_session_clip_hits(None, md, 3, area).is_empty());
     }
 
     #[test]
@@ -8630,7 +9503,7 @@ mod tests {
         let cursor = "abcdef\n".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, area),
+            canvas_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 10, y: 4 })
         );
     }
@@ -8644,7 +9517,7 @@ mod tests {
         let cursor = "abcdef\nghijklm".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, area),
+            canvas_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 12, y: 5 })
         );
     }
@@ -8658,9 +9531,140 @@ mod tests {
         let cursor = "longlineAAAA\nsh".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, area),
+            canvas_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 12, y: 5 })
         );
+    }
+
+    #[test]
+    fn canvas_cursor_position_word_wraps_line_with_spaces() {
+        // The canvas body renders with `Wrap { trim: false }`, which WORD-wraps
+        // at spaces. "hello world foo" at width 8 lays out as three rows
+        // ("hello" / "world" / "foo"), so a cursor before "foo" sits at the
+        // start of the third row. Naive char-division (col / width) would put
+        // it at row 1 col 4 — inside "world" — which is the residual bug.
+        let area = Rect::new(10, 2, 8, 6);
+        let markdown = "hello world foo";
+        let cursor = "hello world ".chars().count();
+
+        assert_eq!(
+            canvas_cursor_position(None, markdown, cursor, 0, area),
+            Some(Position { x: 10, y: 4 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_word_wrapped_line_offsets_following_line() {
+        // A word-wrapped line consumes the right number of visual rows, so a
+        // normal line below it lands on the correct row. "hello world foo" at
+        // width 8 is three rows; "next" starts on the fourth. Char-division
+        // (ceil(15/8) = 2) would undercount and pull the line up a row.
+        let area = Rect::new(10, 2, 8, 8);
+        let markdown = "hello world foo\nnext";
+        let cursor = "hello world foo\n".chars().count();
+
+        assert_eq!(
+            canvas_cursor_position(None, markdown, cursor, 0, area),
+            Some(Position { x: 10, y: 5 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_hard_break_then_space_no_phantom_row() {
+        // "abcd efgh" at width 4: "abcd" exactly fills row 0, the space is the
+        // break point (consumed), and "efgh" is row 1 — two rows, not three.
+        // A cursor before 'e' sits at row 1 col 0. (A naive `wrap_to_width`
+        // reuse would emit a spurious empty middle row here and also misplace
+        // the column; ratatui collapses the break space instead.)
+        let area = Rect::new(10, 2, 4, 8);
+        let markdown = "abcd efgh";
+        let cursor = "abcd ".chars().count();
+
+        assert_eq!(
+            canvas_cursor_position(None, markdown, cursor, 0, area),
+            Some(Position { x: 10, y: 3 })
+        );
+    }
+
+    #[test]
+    fn canvas_cursor_position_matches_painted_glyph_on_wrapped_line() {
+        // Cross-check the computed cursor cell against the glyph ratatui
+        // actually paints, using the exact `Paragraph::wrap(Wrap{trim:false})`
+        // the canvas body uses. The cursor before "foo" must land on the
+        // painted 'f' at the start of the wrapped row — not somewhere in the
+        // middle of "world" as char-division would compute.
+        let w = 8u16;
+        let h = 6u16;
+        let area = Rect::new(0, 0, w, h);
+        let markdown = "hello world foo";
+        let cursor = "hello world ".chars().count();
+
+        let pos = canvas_cursor_position(None, markdown, cursor, 0, area).expect("cursor pos");
+
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            // Plain markdown renders one Line == the raw text, so this matches
+            // what `render_canvas_popup_at` feeds the Paragraph for this input.
+            let para = Paragraph::new(markdown).wrap(Wrap { trim: false });
+            f.render_widget(para, area);
+        })
+        .expect("draw");
+        let buf = term.backend().buffer();
+        let glyph = buf
+            .cell((pos.x, pos.y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+
+        assert_eq!(
+            glyph, "f",
+            "computed cursor {pos:?} should sit on the painted 'f' starting the wrapped row"
+        );
+    }
+
+    #[test]
+    fn canvas_follow_scroll_advances_when_cursor_below_window() {
+        // Cursor on visual row 19 with a 5-row window anchored at offset 0 must
+        // scroll down so the cursor becomes the bottom visible row (offset 15).
+        assert_eq!(canvas_follow_scroll(0, 19, 5), 15);
+    }
+
+    #[test]
+    fn canvas_follow_scroll_returns_to_top_when_cursor_above_window() {
+        // Cursor back on row 0 while scrolled to 15 snaps the window to the top.
+        assert_eq!(canvas_follow_scroll(15, 0, 5), 0);
+    }
+
+    #[test]
+    fn canvas_follow_scroll_unchanged_when_cursor_already_visible() {
+        assert_eq!(canvas_follow_scroll(0, 2, 5), 0);
+        assert_eq!(canvas_follow_scroll(10, 12, 5), 10);
+    }
+
+    #[test]
+    fn canvas_cursor_position_subtracts_scroll_offset() {
+        // Ten single-row lines at width 20; the cursor sits on logical line 7.
+        let area = Rect::new(10, 0, 20, 5);
+        let markdown = (0..10).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let cursor = markdown.find("L7").unwrap();
+        // Scrolled past the first 5 rows, row 7 renders two rows into the view.
+        assert_eq!(
+            canvas_cursor_position(None, &markdown, cursor, 5, area),
+            Some(Position { x: 10, y: 2 })
+        );
+        // Without scrolling, that row is below the 5-row window: no cell to draw.
+        assert_eq!(canvas_cursor_position(None, &markdown, cursor, 0, area), None);
+    }
+
+    #[test]
+    fn canvas_total_visual_rows_counts_trailing_empty_line() {
+        // "a\n" is two rows: the text row and the trailing empty row the cursor
+        // can sit on. The count must include that final row so the scroll clamp
+        // keeps it reachable.
+        assert_eq!(canvas_total_visual_rows(None, "a\n", 20), 2);
+        assert_eq!(canvas_total_visual_rows(None, "", 20), 1);
+        // "abcdef" wraps to two rows at width 5.
+        assert_eq!(canvas_total_visual_rows(None, "abcdef", 5), 2);
     }
 
     #[test]
@@ -8685,70 +9689,135 @@ mod tests {
     #[test]
     fn canvas_focus_styles_are_distinct_from_session_focus() {
         let theme = Theme::default();
+        let active_canvas = canvas_border_style(&theme, true);
+        let inactive_canvas = canvas_border_style(&theme, false);
+
         assert_eq!(pane_border_style(&theme, true).fg, Some(theme.border_focused));
-        assert_eq!(canvas_border_style(&theme, true).fg, Some(theme.accent_alt));
-        assert_eq!(canvas_border_style(&theme, false).fg, Some(theme.border));
-        assert_ne!(
-            canvas_border_style(&theme, true).fg,
-            pane_border_style(&theme, true).fg
+        assert_eq!(active_canvas.fg, Some(theme.accent_alt));
+        assert_eq!(inactive_canvas.fg, active_canvas.fg);
+        assert_ne!(inactive_canvas.fg, Some(theme.border));
+        assert!(active_canvas.add_modifier.contains(Modifier::BOLD));
+        assert!(!inactive_canvas.add_modifier.contains(Modifier::BOLD));
+        assert!(
+            inactive_canvas.add_modifier.contains(Modifier::DIM),
+            "inactive canvas border should dim without switching hue"
         );
+        assert_ne!(active_canvas.fg, pane_border_style(&theme, true).fg);
     }
 
     #[test]
-    fn canvas_title_close_button_sits_in_title_bar_disjoint_from_other_controls() {
+    fn canvas_title_close_button_matches_chat_view_geometry() {
+        // The canvas close button must sit in the exact same spot as the
+        // session chat view's close button: the rightmost ` x ` slot, inset
+        // one column from the right corner.
         let rect = Rect::new(0, 0, 100, 12);
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
         let close = canvas_title_close_button_range(rect, summary_ref)
             .expect("close button range should be produced at this width");
-        let run = canvas_title_run_button_range(rect, summary_ref).expect("run range");
-        let toggle = canvas_title_toggle_button_range(summary_ref, rect).expect("toggle range");
-
-        // Lives on the top border row.
+        assert_eq!(
+            close,
+            view_close_button_range(rect),
+            "canvas close must mirror the chat-view close geometry"
+        );
+        // Rightmost control: lives on the top border row and ends one column
+        // inset from the right corner.
         assert_eq!(close.2, rect.y);
-        // Valid, non-empty range strictly inside the block's left/right borders.
-        assert!(close.0 < close.1, "close range must be non-empty: {close:?}");
-        assert!(close.0 > rect.x, "close must clear the left border: {close:?}");
-        assert!(
-            close.1 < rect.x + rect.width,
-            "close must clear the right border: {close:?}"
-        );
-
-        // Disjoint from the Run button, the mode toggle, and (by construction)
-        // the harness label that sits at the far-right corner.
-        let disjoint =
-            |a: (u16, u16, u16), b: (u16, u16, u16)| a.2 != b.2 || a.1 <= b.0 || b.1 <= a.0;
-        assert!(disjoint(close, run), "close {close:?} overlaps run {run:?}");
-        assert!(
-            disjoint(close, toggle),
-            "close {close:?} overlaps toggle {toggle:?}"
-        );
-
-        // Close sits left of the Run button.
-        assert!(close.1 <= run.0, "close should be left of the run button");
+        assert_eq!(close.1, rect.x + rect.width - 1);
     }
 
     #[test]
-    fn canvas_title_widget_icons_produced_left_of_close_button() {
+    fn canvas_title_right_cluster_orders_run_widgets_close_left_to_right() {
+        // Scanning left→right, the right cluster must read
+        // `[harness] [Run] [widgets] [x]`, every range disjoint, with the
+        // mode toggle sitting far left of all of them.
+        let rect = Rect::new(0, 0, 100, 12);
+        let summary = summary_with_mode("smith", Some("interactive"));
+        let summary_ref = Some(&summary);
+        let count = 2usize;
+
+        let close = canvas_title_close_button_range(rect, summary_ref).expect("close range");
+        let widgets = canvas_title_widget_icon_ranges(rect, summary_ref, count);
+        let run = canvas_title_run_button_range(rect, summary_ref, count).expect("run range");
+        let harness =
+            canvas_title_harness_range(rect, summary_ref, count).expect("harness range");
+        let toggle = canvas_title_toggle_button_range(summary_ref, rect).expect("toggle range");
+
+        assert_eq!(widgets.len(), count, "one icon range per widget: {widgets:?}");
+        for r in [close, run, harness, toggle] {
+            assert_eq!(r.2, rect.y, "control must live on the top border row");
+            assert!(r.0 < r.1, "control range must be non-empty: {r:?}");
+        }
+
+        let widgets_min = widgets.iter().map(|w| w.0).min().unwrap();
+        let widgets_max = widgets.iter().map(|w| w.1).max().unwrap();
+
+        // Close is the rightmost control; widgets, then Run, then harness step
+        // left from it.
+        assert!(
+            widgets_max <= close.0,
+            "widgets {widgets:?} must sit left of close {close:?}"
+        );
+        assert!(
+            run.1 <= widgets_min,
+            "run {run:?} must sit left of the leftmost widget"
+        );
+        assert!(
+            harness.1 <= run.0,
+            "harness {harness:?} must sit left of run {run:?}"
+        );
+        assert!(
+            toggle.1 <= harness.0,
+            "toggle {toggle:?} must sit left of harness {harness:?}"
+        );
+
+        // No overlaps among any of close / widgets / run / harness / toggle.
+        let mut ranges = vec![close, run, harness, toggle];
+        ranges.extend(widgets.iter().copied());
+        for i in 0..ranges.len() {
+            for j in (i + 1)..ranges.len() {
+                let a = ranges[i];
+                let b = ranges[j];
+                assert!(
+                    a.2 != b.2 || a.1 <= b.0 || b.1 <= a.0,
+                    "controls overlap: {a:?} vs {b:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn canvas_title_widget_icons_sit_between_run_and_close() {
         let rect = Rect::new(0, 0, 100, 12);
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        // No widgets → no icon ranges.
+        // No widgets → no icon ranges, and Run falls back to sitting just left
+        // of the close button.
         assert!(canvas_title_widget_icon_ranges(rect, summary_ref, 0).is_empty());
+        let close = canvas_title_close_button_range(rect, summary_ref).expect("close range");
+        let run_no_widgets =
+            canvas_title_run_button_range(rect, summary_ref, 0).expect("run range");
+        assert!(
+            run_no_widgets.1 <= close.0,
+            "with no widgets, run {run_no_widgets:?} sits left of close {close:?}"
+        );
 
-        // Two widgets → two icon ranges, ordered left-to-right, all to the
-        // left of the close button and mutually disjoint.
+        // Two widgets → ordered left-to-right, between Run and close, disjoint.
         let icons = canvas_title_widget_icon_ranges(rect, summary_ref, 2);
         assert_eq!(icons.len(), 2, "one hit range per widget: {icons:?}");
-        let close = canvas_title_close_button_range(rect, summary_ref).expect("close range");
+        let run = canvas_title_run_button_range(rect, summary_ref, 2).expect("run range");
         for icon in &icons {
             assert_eq!(icon.2, rect.y);
             assert!(icon.0 < icon.1, "icon range must be non-empty: {icon:?}");
             assert!(
                 icon.1 <= close.0,
                 "icon {icon:?} should sit left of close {close:?}"
+            );
+            assert!(
+                run.1 <= icon.0,
+                "icon {icon:?} should sit right of run {run:?}"
             );
         }
         assert!(

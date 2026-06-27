@@ -31,6 +31,15 @@ view `x` button), alongside delete and cancel:
   terminated across daemon restarts until an explicit restart.
 - **Archived state is persisted** on the session record so it survives daemon
   and client restarts.
+- **Archiving is atomic against adapter teardown.** A single archive action
+  reliably leaves the session archived — terminating the live adapter must never
+  race ahead of (or behind) the archived flag and leave the session looking
+  merely stopped (which would force the user to archive a second time). The
+  daemon records the archive intent and persists+broadcasts the archived,
+  terminal state *before* it tears the adapter down, and the adapter's
+  asynchronous close handler keeps `archived` set when it persists/broadcasts
+  the resulting terminal state. Every client reflects the archive on the first
+  action.
 
 The kill prompt requires an explicit choice: `d` deletes (destructive), `a`
 archives, and anything else (including a reflexive `y`/Enter) cancels.
@@ -63,6 +72,11 @@ single reflexive keystroke once a non-destructive option shares the prompt.
   archived sessions as ordinary entries — acceptable and non-breaking.
 - Archive keeps the worktree; only delete removes it. Disk usage of archived
   sessions persists until they are explicitly deleted.
+- Any session-lifecycle action that flips a persisted flag while also
+  terminating a live adapter must guard against the adapter's asynchronous close
+  event clobbering that flag. The close handler runs on its own task and
+  persists+broadcasts the session's terminal state; it must honor in-flight
+  intent (such as archive) instead of overwriting it with stale state.
 
 ## Non-Goals
 
