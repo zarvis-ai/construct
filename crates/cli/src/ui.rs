@@ -741,12 +741,17 @@ fn render_session_widget_title(
     panels: Vec<agentd_protocol::UiPanel>,
     close_shown: bool,
     reserved_right_width: u16,
-    focused: bool,
+    border_style: Style,
 ) -> Line<'static> {
     let label_width = 2u16.saturating_add((panels.len() as u16).saturating_mul(2));
     let (x_start, _x_end, y) =
         dynamic_ui_trigger_range(view_area, close_shown, label_width, reserved_right_width);
-    let mut spans = vec![Span::styled("─ ", pane_border_style(&app.theme, focused))];
+    // The leading "─ " stitches the indicator into the top border, so it must
+    // carry the pane's own border color (the session view's focus-aware border,
+    // the canvas's accent border). Passing the style in keeps the two title bars
+    // from drifting — a hardcoded `pane_border_style` here painted a green dash
+    // on the canvas's accent border.
+    let mut spans = vec![Span::styled("─ ", border_style)];
     // Ratatui right-aligned block titles paint one cell left of the simple
     // `right - width` geometry used for layout reservation; mirror that for
     // hit-testing so hover/click lands on the visible square, not one cell over.
@@ -2892,7 +2897,7 @@ fn apply_pane_title_right_cluster<'a>(
     app: &mut App,
     area: Rect,
     summary: Option<&agentd_protocol::SessionSummary>,
-    focused: bool,
+    border_style: Style,
     show_close: bool,
     session_actions: bool,
     mut block: Block<'a>,
@@ -2907,11 +2912,8 @@ fn apply_pane_title_right_cluster<'a>(
         .map(UnicodeWidthStr::width)
         .unwrap_or(0) as u16;
     let harness_right = harness_label_text.as_ref().map(|text| {
-        Line::from(Span::styled(
-            text.clone(),
-            pane_border_style(&app.theme, focused),
-        ))
-        .alignment(ratatui::layout::Alignment::Right)
+        Line::from(Span::styled(text.clone(), border_style))
+            .alignment(ratatui::layout::Alignment::Right)
     });
     let widget_title = summary.and_then(|s| {
         let panels = session_sticky_widget_panels(app, &s.id);
@@ -2923,7 +2925,7 @@ fn apply_pane_title_right_cluster<'a>(
                 panels,
                 show_close,
                 harness_width,
-                focused,
+                border_style,
             )
         })
     });
@@ -3069,20 +3071,20 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     // only shown when a session is actually selected (groups, "no session", and
     // the diff-overlay branch don't need it).
     let show_close = summary.is_some();
+    let border_style = pane_border_style(&app.theme, focused);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(pane_border_style(&app.theme, focused))
+        .border_style(border_style)
         .title(title);
-    let block =
-        apply_pane_title_right_cluster(
-            app,
-            area,
-            summary.as_ref(),
-            focused,
-            show_close,
-            true,
-            block,
-        );
+    let block = apply_pane_title_right_cluster(
+        app,
+        area,
+        summary.as_ref(),
+        border_style,
+        show_close,
+        true,
+        block,
+    );
     let inner = block.inner(area);
     f.render_widget(block, area);
     clear_pane_side_borders(f, area, app);
@@ -3425,7 +3427,7 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     );
     app.set_scrollback_for_window(window_id, clamped_scrollback);
     app.layout.terminal_scrollbar = terminal_scrollbar;
-    render_visible_dynamic_ui_panels(f, area, app, &sticky_panels);
+    render_visible_dynamic_ui_panels(f, area, app, &id, &sticky_panels);
     if app.dynamic_ui_popover_open.as_deref() == Some(id.as_str()) && !sticky_panels.is_empty() {
         render_dynamic_ui_dropdown(f, area, app, &sticky_panels);
     }
@@ -3690,11 +3692,9 @@ fn render_visible_dynamic_ui_panels(
     f: &mut Frame,
     session_area: Rect,
     app: &mut App,
+    session_id: &str,
     panels: &[agentd_protocol::UiPanel],
 ) {
-    let Some(session_id) = app.selected_id() else {
-        return;
-    };
     let now = std::time::Instant::now();
     app.dynamic_ui_temporary_until
         .retain(|_, until| *until > now);
@@ -3703,7 +3703,7 @@ fn render_visible_dynamic_ui_panels(
     }
     let mut visible: Vec<_> = panels
         .iter()
-        .filter(|panel| app.dynamic_ui_panel_visible(&session_id, &panel.id))
+        .filter(|panel| app.dynamic_ui_panel_visible(session_id, &panel.id))
         .cloned()
         .collect();
     visible.sort_by(|a, b| a.id.cmp(&b.id));
@@ -3716,7 +3716,7 @@ fn render_visible_dynamic_ui_panels(
     if let Some((mx, my)) = app.mouse_pos {
         if contains_rect(area, mx, my) {
             for panel in &visible {
-                let key = (session_id.clone(), panel.id.clone());
+                let key = (session_id.to_string(), panel.id.clone());
                 if app.dynamic_ui_temporary_until.contains_key(&key) {
                     app.dynamic_ui_temporary_until.insert(
                         key,
@@ -3741,13 +3741,13 @@ fn render_visible_dynamic_ui_panels(
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let mut rendered = render_dynamic_ui_stack_lines(inner, app, &session_id, &visible);
+    let mut rendered = render_dynamic_ui_stack_lines(inner, app, session_id, &visible);
     let content_rows = rendered.len();
     let viewport_rows = inner.height as usize;
     let max_scroll = content_rows.saturating_sub(viewport_rows);
     let offset = app
         .dynamic_ui_scroll_offsets
-        .entry(session_id.clone())
+        .entry(session_id.to_string())
         .or_insert(0);
     *offset = (*offset).min(max_scroll);
     let scroll = *offset;
@@ -3778,7 +3778,8 @@ fn render_visible_dynamic_ui_panels(
     );
     render_dynamic_ui_stack_scrollbar(f.buffer_mut(), inner, scroll, content_rows);
     app.layout.dynamic_ui_popover_area = Some(area);
-    app.layout.dynamic_ui_scroll_metrics = Some((session_id, content_rows, viewport_rows));
+    app.layout.dynamic_ui_scroll_metrics =
+        Some((session_id.to_string(), content_rows, viewport_rows));
 }
 
 fn dynamic_ui_stack_area(session_area: Rect) -> Option<Rect> {
@@ -7483,12 +7484,13 @@ fn render_canvas_popup_at(
     let title = canvas_title_line(app, popup, active, now, &left);
     let title_toggle_hit = canvas_title_toggle_button_range(summary_ref, rect);
 
+    let border_style = canvas_border_style(&app.theme, active);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(canvas_border_style(&app.theme, active))
+        .border_style(border_style)
         .title(title);
     let block =
-        apply_pane_title_right_cluster(app, rect, summary_ref, active, show_close, true, block);
+        apply_pane_title_right_cluster(app, rect, summary_ref, border_style, show_close, true, block);
     if active {
         // Run lives in the left cluster; the close button and widget icons reuse
         // the shared session-view geometry (`view_close_button_range` and
@@ -7557,6 +7559,19 @@ fn render_canvas_popup_at(
         total_rows,
         viewport_rows,
     );
+    // Reveal the session's hovered/pinned sticky widgets on top of the canvas,
+    // mirroring the normal session view. The title-bar squares are painted by
+    // `apply_pane_title_right_cluster` above (which arms `dynamic_ui_hover` on
+    // hover and registers pin hits), but the canvas's own `Clear` wipes the
+    // widget body the session view drew underneath — so without re-rendering it
+    // here the widget never appears while the canvas is shown. Only the active
+    // canvas drives the single hover/scroll/popover layout state.
+    if active {
+        let panels = session_sticky_widget_panels(app, &popup.canvas.session_id);
+        if !panels.is_empty() {
+            render_visible_dynamic_ui_panels(f, rect, app, &popup.canvas.session_id, &panels);
+        }
+    }
     // Capture session-clip hitboxes for the active canvas so hover/click can map
     // a cell → session id. Only the active canvas is interactive; the same
     // `scroll_offset` applied to the paragraph is applied here so the hitboxes

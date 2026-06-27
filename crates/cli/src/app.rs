@@ -12395,6 +12395,113 @@ mod tests {
         server.abort();
     }
 
+    /// The widget indicator's leading "─" stitches the square into the title
+    /// bar's top border, so it must carry the *canvas* border color (accent_alt),
+    /// not the session view's green `pane_border_style`. Regression: it painted
+    /// a green dash on the canvas's accent border.
+    #[tokio::test]
+    async fn canvas_widget_icon_dash_matches_canvas_border_color() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.ui_panels.insert(
+            "s1".into(),
+            HashMap::from([(
+                "w1".to_string(),
+                agentd_protocol::UiPanel {
+                    id: "w1".into(),
+                    source: Some("w1.md".into()),
+                    title: Some("widget".into()),
+                    created_at_ms: 1,
+                    placement: agentd_protocol::UiPlacement::Sticky,
+                    markdown: "# widget".into(),
+                },
+            )]),
+        );
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "# canvas\n\nbody", 0));
+        {
+            let popup = app.canvas_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+
+        // The widget title actually painted (otherwise this test is vacuous).
+        assert!(
+            !app.layout.dynamic_ui_widget_hits.is_empty(),
+            "widget title square should register a hit"
+        );
+
+        let modal = app.layout.modal_area.expect("canvas modal area");
+        let accent = app.theme.accent_alt;
+        let buf = term.backend().buffer();
+        let y = modal.y;
+        // Every "─" on the canvas's top border — including the indicator's
+        // leading dash — must use the accent border color, never the green
+        // session-view border.
+        let mismatched: Vec<u16> = (modal.x..modal.x + modal.width)
+            .filter(|&x| buf.cell((x, y)).map(|c| c.symbol()) == Some("─"))
+            .filter(|&x| buf.cell((x, y)).and_then(|c| c.style().fg) != Some(accent))
+            .collect();
+        assert!(
+            mismatched.is_empty(),
+            "canvas top-border dashes must match the accent border color; mismatched cols: {mismatched:?}"
+        );
+        server.abort();
+    }
+
+    /// Hovering/pinning a session's sticky widget while its canvas is open must
+    /// reveal the widget body *on top of* the canvas. Regression: the canvas's
+    /// own `Clear` wiped the widget the session view had drawn underneath, so the
+    /// widget was never visible while the canvas was shown.
+    #[tokio::test]
+    async fn canvas_reveals_pinned_widget_over_canvas() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.ui_panels.insert(
+            "s1".into(),
+            HashMap::from([(
+                "w1".to_string(),
+                agentd_protocol::UiPanel {
+                    id: "w1".into(),
+                    source: Some("w1.md".into()),
+                    title: Some("ZZWIDGET".into()),
+                    created_at_ms: 1,
+                    placement: agentd_protocol::UiPlacement::Sticky,
+                    markdown: "# ZZWIDGET\n\nbody text".into(),
+                },
+            )]),
+        );
+        // Pin the widget so it is visible without simulating a hover.
+        app.dynamic_ui_selected
+            .insert(("s1".to_string(), "w1".to_string()));
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "# canvas\n\nbody", 0));
+        {
+            let popup = app.canvas_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("canvas should render");
+        let text = rendered_text(term.backend().buffer());
+
+        assert!(
+            text.contains("ZZWIDGET"),
+            "pinned widget body should render on top of the canvas: {text:?}"
+        );
+        server.abort();
+    }
+
     /// The Run button now lives in the LEFT cluster of the canvas title bar,
     /// between the session name and the ` * modified` marker — not pinned to the
     /// right side any more.
