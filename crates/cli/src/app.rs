@@ -14575,6 +14575,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_cursor_advances_when_space_appended_to_heading() {
+        let (app, _dir, server) = empty_app().await;
+        let width = 40u16;
+
+        // A heading line and the same line after a trailing space is typed at the
+        // end. The buffer offset moves by one char, so the rendered cursor column
+        // must move by one too — otherwise the caret desyncs from the edit point.
+        // Headings paint their `#` markers literally, so "## foo" renders 6 wide.
+        let before = "## foo";
+        let after = "## foo ";
+        let (_, col_before) = crate::ui::program_cursor_visual_pos(
+            Some(&app),
+            before,
+            before.chars().count(),
+            width as usize,
+        );
+        let (_, col_after) = crate::ui::program_cursor_visual_pos(
+            Some(&app),
+            after,
+            after.chars().count(),
+            width as usize,
+        );
+
+        assert_eq!(
+            col_after,
+            col_before + 1,
+            "appending a trailing space to a heading must advance the cursor column by one"
+        );
+
+        // The cursor must land exactly at the painted end of the rendered heading
+        // ("## foo ", 7 wide), with no gap between the text and the caret — i.e.
+        // the trailing space is actually rendered.
+        assert_eq!(
+            col_after, 7,
+            "cursor should sit immediately after the rendered trailing space"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_vertical_nav_preserves_preferred_column_across_wrap() {
         let (mut app, _dir, server) = empty_app().await;
         // "abcdefghij" wraps to two visual rows; "XY" is a short line below it.

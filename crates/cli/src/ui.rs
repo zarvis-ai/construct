@@ -8907,6 +8907,28 @@ fn program_list_item_content(raw: &str) -> Option<(usize, &str)> {
     Some((leading, rest))
 }
 
+/// For a markdown heading line, return `(leading_indent_chars, content)` where
+/// `content` is the heading text — the `#` markers are painted literally, so
+/// they stay in the slice — taken from the raw line WITH its trailing whitespace
+/// preserved, or `None` when the line isn't a heading. Detection matches the
+/// renderer (`program_heading_level` on the fully-trimmed line), but the content
+/// is sliced from the raw line so a trailing space the user just typed survives —
+/// `raw.trim()` would drop it, stranding the cursor at the end of the line
+/// because the rendered glyphs and the cursor column would then disagree on the
+/// line's width. Headings don't render their leading indent, so only the indent
+/// is stripped from the front, mirroring the trimmed text the renderer used.
+fn program_heading_content(raw: &str) -> Option<(usize, &str)> {
+    let trimmed = raw.trim();
+    program_heading_level(trimmed)?;
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    let content = raw
+        .char_indices()
+        .nth(leading)
+        .map(|(idx, _)| &raw[idx..])
+        .unwrap_or("");
+    Some((leading, content))
+}
+
 /// The plain text the program body paints for one logical markdown line, before
 /// ratatui word-wraps it. Mirrors the per-line transformation in
 /// [`render_program_markdown_lines`] / [`program_visual_col_for_line`] — kept
@@ -8918,8 +8940,8 @@ fn program_rendered_line_text(app: Option<&App>, raw: &str) -> String {
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
         String::new()
-    } else if program_heading_level(trimmed).is_some() {
-        program_inline_rendered_text(app, trimmed)
+    } else if let Some((_, content)) = program_heading_content(raw) {
+        program_inline_rendered_text(app, content)
     } else if let Some((_, rest)) = program_list_item_content(raw) {
         format!(
             "{}  • {}",
@@ -9021,8 +9043,8 @@ fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Ve
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
         (String::new(), Vec::new())
-    } else if program_heading_level(trimmed).is_some() {
-        program_inline_with_clips(app, trimmed, 0)
+    } else if let Some((_, content)) = program_heading_content(raw) {
+        program_inline_with_clips(app, content, 0)
     } else if let Some(rest) = trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
@@ -9142,8 +9164,11 @@ fn program_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> 
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     let trimmed = raw.trim();
     let col = raw_col.saturating_sub(leading);
-    if program_heading_level(trimmed).is_some() {
-        program_inline_visual_width(app, trimmed, col)
+    if let Some((_, content)) = program_heading_content(raw) {
+        // `content` keeps any trailing space (sliced from the raw line, leading
+        // indent stripped) so the cursor column advances past a space typed at the
+        // end of the heading — matching the glyphs the renderer paints.
+        program_inline_visual_width(app, content, col)
     } else if let Some((_, rest)) = program_list_item_content(raw) {
         // Mirror the proportional indent rendered for nested bullets: the bullet
         // glyph and text sit `leading` columns further right than a top-level
@@ -9223,10 +9248,15 @@ fn render_program_markdown_lines<'a>(
         if trimmed.is_empty() {
             out.push(Line::from(""));
         } else if let Some(level) = program_heading_level(trimmed) {
+            // Slice the heading text from the raw line (leading indent stripped,
+            // trailing whitespace kept) so a space typed at the end of the heading
+            // paints a cell for the cursor to land on. `raw.trim()` would drop it,
+            // desyncing the caret from the rendered glyphs.
+            let content = program_heading_content(raw).map_or(trimmed, |(_, c)| c);
             out.push(render_program_heading_line(
                 &app.theme,
                 level,
-                trimmed,
+                content,
                 line_start + leading,
                 selection,
                 search_matches,
