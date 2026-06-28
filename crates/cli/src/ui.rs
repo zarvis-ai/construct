@@ -7452,6 +7452,123 @@ fn apply_canvas_shimmer(lines: &mut [Line], shimmer: &CanvasShimmer, theme: &The
     }
 }
 
+/// Build the empty-canvas onboarding placeholder: a one-line description of what
+/// the canvas is, up to two clickable template buttons, a divider, and a tip.
+/// Returns the lines to render plus the button hitboxes. Coordinates are absolute
+/// screen cells — safe because an empty canvas never scrolls (offset is always 0)
+/// and every line is kept within `inner.width`, so no wrapping shifts the rows.
+/// Falls back to a plain description+tip when the canvas is too small for buttons
+/// or no templates are available.
+fn canvas_empty_placeholder(
+    theme: &crate::theme::Theme,
+    templates: &[agentd_protocol::CanvasTemplate],
+    inner: Rect,
+) -> (Vec<Line<'static>>, Vec<crate::app::CanvasTemplateHit>) {
+    let dim = Style::default().fg(theme.dim);
+    let width = inner.width as usize;
+    const DESC: &str =
+        "Canvas — a shared Markdown space you and your agents edit and run together.";
+    const TIP: &str =
+        "Tip: @{session:id} embeds a live session · select text + Run to dispatch · :::clip groups output.";
+
+    let desc_line = Line::from(Span::styled(truncate_to_width(DESC, width), dim));
+    let tip_line = Line::from(Span::styled(truncate_to_width(TIP, width), dim));
+    let divider = Line::from(Span::styled("─".repeat(width), dim));
+    let plain = || {
+        (
+            vec![
+                desc_line.clone(),
+                Line::from(""),
+                divider.clone(),
+                Line::from(""),
+                tip_line.clone(),
+            ],
+            Vec::new(),
+        )
+    };
+
+    const INDENT: usize = 2;
+    const GAP: usize = 3;
+    const MAX_LABEL: usize = 20;
+
+    // Up to two non-blank templates become buttons; "blank" *is* the empty state,
+    // so offering it here would be a no-op. Keep only as many as fit on one row.
+    let mut buttons: Vec<(String, usize, &agentd_protocol::CanvasTemplate)> = Vec::new();
+    let mut used = INDENT;
+    for (i, t) in templates
+        .iter()
+        .filter(|t| t.id != "blank")
+        .take(2)
+        .enumerate()
+    {
+        let label = format!(" {} ", truncate_to_width(&t.name, MAX_LABEL));
+        let inner_w = UnicodeWidthStr::width(label.as_str());
+        let box_w = inner_w + 2; // side borders
+        let needed = if i == 0 { box_w } else { GAP + box_w };
+        if used + needed > width {
+            break;
+        }
+        used += needed;
+        buttons.push((label, inner_w, t));
+    }
+
+    if buttons.is_empty() || inner.height < 5 {
+        return plain();
+    }
+
+    let border = Style::default().fg(theme.accent);
+    let label_style = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
+    let indent = || Span::styled(" ".repeat(INDENT), Style::default());
+    let gap = || Span::styled(" ".repeat(GAP), Style::default());
+
+    let mut top = vec![indent()];
+    let mut mid = vec![indent()];
+    let mut bot = vec![indent()];
+    let mut hits = Vec::new();
+    // Lines 0/1 are the description and a blank, so the button box occupies the
+    // three rows starting at line index 2.
+    let row_start = inner.y + 2;
+    let row_end = inner.y + 4;
+    let mut col = inner.x as usize + INDENT;
+    for (i, (label, inner_w, t)) in buttons.iter().enumerate() {
+        if i > 0 {
+            top.push(gap());
+            mid.push(gap());
+            bot.push(gap());
+            col += GAP;
+        }
+        let bar = "─".repeat(*inner_w);
+        top.push(Span::styled(format!("┌{bar}┐"), border));
+        mid.push(Span::styled("│".to_string(), border));
+        mid.push(Span::styled(label.clone(), label_style));
+        mid.push(Span::styled("│".to_string(), border));
+        bot.push(Span::styled(format!("└{bar}┘"), border));
+        let box_w = inner_w + 2;
+        hits.push(crate::app::CanvasTemplateHit {
+            col_start: col as u16,
+            col_end: (col + box_w) as u16,
+            row_start,
+            row_end,
+            template_id: t.id.clone(),
+            markdown: t.markdown.clone(),
+        });
+        col += box_w;
+    }
+
+    let lines = vec![
+        desc_line,
+        Line::from(""),
+        Line::from(top),
+        Line::from(mid),
+        Line::from(bot),
+        Line::from(""),
+        divider,
+        Line::from(""),
+        tip_line,
+    ];
+    (lines, hits)
+}
+
 fn render_canvas_popup_at(
     f: &mut Frame,
     app: &mut App,
@@ -7568,12 +7685,18 @@ fn render_canvas_popup_at(
     if let Some(shimmer) = canvas_run_shimmer(app, popup, now) {
         apply_canvas_shimmer(&mut lines, &shimmer, &app.theme);
     }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "Type Markdown here. Use @{session:id}, @{harness:codex}, or :::clip blocks.",
-            Style::default().fg(app.theme.dim),
-        )));
-    }
+    // Empty canvas: replace the bare body with a richer onboarding placeholder —
+    // a one-line description, clickable template buttons, a divider, and a tip.
+    // The button hitboxes are returned so the active canvas can publish them for
+    // the mouse handler. Non-empty canvases get no hits.
+    let placeholder_hits = if lines.is_empty() {
+        let (placeholder_lines, hits) =
+            canvas_empty_placeholder(&app.theme, &app.canvas_templates, inner);
+        lines = placeholder_lines;
+        hits
+    } else {
+        Vec::new()
+    };
     // Vertical scroll: the body can exceed `inner.height` wrapped rows. Clamp
     // the popup's stored offset to the current geometry (content edits or a
     // resize may have shrunk the scrollable range) and skip that many wrapped
@@ -7587,6 +7710,9 @@ fn render_canvas_popup_at(
         // Remember the live viewport so cursor-move handlers can keep the caret
         // visible on the next keystroke, and persist the clamped offset.
         app.layout.canvas_inner_area = Some(inner);
+        // Publish (or clear) the empty-state template buttons. Only the active
+        // canvas owns the hitboxes, so a click never targets an inactive split.
+        app.layout.canvas_template_hits = placeholder_hits;
         if let Some(real) = app.canvas_popup.as_mut() {
             real.scroll_offset = scroll_offset;
         }
@@ -9874,6 +10000,68 @@ mod tests {
     fn canvas_session_clip_hits_empty_without_clips() {
         let area = Rect::new(0, 0, 40, 4);
         assert!(canvas_session_clip_hits(None, "just prose, no clips", 0, area).is_empty());
+    }
+
+    fn placeholder_template(id: &str, name: &str) -> agentd_protocol::CanvasTemplate {
+        agentd_protocol::CanvasTemplate {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: None,
+            markdown: format!("# {name}\n"),
+            built_in: true,
+        }
+    }
+
+    #[test]
+    fn canvas_empty_placeholder_offers_clickable_template_buttons() {
+        let theme = crate::theme::Theme::default();
+        let templates = vec![
+            placeholder_template("blank", "Blank"),
+            placeholder_template("tasks", "Tasks"),
+            placeholder_template("investigation", "Investigation"),
+        ];
+        // Inner rect offset from origin to confirm hits use absolute coordinates.
+        let inner = Rect::new(2, 1, 76, 20);
+        let (lines, hits) = canvas_empty_placeholder(&theme, &templates, inner);
+
+        // Two buttons — "blank" is the empty state itself, so it's filtered out.
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].template_id, "tasks");
+        assert_eq!(hits[1].template_id, "investigation");
+        assert_eq!(hits[0].markdown, "# Tasks\n");
+
+        // Buttons occupy the three rows after the description + blank line, in the
+        // inner rect's coordinate space (rows 1+2 ..= 1+4).
+        assert_eq!(hits[0].row_start, inner.y + 2);
+        assert_eq!(hits[0].row_end, inner.y + 4);
+        assert!(hits[0].col_start >= inner.x);
+        // The button box label-row click lands inside the first button.
+        assert!(hits[0].contains(hits[0].col_start, hits[0].row_start + 1));
+        // The two buttons never overlap.
+        assert!(hits[0].col_end <= hits[1].col_start);
+        // No placeholder line exceeds the inner width, so nothing wraps and the
+        // absolute hit rows stay correct.
+        for line in &lines {
+            assert!(line.width() <= inner.width as usize);
+        }
+    }
+
+    #[test]
+    fn canvas_empty_placeholder_falls_back_when_narrow() {
+        let theme = crate::theme::Theme::default();
+        let templates = vec![placeholder_template("tasks", "Tasks")];
+        // Too narrow for an indented bordered button: plain description + tip only.
+        let (_, hits) = canvas_empty_placeholder(&theme, &templates, Rect::new(0, 0, 6, 20));
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn canvas_empty_placeholder_has_no_buttons_without_templates() {
+        let theme = crate::theme::Theme::default();
+        let (lines, hits) = canvas_empty_placeholder(&theme, &[], Rect::new(0, 0, 80, 20));
+        assert!(hits.is_empty());
+        // Still shows the description and tip prose.
+        assert!(!lines.is_empty());
     }
 
     #[test]

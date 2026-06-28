@@ -29,9 +29,59 @@ const PROJECT_MEMORY_TEMPLATE: &str =
     "# Project Memory\n\n## Overview\n\n## Architecture\n\n## Workflows\n\n## Decisions\n\n## Pitfalls\n";
 const CANVAS_REVISION_LIMIT: usize = 50;
 const BLANK_CANVAS: &str = "";
-const KANBAN_CANVAS: &str = "# Todo\n\n- \n\n# Progress\n\n# Done\n";
-const INVESTIGATION_CANVAS: &str =
-    "# Question\n\n\n# Context\n\n\n# Plan\n\n- \n\n# Findings\n\n\n# Done\n";
+const TASKS_CANVAS: &str = concat!(
+    "# Tasks\n",
+    "\n",
+    "Press Run (or select a section, then Run) to put the agent to work: it ",
+    "reads this board top to bottom, starts the unblocked Todo items, hands ",
+    "heavy or parallel work to subagents, moves cards into Progress, and records ",
+    "results under Done. Run again to keep it going.\n",
+    "\n",
+    "Aim a task at a worker with a smart clip — type @ to pick one. For example, ",
+    "@{harness:codex} runs a task with Codex, or embed an existing session to ",
+    "track and continue its work.\n",
+    "\n",
+    "## Todo\n",
+    "\n",
+    "- \n",
+    "\n",
+    "## Progress\n",
+    "\n",
+    "## Done\n",
+);
+const INVESTIGATION_CANVAS: &str = concat!(
+    "# Investigation\n",
+    "\n",
+    "Run this canvas to investigate autonomously: the agent works the Plan, ",
+    "gathers evidence into Findings, and keeps going until the Question is ",
+    "answered. Select a single step and Run to scope the work narrowly, or hand a ",
+    "sub-investigation to a subagent by naming a harness like @{harness:claude}.\n",
+    "\n",
+    "## Question\n",
+    "\n",
+    "The one thing you want answered — keep it specific.\n",
+    "\n",
+    "## Context\n",
+    "\n",
+    "What is already known and where to look. Type @ to embed a live session or ",
+    "a harness so the agent can follow it.\n",
+    "\n",
+    "## Plan\n",
+    "\n",
+    "The steps to answer the Question. The agent checks these off and adds new ",
+    "ones as it learns.\n",
+    "\n",
+    "- \n",
+    "\n",
+    "## Findings\n",
+    "\n",
+    "Evidence and conclusions as they emerge, each tied to the step that produced ",
+    "it.\n",
+    "\n",
+    "## Done\n",
+    "\n",
+    "Closed-out work and the final answer to the Question.\n",
+);
 
 #[derive(Debug, Default)]
 struct WidgetFrontmatter {
@@ -418,18 +468,20 @@ impl Storage {
                 built_in: true,
             },
             CanvasTemplate {
-                id: "kanban".to_string(),
-                name: "Kanban".to_string(),
+                id: "tasks".to_string(),
+                name: "Tasks".to_string(),
                 description: Some(
-                    "Todo, progress, and done sections for delegated work".to_string(),
+                    "Todo / Progress / Done board the agent runs and delegates".to_string(),
                 ),
-                markdown: KANBAN_CANVAS.to_string(),
+                markdown: TASKS_CANVAS.to_string(),
                 built_in: true,
             },
             CanvasTemplate {
                 id: "investigation".to_string(),
                 name: "Investigation".to_string(),
-                description: Some("Question, context, plan, findings, and done".to_string()),
+                description: Some(
+                    "Question, context, plan, findings, and done — run to investigate".to_string(),
+                ),
                 markdown: INVESTIGATION_CANVAS.to_string(),
                 built_in: true,
             },
@@ -1410,7 +1462,7 @@ mod canvas_tests {
         assert_eq!(review.description.as_deref(), Some("Review active work"));
         assert_eq!(review.markdown, "# Review\n");
         assert!(!review.built_in);
-        assert!(templates.iter().any(|t| t.id == "kanban" && t.built_in));
+        assert!(templates.iter().any(|t| t.id == "tasks" && t.built_in));
     }
 }
 

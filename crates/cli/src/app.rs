@@ -594,6 +594,31 @@ impl CanvasClipHit {
     }
 }
 
+/// A clickable template button drawn in the empty-canvas placeholder. The box
+/// spans `row_start..=row_end` (top border, label, bottom border) over the
+/// columns `col_start..col_end`; clicking anywhere inside fills the canvas with
+/// that template's Markdown. Republished every frame the active canvas is empty.
+#[derive(Debug, Clone)]
+pub struct CanvasTemplateHit {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub row_start: u16,
+    pub row_end: u16,
+    /// Template id persisted on the canvas document once applied.
+    pub template_id: String,
+    /// The template's Markdown, dropped straight into the buffer on click.
+    pub markdown: String,
+}
+
+impl CanvasTemplateHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row >= self.row_start
+            && row <= self.row_end
+            && col >= self.col_start
+            && col < self.col_end
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MatrixWidgetHitKind {
     Select { panel_id: String },
@@ -709,6 +734,10 @@ pub struct App {
     pub transcript_scroll: u16,
     pub minibuffer: Option<Minibuffer>,
     pub harnesses: Vec<HarnessInfo>,
+    /// Canvas templates offered as clickable buttons in the empty-canvas
+    /// placeholder. Fetched at startup and on reload (same cadence as
+    /// `harnesses`); rarely changes within a session.
+    pub canvas_templates: Vec<agentd_protocol::CanvasTemplate>,
     pub theme: crate::theme::Theme,
     pub help_visible: bool,
     pub profile: Profile,
@@ -1860,6 +1889,10 @@ pub struct LayoutSnapshot {
     /// Session smart-clip hitboxes in the active canvas body from the last
     /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
     pub canvas_clip_hits: Vec<CanvasClipHit>,
+    /// Template-button hitboxes drawn in the empty-canvas placeholder. Clicking
+    /// one fills the canvas with that template's Markdown. Empty unless the
+    /// active canvas is showing the empty-state placeholder.
+    pub canvas_template_hits: Vec<CanvasTemplateHit>,
     /// Bounds of the browser preview overlay rendered in the terminal view.
     pub browser_preview_area: Option<ratatui::layout::Rect>,
     /// Top-right close button bounds for the browser preview overlay: `(x_start, x_end, y)`.
@@ -2035,6 +2068,11 @@ async fn run_with_socket_initial_selection(
     let sessions = client.list().await.unwrap_or_default();
     let groups = client.list_projects().await.unwrap_or_default();
     let harnesses = client.harnesses().await.unwrap_or_default();
+    let canvas_templates = client
+        .canvas_templates()
+        .await
+        .map(|r| r.templates)
+        .unwrap_or_default();
     // Theme config is parsed now; the final palette (light vs dark) is resolved
     // after raw mode is on, once we can query the terminal background (OSC 11).
     let theme_config = crate::theme::ThemeConfig::load();
@@ -2123,6 +2161,7 @@ async fn run_with_socket_initial_selection(
         transcript_scroll: 0,
         minibuffer: None,
         harnesses,
+        canvas_templates,
         theme,
         help_visible: false,
         profile,
@@ -2787,6 +2826,11 @@ impl App {
         let sessions = client.list().await.unwrap_or_default();
         let groups = client.list_projects().await.unwrap_or_default();
         let harnesses = client.harnesses().await.unwrap_or_default();
+        let canvas_templates = client
+            .canvas_templates()
+            .await
+            .map(|r| r.templates)
+            .unwrap_or_default();
         let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
 
         self.client = client;
@@ -2795,6 +2839,9 @@ impl App {
         self.sessions = sessions;
         self.groups = groups;
         self.harnesses = harnesses;
+        if !canvas_templates.is_empty() {
+            self.canvas_templates = canvas_templates;
+        }
         // A daemon restart respawns every PTY session and truncates each
         // session's pty.log so the new child renders into a clean slate
         // (see Manager::respawn). But our in-memory terminal histories
@@ -7794,6 +7841,22 @@ impl App {
             }
             return true;
         }
+        // Clicking a template button in the empty-canvas placeholder fills the
+        // buffer with that template's Markdown — a starting point the user then
+        // edits. Checked before the generic cursor-placement handler so the
+        // click doesn't just move the caret.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(hit) = self
+                .layout
+                .canvas_template_hits
+                .iter()
+                .find(|hit| hit.contains(ev.column, ev.row))
+                .cloned()
+            {
+                self.apply_canvas_template(hit.template_id, hit.markdown);
+                return true;
+            }
+        }
         // Clicking a session smart-clip focuses that session, just like clicking
         // its row in the session list. The canvas follows selection, so the
         // clicked session's canvas reveals in place.
@@ -8616,6 +8679,31 @@ impl App {
         if !cut.is_empty() {
             self.copy_canvas_text(&cut, "cut");
         }
+    }
+
+    /// Fill an empty canvas from a placeholder template button. Replaces the
+    /// whole buffer (the placeholder only shows when the canvas is empty), records
+    /// an undo state so the user can back out, and stamps the document's
+    /// `template_id`. Persists on the normal save path (close / Run), exactly like
+    /// typed edits.
+    fn apply_canvas_template(&mut self, template_id: String, markdown: String) {
+        if self.canvas_popup.is_none() {
+            return;
+        }
+        self.push_canvas_undo_state();
+        let Some(popup) = self.canvas_popup.as_mut() else {
+            return;
+        };
+        popup.buffer = markdown;
+        popup.cursor = popup.buffer.chars().count();
+        popup.preferred_col = None;
+        popup.selection = None;
+        popup.smart_clip = None;
+        if !template_id.is_empty() {
+            popup.canvas.template_id = Some(template_id);
+        }
+        Self::update_canvas_smart_clip_after_cursor_move(popup);
+        self.follow_canvas_scroll();
     }
 
     fn insert_canvas_text(&mut self, text: &str) {
@@ -11652,6 +11740,7 @@ mod tests {
             canvas_selection_run_hit: None,
             canvas_inner_area: None,
             canvas_clip_hits: Vec::new(),
+            canvas_template_hits: Vec::new(),
             browser_preview_area: None,
             browser_preview_close: None,
             terminal_scrollbar: None,
@@ -11690,6 +11779,7 @@ mod tests {
             transcript_scroll: 0,
             minibuffer: None,
             harnesses: Vec::new(),
+            canvas_templates: Vec::new(),
             theme: crate::theme::Theme::default(),
             help_visible: false,
             profile: Profile::Emacs,
@@ -11904,6 +11994,45 @@ mod tests {
         app.focus = PaneFocus::List;
         app.select_session(target);
         assert_eq!(app.selection.session_id(), Some("s2"));
+    }
+
+    #[test]
+    fn canvas_template_hit_contains_spans_box_rows() {
+        let hit = CanvasTemplateHit {
+            col_start: 4,
+            col_end: 18,
+            row_start: 3,
+            row_end: 5,
+            template_id: "tasks".into(),
+            markdown: "# Todo\n".into(),
+        };
+        // Inside the box (any of its three rows) hits; the edges and outside miss.
+        assert!(hit.contains(4, 3));
+        assert!(hit.contains(10, 4));
+        assert!(hit.contains(17, 5));
+        assert!(!hit.contains(18, 4)); // col_end is exclusive
+        assert!(!hit.contains(10, 6)); // below the box
+        assert!(!hit.contains(3, 4)); // left of the box
+    }
+
+    #[tokio::test]
+    async fn canvas_template_button_fills_empty_buffer() {
+        let (mut app, _dir, _server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+
+        app.apply_canvas_template("tasks".into(), "# Todo\n\n# Done\n".into());
+
+        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "# Todo\n\n# Done\n");
+        // Cursor lands at the end of the inserted template.
+        assert_eq!(popup.cursor, "# Todo\n\n# Done\n".chars().count());
+        // The template id is stamped onto the document for persistence.
+        assert_eq!(popup.canvas.template_id.as_deref(), Some("tasks"));
+        // The prior (empty) state is recorded so the fill can be undone.
+        assert_eq!(popup.undo_stack.len(), 1);
+
+        app.undo_canvas_edit();
+        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "");
     }
 
     /// Clicking a clip that points at a session with no navigable list row —
