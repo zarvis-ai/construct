@@ -943,7 +943,7 @@ pub struct ProgramTemplate {
 
 /// Default reference link offered by built-in program templates and surfaced in
 /// the empty-state placeholder footer.
-pub const PROGRAM_DOCS_REFERENCE: &str = "https://github.com/zarvis-ai/agentd";
+pub const PROGRAM_DOCS_REFERENCE: &str = "https://github.com/zarvis-ai/construct";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProgramSmartClipDescriptor {
