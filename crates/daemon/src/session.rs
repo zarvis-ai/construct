@@ -3389,17 +3389,42 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Collect the ids of direct child subagent sessions parented under
+    /// `parent_id`. Used by [`archive`](Self::archive) and
+    /// [`delete`](Self::delete) to cascade onto a session's subagents instead
+    /// of leaving them as orphaned rows once their owner is gone.
+    async fn child_subagent_ids(&self, parent_id: &str) -> Vec<String> {
+        let sessions = self.sessions.read().await;
+        let mut ids = Vec::new();
+        for (sid, entry) in sessions.iter() {
+            let s = entry.summary.read().await;
+            if s.parent_session_id.as_deref() == Some(parent_id)
+                && matches!(s.kind, agentd_protocol::SessionKind::Subagent)
+            {
+                ids.push(sid.clone());
+            }
+        }
+        ids
+    }
+
     /// Archive a session: terminate its adapter (if any) but keep the
     /// transcript, worktree, and start params on disk so it can be restarted
     /// later. The session is marked `archived` (hidden from the list by
     /// default and skipped by startup auto-resume) and persisted. Archiving an
     /// already-terminal session just sets the flag. Reversed by `restart`,
     /// which clears `archived` and brings the session back to the active list.
+    ///
+    /// Cascades onto the session's subagents: archiving an owner archives the
+    /// child subagents it spawned (recursively), so they don't linger as
+    /// orphaned rows once their parent is gone.
     pub async fn archive(&self, id: &str) -> Result<()> {
         let entry = self
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        // Snapshot the child subagents before we start mutating state so a
+        // concurrently-finishing subagent can't slip out of the cascade.
+        let child_subagents = self.child_subagent_ids(id).await;
         // Record the archive intent before anything that can yield. Terminating
         // the adapter (below) makes its `drain_adapter` Closed handler fire on a
         // separate task and race this bookkeeping; that handler reads this flag
@@ -3447,12 +3472,29 @@ impl SessionManager {
                 let _ = tokio::time::timeout(Duration::from_secs(3), adapter.shutdown()).await;
             });
         }
+        // Cascade onto subagents. Recurses through each child's own `archive`,
+        // so nested subagents archive too. A failure on one child is logged but
+        // never aborts the rest or the parent archive.
+        for sid in &child_subagents {
+            if let Err(e) = Box::pin(self.archive(sid)).await {
+                tracing::warn!(
+                    parent = %id,
+                    subagent = %sid,
+                    error = %e,
+                    "subagent cascade-archive failed",
+                );
+            }
+        }
         Ok(())
     }
 
     /// Delete a session entirely: kill the adapter if still alive, remove the
     /// worktree (best effort), drop the on-disk record, evict from the live
     /// map, and broadcast a `session/deleted` notification.
+    ///
+    /// Cascades onto the session's subagents: deleting an owner deletes the
+    /// child subagents it spawned (recursively), so they don't linger as
+    /// orphaned rows once their parent is gone.
     pub async fn delete(&self, id: &str) -> Result<()> {
         // Pull out the entry so the in-memory map releases the Arc; the
         // entry itself stays alive via our local Arc until the function ends.
@@ -3461,6 +3503,11 @@ impl SessionManager {
             map.remove(id)
                 .ok_or_else(|| anyhow!("session not found: {}", id))?
         };
+
+        // Snapshot child subagents now (the parent is out of the map, the
+        // children are still in it) so a deleted owner takes its subagents with
+        // it instead of leaving them orphaned in the list.
+        let child_subagents = self.child_subagent_ids(id).await;
 
         // Tell the drain task and event handler not to write storage anymore
         // before we tear the adapter down (killing the adapter triggers a
@@ -3517,6 +3564,20 @@ impl SessionManager {
                 let _ = std::fs::remove_file(&mcp_path);
             }
         });
+
+        // Cascade onto subagents. Recurses through each child's own `delete`,
+        // so nested subagents are torn down too. A failure on one child is
+        // logged but never aborts the rest or the parent delete.
+        for sid in &child_subagents {
+            if let Err(e) = Box::pin(self.delete(sid)).await {
+                tracing::warn!(
+                    parent = %id,
+                    subagent = %sid,
+                    error = %e,
+                    "subagent cascade-delete failed",
+                );
+            }
+        }
 
         Ok(())
     }
@@ -4774,6 +4835,19 @@ mod tests {
         })
     }
 
+    /// A `SessionKind::Subagent` entry whose `parent_session_id` points at
+    /// `parent_id`, mirroring how `construct_subagent_create` links a child to
+    /// its owner.
+    async fn synthetic_subagent_entry(
+        id: &str,
+        parent_id: &str,
+        position: i64,
+    ) -> Arc<SessionEntry> {
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::Subagent, position);
+        entry.summary.write().await.parent_session_id = Some(parent_id.to_string());
+        entry
+    }
+
     #[tokio::test]
     async fn move_session_ignores_hidden_subagents_in_reorder_region() {
         use tempfile::tempdir;
@@ -5782,6 +5856,93 @@ mod tests {
                 cols: 132,
                 rows: 50
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_cascades_to_subagents() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // A user session owning two subagents, one of which itself owns a
+        // nested subagent. Deleting the owner must take all three with it.
+        mgr.sessions.write().await.insert(
+            "parent".into(),
+            synthetic_entry("parent", agentd_protocol::SessionKind::User, 0),
+        );
+        for (id, parent) in [("subA", "parent"), ("subB", "parent"), ("subA1", "subA")] {
+            let e = synthetic_subagent_entry(id, parent, 0).await;
+            mgr.sessions.write().await.insert(id.into(), e);
+        }
+        // An unrelated user session must survive the cascade untouched.
+        mgr.sessions.write().await.insert(
+            "other".into(),
+            synthetic_entry("other", agentd_protocol::SessionKind::User, 10),
+        );
+
+        mgr.delete("parent").await.expect("delete parent");
+
+        let ids: Vec<String> = mgr.list().await.into_iter().map(|s| s.id).collect();
+        assert!(!ids.contains(&"parent".to_string()), "parent must be deleted");
+        assert!(!ids.contains(&"subA".to_string()), "direct subagent must be deleted");
+        assert!(!ids.contains(&"subB".to_string()), "direct subagent must be deleted");
+        assert!(!ids.contains(&"subA1".to_string()), "nested subagent must be deleted");
+        assert!(
+            ids.contains(&"other".to_string()),
+            "unrelated session must survive the cascade",
+        );
+    }
+
+    #[tokio::test]
+    async fn archive_cascades_to_subagents() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "parent".into(),
+            synthetic_entry("parent", agentd_protocol::SessionKind::User, 0),
+        );
+        for (id, parent) in [("subA", "parent"), ("subA1", "subA")] {
+            let e = synthetic_subagent_entry(id, parent, 0).await;
+            mgr.sessions.write().await.insert(id.into(), e);
+        }
+        // A subagent owned by a *different* parent must not be archived.
+        mgr.sessions.write().await.insert(
+            "other".into(),
+            synthetic_subagent_entry("other", "someone-else", 10).await,
+        );
+
+        mgr.archive("parent").await.expect("archive parent");
+
+        // Archived sessions stay in the manager (unlike delete) but carry the
+        // archived flag — recursively, down to the nested subagent.
+        for id in ["parent", "subA", "subA1"] {
+            let entry = mgr.get_entry(id).await.expect("entry present");
+            assert!(
+                entry.summary.read().await.archived,
+                "{id} should be archived by the cascade",
+            );
+        }
+        let other = mgr.get_entry("other").await.expect("other present");
+        assert!(
+            !other.summary.read().await.archived,
+            "a subagent of a different parent must not be archived",
         );
     }
 

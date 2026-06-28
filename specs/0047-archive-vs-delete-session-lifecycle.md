@@ -29,6 +29,7 @@ Delete was previously the only way an agent could clear finished work, which for
 - The daemon's archive path returns immediately and performs adapter shutdown in the background; callers should treat archive as fire-and-forget state flip, not a blocking teardown.
 - Descriptions/help text for delete should keep steering callers toward archive when the intent is "tidy up, not destroy," so the destructive option is chosen deliberately.
 - Restore/un-archive (resuming an archived session) is a separate operation; today it exists in the daemon and is reachable by restarting the session. Exposing it as a first-class MCP/CLI verb is a natural follow-up but is not required for archive to be useful.
+- Both operations cascade onto the session's subagents (archive archives them, delete deletes them, recursively); see [0052-session-removal-cascades-to-subagents](0052-session-removal-cascades-to-subagents.md).
 
 ## Non-Goals
 
