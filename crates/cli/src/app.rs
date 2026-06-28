@@ -110,9 +110,10 @@ fn selection_is_valid_for_sessions(
 ) -> bool {
     match selection {
         Selection::None => true,
-        Selection::Session(id) => sessions
-            .iter()
-            .any(|s| s.id == *id && is_user_list_session(s)),
+        // A pane may hold any live session, not just ones with a list row: a
+        // canvas clip can point the main view at a subagent. Keep the pane as
+        // long as the session still exists; pruning only fires once it's gone.
+        Selection::Session(id) => sessions.iter().any(|s| s.id == *id),
         Selection::Group(id) => groups.iter().any(|g| g.id == *id),
         Selection::ArchivedRow(section) => match section {
             ArchiveSection::Ungrouped => sessions
@@ -4292,6 +4293,20 @@ impl App {
     }
 
     fn ensure_selection_valid(&mut self) {
+        // A session selection stays valid as long as the session still
+        // exists, even when it has no navigable list row — e.g. a subagent,
+        // which renders only as a child of its parent (and never at all when
+        // the parent is the hidden orchestrator) but is reachable through a
+        // canvas session clip. The main view can display any live session;
+        // the list simply won't highlight a row for it. Without this, clicking
+        // such a clip selects the session and the next session-list refresh
+        // would immediately revert the selection (popping the stashed canvas
+        // back open over the would-be target).
+        if let Selection::Session(id) = &self.selection {
+            if self.sessions.iter().any(|s| s.id == *id) {
+                return;
+            }
+        }
         let items = self.list_items();
         if items.iter().any(|it| it.matches(&self.selection)) {
             return;
@@ -7850,6 +7865,13 @@ impl App {
                 if self.sessions.iter().any(|s| s.id == session_id) {
                     self.focus = PaneFocus::List;
                     self.select_session(session_id);
+                    // Point the active window pane at the target too — the main
+                    // view renders from the pane's selection, not `self.selection`
+                    // directly (see `render_main_windows`). The list-row click and
+                    // the switch/new/fork paths all do this; without it the clip
+                    // updates the selection but the pane keeps rendering the old
+                    // session, so the switch never visibly lands.
+                    self.sync_active_window_selection();
                 }
                 return true;
             }
@@ -12013,6 +12035,83 @@ mod tests {
         assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "");
     }
 
+    /// Clicking a clip that points at a session with no navigable list row —
+    /// the canonical case being a subagent, which renders only as a child of
+    /// its parent (and never at all when the parent is the hidden
+    /// orchestrator) — must switch to it *persistently*. Two prior bugs made
+    /// it flicker back to the canvas: (1) the click never synced the active
+    /// window pane, so the main view kept rendering the old session, and
+    /// (2) the next `refresh_sessions → ensure_selection_valid` reverted the
+    /// selection because the subagent isn't in `list_items()`, which also
+    /// popped the stashed canvas back open.
+    #[tokio::test]
+    async fn canvas_clip_click_to_subagent_persists_across_refresh() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        // The orchestrator (the fleet dispatcher whose canvas holds the clips)
+        // is hidden from the list, so its subagent children never get a row.
+        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        orch.id = "orch".into();
+        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        sub.id = "sub1".into();
+        sub.parent_session_id = Some("orch".into());
+        app.sessions = vec![s1, orch, sub];
+        app.orchestrator_id = Some("orch".into());
+        // The canvas-owner session is selected and its canvas is open; the
+        // active window pane points at it (test_app's initial leaf is s1).
+        app.selection = Selection::Session("s1".into());
+        app.sync_active_window_selection();
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "see @{session:sub1}", 0));
+        // The subagent isn't reachable through the list at all.
+        assert!(
+            !app
+                .list_items()
+                .iter()
+                .any(|it| it.matches(&Selection::Session("sub1".into()))),
+            "subagent must not have a navigable list row"
+        );
+
+        // Geometry the last canvas render would have captured: a modal area
+        // and a clip hit for the subagent.
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.canvas_clip_hits = vec![CanvasClipHit {
+            col_start: 4,
+            col_end: 16,
+            row: 3,
+            session_id: "sub1".into(),
+        }];
+
+        // Click the clip.
+        let consumed = app
+            .handle_canvas_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+            .await;
+        assert!(consumed, "clip click is handled by the canvas mouse router");
+        assert_eq!(app.selection.session_id(), Some("sub1"));
+        // The active window pane drives the main view; it must point at the
+        // target, or the click wouldn't actually reveal the session.
+        assert_eq!(
+            app.selection_for_window(app.active_window_id)
+                .and_then(|s| s.session_id().map(str::to_string)),
+            Some("sub1".to_string()),
+            "active window pane must follow the clicked clip"
+        );
+
+        // A session-list refresh re-validates the selection. The subagent has
+        // no list row, but it still exists — the selection must survive.
+        app.ensure_selection_valid();
+        assert_eq!(
+            app.selection.session_id(),
+            Some("sub1"),
+            "subagent clip selection must persist across a session refresh"
+        );
+    }
+
     #[tokio::test]
     async fn canvas_c_l_centers_cursor_row_in_viewport() {
         let (mut app, _dir, _server) = empty_app().await;
@@ -12941,11 +13040,12 @@ mod tests {
         server.abort();
     }
 
-    /// The canvas session-actions button must reuse the session chat view's
-    /// geometry AND styling: same `view_close_button_range` slot, painted in
-    /// the shared `matrix_close` color rather than the canvas accent.
+    /// The canvas session-actions button reuses the session chat view's
+    /// geometry — the same `view_close_button_range` slot — but as of #556 it
+    /// paints in the canvas border color (`accent_alt`) so the ☰ reads as part
+    /// of the canvas frame, not in the shared session-view `matrix_close` hue.
     #[tokio::test]
-    async fn canvas_title_actions_matches_session_view_styling() {
+    async fn canvas_title_actions_reuse_session_geometry_in_canvas_border_color() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
@@ -12954,7 +13054,9 @@ mod tests {
         app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
         app.canvas_popup.as_mut().unwrap().revealed_at =
             Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
-        let matrix_close = app.theme.matrix_close;
+        // Canvas border color (#556): `canvas_border_style` paints the frame in
+        // `accent_alt`, and the render path passes that hue through to the ☰.
+        let canvas_border_color = app.theme.accent_alt;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
@@ -12975,8 +13077,8 @@ mod tests {
             .expect("hamburger glyph paints in its range");
         assert_eq!(
             glyph_cell.style().fg,
-            Some(matrix_close),
-            "canvas action glyph should use the shared session-view action color"
+            Some(canvas_border_color),
+            "canvas action glyph should use the canvas border color (#556)"
         );
         server.abort();
     }
@@ -14429,6 +14531,46 @@ mod tests {
             glyph, "b",
             "computed cursor ({row}, {col}) should sit on painted wrapped list content"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_cursor_advances_when_space_appended_to_list_item() {
+        let (app, _dir, server) = empty_app().await;
+        let width = 40u16;
+
+        // A bullet line and the same line after a trailing space is typed at the
+        // end. The buffer offset moves by one char, so the rendered cursor column
+        // must move by one too — otherwise the caret desyncs from the edit point.
+        let before = "* foo";
+        let after = "* foo ";
+        let (_, col_before) = crate::ui::canvas_cursor_visual_pos(
+            Some(&app),
+            before,
+            before.chars().count(),
+            width as usize,
+        );
+        let (_, col_after) = crate::ui::canvas_cursor_visual_pos(
+            Some(&app),
+            after,
+            after.chars().count(),
+            width as usize,
+        );
+
+        assert_eq!(
+            col_after,
+            col_before + 1,
+            "appending a trailing space to a list item must advance the cursor column by one"
+        );
+
+        // The cursor must also land exactly at the painted end of the rendered
+        // bullet line ("  • foo ", 8 wide), with no gap between the text and the
+        // caret — i.e. the trailing space is actually rendered.
+        assert_eq!(
+            col_after, 8,
+            "cursor should sit immediately after the rendered trailing space"
+        );
+
         server.abort();
     }
 

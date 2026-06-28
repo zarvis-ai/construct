@@ -79,7 +79,7 @@ pub fn catalog() -> Vec<Value> {
         // ----- Write -----
         tool(
             "construct_canvas_edit",
-            "PREFERRED for changing a session's canvas: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST canvas content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_canvas_get and retry. Agent edits need no user confirmation. Set `shimmer: true` on an individual edit to keep the block(s) it touches in shimmer animation after the edit — useful during a planning pass to mark blocks as queued for a subagent while immediately clearing shimmer on blocks that need no work.",
+            "PREFERRED for changing a session's canvas: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST canvas content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_canvas_get and retry. Agent edits need no user confirmation. Set `shimmer: true` on an individual edit to keep the block(s) it touches in shimmer animation after the edit — shimmer means the block's work is still pending in this run (queued, in progress, or not yet done) regardless of how it runs. Useful during a planning pass to keep pending blocks shimmering while immediately clearing shimmer on blocks that need no work.",
             json!({
                 "type": "object",
                 "properties": {
@@ -93,7 +93,7 @@ pub fn catalog() -> Vec<Value> {
                                 "old_string": { "type": "string" },
                                 "new_string": { "type": "string" },
                                 "replace_all": { "type": "boolean" },
-                                "shimmer": { "type": "boolean", "description": "Keep the edited block in shimmer after this edit (e.g. block is queued for a subagent)" }
+                                "shimmer": { "type": "boolean", "description": "Keep the edited block shimmering after this edit because its work is still pending (queued, in progress, or not yet done, regardless of how it runs); omit once the block is settled" }
                             },
                             "required": ["old_string", "new_string"]
                         }
@@ -195,6 +195,14 @@ pub fn catalog() -> Vec<Value> {
         tool(
             "construct_delete_session",
             "Delete a session entirely: kill if running, remove transcript, worktree, and metadata from disk.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
+            "construct_archive_session",
+            "Archive a session (soft, reversible): terminate its adapter and hide it from the \
+             session list, but KEEP its transcript and worktree on disk. Unlike delete_session, \
+             nothing is removed and the session can be restarted later. Prefer this over \
+             delete_session when you want to tidy up finished sessions without losing their history.",
             schema_obj(&[("session_id", "string", true)]),
         ),
         tool(
@@ -304,6 +312,13 @@ pub fn catalog() -> Vec<Value> {
         tool(
             "construct_subagent_delete",
             "Delete a subagent owned by the current session.",
+            schema_obj(&[("subagent_id", "string", true)]),
+        ),
+        tool(
+            "construct_subagent_archive",
+            "Archive a subagent owned by the current session (soft, reversible): terminate it but \
+             KEEP its transcript and worktree. Unlike subagent_delete, nothing is wiped and it can \
+             be restarted later. Use this to tidy up finished subagents without losing their work.",
             schema_obj(&[("subagent_id", "string", true)]),
         ),
     ];
@@ -558,6 +573,10 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             client.delete(&arg_str(&args, "session_id")?).await?;
             json!({ "ok": true })
         }
+        "construct_archive_session" => {
+            client.archive(&arg_str(&args, "session_id")?).await?;
+            json!({ "ok": true })
+        }
         "construct_pin_session" => {
             let sid = arg_str(&args, "session_id")?;
             let pinned = args
@@ -703,6 +722,12 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             client.delete(&sid).await?;
             json!({ "ok": true })
         }
+        "construct_subagent_archive" => {
+            let sid = arg_str(&args, "subagent_id")?;
+            owned_subagent_detail(client, session_id, &sid).await?;
+            client.archive(&sid).await?;
+            json!({ "ok": true })
+        }
         "webui_hot_reload" => {
             let dir = args.get("dir").and_then(|v| v.as_str()).map(String::from);
             let res = client.dev_set_assets(dir).await?;
@@ -844,7 +869,25 @@ mod tests {
             "construct_subagent_enqueue",
             "construct_subagent_cancel",
             "construct_subagent_delete",
+            "construct_subagent_archive",
         ] {
+            assert!(names.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn catalog_includes_session_lifecycle_tools() {
+        let names: std::collections::HashSet<String> = catalog()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(|name| name.as_str())
+                    .map(|name| name.to_string())
+            })
+            .collect();
+
+        // Archive is the soft/reversible sibling of delete; both must be advertised.
+        for expected in ["construct_delete_session", "construct_archive_session"] {
             assert!(names.contains(expected), "missing {expected}");
         }
     }
@@ -966,6 +1009,16 @@ mod tests {
                         );
                         json!(null)
                     }
+                    ipc_method::SESSION_ARCHIVE => {
+                        assert_eq!(
+                            params.get("session_id").and_then(|s| s.as_str()),
+                            Some("ssub")
+                        );
+                        // Archive is soft: flip the flag, keep the record + events.
+                        created.archived = true;
+                        created.state = SessionState::Done;
+                        json!(null)
+                    }
                     ipc_method::SESSION_DELETE => {
                         assert_eq!(
                             params.get("session_id").and_then(|s| s.as_str()),
@@ -1028,6 +1081,27 @@ mod tests {
             json!({ "subagent_id": "ssub" }),
         )
         .await;
+
+        // Archive is the soft, reversible counterpart of delete: it flips the
+        // `archived` flag on the daemon side but leaves the record + transcript
+        // in place. A peek afterwards still returns the subagent and its events.
+        call_tool(
+            &client,
+            Some("sparent"),
+            "construct_subagent_archive",
+            json!({ "subagent_id": "ssub" }),
+        )
+        .await;
+        let after_archive = call_tool(
+            &client,
+            Some("sparent"),
+            "construct_subagent_peek",
+            json!({ "subagent_id": "ssub" }),
+        )
+        .await;
+        assert_eq!(after_archive["summary"]["archived"], true);
+        assert_eq!(after_archive["events"][0]["event"]["text"], "done");
+
         call_tool(
             &client,
             Some("sparent"),
