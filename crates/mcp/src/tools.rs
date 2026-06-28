@@ -79,7 +79,7 @@ pub fn catalog() -> Vec<Value> {
         // ----- Write -----
         tool(
             "construct_canvas_edit",
-            "PREFERRED for changing a session's canvas: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST canvas content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_canvas_get and retry. Agent edits need no user confirmation. Set `shimmer: true` on an individual edit to keep the block(s) it touches in shimmer animation after the edit — useful during a planning pass to mark blocks as queued for a subagent while immediately clearing shimmer on blocks that need no work.",
+            "PREFERRED for changing a session's canvas: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST canvas content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_canvas_get and retry. Agent edits need no user confirmation. Set `shimmer: true` on an individual edit to keep the block(s) it touches in shimmer animation after the edit — shimmer means the block's work is still pending in this run (queued for a subagent, in progress, or not yet done). Useful during a planning pass to keep pending blocks shimmering while immediately clearing shimmer on blocks that need no work.",
             json!({
                 "type": "object",
                 "properties": {
@@ -93,7 +93,7 @@ pub fn catalog() -> Vec<Value> {
                                 "old_string": { "type": "string" },
                                 "new_string": { "type": "string" },
                                 "replace_all": { "type": "boolean" },
-                                "shimmer": { "type": "boolean", "description": "Keep the edited block in shimmer after this edit (e.g. block is queued for a subagent)" }
+                                "shimmer": { "type": "boolean", "description": "Keep the edited block shimmering after this edit because its work is still pending (queued for a subagent, in progress, or not yet done); omit once the block is settled" }
                             },
                             "required": ["old_string", "new_string"]
                         }
