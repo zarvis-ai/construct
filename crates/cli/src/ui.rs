@@ -2905,6 +2905,7 @@ fn apply_pane_title_right_cluster<'a>(
     show_close: bool,
     session_actions: bool,
     focused: bool,
+    menu_icon_color: Color,
     mut block: Block<'a>,
 ) -> Block<'a> {
     // Harness name right-aligned on the top border so it visually detaches from
@@ -2939,9 +2940,10 @@ fn apply_pane_title_right_cluster<'a>(
     // over it — the click handlers in `app.rs` mirror the same
     // `view_close_button_range` geometry. When the pane is unfocused the glyph
     // dims to match the unfocused title-bar border, so an inactive pane's menu
-    // icon no longer reads at full brightness.
+    // icon no longer reads at full brightness. `menu_icon_color` sets the base
+    // hue (canvas view passes its border color so the ☰ matches the frame).
     let close_hovered = show_close && hovered_view_close_button(app, area);
-    let close_style = session_menu_icon_style(&app.theme, close_hovered, focused);
+    let close_style = session_menu_icon_style(&app.theme, menu_icon_color, close_hovered, focused);
     let close_label = if session_actions { " ☰ " } else { " x " };
     let close = Line::from(Span::styled(close_label, close_style))
         .alignment(ratatui::layout::Alignment::Right);
@@ -2962,14 +2964,16 @@ fn apply_pane_title_right_cluster<'a>(
 /// canvas view via `apply_pane_title_right_cluster`).
 ///
 /// Hover wins: the glyph bolds in themed text color when the cursor is over it.
-/// Otherwise it paints in `matrix_close`, but dims (`Modifier::DIM`) when the
-/// pane is unfocused so it tracks the unfocused title-bar border instead of
-/// staying at full brightness on an inactive pane.
-fn session_menu_icon_style(theme: &Theme, hovered: bool, focused: bool) -> Style {
+/// Otherwise it paints in `base` — the chat/PTY session view passes
+/// `matrix_close`; the canvas view passes its border color so the icon reads as
+/// part of the canvas frame instead of as a separately-hued badge. Either way it
+/// dims (`Modifier::DIM`) when the pane is unfocused so it tracks the unfocused
+/// title-bar border instead of staying at full brightness on an inactive pane.
+fn session_menu_icon_style(theme: &Theme, base: Color, hovered: bool, focused: bool) -> Style {
     if hovered {
         Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
     } else {
-        let style = Style::default().fg(theme.matrix_close);
+        let style = Style::default().fg(base);
         if focused {
             style
         } else {
@@ -3099,6 +3103,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title);
+    let menu_icon_color = app.theme.matrix_close;
     let block = apply_pane_title_right_cluster(
         app,
         area,
@@ -3107,6 +3112,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         show_close,
         true,
         focused,
+        menu_icon_color,
         block,
     );
     let inner = block.inner(area);
@@ -7509,6 +7515,12 @@ fn render_canvas_popup_at(
     let title_toggle_hit = canvas_title_toggle_button_range(summary_ref, rect);
 
     let border_style = canvas_border_style(&app.theme, active);
+    // The session-actions ☰ icon should read as part of the canvas frame, so its
+    // base hue tracks the canvas border color (accent_alt) rather than the
+    // default session-view close color. Focus dimming + hover still compose via
+    // `session_menu_icon_style` (focused → border hue, unfocused → dimmed, hover
+    // wins).
+    let menu_icon_color = border_style.fg.unwrap_or(app.theme.accent_alt);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -7521,6 +7533,7 @@ fn render_canvas_popup_at(
         show_close,
         true,
         active,
+        menu_icon_color,
         block,
     );
     if active {
@@ -8691,6 +8704,32 @@ fn canvas_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
     starts
 }
 
+/// For a markdown list-item line, return `(leading_indent_chars, content)` where
+/// `content` is the text after the `- `/`* ` marker WITH its trailing whitespace
+/// preserved, or `None` when the line isn't a bullet. Detection matches the
+/// renderer (a fully-trimmed `* `/`- ` prefix, so a lone "* " with no content
+/// yet stays literal), but the returned content is sliced from the raw line so a
+/// trailing space the user just typed survives — `raw.trim()` would drop it,
+/// stranding the cursor at the end of the line because the rendered glyphs and
+/// the cursor column would then disagree on the line's width.
+fn canvas_list_item_content(raw: &str) -> Option<(usize, &str)> {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))?;
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    let after_indent = raw
+        .char_indices()
+        .nth(leading)
+        .map(|(idx, _)| &raw[idx..])
+        .unwrap_or("");
+    let rest = after_indent
+        .strip_prefix("- ")
+        .or_else(|| after_indent.strip_prefix("* "))
+        .unwrap_or(after_indent);
+    Some((leading, rest))
+}
+
 /// The plain text the canvas body paints for one logical markdown line, before
 /// ratatui word-wraps it. Mirrors the per-line transformation in
 /// [`render_canvas_markdown_lines`] / [`canvas_visual_col_for_line`] — kept
@@ -8704,10 +8743,7 @@ fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
         String::new()
     } else if canvas_heading_level(trimmed).is_some() {
         canvas_inline_rendered_text(app, trimmed)
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
+    } else if let Some((_, rest)) = canvas_list_item_content(raw) {
         format!(
             "{}  • {}",
             " ".repeat(leading),
@@ -8931,15 +8967,13 @@ fn canvas_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> u
     let col = raw_col.saturating_sub(leading);
     if canvas_heading_level(trimmed).is_some() {
         canvas_inline_visual_width(app, trimmed, col)
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
+    } else if let Some((_, rest)) = canvas_list_item_content(raw) {
         // Mirror the proportional indent rendered for nested bullets: the bullet
         // glyph and text sit `leading` columns further right than a top-level
-        // item, so the cursor column must account for the same offset.
-        let prefix = trimmed.chars().count() - rest.chars().count();
-        leading + 4 + canvas_inline_visual_width(app, rest, col.saturating_sub(prefix))
+        // item, so the cursor column must account for the same offset. The `- `/
+        // `* ` marker is always two chars; the rendered `  • ` prefix is 4 wide.
+        // `rest` keeps any trailing space so the column advances past it.
+        leading + 4 + canvas_inline_visual_width(app, rest, col.saturating_sub(2))
     } else if raw_col <= leading {
         raw_col
     } else {
@@ -9021,13 +9055,12 @@ fn render_canvas_markdown_lines<'a>(
                 search_matches,
                 search_selected,
             ));
-        } else if let Some(rest) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
+        } else if let Some((_, rest)) = canvas_list_item_content(raw) {
             // Nesting is encoded as leading spaces on the source line; render it
             // as proportional indentation before the bullet so deeper items sit
-            // visibly further right than their parents.
+            // visibly further right than their parents. `rest` keeps any trailing
+            // whitespace so a space typed at the end of the bullet paints a cell
+            // for the cursor to land on.
             let bullet = format!("{}  • ", " ".repeat(leading));
             let mut spans = vec![Span::styled(bullet, Style::default().fg(app.theme.accent))];
             spans.extend(render_canvas_inline_spans(
@@ -10164,12 +10197,14 @@ mod tests {
         // the canvas view via `apply_pane_title_right_cluster`. When the pane is
         // focused it stays at full brightness; when unfocused it dims to match
         // the unfocused title-bar border. Hover always wins regardless of focus.
+        // The chat/PTY session view passes `matrix_close` as the base hue.
         let theme = Theme::default();
+        let base = theme.matrix_close;
 
-        let focused = session_menu_icon_style(&theme, false, true);
-        let unfocused = session_menu_icon_style(&theme, false, false);
-        let hovered_focused = session_menu_icon_style(&theme, true, true);
-        let hovered_unfocused = session_menu_icon_style(&theme, true, false);
+        let focused = session_menu_icon_style(&theme, base, false, true);
+        let unfocused = session_menu_icon_style(&theme, base, false, false);
+        let hovered_focused = session_menu_icon_style(&theme, base, true, true);
+        let hovered_unfocused = session_menu_icon_style(&theme, base, true, false);
 
         // Same base color whether focused or not — only brightness changes.
         assert_eq!(focused.fg, Some(theme.matrix_close));
@@ -10191,6 +10226,51 @@ mod tests {
             assert!(hovered.add_modifier.contains(Modifier::BOLD));
             assert!(!hovered.add_modifier.contains(Modifier::DIM));
         }
+    }
+
+    #[test]
+    fn canvas_title_menu_icon_matches_canvas_border_color() {
+        // In the CANVAS view's title bar the session-actions ☰ glyph should be
+        // drawn in the canvas border color (the cyan accent the canvas frame
+        // uses) rather than the default chat/PTY session-view close hue. The
+        // unfocused-dim and hover behavior from #551 must still compose: focused
+        // → border hue, unfocused → border hue + DIM, hover → bold themed text.
+        let theme = Theme::default();
+
+        // Derive the base hue the same way the canvas render path does, so the
+        // icon can't drift from the border color it's meant to match.
+        let focused_border = canvas_border_style(&theme, true);
+        let unfocused_border = canvas_border_style(&theme, false);
+        let base = focused_border.fg.unwrap_or(theme.accent_alt);
+
+        // The base IS the canvas border color, and it's distinct from the
+        // session-view default (matrix_close) — otherwise this would be a no-op.
+        assert_eq!(Some(base), focused_border.fg);
+        assert_eq!(
+            focused_border.fg, unfocused_border.fg,
+            "canvas border hue is focus-independent"
+        );
+        assert_ne!(
+            base, theme.matrix_close,
+            "canvas icon must not reuse the session-view close hue"
+        );
+
+        let focused = session_menu_icon_style(&theme, base, false, true);
+        let unfocused = session_menu_icon_style(&theme, base, false, false);
+        let hovered = session_menu_icon_style(&theme, base, true, true);
+
+        // Focused: canvas border hue at full brightness (matches the frame).
+        assert_eq!(focused.fg, focused_border.fg);
+        assert!(!focused.add_modifier.contains(Modifier::DIM));
+
+        // Unfocused: same hue, dimmed (tracks the dimmed canvas border).
+        assert_eq!(unfocused.fg, focused_border.fg);
+        assert!(unfocused.add_modifier.contains(Modifier::DIM));
+
+        // Hover still wins: bold themed text, never the border hue, never dimmed.
+        assert_eq!(hovered.fg, Some(theme.text));
+        assert!(hovered.add_modifier.contains(Modifier::BOLD));
+        assert!(!hovered.add_modifier.contains(Modifier::DIM));
     }
 
     #[test]
