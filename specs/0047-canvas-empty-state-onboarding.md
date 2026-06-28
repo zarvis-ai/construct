@@ -35,7 +35,7 @@ This spec does not define a full template gallery, template management/editing U
 
 ## Examples
 
-- Opening a fresh canvas shows the description, two bordered template buttons (e.g. Kanban and Investigation), a divider, and a tip.
-- Clicking the Kanban button replaces the empty body with the Kanban template's Markdown, places the cursor at the end, and the placeholder vanishes; `C-/` undoes back to the empty state.
+- Opening a fresh canvas shows the description, two bordered template buttons (e.g. Tasks and Investigation), a divider, and a tip.
+- Clicking the Tasks button replaces the empty body with the Tasks template's Markdown, places the cursor at the end, and the placeholder vanishes; `C-/` undoes back to the empty state.
 - Deleting all canvas content brings the placeholder back.
 - On a very narrow canvas, the same canvas shows only the description and tip, with no buttons.

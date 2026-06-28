@@ -11981,7 +11981,7 @@ mod tests {
             col_end: 18,
             row_start: 3,
             row_end: 5,
-            template_id: "kanban".into(),
+            template_id: "tasks".into(),
             markdown: "# Todo\n".into(),
         };
         // Inside the box (any of its three rows) hits; the edges and outside miss.
@@ -11998,14 +11998,14 @@ mod tests {
         let (mut app, _dir, _server) = empty_app().await;
         app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
 
-        app.apply_canvas_template("kanban".into(), "# Todo\n\n# Done\n".into());
+        app.apply_canvas_template("tasks".into(), "# Todo\n\n# Done\n".into());
 
         let popup = app.canvas_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "# Todo\n\n# Done\n");
         // Cursor lands at the end of the inserted template.
         assert_eq!(popup.cursor, "# Todo\n\n# Done\n".chars().count());
         // The template id is stamped onto the document for persistence.
-        assert_eq!(popup.canvas.template_id.as_deref(), Some("kanban"));
+        assert_eq!(popup.canvas.template_id.as_deref(), Some("tasks"));
         // The prior (empty) state is recorded so the fill can be undone.
         assert_eq!(popup.undo_stack.len(), 1);
 

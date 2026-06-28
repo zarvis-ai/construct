@@ -9984,7 +9984,7 @@ mod tests {
         let theme = crate::theme::Theme::default();
         let templates = vec![
             placeholder_template("blank", "Blank"),
-            placeholder_template("kanban", "Kanban"),
+            placeholder_template("tasks", "Tasks"),
             placeholder_template("investigation", "Investigation"),
         ];
         // Inner rect offset from origin to confirm hits use absolute coordinates.
@@ -9993,9 +9993,9 @@ mod tests {
 
         // Two buttons — "blank" is the empty state itself, so it's filtered out.
         assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].template_id, "kanban");
+        assert_eq!(hits[0].template_id, "tasks");
         assert_eq!(hits[1].template_id, "investigation");
-        assert_eq!(hits[0].markdown, "# Kanban\n");
+        assert_eq!(hits[0].markdown, "# Tasks\n");
 
         // Buttons occupy the three rows after the description + blank line, in the
         // inner rect's coordinate space (rows 1+2 ..= 1+4).
@@ -10016,7 +10016,7 @@ mod tests {
     #[test]
     fn canvas_empty_placeholder_falls_back_when_narrow() {
         let theme = crate::theme::Theme::default();
-        let templates = vec![placeholder_template("kanban", "Kanban")];
+        let templates = vec![placeholder_template("tasks", "Tasks")];
         // Too narrow for an indented bordered button: plain description + tip only.
         let (_, hits) = canvas_empty_placeholder(&theme, &templates, Rect::new(0, 0, 6, 20));
         assert!(hits.is_empty());
