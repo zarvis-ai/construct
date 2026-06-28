@@ -12836,12 +12836,12 @@ mod tests {
             .expect("canvas hover card should render");
         let text = rendered_text(term.backend().buffer());
         assert!(
-            text.contains("session output"),
-            "preview card should include hover label"
-        );
-        assert!(
             text.contains("SESS_PREVIEW_"),
             "session output preview should include session marker"
+        );
+        assert!(
+            !text.contains("session output"),
+            "preview card should not include the old hover label"
         );
         server.abort();
     }

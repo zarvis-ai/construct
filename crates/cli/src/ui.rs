@@ -31,8 +31,7 @@ const MATRIX_WALLPAPER_DIM: f32 = 0.22;
 const PREVIEW_REVEAL_SECS: f32 = 1.0;
 const CANVAS_REVEAL_SECS: f32 = CANVAS_REVEAL_MS as f32 / 1000.0;
 const CANVAS_RUN_BUTTON: &str = " ▶ ";
-const CANVAS_CLIP_HOVER_PREVIEW_ROWS: u16 = 4;
-const CANVAS_CLIP_HOVER_PREVIEW_LABEL: &str = " session output ";
+const CANVAS_CLIP_HOVER_PREVIEW_ROWS: u16 = 8;
 /// How long the canvas shimmer-text preview lingers after the pointer stops
 /// moving before it self-dismisses. The clip-chip preview, by contrast, stays
 /// up for as long as the chip is hovered.
@@ -7624,20 +7623,9 @@ fn render_canvas_clip_hover(f: &mut Frame, app: &mut App, modal: Rect) {
 
 /// Lay out the floating session hover card so it reads as a landscape tile: its
 /// width always exceeds its height when the available `max_w` allows. Returns
-/// `(width, height)` including borders. `line_count` is the number of text rows
-/// (which already includes the preview label + spacer when `has_preview`).
-fn session_hover_card_size(
-    content_w: u16,
-    line_count: u16,
-    has_preview: bool,
-    max_w: u16,
-) -> (u16, u16) {
-    let preview = if has_preview {
-        CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1)
-    } else {
-        0
-    };
-    let height = line_count.saturating_add(2).saturating_add(preview);
+/// `(width, height)` including borders.
+fn session_hover_card_size(content_w: u16, content_h: u16, max_w: u16) -> (u16, u16) {
+    let height = content_h.saturating_add(2);
     let cap = max_w.max(3);
     let base = content_w.saturating_add(2).clamp(3, cap);
     // Force landscape: at least one column wider than the card is tall, bounded
@@ -7647,12 +7635,11 @@ fn session_hover_card_size(
     (width, height)
 }
 
-/// Render the floating session hover card — glyph + name, harness · model,
-/// status, last prompt, and a live tail of the session's PTY output — anchored
-/// just below `(anchor_col, anchor_row)` (or above it when there's no room) and
-/// kept inside `modal`. Clears its own area so it overlays the canvas body
-/// without disturbing it. Shared by the clip-chip hover and the shimmer-text
-/// hover; always laid out wider than it is tall.
+/// Render the floating session hover card — a live tail of the session's PTY
+/// output — anchored just below `(anchor_col, anchor_row)` (or above it when
+/// there's no room) and kept inside `modal`. Clears its own area so it overlays
+/// the canvas body without disturbing it. Shared by the clip-chip hover and the
+/// shimmer-text hover; always laid out wider than it is tall.
 fn render_session_hover_card(
     f: &mut Frame,
     app: &mut App,
@@ -7661,76 +7648,25 @@ fn render_session_hover_card(
     anchor_col: u16,
     anchor_row: u16,
 ) {
-    let Some(s) = app.sessions.iter().find(|s| s.id == session_id) else {
+    let Some(_s) = app.sessions.iter().find(|s| s.id == session_id) else {
         return;
     };
 
-    let glyph_style = state_style(&app.theme, s.state);
-    let mut lines: Vec<Line> = vec![
-        Line::from(vec![
-            Span::styled(format!("{} ", s.state.glyph()), glyph_style),
-            Span::styled(
-                primary_label(s),
-                Style::default()
-                    .fg(app.theme.text)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!(
-                "{} · {}",
-                harness_label(s),
-                s.model.as_deref().unwrap_or("—")
-            ),
-            Style::default().fg(app.theme.dim),
-        )),
-        Line::from(Span::styled(s.state.label(), glyph_style)),
-    ];
-    if let Some(prompt) = s
-        .last_prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-    {
-        let one_line: String = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-        lines.push(Line::from(Span::styled(
-            one_line,
-            Style::default().fg(app.theme.muted),
-        )));
-    }
-
-    // A wider cap than the clip card used to use so the live output reads as a
-    // landscape strip. The PTY tail is replayed at the modal width and clipped
-    // into the (narrower) card by `render_pty_tail`.
-    let max_w = modal.width.saturating_sub(2).clamp(1, 64);
-    let mut preview_output = app
+    let max_w = modal.width.saturating_sub(2).clamp(1, 128);
+    let preview_output = app
         .histories
         .get_mut(session_id)
         .map(|history| history.replay(max_w.max(1), CANVAS_CLIP_HOVER_PREVIEW_ROWS, 0));
-    let has_preview = match preview_output {
-        Some(ref out) => non_empty_row_span(out.screen) > 0,
-        None => false,
+    let Some(out) = preview_output else {
+        return;
     };
-    if has_preview {
-        lines.push(Line::from(Span::styled(
-            CANVAS_CLIP_HOVER_PREVIEW_LABEL,
-            Style::default().fg(app.theme.text).add_modifier(Modifier::DIM),
-        )));
-        lines.push(Line::from(""));
+    if non_empty_row_span(out.screen) == 0 {
+        return;
     }
 
-    let content_w = lines
-        .iter()
-        .map(|l| {
-            l.spans
-                .iter()
-                .map(|sp| UnicodeWidthStr::width(sp.content.as_ref()))
-                .sum::<usize>() as u16
-        })
-        .max()
-        .unwrap_or(0);
-    let (width, height) =
-        session_hover_card_size(content_w, lines.len() as u16, has_preview, max_w);
+    let content_w = max_w;
+    let content_h = CANVAS_CLIP_HOVER_PREVIEW_ROWS;
+    let (width, height) = session_hover_card_size(content_w, content_h, max_w);
     if modal.height < height || modal.width < width {
         return;
     }
@@ -7759,13 +7695,7 @@ fn render_session_hover_card(
     f.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.accent_alt))
-            .title(Span::styled(
-                " session ",
-                Style::default()
-                    .fg(app.theme.accent_alt)
-                    .add_modifier(Modifier::BOLD),
-            )),
+            .border_style(Style::default().fg(app.theme.accent_alt)),
         area,
     );
     let inner = Rect {
@@ -7774,48 +7704,17 @@ fn render_session_hover_card(
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let text_area = Rect {
-        x: inner.x,
-        y: inner.y,
-        width: inner.width,
-        height: if has_preview {
-            inner
-                .height
-                .saturating_sub(CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1))
-        } else {
-            inner.height
-        },
-    };
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), text_area);
-    if has_preview {
-        let out = preview_output.take().expect("preview output while rendering");
-        let preview_area = Rect {
+    render_pty_tail(
+        f,
+        Rect {
             x: inner.x,
-            y: text_area.y.saturating_add(text_area.height),
+            y: inner.y,
             width: inner.width,
-            height: CANVAS_CLIP_HOVER_PREVIEW_ROWS.saturating_add(1),
-        };
-        f.render_widget(
-            Paragraph::new("─".repeat(preview_area.width as usize)),
-            Rect {
-                x: inner.x,
-                y: preview_area.y,
-                width: inner.width,
-                height: 1,
-            },
-        );
-        render_pty_tail(
-            f,
-            Rect {
-                x: inner.x,
-                y: preview_area.y.saturating_add(1),
-                width: inner.width,
-                height: preview_area.height.saturating_sub(1),
-            },
-            out.screen,
-            &app.theme,
-        );
-    }
+            height: inner.height,
+        },
+        out.screen,
+        &app.theme,
+    );
 }
 
 /// Session-preview popover shown while the mouse hovers *shimmering* canvas text
@@ -9654,16 +9553,16 @@ mod tests {
 
     #[test]
     fn session_hover_card_size_is_landscape() {
-        // Short content + a preview: width is forced past height so the card
+        // Short content: width is forced past height so the card
         // reads as a landscape tile rather than a portrait sliver.
-        let (w, h) = session_hover_card_size(8, 6, true, 64);
+        let (w, h) = session_hover_card_size(8, 6, 64);
         assert!(w > h, "expected landscape card, got {w}x{h}");
         // Wide content drives the width but stays bounded by the cap.
-        let (w, h) = session_hover_card_size(200, 6, true, 64);
+        let (w, h) = session_hover_card_size(200, 6, 64);
         assert_eq!(w, 64);
         assert!(w > h, "capped width should still exceed height: {w}x{h}");
-        // No preview: a shorter card, still wider than tall.
-        let (w, h) = session_hover_card_size(4, 3, false, 64);
+        // Shorter card, still wider than tall.
+        let (w, h) = session_hover_card_size(4, 3, 64);
         assert!(w > h, "expected landscape card without preview, got {w}x{h}");
     }
 
