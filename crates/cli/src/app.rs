@@ -14403,6 +14403,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn canvas_cursor_advances_when_space_appended_to_list_item() {
+        let (app, _dir, server) = empty_app().await;
+        let width = 40u16;
+
+        // A bullet line and the same line after a trailing space is typed at the
+        // end. The buffer offset moves by one char, so the rendered cursor column
+        // must move by one too — otherwise the caret desyncs from the edit point.
+        let before = "* foo";
+        let after = "* foo ";
+        let (_, col_before) = crate::ui::canvas_cursor_visual_pos(
+            Some(&app),
+            before,
+            before.chars().count(),
+            width as usize,
+        );
+        let (_, col_after) = crate::ui::canvas_cursor_visual_pos(
+            Some(&app),
+            after,
+            after.chars().count(),
+            width as usize,
+        );
+
+        assert_eq!(
+            col_after,
+            col_before + 1,
+            "appending a trailing space to a list item must advance the cursor column by one"
+        );
+
+        // The cursor must also land exactly at the painted end of the rendered
+        // bullet line ("  • foo ", 8 wide), with no gap between the text and the
+        // caret — i.e. the trailing space is actually rendered.
+        assert_eq!(
+            col_after, 8,
+            "cursor should sit immediately after the rendered trailing space"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn canvas_vertical_nav_preserves_preferred_column_across_wrap() {
         let (mut app, _dir, server) = empty_app().await;
         // "abcdefghij" wraps to two visual rows; "XY" is a short line below it.

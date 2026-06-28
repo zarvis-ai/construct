@@ -8691,6 +8691,32 @@ fn canvas_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
     starts
 }
 
+/// For a markdown list-item line, return `(leading_indent_chars, content)` where
+/// `content` is the text after the `- `/`* ` marker WITH its trailing whitespace
+/// preserved, or `None` when the line isn't a bullet. Detection matches the
+/// renderer (a fully-trimmed `* `/`- ` prefix, so a lone "* " with no content
+/// yet stays literal), but the returned content is sliced from the raw line so a
+/// trailing space the user just typed survives — `raw.trim()` would drop it,
+/// stranding the cursor at the end of the line because the rendered glyphs and
+/// the cursor column would then disagree on the line's width.
+fn canvas_list_item_content(raw: &str) -> Option<(usize, &str)> {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))?;
+    let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+    let after_indent = raw
+        .char_indices()
+        .nth(leading)
+        .map(|(idx, _)| &raw[idx..])
+        .unwrap_or("");
+    let rest = after_indent
+        .strip_prefix("- ")
+        .or_else(|| after_indent.strip_prefix("* "))
+        .unwrap_or(after_indent);
+    Some((leading, rest))
+}
+
 /// The plain text the canvas body paints for one logical markdown line, before
 /// ratatui word-wraps it. Mirrors the per-line transformation in
 /// [`render_canvas_markdown_lines`] / [`canvas_visual_col_for_line`] — kept
@@ -8704,10 +8730,7 @@ fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
         String::new()
     } else if canvas_heading_level(trimmed).is_some() {
         canvas_inline_rendered_text(app, trimmed)
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
+    } else if let Some((_, rest)) = canvas_list_item_content(raw) {
         format!(
             "{}  • {}",
             " ".repeat(leading),
@@ -8931,15 +8954,13 @@ fn canvas_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> u
     let col = raw_col.saturating_sub(leading);
     if canvas_heading_level(trimmed).is_some() {
         canvas_inline_visual_width(app, trimmed, col)
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
+    } else if let Some((_, rest)) = canvas_list_item_content(raw) {
         // Mirror the proportional indent rendered for nested bullets: the bullet
         // glyph and text sit `leading` columns further right than a top-level
-        // item, so the cursor column must account for the same offset.
-        let prefix = trimmed.chars().count() - rest.chars().count();
-        leading + 4 + canvas_inline_visual_width(app, rest, col.saturating_sub(prefix))
+        // item, so the cursor column must account for the same offset. The `- `/
+        // `* ` marker is always two chars; the rendered `  • ` prefix is 4 wide.
+        // `rest` keeps any trailing space so the column advances past it.
+        leading + 4 + canvas_inline_visual_width(app, rest, col.saturating_sub(2))
     } else if raw_col <= leading {
         raw_col
     } else {
@@ -9021,13 +9042,12 @@ fn render_canvas_markdown_lines<'a>(
                 search_matches,
                 search_selected,
             ));
-        } else if let Some(rest) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
+        } else if let Some((_, rest)) = canvas_list_item_content(raw) {
             // Nesting is encoded as leading spaces on the source line; render it
             // as proportional indentation before the bullet so deeper items sit
-            // visibly further right than their parents.
+            // visibly further right than their parents. `rest` keeps any trailing
+            // whitespace so a space typed at the end of the bullet paints a cell
+            // for the cursor to land on.
             let bullet = format!("{}  • ", " ".repeat(leading));
             let mut spans = vec![Span::styled(bullet, Style::default().fg(app.theme.accent))];
             spans.extend(render_canvas_inline_spans(
