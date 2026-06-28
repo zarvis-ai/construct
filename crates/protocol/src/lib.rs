@@ -751,11 +751,11 @@ impl SessionState {
 pub mod ipc_method {
     pub const PING: &str = "ping";
     pub const HARNESS_LIST: &str = "harness.list";
-    pub const CANVAS_GET: &str = "canvas.get";
-    pub const CANVAS_UPDATE: &str = "canvas.update";
-    pub const CANVAS_EDIT: &str = "canvas.edit";
-    pub const CANVAS_EXECUTE: &str = "canvas.execute";
-    pub const CANVAS_LIST_TEMPLATES: &str = "canvas.list_templates";
+    pub const PROGRAM_GET: &str = "program.get";
+    pub const PROGRAM_UPDATE: &str = "program.update";
+    pub const PROGRAM_EDIT: &str = "program.edit";
+    pub const PROGRAM_EXECUTE: &str = "program.execute";
+    pub const PROGRAM_LIST_TEMPLATES: &str = "program.list_templates";
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_GET: &str = "session.get";
@@ -864,7 +864,7 @@ pub mod ipc_method {
 pub mod ipc_notif {
     pub const EVENT: &str = "session/event";
     pub const STATE: &str = "session/state";
-    pub const CANVAS_STATE: &str = "canvas/state";
+    pub const PROGRAM_STATE: &str = "program/state";
     pub const DELETED: &str = "session/deleted";
     pub const GROUP_STATE: &str = "group/state";
     pub const GROUP_DELETED: &str = "group/deleted";
@@ -880,19 +880,19 @@ pub mod ipc_notif {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CanvasUpdateActor {
+pub enum ProgramUpdateActor {
     Human,
     Agent,
 }
 
-impl Default for CanvasUpdateActor {
+impl Default for ProgramUpdateActor {
     fn default() -> Self {
         Self::Human
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasDocument {
+pub struct ProgramDocument {
     pub session_id: String,
     pub markdown: String,
     pub version: u64,
@@ -902,7 +902,7 @@ pub struct CanvasDocument {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasRunProgress {
+pub struct ProgramRunProgress {
     pub run_id: String,
     pub started_at_ms: i64,
     pub expires_at_ms: i64,
@@ -915,9 +915,9 @@ pub struct CanvasRunProgress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasRevision {
+pub struct ProgramRevision {
     pub version: u64,
-    pub actor: CanvasUpdateActor,
+    pub actor: ProgramUpdateActor,
     pub at_ms: i64,
     pub markdown: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -925,7 +925,7 @@ pub struct CanvasRevision {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasTemplate {
+pub struct ProgramTemplate {
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -936,38 +936,38 @@ pub struct CanvasTemplate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanvasSmartClipDescriptor {
+pub struct ProgramSmartClipDescriptor {
     pub type_name: &'static str,
     pub syntax: &'static str,
     pub description: &'static str,
 }
 
-pub const CANVAS_SMART_CLIP_DESCRIPTORS: &[CanvasSmartClipDescriptor] = &[
-    CanvasSmartClipDescriptor {
+pub const PROGRAM_SMART_CLIP_DESCRIPTORS: &[ProgramSmartClipDescriptor] = &[
+    ProgramSmartClipDescriptor {
         type_name: "session",
         syntax: "@{session:<session_id> ...}",
         description:
             "References an existing session; inspect, resume, focus, or summarize that session when relevant.",
     },
-    CanvasSmartClipDescriptor {
+    ProgramSmartClipDescriptor {
         type_name: "harness",
         syntax: "@{harness:<name> ...}",
         description:
-            "References an agent harness such as codex, claude, or shell; create or resume a suitable subagent when the canvas calls for delegated work.",
+            "References an agent harness such as codex, claude, or shell; create or resume a suitable subagent when the program calls for delegated work.",
     },
-    CanvasSmartClipDescriptor {
+    ProgramSmartClipDescriptor {
         type_name: "typed-reference",
         syntax: "@{<type>:<target> ...}",
         description:
             "A generic compact typed reference. Preserve unknown types and resolve them only when you have an appropriate tool or context.",
     },
-    CanvasSmartClipDescriptor {
+    ProgramSmartClipDescriptor {
         type_name: "clip-block",
         syntax: ":::clip <type> ... :::",
         description:
-            "A larger typed clip block. Treat the block body as attached structured context for the surrounding canvas instructions.",
+            "A larger typed clip block. Treat the block body as attached structured context for the surrounding program instructions.",
     },
-    CanvasSmartClipDescriptor {
+    ProgramSmartClipDescriptor {
         type_name: "session-response",
         syntax: "session-response",
         description:
@@ -976,27 +976,27 @@ pub const CANVAS_SMART_CLIP_DESCRIPTORS: &[CanvasSmartClipDescriptor] = &[
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasGetParams {
+pub struct ProgramGetParams {
     pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasGetResult {
-    pub canvas: CanvasDocument,
+pub struct ProgramGetResult {
+    pub program: ProgramDocument,
     #[serde(default)]
-    pub revisions: Vec<CanvasRevision>,
+    pub revisions: Vec<ProgramRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_run: Option<CanvasRunProgress>,
+    pub active_run: Option<ProgramRunProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasUpdateParams {
+pub struct ProgramUpdateParams {
     pub session_id: String,
     pub markdown: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_version: Option<u64>,
     #[serde(default)]
-    pub actor: CanvasUpdateActor,
+    pub actor: ProgramUpdateActor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1004,23 +1004,23 @@ pub struct CanvasUpdateParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasUpdateResult {
-    pub canvas: CanvasDocument,
+pub struct ProgramUpdateResult {
+    pub program: ProgramDocument,
 }
 
-/// One anchored edit: replace `old_string` with `new_string` in the canvas
+/// One anchored edit: replace `old_string` with `new_string` in the program
 /// Markdown. An empty `old_string` appends `new_string` to the end of the
 /// document. Anchored edits apply to the *latest* document content, so
 /// concurrent edits to other regions merge without a version conflict; the
 /// only failures are a vanished anchor (`old_string` not found) or an
 /// ambiguous one (multiple matches without `replace_all`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasEdit {
+pub struct ProgramEdit {
     pub old_string: String,
     pub new_string: String,
     #[serde(default)]
     pub replace_all: bool,
-    /// If true, the block(s) touched by this edit are re-added to the canvas
+    /// If true, the block(s) touched by this edit are re-added to the program
     /// run's shimmer set after the edit, keeping them animated until a later
     /// edit or task completion clears them.
     #[serde(default)]
@@ -1028,17 +1028,17 @@ pub struct CanvasEdit {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasEditParams {
+pub struct ProgramEditParams {
     pub session_id: String,
-    pub edits: Vec<CanvasEdit>,
+    pub edits: Vec<ProgramEdit>,
     #[serde(default)]
-    pub actor: CanvasUpdateActor,
+    pub actor: ProgramUpdateActor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasExecuteParams {
+pub struct ProgramExecuteParams {
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<String>,
@@ -1047,23 +1047,23 @@ pub struct CanvasExecuteParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasExecuteResult {
-    pub canvas: CanvasDocument,
+pub struct ProgramExecuteResult {
+    pub program: ProgramDocument,
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_run: Option<CanvasRunProgress>,
+    pub active_run: Option<ProgramRunProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasListTemplatesResult {
-    pub templates: Vec<CanvasTemplate>,
+pub struct ProgramListTemplatesResult {
+    pub templates: Vec<ProgramTemplate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CanvasStateNotificationPayload {
-    pub canvas: CanvasDocument,
+pub struct ProgramStateNotificationPayload {
+    pub program: ProgramDocument,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub active_run: Option<CanvasRunProgress>,
+    pub active_run: Option<ProgramRunProgress>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

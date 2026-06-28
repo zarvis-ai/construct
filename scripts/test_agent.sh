@@ -34,7 +34,7 @@ fi
 if [[ $# -eq 0 ]]; then
   echo "isolated construct test env: $DEMO_DIR" >&2
   echo "try: $0 list" >&2
-  echo "try: $0 canvas templates" >&2
+  echo "try: $0 program templates" >&2
 fi
 
 exec "$CLIENT_BIN" "$@"

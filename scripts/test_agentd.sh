@@ -50,11 +50,11 @@ seed_sessions() {
     $CLIENT_BIN send "$sid" 'for i in 1 2 3 4; do echo "[$i] reading files, running checks"; sleep 0.5; done; echo "activity complete"' >/dev/null || true
   fi
 
-  sid="$($CLIENT_BIN new --title "canvas board" --no-tui shell "" | tr -d '[:space:]')"
+  sid="$($CLIENT_BIN new --title "program board" --no-tui shell "" | tr -d '[:space:]')"
   if [[ -n "$sid" ]]; then
-    $CLIENT_BIN canvas set "$sid" --template kanban >/dev/null || true
-    $CLIENT_BIN canvas get "$sid" >/dev/null 2>&1 || true
-    $CLIENT_BIN send "$sid" "echo 'Canvas session ready. Try: construct canvas get $sid'" >/dev/null || true
+    $CLIENT_BIN program set "$sid" --template kanban >/dev/null || true
+    $CLIENT_BIN program get "$sid" >/dev/null 2>&1 || true
+    $CLIENT_BIN send "$sid" "echo 'Program session ready. Try: construct program get $sid'" >/dev/null || true
   fi
 
   sid="$($CLIENT_BIN new --title "browser preview prompt" --mode headless --no-tui smith "Use browser_open to open https://example.com with preview true, then summarize what changed in the UI." | tr -d '[:space:]' || true)"

@@ -21,7 +21,7 @@ All of these route to the daemon's existing single archive entry point that flip
 
 ## Reason
 
-Delete was previously the only way an agent could clear finished work, which forced an irreversible choice: lose the transcript/worktree or leave clutter. Orchestration patterns (a canvas moving a TODO to Done) routinely want to retire a subagent while preserving its history for later inspection or restart. The TUI already offered archive; agents and CLI users had no equivalent, so the soft/reversible option was unreachable programmatically.
+Delete was previously the only way an agent could clear finished work, which forced an irreversible choice: lose the transcript/worktree or leave clutter. Orchestration patterns (a program moving a TODO to Done) routinely want to retire a subagent while preserving its history for later inspection or restart. The TUI already offered archive; agents and CLI users had no equivalent, so the soft/reversible option was unreachable programmatically.
 
 ## Consequences
 

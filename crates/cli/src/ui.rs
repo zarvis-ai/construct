@@ -1,7 +1,7 @@
 //! Ratatui rendering for the TUI.
 
 use crate::app::{
-    App, CANVAS_CONTENT_PADDING_X, CANVAS_CONTENT_PADDING_Y, CANVAS_REVEAL_MS, HarnessHit, HintZone,
+    App, PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y, PROGRAM_REVEAL_MS, HarnessHit, HintZone,
     ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferIntent, PaneFocus, ScreenPoint,
     Selection, SessionTitleMenuAction, TextSelectionRange, ViewMode, WindowDividerHit,
     WindowPaneHit, WindowSplitDirection, ZoomMode,
@@ -29,16 +29,16 @@ const MATRIX_WALLPAPER_DIM: f32 = 0.22;
 /// appear, and the top-to-bottom erase on disappear. Applies to both the
 /// terminal-view overlay and the matrix-rain wallpaper.
 const PREVIEW_REVEAL_SECS: f32 = 1.0;
-const CANVAS_REVEAL_SECS: f32 = CANVAS_REVEAL_MS as f32 / 1000.0;
-const CANVAS_RUN_BUTTON: &str = " ▶ ";
-const CANVAS_CLIP_HOVER_PREVIEW_COLS: u16 = 102;
-const CANVAS_CLIP_HOVER_PREVIEW_ROWS: u16 = 12;
-/// How long the canvas shimmer-text preview lingers after the pointer stops
+const PROGRAM_REVEAL_SECS: f32 = PROGRAM_REVEAL_MS as f32 / 1000.0;
+const PROGRAM_RUN_BUTTON: &str = " ▶ ";
+const PROGRAM_CLIP_HOVER_PREVIEW_COLS: u16 = 102;
+const PROGRAM_CLIP_HOVER_PREVIEW_ROWS: u16 = 12;
+/// How long the program shimmer-text preview lingers after the pointer stops
 /// moving before it self-dismisses. The clip-chip preview, by contrast, stays
 /// up for as long as the chip is hovered.
-const CANVAS_SHIMMER_HOVER_IDLE: Duration = Duration::from_secs(1);
-const CANVAS_SELECTION_RUN_MENU_W: u16 = 9;
-const CANVAS_SELECTION_RUN_MENU_H: u16 = 3;
+const PROGRAM_SHIMMER_HOVER_IDLE: Duration = Duration::from_secs(1);
+const PROGRAM_SELECTION_RUN_MENU_W: u16 = 9;
+const PROGRAM_SELECTION_RUN_MENU_H: u16 = 3;
 
 /// Row-fraction range `[start, end)` of a preview image to paint this
 /// frame. On appear the image fills from the top over `PREVIEW_REVEAL_SECS`
@@ -255,15 +255,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_minibuffer(f, minibuffer_area, app);
     render_diamond_tooltip(f, app);
     render_pin_diamond_tooltip(f, app, &pinned_ids);
-    render_view_canvas_toggle_tooltip(f, app);
+    render_view_program_toggle_tooltip(f, app);
     render_view_close_tooltip(f, app);
     render_browser_preview_close_tooltip(f, app);
     render_list_title_button_tooltips(f, app);
     render_view_uncollapse_tooltip(f, app);
     render_harness_unavailable_tooltip(f, app);
     render_modeline_approval_mode_tooltip(f, app);
-    app.sync_canvas_popup_with_selection();
-    render_canvas_popup(f, app);
+    app.sync_program_popup_with_selection();
+    render_program_popup(f, app);
     render_tasks_popup(f, app);
     render_remote_control_popup(f, app);
     if app.help_visible {
@@ -701,7 +701,7 @@ pub fn view_close_button_range(view_area: Rect) -> (u16, u16, u16) {
     (x_start, x_end, view_area.y)
 }
 
-pub fn view_canvas_toggle_button_range(view_area: Rect) -> (u16, u16, u16) {
+pub fn view_program_toggle_button_range(view_area: Rect) -> (u16, u16, u16) {
     let x_start = view_area.x + 2;
     let x_end = view_area.x + 3;
     (x_start, x_end, view_area.y)
@@ -752,9 +752,9 @@ fn render_session_widget_title(
         dynamic_ui_trigger_range(view_area, close_shown, label_width, reserved_right_width);
     // The leading "─ " stitches the indicator into the top border, so it must
     // carry the pane's own border color (the session view's focus-aware border,
-    // the canvas's accent border). Passing the style in keeps the two title bars
+    // the program's accent border). Passing the style in keeps the two title bars
     // from drifting — a hardcoded `pane_border_style` here painted a green dash
-    // on the canvas's accent border.
+    // on the program's accent border.
     let mut spans = vec![Span::styled("─ ", border_style)];
     // Ratatui right-aligned block titles paint one cell left of the simple
     // `right - width` geometry used for layout reservation; mirror that for
@@ -815,11 +815,11 @@ fn hovered_view_close_button(app: &App, view_area: Rect) -> bool {
     my == y && mx >= x_start && mx < x_end
 }
 
-fn hovered_view_canvas_toggle_button(app: &App, view_area: Rect) -> bool {
+fn hovered_view_program_toggle_button(app: &App, view_area: Rect) -> bool {
     let Some((mx, my)) = app.mouse_pos else {
         return false;
     };
-    let (x_start, x_end, y) = view_canvas_toggle_button_range(view_area);
+    let (x_start, x_end, y) = view_program_toggle_button_range(view_area);
     my == y && mx >= x_start && mx < x_end
 }
 
@@ -940,30 +940,30 @@ fn render_view_close_tooltip(f: &mut Frame, app: &App) {
     f.render_widget(p, rect);
 }
 
-fn render_view_canvas_toggle_tooltip(f: &mut Frame, app: &App) {
+fn render_view_program_toggle_tooltip(f: &mut Frame, app: &App) {
     let Some(view_area) = app.layout.view_area else {
         return;
     };
-    if !hovered_view_canvas_toggle_button(app, view_area) {
+    if !hovered_view_program_toggle_button(app, view_area) {
         return;
     }
     let Some(s) = app.selected_session() else {
         return;
     };
-    let canvas_open = app
-        .open_canvas_session_ids()
+    let program_open = app
+        .open_program_session_ids()
         .iter()
         .any(|id| id == &s.id);
-    let (cx, _, cy) = view_canvas_toggle_button_range(view_area);
-    let label = if canvas_open {
-        " Canvas mode: click to return to chat "
+    let (cx, _, cy) = view_program_toggle_button_range(view_area);
+    let label = if program_open {
+        " Program mode: click to return to chat "
     } else {
-        " Chat mode: click to open canvas "
+        " Chat mode: click to open program "
     };
     let inner_w = UnicodeWidthStr::width(label) as u16;
     let w = inner_w + 2;
     let h: u16 = 3;
-    let rect = view_canvas_toggle_tooltip_rect(view_area, f.area(), cx, cy, w, h);
+    let rect = view_program_toggle_tooltip_rect(view_area, f.area(), cx, cy, w, h);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border));
@@ -974,7 +974,7 @@ fn render_view_canvas_toggle_tooltip(f: &mut Frame, app: &App) {
     f.render_widget(p, rect);
 }
 
-fn view_canvas_toggle_tooltip_rect(
+fn view_program_toggle_tooltip_rect(
     view_area: Rect,
     total: Rect,
     anchor_x: u16,
@@ -2887,7 +2887,7 @@ fn render_main_windows(f: &mut Frame, area: Rect, app: &mut App) {
 
 /// Build the shared right-side cluster of a pane title bar — session widget
 /// indicators, the harness label, and the close (` x `) button — and add them to
-/// `block` as right-aligned titles. Both the normal session view and the canvas
+/// `block` as right-aligned titles. Both the normal session view and the program
 /// popup call this so their right clusters can't drift in layout, styling, or
 /// geometry.
 ///
@@ -2941,7 +2941,7 @@ fn apply_pane_title_right_cluster<'a>(
     // `view_close_button_range` geometry. When the pane is unfocused the glyph
     // dims to match the unfocused title-bar border, so an inactive pane's menu
     // icon no longer reads at full brightness. `menu_icon_color` sets the base
-    // hue (canvas view passes its border color so the ☰ matches the frame).
+    // hue (program view passes its border color so the ☰ matches the frame).
     let close_hovered = show_close && hovered_view_close_button(app, area);
     let close_style = session_menu_icon_style(&app.theme, menu_icon_color, close_hovered, focused);
     let close_label = if session_actions { " ☰ " } else { " x " };
@@ -2961,12 +2961,12 @@ fn apply_pane_title_right_cluster<'a>(
 
 /// Style for the session-title actions glyph (the ` ☰ ` / ` x ` button at the
 /// right edge of a pane title bar, shared by the chat/PTY session view and the
-/// canvas view via `apply_pane_title_right_cluster`).
+/// program view via `apply_pane_title_right_cluster`).
 ///
 /// Hover wins: the glyph bolds in themed text color when the cursor is over it.
 /// Otherwise it paints in `base` — the chat/PTY session view passes
-/// `matrix_close`; the canvas view passes its border color so the icon reads as
-/// part of the canvas frame instead of as a separately-hued badge. Either way it
+/// `matrix_close`; the program view passes its border color so the icon reads as
+/// part of the program frame instead of as a separately-hued badge. Either way it
 /// dims (`Modifier::DIM`) when the pane is unfocused so it tracks the unfocused
 /// title-bar border instead of staying at full brightness on an inactive pane.
 fn session_menu_icon_style(theme: &Theme, base: Color, hovered: bool, focused: bool) -> Style {
@@ -3065,12 +3065,12 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .as_ref()
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
-    let canvas_open = summary
+    let program_open = summary
         .as_ref()
-        .is_some_and(|s| app.open_canvas_session_ids().iter().any(|id| id == &s.id));
+        .is_some_and(|s| app.open_program_session_ids().iter().any(|id| id == &s.id));
     let mode_glyph = summary.as_ref().map(|s| {
-        if canvas_open {
-            canvas_mode_glyph()
+        if program_open {
+            program_mode_glyph()
         } else {
             session_status_glyph(app, s)
         }
@@ -3094,7 +3094,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         (None, None) => " no session ".to_string(),
     };
     // Right-side cluster (widget indicators, harness label, close button) is
-    // shared with the canvas popup so the two title bars can't drift. Close is
+    // shared with the program popup so the two title bars can't drift. Close is
     // only shown when a session is actually selected (groups, "no session", and
     // the diff-overlay branch don't need it).
     let show_close = summary.is_some();
@@ -5744,7 +5744,7 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         String::new()
     };
     let mut search_status = None;
-    if let Some(search) = app.canvas_popup.as_ref().and_then(|popup| popup.search.as_ref()) {
+    if let Some(search) = app.program_popup.as_ref().and_then(|popup| popup.search.as_ref()) {
         let selected = if search.matches.is_empty() {
             0
         } else {
@@ -5988,7 +5988,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             "zoomed: view — ",
             vec![
                 ("C-x x operator", KeyAction::OpenCommandPalette),
-                ("C-x Space canvas", KeyAction::OpenCanvas),
+                ("C-x Space program", KeyAction::OpenProgram),
                 ("C-x z unzoom", KeyAction::ToggleZoom),
                 ("C-x o list", KeyAction::SwitchFocus),
             ],
@@ -5997,7 +5997,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             "zoomed: list — ",
             vec![
                 ("C-x x operator", KeyAction::OpenCommandPalette),
-                ("C-x Space canvas", KeyAction::OpenCanvas),
+                ("C-x Space program", KeyAction::OpenProgram),
                 ("C-x z unzoom", KeyAction::ToggleZoom),
                 ("C-x o view", KeyAction::SwitchFocus),
             ],
@@ -6006,7 +6006,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             "",
             vec![
                 ("C-x x operator", KeyAction::OpenCommandPalette),
-                ("C-x Space canvas", KeyAction::OpenCanvas),
+                ("C-x Space program", KeyAction::OpenProgram),
                 ("C-x z zoom", KeyAction::ToggleZoom),
             ],
         ),
@@ -6132,7 +6132,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x b           switch focused window to an existing session
     C-x i           send input to selected session
     C-x k           delete selected session (confirms; kills if running)
-    C-x Space       open selected session's canvas
+    C-x Space       open selected session's program
     C-x d           show diff
     C-x r           rename selected session (clears title on empty submit)
     C-x f           fork selected session into a new harness (seeded w/ history)
@@ -6158,7 +6158,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
-                    palette commands: new fork send delete rename canvas diff border
+                    palette commands: new fork send delete rename program diff border
                                       zoom interrupt refresh harnesses help
     ?               toggle this help
     C-x C-c          quit
@@ -7314,27 +7314,27 @@ fn render_tasks_popup(f: &mut Frame, app: &mut App) {
     f.render_widget(para, inner);
 }
 
-fn render_canvas_popup(f: &mut Frame, app: &mut App) {
+fn render_program_popup(f: &mut Frame, app: &mut App) {
     let now = Instant::now();
-    app.layout.canvas_title_run_hit = None;
-    app.layout.canvas_title_toggle_hit = None;
-    app.layout.canvas_title_close_hit = None;
-    app.layout.canvas_selection_run_hit = None;
-    app.layout.canvas_inner_area = None;
-    app.layout.canvas_clip_hits.clear();
+    app.layout.program_title_run_hit = None;
+    app.layout.program_title_toggle_hit = None;
+    app.layout.program_title_close_hit = None;
+    app.layout.program_selection_run_hit = None;
+    app.layout.program_inner_area = None;
+    app.layout.program_clip_hits.clear();
     if app
-        .canvas_popup
+        .program_popup
         .as_ref()
         .is_some_and(|popup| popup.closing && now >= popup.hide_after)
     {
-        app.canvas_popup = None;
+        app.program_popup = None;
     }
 
     let active_session_id = app
-        .canvas_popup
+        .program_popup
         .as_ref()
-        .map(|popup| popup.canvas.session_id.clone());
-    let mut popups: Vec<(crate::app::CanvasPopup, Rect, bool)> = Vec::new();
+        .map(|popup| popup.program.session_id.clone());
+    let mut popups: Vec<(crate::app::ProgramPopup, Rect, bool)> = Vec::new();
     for hit in &app.layout.main_window_areas {
         let Some(crate::app::Selection::Session(session_id)) = app.selection_for_window(hit.id)
         else {
@@ -7343,11 +7343,11 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
         if active_session_id.as_deref() == Some(session_id.as_str()) {
             continue;
         }
-        if let Some(popup) = app.canvas_popups.get(&session_id) {
+        if let Some(popup) = app.program_popups.get(&session_id) {
             popups.push((popup.clone(), hit.area, false));
         }
     }
-    if let Some(popup) = app.canvas_popup.as_ref() {
+    if let Some(popup) = app.program_popup.as_ref() {
         let base_rect = app
             .layout
             .main_window_areas
@@ -7360,42 +7360,42 @@ fn render_canvas_popup(f: &mut Frame, app: &mut App) {
         popups.push((popup.clone(), base_rect, true));
     }
     for (popup, base_rect, active) in popups {
-        render_canvas_popup_at(f, app, &popup, base_rect, active, now);
+        render_program_popup_at(f, app, &popup, base_rect, active, now);
     }
 }
 
-/// Temporal speed of the canvas Run shimmer wave, in radians/sec.
-const CANVAS_SHIMMER_SPEED: f32 = 4.2;
+/// Temporal speed of the program Run shimmer wave, in radians/sec.
+const PROGRAM_SHIMMER_SPEED: f32 = 4.2;
 /// Spatial frequency of the shimmer wave, in radians per character. The bright
 /// band spans roughly `2π / DENSITY` characters, so ~0.18 gives a highlight
 /// band ~35 chars wide travelling through the running region.
-const CANVAS_SHIMMER_DENSITY: f32 = 0.18;
+const PROGRAM_SHIMMER_DENSITY: f32 = 0.18;
 
-/// Which source lines of a canvas are shimmering, plus the wave phase (spec
-/// 0042). Derived from the session's `CanvasRun` at render time.
-struct CanvasShimmer {
+/// Which source lines of a program are shimmering, plus the wave phase (spec
+/// 0042). Derived from the session's `ProgramRun` at render time.
+struct ProgramShimmer {
     /// Indexed by source-line; `true` => the line is in a still-running block.
     active_lines: Vec<bool>,
     /// Phase of the travelling highlight wave, in radians.
     phase: f32,
 }
 
-/// Build the shimmer overlay for a popup from its session's `CanvasRun`, or
+/// Build the shimmer overlay for a popup from its session's `ProgramRun`, or
 /// `None` if no run is active, it has lapsed, or every block has settled. A
 /// block shimmers while its current text still matches a pending signature, so
 /// agent rewrites and user edits both take blocks out of the animation.
-fn canvas_run_shimmer(
+fn program_run_shimmer(
     app: &App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     now: Instant,
-) -> Option<CanvasShimmer> {
-    let run = app.canvas_runs.get(&popup.canvas.session_id)?;
+) -> Option<ProgramShimmer> {
+    let run = app.program_runs.get(&popup.program.session_id)?;
     if now >= run.deadline {
         return None;
     }
     let mut active_lines = vec![false; popup.buffer.lines().count()];
     let mut any = false;
-    for block in crate::app::canvas_blocks(&popup.buffer) {
+    for block in crate::app::program_blocks(&popup.buffer) {
         if run.pending.contains(&block.signature) {
             for slot in active_lines
                 .iter_mut()
@@ -7411,17 +7411,17 @@ fn canvas_run_shimmer(
         return None;
     }
     let phase =
-        now.saturating_duration_since(run.started_at).as_secs_f32() * CANVAS_SHIMMER_SPEED;
-    Some(CanvasShimmer { active_lines, phase })
+        now.saturating_duration_since(run.started_at).as_secs_f32() * PROGRAM_SHIMMER_SPEED;
+    Some(ProgramShimmer { active_lines, phase })
 }
 
-/// Overlay the Run shimmer onto already-rendered canvas lines: for each active
+/// Overlay the Run shimmer onto already-rendered program lines: for each active
 /// line, re-emit its text character-by-character with a brightness drawn from a
 /// travelling wave, so a highlight band sweeps through the running region. The
 /// global character index advances across active lines so the band is
 /// continuous down the document. Spans carrying a background (smart-clip chips,
 /// selection) are left intact but still advance the wave so its spacing holds.
-fn apply_canvas_shimmer(lines: &mut [Line], shimmer: &CanvasShimmer, theme: &Theme) {
+fn apply_program_shimmer(lines: &mut [Line], shimmer: &ProgramShimmer, theme: &Theme) {
     let mut gidx: usize = 0;
     for (i, line) in lines.iter_mut().enumerate() {
         if !shimmer.active_lines.get(i).copied().unwrap_or(false) {
@@ -7436,7 +7436,7 @@ fn apply_canvas_shimmer(lines: &mut [Line], shimmer: &CanvasShimmer, theme: &The
             }
             let style = span.style;
             for ch in span.content.chars() {
-                let w = (shimmer.phase - gidx as f32 * CANVAS_SHIMMER_DENSITY).sin();
+                let w = (shimmer.phase - gidx as f32 * PROGRAM_SHIMMER_DENSITY).sin();
                 // 0..1, eased so most of the region rests dim and the crest pops.
                 let t = (0.5 + 0.5 * w).clamp(0.0, 1.0);
                 let eased = t * t * (3.0 - 2.0 * t);
@@ -7452,22 +7452,22 @@ fn apply_canvas_shimmer(lines: &mut [Line], shimmer: &CanvasShimmer, theme: &The
     }
 }
 
-/// Build the empty-canvas onboarding placeholder: a one-line description of what
-/// the canvas is, up to two clickable template buttons, a divider, and a tip.
+/// Build the empty-program onboarding placeholder: a one-line description of what
+/// the program is, up to two clickable template buttons, a divider, and a tip.
 /// Returns the lines to render plus the button hitboxes. Coordinates are absolute
-/// screen cells — safe because an empty canvas never scrolls (offset is always 0)
+/// screen cells — safe because an empty program never scrolls (offset is always 0)
 /// and every line is kept within `inner.width`, so no wrapping shifts the rows.
-/// Falls back to a plain description+tip when the canvas is too small for buttons
+/// Falls back to a plain description+tip when the program is too small for buttons
 /// or no templates are available.
-fn canvas_empty_placeholder(
+fn program_empty_placeholder(
     theme: &crate::theme::Theme,
-    templates: &[agentd_protocol::CanvasTemplate],
+    templates: &[agentd_protocol::ProgramTemplate],
     inner: Rect,
-) -> (Vec<Line<'static>>, Vec<crate::app::CanvasTemplateHit>) {
+) -> (Vec<Line<'static>>, Vec<crate::app::ProgramTemplateHit>) {
     let dim = Style::default().fg(theme.dim);
     let width = inner.width as usize;
     const DESC: &str =
-        "Canvas — a shared Markdown space you and your agents edit and run together.";
+        "Program — a shared Markdown space you and your agents edit and run together.";
     const TIP: &str =
         "Tip: @{session:id} embeds a live session · select text + Run to dispatch · :::clip groups output.";
 
@@ -7493,7 +7493,7 @@ fn canvas_empty_placeholder(
 
     // Up to two non-blank templates become buttons; "blank" *is* the empty state,
     // so offering it here would be a no-op. Keep only as many as fit on one row.
-    let mut buttons: Vec<(String, usize, &agentd_protocol::CanvasTemplate)> = Vec::new();
+    let mut buttons: Vec<(String, usize, &agentd_protocol::ProgramTemplate)> = Vec::new();
     let mut used = INDENT;
     for (i, t) in templates
         .iter()
@@ -7544,7 +7544,7 @@ fn canvas_empty_placeholder(
         mid.push(Span::styled("│".to_string(), border));
         bot.push(Span::styled(format!("└{bar}┘"), border));
         let box_w = inner_w + 2;
-        hits.push(crate::app::CanvasTemplateHit {
+        hits.push(crate::app::ProgramTemplateHit {
             col_start: col as u16,
             col_end: (col + box_w) as u16,
             row_start,
@@ -7569,10 +7569,10 @@ fn canvas_empty_placeholder(
     (lines, hits)
 }
 
-fn render_canvas_popup_at(
+fn render_program_popup_at(
     f: &mut Frame,
     app: &mut App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     base_rect: Rect,
     active: bool,
     now: Instant,
@@ -7586,11 +7586,11 @@ fn render_canvas_popup_at(
             .hide_after
             .saturating_duration_since(now)
             .as_secs_f32()
-            / CANVAS_REVEAL_SECS
+            / PROGRAM_REVEAL_SECS
     } else {
         now.saturating_duration_since(popup.revealed_at)
             .as_secs_f32()
-            / CANVAS_REVEAL_SECS
+            / PROGRAM_REVEAL_SECS
     }
     .clamp(0.0, 1.0);
     if progress <= 0.0 {
@@ -7609,7 +7609,7 @@ fn render_canvas_popup_at(
     let summary = app
         .sessions
         .iter()
-        .find(|s| s.id == popup.canvas.session_id)
+        .find(|s| s.id == popup.program.session_id)
         .cloned();
     let summary_ref = summary.as_ref();
 
@@ -7617,23 +7617,23 @@ fn render_canvas_popup_at(
     // between the name and the dirty marker). Right cluster (widgets, harness,
     // close) is shared with the normal session view via
     // `apply_pane_title_right_cluster`, so the two title bars can't drift in
-    // layout, styling, or geometry. The canvas can always be dismissed, so it
+    // layout, styling, or geometry. The program can always be dismissed, so it
     // always offers a close button.
     let show_close = true;
     let dirty = popup.buffer != popup.saved_markdown;
-    let left = canvas_title_left_layout(
+    let left = program_title_left_layout(
         summary_ref,
-        short_id(&popup.canvas.session_id),
+        short_id(&popup.program.session_id),
         rect,
         dirty,
         show_close,
     );
-    let title = canvas_title_line(app, popup, active, now, &left);
-    let title_toggle_hit = canvas_title_toggle_button_range(summary_ref, rect);
+    let title = program_title_line(app, popup, active, now, &left);
+    let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
 
-    let border_style = canvas_border_style(&app.theme, active);
-    // The session-actions ☰ icon should read as part of the canvas frame, so its
-    // base hue tracks the canvas border color (accent_alt) rather than the
+    let border_style = program_border_style(&app.theme, active);
+    // The session-actions ☰ icon should read as part of the program frame, so its
+    // base hue tracks the program border color (accent_alt) rather than the
     // default session-view close color. Focus dimming + hover still compose via
     // `session_menu_icon_style` (focused → border hue, unfocused → dimmed, hover
     // wins).
@@ -7657,41 +7657,41 @@ fn render_canvas_popup_at(
         // Run lives in the left cluster; the close button and widget icons reuse
         // the shared session-view geometry (`view_close_button_range` and
         // `dynamic_ui_widget_hits` from `render_session_widget_title`) so the
-        // canvas click handlers in `app.rs` line up with what's painted.
-        app.layout.canvas_title_run_hit = left.run;
-        app.layout.canvas_title_toggle_hit = title_toggle_hit;
-        app.layout.canvas_title_close_hit = show_close.then(|| view_close_button_range(rect));
+        // program click handlers in `app.rs` line up with what's painted.
+        app.layout.program_title_run_hit = left.run;
+        app.layout.program_title_toggle_hit = title_toggle_hit;
+        app.layout.program_title_close_hit = show_close.then(|| view_close_button_range(rect));
     }
     let inner = block.inner(rect).inner(Margin {
-        horizontal: CANVAS_CONTENT_PADDING_X,
-        vertical: CANVAS_CONTENT_PADDING_Y,
+        horizontal: PROGRAM_CONTENT_PADDING_X,
+        vertical: PROGRAM_CONTENT_PADDING_Y,
     });
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let selection = canvas_selection_range(popup);
+    let selection = program_selection_range(popup);
     let search = popup.search.as_ref().filter(|search| !search.matches.is_empty());
     let search_matches = search.map(|search| search.matches.as_slice());
     let search_selected = search.map(|search| search.selected);
-    let mut lines = render_canvas_markdown_lines(
+    let mut lines = render_program_markdown_lines(
         app,
         &popup.buffer,
         selection,
         search_matches,
         search_selected,
     );
-    // Run shimmer (spec 0042): while a canvas Run is executing for this session,
+    // Run shimmer (spec 0042): while a program Run is executing for this session,
     // sweep a highlight through the blocks that have not settled yet.
-    if let Some(shimmer) = canvas_run_shimmer(app, popup, now) {
-        apply_canvas_shimmer(&mut lines, &shimmer, &app.theme);
+    if let Some(shimmer) = program_run_shimmer(app, popup, now) {
+        apply_program_shimmer(&mut lines, &shimmer, &app.theme);
     }
-    // Empty canvas: replace the bare body with a richer onboarding placeholder —
+    // Empty program: replace the bare body with a richer onboarding placeholder —
     // a one-line description, clickable template buttons, a divider, and a tip.
-    // The button hitboxes are returned so the active canvas can publish them for
-    // the mouse handler. Non-empty canvases get no hits.
+    // The button hitboxes are returned so the active program can publish them for
+    // the mouse handler. Non-empty programes get no hits.
     let placeholder_hits = if lines.is_empty() {
         let (placeholder_lines, hits) =
-            canvas_empty_placeholder(&app.theme, &app.canvas_templates, inner);
+            program_empty_placeholder(&app.theme, &app.program_templates, inner);
         lines = placeholder_lines;
         hits
     } else {
@@ -7703,17 +7703,17 @@ fn render_canvas_popup_at(
     // rows when rendering. `Paragraph::scroll` with `Wrap` skips *wrapped* rows,
     // matching the wrapped-row coordinate space the cursor math uses.
     let viewport_rows = inner.height as usize;
-    let total_rows = canvas_total_visual_rows(Some(app), &popup.buffer, inner.width as usize);
+    let total_rows = program_total_visual_rows(Some(app), &popup.buffer, inner.width as usize);
     let max_scroll = total_rows.saturating_sub(viewport_rows);
     let scroll_offset = popup.scroll_offset.min(max_scroll);
     if active {
         // Remember the live viewport so cursor-move handlers can keep the caret
         // visible on the next keystroke, and persist the clamped offset.
-        app.layout.canvas_inner_area = Some(inner);
+        app.layout.program_inner_area = Some(inner);
         // Publish (or clear) the empty-state template buttons. Only the active
-        // canvas owns the hitboxes, so a click never targets an inactive split.
-        app.layout.canvas_template_hits = placeholder_hits;
-        if let Some(real) = app.canvas_popup.as_mut() {
+        // program owns the hitboxes, so a click never targets an inactive split.
+        app.layout.program_template_hits = placeholder_hits;
+        if let Some(real) = app.program_popup.as_mut() {
             real.scroll_offset = scroll_offset;
         }
     }
@@ -7721,7 +7721,7 @@ fn render_canvas_popup_at(
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(para, inner);
-    render_canvas_scroll_indicator(
+    render_program_scroll_indicator(
         f,
         &app.theme,
         rect,
@@ -7730,55 +7730,55 @@ fn render_canvas_popup_at(
         total_rows,
         viewport_rows,
     );
-    // Reveal the session's hovered/pinned sticky widgets on top of the canvas,
+    // Reveal the session's hovered/pinned sticky widgets on top of the program,
     // mirroring the normal session view. The title-bar squares are painted by
     // `apply_pane_title_right_cluster` above (which arms `dynamic_ui_hover` on
-    // hover and registers pin hits), but the canvas's own `Clear` wipes the
+    // hover and registers pin hits), but the program's own `Clear` wipes the
     // widget body the session view drew underneath — so without re-rendering it
-    // here the widget never appears while the canvas is shown. Only the active
-    // canvas drives the single hover/scroll/popover layout state.
+    // here the widget never appears while the program is shown. Only the active
+    // program drives the single hover/scroll/popover layout state.
     if active {
-        let panels = session_sticky_widget_panels(app, &popup.canvas.session_id);
+        let panels = session_sticky_widget_panels(app, &popup.program.session_id);
         if !panels.is_empty() {
-            render_visible_dynamic_ui_panels(f, rect, app, &popup.canvas.session_id, &panels);
+            render_visible_dynamic_ui_panels(f, rect, app, &popup.program.session_id, &panels);
         }
     }
-    // Capture session-clip hitboxes for this canvas so hover can work for any
-    // visible canvas, even when another split is focused. Only the active canvas
+    // Capture session-clip hitboxes for this program so hover can work for any
+    // visible program, even when another split is focused. Only the active program
     // publishes click hitboxes into layout state.
-    let clip_hits = canvas_session_clip_hits(Some(app), &popup.buffer, scroll_offset, inner);
+    let clip_hits = program_session_clip_hits(Some(app), &popup.buffer, scroll_offset, inner);
     if active {
-        app.layout.canvas_clip_hits = clip_hits.clone();
+        app.layout.program_clip_hits = clip_hits.clone();
     }
     if active && !popup.closing {
         if let Some(pos) =
-            canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, inner)
+            program_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, inner)
         {
             render_editor_cursor(f, pos, &app.theme);
-            render_canvas_smart_clip_picker(f, app, popup, pos, inner);
+            render_program_smart_clip_picker(f, app, popup, pos, inner);
         }
     }
     if active && !popup.closing {
-        render_canvas_selection_context_menu(f, app, popup, scroll_offset, inner);
+        render_program_selection_context_menu(f, app, popup, scroll_offset, inner);
     }
-    render_canvas_title_tooltip(f, app, popup, summary_ref, rect);
+    render_program_title_tooltip(f, app, popup, summary_ref, rect);
     if !popup.closing {
-        render_canvas_clip_hover(f, app, rect, &clip_hits);
+        render_program_clip_hover(f, app, rect, &clip_hits);
     }
     if active && !popup.closing {
-        render_canvas_shimmer_hover(f, app, popup, rect, scroll_offset, inner, now);
+        render_program_shimmer_hover(f, app, popup, rect, scroll_offset, inner, now);
     }
 }
 
 /// Mini session-preview popover shown while the mouse hovers a `@{session:id}`
-/// smart-clip in the canvas body. Reads the freshly captured clip hitboxes,
+/// smart-clip in the program body. Reads the freshly captured clip hitboxes,
 /// resolves the hovered session, and paints the shared session card anchored to
 /// the hovered chip. Persists for as long as the chip is hovered.
-fn render_canvas_clip_hover(
+fn render_program_clip_hover(
     f: &mut Frame,
     app: &mut App,
     modal: Rect,
-    hits: &[crate::app::CanvasClipHit],
+    hits: &[crate::app::ProgramClipHit],
 ) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
@@ -7839,7 +7839,7 @@ fn session_hover_card_rect(
 /// Render the floating session hover card — a live tail of the session's PTY
 /// output — anchored just below `(anchor_col, anchor_row)` (or above it when
 /// there's no room) and kept inside `modal`. Clears its own area so it overlays
-/// the canvas body without disturbing it. Shared by the clip-chip hover and the
+/// the program body without disturbing it. Shared by the clip-chip hover and the
 /// shimmer-text hover; always laid out wider than it is tall.
 fn render_session_hover_card(
     f: &mut Frame,
@@ -7856,11 +7856,11 @@ fn render_session_hover_card(
     let max_w = modal
         .width
         .saturating_sub(2)
-        .clamp(1, CANVAS_CLIP_HOVER_PREVIEW_COLS);
+        .clamp(1, PROGRAM_CLIP_HOVER_PREVIEW_COLS);
     let preview_output = app
         .histories
         .get_mut(session_id)
-        .map(|history| history.replay(max_w.max(1), CANVAS_CLIP_HOVER_PREVIEW_ROWS, 0));
+        .map(|history| history.replay(max_w.max(1), PROGRAM_CLIP_HOVER_PREVIEW_ROWS, 0));
     let Some(out) = preview_output else {
         return;
     };
@@ -7869,7 +7869,7 @@ fn render_session_hover_card(
     }
 
     let content_w = max_w;
-    let content_h = CANVAS_CLIP_HOVER_PREVIEW_ROWS;
+    let content_h = PROGRAM_CLIP_HOVER_PREVIEW_ROWS;
     let (width, height) = session_hover_card_size(content_w, content_h, max_w);
     let Some(area) = session_hover_card_rect(modal, width, height, anchor_col, anchor_row) else {
         return;
@@ -7901,15 +7901,15 @@ fn render_session_hover_card(
     );
 }
 
-/// Session-preview popover shown while the mouse hovers *shimmering* canvas text
-/// — a block still running under a canvas Run. Resolves the session clip inside
+/// Session-preview popover shown while the mouse hovers *shimmering* program text
+/// — a block still running under a program Run. Resolves the session clip inside
 /// the shimmering block under the cursor and paints the shared session card with
 /// that session's live output. Unlike the clip-chip hover, it self-dismisses
-/// once the pointer has been still for [`CANVAS_SHIMMER_HOVER_IDLE`].
-fn render_canvas_shimmer_hover(
+/// once the pointer has been still for [`PROGRAM_SHIMMER_HOVER_IDLE`].
+fn render_program_shimmer_hover(
     f: &mut Frame,
     app: &mut App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     modal: Rect,
     scroll_offset: usize,
     body: Rect,
@@ -7922,26 +7922,26 @@ fn render_canvas_shimmer_hover(
     // been still for the idle window, hide it.
     let moved_recently = app
         .last_mouse_move
-        .is_some_and(|t| now.saturating_duration_since(t) < CANVAS_SHIMMER_HOVER_IDLE);
+        .is_some_and(|t| now.saturating_duration_since(t) < PROGRAM_SHIMMER_HOVER_IDLE);
     if !moved_recently {
         return;
     }
-    // A clip chip under the cursor is owned by `render_canvas_clip_hover`; don't
+    // A clip chip under the cursor is owned by `render_program_clip_hover`; don't
     // double-render the card on top of it.
     if app
         .layout
-        .canvas_clip_hits
+        .program_clip_hits
         .iter()
         .any(|hit| hit.contains(mx, my))
     {
         return;
     }
-    let Some(shimmer) = canvas_run_shimmer(app, popup, now) else {
+    let Some(shimmer) = program_run_shimmer(app, popup, now) else {
         return;
     };
     let line_sessions =
-        canvas_shimmer_line_sessions(Some(app), &popup.buffer, &shimmer.active_lines);
-    let Some(session_id) = canvas_shimmer_session_at(
+        program_shimmer_line_sessions(Some(app), &popup.buffer, &shimmer.active_lines);
+    let Some(session_id) = program_shimmer_session_at(
         Some(app),
         &popup.buffer,
         &line_sessions,
@@ -7959,15 +7959,15 @@ fn render_canvas_shimmer_hover(
 /// belongs to (resolved from the first `@{session:…}` clip in that block), or
 /// `None` for lines outside a shimmering block and shimmering blocks with no
 /// session clip. A block "shimmers" when any of its lines is set in
-/// `active_lines` (the per-source-line mask from [`canvas_run_shimmer`]).
-fn canvas_shimmer_line_sessions(
+/// `active_lines` (the per-source-line mask from [`program_run_shimmer`]).
+fn program_shimmer_line_sessions(
     app: Option<&App>,
     markdown: &str,
     active_lines: &[bool],
 ) -> Vec<Option<String>> {
     let lines: Vec<&str> = markdown.lines().collect();
     let mut out = vec![None; lines.len()];
-    for block in crate::app::canvas_blocks(markdown) {
+    for block in crate::app::program_blocks(markdown) {
         let shimmering = (block.start_line..block.end_line)
             .any(|li| active_lines.get(li).copied().unwrap_or(false));
         if !shimmering {
@@ -7975,9 +7975,9 @@ fn canvas_shimmer_line_sessions(
         }
         let sid = (block.start_line..block.end_line).find_map(|li| {
             let raw = lines.get(li)?;
-            let (_rendered, clips) = canvas_rendered_line_with_clips(app, raw);
+            let (_rendered, clips) = program_rendered_line_with_clips(app, raw);
             clips.iter().find_map(|clip| {
-                let (kind, id) = canvas_smart_clip_target(&clip.raw_clip);
+                let (kind, id) = program_smart_clip_target(&clip.raw_clip);
                 (kind == "session").then(|| id.to_string())
             })
         });
@@ -7992,11 +7992,11 @@ fn canvas_shimmer_line_sessions(
     out
 }
 
-/// Resolve a screen cell over the canvas body to the session id of the
+/// Resolve a screen cell over the program body to the session id of the
 /// shimmering block under it, or `None` when the cell isn't on a shimmering
 /// block that references a session. Mirrors the wrap/scroll math of
-/// [`canvas_session_clip_hits`] so hover targets line up with what's painted.
-fn canvas_shimmer_session_at(
+/// [`program_session_clip_hits`] so hover targets line up with what's painted.
+fn program_shimmer_session_at(
     app: Option<&App>,
     markdown: &str,
     line_sessions: &[Option<String>],
@@ -8018,8 +8018,8 @@ fn canvas_shimmer_session_at(
     let width = area.width as usize;
     let mut visual_row_base = 0usize;
     for (i, raw) in markdown.lines().enumerate() {
-        let (rendered, _clips) = canvas_rendered_line_with_clips(app, raw);
-        let rows = canvas_wrap_row_starts(&rendered, width).len();
+        let (rendered, _clips) = program_rendered_line_with_clips(app, raw);
+        let rows = program_wrap_row_starts(&rendered, width).len();
         let next_base = visual_row_base.saturating_add(rows);
         if target_abs_row >= visual_row_base && target_abs_row < next_base {
             return line_sessions.get(i).cloned().flatten();
@@ -8029,11 +8029,11 @@ fn canvas_shimmer_session_at(
     None
 }
 
-/// Paint a slim vertical scroll thumb on the canvas popup's right border when
+/// Paint a slim vertical scroll thumb on the program popup's right border when
 /// the body overflows its viewport. Like the terminal scrollback bar, it tints
 /// only the cell background so the border glyph underneath stays intact, and it
 /// sits on the border column so it never clobbers body text.
-fn render_canvas_scroll_indicator(
+fn render_program_scroll_indicator(
     f: &mut Frame,
     theme: &Theme,
     rect: Rect,
@@ -8070,7 +8070,7 @@ fn render_canvas_scroll_indicator(
     }
 }
 
-fn canvas_border_style(theme: &Theme, active: bool) -> Style {
+fn program_border_style(theme: &Theme, active: bool) -> Style {
     if active {
         Style::default()
             .fg(theme.accent_alt)
@@ -8082,30 +8082,30 @@ fn canvas_border_style(theme: &Theme, active: bool) -> Style {
     }
 }
 
-/// Column geometry for the canvas title bar's LEFT cluster — the truncated
+/// Column geometry for the program title bar's LEFT cluster — the truncated
 /// session label, the Run button (now wedged between the name and the dirty
 /// marker), and the `modified` marker. Both the title renderer and the tooltip
 /// hit-tester derive positions from this so they can't drift.
-struct CanvasTitleLeft {
+struct ProgramTitleLeft {
     /// Truncated session label (or short id when the session isn't summarized).
     label: String,
     /// Run-button hit range `(x_start, x_end_exclusive, y)`, or `None` when the
     /// pane is too narrow to fit it.
     run: Option<(u16, u16, u16)>,
     /// `modified` word hit range `(x_start, x_end_exclusive)` on row `rect.y`,
-    /// or `None` when the canvas is not dirty.
+    /// or `None` when the program is not dirty.
     modified: Option<(u16, u16)>,
 }
 
-fn canvas_title_left_layout(
+fn program_title_left_layout(
     summary: Option<&agentd_protocol::SessionSummary>,
     fallback_label: &str,
     rect: Rect,
     dirty: bool,
     show_close: bool,
-) -> CanvasTitleLeft {
-    let glyph_w = UnicodeWidthStr::width(canvas_mode_glyph());
-    let run_w = UnicodeWidthStr::width(CANVAS_RUN_BUTTON);
+) -> ProgramTitleLeft {
+    let glyph_w = UnicodeWidthStr::width(program_mode_glyph());
+    let run_w = UnicodeWidthStr::width(PROGRAM_RUN_BUTTON);
     let marker_w = if dirty {
         UnicodeWidthStr::width(" * modified")
     } else {
@@ -8117,7 +8117,7 @@ fn canvas_title_left_layout(
     let close_w = if show_close { 3 } else { 0 };
     // Mirror the session view's title-label budget (corners + harness + close +
     // ` <glyph> <label> ` scaffolding), and additionally reserve the
-    // canvas-only left-cluster extras: the Run button and the dirty marker.
+    // program-only left-cluster extras: the Run button and the dirty marker.
     let label_budget = (rect.width as usize)
         .saturating_sub(2)
         .saturating_sub(harness_w)
@@ -8152,24 +8152,24 @@ fn canvas_title_left_layout(
         let end = start.saturating_add(UnicodeWidthStr::width("modified") as u16);
         (start, end)
     });
-    CanvasTitleLeft {
+    ProgramTitleLeft {
         label,
         run,
         modified,
     }
 }
 
-fn canvas_title_line<'a>(
+fn program_title_line<'a>(
     app: &App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     active: bool,
     now: Instant,
-    left: &CanvasTitleLeft,
+    left: &ProgramTitleLeft,
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
-    let toggle_glyph = canvas_mode_glyph();
-    let border_style = canvas_border_style(&app.theme, active);
-    let canvas_style = canvas_toggle_style(app, popup, active);
+    let toggle_glyph = program_mode_glyph();
+    let border_style = program_border_style(&app.theme, active);
+    let program_style = program_toggle_style(app, popup, active);
     let modified_style = Style::default()
         .fg(app.theme.warning)
         .add_modifier(Modifier::BOLD);
@@ -8181,8 +8181,8 @@ fn canvas_title_line<'a>(
     // A run in flight pulses the Run glyph, so there's a running cue even once
     // every block has settled but the owning turn is still going (spec 0042).
     let run_started = app
-        .canvas_runs
-        .get(&popup.canvas.session_id)
+        .program_runs
+        .get(&popup.program.session_id)
         .filter(|run| now < run.deadline && !run.first_output_seen)
         .map(|run| run.started_at);
     let run_style = if run_hovered {
@@ -8190,7 +8190,7 @@ fn canvas_title_line<'a>(
             .fg(app.theme.text)
             .add_modifier(Modifier::BOLD)
     } else if let Some(started) = run_started {
-        let phase = now.saturating_duration_since(started).as_secs_f32() * CANVAS_SHIMMER_SPEED;
+        let phase = now.saturating_duration_since(started).as_secs_f32() * PROGRAM_SHIMMER_SPEED;
         let t = (0.5 + 0.5 * phase.sin()).clamp(0.0, 1.0);
         Style::default()
             .fg(blend_color(app.theme.accent, app.theme.text, t))
@@ -8206,7 +8206,7 @@ fn canvas_title_line<'a>(
 
     let mut spans = vec![
         Span::styled(" ", border_style),
-        Span::styled(toggle_glyph.to_string(), canvas_style),
+        Span::styled(toggle_glyph.to_string(), program_style),
         Span::styled(" ", border_style),
         Span::styled(left.label.clone(), border_style),
     ];
@@ -8216,7 +8216,7 @@ fn canvas_title_line<'a>(
         let run_button = if run_started.is_some() {
             format!(" {} ", app.spinner_frame())
         } else {
-            CANVAS_RUN_BUTTON.to_string()
+            PROGRAM_RUN_BUTTON.to_string()
         };
         spans.push(Span::styled(run_button, run_style));
     } else {
@@ -8230,13 +8230,13 @@ fn canvas_title_line<'a>(
     Line::from(spans)
 }
 
-fn canvas_mode_glyph() -> &'static str {
+fn program_mode_glyph() -> &'static str {
     "▣"
 }
 
-fn canvas_toggle_style(
+fn program_toggle_style(
     app: &App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     active: bool,
 ) -> Style {
     let style = if popup.closing {
@@ -8251,11 +8251,11 @@ fn canvas_toggle_style(
     style.add_modifier(Modifier::BOLD)
 }
 
-fn canvas_title_toggle_button_range(
+fn program_title_toggle_button_range(
     summary: Option<&agentd_protocol::SessionSummary>,
     rect: Rect,
 ) -> Option<(u16, u16, u16)> {
-    let toggle_w = UnicodeWidthStr::width(canvas_mode_glyph()) as u16;
+    let toggle_w = UnicodeWidthStr::width(program_mode_glyph()) as u16;
     if toggle_w == 0 || rect.width < toggle_w.saturating_add(2) {
         return None;
     }
@@ -8275,10 +8275,10 @@ fn canvas_title_toggle_button_range(
     Some((x_start, x_end, rect.y))
 }
 
-fn render_canvas_title_tooltip(
+fn render_program_title_tooltip(
     f: &mut Frame,
     app: &App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     summary: Option<&agentd_protocol::SessionSummary>,
     rect: Rect,
 ) {
@@ -8288,11 +8288,11 @@ fn render_canvas_title_tooltip(
     if my != rect.y {
         return;
     }
-    if let Some((xs, xe, y)) = app.layout.canvas_title_toggle_hit {
+    if let Some((xs, xe, y)) = app.layout.program_title_toggle_hit {
         if my == y && mx >= xs && mx < xe {
-            let mode = if popup.closing { "Chat" } else { "Canvas" };
+            let mode = if popup.closing { "Chat" } else { "Program" };
             let action = if popup.closing {
-                "open canvas"
+                "open program"
             } else {
                 "return to chat"
             };
@@ -8306,13 +8306,13 @@ fn render_canvas_title_tooltip(
             return;
         }
     }
-    if let Some((xs, xe, y)) = app.layout.canvas_title_run_hit {
+    if let Some((xs, xe, y)) = app.layout.program_title_run_hit {
         if my == y && mx >= xs && mx < xe {
-            render_button_tooltip(f, &app.theme, " Run canvas ", mx, my);
+            render_button_tooltip(f, &app.theme, " Run program ", mx, my);
             return;
         }
     }
-    if let Some((xs, xe, y)) = app.layout.canvas_title_close_hit {
+    if let Some((xs, xe, y)) = app.layout.program_title_close_hit {
         if my == y && mx >= xs && mx < xe {
             if app.session_title_menu.is_some() {
                 return;
@@ -8322,9 +8322,9 @@ fn render_canvas_title_tooltip(
         }
     }
     let dirty = popup.buffer != popup.saved_markdown;
-    let left = canvas_title_left_layout(
+    let left = program_title_left_layout(
         summary,
-        short_id(&popup.canvas.session_id),
+        short_id(&popup.program.session_id),
         rect,
         dirty,
         true,
@@ -8336,30 +8336,30 @@ fn render_canvas_title_tooltip(
     }
 }
 
-fn render_canvas_selection_context_menu(
+fn render_program_selection_context_menu(
     f: &mut Frame,
     app: &mut App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     scroll_offset: usize,
-    canvas_area: Rect,
+    program_area: Rect,
 ) {
-    if canvas_selection_range(popup).is_none() {
-        app.layout.canvas_selection_run_hit = None;
+    if program_selection_range(popup).is_none() {
+        app.layout.program_selection_run_hit = None;
         return;
     }
     let Some(pos) =
-        canvas_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, canvas_area)
+        program_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, program_area)
     else {
-        app.layout.canvas_selection_run_hit = None;
+        app.layout.program_selection_run_hit = None;
         return;
     };
-    let rect = canvas_selection_context_menu_rect(pos, canvas_area);
+    let rect = program_selection_context_menu_rect(pos, program_area);
     let hit = (
         rect.x.saturating_add(1),
         rect.x.saturating_add(rect.width.saturating_sub(1)),
         rect.y.saturating_add(1),
     );
-    app.layout.canvas_selection_run_hit = Some(hit);
+    app.layout.program_selection_run_hit = Some(hit);
     let hovered = app
         .mouse_pos
         .is_some_and(|(mx, my)| my == hit.2 && mx >= hit.0 && mx < hit.1);
@@ -8388,38 +8388,38 @@ fn render_canvas_selection_context_menu(
     );
 }
 
-fn canvas_selection_context_menu_rect(pos: Position, total: Rect) -> Rect {
+fn program_selection_context_menu_rect(pos: Position, total: Rect) -> Rect {
     let max_x = total
         .x
         .saturating_add(total.width)
-        .saturating_sub(CANVAS_SELECTION_RUN_MENU_W);
+        .saturating_sub(PROGRAM_SELECTION_RUN_MENU_W);
     let max_y = total
         .y
         .saturating_add(total.height)
-        .saturating_sub(CANVAS_SELECTION_RUN_MENU_H);
+        .saturating_sub(PROGRAM_SELECTION_RUN_MENU_H);
     Rect {
         x: pos.x.saturating_add(1).min(max_x),
         y: pos.y.saturating_add(1).min(max_y),
-        width: CANVAS_SELECTION_RUN_MENU_W.min(total.width),
-        height: CANVAS_SELECTION_RUN_MENU_H.min(total.height),
+        width: PROGRAM_SELECTION_RUN_MENU_W.min(total.width),
+        height: PROGRAM_SELECTION_RUN_MENU_H.min(total.height),
     }
 }
 
 
-fn render_canvas_smart_clip_picker(
+fn render_program_smart_clip_picker(
     f: &mut Frame,
     app: &App,
-    popup: &crate::app::CanvasPopup,
+    popup: &crate::app::ProgramPopup,
     cursor_pos: Position,
-    canvas_area: Rect,
+    program_area: Rect,
 ) {
     let Some(search) = popup.smart_clip.as_ref() else {
         return;
     };
-    if canvas_area.width == 0 || canvas_area.height < 3 {
+    if program_area.width == 0 || program_area.height < 3 {
         return;
     }
-    let candidates = app.canvas_smart_clip_candidates(popup);
+    let candidates = app.program_smart_clip_candidates(popup);
     let group_count = candidates
         .iter()
         .fold((None, 0usize), |(last, count), candidate| {
@@ -8435,20 +8435,20 @@ fn render_canvas_smart_clip_picker(
     } else {
         candidates.len().saturating_add(group_count)
     };
-    let max_rows = canvas_area.height.saturating_sub(2).min(10);
+    let max_rows = program_area.height.saturating_sub(2).min(10);
     let row_count = (desired_rows as u16).min(max_rows);
-    let width = 42u16.min(canvas_area.width.max(1));
+    let width = 42u16.min(program_area.width.max(1));
     let x = cursor_pos
         .x
-        .min(canvas_area.x.saturating_add(canvas_area.width.saturating_sub(width)));
+        .min(program_area.x.saturating_add(program_area.width.saturating_sub(width)));
     let below_y = cursor_pos.y.saturating_add(1);
     let above_y = cursor_pos.y.saturating_sub(row_count.saturating_add(2));
     let y = if below_y.saturating_add(row_count).saturating_add(2)
-        <= canvas_area.y.saturating_add(canvas_area.height)
+        <= program_area.y.saturating_add(program_area.height)
     {
         below_y
     } else {
-        above_y.max(canvas_area.y)
+        above_y.max(program_area.y)
     };
     let rect = Rect {
         x,
@@ -8521,13 +8521,13 @@ fn render_canvas_smart_clip_picker(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Absolute wrapped position of the cursor within the canvas body:
+/// Absolute wrapped position of the cursor within the program body:
 /// `(visual_row, column_within_row)`, both in the `Wrap { trim: false }`
 /// word-wrap coordinate space the body is laid out with (see
-/// [`canvas_wrap_row_starts`] / [`canvas_wrap_locate`]). `width` is the inner
+/// [`program_wrap_row_starts`] / [`program_wrap_locate`]). `width` is the inner
 /// content width in cells; a zero width collapses the whole buffer onto row 0,
 /// column 0.
-pub(crate) fn canvas_cursor_visual_pos(
+pub(crate) fn program_cursor_visual_pos(
     app: Option<&App>,
     markdown: &str,
     cursor: usize,
@@ -8536,9 +8536,9 @@ pub(crate) fn canvas_cursor_visual_pos(
     if width == 0 {
         return (0, 0);
     }
-    let (line, col) = canvas_line_col(markdown, cursor);
+    let (line, col) = program_line_col(markdown, cursor);
 
-    // The canvas body is rendered with `Wrap { trim: false }`, which WORD-wraps
+    // The program body is rendered with `Wrap { trim: false }`, which WORD-wraps
     // at whitespace (and hard-breaks words longer than the width) rather than
     // slicing every `width` characters. A logical line containing spaces breaks
     // earlier than naive char-division predicts, so the cursor must reuse the
@@ -8547,27 +8547,27 @@ pub(crate) fn canvas_cursor_visual_pos(
     // drifts the moment a line wraps mid-word and compounds for lines below.
     let mut visual_row = 0usize;
     for raw in markdown.lines().take(line) {
-        let text = canvas_rendered_line_text(app, raw);
-        visual_row = visual_row.saturating_add(canvas_wrap_row_starts(&text, width).len());
+        let text = program_rendered_line_text(app, raw);
+        visual_row = visual_row.saturating_add(program_wrap_row_starts(&text, width).len());
     }
 
     let cur_raw = markdown.lines().nth(line).unwrap_or("");
-    let visual_col = canvas_visual_col_for_line(app, cur_raw, col);
-    let starts = canvas_wrap_row_starts(&canvas_rendered_line_text(app, cur_raw), width);
-    let (row_in_line, col_in_row) = canvas_wrap_locate(&starts, visual_col, width);
+    let visual_col = program_visual_col_for_line(app, cur_raw, col);
+    let starts = program_wrap_row_starts(&program_rendered_line_text(app, cur_raw), width);
+    let (row_in_line, col_in_row) = program_wrap_locate(&starts, visual_col, width);
     let visual_row = visual_row.saturating_add(row_in_line);
     (visual_row, col_in_row)
 }
 
-/// Wrapped visual row of the cursor (see [`canvas_cursor_visual_pos`]). Drives
+/// Wrapped visual row of the cursor (see [`program_cursor_visual_pos`]). Drives
 /// the cursor-follow scroll so the caret stays inside the visible window.
-pub(crate) fn canvas_cursor_visual_row(
+pub(crate) fn program_cursor_visual_row(
     app: Option<&App>,
     markdown: &str,
     cursor: usize,
     width: usize,
 ) -> usize {
-    canvas_cursor_visual_pos(app, markdown, cursor, width).0
+    program_cursor_visual_pos(app, markdown, cursor, width).0
 }
 
 /// Total number of wrapped visual rows the whole buffer occupies at `width`,
@@ -8575,11 +8575,11 @@ pub(crate) fn canvas_cursor_visual_row(
 /// in a newline (or is empty). Bounds the scroll offset and drives the scroll
 /// indicator. Defined as "the cursor's row at the very end of the buffer, plus
 /// one" so the last reachable caret row is always `< total`.
-pub(crate) fn canvas_total_visual_rows(app: Option<&App>, markdown: &str, width: usize) -> usize {
+pub(crate) fn program_total_visual_rows(app: Option<&App>, markdown: &str, width: usize) -> usize {
     if width == 0 {
         return markdown.matches('\n').count() + 1;
     }
-    canvas_cursor_visual_pos(app, markdown, markdown.chars().count(), width)
+    program_cursor_visual_pos(app, markdown, markdown.chars().count(), width)
         .0
         .saturating_add(1)
 }
@@ -8588,7 +8588,7 @@ pub(crate) fn canvas_total_visual_rows(app: Option<&App>, markdown: &str, width:
 /// `viewport_height`-row window. Scrolls up so the cursor is the top row when it
 /// sits above the window, and down so it is the bottom row when it sits below;
 /// otherwise the offset is left unchanged.
-pub(crate) fn canvas_follow_scroll(
+pub(crate) fn program_follow_scroll(
     scroll_offset: usize,
     cursor_row: usize,
     viewport_height: usize,
@@ -8605,7 +8605,7 @@ pub(crate) fn canvas_follow_scroll(
     }
 }
 
-/// Inverse of [`canvas_cursor_visual_pos`]: the buffer char offset whose cursor
+/// Inverse of [`program_cursor_visual_pos`]: the buffer char offset whose cursor
 /// paints at absolute visual `(target_row, target_col)` in the word-wrapped
 /// body. Used by vertical navigation (land on a visual row while keeping a
 /// preferred column) and mouse hit-testing (place the cursor where a click fell,
@@ -8616,7 +8616,7 @@ pub(crate) fn canvas_follow_scroll(
 /// `target_col` left of or past a row's content clamps to that row's first or
 /// last offset. Forward visual position is monotonic in char offset, so the
 /// landing offset is the last column on the target row at or before the target.
-pub(crate) fn canvas_visual_to_cursor(
+pub(crate) fn program_visual_to_cursor(
     app: Option<&App>,
     markdown: &str,
     target_row: usize,
@@ -8632,8 +8632,8 @@ pub(crate) fn canvas_visual_to_cursor(
     let mut line_start = 0usize; // char offset of the current line's first char
     let mut owner: Option<(usize, Vec<usize>, &str, usize)> = None;
     for raw in markdown.split('\n') {
-        let rendered = canvas_rendered_line_text(app, raw);
-        let starts = canvas_wrap_row_starts(&rendered, width);
+        let rendered = program_rendered_line_text(app, raw);
+        let starts = program_wrap_row_starts(&rendered, width);
         let row_count = starts.len();
         if target_row < rows_before + row_count {
             owner = Some((line_start, starts, raw, rows_before));
@@ -8653,8 +8653,8 @@ pub(crate) fn canvas_visual_to_cursor(
     let line_len = raw.chars().count();
     let mut best_col = 0usize;
     for raw_col in 0..=line_len {
-        let visual_col = canvas_visual_col_for_line(app, raw, raw_col);
-        let (r, c) = canvas_wrap_locate(&starts, visual_col, width);
+        let visual_col = program_visual_col_for_line(app, raw, raw_col);
+        let (r, c) = program_wrap_locate(&starts, visual_col, width);
         if r < row_in_line || (r == row_in_line && c <= target_col) {
             best_col = raw_col;
         } else {
@@ -8664,18 +8664,18 @@ pub(crate) fn canvas_visual_to_cursor(
     line_start + best_col
 }
 
-/// The inner content width available to the canvas body, derived from the
+/// The inner content width available to the program body, derived from the
 /// popup's outer modal rect: the bordered block removes one cell per side and
-/// the content margin removes [`CANVAS_CONTENT_PADDING_X`] more per side. Mouse
+/// the content margin removes [`PROGRAM_CONTENT_PADDING_X`] more per side. Mouse
 /// hit-testing reuses this so it word-wraps on the exact width
-/// [`render_canvas_popup_at`] paints.
-pub(crate) fn canvas_modal_inner_width(modal: Rect) -> usize {
+/// [`render_program_popup_at`] paints.
+pub(crate) fn program_modal_inner_width(modal: Rect) -> usize {
     (modal.width as usize)
         .saturating_sub(2)
-        .saturating_sub(2 * CANVAS_CONTENT_PADDING_X as usize)
+        .saturating_sub(2 * PROGRAM_CONTENT_PADDING_X as usize)
 }
 
-fn canvas_cursor_position(
+fn program_cursor_position(
     app: Option<&App>,
     markdown: &str,
     cursor: usize,
@@ -8686,7 +8686,7 @@ fn canvas_cursor_position(
         return None;
     }
     let width = area.width as usize;
-    let (visual_row, x) = canvas_cursor_visual_pos(app, markdown, cursor, width);
+    let (visual_row, x) = program_cursor_visual_pos(app, markdown, cursor, width);
     // Translate the absolute wrapped row into a row within the scrolled window;
     // a cursor scrolled above the top or below the bottom has no on-screen cell.
     let visual_row = visual_row.checked_sub(scroll_offset)?;
@@ -8701,12 +8701,12 @@ fn canvas_cursor_position(
 
 /// Locate a display column `visual_col` within a word-wrapped line: return the
 /// `(row, col)` of the wrapped row that holds it, given the per-row starting
-/// display offsets from [`canvas_wrap_row_starts`]. The row is the last one
+/// display offsets from [`program_wrap_row_starts`]. The row is the last one
 /// whose start is at or before `visual_col`; the column is the remainder. A
 /// cursor parked exactly at the right edge of a full row (or inside a run of
 /// collapsed break-whitespace) is rolled onto the next row so it never paints
 /// past the editor edge.
-fn canvas_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (usize, usize) {
+fn program_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (usize, usize) {
     let width = width.max(1);
     let mut row = 0usize;
     for (idx, &start) in starts.iter().enumerate() {
@@ -8734,7 +8734,7 @@ fn canvas_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (usi
 /// the cursor's row count and intra-line column on the same glyphs the body
 /// paints. Verified against ratatui's `TestBackend` output for word breaks,
 /// hard breaks, trailing/leading whitespace, and collapsed multi-space runs.
-fn canvas_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
+fn program_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
     let max = width.max(1);
     // Each buffered glyph carries `(origin, glyph_width)` where `origin` is its
     // display offset in the unwrapped line, so a finished row reports where it
@@ -8838,7 +8838,7 @@ fn canvas_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
 /// trailing space the user just typed survives — `raw.trim()` would drop it,
 /// stranding the cursor at the end of the line because the rendered glyphs and
 /// the cursor column would then disagree on the line's width.
-fn canvas_list_item_content(raw: &str) -> Option<(usize, &str)> {
+fn program_list_item_content(raw: &str) -> Option<(usize, &str)> {
     let trimmed = raw.trim();
     trimmed
         .strip_prefix("- ")
@@ -8856,24 +8856,24 @@ fn canvas_list_item_content(raw: &str) -> Option<(usize, &str)> {
     Some((leading, rest))
 }
 
-/// The plain text the canvas body paints for one logical markdown line, before
+/// The plain text the program body paints for one logical markdown line, before
 /// ratatui word-wraps it. Mirrors the per-line transformation in
-/// [`render_canvas_markdown_lines`] / [`canvas_visual_col_for_line`] — kept
+/// [`render_program_markdown_lines`] / [`program_visual_col_for_line`] — kept
 /// heading markers, the `  • ` list prefix, and expanded smart-clip chips — so
 /// the cursor's wrap math sees exactly the glyphs (and their spaces) ratatui
 /// wraps.
-fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
+fn program_rendered_line_text(app: Option<&App>, raw: &str) -> String {
     let trimmed = raw.trim();
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
         String::new()
-    } else if canvas_heading_level(trimmed).is_some() {
-        canvas_inline_rendered_text(app, trimmed)
-    } else if let Some((_, rest)) = canvas_list_item_content(raw) {
+    } else if program_heading_level(trimmed).is_some() {
+        program_inline_rendered_text(app, trimmed)
+    } else if let Some((_, rest)) = program_list_item_content(raw) {
         format!(
             "{}  • {}",
             " ".repeat(leading),
-            canvas_inline_rendered_text(app, rest)
+            program_inline_rendered_text(app, rest)
         )
     } else {
         // Normal line: the renderer keeps the raw leading whitespace and
@@ -8884,16 +8884,16 @@ fn canvas_rendered_line_text(app: Option<&App>, raw: &str) -> String {
             .map(|(idx, _)| &raw[idx..])
             .unwrap_or("");
         let mut out: String = raw.chars().take(leading).collect();
-        out.push_str(&canvas_inline_rendered_text(app, body));
+        out.push_str(&program_inline_rendered_text(app, body));
         out
     }
 }
 
 /// Expand inline smart-clip chips (`@{…}`) in `text` to the ` label ` form the
 /// renderer paints, leaving the surrounding text untouched. The label comes
-/// from the same source as [`canvas_smart_clip_visual_width`], so the rendered
+/// from the same source as [`program_smart_clip_visual_width`], so the rendered
 /// text and the cursor column stay width-consistent.
-fn canvas_inline_rendered_text(app: Option<&App>, text: &str) -> String {
+fn program_inline_rendered_text(app: Option<&App>, text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
     while let Some(start) = rest.find("@{") {
@@ -8904,7 +8904,7 @@ fn canvas_inline_rendered_text(app: Option<&App>, text: &str) -> String {
             return out;
         };
         let raw_clip = &after_marker[..end];
-        let (_, label) = canvas_smart_clip_label(app, raw_clip);
+        let (_, label) = program_smart_clip_label(app, raw_clip);
         out.push(' ');
         out.push_str(&label);
         out.push(' ');
@@ -8914,7 +8914,7 @@ fn canvas_inline_rendered_text(app: Option<&App>, text: &str) -> String {
     out
 }
 
-/// One smart-clip located within a rendered canvas line: its display-column
+/// One smart-clip located within a rendered program line: its display-column
 /// `visual_start` (counting collapsed break-whitespace, before word-wrap), its
 /// `visual_width`, and the raw clip body so the kind/id can be resolved.
 struct LineClip {
@@ -8923,13 +8923,13 @@ struct LineClip {
     raw_clip: String,
 }
 
-/// Like [`canvas_inline_rendered_text`] but also reports each smart-clip's
+/// Like [`program_inline_rendered_text`] but also reports each smart-clip's
 /// display-column span within the produced text. `base` is the visual column at
 /// which `text` begins on the rendered line (e.g. a bullet's `  • ` prefix), so
 /// the returned spans are in the same coordinate space as
-/// [`canvas_wrap_row_starts`]. The produced string is byte-for-byte what
-/// `canvas_inline_rendered_text` returns.
-fn canvas_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (String, Vec<LineClip>) {
+/// [`program_wrap_row_starts`]. The produced string is byte-for-byte what
+/// `program_inline_rendered_text` returns.
+fn program_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (String, Vec<LineClip>) {
     let mut out = String::new();
     let mut clips = Vec::new();
     let mut visual = base;
@@ -8944,8 +8944,8 @@ fn canvas_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (Stri
             return (out, clips);
         };
         let raw_clip = &after_marker[..end];
-        let width = canvas_smart_clip_visual_width(app, raw_clip);
-        let (_, label) = canvas_smart_clip_label(app, raw_clip);
+        let width = program_smart_clip_visual_width(app, raw_clip);
+        let (_, label) = program_smart_clip_label(app, raw_clip);
         clips.push(LineClip {
             visual_start: visual,
             visual_width: width,
@@ -8961,22 +8961,22 @@ fn canvas_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (Stri
     (out, clips)
 }
 
-/// The plain text the canvas body paints for one logical line (identical to
-/// [`canvas_rendered_line_text`]) paired with the display-column spans of every
+/// The plain text the program body paints for one logical line (identical to
+/// [`program_rendered_line_text`]) paired with the display-column spans of every
 /// smart-clip in it. Computing both from one pass keeps the clip offsets and the
 /// wrapped text perfectly consistent for hit-testing.
-fn canvas_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec<LineClip>) {
+fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec<LineClip>) {
     let trimmed = raw.trim();
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
         (String::new(), Vec::new())
-    } else if canvas_heading_level(trimmed).is_some() {
-        canvas_inline_with_clips(app, trimmed, 0)
+    } else if program_heading_level(trimmed).is_some() {
+        program_inline_with_clips(app, trimmed, 0)
     } else if let Some(rest) = trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
     {
-        let (body, clips) = canvas_inline_with_clips(app, rest, leading + 4);
+        let (body, clips) = program_inline_with_clips(app, rest, leading + 4);
         (format!("{}  • {body}", " ".repeat(leading)), clips)
     } else {
         let body = raw
@@ -8985,23 +8985,23 @@ fn canvas_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec
             .map(|(idx, _)| &raw[idx..])
             .unwrap_or("");
         let lead: String = raw.chars().take(leading).collect();
-        let (body_text, clips) = canvas_inline_with_clips(app, body, leading);
+        let (body_text, clips) = program_inline_with_clips(app, body, leading);
         (format!("{lead}{body_text}"), clips)
     }
 }
 
 /// On-screen cell ranges of every session smart-clip in `markdown`, laid out in
-/// `area` with the same word-wrap as [`canvas_cursor_position`] (ratatui's
+/// `area` with the same word-wrap as [`program_cursor_position`] (ratatui's
 /// `Wrap { trim: false }`). Each session clip maps to one or more
-/// [`CanvasClipHit`]s (one per wrapped-row segment) so the mouse handler can
+/// [`ProgramClipHit`]s (one per wrapped-row segment) so the mouse handler can
 /// resolve a cell → session id for hover-preview and click-to-focus. Clips of
 /// other kinds (harness, response) are skipped.
-pub(crate) fn canvas_session_clip_hits(
+pub(crate) fn program_session_clip_hits(
     app: Option<&App>,
     markdown: &str,
     scroll_offset: usize,
     area: Rect,
-) -> Vec<crate::app::CanvasClipHit> {
+) -> Vec<crate::app::ProgramClipHit> {
     let mut hits = Vec::new();
     if area.width == 0 || area.height == 0 {
         return hits;
@@ -9015,10 +9015,10 @@ pub(crate) fn canvas_session_clip_hits(
         if visual_row_base >= viewport_end {
             break;
         }
-        let (rendered, clips) = canvas_rendered_line_with_clips(app, raw);
-        let starts = canvas_wrap_row_starts(&rendered, width);
+        let (rendered, clips) = program_rendered_line_with_clips(app, raw);
+        let starts = program_wrap_row_starts(&rendered, width);
         for clip in &clips {
-            let (kind, id) = canvas_smart_clip_target(&clip.raw_clip);
+            let (kind, id) = program_smart_clip_target(&clip.raw_clip);
             if kind != "session" {
                 continue;
             }
@@ -9026,7 +9026,7 @@ pub(crate) fn canvas_session_clip_hits(
             // merging contiguous same-row cells into one hit.
             let mut segment: Option<(u16, u16, u16)> = None; // (row, start, end)
             for vcol in clip.visual_start..clip.visual_start.saturating_add(clip.visual_width) {
-                let (row_in_line, col_in_row) = canvas_wrap_locate(&starts, vcol, width);
+                let (row_in_line, col_in_row) = program_wrap_locate(&starts, vcol, width);
                 let abs_row = visual_row_base.saturating_add(row_in_line);
                 if abs_row < scroll_offset {
                     continue; // above the fold (rows grow with the column)
@@ -9045,7 +9045,7 @@ pub(crate) fn canvas_session_clip_hits(
                     }
                     _ => {
                         if let Some((row, col_start, col_end)) = segment.take() {
-                            hits.push(crate::app::CanvasClipHit {
+                            hits.push(crate::app::ProgramClipHit {
                                 col_start,
                                 col_end,
                                 row,
@@ -9057,7 +9057,7 @@ pub(crate) fn canvas_session_clip_hits(
                 }
             }
             if let Some((row, col_start, col_end)) = segment.take() {
-                hits.push(crate::app::CanvasClipHit {
+                hits.push(crate::app::ProgramClipHit {
                     col_start,
                     col_end,
                     row,
@@ -9070,7 +9070,7 @@ pub(crate) fn canvas_session_clip_hits(
     hits
 }
 
-fn canvas_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
+fn program_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
     let mut line = 0usize;
     let mut col = 0usize;
     for (idx, ch) in markdown.chars().enumerate() {
@@ -9087,19 +9087,19 @@ fn canvas_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
     (line, col)
 }
 
-fn canvas_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> usize {
+fn program_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> usize {
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     let trimmed = raw.trim();
     let col = raw_col.saturating_sub(leading);
-    if canvas_heading_level(trimmed).is_some() {
-        canvas_inline_visual_width(app, trimmed, col)
-    } else if let Some((_, rest)) = canvas_list_item_content(raw) {
+    if program_heading_level(trimmed).is_some() {
+        program_inline_visual_width(app, trimmed, col)
+    } else if let Some((_, rest)) = program_list_item_content(raw) {
         // Mirror the proportional indent rendered for nested bullets: the bullet
         // glyph and text sit `leading` columns further right than a top-level
         // item, so the cursor column must account for the same offset. The `- `/
         // `* ` marker is always two chars; the rendered `  • ` prefix is 4 wide.
         // `rest` keeps any trailing space so the column advances past it.
-        leading + 4 + canvas_inline_visual_width(app, rest, col.saturating_sub(2))
+        leading + 4 + program_inline_visual_width(app, rest, col.saturating_sub(2))
     } else if raw_col <= leading {
         raw_col
     } else {
@@ -9108,11 +9108,11 @@ fn canvas_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> u
             .nth(leading)
             .map(|(idx, _)| &raw[idx..])
             .unwrap_or("");
-        leading + canvas_inline_visual_width(app, body, raw_col - leading)
+        leading + program_inline_visual_width(app, body, raw_col - leading)
     }
 }
 
-fn canvas_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> usize {
+fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> usize {
     // Display width of the first `n` chars of `s`, counting wide chars (emoji, CJK) as 2.
     fn chars_display_width(s: &str, n: usize) -> usize {
         s.chars()
@@ -9141,23 +9141,23 @@ fn canvas_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> 
         let raw_clip = &after_marker[..end_b];
         let clip_len = 2 + raw_clip.chars().count() + 1;
         if raw_col <= raw + clip_len {
-            return visual + canvas_smart_clip_visual_width(app, raw_clip);
+            return visual + program_smart_clip_visual_width(app, raw_clip);
         }
-        visual += canvas_smart_clip_visual_width(app, raw_clip);
+        visual += program_smart_clip_visual_width(app, raw_clip);
         raw += clip_len;
         rest = &after_marker[end_b + 1..];
     }
     visual + chars_display_width(rest, raw_col.saturating_sub(raw))
 }
 
-fn canvas_selection_range(popup: &crate::app::CanvasPopup) -> Option<(usize, usize)> {
+fn program_selection_range(popup: &crate::app::ProgramPopup) -> Option<(usize, usize)> {
     let selection = popup.selection.as_ref()?;
     let start = selection.anchor.min(selection.head);
     let end = selection.anchor.max(selection.head);
     (start != end).then_some((start, end))
 }
 
-fn render_canvas_markdown_lines<'a>(
+fn render_program_markdown_lines<'a>(
     app: &App,
     markdown: &'a str,
     selection: Option<(usize, usize)>,
@@ -9171,8 +9171,8 @@ fn render_canvas_markdown_lines<'a>(
         let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
         if trimmed.is_empty() {
             out.push(Line::from(""));
-        } else if let Some(level) = canvas_heading_level(trimmed) {
-            out.push(render_canvas_heading_line(
+        } else if let Some(level) = program_heading_level(trimmed) {
+            out.push(render_program_heading_line(
                 &app.theme,
                 level,
                 trimmed,
@@ -9181,7 +9181,7 @@ fn render_canvas_markdown_lines<'a>(
                 search_matches,
                 search_selected,
             ));
-        } else if let Some((_, rest)) = canvas_list_item_content(raw) {
+        } else if let Some((_, rest)) = program_list_item_content(raw) {
             // Nesting is encoded as leading spaces on the source line; render it
             // as proportional indentation before the bullet so deeper items sit
             // visibly further right than their parents. `rest` keeps any trailing
@@ -9189,7 +9189,7 @@ fn render_canvas_markdown_lines<'a>(
             // for the cursor to land on.
             let bullet = format!("{}  • ", " ".repeat(leading));
             let mut spans = vec![Span::styled(bullet, Style::default().fg(app.theme.accent))];
-            spans.extend(render_canvas_inline_spans(
+            spans.extend(render_program_inline_spans(
                 app,
                 rest,
                 line_start + leading + 2,
@@ -9201,7 +9201,7 @@ fn render_canvas_markdown_lines<'a>(
         } else if let Some(rest) = trimmed.strip_prefix(":::clip") {
             out.push(Line::from(vec![
                 Span::raw("  "),
-                canvas_chip_span(
+                program_chip_span(
                     format!("clip {}", rest.trim()).trim(),
                     app.theme.highlight_fg,
                     app.theme.info,
@@ -9213,7 +9213,7 @@ fn render_canvas_markdown_lines<'a>(
                 Style::default().fg(app.theme.dim),
             )));
         } else {
-            out.push(Line::from(render_canvas_inline_spans(
+            out.push(Line::from(render_program_inline_spans(
                 app,
                 raw,
                 line_start,
@@ -9228,14 +9228,14 @@ fn render_canvas_markdown_lines<'a>(
 }
 
 #[cfg(test)]
-pub(crate) fn render_canvas_markdown_lines_for_test<'a>(
+pub(crate) fn render_program_markdown_lines_for_test<'a>(
     app: &App,
     markdown: &'a str,
 ) -> Vec<Line<'a>> {
-    render_canvas_markdown_lines(app, markdown, None, None, None)
+    render_program_markdown_lines(app, markdown, None, None, None)
 }
 
-fn canvas_heading_level(trimmed: &str) -> Option<u8> {
+fn program_heading_level(trimmed: &str) -> Option<u8> {
     if trimmed.starts_with("### ") {
         Some(3)
     } else if trimmed.starts_with("## ") {
@@ -9247,7 +9247,7 @@ fn canvas_heading_level(trimmed: &str) -> Option<u8> {
     }
 }
 
-fn render_canvas_heading_line<'a>(
+fn render_program_heading_line<'a>(
     theme: &Theme,
     level: u8,
     text: &'a str,
@@ -9262,7 +9262,7 @@ fn render_canvas_heading_line<'a>(
         _ => theme.info,
     };
     let style = Style::default().fg(fg).add_modifier(Modifier::BOLD);
-    Line::from(canvas_text_spans(
+    Line::from(program_text_spans(
         theme,
         text,
         base,
@@ -9273,7 +9273,7 @@ fn render_canvas_heading_line<'a>(
     ))
 }
 
-fn render_canvas_inline_spans<'a>(
+fn render_program_inline_spans<'a>(
     app: &App,
     text: &'a str,
     base: usize,
@@ -9287,7 +9287,7 @@ fn render_canvas_inline_spans<'a>(
     while let Some(start) = rest.find("@{") {
         let (before, after_start) = rest.split_at(start);
         if !before.is_empty() {
-            spans.extend(canvas_text_spans(
+            spans.extend(program_text_spans(
                 &app.theme,
                 before,
                 base + offset,
@@ -9299,7 +9299,7 @@ fn render_canvas_inline_spans<'a>(
         }
         let after_marker = &after_start[2..];
         let Some(end) = after_marker.find('}') else {
-            spans.extend(canvas_text_spans(
+            spans.extend(program_text_spans(
                 &app.theme,
                 after_start,
                 base + offset + before.chars().count(),
@@ -9322,7 +9322,7 @@ fn render_canvas_inline_spans<'a>(
         });
         let clip_is_active_match = clip_match_idx
             .is_some_and(|idx| search_selected == Some(idx));
-        spans.push(canvas_smart_clip_span(
+        spans.push(program_smart_clip_span(
             app,
             raw_clip,
             clip_match_idx.is_some(),
@@ -9332,7 +9332,7 @@ fn render_canvas_inline_spans<'a>(
         rest = &after_marker[end + 1..];
     }
     if !rest.is_empty() {
-        spans.extend(canvas_text_spans(
+        spans.extend(program_text_spans(
             &app.theme,
         rest,
         base + offset,
@@ -9345,7 +9345,7 @@ fn render_canvas_inline_spans<'a>(
     spans
 }
 
-fn canvas_text_spans<'a>(
+fn program_text_spans<'a>(
     theme: &Theme,
     text: &str,
     base: usize,
@@ -9361,7 +9361,7 @@ fn canvas_text_spans<'a>(
     let mut chunk_in_active_match: Option<bool> = None;
     for (idx, ch) in text.chars().enumerate() {
         let absolute_idx = base + idx;
-        let match_idx = search_matches.and_then(|matches| canvas_search_match_index(matches, absolute_idx));
+        let match_idx = search_matches.and_then(|matches| program_search_match_index(matches, absolute_idx));
         let in_match = Some(match_idx.is_some());
         let in_active_match = Some(search_selected.is_some_and(|selected| Some(selected) == match_idx));
         let selected = selection.map(|(sel_start, sel_end)| absolute_idx >= sel_start && absolute_idx < sel_end);
@@ -9372,7 +9372,7 @@ fn canvas_text_spans<'a>(
             if !chunk.is_empty() {
                 spans.push(Span::styled(
                     std::mem::take(&mut chunk),
-                    canvas_text_span_style(
+                    program_text_span_style(
                         theme,
                         style,
                         chunk_selected,
@@ -9390,7 +9390,7 @@ fn canvas_text_spans<'a>(
     if !chunk.is_empty() {
         spans.push(Span::styled(
             chunk,
-            canvas_text_span_style(
+            program_text_span_style(
                 theme,
                 style,
                 chunk_selected,
@@ -9402,7 +9402,7 @@ fn canvas_text_spans<'a>(
     spans
 }
 
-fn canvas_text_span_style(
+fn program_text_span_style(
     theme: &Theme,
     mut style: Style,
     selected: Option<bool>,
@@ -9423,15 +9423,15 @@ fn canvas_text_span_style(
     style
 }
 
-fn canvas_search_match_index(matches: &[(usize, usize)], idx: usize) -> Option<usize> {
+fn program_search_match_index(matches: &[(usize, usize)], idx: usize) -> Option<usize> {
     matches
         .iter()
         .enumerate()
         .find_map(|(i, &(start, end))| (idx >= start && idx < end).then_some(i))
 }
 
-fn canvas_smart_clip_span<'a>(app: &App, raw_clip: &str, in_match: bool, is_active_match: bool) -> Span<'a> {
-    let (kind, label) = canvas_smart_clip_label(Some(app), raw_clip);
+fn program_smart_clip_span<'a>(app: &App, raw_clip: &str, in_match: bool, is_active_match: bool) -> Span<'a> {
+    let (kind, label) = program_smart_clip_label(Some(app), raw_clip);
     let bg = if is_active_match {
         app.theme.highlight_bg
     } else if in_match {
@@ -9451,15 +9451,15 @@ fn canvas_smart_clip_span<'a>(app: &App, raw_clip: &str, in_match: bool, is_acti
     Span::styled(format!(" {} ", label), style)
 }
 
-fn canvas_smart_clip_visual_width(app: Option<&App>, raw_clip: &str) -> usize {
-    let (_, label) = canvas_smart_clip_label(app, raw_clip);
+fn program_smart_clip_visual_width(app: Option<&App>, raw_clip: &str) -> usize {
+    let (_, label) = program_smart_clip_label(app, raw_clip);
     label.chars().count() + 2
 }
 
 /// Parse a smart-clip body (`session:abc`, `harness:codex`, or
 /// `session:abc clip_id=3`) into its `(kind, id)`. The kind selects the chip
 /// styling and label; the id resolves the referenced session/harness.
-fn canvas_smart_clip_target(raw_clip: &str) -> (&str, &str) {
+fn program_smart_clip_target(raw_clip: &str) -> (&str, &str) {
     let first = raw_clip.split_whitespace().next().unwrap_or(raw_clip);
     first.split_once(':').unwrap_or(("clip", first))
 }
@@ -9468,19 +9468,19 @@ fn canvas_smart_clip_target(raw_clip: &str) -> (&str, &str) {
 /// Mirrors the session list's leading lifecycle glyph and name; shows the
 /// harness (not the model) and drops the redundant "session" prefix and the
 /// status word.
-fn canvas_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
+fn program_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
     format!("{} {} · {}", s.state.glyph(), primary_label(s), harness_label(s))
 }
 
-pub(crate) fn canvas_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
-    let (kind, id) = canvas_smart_clip_target(raw_clip);
+pub(crate) fn program_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
+    let (kind, id) = program_smart_clip_target(raw_clip);
     let label = match kind {
         "session" => app
             .and_then(|app| {
                 app.sessions
                     .iter()
                     .find(|s| s.id == id)
-                    .map(canvas_session_clip_label)
+                    .map(program_session_clip_label)
             })
             .unwrap_or_else(|| format!("session {id}")),
         "harness" => app
@@ -9497,7 +9497,7 @@ pub(crate) fn canvas_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) 
     (kind, label)
 }
 
-fn canvas_chip_span<'a>(
+fn program_chip_span<'a>(
     label: impl AsRef<str>,
     fg: ratatui::style::Color,
     bg: ratatui::style::Color,
@@ -9747,11 +9747,11 @@ mod tests {
     }
 
     #[test]
-    fn view_canvas_toggle_tooltip_stays_inside_session_view() {
+    fn view_program_toggle_tooltip_stays_inside_session_view() {
         let view = Rect::new(30, 0, 90, 40);
         let total = Rect::new(0, 0, 120, 40);
-        let (anchor_x, _, anchor_y) = view_canvas_toggle_button_range(view);
-        let rect = view_canvas_toggle_tooltip_rect(view, total, anchor_x, anchor_y, 40, 3);
+        let (anchor_x, _, anchor_y) = view_program_toggle_button_range(view);
+        let rect = view_program_toggle_tooltip_rect(view, total, anchor_x, anchor_y, 40, 3);
 
         assert!(
             rect.x >= view.x,
@@ -9781,9 +9781,9 @@ mod tests {
     #[test]
     fn session_hover_card_uses_narrower_taller_preview_geometry() {
         let (w, h) = session_hover_card_size(
-            CANVAS_CLIP_HOVER_PREVIEW_COLS,
-            CANVAS_CLIP_HOVER_PREVIEW_ROWS,
-            CANVAS_CLIP_HOVER_PREVIEW_COLS,
+            PROGRAM_CLIP_HOVER_PREVIEW_COLS,
+            PROGRAM_CLIP_HOVER_PREVIEW_ROWS,
+            PROGRAM_CLIP_HOVER_PREVIEW_COLS,
         );
         assert_eq!(w, 102, "outer width should be about 20% narrower than 128");
         assert_eq!(h, 14, "outer height should be about 40% taller than 10");
@@ -9802,13 +9802,13 @@ mod tests {
     }
 
     #[test]
-    fn canvas_shimmer_line_sessions_maps_block_to_its_session() {
+    fn program_shimmer_line_sessions_maps_block_to_its_session() {
         // Two blocks; only the first shimmers. Every line of the shimmering
         // block resolves to the session its clip references; the settled block
         // and the blank separator resolve to nothing.
         let md = "- working @{session:s1}\n- detail line\n\n- idle @{session:s2}";
         let active = [true, true, false, false];
-        let got = canvas_shimmer_line_sessions(None, md, &active);
+        let got = program_shimmer_line_sessions(None, md, &active);
         assert_eq!(
             got,
             vec![Some("s1".to_string()), Some("s1".to_string()), None, None]
@@ -9816,78 +9816,78 @@ mod tests {
     }
 
     #[test]
-    fn canvas_shimmer_line_sessions_ignores_blocks_without_a_session_clip() {
+    fn program_shimmer_line_sessions_ignores_blocks_without_a_session_clip() {
         // A shimmering block with no session clip yields no hover target.
         let md = "just running prose\nmore prose";
         let active = [true, true];
         assert_eq!(
-            canvas_shimmer_line_sessions(None, md, &active),
+            program_shimmer_line_sessions(None, md, &active),
             vec![None, None]
         );
     }
 
     #[test]
-    fn canvas_shimmer_session_at_resolves_cursor_to_block_session() {
+    fn program_shimmer_session_at_resolves_cursor_to_block_session() {
         let area = Rect::new(0, 0, 80, 6);
         let md = "- working @{session:s1}\n- detail line\n\n- idle @{session:s2}";
         let line_sessions = vec![Some("s1".to_string()), Some("s1".to_string()), None, None];
         // Both lines of the shimmering block resolve to s1.
         assert_eq!(
-            canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 5, 0),
+            program_shimmer_session_at(None, md, &line_sessions, 0, area, 5, 0),
             Some("s1".to_string())
         );
         assert_eq!(
-            canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 1),
+            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 1),
             Some("s1".to_string())
         );
         // The settled block and out-of-body cells resolve to nothing.
-        assert_eq!(canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 3), None);
-        assert_eq!(canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 99), None);
+        assert_eq!(program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 3), None);
+        assert_eq!(program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 99), None);
     }
 
     #[test]
-    fn canvas_shimmer_session_at_tracks_scroll_offset() {
+    fn program_shimmer_session_at_tracks_scroll_offset() {
         // A target on the third logical row follows the viewport when scrolled.
         let area = Rect::new(0, 0, 80, 6);
         let md = "l0\nl1\n@{session:s2}";
         let line_sessions = vec![None, None, Some("s2".to_string())];
         assert_eq!(
-            canvas_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 2),
+            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 2),
             Some("s2".to_string())
         );
         assert_eq!(
-            canvas_shimmer_session_at(None, md, &line_sessions, 2, area, 0, 0),
+            program_shimmer_session_at(None, md, &line_sessions, 2, area, 0, 0),
             Some("s2".to_string())
         );
     }
 
     #[test]
-    fn canvas_cursor_position_targets_current_character_cell() {
+    fn program_cursor_position_targets_current_character_cell() {
         let area = Rect::new(10, 2, 20, 4);
         assert_eq!(
-            canvas_cursor_position(None, "abc", 1, 0, area),
+            program_cursor_position(None, "abc", 1, 0, area),
             Some(Position { x: 11, y: 2 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_accounts_for_wrapped_lines() {
+    fn program_cursor_position_accounts_for_wrapped_lines() {
         let area = Rect::new(10, 2, 5, 4);
         assert_eq!(
-            canvas_cursor_position(None, "abcdef", 6, 0, area),
+            program_cursor_position(None, "abcdef", 6, 0, area),
             Some(Position { x: 11, y: 3 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_uses_rendered_smart_clip_width() {
+    fn program_cursor_position_uses_rendered_smart_clip_width() {
         let area = Rect::new(10, 2, 80, 4);
         let markdown = "run @{harness:codex} now";
         let cursor = "run @{harness:codex}".chars().count();
         let chip_width = " harness codex ".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position {
                 x: 10 + "run ".chars().count() as u16 + chip_width as u16,
                 y: 2,
@@ -9930,45 +9930,45 @@ mod tests {
     }
 
     #[test]
-    fn canvas_session_clip_label_shows_glyph_name_and_harness() {
+    fn program_session_clip_label_shows_glyph_name_and_harness() {
         let s = clip_test_session("abc123", Some("My Task"), "codex", SessionState::Running);
         // `<glyph> <name> · <harness>` — no "session" prefix, no model, no status word.
-        assert_eq!(canvas_session_clip_label(&s), "● My Task · codex");
-        let label = canvas_session_clip_label(&s);
+        assert_eq!(program_session_clip_label(&s), "● My Task · codex");
+        let label = program_session_clip_label(&s);
         assert!(!label.contains("session"), "dropped the session prefix: {label}");
         assert!(!label.contains("running"), "dropped the status word: {label}");
     }
 
     #[test]
-    fn canvas_session_clip_label_used_by_smart_clip_label() {
+    fn program_session_clip_label_used_by_smart_clip_label() {
         // The chip label routes through the shared session-label helper when the
         // session resolves against the app.
         let s = clip_test_session("s9", Some("Build"), "claude", SessionState::Done);
         let (kind, label) = (
-            canvas_smart_clip_target("session:s9").0,
-            canvas_session_clip_label(&s),
+            program_smart_clip_target("session:s9").0,
+            program_session_clip_label(&s),
         );
         assert_eq!(kind, "session");
         assert_eq!(label, "✓ Build · claude");
     }
 
     #[test]
-    fn canvas_session_clip_hits_map_cells_to_session_ids() {
+    fn program_session_clip_hits_map_cells_to_session_ids() {
         // Two session clips with a harness clip between them: only the session
         // clips produce hits, each over the chip's painted cells (incl. padding).
         let area = Rect::new(0, 0, 80, 6);
         let md = "@{session:s1} mid @{harness:codex} @{session:s2}";
-        let hits = canvas_session_clip_hits(None, md, 0, area);
+        let hits = program_session_clip_hits(None, md, 0, area);
         assert_eq!(
             hits,
             vec![
-                crate::app::CanvasClipHit {
+                crate::app::ProgramClipHit {
                     col_start: 0,
                     col_end: 12,
                     row: 0,
                     session_id: "s1".into(),
                 },
-                crate::app::CanvasClipHit {
+                crate::app::ProgramClipHit {
                     col_start: 33,
                     col_end: 45,
                     row: 0,
@@ -9982,11 +9982,11 @@ mod tests {
     }
 
     #[test]
-    fn canvas_session_clip_hits_span_wrapped_rows() {
+    fn program_session_clip_hits_span_wrapped_rows() {
         // A chip wider than the body wraps; the clip still maps entirely to its
         // session across every row it occupies, with no foreign ids.
         let area = Rect::new(0, 0, 8, 6);
-        let hits = canvas_session_clip_hits(None, "@{session:s1}", 0, area);
+        let hits = program_session_clip_hits(None, "@{session:s1}", 0, area);
         assert!(!hits.is_empty());
         assert!(hits.iter().all(|h| h.session_id == "s1"));
         let rows: std::collections::BTreeSet<u16> = hits.iter().map(|h| h.row).collect();
@@ -9997,13 +9997,13 @@ mod tests {
     }
 
     #[test]
-    fn canvas_session_clip_hits_empty_without_clips() {
+    fn program_session_clip_hits_empty_without_clips() {
         let area = Rect::new(0, 0, 40, 4);
-        assert!(canvas_session_clip_hits(None, "just prose, no clips", 0, area).is_empty());
+        assert!(program_session_clip_hits(None, "just prose, no clips", 0, area).is_empty());
     }
 
-    fn placeholder_template(id: &str, name: &str) -> agentd_protocol::CanvasTemplate {
-        agentd_protocol::CanvasTemplate {
+    fn placeholder_template(id: &str, name: &str) -> agentd_protocol::ProgramTemplate {
+        agentd_protocol::ProgramTemplate {
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -10013,7 +10013,7 @@ mod tests {
     }
 
     #[test]
-    fn canvas_empty_placeholder_offers_clickable_template_buttons() {
+    fn program_empty_placeholder_offers_clickable_template_buttons() {
         let theme = crate::theme::Theme::default();
         let templates = vec![
             placeholder_template("blank", "Blank"),
@@ -10022,7 +10022,7 @@ mod tests {
         ];
         // Inner rect offset from origin to confirm hits use absolute coordinates.
         let inner = Rect::new(2, 1, 76, 20);
-        let (lines, hits) = canvas_empty_placeholder(&theme, &templates, inner);
+        let (lines, hits) = program_empty_placeholder(&theme, &templates, inner);
 
         // Two buttons — "blank" is the empty state itself, so it's filtered out.
         assert_eq!(hits.len(), 2);
@@ -10047,38 +10047,38 @@ mod tests {
     }
 
     #[test]
-    fn canvas_empty_placeholder_falls_back_when_narrow() {
+    fn program_empty_placeholder_falls_back_when_narrow() {
         let theme = crate::theme::Theme::default();
         let templates = vec![placeholder_template("tasks", "Tasks")];
         // Too narrow for an indented bordered button: plain description + tip only.
-        let (_, hits) = canvas_empty_placeholder(&theme, &templates, Rect::new(0, 0, 6, 20));
+        let (_, hits) = program_empty_placeholder(&theme, &templates, Rect::new(0, 0, 6, 20));
         assert!(hits.is_empty());
     }
 
     #[test]
-    fn canvas_empty_placeholder_has_no_buttons_without_templates() {
+    fn program_empty_placeholder_has_no_buttons_without_templates() {
         let theme = crate::theme::Theme::default();
-        let (lines, hits) = canvas_empty_placeholder(&theme, &[], Rect::new(0, 0, 80, 20));
+        let (lines, hits) = program_empty_placeholder(&theme, &[], Rect::new(0, 0, 80, 20));
         assert!(hits.is_empty());
         // Still shows the description and tip prose.
         assert!(!lines.is_empty());
     }
 
     #[test]
-    fn canvas_session_clip_hits_track_scroll_offset() {
+    fn program_session_clip_hits_track_scroll_offset() {
         // A clip on the third logical row (abs visual row 2) shifts up by the
         // scroll offset so its hitbox follows the visible viewport.
         let area = Rect::new(0, 0, 80, 6);
         let md = "l0\nl1\n@{session:s1}\nl3";
-        let unscrolled = canvas_session_clip_hits(None, md, 0, area);
+        let unscrolled = program_session_clip_hits(None, md, 0, area);
         assert_eq!(unscrolled.len(), 1);
         assert_eq!(unscrolled[0].row, 2);
         assert_eq!(unscrolled[0].session_id, "s1");
 
-        let scrolled = canvas_session_clip_hits(None, md, 2, area);
+        let scrolled = program_session_clip_hits(None, md, 2, area);
         assert_eq!(
             scrolled,
-            vec![crate::app::CanvasClipHit {
+            vec![crate::app::ProgramClipHit {
                 col_start: 0,
                 col_end: 12,
                 row: 0,
@@ -10087,11 +10087,11 @@ mod tests {
         );
 
         // Scrolled entirely past the clip: no hit remains.
-        assert!(canvas_session_clip_hits(None, md, 3, area).is_empty());
+        assert!(program_session_clip_hits(None, md, 3, area).is_empty());
     }
 
     #[test]
-    fn canvas_cursor_position_accounts_for_preceding_wrapped_line() {
+    fn program_cursor_position_accounts_for_preceding_wrapped_line() {
         // "abcdef" wraps to two visual rows at width 5, so the next logical
         // line ("XY") starts on the third row (y offset 2), not the second.
         let area = Rect::new(10, 2, 5, 6);
@@ -10099,13 +10099,13 @@ mod tests {
         let cursor = "abcdef\n".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 10, y: 4 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_combines_preceding_wrap_and_intra_line_offset() {
+    fn program_cursor_position_combines_preceding_wrap_and_intra_line_offset() {
         // The preceding line wraps (2 rows) AND the cursor sits past a wrap
         // boundary within its own line: both offsets must accumulate.
         let area = Rect::new(10, 2, 5, 8);
@@ -10113,13 +10113,13 @@ mod tests {
         let cursor = "abcdef\nghijklm".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 12, y: 5 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_offsets_normal_line_below_wrapped_line() {
+    fn program_cursor_position_offsets_normal_line_below_wrapped_line() {
         // "longlineAAAA" (12 cols) wraps to three rows at width 5, so the
         // following non-wrapping line ("short") starts on the fourth row.
         let area = Rect::new(10, 2, 5, 8);
@@ -10127,14 +10127,14 @@ mod tests {
         let cursor = "longlineAAAA\nsh".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 12, y: 5 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_word_wraps_line_with_spaces() {
-        // The canvas body renders with `Wrap { trim: false }`, which WORD-wraps
+    fn program_cursor_position_word_wraps_line_with_spaces() {
+        // The program body renders with `Wrap { trim: false }`, which WORD-wraps
         // at spaces. "hello world foo" at width 8 lays out as three rows
         // ("hello" / "world" / "foo"), so a cursor before "foo" sits at the
         // start of the third row. Naive char-division (col / width) would put
@@ -10144,13 +10144,13 @@ mod tests {
         let cursor = "hello world ".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 10, y: 4 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_word_wrapped_line_offsets_following_line() {
+    fn program_cursor_position_word_wrapped_line_offsets_following_line() {
         // A word-wrapped line consumes the right number of visual rows, so a
         // normal line below it lands on the correct row. "hello world foo" at
         // width 8 is three rows; "next" starts on the fourth. Char-division
@@ -10160,13 +10160,13 @@ mod tests {
         let cursor = "hello world foo\n".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 10, y: 5 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_hard_break_then_space_no_phantom_row() {
+    fn program_cursor_position_hard_break_then_space_no_phantom_row() {
         // "abcd efgh" at width 4: "abcd" exactly fills row 0, the space is the
         // break point (consumed), and "efgh" is row 1 — two rows, not three.
         // A cursor before 'e' sits at row 1 col 0. (A naive `wrap_to_width`
@@ -10177,16 +10177,16 @@ mod tests {
         let cursor = "abcd ".chars().count();
 
         assert_eq!(
-            canvas_cursor_position(None, markdown, cursor, 0, area),
+            program_cursor_position(None, markdown, cursor, 0, area),
             Some(Position { x: 10, y: 3 })
         );
     }
 
     #[test]
-    fn canvas_cursor_position_matches_painted_glyph_on_wrapped_line() {
+    fn program_cursor_position_matches_painted_glyph_on_wrapped_line() {
         // Cross-check the computed cursor cell against the glyph ratatui
         // actually paints, using the exact `Paragraph::wrap(Wrap{trim:false})`
-        // the canvas body uses. The cursor before "foo" must land on the
+        // the program body uses. The cursor before "foo" must land on the
         // painted 'f' at the start of the wrapped row — not somewhere in the
         // middle of "world" as char-division would compute.
         let w = 8u16;
@@ -10195,13 +10195,13 @@ mod tests {
         let markdown = "hello world foo";
         let cursor = "hello world ".chars().count();
 
-        let pos = canvas_cursor_position(None, markdown, cursor, 0, area).expect("cursor pos");
+        let pos = program_cursor_position(None, markdown, cursor, 0, area).expect("cursor pos");
 
         let backend = ratatui::backend::TestBackend::new(w, h);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| {
             // Plain markdown renders one Line == the raw text, so this matches
-            // what `render_canvas_popup_at` feeds the Paragraph for this input.
+            // what `render_program_popup_at` feeds the Paragraph for this input.
             let para = Paragraph::new(markdown).wrap(Wrap { trim: false });
             f.render_widget(para, area);
         })
@@ -10219,7 +10219,7 @@ mod tests {
     }
 
     #[test]
-    fn canvas_cursor_position_accounts_for_wide_emoji() {
+    fn program_cursor_position_accounts_for_wide_emoji() {
         // ⏳ (U+23F3, HOURGLASS WITH FLOWING SAND) is a double-width character
         // (display width 2). The cursor placed just after it must sit at column 2,
         // not column 1, and the character after it must sit at column 3, not 2.
@@ -10228,97 +10228,97 @@ mod tests {
 
         // Cursor at char index 0 (before ⏳) → display col 0.
         assert_eq!(
-            canvas_cursor_position(None, markdown, 0, 0, area),
+            program_cursor_position(None, markdown, 0, 0, area),
             Some(Position { x: 10, y: 2 }),
             "cursor before ⏳ should be at col 0"
         );
         // Cursor at char index 1 (after ⏳) → display col 2 (emoji is 2 wide).
         assert_eq!(
-            canvas_cursor_position(None, markdown, 1, 0, area),
+            program_cursor_position(None, markdown, 1, 0, area),
             Some(Position { x: 12, y: 2 }),
             "cursor after ⏳ should be at col 2 (emoji is double-width)"
         );
         // Cursor at char index 2 (after ⏳ + 'a') → display col 3.
         assert_eq!(
-            canvas_cursor_position(None, markdown, 2, 0, area),
+            program_cursor_position(None, markdown, 2, 0, area),
             Some(Position { x: 13, y: 2 }),
             "cursor after ⏳a should be at col 3"
         );
     }
 
     #[test]
-    fn canvas_visual_to_cursor_accounts_for_wide_emoji() {
+    fn program_visual_to_cursor_accounts_for_wide_emoji() {
         // Inverse: clicking at display column 2 on a line starting with ⏳ should
         // resolve to char offset 1 (just after the emoji), not char offset 2.
         let markdown = "⏳abc";
         // Display col 2 on row 0 (just after ⏳) → char offset 1.
         assert_eq!(
-            canvas_visual_to_cursor(None, markdown, 0, 2, 40),
+            program_visual_to_cursor(None, markdown, 0, 2, 40),
             1,
             "click at display col 2 should land at char offset 1 (after ⏳)"
         );
         // Display col 3 on row 0 (after 'a') → char offset 2.
         assert_eq!(
-            canvas_visual_to_cursor(None, markdown, 0, 3, 40),
+            program_visual_to_cursor(None, markdown, 0, 3, 40),
             2,
             "click at display col 3 should land at char offset 2 (after ⏳a)"
         );
     }
 
     #[test]
-    fn canvas_follow_scroll_advances_when_cursor_below_window() {
+    fn program_follow_scroll_advances_when_cursor_below_window() {
         // Cursor on visual row 19 with a 5-row window anchored at offset 0 must
         // scroll down so the cursor becomes the bottom visible row (offset 15).
-        assert_eq!(canvas_follow_scroll(0, 19, 5), 15);
+        assert_eq!(program_follow_scroll(0, 19, 5), 15);
     }
 
     #[test]
-    fn canvas_follow_scroll_returns_to_top_when_cursor_above_window() {
+    fn program_follow_scroll_returns_to_top_when_cursor_above_window() {
         // Cursor back on row 0 while scrolled to 15 snaps the window to the top.
-        assert_eq!(canvas_follow_scroll(15, 0, 5), 0);
+        assert_eq!(program_follow_scroll(15, 0, 5), 0);
     }
 
     #[test]
-    fn canvas_follow_scroll_unchanged_when_cursor_already_visible() {
-        assert_eq!(canvas_follow_scroll(0, 2, 5), 0);
-        assert_eq!(canvas_follow_scroll(10, 12, 5), 10);
+    fn program_follow_scroll_unchanged_when_cursor_already_visible() {
+        assert_eq!(program_follow_scroll(0, 2, 5), 0);
+        assert_eq!(program_follow_scroll(10, 12, 5), 10);
     }
 
     #[test]
-    fn canvas_cursor_position_subtracts_scroll_offset() {
+    fn program_cursor_position_subtracts_scroll_offset() {
         // Ten single-row lines at width 20; the cursor sits on logical line 7.
         let area = Rect::new(10, 0, 20, 5);
         let markdown = (0..10).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
         let cursor = markdown.find("L7").unwrap();
         // Scrolled past the first 5 rows, row 7 renders two rows into the view.
         assert_eq!(
-            canvas_cursor_position(None, &markdown, cursor, 5, area),
+            program_cursor_position(None, &markdown, cursor, 5, area),
             Some(Position { x: 10, y: 2 })
         );
         // Without scrolling, that row is below the 5-row window: no cell to draw.
-        assert_eq!(canvas_cursor_position(None, &markdown, cursor, 0, area), None);
+        assert_eq!(program_cursor_position(None, &markdown, cursor, 0, area), None);
     }
 
     #[test]
-    fn canvas_total_visual_rows_counts_trailing_empty_line() {
+    fn program_total_visual_rows_counts_trailing_empty_line() {
         // "a\n" is two rows: the text row and the trailing empty row the cursor
         // can sit on. The count must include that final row so the scroll clamp
         // keeps it reachable.
-        assert_eq!(canvas_total_visual_rows(None, "a\n", 20), 2);
-        assert_eq!(canvas_total_visual_rows(None, "", 20), 1);
+        assert_eq!(program_total_visual_rows(None, "a\n", 20), 2);
+        assert_eq!(program_total_visual_rows(None, "", 20), 1);
         // "abcdef" wraps to two rows at width 5.
-        assert_eq!(canvas_total_visual_rows(None, "abcdef", 5), 2);
+        assert_eq!(program_total_visual_rows(None, "abcdef", 5), 2);
     }
 
     #[test]
-    fn canvas_heading_rendering_keeps_markdown_marker() {
+    fn program_heading_rendering_keeps_markdown_marker() {
         let theme = Theme::default();
         assert_eq!(
-            line_text(&render_canvas_heading_line(&theme, 1, "# Todo", 0, None, None, None)),
+            line_text(&render_program_heading_line(&theme, 1, "# Todo", 0, None, None, None)),
             "# Todo"
         );
         assert_eq!(
-            line_text(&render_canvas_heading_line(
+            line_text(&render_program_heading_line(
                 &theme,
                 2,
                 "## Progress",
@@ -10332,9 +10332,9 @@ mod tests {
     }
 
     #[test]
-    fn canvas_text_spans_highlights_search_matches() {
+    fn program_text_spans_highlights_search_matches() {
         let theme = Theme::default();
-        let spans = canvas_text_spans(
+        let spans = program_text_spans(
             &theme,
             "alpha alpha",
             0,
@@ -10360,29 +10360,29 @@ mod tests {
     }
 
     #[test]
-    fn canvas_focus_styles_are_distinct_from_session_focus() {
+    fn program_focus_styles_are_distinct_from_session_focus() {
         let theme = Theme::default();
-        let active_canvas = canvas_border_style(&theme, true);
-        let inactive_canvas = canvas_border_style(&theme, false);
+        let active_program = program_border_style(&theme, true);
+        let inactive_program = program_border_style(&theme, false);
 
         assert_eq!(pane_border_style(&theme, true).fg, Some(theme.border_focused));
-        assert_eq!(active_canvas.fg, Some(theme.accent_alt));
-        assert_eq!(inactive_canvas.fg, active_canvas.fg);
-        assert_ne!(inactive_canvas.fg, Some(theme.border));
-        assert!(active_canvas.add_modifier.contains(Modifier::BOLD));
-        assert!(!inactive_canvas.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(active_program.fg, Some(theme.accent_alt));
+        assert_eq!(inactive_program.fg, active_program.fg);
+        assert_ne!(inactive_program.fg, Some(theme.border));
+        assert!(active_program.add_modifier.contains(Modifier::BOLD));
+        assert!(!inactive_program.add_modifier.contains(Modifier::BOLD));
         assert!(
-            inactive_canvas.add_modifier.contains(Modifier::DIM),
-            "inactive canvas border should dim without switching hue"
+            inactive_program.add_modifier.contains(Modifier::DIM),
+            "inactive program border should dim without switching hue"
         );
-        assert_ne!(active_canvas.fg, pane_border_style(&theme, true).fg);
+        assert_ne!(active_program.fg, pane_border_style(&theme, true).fg);
     }
 
     #[test]
     fn session_menu_icon_dims_when_pane_unfocused() {
         // The session-actions menu glyph (` ☰ `) at the right of the pane title
         // bar is shared by both the chat/PTY session view (`render_detail`) and
-        // the canvas view via `apply_pane_title_right_cluster`. When the pane is
+        // the program view via `apply_pane_title_right_cluster`. When the pane is
         // focused it stays at full brightness; when unfocused it dims to match
         // the unfocused title-bar border. Hover always wins regardless of focus.
         // The chat/PTY session view passes `matrix_close` as the base hue.
@@ -10417,41 +10417,41 @@ mod tests {
     }
 
     #[test]
-    fn canvas_title_menu_icon_matches_canvas_border_color() {
-        // In the CANVAS view's title bar the session-actions ☰ glyph should be
-        // drawn in the canvas border color (the cyan accent the canvas frame
+    fn program_title_menu_icon_matches_program_border_color() {
+        // In the PROGRAM view's title bar the session-actions ☰ glyph should be
+        // drawn in the program border color (the cyan accent the program frame
         // uses) rather than the default chat/PTY session-view close hue. The
         // unfocused-dim and hover behavior from #551 must still compose: focused
         // → border hue, unfocused → border hue + DIM, hover → bold themed text.
         let theme = Theme::default();
 
-        // Derive the base hue the same way the canvas render path does, so the
+        // Derive the base hue the same way the program render path does, so the
         // icon can't drift from the border color it's meant to match.
-        let focused_border = canvas_border_style(&theme, true);
-        let unfocused_border = canvas_border_style(&theme, false);
+        let focused_border = program_border_style(&theme, true);
+        let unfocused_border = program_border_style(&theme, false);
         let base = focused_border.fg.unwrap_or(theme.accent_alt);
 
-        // The base IS the canvas border color, and it's distinct from the
+        // The base IS the program border color, and it's distinct from the
         // session-view default (matrix_close) — otherwise this would be a no-op.
         assert_eq!(Some(base), focused_border.fg);
         assert_eq!(
             focused_border.fg, unfocused_border.fg,
-            "canvas border hue is focus-independent"
+            "program border hue is focus-independent"
         );
         assert_ne!(
             base, theme.matrix_close,
-            "canvas icon must not reuse the session-view close hue"
+            "program icon must not reuse the session-view close hue"
         );
 
         let focused = session_menu_icon_style(&theme, base, false, true);
         let unfocused = session_menu_icon_style(&theme, base, false, false);
         let hovered = session_menu_icon_style(&theme, base, true, true);
 
-        // Focused: canvas border hue at full brightness (matches the frame).
+        // Focused: program border hue at full brightness (matches the frame).
         assert_eq!(focused.fg, focused_border.fg);
         assert!(!focused.add_modifier.contains(Modifier::DIM));
 
-        // Unfocused: same hue, dimmed (tracks the dimmed canvas border).
+        // Unfocused: same hue, dimmed (tracks the dimmed program border).
         assert_eq!(unfocused.fg, focused_border.fg);
         assert!(unfocused.add_modifier.contains(Modifier::DIM));
 
@@ -10462,19 +10462,19 @@ mod tests {
     }
 
     #[test]
-    fn canvas_title_left_layout_places_run_between_name_and_marker() {
+    fn program_title_left_layout_places_run_between_name_and_marker() {
         // The Run button now lives in the LEFT cluster: directly after the
         // ` <glyph> <label>` prefix and left of the ` * modified` marker.
         let rect = Rect::new(0, 0, 100, 12);
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        let layout = canvas_title_left_layout(summary_ref, "sess", rect, true, true);
+        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true);
         let run = layout.run.expect("run button fits at this width");
         let modified = layout.modified.expect("dirty marker present");
 
         assert_eq!(run.2, rect.y, "run sits on the title row");
-        let glyph_w = UnicodeWidthStr::width(canvas_mode_glyph()) as u16;
+        let glyph_w = UnicodeWidthStr::width(program_mode_glyph()) as u16;
         let label_w = UnicodeWidthStr::width(layout.label.as_str()) as u16;
         assert_eq!(
             run.0,
@@ -10483,7 +10483,7 @@ mod tests {
         );
         assert_eq!(
             run.1 - run.0,
-            UnicodeWidthStr::width(CANVAS_RUN_BUTTON) as u16,
+            UnicodeWidthStr::width(PROGRAM_RUN_BUTTON) as u16,
             "run hit spans the ▶ button width"
         );
         assert!(
@@ -10492,7 +10492,7 @@ mod tests {
         );
 
         // The mode toggle stays far left of the Run button.
-        let toggle = canvas_title_toggle_button_range(summary_ref, rect).expect("toggle range");
+        let toggle = program_title_toggle_button_range(summary_ref, rect).expect("toggle range");
         assert!(
             toggle.1 <= run.0,
             "toggle {toggle:?} sits left of run {run:?}"
@@ -10500,7 +10500,7 @@ mod tests {
     }
 
     #[test]
-    fn canvas_title_left_layout_clears_shared_right_cluster() {
+    fn program_title_left_layout_clears_shared_right_cluster() {
         // The left cluster (label + Run + dirty marker) is budgeted so it never
         // overruns the space reserved for the shared right cluster (harness +
         // close), mirroring how the session view budgets its title label. Use a
@@ -10509,7 +10509,7 @@ mod tests {
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        let layout = canvas_title_left_layout(summary_ref, "sess", rect, true, true);
+        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true);
         let run = layout.run.expect("run fits");
         let modified = layout.modified.expect("dirty marker present");
         let left_extent = modified.1.max(run.1);
