@@ -1,4 +1,4 @@
-# 0047-canvas-shimmer-agent-contract
+# 0048-canvas-shimmer-agent-contract
 
 Status: accepted
 Date: 2026-06-27
