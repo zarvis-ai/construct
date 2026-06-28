@@ -1,7 +1,7 @@
 # 0048-program-shimmer-agent-contract
 
 Status: accepted
-Date: 2026-06-27
+Date: 2026-06-28
 Area: harness
 Scope: What an agent executing a program Run must do with per-block shimmer so the animation truthfully tracks unfinished work.
 
@@ -27,7 +27,7 @@ The shimmer's job is to fill the silence between Run and the agent's first write
 
 - The agent-facing instructions and the program-edit tool description must describe shimmer as pending-vs-settled, never tied to a particular execution mechanism. They must not reintroduce an "only when a subagent is actively running" rule, both because the planning pass necessarily marks blocks before any delegated work starts and because delegation is only one of the ways a block can run.
 - The planning-pass-first requirement is surfaced in the program execution prompt itself (the literal turn prompt), not only in the run-context instructions, because salience there is what makes agents actually do it before starting work.
-- Narrowing remains best-effort and system-owned: a pending block the agent never re-touches still clears at turn end via the stop signal in `0042`. The agent contract here only governs which blocks the agent actively keeps shimmering or clears, not the lifecycle backstops.
+- Narrowing remains best-effort and system-owned: a pending block the agent never re-touches still clears via the stop signals in `0042` — the inactivity backstop once the run goes silent, or, for an unmanaged run that no declaration ever narrowed, the owning session returning to idle. Because a run the agent has narrowed is no longer cleared by the owning session merely going idle (`0042`), a self-scheduling agent that delegates a block and returns to awaiting-input keeps that block shimmering until it settles it or the backstop fires. The agent contract here only governs which blocks the agent actively keeps shimmering or clears, not the lifecycle backstops.
 - This is an agent behavior contract, not a system mechanism. The daemon still treats any edit without `shimmer: true` as a clear and re-adds shimmer only for edits that set the flag; this spec constrains how the agent uses that mechanism.
 
 ## Non-Goals

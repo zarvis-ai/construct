@@ -994,6 +994,10 @@ impl SessionManager {
             pending_block_signatures: pending.into_iter().collect(),
             seen_running: false,
             first_output_seen: false,
+            // Unmanaged until the agent narrows it with a declaration/edit.
+            // Until then it is the optimistic full-program shimmer and stays
+            // subject to the owning-session idle stop signal.
+            agent_managed: false,
         };
         if let Ok(mut runs) = self.program_runs.lock() {
             runs.insert(session_id.to_string(), run.clone());
@@ -1013,6 +1017,14 @@ impl SessionManager {
             let Some(run) = runs.get_mut(session_id) else {
                 return;
             };
+            // A declaration/edit during the run means the agent is actively
+            // managing it: from here on, trust the declarations and the
+            // inactivity backstop to clear it, not the owning session's idle
+            // transition (a self-scheduling agent goes idle while delegated or
+            // background work is still in flight). See spec 0042.
+            run.agent_managed = true;
+            // Refresh the inactivity backstop — the run is still being worked.
+            run.expires_at_ms = now_ms + PROGRAM_RUN_MAX_MS;
             run.pending_block_signatures
                 .retain(|sig| current.contains(sig));
             for sig in shimmer_add {
@@ -1060,8 +1072,24 @@ impl SessionManager {
                             updated = true;
                         }
                     }
-                    SessionState::AwaitingInput | SessionState::Done | SessionState::Errored => {
+                    SessionState::Done | SessionState::Errored => {
+                        // Terminal: the owning agent is gone and can never
+                        // settle the remaining blocks, so clear authoritatively
+                        // once the run was seen running — whether or not it is
+                        // agent-managed.
                         if run.seen_running {
+                            clear = true;
+                        }
+                    }
+                    SessionState::AwaitingInput => {
+                        // Idle but still alive. For an unmanaged run (a
+                        // non-declaring harness's optimistic shimmer, never
+                        // narrowed) this is the turn-end stop signal. For a
+                        // managed run it is NOT: a self-scheduling agent goes
+                        // idle while delegated/background work is still pending,
+                        // so keep shimmering and let a later declaration or the
+                        // inactivity backstop clear it. See spec 0042.
+                        if run.seen_running && !run.agent_managed {
                             clear = true;
                         }
                     }
@@ -5935,5 +5963,116 @@ mod tests {
 
         // Run should now be cleared
         assert!(mgr.program_run_snapshot(id).is_none());
+    }
+
+    // A run the agent is actively managing (it has narrowed it with a
+    // declaration/edit) must survive the owning session returning to idle —
+    // the agent delegated work and its own turn ended while that work is still
+    // pending. It clears only when its pending set empties (spec 0042).
+    #[tokio::test]
+    async fn program_run_managed_survives_idle_and_clears_on_settle() {
+        use agentd_protocol::SessionState;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "smanagedrun";
+        let body = "# Alpha\n\n# Beta\n";
+
+        // Fresh run: unmanaged, both blocks pending.
+        let run = mgr
+            .start_program_run(id, body, false)
+            .expect("start_program_run");
+        assert!(!run.agent_managed, "a fresh run is unmanaged");
+        assert_eq!(run.pending_block_signatures.len(), 2);
+
+        // Owning session is seen running.
+        mgr.note_session_state_for_program_run(id, SessionState::Running);
+        assert!(
+            mgr.program_run_snapshot(id)
+                .expect("run present")
+                .seen_running
+        );
+
+        // Planning-pass-style declaration narrows the run (text unchanged, so
+        // both blocks stay pending) and marks it agent-managed.
+        mgr.narrow_program_run(id, body, Default::default());
+        let run = mgr.program_run_snapshot(id).expect("managed run present");
+        assert!(run.agent_managed, "an in-run declaration marks it managed");
+        assert_eq!(run.pending_block_signatures.len(), 2);
+
+        // The agent delegates and its own turn ends → AwaitingInput. The
+        // managed run must NOT clear: delegated work is still pending.
+        mgr.note_session_state_for_program_run(id, SessionState::AwaitingInput);
+        assert_eq!(
+            mgr.program_run_snapshot(id)
+                .expect("managed run survives the owning session going idle")
+                .pending_block_signatures
+                .len(),
+            2
+        );
+
+        // Repeated wake/idle cycles (e.g. a /loop monitor) keep it alive.
+        mgr.note_session_state_for_program_run(id, SessionState::Running);
+        mgr.note_session_state_for_program_run(id, SessionState::AwaitingInput);
+        assert!(mgr.program_run_snapshot(id).is_some(), "still pending");
+
+        // Settle one block (its text changes, dropping its signature); the
+        // other stays pending and the run lives on.
+        mgr.narrow_program_run(id, "# Alpha done\n\n# Beta\n", Default::default());
+        assert_eq!(
+            mgr.program_run_snapshot(id)
+                .expect("one block still pending")
+                .pending_block_signatures,
+            vec!["# Beta".to_string()]
+        );
+
+        // Settling the last block empties the pending set → the run clears.
+        mgr.narrow_program_run(id, "# Alpha done\n\n# Beta done\n", Default::default());
+        assert!(
+            mgr.program_run_snapshot(id).is_none(),
+            "an empty pending set clears the run"
+        );
+    }
+
+    // A terminal owning-session state clears even a managed run with pending
+    // blocks: the agent is gone and can never settle them (spec 0042).
+    #[tokio::test]
+    async fn program_run_managed_clears_on_terminal_state() {
+        use agentd_protocol::SessionState;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "sterminalrun";
+        let body = "# Alpha\n\n# Beta\n";
+        mgr.start_program_run(id, body, false).expect("start");
+        mgr.note_session_state_for_program_run(id, SessionState::Running);
+        mgr.narrow_program_run(id, body, Default::default());
+        assert!(
+            mgr.program_run_snapshot(id).expect("managed").agent_managed,
+            "run is managed with pending blocks"
+        );
+
+        // Errored is terminal → clear despite still-pending blocks.
+        mgr.note_session_state_for_program_run(id, SessionState::Errored);
+        assert!(
+            mgr.program_run_snapshot(id).is_none(),
+            "a terminal state clears a managed run"
+        );
     }
 }

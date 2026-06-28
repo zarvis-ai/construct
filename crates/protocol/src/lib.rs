@@ -912,6 +912,17 @@ pub struct ProgramRunProgress {
     pub seen_running: bool,
     #[serde(default)]
     pub first_output_seen: bool,
+    /// True once an in-run program declaration/edit has narrowed this run —
+    /// i.e. the run is actively managed via per-block declarations rather than
+    /// riding the untouched optimistic full-program shimmer. A managed run is
+    /// cleared by its pending set emptying, a terminal owning-session state, or
+    /// the inactivity backstop — NOT by the owning session merely returning to
+    /// awaiting-input (a self-scheduling agent goes idle while delegated or
+    /// background work is still in flight). An unmanaged run that no
+    /// declaration has narrowed still clears when the owning session goes idle
+    /// after being seen running. See `specs/0042-program-run-progress-affordance.md`.
+    #[serde(default)]
+    pub agent_managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
