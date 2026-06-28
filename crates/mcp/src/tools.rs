@@ -198,6 +198,14 @@ pub fn catalog() -> Vec<Value> {
             schema_obj(&[("session_id", "string", true)]),
         ),
         tool(
+            "construct_archive_session",
+            "Archive a session (soft, reversible): terminate its adapter and hide it from the \
+             session list, but KEEP its transcript and worktree on disk. Unlike delete_session, \
+             nothing is removed and the session can be restarted later. Prefer this over \
+             delete_session when you want to tidy up finished sessions without losing their history.",
+            schema_obj(&[("session_id", "string", true)]),
+        ),
+        tool(
             "construct_pin_session",
             "Pin or unpin a session so it shows as a live tile in the TUI pin strip.",
             json!({
@@ -304,6 +312,13 @@ pub fn catalog() -> Vec<Value> {
         tool(
             "construct_subagent_delete",
             "Delete a subagent owned by the current session.",
+            schema_obj(&[("subagent_id", "string", true)]),
+        ),
+        tool(
+            "construct_subagent_archive",
+            "Archive a subagent owned by the current session (soft, reversible): terminate it but \
+             KEEP its transcript and worktree. Unlike subagent_delete, nothing is wiped and it can \
+             be restarted later. Use this to tidy up finished subagents without losing their work.",
             schema_obj(&[("subagent_id", "string", true)]),
         ),
     ];
@@ -558,6 +573,10 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             client.delete(&arg_str(&args, "session_id")?).await?;
             json!({ "ok": true })
         }
+        "construct_archive_session" => {
+            client.archive(&arg_str(&args, "session_id")?).await?;
+            json!({ "ok": true })
+        }
         "construct_pin_session" => {
             let sid = arg_str(&args, "session_id")?;
             let pinned = args
@@ -703,6 +722,12 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             client.delete(&sid).await?;
             json!({ "ok": true })
         }
+        "construct_subagent_archive" => {
+            let sid = arg_str(&args, "subagent_id")?;
+            owned_subagent_detail(client, session_id, &sid).await?;
+            client.archive(&sid).await?;
+            json!({ "ok": true })
+        }
         "webui_hot_reload" => {
             let dir = args.get("dir").and_then(|v| v.as_str()).map(String::from);
             let res = client.dev_set_assets(dir).await?;
@@ -844,7 +869,25 @@ mod tests {
             "construct_subagent_enqueue",
             "construct_subagent_cancel",
             "construct_subagent_delete",
+            "construct_subagent_archive",
         ] {
+            assert!(names.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn catalog_includes_session_lifecycle_tools() {
+        let names: std::collections::HashSet<String> = catalog()
+            .into_iter()
+            .filter_map(|tool| {
+                tool.get("name")
+                    .and_then(|name| name.as_str())
+                    .map(|name| name.to_string())
+            })
+            .collect();
+
+        // Archive is the soft/reversible sibling of delete; both must be advertised.
+        for expected in ["construct_delete_session", "construct_archive_session"] {
             assert!(names.contains(expected), "missing {expected}");
         }
     }
@@ -966,6 +1009,16 @@ mod tests {
                         );
                         json!(null)
                     }
+                    ipc_method::SESSION_ARCHIVE => {
+                        assert_eq!(
+                            params.get("session_id").and_then(|s| s.as_str()),
+                            Some("ssub")
+                        );
+                        // Archive is soft: flip the flag, keep the record + events.
+                        created.archived = true;
+                        created.state = SessionState::Done;
+                        json!(null)
+                    }
                     ipc_method::SESSION_DELETE => {
                         assert_eq!(
                             params.get("session_id").and_then(|s| s.as_str()),
@@ -1028,6 +1081,27 @@ mod tests {
             json!({ "subagent_id": "ssub" }),
         )
         .await;
+
+        // Archive is the soft, reversible counterpart of delete: it flips the
+        // `archived` flag on the daemon side but leaves the record + transcript
+        // in place. A peek afterwards still returns the subagent and its events.
+        call_tool(
+            &client,
+            Some("sparent"),
+            "construct_subagent_archive",
+            json!({ "subagent_id": "ssub" }),
+        )
+        .await;
+        let after_archive = call_tool(
+            &client,
+            Some("sparent"),
+            "construct_subagent_peek",
+            json!({ "subagent_id": "ssub" }),
+        )
+        .await;
+        assert_eq!(after_archive["summary"]["archived"], true);
+        assert_eq!(after_archive["events"][0]["event"]["text"], "done");
+
         call_tool(
             &client,
             Some("sparent"),

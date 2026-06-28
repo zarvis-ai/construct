@@ -132,6 +132,9 @@ enum Command {
     Kill { session_id: String },
     /// Delete a session entirely (kill if running, remove transcript + worktree).
     Delete { session_id: String },
+    /// Archive a session (soft, reversible): terminate its adapter and hide it
+    /// from the list, but keep its transcript + worktree so it can be restarted.
+    Archive { session_id: String },
     /// Rename a session — sets the user-facing title (shown instead of the
     /// session hash). Pass `--clear` to remove the title and fall back to
     /// the hash.
@@ -502,6 +505,11 @@ async fn main() -> Result<()> {
         Command::Delete { session_id } => {
             let c = connect(&socket).await?;
             c.delete(&session_id).await?;
+            Ok(())
+        }
+        Command::Archive { session_id } => {
+            let c = connect(&socket).await?;
+            c.archive(&session_id).await?;
             Ok(())
         }
         Command::Rename {
