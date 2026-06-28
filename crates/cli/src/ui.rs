@@ -9051,6 +9051,14 @@ fn render_canvas_markdown_lines<'a>(
     out
 }
 
+#[cfg(test)]
+pub(crate) fn render_canvas_markdown_lines_for_test<'a>(
+    app: &App,
+    markdown: &'a str,
+) -> Vec<Line<'a>> {
+    render_canvas_markdown_lines(app, markdown, None, None, None)
+}
+
 fn canvas_heading_level(trimmed: &str) -> Option<u8> {
     if trimmed.starts_with("### ") {
         Some(3)

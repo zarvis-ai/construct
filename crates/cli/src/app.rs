@@ -8636,21 +8636,66 @@ impl App {
     }
 
     fn move_canvas_cursor(&mut self, delta: isize) {
+        let cursor = {
+            let Some(popup) = self.canvas_popup.as_ref() else {
+                return;
+            };
+            self.canvas_horizontal_cursor_target(popup, delta)
+        };
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
-        if delta < 0 {
-            for _ in 0..delta.unsigned_abs() {
-                popup.cursor = canvas_cursor_left(&popup.buffer, popup.cursor);
-            }
-        } else {
-            for _ in 0..delta as usize {
-                popup.cursor = canvas_cursor_right(&popup.buffer, popup.cursor);
-            }
-        }
+        popup.cursor = cursor;
         popup.preferred_col = None;
         Self::update_canvas_selection_head(popup);
         Self::update_canvas_smart_clip_after_cursor_move(popup);
+    }
+
+    fn canvas_horizontal_cursor_target(&self, popup: &CanvasPopup, delta: isize) -> usize {
+        let mut cursor = popup.cursor;
+        let steps = delta.unsigned_abs();
+        let direction = delta.signum();
+        for _ in 0..steps {
+            cursor = self.canvas_horizontal_cursor_step(popup, cursor, direction);
+        }
+        cursor
+    }
+
+    fn canvas_horizontal_cursor_step(
+        &self,
+        popup: &CanvasPopup,
+        cursor: usize,
+        direction: isize,
+    ) -> usize {
+        let Some(inner) = self.layout.canvas_inner_area else {
+            return if direction < 0 {
+                canvas_cursor_left(&popup.buffer, cursor)
+            } else {
+                canvas_cursor_right(&popup.buffer, cursor)
+            };
+        };
+        let width = inner.width as usize;
+        if width == 0 {
+            return cursor;
+        }
+
+        let old_pos = ui::canvas_cursor_visual_pos(Some(self), &popup.buffer, cursor, width);
+        let mut next = cursor;
+        loop {
+            let candidate = if direction < 0 {
+                canvas_cursor_left(&popup.buffer, next)
+            } else {
+                canvas_cursor_right(&popup.buffer, next)
+            };
+            if candidate == next {
+                return candidate;
+            }
+            next = candidate;
+            let new_pos = ui::canvas_cursor_visual_pos(Some(self), &popup.buffer, next, width);
+            if new_pos != old_pos {
+                return next;
+            }
+        }
     }
 
     fn move_canvas_cursor_vertical(&mut self, delta: isize) {
@@ -14122,6 +14167,70 @@ mod tests {
             app.canvas_popup.as_ref().unwrap().cursor,
             2,
             "Ctrl-A must land on list content even when cursor starts on wrapped row"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_down_moves_between_wrapped_rows_inside_list_content() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "* abcdefghij", 4));
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+
+        app.move_canvas_cursor_vertical(1);
+
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            9,
+            "Down should preserve the content column across wrapped bullet rows"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_right_skips_collapsed_wrap_space() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcd efgh", 4));
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 4, 20));
+
+        app.move_canvas_cursor(1);
+
+        assert_eq!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            6,
+            "Right should skip word-wrap break whitespace that does not occupy a painted cell"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_cursor_position_matches_painted_wrapped_list_content() {
+        let (app, _dir, server) = empty_app().await;
+        let markdown = "* alpha beta gamma";
+        let cursor = "* alpha ".chars().count();
+        let width = 6u16;
+        let (row, col) =
+            crate::ui::canvas_cursor_visual_pos(Some(&app), markdown, cursor, width as usize);
+
+        let backend = ratatui::backend::TestBackend::new(width, 6);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| {
+            let lines = crate::ui::render_canvas_markdown_lines_for_test(&app, markdown);
+            let para = ratatui::widgets::Paragraph::new(lines)
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            f.render_widget(para, Rect::new(0, 0, width, 6));
+        })
+        .expect("draw");
+        let glyph = term
+            .backend()
+            .buffer()
+            .cell((col as u16, row as u16))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+
+        assert_eq!(
+            glyph, "b",
+            "computed cursor ({row}, {col}) should sit on painted wrapped list content"
         );
         server.abort();
     }
