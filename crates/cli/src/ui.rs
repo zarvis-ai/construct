@@ -7662,7 +7662,13 @@ fn render_program_popup_at(
         app.layout.program_title_toggle_hit = title_toggle_hit;
         app.layout.program_title_close_hit = show_close.then(|| view_close_button_range(rect));
     }
-    let inner = block.inner(rect).inner(Margin {
+    // Area inside the program's border (title bar excluded), mirroring the
+    // session view's `block.inner(area)`. The content body adds extra padding on
+    // top of this, but the sticky-widget popover must use the un-padded border
+    // inner so its top sits exactly one row below the title bar — the same
+    // y-position as the normal session view (see the widget reveal below).
+    let block_inner = block.inner(rect);
+    let inner = block_inner.inner(Margin {
         horizontal: PROGRAM_CONTENT_PADDING_X,
         vertical: PROGRAM_CONTENT_PADDING_Y,
     });
@@ -7740,7 +7746,17 @@ fn render_program_popup_at(
     if active {
         let panels = session_sticky_widget_panels(app, &popup.program.session_id);
         if !panels.is_empty() {
-            render_visible_dynamic_ui_panels(f, rect, app, &popup.program.session_id, &panels);
+            // Pass the border-stripped inner rect (not the full `rect`) so the
+            // popover starts below the title bar, matching the session view. Using
+            // the full `rect` here put the widget's top on the title row, hiding the
+            // □/■ squares and the other title-bar controls.
+            render_visible_dynamic_ui_panels(
+                f,
+                block_inner,
+                app,
+                &popup.program.session_id,
+                &panels,
+            );
         }
     }
     // Capture session-clip hitboxes for this program so hover can work for any
