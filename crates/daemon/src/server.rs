@@ -5,8 +5,8 @@ use crate::remote::RemoteState;
 use crate::session::{BroadcastMsg, SessionManager};
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
-    ipc_method, ipc_notif, transport, CanvasEditParams, CanvasExecuteParams, CanvasGetParams,
-    CanvasUpdateParams,
+    ipc_method, ipc_notif, transport, ProgramEditParams, ProgramExecuteParams, ProgramGetParams,
+    ProgramUpdateParams,
     ChatViewerActiveResult, CreateSessionParams, ErrorObject, GroupCreateParams, GroupCreateResult,
     GroupDeleteParams, GroupMoveParams, GroupRenameParams, GroupSetCollapsedParams, Notification,
     PingResult, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
@@ -922,7 +922,7 @@ fn forward_broadcast(
             BroadcastMsg::Event(e) => e.session_id == *f,
             BroadcastMsg::State(s) => s.session.id == *f,
             BroadcastMsg::Deleted(d) => d.session_id == *f,
-            BroadcastMsg::CanvasState(c) => c.canvas.session_id == *f,
+            BroadcastMsg::ProgramState(c) => c.program.session_id == *f,
             // Group + remote-state notifications aren't session-
             // specific; always forward even when a session filter
             // is set so the local TUI's remote badge stays accurate
@@ -958,12 +958,12 @@ fn forward_broadcast(
             };
             Notification::new(ipc_notif::DELETED, Some(p))
         }
-        BroadcastMsg::CanvasState(c) => {
+        BroadcastMsg::ProgramState(c) => {
             let p = match serde_json::to_value(&c) {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            Notification::new(ipc_notif::CANVAS_STATE, Some(p))
+            Notification::new(ipc_notif::PROGRAM_STATE, Some(p))
         }
         BroadcastMsg::GroupState(g) => {
             let p = match serde_json::to_value(&g) {
@@ -1049,35 +1049,35 @@ async fn dispatch(
             version: IPC_VERSION.to_string(),
         }),
         m if m == ipc_method::HARNESS_LIST => ok!(&manager.harnesses()),
-        m if m == ipc_method::CANVAS_GET => {
-            let p = params!(CanvasGetParams);
-            match manager.canvas_get(&p.session_id).await {
+        m if m == ipc_method::PROGRAM_GET => {
+            let p = params!(ProgramGetParams);
+            match manager.program_get(&p.session_id).await {
                 Ok(result) => ok!(&result),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
-        m if m == ipc_method::CANVAS_UPDATE => {
-            let p = params!(CanvasUpdateParams);
-            match manager.canvas_update(p).await {
+        m if m == ipc_method::PROGRAM_UPDATE => {
+            let p = params!(ProgramUpdateParams);
+            match manager.program_update(p).await {
                 Ok(result) => ok!(&result),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
-        m if m == ipc_method::CANVAS_EDIT => {
-            let p = params!(CanvasEditParams);
-            match manager.canvas_edit(p).await {
+        m if m == ipc_method::PROGRAM_EDIT => {
+            let p = params!(ProgramEditParams);
+            match manager.program_edit(p).await {
                 Ok(result) => ok!(&result),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
-        m if m == ipc_method::CANVAS_EXECUTE => {
-            let p = params!(CanvasExecuteParams);
-            match manager.canvas_execute(p).await {
+        m if m == ipc_method::PROGRAM_EXECUTE => {
+            let p = params!(ProgramExecuteParams);
+            match manager.program_execute(p).await {
                 Ok(result) => ok!(&result),
                 Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
             }
         }
-        m if m == ipc_method::CANVAS_LIST_TEMPLATES => match manager.canvas_templates() {
+        m if m == ipc_method::PROGRAM_LIST_TEMPLATES => match manager.program_templates() {
             Ok(result) => ok!(&result),
             Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
         },

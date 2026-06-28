@@ -10,17 +10,17 @@ use std::path::{Path, PathBuf};
 pub const TOOL_NAME: &str = "agentd_context";
 pub const ENV_GLOBAL_MEMORY_FILE: &str = "CONSTRUCT_GLOBAL_MEMORY_FILE";
 pub const ENV_PROJECT_MEMORY_FILE: &str = "CONSTRUCT_PROJECT_MEMORY_FILE";
-pub const ENV_CANVAS_RUN_CONTEXT_FILE: &str = "CONSTRUCT_CANVAS_RUN_CONTEXT_FILE";
+pub const ENV_PROGRAM_RUN_CONTEXT_FILE: &str = "CONSTRUCT_PROGRAM_RUN_CONTEXT_FILE";
 pub const ENV_PROJECT_ID: &str = "CONSTRUCT_PROJECT_ID";
 pub const ENV_SESSION_ID: &str = "CONSTRUCT_SESSION_ID";
 pub const ENV_SESSION_WIDGETS_DIR: &str = "CONSTRUCT_SESSION_WIDGETS_DIR";
 pub const MAX_MEMORY_BYTES: usize = 24 * 1024;
-pub const MAX_CANVAS_RUN_CONTEXT_BYTES: usize = 1024 * 1024;
+pub const MAX_PROGRAM_RUN_CONTEXT_BYTES: usize = 1024 * 1024;
 
 pub const MCP_CONTEXT_ENV_VARS: &[&str] = &[
     ENV_GLOBAL_MEMORY_FILE,
     ENV_PROJECT_MEMORY_FILE,
-    ENV_CANVAS_RUN_CONTEXT_FILE,
+    ENV_PROGRAM_RUN_CONTEXT_FILE,
     ENV_PROJECT_ID,
     ENV_SESSION_WIDGETS_DIR,
     "CONSTRUCT_RUNTIME_DIR",
@@ -30,7 +30,7 @@ pub const MCP_CONTEXT_ENV_VARS: &[&str] = &[
 ];
 
 pub const TOOL_DESCRIPTION: &str =
-    "Load construct global/project memory, pending canvas-run context, session widget paths, and operating context. Call this before starting any user task, before planning, and before using other tools. If canvas_run is present, treat it as the authoritative current canvas execution payload. Use the returned memory as durable context, follow its maintenance policy, update listed Markdown memory files with normal file tools when you learn durable information, and create/update session widgets when compact task status or actions would help the user.";
+    "Load construct global/project memory, pending program-run context, session widget paths, and operating context. Call this before starting any user task, before planning, and before using other tools. If program_run is present, treat it as the authoritative current program execution payload. Use the returned memory as durable context, follow its maintenance policy, update listed Markdown memory files with normal file tools when you learn durable information, and create/update session widgets when compact task status or actions would help the user.";
 
 const WIDGET_POLICY: &[&str] = &[
     "Use session widgets for compact task status, checklists, decision prompts, and action links that help the user monitor or steer the current session.",
@@ -77,7 +77,7 @@ pub struct AgentdContext {
     pub project_memory: Option<MemoryFile>,
     pub session_widgets: Option<WidgetDirectory>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub canvas_run: Option<CanvasRunContext>,
+    pub program_run: Option<ProgramRunContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -105,18 +105,18 @@ pub struct WidgetDirectory {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CanvasRunContext {
+pub struct ProgramRunContext {
     pub session_id: String,
-    pub canvas_version: u64,
-    pub canvas_updated_at_ms: i64,
+    pub program_version: u64,
+    pub program_updated_at_ms: i64,
     pub scope: String,
     pub instructions: Vec<String>,
-    pub smart_clips: Vec<CanvasSmartClipReference>,
+    pub smart_clips: Vec<ProgramSmartClipReference>,
     pub markdown: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CanvasSmartClipReference {
+pub struct ProgramSmartClipReference {
     pub type_name: String,
     pub syntax: String,
     pub description: String,
@@ -126,7 +126,7 @@ pub fn build_from_env() -> AgentdContext {
     let global_path = std::env::var_os(ENV_GLOBAL_MEMORY_FILE).map(PathBuf::from);
     let project_path = std::env::var_os(ENV_PROJECT_MEMORY_FILE).map(PathBuf::from);
     let widgets_dir = std::env::var_os(ENV_SESSION_WIDGETS_DIR).map(PathBuf::from);
-    let canvas_run_path = std::env::var_os(ENV_CANVAS_RUN_CONTEXT_FILE).map(PathBuf::from);
+    let program_run_path = std::env::var_os(ENV_PROGRAM_RUN_CONTEXT_FILE).map(PathBuf::from);
     AgentdContext {
         session_id: std::env::var(ENV_SESSION_ID).ok(),
         project_id: std::env::var(ENV_PROJECT_ID).ok(),
@@ -134,7 +134,7 @@ pub fn build_from_env() -> AgentdContext {
             "Use this context before starting work in this construct session.".to_string(),
             "Read global_memory and project_memory, if present, before planning or making changes."
                 .to_string(),
-            "If canvas_run is present, read it before acting; it contains the latest canvas Markdown, selected/full scope, smart clip reference, and autonomous run instructions for a canvas execution turn.".to_string(),
+            "If program_run is present, read it before acting; it contains the latest program Markdown, selected/full scope, smart clip reference, and autonomous run instructions for a program execution turn.".to_string(),
             "When you learn durable information, update the listed Markdown memory file directly with normal file tools according to memory_policy.".to_string(),
             "When compact task status or actions would help the user, create/update Markdown widgets in session_widgets.dir according to widget_policy.".to_string(),
         ],
@@ -144,7 +144,7 @@ pub fn build_from_env() -> AgentdContext {
         global_memory: global_path.as_deref().and_then(load_bounded),
         project_memory: project_path.as_deref().and_then(load_bounded),
         session_widgets: widgets_dir.as_deref().map(widget_directory),
-        canvas_run: canvas_run_path.as_deref().and_then(load_canvas_run_context),
+        program_run: program_run_path.as_deref().and_then(load_program_run_context),
     }
 }
 
@@ -203,9 +203,9 @@ fn load_bounded(path: &Path) -> Option<MemoryFile> {
     })
 }
 
-fn load_canvas_run_context(path: &Path) -> Option<CanvasRunContext> {
+fn load_program_run_context(path: &Path) -> Option<ProgramRunContext> {
     let bytes = std::fs::read(path).ok()?;
-    if bytes.len() > MAX_CANVAS_RUN_CONTEXT_BYTES {
+    if bytes.len() > MAX_PROGRAM_RUN_CONTEXT_BYTES {
         return None;
     }
     serde_json::from_slice(&bytes).ok()
@@ -331,31 +331,31 @@ mod tests {
     }
 
     #[test]
-    fn loads_canvas_run_context_from_env() {
+    fn loads_program_run_context_from_env() {
         let _g = ENV_LOCK.lock().unwrap();
-        let tmp = temp_dir("canvas-run");
-        let canvas_run = tmp.join("canvas-run-context.json");
-        let body = CanvasRunContext {
+        let tmp = temp_dir("program-run");
+        let program_run = tmp.join("program-run-context.json");
+        let body = ProgramRunContext {
             session_id: "s123".to_string(),
-            canvas_version: 7,
-            canvas_updated_at_ms: 42,
+            program_version: 7,
+            program_updated_at_ms: 42,
             scope: "selection".to_string(),
-            instructions: vec!["Read this canvas run before acting.".to_string()],
-            smart_clips: vec![CanvasSmartClipReference {
+            instructions: vec!["Read this program run before acting.".to_string()],
+            smart_clips: vec![ProgramSmartClipReference {
                 type_name: "session".to_string(),
                 syntax: "@{session:<session_id> ...}".to_string(),
                 description: "References an existing session.".to_string(),
             }],
             markdown: "# Plan\n\n- ship it".to_string(),
         };
-        std::fs::write(&canvas_run, serde_json::to_vec(&body).unwrap()).unwrap();
-        std::env::set_var(ENV_CANVAS_RUN_CONTEXT_FILE, &canvas_run);
+        std::fs::write(&program_run, serde_json::to_vec(&body).unwrap()).unwrap();
+        std::env::set_var(ENV_PROGRAM_RUN_CONTEXT_FILE, &program_run);
 
         let context = build_from_env();
 
         clear_env();
 
-        assert_eq!(context.canvas_run, Some(body));
+        assert_eq!(context.program_run, Some(body));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
@@ -365,7 +365,7 @@ mod tests {
         std::env::remove_var(ENV_PROJECT_MEMORY_FILE);
         std::env::remove_var(ENV_PROJECT_ID);
         std::env::remove_var(ENV_SESSION_WIDGETS_DIR);
-        std::env::remove_var(ENV_CANVAS_RUN_CONTEXT_FILE);
+        std::env::remove_var(ENV_PROGRAM_RUN_CONTEXT_FILE);
     }
 
     fn temp_dir(name: &str) -> PathBuf {

@@ -15,7 +15,7 @@
 //! ```
 
 use agentd_protocol::{
-    CanvasDocument, CanvasEdit, CanvasRevision, CanvasTemplate, CanvasUpdateActor, GroupSummary,
+    ProgramDocument, ProgramEdit, ProgramRevision, ProgramTemplate, ProgramUpdateActor, GroupSummary,
     SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
 };
 use anyhow::{Context, Result};
@@ -27,9 +27,9 @@ const GLOBAL_MEMORY_TEMPLATE: &str =
     "# Global Memory\n\n## Preferences\n\n## Workflows\n\n## Pitfalls\n";
 const PROJECT_MEMORY_TEMPLATE: &str =
     "# Project Memory\n\n## Overview\n\n## Architecture\n\n## Workflows\n\n## Decisions\n\n## Pitfalls\n";
-const CANVAS_REVISION_LIMIT: usize = 50;
-const BLANK_CANVAS: &str = "";
-const TASKS_CANVAS: &str = concat!(
+const PROGRAM_REVISION_LIMIT: usize = 50;
+const BLANK_PROGRAM: &str = "";
+const TASKS_PROGRAM: &str = concat!(
     "# Tasks\n",
     "\n",
     "Press Run (or select a section, then Run) to put the agent to work: it ",
@@ -49,10 +49,10 @@ const TASKS_CANVAS: &str = concat!(
     "\n",
     "## Done\n",
 );
-const INVESTIGATION_CANVAS: &str = concat!(
+const INVESTIGATION_PROGRAM: &str = concat!(
     "# Investigation\n",
     "\n",
-    "Run this canvas to investigate autonomously: the agent works the Plan, ",
+    "Run this program to investigate autonomously: the agent works the Plan, ",
     "gathers evidence into Findings, and keeps going until the Question is ",
     "answered. Select a single step and Run to scope the work narrowly, or hand a ",
     "sub-investigation to a subagent by naming a harness like @{harness:claude}.\n",
@@ -95,7 +95,7 @@ struct WidgetFrontmatter {
 /// appends `new_string` to the end of the document. A missing anchor or an
 /// ambiguous one (multiple matches without `replace_all`) is an error — the
 /// signal that the targeted text genuinely changed underneath the writer.
-pub fn apply_canvas_edits(base: &str, edits: &[CanvasEdit]) -> Result<String> {
+pub fn apply_program_edits(base: &str, edits: &[ProgramEdit]) -> Result<String> {
     let mut working = base.to_string();
     for (i, edit) in edits.iter().enumerate() {
         if edit.old_string.is_empty() {
@@ -112,12 +112,12 @@ pub fn apply_canvas_edits(base: &str, edits: &[CanvasEdit]) -> Result<String> {
         let matches = working.matches(&edit.old_string).count();
         match matches {
             0 => anyhow::bail!(
-                "canvas edit {}: old_string not found in the current canvas:\n{}",
+                "program edit {}: old_string not found in the current program:\n{}",
                 i + 1,
                 edit.old_string
             ),
             n if n > 1 && !edit.replace_all => anyhow::bail!(
-                "canvas edit {}: old_string is not unique ({} matches); add surrounding context or set replace_all",
+                "program edit {}: old_string is not unique ({} matches); add surrounding context or set replace_all",
                 i + 1,
                 n
             ),
@@ -134,7 +134,7 @@ pub fn apply_canvas_edits(base: &str, edits: &[CanvasEdit]) -> Result<String> {
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct CanvasMeta {
+struct ProgramMeta {
     #[serde(default)]
     version: u64,
     #[serde(default)]
@@ -144,7 +144,7 @@ struct CanvasMeta {
 }
 
 #[derive(Debug, Default)]
-struct CanvasTemplateFrontmatter {
+struct ProgramTemplateFrontmatter {
     name: Option<String>,
     description: Option<String>,
 }
@@ -309,27 +309,51 @@ impl Storage {
         self.session_dir(id).join("widgets")
     }
 
-    pub fn canvas_path(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("canvas.md")
+    pub fn program_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("program.md")
     }
 
-    pub fn canvas_meta_path(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("canvas.json")
+    pub fn program_meta_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("program.json")
     }
 
-    pub fn canvas_revisions_path(&self, id: &str) -> PathBuf {
-        self.session_dir(id).join("canvas-revisions.jsonl")
+    pub fn program_revisions_path(&self, id: &str) -> PathBuf {
+        self.session_dir(id).join("program-revisions.jsonl")
     }
 
-    pub fn canvas_templates_dir(&self) -> PathBuf {
-        self.data_dir.join("canvas").join("templates")
+    pub fn program_templates_dir(&self) -> PathBuf {
+        self.data_dir.join("program").join("templates")
     }
 
-    pub fn read_canvas(&self, id: &str) -> Result<CanvasDocument> {
+    /// One-time, idempotent migration: the per-session program document was
+    /// formerly named "canvas". Rename any surviving `canvas.*` artifacts to
+    /// their `program.*` counterparts on first access so existing sessions keep
+    /// their content after the rename. Only renames when the legacy file exists
+    /// and the new file does not, so it is safe to call on every read.
+    fn migrate_legacy_program_files(&self, id: &str) {
+        let dir = self.session_dir(id);
+        for (old, new) in [
+            ("canvas.md", "program.md"),
+            ("canvas.json", "program.json"),
+            ("canvas-revisions.jsonl", "program-revisions.jsonl"),
+            ("canvas-run-context.json", "program-run-context.json"),
+        ] {
+            let old_path = dir.join(old);
+            let new_path = dir.join(new);
+            if old_path.exists() && !new_path.exists() {
+                if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                    tracing::warn!(session = %id, old, new, error = %e, "migrate legacy canvas file failed");
+                }
+            }
+        }
+    }
+
+    pub fn read_program(&self, id: &str) -> Result<ProgramDocument> {
         self.ensure_session_dir(id)?;
-        let markdown = std::fs::read_to_string(self.canvas_path(id)).unwrap_or_default();
-        let meta = self.read_canvas_meta(id).unwrap_or_default();
-        Ok(CanvasDocument {
+        self.migrate_legacy_program_files(id);
+        let markdown = std::fs::read_to_string(self.program_path(id)).unwrap_or_default();
+        let meta = self.read_program_meta(id).unwrap_or_default();
+        Ok(ProgramDocument {
             session_id: id.to_string(),
             markdown,
             version: meta.version,
@@ -338,29 +362,29 @@ impl Storage {
         })
     }
 
-    pub fn update_canvas(
+    pub fn update_program(
         &self,
         id: &str,
         markdown: String,
-        actor: CanvasUpdateActor,
+        actor: ProgramUpdateActor,
         base_version: Option<u64>,
         template_id: Option<String>,
         note: Option<String>,
-    ) -> Result<CanvasDocument> {
-        let current = self.read_canvas(id)?;
+    ) -> Result<ProgramDocument> {
+        let current = self.read_program(id)?;
         if let Some(base) = base_version {
             if base != current.version {
                 anyhow::bail!(
-                    "canvas conflict: current version is {}, attempted base version is {}",
+                    "program conflict: current version is {}, attempted base version is {}",
                     current.version,
                     base
                 );
             }
         }
-        if actor == CanvasUpdateActor::Agent && current.version > 0 {
-            self.append_canvas_revision(
+        if actor == ProgramUpdateActor::Agent && current.version > 0 {
+            self.append_program_revision(
                 id,
-                CanvasRevision {
+                ProgramRevision {
                     version: current.version,
                     actor,
                     at_ms: current.updated_at_ms,
@@ -370,48 +394,48 @@ impl Storage {
             )?;
         }
         self.ensure_session_dir(id)?;
-        let next = CanvasDocument {
+        let next = ProgramDocument {
             session_id: id.to_string(),
             markdown,
             version: current.version.saturating_add(1),
             updated_at_ms: chrono::Utc::now().timestamp_millis(),
             template_id: template_id.or(current.template_id),
         };
-        let canvas_tmp = self.canvas_path(id).with_extension("md.tmp");
-        std::fs::write(&canvas_tmp, &next.markdown)
-            .with_context(|| format!("write {}", canvas_tmp.display()))?;
-        std::fs::rename(&canvas_tmp, self.canvas_path(id))
-            .with_context(|| format!("rename {}", self.canvas_path(id).display()))?;
-        self.save_canvas_meta(&next)?;
+        let program_tmp = self.program_path(id).with_extension("md.tmp");
+        std::fs::write(&program_tmp, &next.markdown)
+            .with_context(|| format!("write {}", program_tmp.display()))?;
+        std::fs::rename(&program_tmp, self.program_path(id))
+            .with_context(|| format!("rename {}", self.program_path(id).display()))?;
+        self.save_program_meta(&next)?;
         Ok(next)
     }
 
-    /// Apply a sequence of anchored edits to the *latest* canvas content and
-    /// persist the result as a new version. Unlike [`Self::update_canvas`],
+    /// Apply a sequence of anchored edits to the *latest* program content and
+    /// persist the result as a new version. Unlike [`Self::update_program`],
     /// there is no `base_version` gate: edits are anchored to text, so
     /// concurrent changes to *other* regions merge cleanly. Returns an error
     /// — and writes nothing — when any edit's anchor is missing or ambiguous,
     /// so the caller can re-read and retry. A no-op edit set leaves the version
     /// untouched.
-    pub fn edit_canvas(
+    pub fn edit_program(
         &self,
         id: &str,
-        edits: &[CanvasEdit],
-        actor: CanvasUpdateActor,
+        edits: &[ProgramEdit],
+        actor: ProgramUpdateActor,
         note: Option<String>,
-    ) -> Result<CanvasDocument> {
+    ) -> Result<ProgramDocument> {
         if edits.is_empty() {
-            anyhow::bail!("canvas edit: no edits provided");
+            anyhow::bail!("program edit: no edits provided");
         }
-        let current = self.read_canvas(id)?;
-        let markdown = apply_canvas_edits(&current.markdown, edits)?;
+        let current = self.read_program(id)?;
+        let markdown = apply_program_edits(&current.markdown, edits)?;
         if markdown == current.markdown {
             return Ok(current);
         }
-        if actor == CanvasUpdateActor::Agent && current.version > 0 {
-            self.append_canvas_revision(
+        if actor == ProgramUpdateActor::Agent && current.version > 0 {
+            self.append_program_revision(
                 id,
-                CanvasRevision {
+                ProgramRevision {
                     version: current.version,
                     actor,
                     at_ms: current.updated_at_ms,
@@ -421,24 +445,24 @@ impl Storage {
             )?;
         }
         self.ensure_session_dir(id)?;
-        let next = CanvasDocument {
+        let next = ProgramDocument {
             session_id: id.to_string(),
             markdown,
             version: current.version.saturating_add(1),
             updated_at_ms: chrono::Utc::now().timestamp_millis(),
             template_id: current.template_id.clone(),
         };
-        let canvas_tmp = self.canvas_path(id).with_extension("md.tmp");
-        std::fs::write(&canvas_tmp, &next.markdown)
-            .with_context(|| format!("write {}", canvas_tmp.display()))?;
-        std::fs::rename(&canvas_tmp, self.canvas_path(id))
-            .with_context(|| format!("rename {}", self.canvas_path(id).display()))?;
-        self.save_canvas_meta(&next)?;
+        let program_tmp = self.program_path(id).with_extension("md.tmp");
+        std::fs::write(&program_tmp, &next.markdown)
+            .with_context(|| format!("write {}", program_tmp.display()))?;
+        std::fs::rename(&program_tmp, self.program_path(id))
+            .with_context(|| format!("rename {}", self.program_path(id).display()))?;
+        self.save_program_meta(&next)?;
         Ok(next)
     }
 
-    pub fn read_canvas_revisions(&self, id: &str) -> Result<Vec<CanvasRevision>> {
-        let path = self.canvas_revisions_path(id);
+    pub fn read_program_revisions(&self, id: &str) -> Result<Vec<ProgramRevision>> {
+        let path = self.program_revisions_path(id);
         if !path.exists() {
             return Ok(Vec::new());
         }
@@ -450,43 +474,53 @@ impl Storage {
             if line.trim().is_empty() {
                 continue;
             }
-            match serde_json::from_str::<CanvasRevision>(&line) {
+            match serde_json::from_str::<ProgramRevision>(&line) {
                 Ok(revision) => revisions.push(revision),
-                Err(e) => tracing::warn!(session = %id, error = %e, "skip bad canvas revision"),
+                Err(e) => tracing::warn!(session = %id, error = %e, "skip bad program revision"),
             }
         }
         Ok(revisions)
     }
 
-    pub fn canvas_templates(&self) -> Result<Vec<CanvasTemplate>> {
+    pub fn program_templates(&self) -> Result<Vec<ProgramTemplate>> {
         let mut templates = vec![
-            CanvasTemplate {
+            ProgramTemplate {
                 id: "blank".to_string(),
                 name: "Blank".to_string(),
-                description: Some("Start with an empty orchestration canvas".to_string()),
-                markdown: BLANK_CANVAS.to_string(),
+                description: Some("Start with an empty orchestration program".to_string()),
+                markdown: BLANK_PROGRAM.to_string(),
                 built_in: true,
             },
-            CanvasTemplate {
+            ProgramTemplate {
                 id: "tasks".to_string(),
                 name: "Tasks".to_string(),
                 description: Some(
                     "Todo / Progress / Done board the agent runs and delegates".to_string(),
                 ),
-                markdown: TASKS_CANVAS.to_string(),
+                markdown: TASKS_PROGRAM.to_string(),
                 built_in: true,
             },
-            CanvasTemplate {
+            ProgramTemplate {
                 id: "investigation".to_string(),
                 name: "Investigation".to_string(),
                 description: Some(
                     "Question, context, plan, findings, and done — run to investigate".to_string(),
                 ),
-                markdown: INVESTIGATION_CANVAS.to_string(),
+                markdown: INVESTIGATION_PROGRAM.to_string(),
                 built_in: true,
             },
         ];
-        let dir = self.canvas_templates_dir();
+        let dir = self.program_templates_dir();
+        // Migrate user templates from the former `canvas/templates` location.
+        let legacy_dir = self.data_dir.join("canvas").join("templates");
+        if legacy_dir.exists() && !dir.exists() {
+            if let Some(parent) = dir.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::rename(&legacy_dir, &dir) {
+                tracing::warn!(error = %e, "migrate legacy canvas templates dir failed");
+            }
+        }
         if dir.exists() {
             for entry in
                 std::fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))?
@@ -502,12 +536,12 @@ impl Storage {
                 let raw = match std::fs::read_to_string(&path) {
                     Ok(raw) => raw,
                     Err(e) => {
-                        tracing::warn!(path = %path.display(), error = ?e, "skip unreadable canvas template");
+                        tracing::warn!(path = %path.display(), error = ?e, "skip unreadable program template");
                         continue;
                     }
                 };
-                let (frontmatter, markdown) = parse_canvas_template_frontmatter(&raw);
-                templates.push(CanvasTemplate {
+                let (frontmatter, markdown) = parse_program_template_frontmatter(&raw);
+                templates.push(ProgramTemplate {
                     id: stem.to_string(),
                     name: frontmatter
                         .name
@@ -527,23 +561,23 @@ impl Storage {
         Ok(templates)
     }
 
-    fn read_canvas_meta(&self, id: &str) -> Result<CanvasMeta> {
-        let path = self.canvas_meta_path(id);
+    fn read_program_meta(&self, id: &str) -> Result<ProgramMeta> {
+        let path = self.program_meta_path(id);
         if !path.exists() {
-            return Ok(CanvasMeta::default());
+            return Ok(ProgramMeta::default());
         }
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
     }
 
-    fn save_canvas_meta(&self, canvas: &CanvasDocument) -> Result<()> {
-        self.ensure_session_dir(&canvas.session_id)?;
-        let meta = CanvasMeta {
-            version: canvas.version,
-            updated_at_ms: canvas.updated_at_ms,
-            template_id: canvas.template_id.clone(),
+    fn save_program_meta(&self, program: &ProgramDocument) -> Result<()> {
+        self.ensure_session_dir(&program.session_id)?;
+        let meta = ProgramMeta {
+            version: program.version,
+            updated_at_ms: program.updated_at_ms,
+            template_id: program.template_id.clone(),
         };
-        let path = self.canvas_meta_path(&canvas.session_id);
+        let path = self.program_meta_path(&program.session_id);
         let tmp = path.with_extension("json.tmp");
         let json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
@@ -551,12 +585,12 @@ impl Storage {
         Ok(())
     }
 
-    fn append_canvas_revision(&self, id: &str, revision: CanvasRevision) -> Result<()> {
+    fn append_program_revision(&self, id: &str, revision: ProgramRevision) -> Result<()> {
         self.ensure_session_dir(id)?;
-        let mut revisions = self.read_canvas_revisions(&id)?;
+        let mut revisions = self.read_program_revisions(&id)?;
         revisions.push(revision);
-        let start = revisions.len().saturating_sub(CANVAS_REVISION_LIMIT);
-        let path = self.canvas_revisions_path(&id);
+        let start = revisions.len().saturating_sub(PROGRAM_REVISION_LIMIT);
+        let path = self.program_revisions_path(&id);
         let tmp = path.with_extension("jsonl.tmp");
         let mut f =
             std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
@@ -1001,12 +1035,12 @@ fn parse_widget_frontmatter_fields(frontmatter: &str) -> WidgetFrontmatter {
     parsed
 }
 
-fn parse_canvas_template_frontmatter(raw: &str) -> (CanvasTemplateFrontmatter, String) {
+fn parse_program_template_frontmatter(raw: &str) -> (ProgramTemplateFrontmatter, String) {
     let Some(rest) = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))
     else {
-        return (CanvasTemplateFrontmatter::default(), raw.to_string());
+        return (ProgramTemplateFrontmatter::default(), raw.to_string());
     };
     let mut byte_offset = raw.len().saturating_sub(rest.len());
     let mut frontmatter = String::new();
@@ -1014,16 +1048,16 @@ fn parse_canvas_template_frontmatter(raw: &str) -> (CanvasTemplateFrontmatter, S
         let trimmed = line.trim_end_matches(['\r', '\n']);
         byte_offset += line.len();
         if trimmed == "---" {
-            let parsed = parse_canvas_template_frontmatter_fields(&frontmatter);
+            let parsed = parse_program_template_frontmatter_fields(&frontmatter);
             return (parsed, raw[byte_offset..].to_string());
         }
         frontmatter.push_str(line);
     }
-    (CanvasTemplateFrontmatter::default(), raw.to_string())
+    (ProgramTemplateFrontmatter::default(), raw.to_string())
 }
 
-fn parse_canvas_template_frontmatter_fields(frontmatter: &str) -> CanvasTemplateFrontmatter {
-    let mut parsed = CanvasTemplateFrontmatter::default();
+fn parse_program_template_frontmatter_fields(frontmatter: &str) -> ProgramTemplateFrontmatter {
+    let mut parsed = ProgramTemplateFrontmatter::default();
     for line in frontmatter.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1256,18 +1290,18 @@ mod pty_range_tests {
 }
 
 #[cfg(test)]
-mod canvas_tests {
+mod program_tests {
     use super::*;
 
     #[test]
-    fn canvas_update_rejects_stale_base_version() {
+    fn program_update_rejects_stale_base_version() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new(tmp.path().join("data")).unwrap();
         let first = storage
-            .update_canvas(
+            .update_program(
                 "s1",
                 "# Todo\n".into(),
-                agentd_protocol::CanvasUpdateActor::Human,
+                agentd_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -1276,21 +1310,21 @@ mod canvas_tests {
         assert_eq!(first.version, 1);
 
         let err = storage
-            .update_canvas(
+            .update_program(
                 "s1",
                 "# Changed\n".into(),
-                agentd_protocol::CanvasUpdateActor::Agent,
+                agentd_protocol::ProgramUpdateActor::Agent,
                 Some(0),
                 None,
                 None,
             )
             .unwrap_err();
 
-        assert!(err.to_string().contains("canvas conflict"));
+        assert!(err.to_string().contains("program conflict"));
     }
 
-    fn edit(old: &str, new: &str) -> CanvasEdit {
-        CanvasEdit {
+    fn edit(old: &str, new: &str) -> ProgramEdit {
+        ProgramEdit {
             old_string: old.into(),
             new_string: new.into(),
             replace_all: false,
@@ -1299,8 +1333,8 @@ mod canvas_tests {
     }
 
     #[test]
-    fn apply_canvas_edits_replaces_unique_anchor() {
-        let out = apply_canvas_edits(
+    fn apply_program_edits_replaces_unique_anchor() {
+        let out = apply_program_edits(
             "# Todo\n- ship it\n# Done\n",
             &[edit("- ship it", "- ship it @{harness:claude}")],
         )
@@ -1309,36 +1343,36 @@ mod canvas_tests {
     }
 
     #[test]
-    fn apply_canvas_edits_appends_on_empty_old_string() {
+    fn apply_program_edits_appends_on_empty_old_string() {
         // Empty doc: append sets the content.
-        assert_eq!(apply_canvas_edits("", &[edit("", "first")]).unwrap(), "first");
+        assert_eq!(apply_program_edits("", &[edit("", "first")]).unwrap(), "first");
         // Non-empty without trailing newline: a separator is inserted.
         assert_eq!(
-            apply_canvas_edits("# Todo", &[edit("", "- new")]).unwrap(),
+            apply_program_edits("# Todo", &[edit("", "- new")]).unwrap(),
             "# Todo\n- new"
         );
         // Already ends in newline: no extra blank line forced.
         assert_eq!(
-            apply_canvas_edits("# Todo\n", &[edit("", "- new")]).unwrap(),
+            apply_program_edits("# Todo\n", &[edit("", "- new")]).unwrap(),
             "# Todo\n- new"
         );
     }
 
     #[test]
-    fn apply_canvas_edits_errors_on_missing_anchor() {
-        let err = apply_canvas_edits("# Todo\n", &[edit("- nope", "x")]).unwrap_err();
+    fn apply_program_edits_errors_on_missing_anchor() {
+        let err = apply_program_edits("# Todo\n", &[edit("- nope", "x")]).unwrap_err();
         assert!(err.to_string().contains("old_string not found"));
     }
 
     #[test]
-    fn apply_canvas_edits_errors_on_ambiguous_anchor_then_replace_all_works() {
+    fn apply_program_edits_errors_on_ambiguous_anchor_then_replace_all_works() {
         let base = "- a\n- a\n";
-        let err = apply_canvas_edits(base, &[edit("- a", "- b")]).unwrap_err();
+        let err = apply_program_edits(base, &[edit("- a", "- b")]).unwrap_err();
         assert!(err.to_string().contains("not unique"));
 
-        let out = apply_canvas_edits(
+        let out = apply_program_edits(
             base,
-            &[CanvasEdit {
+            &[ProgramEdit {
                 old_string: "- a".into(),
                 new_string: "- b".into(),
                 replace_all: true,
@@ -1350,21 +1384,21 @@ mod canvas_tests {
     }
 
     #[test]
-    fn apply_canvas_edits_are_sequential() {
-        let out = apply_canvas_edits("one two", &[edit("one", "1"), edit("two", "2")]).unwrap();
+    fn apply_program_edits_are_sequential() {
+        let out = apply_program_edits("one two", &[edit("one", "1"), edit("two", "2")]).unwrap();
         assert_eq!(out, "1 2");
     }
 
     #[test]
-    fn edit_canvas_applies_to_latest_without_a_version_gate() {
+    fn edit_program_applies_to_latest_without_a_version_gate() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new(tmp.path().join("data")).unwrap();
         // A human writes v1.
         let v1 = storage
-            .update_canvas(
+            .update_program(
                 "s1",
                 "# Todo\n- a\n# Done\n".into(),
-                agentd_protocol::CanvasUpdateActor::Human,
+                agentd_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -1374,29 +1408,29 @@ mod canvas_tests {
         // The agent edits an anchor with no base_version — it lands on the
         // latest content and bumps the version.
         let v2 = storage
-            .edit_canvas(
+            .edit_program(
                 "s1",
                 &[edit("- a", "- a (done)")],
-                agentd_protocol::CanvasUpdateActor::Agent,
+                agentd_protocol::ProgramUpdateActor::Agent,
                 None,
             )
             .unwrap();
         assert_eq!(v2.version, 2);
         assert_eq!(v2.markdown, "# Todo\n- a (done)\n# Done\n");
         // The overwritten version is retained in history.
-        let revisions = storage.read_canvas_revisions("s1").unwrap();
+        let revisions = storage.read_program_revisions("s1").unwrap();
         assert_eq!(revisions.last().unwrap().version, 1);
     }
 
     #[test]
-    fn edit_canvas_noop_keeps_version() {
+    fn edit_program_noop_keeps_version() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new(tmp.path().join("data")).unwrap();
         let v1 = storage
-            .update_canvas(
+            .update_program(
                 "s1",
                 "# Todo\n- a\n".into(),
-                agentd_protocol::CanvasUpdateActor::Human,
+                agentd_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -1404,10 +1438,10 @@ mod canvas_tests {
             .unwrap();
         // Replacing text with itself changes nothing → version is unchanged.
         let same = storage
-            .edit_canvas(
+            .edit_program(
                 "s1",
                 &[edit("- a", "- a")],
-                agentd_protocol::CanvasUpdateActor::Agent,
+                agentd_protocol::ProgramUpdateActor::Agent,
                 None,
             )
             .unwrap();
@@ -1415,39 +1449,39 @@ mod canvas_tests {
     }
 
     #[test]
-    fn edit_canvas_errors_on_missing_anchor_and_writes_nothing() {
+    fn edit_program_errors_on_missing_anchor_and_writes_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new(tmp.path().join("data")).unwrap();
         storage
-            .update_canvas(
+            .update_program(
                 "s1",
                 "# Todo\n- a\n".into(),
-                agentd_protocol::CanvasUpdateActor::Human,
+                agentd_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
             )
             .unwrap();
         let err = storage
-            .edit_canvas(
+            .edit_program(
                 "s1",
                 &[edit("- vanished", "x")],
-                agentd_protocol::CanvasUpdateActor::Agent,
+                agentd_protocol::ProgramUpdateActor::Agent,
                 None,
             )
             .unwrap_err();
         assert!(err.to_string().contains("old_string not found"));
         // Unchanged on disk.
-        let current = storage.read_canvas("s1").unwrap();
+        let current = storage.read_program("s1").unwrap();
         assert_eq!(current.version, 1);
         assert_eq!(current.markdown, "# Todo\n- a\n");
     }
 
     #[test]
-    fn canvas_templates_include_user_markdown_with_frontmatter() {
+    fn program_templates_include_user_markdown_with_frontmatter() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new(tmp.path().join("data")).unwrap();
-        let dir = storage.canvas_templates_dir();
+        let dir = storage.program_templates_dir();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("review.md"),
@@ -1455,7 +1489,7 @@ mod canvas_tests {
         )
         .unwrap();
 
-        let templates = storage.canvas_templates().unwrap();
+        let templates = storage.program_templates().unwrap();
         let review = templates.iter().find(|t| t.id == "review").unwrap();
 
         assert_eq!(review.name, "Review Board");

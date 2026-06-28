@@ -67,19 +67,19 @@ pub fn catalog() -> Vec<Value> {
             schema_obj(&[("session_id", "string", true)]),
         ),
         tool(
-            "construct_canvas_get",
-            "Fetch a session's canvas Markdown document, version, and retained revisions. Defaults to the current session when `session_id` is omitted.",
+            "construct_program_get",
+            "Fetch a session's program Markdown document, version, and retained revisions. Defaults to the current session when `session_id` is omitted.",
             schema_obj(&[("session_id", "string", false)]),
         ),
         tool(
-            "construct_canvas_list_templates",
-            "List built-in and user canvas templates. User templates live under the daemon data directory at `canvas/templates/*.md`.",
+            "construct_program_list_templates",
+            "List built-in and user program templates. User templates live under the daemon data directory at `program/templates/*.md`.",
             schema_empty(),
         ),
         // ----- Write -----
         tool(
-            "construct_canvas_edit",
-            "PREFERRED for changing a session's canvas: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST canvas content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_canvas_get and retry. Agent edits need no user confirmation. Set `shimmer: true` on an individual edit to keep the block(s) it touches in shimmer animation after the edit — shimmer means the block's work is still pending in this run (queued, in progress, or not yet done) regardless of how it runs. Useful during a planning pass to keep pending blocks shimmering while immediately clearing shimmer on blocks that need no work.",
+            "construct_program_edit",
+            "PREFERRED for changing a session's program: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST program content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_program_get and retry. Agent edits need no user confirmation. Set `shimmer: true` on an individual edit to keep the block(s) it touches in shimmer animation after the edit — shimmer means the block's work is still pending in this run (queued, in progress, or not yet done) regardless of how it runs. Useful during a planning pass to keep pending blocks shimmering while immediately clearing shimmer on blocks that need no work.",
             json!({
                 "type": "object",
                 "properties": {
@@ -104,8 +104,8 @@ pub fn catalog() -> Vec<Value> {
             }),
         ),
         tool(
-            "construct_canvas_update",
-            "Replace a session's ENTIRE canvas Markdown. Prefer construct_canvas_edit for targeted changes — it merges with concurrent human edits, whereas a whole-document replace can clobber them. Use this only for wholesale rewrites or initial population. Pass `base_version` from construct_canvas_get for optimistic conflict detection; on conflict, re-read the canvas and retry with a resolved document. Agent updates need no user confirmation.",
+            "construct_program_update",
+            "Replace a session's ENTIRE program Markdown. Prefer construct_program_edit for targeted changes — it merges with concurrent human edits, whereas a whole-document replace can clobber them. Use this only for wholesale rewrites or initial population. Pass `base_version` from construct_program_get for optimistic conflict detection; on conflict, re-read the program and retry with a resolved document. Agent updates need no user confirmation.",
             json!({
                 "type": "object",
                 "properties": {
@@ -119,8 +119,8 @@ pub fn catalog() -> Vec<Value> {
             }),
         ),
         tool(
-            "construct_canvas_execute",
-            "Ask the owning session to execute the full canvas or a selected Markdown fragment. Defaults to the current session when `session_id` is omitted.",
+            "construct_program_execute",
+            "Ask the owning session to execute the full program or a selected Markdown fragment. Defaults to the current session when `session_id` is omitted.",
             json!({
                 "type": "object",
                 "properties": {
@@ -451,29 +451,29 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             let tasks = client.list_tasks(&sid).await?;
             json!({ "tasks": tasks })
         }
-        "construct_canvas_get" => {
+        "construct_program_get" => {
             let sid = optional_session_arg(&args, session_id)?;
-            serde_json::to_value(client.canvas_get(&sid).await?)?
+            serde_json::to_value(client.program_get(&sid).await?)?
         }
-        "construct_canvas_list_templates" => {
-            serde_json::to_value(client.canvas_templates().await?)?
+        "construct_program_list_templates" => {
+            serde_json::to_value(client.program_templates().await?)?
         }
         // ----- Write -----
-        "construct_canvas_update" => {
+        "construct_program_update" => {
             let sid = optional_session_arg(&args, session_id)?;
-            let params = agentd_protocol::CanvasUpdateParams {
+            let params = agentd_protocol::ProgramUpdateParams {
                 session_id: sid,
                 markdown: arg_str(&args, "markdown")?,
                 base_version: args.get("base_version").and_then(|v| v.as_u64()),
-                actor: agentd_protocol::CanvasUpdateActor::Agent,
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
                 template_id: arg_str(&args, "template_id").ok(),
                 note: arg_str(&args, "note").ok(),
             };
-            serde_json::to_value(client.canvas_update(params).await?)?
+            serde_json::to_value(client.program_update(params).await?)?
         }
-        "construct_canvas_edit" => {
+        "construct_program_edit" => {
             let sid = optional_session_arg(&args, session_id)?;
-            let edits: Vec<agentd_protocol::CanvasEdit> = serde_json::from_value(
+            let edits: Vec<agentd_protocol::ProgramEdit> = serde_json::from_value(
                 args.get("edits")
                     .cloned()
                     .ok_or_else(|| anyhow!("missing or non-array `edits`"))?,
@@ -482,22 +482,22 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             if edits.is_empty() {
                 return Err(anyhow!("`edits` must contain at least one edit"));
             }
-            let params = agentd_protocol::CanvasEditParams {
+            let params = agentd_protocol::ProgramEditParams {
                 session_id: sid,
                 edits,
-                actor: agentd_protocol::CanvasUpdateActor::Agent,
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
                 note: arg_str(&args, "note").ok(),
             };
-            serde_json::to_value(client.canvas_edit(params).await?)?
+            serde_json::to_value(client.program_edit(params).await?)?
         }
-        "construct_canvas_execute" => {
+        "construct_program_execute" => {
             let sid = optional_session_arg(&args, session_id)?;
-            let params = agentd_protocol::CanvasExecuteParams {
+            let params = agentd_protocol::ProgramExecuteParams {
                 session_id: sid,
                 selection: arg_str(&args, "selection").ok(),
                 base_version: args.get("base_version").and_then(|v| v.as_u64()),
             };
-            serde_json::to_value(client.canvas_execute(params).await?)?
+            serde_json::to_value(client.program_execute(params).await?)?
         }
         "construct_create_session" => {
             let harness = arg_str(&args, "harness")?;
@@ -893,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_includes_canvas_tools() {
+    fn catalog_includes_program_tools() {
         let names: std::collections::HashSet<String> = catalog()
             .into_iter()
             .filter_map(|tool| {
@@ -904,11 +904,11 @@ mod tests {
             .collect();
 
         for expected in [
-            "construct_canvas_get",
-            "construct_canvas_list_templates",
-            "construct_canvas_update",
-            "construct_canvas_edit",
-            "construct_canvas_execute",
+            "construct_program_get",
+            "construct_program_list_templates",
+            "construct_program_update",
+            "construct_program_edit",
+            "construct_program_execute",
         ] {
             assert!(names.contains(expected), "missing {expected}");
         }

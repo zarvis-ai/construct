@@ -21,4 +21,4 @@ Missing or ignoring the Matrix-rain widget viewport must not block any user jour
 
 ## Non-Goals
 
-This does not introduce widget TTLs, dismissed states, or guaranteed notification delivery. It does not make the Matrix-rain panel an arbitrary model-drawn canvas independent of session widgets.
+This does not introduce widget TTLs, dismissed states, or guaranteed notification delivery. It does not make the Matrix-rain panel an arbitrary model-drawn program independent of session widgets.

@@ -5,15 +5,15 @@ use crate::config::Config;
 use crate::storage::Storage;
 use crate::worktree;
 use agentd_protocol::{
-    agent_context, ahp_method, CanvasDocument, CanvasEditParams, CanvasExecuteParams,
-    CanvasExecuteResult, CanvasGetResult, CanvasListTemplatesResult, CanvasRunProgress,
-    CanvasStateNotificationPayload, CanvasUpdateParams, CanvasUpdateResult, ClientView,
+    agent_context, ahp_method, ProgramDocument, ProgramEditParams, ProgramExecuteParams,
+    ProgramExecuteResult, ProgramGetResult, ProgramListTemplatesResult, ProgramRunProgress,
+    ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult, ClientView,
     CreateSessionParams, DeletedNotificationPayload, EventNotificationPayload,
     GroupDeletedNotificationPayload, GroupStateNotificationPayload, GroupSummary, HarnessInfo,
     MessageRole, MoveDirection, PtyReplayResult, PtySize, SessionAttachClipboardParams,
     SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionEvent,
     SessionStartParams, SessionState, SessionSummary, SessionWidgetDeleteParams,
-    StateNotificationPayload, TimestampedEvent, TranscriptResult, CANVAS_SMART_CLIP_DESCRIPTORS,
+    StateNotificationPayload, TimestampedEvent, TranscriptResult, PROGRAM_SMART_CLIP_DESCRIPTORS,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -49,14 +49,14 @@ const PTY_REPLAY_CAP: usize = 8 * 1024 * 1024;
 const RESPAWN_REDRAW_POLL: Duration = Duration::from_millis(100);
 const RESPAWN_REDRAW_SETTLE: Duration = Duration::from_millis(400);
 const RESPAWN_REDRAW_MAX_WAIT: Duration = Duration::from_secs(6);
-/// After delivering a canvas prompt as a bracketed paste to an external
+/// After delivering a program prompt as a bracketed paste to an external
 /// agent TUI, wait this long before sending the submit Enter. The paste is
 /// explicitly delimited by its `ESC[201~` end marker, so the harness has
 /// already finalized the multi-line body into its input box; this short
 /// settle lets its render/state update land so the trailing `\r` is read as
 /// a clean submit keypress rather than being coalesced into the paste.
-const CANVAS_EXTERNAL_PTY_SUBMIT_DELAY: Duration = Duration::from_millis(120);
-const CANVAS_RUN_MAX_MS: i64 = 10 * 60 * 1000;
+const PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY: Duration = Duration::from_millis(120);
+const PROGRAM_RUN_MAX_MS: i64 = 10 * 60 * 1000;
 
 /// Whether the post-resume force-redraw should fire now: the child has
 /// produced PTY output and then gone quiet for [`RESPAWN_REDRAW_SETTLE`],
@@ -302,7 +302,7 @@ pub enum BroadcastMsg {
     Deleted(DeletedNotificationPayload),
     GroupState(GroupStateNotificationPayload),
     GroupDeleted(GroupDeletedNotificationPayload),
-    CanvasState(CanvasStateNotificationPayload),
+    ProgramState(ProgramStateNotificationPayload),
     /// Aggregate state for the remote WS transport. Emitted by
     /// `server::handle_ws_connection` on every accept/drop so the
     /// local TUI can show a "remote attached" badge.
@@ -496,28 +496,28 @@ fn should_record_pty_user_message(harness: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CanvasExecutionDelivery {
+enum ProgramExecutionDelivery {
     AdapterInput,
     ExternalPtyTypedSubmit,
     PtySubmit,
 }
 
-fn canvas_execution_delivery(summary: &agentd_protocol::SessionSummary) -> CanvasExecutionDelivery {
+fn program_execution_delivery(summary: &agentd_protocol::SessionSummary) -> ProgramExecutionDelivery {
     if !summary.has_pty {
-        CanvasExecutionDelivery::AdapterInput
+        ProgramExecutionDelivery::AdapterInput
     } else if matches!(summary.harness.as_str(), "claude" | "codex" | "antigravity" | "grok") {
-        CanvasExecutionDelivery::ExternalPtyTypedSubmit
+        ProgramExecutionDelivery::ExternalPtyTypedSubmit
     } else {
-        CanvasExecutionDelivery::PtySubmit
+        ProgramExecutionDelivery::PtySubmit
     }
 }
 
-/// Frame a canvas prompt as a bracketed paste for delivery to an external
+/// Frame a program prompt as a bracketed paste for delivery to an external
 /// agent TUI. The body is wrapped in the `ESC[200~` / `ESC[201~` markers a
 /// real terminal sends around a paste; any embedded `ESC[201~` is stripped
 /// first so it can't terminate the paste early (the same paste-injection
 /// guard real terminals apply).
-fn canvas_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
+fn program_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
     const START: &[u8] = b"\x1b[200~";
     const END: &[u8] = b"\x1b[201~";
     let sanitized = prompt.replace("\x1b[201~", "");
@@ -528,14 +528,14 @@ fn canvas_bracketed_paste_bytes(prompt: &str) -> Vec<u8> {
     bytes
 }
 
-/// Frame a canvas prompt for delivery to a PTY-backed session that runs its
+/// Frame a program prompt for delivery to a PTY-backed session that runs its
 /// own line editor (smith, shell). The prompt is terminated with CR (`\r`) —
 /// the byte a real terminal's Enter key sends — not LF (`\n`): smith's line
 /// editor submits on CR and treats LF as "insert a newline into the buffer",
 /// so an LF terminator would leave the whole prompt sitting unsubmitted in the
 /// editor. Shell PTYs map CR→LF via the line discipline (ICRNL), so submission
 /// works there too.
-fn canvas_pty_submit_bytes(prompt: &str) -> Vec<u8> {
+fn program_pty_submit_bytes(prompt: &str) -> Vec<u8> {
     let mut bytes = prompt.as_bytes().to_vec();
     bytes.push(b'\r');
     bytes
@@ -550,8 +550,8 @@ fn canvas_pty_submit_bytes(prompt: &str) -> Vec<u8> {
 /// `params.prompt`: headless adapters push it onto their run queue and run it
 /// immediately, while interactive PTY harnesses receive it as a native launch
 /// argument or a queued submit. There is no separate daemon-side PTY write of
-/// the seed prompt — so unlike the canvas `Run` path (see
-/// `canvas_pty_submit_bytes`), there is no CR/LF terminator to get right here.
+/// the seed prompt — so unlike the program `Run` path (see
+/// `program_pty_submit_bytes`), there is no CR/LF terminator to get right here.
 /// If this forward is dropped, a created session sits idle in `AwaitingInput`
 /// with no way to start its turn except a manual follow-up `send_input`. See
 /// `specs/0046-session-create-initial-prompt-submits.md`.
@@ -578,41 +578,41 @@ fn start_params_for_create(
     }
 }
 
-fn canvas_run_instructions() -> Vec<String> {
+fn program_run_instructions() -> Vec<String> {
     vec![
-        "Execute this construct canvas as an autonomous run.".to_string(),
+        "Execute this construct program as an autonomous run.".to_string(),
         "Shimmer semantics: a shimmering block means 'work on this block is still pending in this run — queued, in progress, or not yet done; outcome unknown'. No shimmer means 'settled — done, skipped, or no work needed'. Pending is about the state of the work, not how it runs: it applies the same whether you do the block yourself, delegate it, or drive it some other way, and a block counts as pending the moment you decide to act on it. A Run starts every executed block shimmering. Editing a block clears its shimmer unless you pass shimmer: true on that edit, which keeps it shimmering. Pass shimmer: true on any block whose work is still pending; only let shimmer clear (omit it) once the block is settled. Never leave a settled block shimmering, and never drop shimmer from a block whose work is still in flight.".to_string(),
-        "Planning pass — this MUST be your first canvas action, before doing or delegating any work: make one construct_canvas_edit touching every executed block. Pass shimmer: true on every block whose work is still pending (however you intend to run it), and omit shimmer on every block that needs no work, is already done, or you are skipping, so those clear immediately. Doing this first makes the canvas reflect your plan within seconds of the Run instead of only after the first task completes; skipping it strands settled blocks shimmering and risks dropping shimmer from blocks still in flight.".to_string(),
-        "Treat canvas_run.markdown as free-form instructions and state for this turn, not as a request for a one-shot status report or as a fixed task-management schema.".to_string(),
+        "Planning pass — this MUST be your first program action, before doing or delegating any work: make one construct_program_edit touching every executed block. Pass shimmer: true on every block whose work is still pending (however you intend to run it), and omit shimmer on every block that needs no work, is already done, or you are skipping, so those clear immediately. Doing this first makes the program reflect your plan within seconds of the Run instead of only after the first task completes; skipping it strands settled blocks shimmering and risks dropping shimmer from blocks still in flight.".to_string(),
+        "Treat program_run.markdown as free-form instructions and state for this turn, not as a request for a one-shot status report or as a fixed task-management schema.".to_string(),
         "Infer the user's intended objective from the document structure and prose, then keep taking useful next actions while there is actionable work you can do.".to_string(),
-        "Do not ask the user to run the canvas again; if the document still implies useful work you can perform, continue in this turn.".to_string(),
-        "Record meaningful state changes or results on the canvas with construct_canvas_edit (anchored find/replace edits that merge with concurrent human edits; use construct_canvas_update only for a wholesale rewrite).".to_string(),
-        "Keep the canvas clean: do not add new sections, notes, bullet points, or execution details unless the canvas content or the user's instructions explicitly request them. Only update what the canvas already implies needs updating. The canvas should be at least as concise and readable after a run as it was before.".to_string(),
-        "If blocked, write the blocker and next required external action on the canvas before ending.".to_string(),
-        "Smart clips are Markdown-native typed references. The clip_id attribute identifies a specific clip instance, not the target itself; preserve clip_id values when editing existing clips. You may insert smart clips into the canvas at your discretion even without an explicit user request.".to_string(),
-        "When the canvas implies independent subtasks that can run concurrently or in isolation, prefer delegating each to a child agent via `agentd_subagent_create` rather than executing them inline in this session; this keeps the canvas session as an orchestrator and lets smart clips reference each subagent's live output via `@{session:<id>}`.".to_string(),
+        "Do not ask the user to run the program again; if the document still implies useful work you can perform, continue in this turn.".to_string(),
+        "Record meaningful state changes or results on the program with construct_program_edit (anchored find/replace edits that merge with concurrent human edits; use construct_program_update only for a wholesale rewrite).".to_string(),
+        "Keep the program clean: do not add new sections, notes, bullet points, or execution details unless the program content or the user's instructions explicitly request them. Only update what the program already implies needs updating. The program should be at least as concise and readable after a run as it was before.".to_string(),
+        "If blocked, write the blocker and next required external action on the program before ending.".to_string(),
+        "Smart clips are Markdown-native typed references. The clip_id attribute identifies a specific clip instance, not the target itself; preserve clip_id values when editing existing clips. You may insert smart clips into the program at your discretion even without an explicit user request.".to_string(),
+        "When the program implies independent subtasks that can run concurrently or in isolation, prefer delegating each to a child agent via `agentd_subagent_create` rather than executing them inline in this session; this keeps the program session as an orchestrator and lets smart clips reference each subagent's live output via `@{session:<id>}`.".to_string(),
     ]
 }
 
-fn canvas_execution_prompt() -> String {
-    "Run the current construct canvas autonomously. Before doing work, call agentd_context (or construct_context if you are using MCP) and read the canvas_run field for the latest canvas content, smart clip reference, and run instructions. If canvas_run is unavailable, read the current canvas with the canvas get tool before acting. Then, before starting or delegating any task, your first canvas action must be a single planning-pass construct_canvas_edit: pass shimmer: true on every block whose work is still pending (however you intend to run it) and omit shimmer on every block that needs no work, is already done, or you are skipping so it stops shimmering immediately."
+fn program_execution_prompt() -> String {
+    "Run the current construct program autonomously. Before doing work, call agentd_context (or construct_context if you are using MCP) and read the program_run field for the latest program content, smart clip reference, and run instructions. If program_run is unavailable, read the current program with the program get tool before acting. Then, before starting or delegating any task, your first program action must be a single planning-pass construct_program_edit: pass shimmer: true on every block whose work is still pending (however you intend to run it) and omit shimmer on every block that needs no work, is already done, or you are skipping so it stops shimmering immediately."
         .to_string()
 }
 
-fn canvas_run_context(
-    canvas: &CanvasDocument,
+fn program_run_context(
+    program: &ProgramDocument,
     scope: &str,
     markdown: &str,
-) -> agent_context::CanvasRunContext {
-    agent_context::CanvasRunContext {
-        session_id: canvas.session_id.clone(),
-        canvas_version: canvas.version,
-        canvas_updated_at_ms: canvas.updated_at_ms,
+) -> agent_context::ProgramRunContext {
+    agent_context::ProgramRunContext {
+        session_id: program.session_id.clone(),
+        program_version: program.version,
+        program_updated_at_ms: program.updated_at_ms,
         scope: scope.to_string(),
-        instructions: canvas_run_instructions(),
-        smart_clips: CANVAS_SMART_CLIP_DESCRIPTORS
+        instructions: program_run_instructions(),
+        smart_clips: PROGRAM_SMART_CLIP_DESCRIPTORS
             .iter()
-            .map(|clip| agent_context::CanvasSmartClipReference {
+            .map(|clip| agent_context::ProgramSmartClipReference {
                 type_name: clip.type_name.to_string(),
                 syntax: clip.syntax.to_string(),
                 description: clip.description.to_string(),
@@ -622,7 +622,7 @@ fn canvas_run_context(
     }
 }
 
-fn canvas_run_pending_signatures(body: &str) -> std::collections::HashSet<String> {
+fn program_run_pending_signatures(body: &str) -> std::collections::HashSet<String> {
     let mut sigs = std::collections::HashSet::new();
     let mut cur: Option<Vec<String>> = None;
     for raw in body.lines() {
@@ -644,8 +644,8 @@ fn canvas_run_pending_signatures(body: &str) -> std::collections::HashSet<String
 /// Return the block signatures in `markdown` that are touched by any edit
 /// with `shimmer: true`. The caller merges these into the run's pending set
 /// so those blocks stay animated after the edit.
-fn canvas_shimmer_signatures(
-    edits: &[agentd_protocol::CanvasEdit],
+fn program_shimmer_signatures(
+    edits: &[agentd_protocol::ProgramEdit],
     markdown: &str,
 ) -> std::collections::HashSet<String> {
     // Collect the first non-empty trimmed line from each shimmer edit's new_string
@@ -681,7 +681,7 @@ fn canvas_shimmer_signatures(
     result
 }
 
-fn session_event_is_canvas_output(event: &SessionEvent) -> bool {
+fn session_event_is_program_output(event: &SessionEvent) -> bool {
     matches!(
         event,
         SessionEvent::Reasoning { .. }
@@ -825,7 +825,7 @@ pub struct SessionManager {
     /// UI in a worktree against a running daemon without rebuilding.
     dev_assets: std::sync::Mutex<Option<PathBuf>>,
     widget_snapshots: tokio::sync::Mutex<HashMap<String, WidgetSnapshot>>,
-    canvas_runs: std::sync::Mutex<HashMap<String, CanvasRunProgress>>,
+    program_runs: std::sync::Mutex<HashMap<String, ProgramRunProgress>>,
     /// Monotonic id handed to each client connection so its current
     /// view can be tracked and cleared on disconnect.
     next_conn_id: AtomicU64,
@@ -942,9 +942,9 @@ pub(crate) struct RemoteHandle {
 }
 
 impl SessionManager {
-    fn canvas_run_snapshot(&self, session_id: &str) -> Option<CanvasRunProgress> {
+    fn program_run_snapshot(&self, session_id: &str) -> Option<ProgramRunProgress> {
         let now_ms = Utc::now().timestamp_millis();
-        let mut runs = self.canvas_runs.lock().ok()?;
+        let mut runs = self.program_runs.lock().ok()?;
         if runs.get(session_id).is_some_and(|run| {
             run.expires_at_ms <= now_ms || run.pending_block_signatures.is_empty()
         }) {
@@ -954,15 +954,15 @@ impl SessionManager {
         runs.get(session_id).cloned()
     }
 
-    fn start_canvas_run(
+    fn start_program_run(
         &self,
         session_id: &str,
         body: &str,
         is_selection: bool,
-    ) -> Option<CanvasRunProgress> {
-        let body_sigs = canvas_run_pending_signatures(body);
+    ) -> Option<ProgramRunProgress> {
+        let body_sigs = program_run_pending_signatures(body);
         if body_sigs.is_empty() {
-            if let Ok(mut runs) = self.canvas_runs.lock() {
+            if let Ok(mut runs) = self.program_runs.lock() {
                 runs.remove(session_id);
             }
             return None;
@@ -970,7 +970,7 @@ impl SessionManager {
         let now_ms = Utc::now().timestamp_millis();
         let pending = if is_selection {
             body_sigs
-        } else if let Ok(runs) = self.canvas_runs.lock() {
+        } else if let Ok(runs) = self.program_runs.lock() {
             if let Some(old) = runs.get(session_id) {
                 let old: std::collections::HashSet<String> =
                     old.pending_block_signatures.iter().cloned().collect();
@@ -987,29 +987,29 @@ impl SessionManager {
         } else {
             body_sigs
         };
-        let run = CanvasRunProgress {
+        let run = ProgramRunProgress {
             run_id: format!("{session_id}:{now_ms}"),
             started_at_ms: now_ms,
-            expires_at_ms: now_ms + CANVAS_RUN_MAX_MS,
+            expires_at_ms: now_ms + PROGRAM_RUN_MAX_MS,
             pending_block_signatures: pending.into_iter().collect(),
             seen_running: false,
             first_output_seen: false,
         };
-        if let Ok(mut runs) = self.canvas_runs.lock() {
+        if let Ok(mut runs) = self.program_runs.lock() {
             runs.insert(session_id.to_string(), run.clone());
         }
         Some(run)
     }
 
-    fn narrow_canvas_run(
+    fn narrow_program_run(
         &self,
         session_id: &str,
         markdown: &str,
         shimmer_add: std::collections::HashSet<String>,
     ) {
         let now_ms = Utc::now().timestamp_millis();
-        let current = canvas_run_pending_signatures(markdown);
-        if let Ok(mut runs) = self.canvas_runs.lock() {
+        let current = program_run_pending_signatures(markdown);
+        if let Ok(mut runs) = self.program_runs.lock() {
             let Some(run) = runs.get_mut(session_id) else {
                 return;
             };
@@ -1026,9 +1026,9 @@ impl SessionManager {
         }
     }
 
-    fn mark_canvas_run_output_seen(&self, session_id: &str) {
+    fn mark_program_run_output_seen(&self, session_id: &str) {
         let mut updated = false;
-        if let Ok(mut runs) = self.canvas_runs.lock() {
+        if let Ok(mut runs) = self.program_runs.lock() {
             if let Some(run) = runs.get_mut(session_id) {
                 if !run.first_output_seen {
                     run.first_output_seen = true;
@@ -1037,13 +1037,13 @@ impl SessionManager {
             }
         }
         if updated {
-            if let Ok(canvas) = self.storage.read_canvas(session_id) {
-                self.broadcast_canvas_state(canvas);
+            if let Ok(program) = self.storage.read_program(session_id) {
+                self.broadcast_program_state(program);
             }
         }
     }
 
-    fn note_session_state_for_canvas_run(
+    fn note_session_state_for_program_run(
         &self,
         session_id: &str,
         state: agentd_protocol::SessionState,
@@ -1051,7 +1051,7 @@ impl SessionManager {
         use agentd_protocol::SessionState;
         let mut clear = false;
         let mut updated = false;
-        if let Ok(mut runs) = self.canvas_runs.lock() {
+        if let Ok(mut runs) = self.program_runs.lock() {
             if let Some(run) = runs.get_mut(session_id) {
                 match state {
                     SessionState::Running => {
@@ -1073,8 +1073,8 @@ impl SessionManager {
             }
         }
         if clear || updated {
-            if let Ok(canvas) = self.storage.read_canvas(session_id) {
-                self.broadcast_canvas_state(canvas);
+            if let Ok(program) = self.storage.read_program(session_id) {
+                self.broadcast_program_state(program);
             }
         }
     }
@@ -1200,7 +1200,7 @@ impl SessionManager {
                 restart_tx,
                 dev_assets: std::sync::Mutex::new(dev_assets),
                 widget_snapshots: tokio::sync::Mutex::new(widget_snapshots),
-                canvas_runs: std::sync::Mutex::new(HashMap::new()),
+                program_runs: std::sync::Mutex::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 conn_views: std::sync::Mutex::new(HashMap::new()),
             },
@@ -1680,22 +1680,22 @@ impl SessionManager {
         Ok(String::new())
     }
 
-    pub async fn canvas_get(&self, session_id: &str) -> Result<CanvasGetResult> {
+    pub async fn program_get(&self, session_id: &str) -> Result<ProgramGetResult> {
         self.get_entry(session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
-        Ok(CanvasGetResult {
-            canvas: self.storage.read_canvas(session_id)?,
-            revisions: self.storage.read_canvas_revisions(session_id)?,
-            active_run: self.canvas_run_snapshot(session_id),
+        Ok(ProgramGetResult {
+            program: self.storage.read_program(session_id)?,
+            revisions: self.storage.read_program_revisions(session_id)?,
+            active_run: self.program_run_snapshot(session_id),
         })
     }
 
-    pub async fn canvas_update(&self, params: CanvasUpdateParams) -> Result<CanvasUpdateResult> {
+    pub async fn program_update(&self, params: ProgramUpdateParams) -> Result<ProgramUpdateResult> {
         self.get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
-        let canvas = self.storage.update_canvas(
+        let program = self.storage.update_program(
             &params.session_id,
             params.markdown,
             params.actor,
@@ -1703,39 +1703,39 @@ impl SessionManager {
             params.template_id,
             params.note,
         )?;
-        self.narrow_canvas_run(&params.session_id, &canvas.markdown, Default::default());
-        self.broadcast_canvas_state(canvas.clone());
-        Ok(CanvasUpdateResult { canvas })
+        self.narrow_program_run(&params.session_id, &program.markdown, Default::default());
+        self.broadcast_program_state(program.clone());
+        Ok(ProgramUpdateResult { program })
     }
 
-    pub async fn canvas_edit(&self, params: CanvasEditParams) -> Result<CanvasUpdateResult> {
+    pub async fn program_edit(&self, params: ProgramEditParams) -> Result<ProgramUpdateResult> {
         self.get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
-        let canvas =
+        let program =
             self.storage
-                .edit_canvas(&params.session_id, &params.edits, params.actor, params.note)?;
-        let shimmer_add = canvas_shimmer_signatures(&params.edits, &canvas.markdown);
-        self.narrow_canvas_run(&params.session_id, &canvas.markdown, shimmer_add);
-        self.broadcast_canvas_state(canvas.clone());
-        Ok(CanvasUpdateResult { canvas })
+                .edit_program(&params.session_id, &params.edits, params.actor, params.note)?;
+        let shimmer_add = program_shimmer_signatures(&params.edits, &program.markdown);
+        self.narrow_program_run(&params.session_id, &program.markdown, shimmer_add);
+        self.broadcast_program_state(program.clone());
+        Ok(ProgramUpdateResult { program })
     }
 
-    pub async fn canvas_execute(&self, params: CanvasExecuteParams) -> Result<CanvasExecuteResult> {
+    pub async fn program_execute(&self, params: ProgramExecuteParams) -> Result<ProgramExecuteResult> {
         let entry = self
             .get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
-        let result = CanvasGetResult {
-            canvas: self.storage.read_canvas(&params.session_id)?,
-            revisions: self.storage.read_canvas_revisions(&params.session_id)?,
-            active_run: self.canvas_run_snapshot(&params.session_id),
+        let result = ProgramGetResult {
+            program: self.storage.read_program(&params.session_id)?,
+            revisions: self.storage.read_program_revisions(&params.session_id)?,
+            active_run: self.program_run_snapshot(&params.session_id),
         };
         if let Some(base) = params.base_version {
-            if base != result.canvas.version {
+            if base != result.program.version {
                 anyhow::bail!(
-                    "canvas conflict: current version is {}, attempted base version is {}",
-                    result.canvas.version,
+                    "program conflict: current version is {}, attempted base version is {}",
+                    result.program.version,
                     base
                 );
             }
@@ -1745,9 +1745,9 @@ impl SessionManager {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let body = selected.unwrap_or_else(|| result.canvas.markdown.trim());
+        let body = selected.unwrap_or_else(|| result.program.markdown.trim());
         if body.is_empty() {
-            anyhow::bail!("canvas is empty");
+            anyhow::bail!("program is empty");
         }
         let run_body = body.to_string();
         let is_selection = params.selection.is_some();
@@ -1756,77 +1756,77 @@ impl SessionManager {
         } else {
             "full"
         };
-        let run_context = canvas_run_context(&result.canvas, scope, body);
-        self.write_canvas_run_context(&params.session_id, &run_context)?;
-        let prompt = canvas_execution_prompt();
+        let run_context = program_run_context(&result.program, scope, body);
+        self.write_program_run_context(&params.session_id, &run_context)?;
+        let prompt = program_execution_prompt();
         let delivery = {
             let summary = entry.summary.read().await;
-            canvas_execution_delivery(&*summary)
+            program_execution_delivery(&*summary)
         };
         match delivery {
-            CanvasExecutionDelivery::ExternalPtyTypedSubmit => {
-                self.canvas_submit_typed_prompt(&params.session_id, &prompt)
+            ProgramExecutionDelivery::ExternalPtyTypedSubmit => {
+                self.program_submit_typed_prompt(&params.session_id, &prompt)
                     .await?;
             }
-            CanvasExecutionDelivery::PtySubmit => {
-                self.pty_input(&params.session_id, canvas_pty_submit_bytes(&prompt))
+            ProgramExecutionDelivery::PtySubmit => {
+                self.pty_input(&params.session_id, program_pty_submit_bytes(&prompt))
                     .await?;
             }
-            CanvasExecutionDelivery::AdapterInput => {
+            ProgramExecutionDelivery::AdapterInput => {
                 self.send_input(&params.session_id, prompt.clone()).await?;
             }
         }
-        let active_run = self.start_canvas_run(&params.session_id, &run_body, is_selection);
-        Ok(CanvasExecuteResult {
-            canvas: result.canvas,
+        let active_run = self.start_program_run(&params.session_id, &run_body, is_selection);
+        Ok(ProgramExecuteResult {
+            program: result.program,
             prompt,
             active_run,
         })
     }
 
-    pub fn canvas_templates(&self) -> Result<CanvasListTemplatesResult> {
-        Ok(CanvasListTemplatesResult {
-            templates: self.storage.canvas_templates()?,
+    pub fn program_templates(&self) -> Result<ProgramListTemplatesResult> {
+        Ok(ProgramListTemplatesResult {
+            templates: self.storage.program_templates()?,
         })
     }
 
-    fn broadcast_canvas_state(&self, canvas: CanvasDocument) {
-        let active_run = self.canvas_run_snapshot(&canvas.session_id);
+    fn broadcast_program_state(&self, program: ProgramDocument) {
+        let active_run = self.program_run_snapshot(&program.session_id);
         let _ = self
             .broadcast
-            .send(BroadcastMsg::CanvasState(CanvasStateNotificationPayload {
-                canvas,
+            .send(BroadcastMsg::ProgramState(ProgramStateNotificationPayload {
+                program,
                 active_run,
             }));
     }
 
-    fn canvas_run_context_path(&self, session_id: &str) -> PathBuf {
+    fn program_run_context_path(&self, session_id: &str) -> PathBuf {
         self.storage
             .session_dir(session_id)
-            .join("canvas-run-context.json")
+            .join("program-run-context.json")
     }
 
-    fn install_canvas_run_context_env(&self, env: &mut HashMap<String, String>, session_id: &str) {
+    fn install_program_run_context_env(&self, env: &mut HashMap<String, String>, session_id: &str) {
         env.insert(
-            agent_context::ENV_CANVAS_RUN_CONTEXT_FILE.to_string(),
-            self.canvas_run_context_path(session_id)
+            agent_context::ENV_PROGRAM_RUN_CONTEXT_FILE.to_string(),
+            self.program_run_context_path(session_id)
                 .to_string_lossy()
                 .to_string(),
         );
     }
 
-    fn write_canvas_run_context(
+    fn write_program_run_context(
         &self,
         session_id: &str,
-        context: &agent_context::CanvasRunContext,
+        context: &agent_context::ProgramRunContext,
     ) -> Result<()> {
-        let path = self.canvas_run_context_path(session_id);
+        let path = self.program_run_context_path(session_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_vec_pretty(context).context("serialize canvas run context")?;
+        let json = serde_json::to_vec_pretty(context).context("serialize program run context")?;
         std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path)
             .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
@@ -1973,7 +1973,7 @@ impl SessionManager {
             agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
-        self.install_canvas_run_context_env(&mut env_with_meta, &id);
+        self.install_program_run_context_env(&mut env_with_meta, &id);
         env_with_meta.insert(
             "CONSTRUCT_SESSION_KIND".to_string(),
             match params.kind {
@@ -2261,7 +2261,7 @@ impl SessionManager {
             agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
-        self.install_canvas_run_context_env(&mut start_params.env, id);
+        self.install_program_run_context_env(&mut start_params.env, id);
         // Use the last-known PTY size so the resumed adapter (which
         // sizes its PTY off start_params on session.start) doesn't draw
         // its banner / resume content at the stale creation default.
@@ -2865,10 +2865,10 @@ impl SessionManager {
             let s = entry.summary.read().await;
             s.state
         };
-        self.note_session_state_for_canvas_run(&entry.id, new_state);
+        self.note_session_state_for_program_run(&entry.id, new_state);
 
-        if session_event_is_canvas_output(&event) {
-            self.mark_canvas_run_output_seen(&entry.id);
+        if session_event_is_program_output(&event) {
+            self.mark_program_run_output_seen(&entry.id);
         }
         // Update the per-session task registry from lifecycle events
         // so `session.list_tasks` has live state to return.
@@ -3084,7 +3084,7 @@ impl SessionManager {
         self.pty_input_inner(id, bytes, false).await
     }
 
-    async fn canvas_submit_typed_prompt(&self, id: &str, prompt: &str) -> Result<()> {
+    async fn program_submit_typed_prompt(&self, id: &str, prompt: &str) -> Result<()> {
         // Deliver the prompt as a bracketed paste (`ESC[200~` … `ESC[201~`)
         // rather than raw keystrokes. External agent TUIs (claude/codex/
         // antigravity) enable DEC mode 2004 and only run their multiline
@@ -3094,9 +3094,9 @@ impl SessionManager {
         // the harness exactly where the paste stops, so the Enter we send
         // afterward is read as a submit keypress — without it the prompt
         // landed in the input box but never submitted.
-        self.pty_input_without_capture(id, canvas_bracketed_paste_bytes(prompt))
+        self.pty_input_without_capture(id, program_bracketed_paste_bytes(prompt))
             .await?;
-        tokio::time::sleep(CANVAS_EXTERNAL_PTY_SUBMIT_DELAY).await;
+        tokio::time::sleep(PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY).await;
         self.pty_input_without_capture(id, vec![b'\r']).await?;
         Ok(())
     }
@@ -4409,25 +4409,25 @@ mod tests {
     }
 
     #[test]
-    fn canvas_execution_submits_to_pty_backed_sessions() {
+    fn program_execution_submits_to_pty_backed_sessions() {
         let summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
 
         assert_eq!(
-            canvas_execution_delivery(&summary),
-            CanvasExecutionDelivery::PtySubmit
+            program_execution_delivery(&summary),
+            ProgramExecutionDelivery::PtySubmit
         );
     }
 
     #[test]
-    fn canvas_pty_submit_terminates_with_carriage_return() {
+    fn program_pty_submit_terminates_with_carriage_return() {
         // Smith's line editor submits on CR and treats LF as a newline
         // insertion, so the PtySubmit terminator must be `\r`. An LF here
-        // regresses to the bug where the canvas prompt landed in smith's
+        // regresses to the bug where the program prompt landed in smith's
         // input editor but never submitted.
-        let bytes = canvas_pty_submit_bytes("run the canvas");
+        let bytes = program_pty_submit_bytes("run the program");
         assert_eq!(bytes.last(), Some(&b'\r'));
         assert!(!bytes.contains(&b'\n'));
-        assert_eq!(&bytes[..bytes.len() - 1], b"run the canvas");
+        assert_eq!(&bytes[..bytes.len() - 1], b"run the program");
     }
 
     #[test]
@@ -4468,60 +4468,60 @@ mod tests {
     }
 
     #[test]
-    fn canvas_execution_typed_submit_for_external_agent_pty_sessions() {
+    fn program_execution_typed_submit_for_external_agent_pty_sessions() {
         let mut summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
         summary.harness = "claude".to_string();
 
         assert_eq!(
-            canvas_execution_delivery(&summary),
-            CanvasExecutionDelivery::ExternalPtyTypedSubmit
+            program_execution_delivery(&summary),
+            ProgramExecutionDelivery::ExternalPtyTypedSubmit
         );
     }
 
     #[test]
-    fn canvas_bracketed_paste_frames_and_sanitizes_body() {
+    fn program_bracketed_paste_frames_and_sanitizes_body() {
         // A plain multi-line body is wrapped in the paste markers a real
         // terminal sends, so the external agent TUI buffers it as one paste
         // (its multiline guard fires) instead of submitting on the first
         // newline.
         assert_eq!(
-            canvas_bracketed_paste_bytes("line one\nline two"),
+            program_bracketed_paste_bytes("line one\nline two"),
             b"\x1b[200~line one\nline two\x1b[201~".to_vec()
         );
         // An embedded end marker is stripped so a malicious / accidental
-        // `ESC[201~` in the canvas can't terminate the paste early.
+        // `ESC[201~` in the program can't terminate the paste early.
         assert_eq!(
-            canvas_bracketed_paste_bytes("a\x1b[201~b"),
+            program_bracketed_paste_bytes("a\x1b[201~b"),
             b"\x1b[200~ab\x1b[201~".to_vec()
         );
     }
 
     #[test]
-    fn canvas_execution_prompt_requires_autonomous_run() {
-        let prompt = canvas_execution_prompt();
+    fn program_execution_prompt_requires_autonomous_run() {
+        let prompt = program_execution_prompt();
 
         assert!(prompt.contains("autonomously"));
         assert!(prompt.contains("agentd_context"));
         assert!(prompt.contains("construct_context"));
-        assert!(prompt.contains("canvas_run"));
-        assert!(prompt.contains("latest canvas content"));
+        assert!(prompt.contains("program_run"));
+        assert!(prompt.contains("latest program content"));
         assert!(!prompt.contains("Compare options and summarize findings."));
     }
 
     #[test]
-    fn canvas_run_context_carries_run_contract_and_registered_smart_clips() {
-        let canvas = CanvasDocument {
+    fn program_run_context_carries_run_contract_and_registered_smart_clips() {
+        let program = ProgramDocument {
             session_id: "s123".to_string(),
             markdown: "# Research brief\n\nCompare options and summarize findings.\n".to_string(),
             version: 9,
             updated_at_ms: 1234,
             template_id: None,
         };
-        let context = canvas_run_context(&canvas, "selection", "- selected work");
+        let context = program_run_context(&program, "selection", "- selected work");
 
         assert_eq!(context.session_id, "s123");
-        assert_eq!(context.canvas_version, 9);
-        assert_eq!(context.canvas_updated_at_ms, 1234);
+        assert_eq!(context.program_version, 9);
+        assert_eq!(context.program_updated_at_ms, 1234);
         assert_eq!(context.scope, "selection");
         assert_eq!(context.markdown, "- selected work");
         assert!(context
@@ -4539,12 +4539,12 @@ mod tests {
         assert!(context
             .instructions
             .iter()
-            .any(|s| s.contains("Do not ask the user to run the canvas again")));
+            .any(|s| s.contains("Do not ask the user to run the program again")));
         assert!(context
             .instructions
             .iter()
             .any(|s| s.contains("clip_id attribute identifies a specific clip instance")));
-        for clip in CANVAS_SMART_CLIP_DESCRIPTORS {
+        for clip in PROGRAM_SMART_CLIP_DESCRIPTORS {
             assert!(
                 context
                     .smart_clips
@@ -4558,13 +4558,13 @@ mod tests {
     }
 
     #[test]
-    fn canvas_execution_uses_adapter_input_for_headless_sessions() {
+    fn program_execution_uses_adapter_input_for_headless_sessions() {
         let mut summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
         summary.has_pty = false;
 
         assert_eq!(
-            canvas_execution_delivery(&summary),
-            CanvasExecutionDelivery::AdapterInput
+            program_execution_delivery(&summary),
+            ProgramExecutionDelivery::AdapterInput
         );
     }
 
@@ -5110,7 +5110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_run_context_env_points_at_session_sidecar() {
+    async fn program_run_context_env_points_at_session_sidecar() {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -5123,14 +5123,14 @@ mod tests {
                 .expect("session manager");
         let mut env = HashMap::new();
 
-        mgr.install_canvas_run_context_env(&mut env, "s123");
+        mgr.install_program_run_context_env(&mut env, "s123");
 
         assert_eq!(
-            env.get(agent_context::ENV_CANVAS_RUN_CONTEXT_FILE),
+            env.get(agent_context::ENV_PROGRAM_RUN_CONTEXT_FILE),
             Some(
                 &storage
                     .session_dir("s123")
-                    .join("canvas-run-context.json")
+                    .join("program-run-context.json")
                     .to_string_lossy()
                     .to_string()
             )
@@ -5138,7 +5138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_canvas_run_context_persists_readable_json() {
+    async fn write_program_run_context_persists_readable_json() {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -5149,21 +5149,21 @@ mod tests {
             SessionManager::new(storage, config, tmp.path().join("run"))
                 .await
                 .expect("session manager");
-        let context = agent_context::CanvasRunContext {
+        let context = agent_context::ProgramRunContext {
             session_id: "s123".to_string(),
-            canvas_version: 1,
-            canvas_updated_at_ms: 2,
+            program_version: 1,
+            program_updated_at_ms: 2,
             scope: "full".to_string(),
             instructions: vec!["run".to_string()],
             smart_clips: Vec::new(),
-            markdown: "# Canvas".to_string(),
+            markdown: "# Program".to_string(),
         };
 
-        mgr.write_canvas_run_context("s123", &context)
-            .expect("write canvas run context");
+        mgr.write_program_run_context("s123", &context)
+            .expect("write program run context");
 
-        let bytes = std::fs::read(mgr.canvas_run_context_path("s123")).unwrap();
-        let parsed: agent_context::CanvasRunContext = serde_json::from_slice(&bytes).unwrap();
+        let bytes = std::fs::read(mgr.program_run_context_path("s123")).unwrap();
+        let parsed: agent_context::ProgramRunContext = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, context);
     }
 
@@ -5874,7 +5874,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_canvas_run_lifecycle_daemon() {
+    async fn test_program_run_lifecycle_daemon() {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -5885,13 +5885,13 @@ mod tests {
                 .await
                 .expect("session manager");
 
-        let id = "scanvasrun";
+        let id = "sprogramrun";
         let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
-        // Start a canvas run
+        // Start a program run
         let body = "# Todo\n- a\n";
-        let run = mgr.start_canvas_run(id, body, false).expect("start_canvas_run");
+        let run = mgr.start_program_run(id, body, false).expect("start_program_run");
         assert!(!run.seen_running);
         assert!(!run.first_output_seen);
 
@@ -5905,11 +5905,11 @@ mod tests {
         )
         .await;
 
-        let run = mgr.canvas_run_snapshot(id).expect("run snapshot");
+        let run = mgr.program_run_snapshot(id).expect("run snapshot");
         assert!(run.seen_running);
         assert!(!run.first_output_seen);
 
-        // Send canvas output (reasoning)
+        // Send program output (reasoning)
         mgr.handle_event(
             &entry,
             SessionEvent::Reasoning {
@@ -5919,7 +5919,7 @@ mod tests {
         .await;
 
         // Run is NOT cleared, but first_output_seen is set to true
-        let run = mgr.canvas_run_snapshot(id).expect("run snapshot");
+        let run = mgr.program_run_snapshot(id).expect("run snapshot");
         assert!(run.seen_running);
         assert!(run.first_output_seen);
 
@@ -5934,6 +5934,6 @@ mod tests {
         .await;
 
         // Run should now be cleared
-        assert!(mgr.canvas_run_snapshot(id).is_none());
+        assert!(mgr.program_run_snapshot(id).is_none());
     }
 }

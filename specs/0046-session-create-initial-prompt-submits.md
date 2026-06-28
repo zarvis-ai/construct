@@ -33,8 +33,8 @@ parent would create a child to do work and the child would do nothing until the
 parent noticed and re-sent the task. The whole point of `create(prompt)` is "go
 do this now."
 
-This is distinct from the canvas `Run` submit path (see
-`canvas_pty_submit_bytes` and `0042-canvas-run-progress-affordance`). That path
+This is distinct from the program `Run` submit path (see
+`program_pty_submit_bytes` and `0042-program-run-progress-affordance`). That path
 *does* write bytes into a live PTY-backed session's line editor, so it must
 terminate the prompt with CR (`\r`) — an LF would land in the editor
 unsubmitted. The create path has no such terminator concern because it never

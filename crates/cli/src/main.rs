@@ -115,10 +115,10 @@ enum Command {
     },
     /// Send input to a session.
     Send { session_id: String, text: String },
-    /// Manage a session's orchestration canvas.
-    Canvas {
+    /// Manage a session's orchestration program.
+    Program {
         #[command(subcommand)]
-        command: CanvasCommand,
+        command: ProgramCommand,
     },
     /// Internal: `PreToolUse` hook body for the AskUserQuestion chat-gate.
     /// Reads the hook payload on stdin; if a chat viewer is active for
@@ -210,10 +210,10 @@ enum DaemonCommand {
 }
 
 #[derive(Debug, Subcommand)]
-enum CanvasCommand {
-    /// Print the canvas Markdown and metadata.
+enum ProgramCommand {
+    /// Print the program Markdown and metadata.
     Get { session_id: String },
-    /// Replace the canvas from a file, stdin, or template.
+    /// Replace the program from a file, stdin, or template.
     Set {
         session_id: String,
         /// Read Markdown from this file.
@@ -229,9 +229,9 @@ enum CanvasCommand {
         #[arg(long)]
         base_version: Option<u64>,
     },
-    /// Edit the canvas in $EDITOR and save it back.
+    /// Edit the program in $EDITOR and save it back.
     Edit { session_id: String },
-    /// Ask the owning session to execute the full canvas or selected Markdown.
+    /// Ask the owning session to execute the full program or selected Markdown.
     Execute {
         session_id: String,
         #[arg(long)]
@@ -239,7 +239,7 @@ enum CanvasCommand {
         #[arg(long)]
         base_version: Option<u64>,
     },
-    /// List available canvas templates.
+    /// List available program templates.
     Templates,
 }
 
@@ -450,9 +450,9 @@ async fn main() -> Result<()> {
             c.send_input(&session_id, text).await?;
             Ok(())
         }
-        Command::Canvas { command } => {
+        Command::Program { command } => {
             let c = connect(&socket).await?;
-            run_canvas_command(&c, command).await
+            run_program_command(&c, command).await
         }
         Command::AskGate => {
             // Drain stdin (the PreToolUse payload) so the hook's pipe closes
@@ -603,28 +603,28 @@ fn command_allows_upgrade_prompt(command: &Command) -> bool {
         Command::Daemon { .. }
             | Command::Upgrade { .. }
             | Command::Acp { .. }
-            | Command::Canvas { .. }
+            | Command::Program { .. }
             | Command::AskGate
             | Command::Mcp
             | Command::Adapter { .. }
     )
 }
 
-async fn run_canvas_command(client: &Client, command: CanvasCommand) -> Result<()> {
+async fn run_program_command(client: &Client, command: ProgramCommand) -> Result<()> {
     match command {
-        CanvasCommand::Get { session_id } => {
-            let result = client.canvas_get(&session_id).await?;
+        ProgramCommand::Get { session_id } => {
+            let result = client.program_get(&session_id).await?;
             eprintln!(
                 "session={} version={} updated_at_ms={} template={}",
-                result.canvas.session_id,
-                result.canvas.version,
-                result.canvas.updated_at_ms,
-                result.canvas.template_id.as_deref().unwrap_or("(none)")
+                result.program.session_id,
+                result.program.version,
+                result.program.updated_at_ms,
+                result.program.template_id.as_deref().unwrap_or("(none)")
             );
-            print!("{}", result.canvas.markdown);
+            print!("{}", result.program.markdown);
             Ok(())
         }
-        CanvasCommand::Set {
+        ProgramCommand::Set {
             session_id,
             file,
             stdin,
@@ -646,29 +646,29 @@ async fn run_canvas_command(client: &Client, command: CanvasCommand) -> Result<(
                 (markdown, None)
             } else {
                 let template_id = template.expect("template source counted above");
-                let templates = client.canvas_templates().await?.templates;
+                let templates = client.program_templates().await?.templates;
                 let Some(found) = templates.into_iter().find(|t| t.id == template_id) else {
-                    anyhow::bail!("unknown canvas template: {template_id}");
+                    anyhow::bail!("unknown program template: {template_id}");
                 };
                 (found.markdown, Some(found.id))
             };
             let result = client
-                .canvas_update(agentd_protocol::CanvasUpdateParams {
+                .program_update(agentd_protocol::ProgramUpdateParams {
                     session_id,
                     markdown,
                     base_version,
-                    actor: agentd_protocol::CanvasUpdateActor::Human,
+                    actor: agentd_protocol::ProgramUpdateActor::Human,
                     template_id,
                     note: None,
                 })
                 .await?;
-            println!("updated canvas version {}", result.canvas.version);
+            println!("updated program version {}", result.program.version);
             Ok(())
         }
-        CanvasCommand::Edit { session_id } => {
-            let current = client.canvas_get(&session_id).await?.canvas;
+        ProgramCommand::Edit { session_id } => {
+            let current = client.program_get(&session_id).await?.program;
             let dir = tempfile::tempdir()?;
-            let path = dir.path().join("canvas.md");
+            let path = dir.path().join("program.md");
             std::fs::write(&path, &current.markdown)?;
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
             let status = std::process::Command::new(editor).arg(&path).status()?;
@@ -677,42 +677,42 @@ async fn run_canvas_command(client: &Client, command: CanvasCommand) -> Result<(
             }
             let markdown = std::fs::read_to_string(&path)?;
             if markdown == current.markdown {
-                println!("canvas unchanged at version {}", current.version);
+                println!("program unchanged at version {}", current.version);
                 return Ok(());
             }
             let result = client
-                .canvas_update(agentd_protocol::CanvasUpdateParams {
+                .program_update(agentd_protocol::ProgramUpdateParams {
                     session_id,
                     markdown,
                     base_version: Some(current.version),
-                    actor: agentd_protocol::CanvasUpdateActor::Human,
+                    actor: agentd_protocol::ProgramUpdateActor::Human,
                     template_id: current.template_id,
                     note: None,
                 })
                 .await?;
-            println!("updated canvas version {}", result.canvas.version);
+            println!("updated program version {}", result.program.version);
             Ok(())
         }
-        CanvasCommand::Execute {
+        ProgramCommand::Execute {
             session_id,
             selection,
             base_version,
         } => {
             let result = client
-                .canvas_execute(agentd_protocol::CanvasExecuteParams {
+                .program_execute(agentd_protocol::ProgramExecuteParams {
                     session_id,
                     selection,
                     base_version,
                 })
                 .await?;
             println!(
-                "execution prompt sent from canvas version {}",
-                result.canvas.version
+                "execution prompt sent from program version {}",
+                result.program.version
             );
             Ok(())
         }
-        CanvasCommand::Templates => {
-            for template in client.canvas_templates().await?.templates {
+        ProgramCommand::Templates => {
+            for template in client.program_templates().await?.templates {
                 let source = if template.built_in {
                     "built-in"
                 } else {

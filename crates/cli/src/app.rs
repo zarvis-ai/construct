@@ -47,16 +47,16 @@ pub const SCROLLBACK_MAX: usize = 5_000;
 pub const MINIBUFFER_PANEL_H_DEFAULT: u16 = 13;
 pub const MINIBUFFER_PANEL_H_MIN: u16 = 3;
 pub const MINIBUFFER_PANEL_H_MAX: u16 = 80;
-pub(crate) const CANVAS_REVEAL_MS: u64 = 240;
-pub(crate) const CANVAS_CONTENT_PADDING_X: u16 = 1;
-pub(crate) const CANVAS_CONTENT_PADDING_Y: u16 = 1;
-/// Hard cap on how long a canvas Run shimmer animates without an observed
+pub(crate) const PROGRAM_REVEAL_MS: u64 = 240;
+pub(crate) const PROGRAM_CONTENT_PADDING_X: u16 = 1;
+pub(crate) const PROGRAM_CONTENT_PADDING_Y: u16 = 1;
+/// Hard cap on how long a program Run shimmer animates without an observed
 /// output signal. A missed first-output transition must never strand the
 /// animation; a timeout backstop is mandatory (spec 0042).
-pub(crate) const CANVAS_RUN_MAX_MS: u64 = 10 * 60 * 1000;
-/// Wrapped rows the canvas body scrolls per mouse-wheel notch.
-pub(crate) const CANVAS_WHEEL_SCROLL_ROWS: usize = 3;
-const CANVAS_UNDO_STACK_LIMIT: usize = 100;
+pub(crate) const PROGRAM_RUN_MAX_MS: u64 = 10 * 60 * 1000;
+/// Wrapped rows the program body scrolls per mouse-wheel notch.
+pub(crate) const PROGRAM_WHEEL_SCROLL_ROWS: usize = 3;
+const PROGRAM_UNDO_STACK_LIMIT: usize = 100;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
 
 /// A row in the rendered list view. Sessions and group headers share the
@@ -111,7 +111,7 @@ fn selection_is_valid_for_sessions(
     match selection {
         Selection::None => true,
         // A pane may hold any live session, not just ones with a list row: a
-        // canvas clip can point the main view at a subagent. Keep the pane as
+        // program clip can point the main view at a subagent. Keep the pane as
         // long as the session still exists; pruning only fires once it's gone.
         Selection::Session(id) => sessions.iter().any(|s| s.id == *id),
         Selection::Group(id) => groups.iter().any(|g| g.id == *id),
@@ -577,40 +577,40 @@ impl MatrixRevealHit {
 }
 
 /// On-screen cell range of a session smart-clip (`@{session:id}`) rendered in
-/// the canvas body, captured each frame so a hover/click can map a cell back to
+/// the program body, captured each frame so a hover/click can map a cell back to
 /// its session id. A clip that word-wraps across rows contributes one hit per
 /// row segment. `col_end` is exclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanvasClipHit {
+pub struct ProgramClipHit {
     pub col_start: u16,
     pub col_end: u16,
     pub row: u16,
     pub session_id: String,
 }
 
-impl CanvasClipHit {
+impl ProgramClipHit {
     pub fn contains(&self, col: u16, row: u16) -> bool {
         row == self.row && col >= self.col_start && col < self.col_end
     }
 }
 
-/// A clickable template button drawn in the empty-canvas placeholder. The box
+/// A clickable template button drawn in the empty-program placeholder. The box
 /// spans `row_start..=row_end` (top border, label, bottom border) over the
-/// columns `col_start..col_end`; clicking anywhere inside fills the canvas with
-/// that template's Markdown. Republished every frame the active canvas is empty.
+/// columns `col_start..col_end`; clicking anywhere inside fills the program with
+/// that template's Markdown. Republished every frame the active program is empty.
 #[derive(Debug, Clone)]
-pub struct CanvasTemplateHit {
+pub struct ProgramTemplateHit {
     pub col_start: u16,
     pub col_end: u16,
     pub row_start: u16,
     pub row_end: u16,
-    /// Template id persisted on the canvas document once applied.
+    /// Template id persisted on the program document once applied.
     pub template_id: String,
     /// The template's Markdown, dropped straight into the buffer on click.
     pub markdown: String,
 }
 
-impl CanvasTemplateHit {
+impl ProgramTemplateHit {
     pub fn contains(&self, col: u16, row: u16) -> bool {
         row >= self.row_start
             && row <= self.row_end
@@ -734,10 +734,10 @@ pub struct App {
     pub transcript_scroll: u16,
     pub minibuffer: Option<Minibuffer>,
     pub harnesses: Vec<HarnessInfo>,
-    /// Canvas templates offered as clickable buttons in the empty-canvas
+    /// Program templates offered as clickable buttons in the empty-program
     /// placeholder. Fetched at startup and on reload (same cadence as
     /// `harnesses`); rarely changes within a session.
-    pub canvas_templates: Vec<agentd_protocol::CanvasTemplate>,
+    pub program_templates: Vec<agentd_protocol::ProgramTemplate>,
     pub theme: crate::theme::Theme,
     pub help_visible: bool,
     pub profile: Profile,
@@ -878,7 +878,7 @@ pub struct App {
     /// requests it).
     pub mouse_pos: Option<(u16, u16)>,
     /// When the pointer last changed cells. Drives self-dismissing hovers (e.g.
-    /// the canvas shimmer-text preview, which disappears once the cursor has
+    /// the program shimmer-text preview, which disappears once the cursor has
     /// been still for ~1s). `None` until the first motion event arrives.
     pub last_mouse_move: Option<Instant>,
     /// Whether terminal mouse capture is enabled. When false, agentd
@@ -936,17 +936,17 @@ pub struct App {
     /// /tasks popup state: `None` = closed, `Some(...)` = open with
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
-    /// Selected session's canvas, rendered in an in-TUI modal.
-    pub canvas_popup: Option<CanvasPopup>,
-    /// Open canvas popups for sessions that are not currently selected.
-    /// Presence means the canvas should be restored when that session is
+    /// Selected session's program, rendered in an in-TUI modal.
+    pub program_popup: Option<ProgramPopup>,
+    /// Open program popups for sessions that are not currently selected.
+    /// Presence means the program should be restored when that session is
     /// focused again, including unsaved draft text and cursor state.
-    pub canvas_popups: HashMap<String, CanvasPopup>,
-    /// In-flight canvas Run animations, keyed by session id (spec 0042). An
-    /// entry means a canvas Run is believed to still be executing for that
+    pub program_popups: HashMap<String, ProgramPopup>,
+    /// In-flight program Run animations, keyed by session id (spec 0042). An
+    /// entry means a program Run is believed to still be executing for that
     /// session; it drives the shimmer over the executed Markdown.
-    pub canvas_runs: HashMap<String, CanvasRun>,
-    pub canvas_clipboard: Option<String>,
+    pub program_runs: HashMap<String, ProgramRun>,
+    pub program_clipboard: Option<String>,
     /// Live `/remote-control` modal — URL + QR for the active
     /// remote-WS deployment. `Some` while open, `None` otherwise.
     /// Dismissed with Esc the same way `tasks_popup` is.
@@ -1429,19 +1429,19 @@ pub struct TasksPopup {
     pub tasks: Vec<agentd_protocol::TaskInfo>,
 }
 
-/// In-TUI canvas surface for the selected session. The renderer treats
+/// In-TUI program surface for the selected session. The renderer treats
 /// Markdown as source and projects smart clips as chips/blocks.
 #[derive(Debug, Clone)]
-pub struct CanvasPopup {
-    pub canvas: agentd_protocol::CanvasDocument,
+pub struct ProgramPopup {
+    pub program: agentd_protocol::ProgramDocument,
     pub buffer: String,
     pub saved_markdown: String,
-    pub undo_stack: Vec<CanvasUndoState>,
+    pub undo_stack: Vec<ProgramUndoState>,
     pub cursor: usize,
     pub preferred_col: Option<usize>,
-    pub selection: Option<CanvasSelection>,
-    pub smart_clip: Option<CanvasSmartClipSearch>,
-    pub search: Option<CanvasSearch>,
+    pub selection: Option<ProgramSelection>,
+    pub smart_clip: Option<ProgramSmartClipSearch>,
+    pub search: Option<ProgramSearch>,
     pub revealed_at: Instant,
     pub hide_after: Instant,
     pub closing: bool,
@@ -1451,11 +1451,11 @@ pub struct CanvasPopup {
     pub scroll_offset: usize,
 }
 
-/// In-flight canvas Run animation state for one session (spec 0042). Present
-/// while a canvas Run this client issued is believed to still be executing in
+/// In-flight program Run animation state for one session (spec 0042). Present
+/// while a program Run this client issued is believed to still be executing in
 /// the owning session; drives the "shimmer" over the executed Markdown.
 #[derive(Debug, Clone)]
-pub struct CanvasRun {
+pub struct ProgramRun {
     /// When Run was pressed. The shimmer wave is a function of elapsed time.
     pub started_at: Instant,
     /// Content signatures of blocks still considered running (shimmering). A
@@ -1469,8 +1469,8 @@ pub struct CanvasRun {
     pub first_output_seen: bool,
 }
 
-impl CanvasRun {
-    fn from_progress(progress: agentd_protocol::CanvasRunProgress) -> Option<Self> {
+impl ProgramRun {
+    fn from_progress(progress: agentd_protocol::ProgramRunProgress) -> Option<Self> {
         let now = Instant::now();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1494,10 +1494,10 @@ impl CanvasRun {
     }
 }
 
-/// A canvas "block": a maximal run of consecutive non-blank Markdown lines,
+/// A program "block": a maximal run of consecutive non-blank Markdown lines,
 /// identified by its normalized text. The unit of Run shimmer — a block
 /// shimmers as a whole and settles as a whole (spec 0042).
-pub(crate) struct CanvasBlock {
+pub(crate) struct ProgramBlock {
     /// Source-line index range `[start_line, end_line)` into `markdown.lines()`.
     pub start_line: usize,
     pub end_line: usize,
@@ -1509,7 +1509,7 @@ pub(crate) struct CanvasBlock {
 /// Run start (which records the executed blocks' signatures) and the renderer
 /// (which decides which source lines shimmer) derive from this so their notion
 /// of a block stays identical.
-pub(crate) fn canvas_blocks(markdown: &str) -> Vec<CanvasBlock> {
+pub(crate) fn program_blocks(markdown: &str) -> Vec<ProgramBlock> {
     let mut blocks = Vec::new();
     let mut cur: Option<(usize, Vec<String>)> = None;
     let mut total = 0usize;
@@ -1517,7 +1517,7 @@ pub(crate) fn canvas_blocks(markdown: &str) -> Vec<CanvasBlock> {
         total = i + 1;
         if raw.trim().is_empty() {
             if let Some((start, lines)) = cur.take() {
-                blocks.push(CanvasBlock {
+                blocks.push(ProgramBlock {
                     start_line: start,
                     end_line: i,
                     signature: lines.join("\n"),
@@ -1530,7 +1530,7 @@ pub(crate) fn canvas_blocks(markdown: &str) -> Vec<CanvasBlock> {
         }
     }
     if let Some((start, lines)) = cur.take() {
-        blocks.push(CanvasBlock {
+        blocks.push(ProgramBlock {
             start_line: start,
             end_line: total,
             signature: lines.join("\n"),
@@ -1540,20 +1540,20 @@ pub(crate) fn canvas_blocks(markdown: &str) -> Vec<CanvasBlock> {
 }
 
 /// Signatures of the blocks contained in `body` — the set of blocks that a Run
-/// over `body` should shimmer. For a full-canvas run `body` is the whole
+/// over `body` should shimmer. For a full-program run `body` is the whole
 /// document; for a selection run it is the selected text.
-pub(crate) fn canvas_run_pending_signatures(body: &str) -> HashSet<String> {
-    canvas_blocks(body)
+pub(crate) fn program_run_pending_signatures(body: &str) -> HashSet<String> {
+    program_blocks(body)
         .into_iter()
         .map(|b| b.signature)
         .collect()
 }
 
-/// Result of flushing a canvas popup's buffer to the daemon.
-struct CanvasSaveOutcome {
+/// Result of flushing a program popup's buffer to the daemon.
+struct ProgramSaveOutcome {
     /// The document as it now lives on the daemon (our content, possibly
     /// merged with concurrent edits).
-    canvas: agentd_protocol::CanvasDocument,
+    program: agentd_protocol::ProgramDocument,
     /// A 3-way merge ran because the document advanced underneath us.
     merged: bool,
     /// The merge could not reconcile overlapping edits, so the saved content
@@ -1562,30 +1562,30 @@ struct CanvasSaveOutcome {
 }
 
 #[derive(Debug, Clone)]
-pub struct CanvasSelection {
+pub struct ProgramSelection {
     pub anchor: usize,
     pub head: usize,
     pub dragged: bool,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CanvasUndoState {
+pub(crate) struct ProgramUndoState {
     buffer: String,
     cursor: usize,
     preferred_col: Option<usize>,
-    selection: Option<CanvasSelection>,
-    smart_clip: Option<CanvasSmartClipSearch>,
+    selection: Option<ProgramSelection>,
+    smart_clip: Option<ProgramSmartClipSearch>,
     scroll_offset: usize,
 }
 
 #[derive(Debug, Clone)]
-pub struct CanvasSmartClipSearch {
+pub struct ProgramSmartClipSearch {
     pub trigger_start: usize,
     pub selected: usize,
 }
 
 #[derive(Debug, Clone)]
-pub struct CanvasSearch {
+pub struct ProgramSearch {
     pub anchor_cursor: usize,
     pub query: String,
     pub matches: Vec<(usize, usize)>,
@@ -1593,20 +1593,20 @@ pub struct CanvasSearch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanvasSmartClipCandidate {
-    pub group: CanvasSmartClipGroup,
+pub struct ProgramSmartClipCandidate {
+    pub group: ProgramSmartClipGroup,
     pub clip: String,
     pub label: String,
     pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CanvasSmartClipGroup {
+pub enum ProgramSmartClipGroup {
     Session,
     Harness,
 }
 
-impl CanvasSmartClipGroup {
+impl ProgramSmartClipGroup {
     pub fn label(self) -> &'static str {
         match self {
             Self::Session => "session",
@@ -1874,25 +1874,25 @@ pub struct LayoutSnapshot {
     /// Mouse clicks outside this rect dismiss the modal instead of
     /// falling through to panes underneath it.
     pub modal_area: Option<ratatui::layout::Rect>,
-    /// Canvas title-bar Run button bounds: `(x_start, x_end, y)`.
-    pub canvas_title_run_hit: Option<(u16, u16, u16)>,
-    /// Canvas title-bar mode toggle bounds: `(x_start, x_end, y)`.
-    pub canvas_title_toggle_hit: Option<(u16, u16, u16)>,
-    /// Canvas title-bar close button bounds: `(x_start, x_end, y)`.
-    pub canvas_title_close_hit: Option<(u16, u16, u16)>,
-    /// Canvas selected-text context Run button bounds: `(x_start, x_end, y)`.
-    pub canvas_selection_run_hit: Option<(u16, u16, u16)>,
-    /// Inner content rect of the active canvas popup from the last frame.
+    /// Program title-bar Run button bounds: `(x_start, x_end, y)`.
+    pub program_title_run_hit: Option<(u16, u16, u16)>,
+    /// Program title-bar mode toggle bounds: `(x_start, x_end, y)`.
+    pub program_title_toggle_hit: Option<(u16, u16, u16)>,
+    /// Program title-bar close button bounds: `(x_start, x_end, y)`.
+    pub program_title_close_hit: Option<(u16, u16, u16)>,
+    /// Program selected-text context Run button bounds: `(x_start, x_end, y)`.
+    pub program_selection_run_hit: Option<(u16, u16, u16)>,
+    /// Inner content rect of the active program popup from the last frame.
     /// Cursor-move handlers and the mouse wheel read its width/height to keep
-    /// the caret on-screen and to bound scrolling; `None` when no canvas is open.
-    pub canvas_inner_area: Option<ratatui::layout::Rect>,
-    /// Session smart-clip hitboxes in the active canvas body from the last
+    /// the caret on-screen and to bound scrolling; `None` when no program is open.
+    pub program_inner_area: Option<ratatui::layout::Rect>,
+    /// Session smart-clip hitboxes in the active program body from the last
     /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
-    pub canvas_clip_hits: Vec<CanvasClipHit>,
-    /// Template-button hitboxes drawn in the empty-canvas placeholder. Clicking
-    /// one fills the canvas with that template's Markdown. Empty unless the
-    /// active canvas is showing the empty-state placeholder.
-    pub canvas_template_hits: Vec<CanvasTemplateHit>,
+    pub program_clip_hits: Vec<ProgramClipHit>,
+    /// Template-button hitboxes drawn in the empty-program placeholder. Clicking
+    /// one fills the program with that template's Markdown. Empty unless the
+    /// active program is showing the empty-state placeholder.
+    pub program_template_hits: Vec<ProgramTemplateHit>,
     /// Bounds of the browser preview overlay rendered in the terminal view.
     pub browser_preview_area: Option<ratatui::layout::Rect>,
     /// Top-right close button bounds for the browser preview overlay: `(x_start, x_end, y)`.
@@ -2068,8 +2068,8 @@ async fn run_with_socket_initial_selection(
     let sessions = client.list().await.unwrap_or_default();
     let groups = client.list_projects().await.unwrap_or_default();
     let harnesses = client.harnesses().await.unwrap_or_default();
-    let canvas_templates = client
-        .canvas_templates()
+    let program_templates = client
+        .program_templates()
         .await
         .map(|r| r.templates)
         .unwrap_or_default();
@@ -2161,7 +2161,7 @@ async fn run_with_socket_initial_selection(
         transcript_scroll: 0,
         minibuffer: None,
         harnesses,
-        canvas_templates,
+        program_templates,
         theme,
         help_visible: false,
         profile,
@@ -2180,10 +2180,10 @@ async fn run_with_socket_initial_selection(
         matrix_reveal_hits: Vec::new(),
         orchestrator_desired_size: None,
         tasks_popup: None,
-        canvas_popup: None,
-        canvas_popups: HashMap::new(),
-        canvas_runs: HashMap::new(),
-        canvas_clipboard: None,
+        program_popup: None,
+        program_popups: HashMap::new(),
+        program_runs: HashMap::new(),
+        program_clipboard: None,
         remote_control_popup: None,
         remote_control_task: None,
         terminal_pane_size: (100, 30),
@@ -2268,7 +2268,7 @@ async fn run_with_socket_initial_selection(
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
         app.view = ViewMode::Terminal;
     }
-    app.restore_open_canvas_popups(&persisted.open_canvas_session_ids)
+    app.restore_open_program_popups(&persisted.open_program_session_ids)
         .await;
 
     // Subscribe to all session events.
@@ -2337,7 +2337,7 @@ async fn run_with_socket_initial_selection(
     );
     terminal.show_cursor().ok();
 
-    app.save_open_canvas_popups().await;
+    app.save_open_program_popups().await;
 
     let mut widgets: HashMap<String, crate::tui_state::WidgetState> = HashMap::new();
     for (session_id, panel_id) in &app.dynamic_ui_selected {
@@ -2363,7 +2363,7 @@ async fn run_with_socket_initial_selection(
         hide_pane_side_borders: app.hide_pane_side_borders,
         main_windows: Some(app.main_windows.clone()),
         active_window_id: Some(app.active_window_id),
-        open_canvas_session_ids: app.open_canvas_session_ids(),
+        open_program_session_ids: app.open_program_session_ids(),
         widgets,
     });
 
@@ -2805,7 +2805,7 @@ async fn run_loop(
                     }
                 }
                 app.update_browser_preview_hover_and_expiry();
-                app.expire_canvas_runs(Instant::now());
+                app.expire_program_runs(Instant::now());
             }
         }
     }
@@ -2826,8 +2826,8 @@ impl App {
         let sessions = client.list().await.unwrap_or_default();
         let groups = client.list_projects().await.unwrap_or_default();
         let harnesses = client.harnesses().await.unwrap_or_default();
-        let canvas_templates = client
-            .canvas_templates()
+        let program_templates = client
+            .program_templates()
             .await
             .map(|r| r.templates)
             .unwrap_or_default();
@@ -2839,8 +2839,8 @@ impl App {
         self.sessions = sessions;
         self.groups = groups;
         self.harnesses = harnesses;
-        if !canvas_templates.is_empty() {
-            self.canvas_templates = canvas_templates;
+        if !program_templates.is_empty() {
+            self.program_templates = program_templates;
         }
         // A daemon restart respawns every PTY session and truncates each
         // session's pty.log so the new child renders into a clean slate
@@ -3028,17 +3028,17 @@ impl App {
             return;
         }
 
-        if self.canvas_search_active() {
-            self.append_canvas_search_query_text(&text);
+        if self.program_search_active() {
+            self.append_program_search_query_text(&text);
             return;
         }
 
         // Mirror the keystroke routing precedence (see `on_key`): pasted
-        // text lands in the canvas only when no minibuffer/palette overlay is
+        // text lands in the program only when no minibuffer/palette overlay is
         // capturing input. With an overlay open, `dispatch_paste_text` below
         // routes the paste to the minibuffer / orchestrator instead.
-        if self.canvas_popup.is_some() && self.minibuffer.is_none() {
-            self.insert_canvas_text(&text);
+        if self.program_popup.is_some() && self.minibuffer.is_none() {
+            self.insert_program_text(&text);
             return;
         }
 
@@ -3184,11 +3184,11 @@ impl App {
         } else {
             ViewMode::Chat
         };
-        // The canvas is a per-session surface: keep it attached to whatever
-        // session is now selected. The outgoing session's canvas is stashed
-        // and the incoming one revealed (if it has a canvas open). Navigation
-        // never *closes* a canvas — only its title-glyph toggle / C-x Space do.
-        self.sync_canvas_popup_with_selection();
+        // The program is a per-session surface: keep it attached to whatever
+        // session is now selected. The outgoing session's program is stashed
+        // and the incoming one revealed (if it has a program open). Navigation
+        // never *closes* a program — only its title-glyph toggle / C-x Space do.
+        self.sync_program_popup_with_selection();
     }
 
     /// Tell the daemon which surface we're showing the focused session through
@@ -4057,10 +4057,10 @@ impl App {
                     ViewMode::Chat
                 };
             }
-            // Keep the canvas attached to the focused pane's session (stash
+            // Keep the program attached to the focused pane's session (stash
             // the outgoing one, reveal the incoming). A no-op when the
             // selection didn't actually change.
-            self.sync_canvas_popup_with_selection();
+            self.sync_program_popup_with_selection();
         }
     }
 
@@ -4297,10 +4297,10 @@ impl App {
         // exists, even when it has no navigable list row — e.g. a subagent,
         // which renders only as a child of its parent (and never at all when
         // the parent is the hidden orchestrator) but is reachable through a
-        // canvas session clip. The main view can display any live session;
+        // program session clip. The main view can display any live session;
         // the list simply won't highlight a row for it. Without this, clicking
         // such a clip selects the session and the next session-list refresh
-        // would immediately revert the selection (popping the stashed canvas
+        // would immediately revert the selection (popping the stashed program
         // back open over the would-be target).
         if let Selection::Session(id) = &self.selection {
             if self.sessions.iter().any(|s| s.id == *id) {
@@ -4839,13 +4839,13 @@ impl App {
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::CANVAS_STATE => {
+            m if m == agentd_protocol::ipc_notif::PROGRAM_STATE => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::CanvasStateNotificationPayload,
+                        agentd_protocol::ProgramStateNotificationPayload,
                     >(p)
                     {
-                        self.on_canvas_state(payload.canvas, payload.active_run);
+                        self.on_program_state(payload.program, payload.active_run);
                     }
                 }
             }
@@ -4853,51 +4853,51 @@ impl App {
         }
     }
 
-    /// A canvas changed on the daemon (most often the owning agent edited it).
+    /// A program changed on the daemon (most often the owning agent edited it).
     /// Keep any open popup for that session in sync: when the user has no
     /// unsaved edits, adopt the new content live so they see the agent's
     /// changes and our tracked version stays fresh. When the user is mid-edit,
     /// leave the buffer and the (now stale) base version alone — the
     /// merge-on-save path reconciles both sides without losing either.
-    fn on_canvas_state(
+    fn on_program_state(
         &mut self,
-        canvas: agentd_protocol::CanvasDocument,
-        active_run: Option<agentd_protocol::CanvasRunProgress>,
+        program: agentd_protocol::ProgramDocument,
+        active_run: Option<agentd_protocol::ProgramRunProgress>,
     ) {
-        match active_run.and_then(CanvasRun::from_progress) {
+        match active_run.and_then(ProgramRun::from_progress) {
             Some(run) => {
-                self.canvas_runs.insert(canvas.session_id.clone(), run);
+                self.program_runs.insert(program.session_id.clone(), run);
             }
             None => {
-                self.canvas_runs.remove(&canvas.session_id);
+                self.program_runs.remove(&program.session_id);
             }
         }
-        let updating_session_id = canvas.session_id.clone();
+        let updating_session_id = program.session_id.clone();
         let popup = if self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .is_some_and(|p| p.canvas.session_id == updating_session_id)
+            .is_some_and(|p| p.program.session_id == updating_session_id)
         {
-            self.canvas_popup.as_mut()
+            self.program_popup.as_mut()
         } else {
-            self.canvas_popups.get_mut(&updating_session_id)
+            self.program_popups.get_mut(&updating_session_id)
         };
         let Some(popup) = popup else {
             return;
         };
-        if canvas.version <= popup.canvas.version {
+        if program.version <= popup.program.version {
             return;
         }
         let dirty =
-            canvas_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown;
+            program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown;
         if dirty {
             // Don't clobber unsaved edits. Keep the stale base version so the
             // next save detects the conflict and 3-way merges both sides.
             return;
         }
-        popup.buffer = canvas.markdown.clone();
-        popup.saved_markdown = canvas.markdown.clone();
-        popup.canvas = canvas;
+        popup.buffer = program.markdown.clone();
+        popup.saved_markdown = program.markdown.clone();
+        popup.program = program;
         let buffer_len = popup.buffer.chars().count();
         popup.cursor = popup.cursor.min(buffer_len);
         if let Some(search) = popup.search.as_mut() {
@@ -4906,7 +4906,7 @@ impl App {
         popup.preferred_col = None;
         popup.undo_stack.clear();
         if popup.search.is_some() {
-            self.refresh_canvas_search_for_session(&updating_session_id);
+            self.refresh_program_search_for_session(&updating_session_id);
         }
     }
 
@@ -5153,7 +5153,7 @@ impl App {
         // Track every event's cell so hover-aware rendering (diamond
         // tooltip, etc.) has a current position to render against. Record the
         // wall-clock of an actual cell change so self-dismissing hovers (the
-        // canvas shimmer-text preview) can hide once the pointer is still.
+        // program shimmer-text preview) can hide once the pointer is still.
         let next_pos = (ev.column, ev.row);
         if self.mouse_pos != Some(next_pos) {
             self.last_mouse_move = Some(Instant::now());
@@ -5169,7 +5169,7 @@ impl App {
         // content, so its action rows must take mouse priority over the child
         // (otherwise a mouse-grabbing child swallows every menu click and the
         // split/close/rename actions silently do nothing).
-        if self.handle_canvas_mouse(&ev).await {
+        if self.handle_program_mouse(&ev).await {
             return;
         }
         // URL clicks must be intercepted before the child-mouse-forward path so
@@ -5842,17 +5842,17 @@ impl App {
             return;
         }
         if let Some(modal) = self.layout.modal_area {
-            if self.canvas_popup.is_some() {
+            if self.program_popup.is_some() {
                 if contains(modal, col, row) {
-                    self.place_canvas_cursor(modal, col, row);
+                    self.place_program_cursor(modal, col, row);
                     return;
                 }
-                // A click outside the canvas never closes it. The canvas is a
+                // A click outside the program never closes it. The program is a
                 // per-session surface dismissed only via its title-glyph
                 // toggle or C-x Space. Fall through so the click still selects
-                // a session / focuses a pane; the canvas then follows the new
-                // selection (the prior canvas is stashed, not destroyed) via
-                // sync_canvas_popup_with_selection.
+                // a session / focuses a pane; the program then follows the new
+                // selection (the prior program is stashed, not destroyed) via
+                // sync_program_popup_with_selection.
             } else if !contains(modal, col, row) {
                 self.dismiss_modal();
                 return;
@@ -5985,13 +5985,13 @@ impl App {
                 let (close_x_start, close_x_end, close_y) =
                     crate::ui::view_close_button_range(view);
                 let (toggle_x_start, toggle_x_end, toggle_y) =
-                    crate::ui::view_canvas_toggle_button_range(view);
+                    crate::ui::view_program_toggle_button_range(view);
                 if self.selected_session().is_some()
                     && row == toggle_y
                     && col >= toggle_x_start
                     && col < toggle_x_end
                 {
-                    self.toggle_canvas_popup().await;
+                    self.toggle_program_popup().await;
                     return;
                 }
                 if self.selected_id().is_some()
@@ -6031,7 +6031,7 @@ impl App {
     }
 
     fn dismiss_modal(&mut self) {
-        if self.canvas_popup.take().is_some() {
+        if self.program_popup.take().is_some() {
             return;
         }
         if self.tasks_popup.take().is_some() {
@@ -6809,19 +6809,19 @@ impl App {
                 return;
             }
         }
-        // The canvas captures keystrokes only while it is the topmost input
+        // The program captures keystrokes only while it is the topmost input
         // surface. If a minibuffer/palette overlay is open over it (e.g.
         // `C-x x` opened the command palette or the operator input), that
         // overlay must capture input instead — otherwise typed keys leak
-        // into the canvas buffer and the palette/operator is unusable. The
-        // `C-x` chord that *opens* an overlay still reaches the canvas global
+        // into the program buffer and the palette/operator is unusable. The
+        // `C-x` chord that *opens* an overlay still reaches the program global
         // handler because no minibuffer exists yet at that point; once the
         // overlay is open the minibuffer block below takes over.
-        if self.canvas_popup.is_some() && self.minibuffer.is_none() {
-            if self.handle_canvas_global_key(key).await {
+        if self.program_popup.is_some() && self.minibuffer.is_none() {
+            if self.handle_program_global_key(key).await {
                 return;
             }
-            self.handle_canvas_key(key).await;
+            self.handle_program_key(key).await;
             return;
         }
         // /remote-control modal: Esc closes the popup *and* the
@@ -7008,7 +7008,7 @@ impl App {
                 | KeyAction::ToggleView
                 | KeyAction::ToggleZoom
                 | KeyAction::ToggleHelp
-                | KeyAction::OpenCanvas
+                | KeyAction::OpenProgram
                 | KeyAction::OpenCommandPalette
                 | KeyAction::OpenSwitchSession
                 | KeyAction::OpenNewSession
@@ -7132,7 +7132,7 @@ impl App {
     }
 
     /// Toggle a widget's pinned/selected state from a title-bar indicator
-    /// click. Shared by the session pane title bar and the canvas title bar.
+    /// click. Shared by the session pane title bar and the program title bar.
     pub fn toggle_dynamic_ui_widget_pin(&mut self, session_id: String, panel_id: String) {
         let key = (session_id, panel_id);
         if self.dynamic_ui_selected.contains(&key) {
@@ -7305,43 +7305,43 @@ impl App {
             && live
     }
 
-    async fn open_canvas_popup(&mut self) {
+    async fn open_program_popup(&mut self) {
         let Some(session_id) = self.selected_id() else {
-            self.set_status("canvas: no session selected".to_string());
+            self.set_status("program: no session selected".to_string());
             return;
         };
 
-        match self.client.canvas_get(&session_id).await {
+        match self.client.program_get(&session_id).await {
             Ok(result) => {
-                let version = result.canvas.version;
+                let version = result.program.version;
                 let now = Instant::now();
-                match result.active_run.and_then(CanvasRun::from_progress) {
+                match result.active_run.and_then(ProgramRun::from_progress) {
                     Some(run) => {
-                        self.canvas_runs.insert(result.canvas.session_id.clone(), run);
+                        self.program_runs.insert(result.program.session_id.clone(), run);
                     }
                     None => {
-                        self.canvas_runs.remove(&result.canvas.session_id);
+                        self.program_runs.remove(&result.program.session_id);
                     }
                 }
-                self.canvas_popups.remove(&result.canvas.session_id);
-                self.canvas_popup = Some(canvas_popup_from_document(result.canvas, now));
-                self.set_status(format!("canvas opened at version {version}"));
+                self.program_popups.remove(&result.program.session_id);
+                self.program_popup = Some(program_popup_from_document(result.program, now));
+                self.set_status(format!("program opened at version {version}"));
             }
             Err(e) => {
-                self.set_status(format!("canvas get failed: {e}"));
+                self.set_status(format!("program get failed: {e}"));
             }
         }
     }
 
-    async fn toggle_canvas_popup(&mut self) {
-        if self.canvas_popup.is_some() {
-            self.close_canvas_popup().await;
+    async fn toggle_program_popup(&mut self) {
+        if self.program_popup.is_some() {
+            self.close_program_popup().await;
         } else {
-            self.open_canvas_popup().await;
+            self.open_program_popup().await;
         }
     }
 
-    async fn restore_open_canvas_popups(&mut self, session_ids: &[String]) {
+    async fn restore_open_program_popups(&mut self, session_ids: &[String]) {
         let mut seen = HashSet::new();
         let live_sessions: HashSet<String> = self
             .sessions
@@ -7355,26 +7355,26 @@ impl App {
             if !seen.insert(session_id.clone()) || !live_sessions.contains(session_id) {
                 continue;
             }
-            match self.client.canvas_get(session_id).await {
+            match self.client.program_get(session_id).await {
                 Ok(result) => {
-                    match result.active_run.and_then(CanvasRun::from_progress) {
+                    match result.active_run.and_then(ProgramRun::from_progress) {
                         Some(run) => {
-                            self.canvas_runs.insert(result.canvas.session_id.clone(), run);
+                            self.program_runs.insert(result.program.session_id.clone(), run);
                         }
                         None => {
-                            self.canvas_runs.remove(&result.canvas.session_id);
+                            self.program_runs.remove(&result.program.session_id);
                         }
                     }
-                    let popup = canvas_popup_from_document(result.canvas, now);
+                    let popup = program_popup_from_document(result.program, now);
                     if selected_id.as_deref() == Some(session_id.as_str()) {
-                        self.canvas_popup = Some(popup);
+                        self.program_popup = Some(popup);
                     } else {
-                        self.canvas_popups.insert(session_id.clone(), popup);
+                        self.program_popups.insert(session_id.clone(), popup);
                     }
                 }
                 Err(e) => {
                     self.status = Some((
-                        format!("canvas restore failed for {}: {e}", short_id(session_id)),
+                        format!("program restore failed for {}: {e}", short_id(session_id)),
                         Instant::now(),
                     ));
                 }
@@ -7382,57 +7382,57 @@ impl App {
         }
     }
 
-    pub(crate) fn open_canvas_session_ids(&self) -> Vec<String> {
+    pub(crate) fn open_program_session_ids(&self) -> Vec<String> {
         let mut ids = Vec::new();
         let mut seen = HashSet::new();
-        if let Some(popup) = self.canvas_popup.as_ref() {
-            if !popup.closing && seen.insert(popup.canvas.session_id.clone()) {
-                ids.push(popup.canvas.session_id.clone());
+        if let Some(popup) = self.program_popup.as_ref() {
+            if !popup.closing && seen.insert(popup.program.session_id.clone()) {
+                ids.push(popup.program.session_id.clone());
             }
         }
-        for popup in self.canvas_popups.values() {
-            if !popup.closing && seen.insert(popup.canvas.session_id.clone()) {
-                ids.push(popup.canvas.session_id.clone());
+        for popup in self.program_popups.values() {
+            if !popup.closing && seen.insert(popup.program.session_id.clone()) {
+                ids.push(popup.program.session_id.clone());
             }
         }
         ids.sort();
         ids
     }
 
-    /// The session id of the canvas smart-clip occupying the cell at
-    /// `(col, row)`, if any. Reads the hitboxes captured during the last canvas
+    /// The session id of the program smart-clip occupying the cell at
+    /// `(col, row)`, if any. Reads the hitboxes captured during the last program
     /// render; used for clip click-to-focus and hover-preview.
-    pub fn canvas_clip_session_at(&self, col: u16, row: u16) -> Option<String> {
+    pub fn program_clip_session_at(&self, col: u16, row: u16) -> Option<String> {
         self.layout
-            .canvas_clip_hits
+            .program_clip_hits
             .iter()
             .find(|hit| hit.contains(col, row))
             .map(|hit| hit.session_id.clone())
     }
 
-    pub fn sync_canvas_popup_with_selection(&mut self) {
+    pub fn sync_program_popup_with_selection(&mut self) {
         let selected_id = self.selection.session_id().map(str::to_string);
         let active_id = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .map(|popup| popup.canvas.session_id.clone());
+            .map(|popup| popup.program.session_id.clone());
         if active_id.as_deref() == selected_id.as_deref() {
             return;
         }
-        self.stash_active_canvas_popup();
+        self.stash_active_program_popup();
         if let Some(selected_id) = selected_id {
-            if let Some(mut popup) = self.canvas_popups.remove(&selected_id) {
+            if let Some(mut popup) = self.program_popups.remove(&selected_id) {
                 popup.closing = false;
-                self.canvas_popup = Some(popup);
+                self.program_popup = Some(popup);
             }
         }
     }
 
-    fn stash_active_canvas_popup(&mut self) {
-        if let Some(popup) = self.canvas_popup.take() {
+    fn stash_active_program_popup(&mut self) {
+        if let Some(popup) = self.program_popup.take() {
             if !popup.closing {
-                self.canvas_popups
-                    .insert(popup.canvas.session_id.clone(), popup);
+                self.program_popups
+                    .insert(popup.program.session_id.clone(), popup);
             }
         }
     }
@@ -7444,45 +7444,45 @@ impl App {
     /// re-read the latest content and 3-way merge our edits onto it, using the
     /// last-saved content as the common ancestor. Disjoint edits merge silently;
     /// only genuinely overlapping edits produce conflict markers. Either way the
-    /// write lands, so hiding the canvas never blocks and no edit is lost.
-    async fn save_canvas_popup_document(
+    /// write lands, so hiding the program never blocks and no edit is lost.
+    async fn save_program_popup_document(
         &self,
-        popup: &CanvasPopup,
-    ) -> Result<Option<CanvasSaveOutcome>> {
-        let mut ours = canvas_normalize_smart_clip_instance_ids(&popup.buffer);
+        popup: &ProgramPopup,
+    ) -> Result<Option<ProgramSaveOutcome>> {
+        let mut ours = program_normalize_smart_clip_instance_ids(&popup.buffer);
         if ours == popup.saved_markdown {
             return Ok(None);
         }
         // The content our edits are based on — the common ancestor for a merge.
         let mut ancestor = popup.saved_markdown.clone();
-        let mut base = popup.canvas.version;
+        let mut base = popup.program.version;
         let mut merged = false;
         let mut conflicted = false;
         // Retry to absorb further updates that land between our re-read and
         // our write.
         for _ in 0..5 {
-            let params = agentd_protocol::CanvasUpdateParams {
-                session_id: popup.canvas.session_id.clone(),
+            let params = agentd_protocol::ProgramUpdateParams {
+                session_id: popup.program.session_id.clone(),
                 markdown: ours.clone(),
                 base_version: Some(base),
-                actor: agentd_protocol::CanvasUpdateActor::Human,
-                template_id: popup.canvas.template_id.clone(),
+                actor: agentd_protocol::ProgramUpdateActor::Human,
+                template_id: popup.program.template_id.clone(),
                 note: None,
             };
-            match self.client.canvas_update(params).await {
+            match self.client.program_update(params).await {
                 Ok(result) => {
-                    return Ok(Some(CanvasSaveOutcome {
-                        canvas: result.canvas,
+                    return Ok(Some(ProgramSaveOutcome {
+                        program: result.program,
                         merged,
                         conflicted,
                     }));
                 }
-                Err(e) if e.to_string().contains("canvas conflict") => {
+                Err(e) if e.to_string().contains("program conflict") => {
                     let latest = self
                         .client
-                        .canvas_get(&popup.canvas.session_id)
+                        .program_get(&popup.program.session_id)
                         .await?
-                        .canvas;
+                        .program;
                     let theirs = latest.markdown;
                     merged = true;
                     match diffy::merge(&ancestor, &ours, &theirs) {
@@ -7501,73 +7501,73 @@ impl App {
             }
         }
         Err(anyhow::anyhow!(
-            "canvas merge: gave up after repeated concurrent updates"
+            "program merge: gave up after repeated concurrent updates"
         ))
     }
 
-    async fn save_open_canvas_popups(&mut self) {
-        let active = self.canvas_popup.clone();
+    async fn save_open_program_popups(&mut self) {
+        let active = self.program_popup.clone();
         if let Some(popup) = active.as_ref() {
-            match self.save_canvas_popup_document(popup).await {
+            match self.save_program_popup_document(popup).await {
                 Ok(Some(outcome)) => {
-                    if let Some(active) = self.canvas_popup.as_mut() {
-                        active.buffer = outcome.canvas.markdown.clone();
-                        active.saved_markdown = outcome.canvas.markdown.clone();
-                        active.canvas = outcome.canvas;
+                    if let Some(active) = self.program_popup.as_mut() {
+                        active.buffer = outcome.program.markdown.clone();
+                        active.saved_markdown = outcome.program.markdown.clone();
+                        active.program = outcome.program;
                         active.cursor = active.cursor.min(active.buffer.chars().count());
                         active.preferred_col = None;
                     }
                 }
                 Ok(None) => {}
-                Err(e) => self.status = Some((format!("canvas save failed: {e}"), Instant::now())),
+                Err(e) => self.status = Some((format!("program save failed: {e}"), Instant::now())),
             }
         }
 
-        let cached: Vec<(String, CanvasPopup)> = self
-            .canvas_popups
+        let cached: Vec<(String, ProgramPopup)> = self
+            .program_popups
             .iter()
             .map(|(id, popup)| (id.clone(), popup.clone()))
             .collect();
         for (session_id, popup) in cached {
-            match self.save_canvas_popup_document(&popup).await {
+            match self.save_program_popup_document(&popup).await {
                 Ok(Some(outcome)) => {
-                    if let Some(cached) = self.canvas_popups.get_mut(&session_id) {
-                        cached.buffer = outcome.canvas.markdown.clone();
-                        cached.saved_markdown = outcome.canvas.markdown.clone();
-                        cached.canvas = outcome.canvas;
+                    if let Some(cached) = self.program_popups.get_mut(&session_id) {
+                        cached.buffer = outcome.program.markdown.clone();
+                        cached.saved_markdown = outcome.program.markdown.clone();
+                        cached.program = outcome.program;
                         cached.cursor = cached.cursor.min(cached.buffer.chars().count());
                         cached.preferred_col = None;
                     }
                 }
                 Ok(None) => {}
-                Err(e) => self.status = Some((format!("canvas save failed: {e}"), Instant::now())),
+                Err(e) => self.status = Some((format!("program save failed: {e}"), Instant::now())),
             }
         }
     }
 
-    async fn save_canvas_popup(&mut self) -> bool {
-        let Some(popup) = self.canvas_popup.as_ref() else {
+    async fn save_program_popup(&mut self) -> bool {
+        let Some(popup) = self.program_popup.as_ref() else {
             return true;
         };
-        match self.save_canvas_popup_document(popup).await {
+        match self.save_program_popup_document(popup).await {
             Ok(Some(outcome)) => {
-                let version = outcome.canvas.version;
+                let version = outcome.program.version;
                 let (merged, conflicted) = (outcome.merged, outcome.conflicted);
-                if let Some(popup) = self.canvas_popup.as_mut() {
-                    popup.buffer = outcome.canvas.markdown.clone();
-                    popup.saved_markdown = outcome.canvas.markdown.clone();
-                    popup.canvas = outcome.canvas;
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.buffer = outcome.program.markdown.clone();
+                    popup.saved_markdown = outcome.program.markdown.clone();
+                    popup.program = outcome.program;
                     popup.cursor = popup.cursor.min(popup.buffer.chars().count());
                     popup.preferred_col = None;
                 }
                 if conflicted {
                     self.set_status(format!(
-                        "canvas merged with conflicts to resolve (version {version})"
+                        "program merged with conflicts to resolve (version {version})"
                     ));
                 } else if merged {
-                    self.set_status(format!("canvas merged with agent edits (version {version})"));
+                    self.set_status(format!("program merged with agent edits (version {version})"));
                 } else {
-                    self.set_status(format!("canvas saved version {version}"));
+                    self.set_status(format!("program saved version {version}"));
                 }
                 true
             }
@@ -7575,19 +7575,19 @@ impl App {
                 true
             }
             Err(e) => {
-                self.set_status(format!("canvas save failed: {e}"));
+                self.set_status(format!("program save failed: {e}"));
                 false
             }
         }
     }
 
-    async fn execute_canvas_popup(&mut self, selection: Option<String>) -> bool {
+    async fn execute_program_popup(&mut self, selection: Option<String>) -> bool {
         let Some(session_id) = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .map(|popup| popup.canvas.session_id.clone())
+            .map(|popup| popup.program.session_id.clone())
         else {
-            self.set_status("canvas run failed: no active canvas".to_string());
+            self.set_status("program run failed: no active program".to_string());
             return false;
         };
 
@@ -7595,27 +7595,27 @@ impl App {
         // can tell which blocks the user changed (vs. ones the agent settled,
         // which are already folded into `saved_markdown`). See spec 0042.
         let prev_saved = self
-            .canvas_popup
+            .program_popup
             .as_ref()
             .map(|popup| popup.saved_markdown.clone())
             .unwrap_or_default();
 
         let dirty = self
-            .canvas_popup
+            .program_popup
             .as_ref()
             .is_some_and(|popup| {
-                canvas_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
+                program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
             });
-        if dirty && !self.save_canvas_popup().await {
+        if dirty && !self.save_program_popup().await {
             return false;
         }
 
         let base_version = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .map(|popup| popup.canvas.version);
+            .map(|popup| popup.program.version);
         let selection = selection.map(|selection| {
-            canvas_normalize_smart_clip_instance_ids(&selection)
+            program_normalize_smart_clip_instance_ids(&selection)
         });
         let is_selection = selection.is_some();
         // Optimistic feedback (spec 0042): start the Run shimmer the instant
@@ -7625,45 +7625,45 @@ impl App {
         let run_body = match selection.as_deref() {
             Some(sel) => sel.to_string(),
             None => self
-                .canvas_popup
+                .program_popup
                 .as_ref()
                 .map(|popup| popup.buffer.clone())
                 .unwrap_or_default(),
         };
-        self.start_canvas_run(&session_id, &run_body, is_selection, &prev_saved);
-        let params = agentd_protocol::CanvasExecuteParams {
+        self.start_program_run(&session_id, &run_body, is_selection, &prev_saved);
+        let params = agentd_protocol::ProgramExecuteParams {
             session_id: session_id.clone(),
             selection,
             base_version,
         };
-        match self.client.canvas_execute(params).await {
+        match self.client.program_execute(params).await {
             Ok(result) => {
-                match result.active_run.and_then(CanvasRun::from_progress) {
+                match result.active_run.and_then(ProgramRun::from_progress) {
                     Some(run) => {
-                        self.canvas_runs.insert(session_id.clone(), run);
+                        self.program_runs.insert(session_id.clone(), run);
                     }
                     None => {
-                        self.canvas_runs.remove(&session_id);
+                        self.program_runs.remove(&session_id);
                     }
                 }
-                let scope = if is_selection { "selection" } else { "canvas" };
+                let scope = if is_selection { "selection" } else { "program" };
                 self.set_status(format!(
-                    "canvas run sent ({scope}, version {})",
-                    result.canvas.version
+                    "program run sent ({scope}, version {})",
+                    result.program.version
                 ));
                 true
             }
             Err(e) => {
                 // The request never landed — retract the optimistic shimmer.
-                self.canvas_runs.remove(&session_id);
-                self.set_status(format!("canvas run failed: {e}"));
+                self.program_runs.remove(&session_id);
+                self.set_status(format!("program run failed: {e}"));
                 false
             }
         }
     }
 
     /// Begin (or refresh) the Run shimmer for `session_id` over `body` — the
-    /// executed Markdown (full canvas or selection). Records the block
+    /// executed Markdown (full program or selection). Records the block
     /// signatures to shimmer; they settle as their content changes and the run
     /// clears once the first agent output is observed. See spec 0042.
     ///
@@ -7672,27 +7672,27 @@ impl App {
     /// last daemon sync (`prev_saved`) plus blocks that were still pending —
     /// blocks the agent already settled stay calm. A fresh run, or any
     /// selection run the user explicitly scoped, shimmers its whole region.
-    fn start_canvas_run(
+    fn start_program_run(
         &mut self,
         session_id: &str,
         body: &str,
         is_selection: bool,
         prev_saved: &str,
     ) {
-        let body_sigs = canvas_run_pending_signatures(body);
+        let body_sigs = program_run_pending_signatures(body);
         if body_sigs.is_empty() {
             // Empty body has nothing to shimmer; drop any stale run.
-            self.canvas_runs.remove(session_id);
+            self.program_runs.remove(session_id);
             return;
         }
-        let pending: HashSet<String> = match self.canvas_runs.get(session_id) {
+        let pending: HashSet<String> = match self.program_runs.get(session_id) {
             // Re-Run mid-flight: union of the user's fresh edits (blocks present
             // now but not in the last synced content) and blocks that never
             // settled under the prior run. Agent-settled blocks are in
             // `prev_saved` and absent from `old.pending`, so both terms skip
             // them and they stop re-shimmering.
             Some(old) if !is_selection => {
-                let prev_sigs = canvas_run_pending_signatures(prev_saved);
+                let prev_sigs = program_run_pending_signatures(prev_saved);
                 body_sigs
                     .difference(&prev_sigs)
                     .chain(body_sigs.intersection(&old.pending))
@@ -7703,12 +7703,12 @@ impl App {
             _ => body_sigs,
         };
         let now = Instant::now();
-        self.canvas_runs.insert(
+        self.program_runs.insert(
             session_id.to_string(),
-            CanvasRun {
+            ProgramRun {
                 started_at: now,
                 pending,
-                deadline: now + Duration::from_millis(CANVAS_RUN_MAX_MS),
+                deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,
             },
         );
@@ -7716,29 +7716,29 @@ impl App {
 
     /// Reap Run shimmers that have outlived their backstop deadline, so a
     /// missed first-output signal can never strand the animation (spec 0042).
-    fn expire_canvas_runs(&mut self, now: Instant) {
-        self.canvas_runs.retain(|_, run| now < run.deadline);
+    fn expire_program_runs(&mut self, now: Instant) {
+        self.program_runs.retain(|_, run| now < run.deadline);
     }
 
-    async fn close_canvas_popup(&mut self) {
-        if !self.save_canvas_popup().await {
+    async fn close_program_popup(&mut self) {
+        if !self.save_program_popup().await {
             return;
         }
-        if let Some(popup) = self.canvas_popup.as_mut() {
-            self.canvas_popups.remove(&popup.canvas.session_id);
+        if let Some(popup) = self.program_popup.as_mut() {
+            self.program_popups.remove(&popup.program.session_id);
             let now = Instant::now();
             popup.closing = true;
-            popup.hide_after = now + Duration::from_millis(CANVAS_REVEAL_MS);
+            popup.hide_after = now + Duration::from_millis(PROGRAM_REVEAL_MS);
         }
     }
 
-    fn place_canvas_cursor(&mut self, modal: ratatui::layout::Rect, col: u16, row: u16) {
+    fn place_program_cursor(&mut self, modal: ratatui::layout::Rect, col: u16, row: u16) {
         let cursor = {
             let app: &App = self;
-            let Some(popup) = app.canvas_popup.as_ref() else {
+            let Some(popup) = app.program_popup.as_ref() else {
                 return;
             };
-            canvas_cursor_at_modal_point(
+            program_cursor_at_modal_point(
                 Some(app),
                 &popup.buffer,
                 modal,
@@ -7748,7 +7748,7 @@ impl App {
             )
             .unwrap_or(0)
         };
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.closing = false;
@@ -7758,12 +7758,12 @@ impl App {
         popup.smart_clip = None;
     }
 
-    async fn handle_canvas_mouse(&mut self, ev: &MouseEvent) -> bool {
+    async fn handle_program_mouse(&mut self, ev: &MouseEvent) -> bool {
         use crossterm::event::MouseButton;
         let Some(modal) = self.layout.modal_area else {
             return false;
         };
-        if self.canvas_popup.is_none() {
+        if self.program_popup.is_none() {
             return false;
         }
         if let Some(menu) = self.session_title_menu.clone() {
@@ -7788,10 +7788,10 @@ impl App {
         if !contains {
             return false;
         }
-        let title_run_hit = self.layout.canvas_title_run_hit;
-        let title_toggle_hit = self.layout.canvas_title_toggle_hit;
-        let title_close_hit = self.layout.canvas_title_close_hit;
-        let selection_run_hit = self.layout.canvas_selection_run_hit;
+        let title_run_hit = self.layout.program_title_run_hit;
+        let title_toggle_hit = self.layout.program_title_toggle_hit;
+        let title_close_hit = self.layout.program_title_close_hit;
+        let selection_run_hit = self.layout.program_selection_run_hit;
         let hit_title_toggle = title_toggle_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_title_run = title_run_hit
@@ -7803,30 +7803,30 @@ impl App {
         if hit_title_toggle || hit_title_run || hit_title_close || hit_selection_run {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 if hit_title_toggle {
-                    self.close_canvas_popup().await;
+                    self.close_program_popup().await;
                 } else if hit_title_close {
                     if let Some(session_id) = self
-                        .canvas_popup
+                        .program_popup
                         .as_ref()
-                        .map(|popup| popup.canvas.session_id.clone())
+                        .map(|popup| popup.program.session_id.clone())
                     {
                         self.open_session_title_menu(session_id, modal);
                     }
                 } else {
                     let selection = hit_selection_run
                         .then(|| {
-                            self.canvas_popup
+                            self.program_popup
                                 .as_ref()
-                                .and_then(Self::selected_canvas_text)
+                                .and_then(Self::selected_program_text)
                         })
                         .flatten();
-                    self.execute_canvas_popup(selection).await;
+                    self.execute_program_popup(selection).await;
                 }
             }
             return true;
         }
         // Clicking a title-bar widget indicator pins/unpins that widget. The
-        // canvas reuses the session view's shared widget geometry, so its icons
+        // program reuses the session view's shared widget geometry, so its icons
         // register into `dynamic_ui_widget_hits` (via `render_session_widget_title`)
         // — the same list the pane title bar uses.
         if let Some(hit) = self
@@ -7841,27 +7841,27 @@ impl App {
             }
             return true;
         }
-        // Clicking a template button in the empty-canvas placeholder fills the
+        // Clicking a template button in the empty-program placeholder fills the
         // buffer with that template's Markdown — a starting point the user then
         // edits. Checked before the generic cursor-placement handler so the
         // click doesn't just move the caret.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(hit) = self
                 .layout
-                .canvas_template_hits
+                .program_template_hits
                 .iter()
                 .find(|hit| hit.contains(ev.column, ev.row))
                 .cloned()
             {
-                self.apply_canvas_template(hit.template_id, hit.markdown);
+                self.apply_program_template(hit.template_id, hit.markdown);
                 return true;
             }
         }
         // Clicking a session smart-clip focuses that session, just like clicking
-        // its row in the session list. The canvas follows selection, so the
-        // clicked session's canvas reveals in place.
+        // its row in the session list. The program follows selection, so the
+        // clicked session's program reveals in place.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if let Some(session_id) = self.canvas_clip_session_at(ev.column, ev.row) {
+            if let Some(session_id) = self.program_clip_session_at(ev.column, ev.row) {
                 if self.sessions.iter().any(|s| s.id == session_id) {
                     self.focus = PaneFocus::List;
                     self.select_session(session_id);
@@ -7880,10 +7880,10 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) => {
                 let cursor = {
                     let app: &App = self;
-                    let Some(popup) = app.canvas_popup.as_ref() else {
+                    let Some(popup) = app.program_popup.as_ref() else {
                         return true;
                     };
-                    canvas_cursor_at_modal_point(
+                    program_cursor_at_modal_point(
                         Some(app),
                         &popup.buffer,
                         modal,
@@ -7893,12 +7893,12 @@ impl App {
                     )
                     .unwrap_or(0)
                 };
-                let Some(popup) = self.canvas_popup.as_mut() else {
+                let Some(popup) = self.program_popup.as_mut() else {
                     return true;
                 };
                 popup.cursor = cursor;
                 popup.preferred_col = None;
-                popup.selection = Some(CanvasSelection {
+                popup.selection = Some(ProgramSelection {
                     anchor: cursor,
                     head: cursor,
                     dragged: false,
@@ -7909,10 +7909,10 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 let cursor = {
                     let app: &App = self;
-                    let Some(popup) = app.canvas_popup.as_ref() else {
+                    let Some(popup) = app.program_popup.as_ref() else {
                         return true;
                     };
-                    canvas_cursor_at_modal_point(
+                    program_cursor_at_modal_point(
                         Some(app),
                         &popup.buffer,
                         modal,
@@ -7922,7 +7922,7 @@ impl App {
                     )
                     .unwrap_or(0)
                 };
-                let Some(popup) = self.canvas_popup.as_mut() else {
+                let Some(popup) = self.program_popup.as_mut() else {
                     return true;
                 };
                 popup.cursor = cursor;
@@ -7935,13 +7935,13 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 let should_copy = self
-                    .canvas_popup
+                    .program_popup
                     .as_ref()
                     .and_then(|popup| popup.selection.as_ref())
                     .is_some_and(|selection| selection.dragged);
                 if should_copy {
-                    self.copy_canvas_selection();
-                } else if let Some(popup) = self.canvas_popup.as_mut() {
+                    self.copy_program_selection();
+                } else if let Some(popup) = self.program_popup.as_mut() {
                     popup.selection = None;
                 }
                 true
@@ -7949,165 +7949,165 @@ impl App {
             // Mouse wheel scrolls the body without moving the caret. The next
             // keystroke re-anchors the scroll to the cursor via follow.
             MouseEventKind::ScrollDown => {
-                self.scroll_canvas_popup(CANVAS_WHEEL_SCROLL_ROWS as isize);
+                self.scroll_program_popup(PROGRAM_WHEEL_SCROLL_ROWS as isize);
                 true
             }
             MouseEventKind::ScrollUp => {
-                self.scroll_canvas_popup(-(CANVAS_WHEEL_SCROLL_ROWS as isize));
+                self.scroll_program_popup(-(PROGRAM_WHEEL_SCROLL_ROWS as isize));
                 true
             }
             _ => true,
         }
     }
 
-    async fn handle_canvas_key(&mut self, key: KeyEvent) {
-        if self.canvas_popup.as_ref().is_some_and(|p| p.closing) {
+    async fn handle_program_key(&mut self, key: KeyEvent) {
+        if self.program_popup.as_ref().is_some_and(|p| p.closing) {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let super_mod = key.modifiers.contains(KeyModifiers::SUPER);
-        if self.canvas_search_active() {
+        if self.program_search_active() {
             match key.code {
-                KeyCode::Esc => self.cancel_canvas_search(),
-                KeyCode::Char('g') if ctrl => self.cancel_canvas_search(),
-                KeyCode::Char('s') if ctrl => self.move_canvas_search_match(1),
-                KeyCode::Char('r') if ctrl => self.move_canvas_search_match(-1),
-                KeyCode::Enter => self.accept_canvas_search(),
-                KeyCode::Backspace => self.delete_canvas_search_query_char(),
+                KeyCode::Esc => self.cancel_program_search(),
+                KeyCode::Char('g') if ctrl => self.cancel_program_search(),
+                KeyCode::Char('s') if ctrl => self.move_program_search_match(1),
+                KeyCode::Char('r') if ctrl => self.move_program_search_match(-1),
+                KeyCode::Enter => self.accept_program_search(),
+                KeyCode::Backspace => self.delete_program_search_query_char(),
                 KeyCode::Char(c) if !ctrl && !alt && !super_mod => {
-                    self.append_canvas_search_query_char(c)
+                    self.append_program_search_query_char(c)
                 }
                 _ => {}
             }
-            self.follow_canvas_scroll();
+            self.follow_program_scroll();
             return;
         }
         match key.code {
-            KeyCode::Esc if self.canvas_smart_clip_active() => self.cancel_canvas_smart_clip(),
+            KeyCode::Esc if self.program_smart_clip_active() => self.cancel_program_smart_clip(),
             // Esc only cancels the transient smart-clip picker (above); it is
-            // intentionally NOT a canvas-hide affordance. Show/hide is C-x
+            // intentionally NOT a program-hide affordance. Show/hide is C-x
             // Space (and the title-glyph toggle) only, so a reflexive Esc
-            // while editing canvas prose doesn't blow away the surface.
+            // while editing program prose doesn't blow away the surface.
             KeyCode::Esc => {}
-            KeyCode::Enter if self.canvas_smart_clip_active() => self.accept_canvas_smart_clip(),
-            KeyCode::Up if self.canvas_smart_clip_active() => {
-                self.move_canvas_smart_clip_selection(-1)
+            KeyCode::Enter if self.program_smart_clip_active() => self.accept_program_smart_clip(),
+            KeyCode::Up if self.program_smart_clip_active() => {
+                self.move_program_smart_clip_selection(-1)
             }
-            KeyCode::Down if self.canvas_smart_clip_active() => {
-                self.move_canvas_smart_clip_selection(1)
+            KeyCode::Down if self.program_smart_clip_active() => {
+                self.move_program_smart_clip_selection(1)
             }
-            KeyCode::Char(' ') if ctrl => self.begin_canvas_selection(),
+            KeyCode::Char(' ') if ctrl => self.begin_program_selection(),
             KeyCode::Char('g') if ctrl => {
                 // C-g cancels: dismiss the transient smart-clip picker and
                 // clear any active C-Space selection mark. No-op when neither
-                // is active. Like Esc, it is deliberately NOT a canvas-hide
+                // is active. Like Esc, it is deliberately NOT a program-hide
                 // affordance — it never closes or mutates the surface.
-                self.cancel_canvas_smart_clip();
-                if let Some(popup) = self.canvas_popup.as_mut() {
+                self.cancel_program_smart_clip();
+                if let Some(popup) = self.program_popup.as_mut() {
                     popup.selection = None;
                 }
             }
             KeyCode::Char('a') if ctrl => {
-                if let Some(popup) = self.canvas_popup.as_mut() {
-                    popup.cursor = canvas_line_start(&popup.buffer, popup.cursor);
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.cursor = program_line_start(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
-                    Self::update_canvas_selection_head(popup);
-                    Self::update_canvas_smart_clip_after_cursor_move(popup);
+                    Self::update_program_selection_head(popup);
+                    Self::update_program_smart_clip_after_cursor_move(popup);
                 }
             }
-            KeyCode::Char('s') if ctrl => self.begin_canvas_search(),
+            KeyCode::Char('s') if ctrl => self.begin_program_search(),
             KeyCode::Char('e') if ctrl => {
-                if let Some(popup) = self.canvas_popup.as_mut() {
-                    popup.cursor = canvas_line_end(&popup.buffer, popup.cursor);
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.cursor = program_line_end(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
-                    Self::update_canvas_selection_head(popup);
-                    Self::update_canvas_smart_clip_after_cursor_move(popup);
+                    Self::update_program_selection_head(popup);
+                    Self::update_program_smart_clip_after_cursor_move(popup);
                 }
             }
-            KeyCode::Char('b') if ctrl => self.move_canvas_cursor(-1),
-            KeyCode::Char('f') if ctrl => self.move_canvas_cursor(1),
-            KeyCode::Char('p') if ctrl && self.canvas_smart_clip_active() => {
-                self.move_canvas_smart_clip_selection(-1)
+            KeyCode::Char('b') if ctrl => self.move_program_cursor(-1),
+            KeyCode::Char('f') if ctrl => self.move_program_cursor(1),
+            KeyCode::Char('p') if ctrl && self.program_smart_clip_active() => {
+                self.move_program_smart_clip_selection(-1)
             }
-            KeyCode::Char('n') if ctrl && self.canvas_smart_clip_active() => {
-                self.move_canvas_smart_clip_selection(1)
+            KeyCode::Char('n') if ctrl && self.program_smart_clip_active() => {
+                self.move_program_smart_clip_selection(1)
             }
-            KeyCode::Char('p') if ctrl => self.move_canvas_cursor_vertical(-1),
-            KeyCode::Char('n') if ctrl => self.move_canvas_cursor_vertical(1),
-            KeyCode::Char('v') if ctrl => self.paste_canvas_clipboard(),
-            KeyCode::Char('y') if ctrl => self.paste_canvas_clipboard(),
-            KeyCode::Char('w') if ctrl => self.cut_canvas_selection(),
+            KeyCode::Char('p') if ctrl => self.move_program_cursor_vertical(-1),
+            KeyCode::Char('n') if ctrl => self.move_program_cursor_vertical(1),
+            KeyCode::Char('v') if ctrl => self.paste_program_clipboard(),
+            KeyCode::Char('y') if ctrl => self.paste_program_clipboard(),
+            KeyCode::Char('w') if ctrl => self.cut_program_selection(),
             // M-w is emacs kill-ring-save: copy the selection, never delete.
-            KeyCode::Char('w') if alt => self.copy_canvas_selection_and_deactivate(),
-            KeyCode::Char('/') if ctrl => self.undo_canvas_edit(),
+            KeyCode::Char('w') if alt => self.copy_program_selection_and_deactivate(),
+            KeyCode::Char('/') if ctrl => self.undo_program_edit(),
             // Cmd-C / Ctrl-C also copy, but only when a selection exists so we
             // don't disturb existing behavior otherwise (plain C-c stays a
             // no-op here; the C-x C-c quit chord is consumed earlier in
-            // handle_canvas_global_key, and bare Cmd-C still self-inserts 'c').
+            // handle_program_global_key, and bare Cmd-C still self-inserts 'c').
             KeyCode::Char('c')
                 if (ctrl || super_mod)
                     && self
-                        .canvas_popup
+                        .program_popup
                         .as_ref()
-                        .and_then(Self::canvas_selection_range)
+                        .and_then(Self::program_selection_range)
                         .is_some() =>
             {
-                self.copy_canvas_selection_and_deactivate()
+                self.copy_program_selection_and_deactivate()
             }
-            KeyCode::Char('d') if ctrl => self.delete_canvas_forward(),
-            KeyCode::Char('h') if ctrl => self.delete_canvas_back(),
-            KeyCode::Char('k') if ctrl => self.cut_canvas_line(),
-            KeyCode::Enter => self.insert_canvas_text("\n"),
-            KeyCode::Backspace => self.delete_canvas_back(),
-            KeyCode::Delete => self.delete_canvas_forward(),
-            KeyCode::Left => self.move_canvas_cursor(-1),
-            KeyCode::Right => self.move_canvas_cursor(1),
-            KeyCode::Up => self.move_canvas_cursor_vertical(-1),
-            KeyCode::Down => self.move_canvas_cursor_vertical(1),
+            KeyCode::Char('d') if ctrl => self.delete_program_forward(),
+            KeyCode::Char('h') if ctrl => self.delete_program_back(),
+            KeyCode::Char('k') if ctrl => self.cut_program_line(),
+            KeyCode::Enter => self.insert_program_text("\n"),
+            KeyCode::Backspace => self.delete_program_back(),
+            KeyCode::Delete => self.delete_program_forward(),
+            KeyCode::Left => self.move_program_cursor(-1),
+            KeyCode::Right => self.move_program_cursor(1),
+            KeyCode::Up => self.move_program_cursor_vertical(-1),
+            KeyCode::Down => self.move_program_cursor_vertical(1),
             KeyCode::Char('l') if ctrl => {
-                // C-l: center the current cursor row in the canvas viewport (emacs-like).
-                self.center_canvas_cursor();
+                // C-l: center the current cursor row in the program viewport (emacs-like).
+                self.center_program_cursor();
             }
             KeyCode::Home => {
-                if let Some(popup) = self.canvas_popup.as_mut() {
-                    popup.cursor = canvas_line_start(&popup.buffer, popup.cursor);
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.cursor = program_line_start(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
-                    Self::update_canvas_selection_head(popup);
-                    Self::update_canvas_smart_clip_after_cursor_move(popup);
+                    Self::update_program_selection_head(popup);
+                    Self::update_program_smart_clip_after_cursor_move(popup);
                 }
             }
             KeyCode::End => {
-                if let Some(popup) = self.canvas_popup.as_mut() {
-                    popup.cursor = canvas_line_end(&popup.buffer, popup.cursor);
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.cursor = program_line_end(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
-                    Self::update_canvas_selection_head(popup);
-                    Self::update_canvas_smart_clip_after_cursor_move(popup);
+                    Self::update_program_selection_head(popup);
+                    Self::update_program_smart_clip_after_cursor_move(popup);
                 }
             }
             // Tab / Shift-Tab nest and un-nest the current markdown list
             // item(s). They operate on every list line the selection spans, or
             // just the cursor's line when there is no selection.
-            KeyCode::Tab if !ctrl && !alt => self.shift_canvas_indent(false),
-            KeyCode::BackTab if !ctrl && !alt => self.shift_canvas_indent(true),
-            KeyCode::Char(c) if !ctrl && !alt => self.insert_canvas_text(&c.to_string()),
+            KeyCode::Tab if !ctrl && !alt => self.shift_program_indent(false),
+            KeyCode::BackTab if !ctrl && !alt => self.shift_program_indent(true),
+            KeyCode::Char(c) if !ctrl && !alt => self.insert_program_text(&c.to_string()),
             _ => {}
         }
         // Any cursor move or edit above may have pushed the caret out of the
         // visible window; re-anchor the scroll so it stays on-screen.
-        self.follow_canvas_scroll();
+        self.follow_program_scroll();
     }
 
     /// Indent (or, when `outdent`, un-indent) the markdown list item(s) under
     /// the cursor / selection by one nesting level. Nesting is encoded as
-    /// leading spaces on the source line (`CANVAS_INDENT_UNIT` per level);
+    /// leading spaces on the source line (`PROGRAM_INDENT_UNIT` per level);
     /// non-list lines and the empty leading whitespace at the top level are
     /// left untouched. The cursor and any selection endpoints ride along with
     /// the text they were sitting on so the same logical characters stay
     /// selected / under the cursor after the shift.
-    fn shift_canvas_indent(&mut self, outdent: bool) {
-        const CANVAS_INDENT_UNIT: usize = 2;
-        let Some(popup) = self.canvas_popup.as_ref() else {
+    fn shift_program_indent(&mut self, outdent: bool) {
+        const PROGRAM_INDENT_UNIT: usize = 2;
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         let lines: Vec<String> = popup.buffer.split('\n').map(str::to_string).collect();
@@ -8116,9 +8116,9 @@ impl App {
         // the cursor's line. A selection that ends exactly at a line start does
         // not pull that trailing line in (its text isn't really selected).
         let (range_start, range_end) =
-            Self::canvas_selection_range(popup).unwrap_or((popup.cursor, popup.cursor));
-        let (start_line, _) = canvas_offset_to_line_col(&lines, range_start);
-        let (mut end_line, end_col) = canvas_offset_to_line_col(&lines, range_end);
+            Self::program_selection_range(popup).unwrap_or((popup.cursor, popup.cursor));
+        let (start_line, _) = program_offset_to_line_col(&lines, range_start);
+        let (mut end_line, end_col) = program_offset_to_line_col(&lines, range_end);
         if end_line > start_line && end_col == 0 {
             end_line -= 1;
         }
@@ -8137,7 +8137,7 @@ impl App {
             }
             if outdent {
                 let leading_spaces = line.chars().take_while(|&c| c == ' ').count();
-                let remove = leading_spaces.min(CANVAS_INDENT_UNIT);
+                let remove = leading_spaces.min(PROGRAM_INDENT_UNIT);
                 if remove == 0 {
                     continue;
                 }
@@ -8145,8 +8145,8 @@ impl App {
                 deltas[i] = (remove, 0);
                 changed = true;
             } else {
-                new_lines[i] = format!("{}{}", " ".repeat(CANVAS_INDENT_UNIT), line);
-                deltas[i] = (0, CANVAS_INDENT_UNIT);
+                new_lines[i] = format!("{}{}", " ".repeat(PROGRAM_INDENT_UNIT), line);
+                deltas[i] = (0, PROGRAM_INDENT_UNIT);
                 changed = true;
             }
         }
@@ -8158,7 +8158,7 @@ impl App {
         // the offset's own line can have shifted (edits are at column 0), so we
         // shift its column and re-resolve against the rebuilt lines.
         let remap = |offset: usize| -> usize {
-            let (line, col) = canvas_offset_to_line_col(&lines, offset);
+            let (line, col) = program_offset_to_line_col(&lines, offset);
             let (removed, inserted) = deltas[line];
             let new_col = if removed > 0 {
                 col.saturating_sub(removed)
@@ -8168,17 +8168,17 @@ impl App {
                 col
             };
             let new_col = new_col.min(new_lines[line].chars().count());
-            canvas_line_col_to_offset(&new_lines, line, new_col)
+            program_line_col_to_offset(&new_lines, line, new_col)
         };
 
         let new_cursor = remap(popup.cursor);
-        let new_selection = popup.selection.as_ref().map(|sel| CanvasSelection {
+        let new_selection = popup.selection.as_ref().map(|sel| ProgramSelection {
             anchor: remap(sel.anchor),
             head: remap(sel.head),
             dragged: sel.dragged,
         });
-        self.push_canvas_undo_state();
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.buffer = new_lines.join("\n");
@@ -8188,7 +8188,7 @@ impl App {
         popup.smart_clip = None;
     }
 
-    async fn handle_canvas_global_key(&mut self, key: KeyEvent) -> bool {
+    async fn handle_program_global_key(&mut self, key: KeyEvent) -> bool {
         let chord_active = !self.chord_state.is_empty();
         let is_ctrl_x =
             matches!(key.code, KeyCode::Char('x')) && key.modifiers.contains(KeyModifiers::CONTROL);
@@ -8212,31 +8212,31 @@ impl App {
         true
     }
 
-    fn begin_canvas_selection(&mut self) {
-        let Some(popup) = self.canvas_popup.as_mut() else {
+    fn begin_program_selection(&mut self) {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.smart_clip = None;
-        popup.selection = Some(CanvasSelection {
+        popup.selection = Some(ProgramSelection {
             anchor: popup.cursor,
             head: popup.cursor,
             dragged: false,
         });
-        self.set_status("canvas selection started".to_string());
+        self.set_status("program selection started".to_string());
     }
 
-    fn canvas_search_active(&self) -> bool {
-        self.canvas_popup
+    fn program_search_active(&self) -> bool {
+        self.program_popup
             .as_ref()
             .and_then(|popup| popup.search.as_ref())
             .is_some()
     }
 
-    fn begin_canvas_search(&mut self) {
-        let Some(popup) = self.canvas_popup.as_mut() else {
+    fn begin_program_search(&mut self) {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
-        popup.search = Some(CanvasSearch {
+        popup.search = Some(ProgramSearch {
             anchor_cursor: popup.cursor,
             query: String::new(),
             matches: Vec::new(),
@@ -8246,13 +8246,13 @@ impl App {
         popup.selection = None;
     }
 
-    fn append_canvas_search_query_char(&mut self, ch: char) {
-        self.append_canvas_search_query_text(&ch.to_string());
+    fn append_program_search_query_char(&mut self, ch: char) {
+        self.append_program_search_query_text(&ch.to_string());
     }
 
-    fn append_canvas_search_query_text(&mut self, text: &str) {
+    fn append_program_search_query_text(&mut self, text: &str) {
         {
-            let Some(popup) = self.canvas_popup.as_mut() else {
+            let Some(popup) = self.program_popup.as_mut() else {
                 return;
             };
             let Some(search) = popup.search.as_mut() else {
@@ -8260,12 +8260,12 @@ impl App {
             };
             search.query.push_str(text);
         }
-        self.update_canvas_search_after_edit();
+        self.update_program_search_after_edit();
     }
 
-    fn delete_canvas_search_query_char(&mut self) {
+    fn delete_program_search_query_char(&mut self) {
         {
-            let Some(popup) = self.canvas_popup.as_mut() else {
+            let Some(popup) = self.program_popup.as_mut() else {
                 return;
             };
             let Some(search) = popup.search.as_mut() else {
@@ -8273,26 +8273,26 @@ impl App {
             };
             search.query.pop();
         }
-        self.update_canvas_search_after_edit();
+        self.update_program_search_after_edit();
     }
 
-    fn update_canvas_search_after_edit(&mut self) {
+    fn update_program_search_after_edit(&mut self) {
         let Some(session_id) = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .map(|popup| popup.canvas.session_id.clone())
+            .map(|popup| popup.program.session_id.clone())
         else {
             return;
         };
-        self.refresh_canvas_search_for_session(&session_id);
+        self.refresh_program_search_for_session(&session_id);
     }
 
-    fn refresh_canvas_search_for_session(&mut self, session_id: &str) {
+    fn refresh_program_search_for_session(&mut self, session_id: &str) {
         let snapshot = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .filter(|popup| popup.canvas.session_id == session_id)
-            .or_else(|| self.canvas_popups.get(session_id))
+            .filter(|popup| popup.program.session_id == session_id)
+            .or_else(|| self.program_popups.get(session_id))
             .and_then(|popup| {
                 popup.search.as_ref().map(|search| {
                     (
@@ -8308,20 +8308,20 @@ impl App {
         let matches = if query.is_empty() {
             Vec::new()
         } else {
-            let mut matches = canvas_search_matches(&buffer, &query);
-            canvas_search_add_clip_label_matches(self, &buffer, &query, &mut matches);
+            let mut matches = program_search_matches(&buffer, &query);
+            program_search_add_clip_label_matches(self, &buffer, &query, &mut matches);
             matches.sort_unstable_by_key(|(start, _)| *start);
             matches.dedup();
             matches
         };
         let popup = if self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .is_some_and(|popup| popup.canvas.session_id == session_id)
+            .is_some_and(|popup| popup.program.session_id == session_id)
         {
-            self.canvas_popup.as_mut()
+            self.program_popup.as_mut()
         } else {
-            self.canvas_popups.get_mut(session_id)
+            self.program_popups.get_mut(session_id)
         };
         let Some(popup) = popup else {
             return;
@@ -8344,8 +8344,8 @@ impl App {
         popup.preferred_col = None;
     }
 
-    fn move_canvas_search_match(&mut self, delta: isize) {
-        let Some(popup) = self.canvas_popup.as_mut() else {
+    fn move_program_search_match(&mut self, delta: isize) {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         let Some(search) = popup.search.as_mut() else {
@@ -8362,15 +8362,15 @@ impl App {
         popup.preferred_col = None;
     }
 
-    fn accept_canvas_search(&mut self) {
-        if let Some(popup) = self.canvas_popup.as_mut() {
+    fn accept_program_search(&mut self) {
+        if let Some(popup) = self.program_popup.as_mut() {
             popup.search = None;
             popup.smart_clip = None;
         }
     }
 
-    fn cancel_canvas_search(&mut self) {
-        let Some(popup) = self.canvas_popup.as_mut() else {
+    fn cancel_program_search(&mut self) {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         if let Some(search) = popup.search.take() {
@@ -8380,26 +8380,26 @@ impl App {
         }
     }
 
-    fn canvas_smart_clip_active(&self) -> bool {
-        self.canvas_popup
+    fn program_smart_clip_active(&self) -> bool {
+        self.program_popup
             .as_ref()
             .and_then(|popup| popup.smart_clip.as_ref())
             .is_some()
     }
 
-    fn cancel_canvas_smart_clip(&mut self) {
-        if let Some(popup) = self.canvas_popup.as_mut() {
+    fn cancel_program_smart_clip(&mut self) {
+        if let Some(popup) = self.program_popup.as_mut() {
             popup.smart_clip = None;
         }
     }
 
-    fn move_canvas_smart_clip_selection(&mut self, delta: isize) {
+    fn move_program_smart_clip_selection(&mut self, delta: isize) {
         let candidate_count = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .map(|popup| self.canvas_smart_clip_candidates(popup).len())
+            .map(|popup| self.program_smart_clip_candidates(popup).len())
             .unwrap_or(0);
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         let Some(search) = popup.smart_clip.as_mut() else {
@@ -8420,14 +8420,14 @@ impl App {
         };
     }
 
-    fn accept_canvas_smart_clip(&mut self) {
-        let Some(popup) = self.canvas_popup.as_ref() else {
+    fn accept_program_smart_clip(&mut self) {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         let Some(search) = popup.smart_clip.as_ref() else {
             return;
         };
-        let candidates = self.canvas_smart_clip_candidates(popup);
+        let candidates = self.program_smart_clip_candidates(popup);
         let Some(candidate) = candidates
             .get(search.selected.min(candidates.len().saturating_sub(1)))
             .cloned()
@@ -8435,18 +8435,18 @@ impl App {
             return;
         };
         if popup.cursor < search.trigger_start {
-            let Some(popup) = self.canvas_popup.as_mut() else {
+            let Some(popup) = self.program_popup.as_mut() else {
                 return;
             };
             popup.smart_clip = None;
             return;
         }
-        let clip = canvas_smart_clip_with_instance_id(&candidate.clip, &popup.buffer);
+        let clip = program_smart_clip_with_instance_id(&candidate.clip, &popup.buffer);
         let start_b = byte_pos(&popup.buffer, search.trigger_start);
         let end_b = byte_pos(&popup.buffer, popup.cursor);
         let new_cursor = search.trigger_start + clip.chars().count();
-        self.push_canvas_undo_state();
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.buffer.replace_range(start_b..end_b, &clip);
@@ -8456,23 +8456,23 @@ impl App {
         popup.smart_clip = None;
     }
 
-    fn update_canvas_smart_clip_after_cursor_move(popup: &mut CanvasPopup) {
+    fn update_program_smart_clip_after_cursor_move(popup: &mut ProgramPopup) {
         let Some(search) = popup.smart_clip.as_ref() else {
             return;
         };
-        if canvas_smart_clip_query(popup, search.trigger_start).is_none() {
+        if program_smart_clip_query(popup, search.trigger_start).is_none() {
             popup.smart_clip = None;
         }
     }
 
-    pub(crate) fn canvas_smart_clip_candidates(
+    pub(crate) fn program_smart_clip_candidates(
         &self,
-        popup: &CanvasPopup,
-    ) -> Vec<CanvasSmartClipCandidate> {
+        popup: &ProgramPopup,
+    ) -> Vec<ProgramSmartClipCandidate> {
         let query = popup
             .smart_clip
             .as_ref()
-            .and_then(|search| canvas_smart_clip_query(popup, search.trigger_start))
+            .and_then(|search| program_smart_clip_query(popup, search.trigger_start))
             .unwrap_or_default()
             .to_ascii_lowercase();
         let mut out = Vec::new();
@@ -8488,8 +8488,8 @@ impl App {
             )
             .to_ascii_lowercase();
             if query.is_empty() || haystack.contains(&query) {
-                out.push(CanvasSmartClipCandidate {
-                    group: CanvasSmartClipGroup::Session,
+                out.push(ProgramSmartClipCandidate {
+                    group: ProgramSmartClipGroup::Session,
                     clip: format!("@{{session:{}}}", session.id),
                     label: title,
                     detail: format!("{} · {}", session.harness, session.state.label()),
@@ -8509,8 +8509,8 @@ impl App {
                 } else {
                     "unavailable".to_string()
                 };
-                out.push(CanvasSmartClipCandidate {
-                    group: CanvasSmartClipGroup::Harness,
+                out.push(ProgramSmartClipCandidate {
+                    group: ProgramSmartClipGroup::Harness,
                     clip: format!("@{{harness:{}}}", harness.name),
                     label: harness.name.clone(),
                     detail,
@@ -8521,32 +8521,32 @@ impl App {
         out
     }
 
-    fn update_canvas_selection_head(popup: &mut CanvasPopup) {
+    fn update_program_selection_head(popup: &mut ProgramPopup) {
         if let Some(selection) = popup.selection.as_mut() {
             selection.head = popup.cursor;
         }
     }
 
-    fn canvas_selection_range(popup: &CanvasPopup) -> Option<(usize, usize)> {
+    fn program_selection_range(popup: &ProgramPopup) -> Option<(usize, usize)> {
         let selection = popup.selection.as_ref()?;
         let start = selection.anchor.min(selection.head);
         let end = selection.anchor.max(selection.head);
         (start != end).then_some((start, end))
     }
 
-    fn selected_canvas_text(popup: &CanvasPopup) -> Option<String> {
-        let (start, end) = Self::canvas_selection_range(popup)?;
+    fn selected_program_text(popup: &ProgramPopup) -> Option<String> {
+        let (start, end) = Self::program_selection_range(popup)?;
         let start_b = byte_pos(&popup.buffer, start);
         let end_b = byte_pos(&popup.buffer, end);
         Some(popup.buffer[start_b..end_b].to_string())
     }
 
-    fn push_canvas_undo_state(&mut self) {
-        let popup = match self.canvas_popup.as_mut() {
+    fn push_program_undo_state(&mut self) {
+        let popup = match self.program_popup.as_mut() {
             Some(popup) => popup,
             None => return,
         };
-        popup.undo_stack.push(CanvasUndoState {
+        popup.undo_stack.push(ProgramUndoState {
             buffer: popup.buffer.clone(),
             cursor: popup.cursor,
             preferred_col: popup.preferred_col,
@@ -8554,13 +8554,13 @@ impl App {
             smart_clip: popup.smart_clip.clone(),
             scroll_offset: popup.scroll_offset,
         });
-        while popup.undo_stack.len() > CANVAS_UNDO_STACK_LIMIT {
+        while popup.undo_stack.len() > PROGRAM_UNDO_STACK_LIMIT {
             popup.undo_stack.remove(0);
         }
     }
 
-    fn undo_canvas_edit(&mut self) {
-        let Some(popup) = self.canvas_popup.as_mut() else {
+    fn undo_program_edit(&mut self) {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         let Some(state) = popup.undo_stack.pop() else {
@@ -8572,13 +8572,13 @@ impl App {
         popup.selection = state.selection;
         popup.smart_clip = state.smart_clip;
         popup.scroll_offset = state.scroll_offset;
-        Self::update_canvas_smart_clip_after_cursor_move(popup);
-        self.follow_canvas_scroll();
+        Self::update_program_smart_clip_after_cursor_move(popup);
+        self.follow_program_scroll();
     }
 
-    fn delete_canvas_selection(&mut self) -> Option<String> {
-        let popup = self.canvas_popup.as_mut()?;
-        let (start, end) = Self::canvas_selection_range(popup)?;
+    fn delete_program_selection(&mut self) -> Option<String> {
+        let popup = self.program_popup.as_mut()?;
+        let (start, end) = Self::program_selection_range(popup)?;
         let start_b = byte_pos(&popup.buffer, start);
         let end_b = byte_pos(&popup.buffer, end);
         let deleted = popup.buffer[start_b..end_b].to_string();
@@ -8590,76 +8590,76 @@ impl App {
         Some(deleted)
     }
 
-    fn copy_canvas_text(&mut self, text: &str, verb: &str) {
-        self.canvas_clipboard = Some(text.to_string());
+    fn copy_program_text(&mut self, text: &str, verb: &str) {
+        self.program_clipboard = Some(text.to_string());
         match copy_to_clipboard(text) {
             Ok(outcome) => self.set_status(outcome.status(text.chars().count())),
             Err(e) => self.set_status(format!("{verb} failed: {e}")),
         }
     }
 
-    fn copy_canvas_selection(&mut self) {
+    fn copy_program_selection(&mut self) {
         let Some(text) = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .and_then(Self::selected_canvas_text)
+            .and_then(Self::selected_program_text)
         else {
             return;
         };
         if !text.is_empty() {
-            self.copy_canvas_text(&text, "copy");
+            self.copy_program_text(&text, "copy");
         }
     }
 
     /// Keyboard copy chords (M-w, Cmd-C, Ctrl-C). Copies the active selection
-    /// to both the system clipboard and the internal `canvas_clipboard` exactly
+    /// to both the system clipboard and the internal `program_clipboard` exactly
     /// like the mouse-drag path, then clears the mark — emacs `kill-ring-save`.
     /// The buffer is never mutated; a no-op when there is no selection.
-    fn copy_canvas_selection_and_deactivate(&mut self) {
-        self.copy_canvas_selection();
-        if let Some(popup) = self.canvas_popup.as_mut() {
+    fn copy_program_selection_and_deactivate(&mut self) {
+        self.copy_program_selection();
+        if let Some(popup) = self.program_popup.as_mut() {
             popup.selection = None;
         }
     }
 
-    fn cut_canvas_selection(&mut self) {
+    fn cut_program_selection(&mut self) {
         if !self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .and_then(Self::canvas_selection_range)
+            .and_then(Self::program_selection_range)
             .is_some()
         {
             return;
         }
-        self.push_canvas_undo_state();
-        let Some(text) = self.delete_canvas_selection() else {
+        self.push_program_undo_state();
+        let Some(text) = self.delete_program_selection() else {
             return;
         };
         if !text.is_empty() {
-            self.copy_canvas_text(&text, "cut");
+            self.copy_program_text(&text, "cut");
         }
     }
 
-    fn paste_canvas_clipboard(&mut self) {
+    fn paste_program_clipboard(&mut self) {
         let text = self
-            .canvas_clipboard
+            .program_clipboard
             .clone()
             .or_else(|| read_from_clipboard().ok());
         let Some(text) = text else {
-            self.set_status("canvas paste failed: clipboard unavailable".to_string());
+            self.set_status("program paste failed: clipboard unavailable".to_string());
             return;
         };
         if !text.is_empty() {
-            self.insert_canvas_text(&text);
+            self.insert_program_text(&text);
         }
     }
 
-    fn cut_canvas_line(&mut self) {
-        let Some(popup) = self.canvas_popup.as_ref() else {
+    fn cut_program_line(&mut self) {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         let start = byte_pos(&popup.buffer, popup.cursor);
-        let line_end = canvas_line_end(&popup.buffer, popup.cursor);
+        let line_end = program_line_end(&popup.buffer, popup.cursor);
         let mut end = byte_pos(&popup.buffer, line_end);
         if start == end && end < popup.buffer.len() {
             end += 1;
@@ -8668,8 +8668,8 @@ impl App {
         if cut.is_empty() {
             return;
         }
-        self.push_canvas_undo_state();
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.buffer.replace_range(start..end, "");
@@ -8677,21 +8677,21 @@ impl App {
         popup.selection = None;
         popup.smart_clip = None;
         if !cut.is_empty() {
-            self.copy_canvas_text(&cut, "cut");
+            self.copy_program_text(&cut, "cut");
         }
     }
 
-    /// Fill an empty canvas from a placeholder template button. Replaces the
-    /// whole buffer (the placeholder only shows when the canvas is empty), records
+    /// Fill an empty program from a placeholder template button. Replaces the
+    /// whole buffer (the placeholder only shows when the program is empty), records
     /// an undo state so the user can back out, and stamps the document's
     /// `template_id`. Persists on the normal save path (close / Run), exactly like
     /// typed edits.
-    fn apply_canvas_template(&mut self, template_id: String, markdown: String) {
-        if self.canvas_popup.is_none() {
+    fn apply_program_template(&mut self, template_id: String, markdown: String) {
+        if self.program_popup.is_none() {
             return;
         }
-        self.push_canvas_undo_state();
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.buffer = markdown;
@@ -8700,29 +8700,29 @@ impl App {
         popup.selection = None;
         popup.smart_clip = None;
         if !template_id.is_empty() {
-            popup.canvas.template_id = Some(template_id);
+            popup.program.template_id = Some(template_id);
         }
-        Self::update_canvas_smart_clip_after_cursor_move(popup);
-        self.follow_canvas_scroll();
+        Self::update_program_smart_clip_after_cursor_move(popup);
+        self.follow_program_scroll();
     }
 
-    fn insert_canvas_text(&mut self, text: &str) {
+    fn insert_program_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        if self.canvas_popup.is_none() {
+        if self.program_popup.is_none() {
             return;
         }
         let had_selection = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .and_then(Self::canvas_selection_range)
+            .and_then(Self::program_selection_range)
             .is_some();
-        self.push_canvas_undo_state();
+        self.push_program_undo_state();
         if had_selection {
-            self.delete_canvas_selection();
+            self.delete_program_selection();
         }
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         let trigger_start = if text == "@" {
@@ -8736,52 +8736,52 @@ impl App {
         popup.preferred_col = None;
         popup.selection = None;
         if let Some(trigger_start) = trigger_start {
-            popup.smart_clip = Some(CanvasSmartClipSearch {
+            popup.smart_clip = Some(ProgramSmartClipSearch {
                 trigger_start,
                 selected: 0,
             });
         } else if popup.smart_clip.is_some() {
-            Self::update_canvas_smart_clip_after_cursor_move(popup);
+            Self::update_program_smart_clip_after_cursor_move(popup);
         }
     }
 
-    fn move_canvas_cursor(&mut self, delta: isize) {
+    fn move_program_cursor(&mut self, delta: isize) {
         let cursor = {
-            let Some(popup) = self.canvas_popup.as_ref() else {
+            let Some(popup) = self.program_popup.as_ref() else {
                 return;
             };
-            self.canvas_horizontal_cursor_target(popup, delta)
+            self.program_horizontal_cursor_target(popup, delta)
         };
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.cursor = cursor;
         popup.preferred_col = None;
-        Self::update_canvas_selection_head(popup);
-        Self::update_canvas_smart_clip_after_cursor_move(popup);
+        Self::update_program_selection_head(popup);
+        Self::update_program_smart_clip_after_cursor_move(popup);
     }
 
-    fn canvas_horizontal_cursor_target(&self, popup: &CanvasPopup, delta: isize) -> usize {
+    fn program_horizontal_cursor_target(&self, popup: &ProgramPopup, delta: isize) -> usize {
         let mut cursor = popup.cursor;
         let steps = delta.unsigned_abs();
         let direction = delta.signum();
         for _ in 0..steps {
-            cursor = self.canvas_horizontal_cursor_step(popup, cursor, direction);
+            cursor = self.program_horizontal_cursor_step(popup, cursor, direction);
         }
         cursor
     }
 
-    fn canvas_horizontal_cursor_step(
+    fn program_horizontal_cursor_step(
         &self,
-        popup: &CanvasPopup,
+        popup: &ProgramPopup,
         cursor: usize,
         direction: isize,
     ) -> usize {
-        let Some(inner) = self.layout.canvas_inner_area else {
+        let Some(inner) = self.layout.program_inner_area else {
             return if direction < 0 {
-                canvas_cursor_left(&popup.buffer, cursor)
+                program_cursor_left(&popup.buffer, cursor)
             } else {
-                canvas_cursor_right(&popup.buffer, cursor)
+                program_cursor_right(&popup.buffer, cursor)
             };
         };
         let width = inner.width as usize;
@@ -8789,26 +8789,26 @@ impl App {
             return cursor;
         }
 
-        let old_pos = ui::canvas_cursor_visual_pos(Some(self), &popup.buffer, cursor, width);
+        let old_pos = ui::program_cursor_visual_pos(Some(self), &popup.buffer, cursor, width);
         let mut next = cursor;
         loop {
             let candidate = if direction < 0 {
-                canvas_cursor_left(&popup.buffer, next)
+                program_cursor_left(&popup.buffer, next)
             } else {
-                canvas_cursor_right(&popup.buffer, next)
+                program_cursor_right(&popup.buffer, next)
             };
             if candidate == next {
                 return candidate;
             }
             next = candidate;
-            let new_pos = ui::canvas_cursor_visual_pos(Some(self), &popup.buffer, next, width);
+            let new_pos = ui::program_cursor_visual_pos(Some(self), &popup.buffer, next, width);
             if new_pos != old_pos {
                 return next;
             }
         }
     }
 
-    fn move_canvas_cursor_vertical(&mut self, delta: isize) {
+    fn move_program_cursor_vertical(&mut self, delta: isize) {
         // Move by one *visual* (word-wrapped) row, like a normal editor: a
         // logical line that wraps spans several visual rows, and Up/Down step
         // through each. Work in the same wrapped-row space the body is laid out
@@ -8817,7 +8817,7 @@ impl App {
         // preferred column is tracked in *visual* columns so it survives crossing
         // wrapped rows onto shorter ones. Without a rendered viewport there is
         // nothing to navigate; the follow-scroll runs afterward in the caller.
-        let Some(inner) = self.layout.canvas_inner_area else {
+        let Some(inner) = self.layout.program_inner_area else {
             return;
         };
         let width = inner.width as usize;
@@ -8826,16 +8826,16 @@ impl App {
         }
         let computed = {
             let app: &App = self;
-            app.canvas_popup.as_ref().map(|popup| {
+            app.program_popup.as_ref().map(|popup| {
                 let (row, col) =
-                    ui::canvas_cursor_visual_pos(Some(app), &popup.buffer, popup.cursor, width);
+                    ui::program_cursor_visual_pos(Some(app), &popup.buffer, popup.cursor, width);
                 let target_col = popup.preferred_col.unwrap_or(col);
                 let target_row = if delta < 0 {
                     row.saturating_sub(delta.unsigned_abs())
                 } else {
                     row.saturating_add(delta as usize)
                 };
-                let cursor = ui::canvas_visual_to_cursor(
+                let cursor = ui::program_visual_to_cursor(
                     Some(app),
                     &popup.buffer,
                     target_row,
@@ -8843,7 +8843,7 @@ impl App {
                     width,
                 );
                 (
-                    canvas_normalize_canvas_cursor(&popup.buffer, cursor),
+                    program_normalize_program_cursor(&popup.buffer, cursor),
                     target_col,
                 )
             })
@@ -8852,32 +8852,32 @@ impl App {
             return;
         };
         // When the clip's rendered chip spans the target visual row, the inner
-        // loop in canvas_visual_to_cursor finds no raw position on that row and
+        // loop in program_visual_to_cursor finds no raw position on that row and
         // picks the '@' that opens the clip syntax instead — a position that is
         // still on the *previous* visual row, making the cursor appear stuck.
         // Advance past the entire clip so the cursor actually moves forward.
         if let Some(range) = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .and_then(|p| canvas_smart_clip_range_at_or_containing(&p.buffer, cursor))
+            .and_then(|p| program_smart_clip_range_at_or_containing(&p.buffer, cursor))
         {
             cursor = range.end;
         }
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.cursor = cursor;
         popup.preferred_col = Some(target_col);
-        Self::update_canvas_selection_head(popup);
-        Self::update_canvas_smart_clip_after_cursor_move(popup);
+        Self::update_program_selection_head(popup);
+        Self::update_program_smart_clip_after_cursor_move(popup);
     }
 
-    /// After a cursor move or edit, scroll the canvas popup so the caret stays
+    /// After a cursor move or edit, scroll the program popup so the caret stays
     /// inside the visible window. Uses the inner viewport captured during the
-    /// last render, so it is a no-op until the canvas has rendered at least once
+    /// last render, so it is a no-op until the program has rendered at least once
     /// (the cursor starts at the top, where offset 0 is already correct).
-    fn follow_canvas_scroll(&mut self) {
-        let Some(inner) = self.layout.canvas_inner_area else {
+    fn follow_program_scroll(&mut self) {
+        let Some(inner) = self.layout.program_inner_area else {
             return;
         };
         let width = inner.width as usize;
@@ -8885,25 +8885,25 @@ impl App {
         if width == 0 || viewport == 0 {
             return;
         }
-        let Some(popup) = self.canvas_popup.as_ref() else {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         let cursor_row =
-            crate::ui::canvas_cursor_visual_row(Some(self), &popup.buffer, popup.cursor, width);
-        let total_rows = crate::ui::canvas_total_visual_rows(Some(self), &popup.buffer, width);
+            crate::ui::program_cursor_visual_row(Some(self), &popup.buffer, popup.cursor, width);
+        let total_rows = crate::ui::program_total_visual_rows(Some(self), &popup.buffer, width);
         let max_scroll = total_rows.saturating_sub(viewport);
-        let next = crate::ui::canvas_follow_scroll(popup.scroll_offset, cursor_row, viewport)
+        let next = crate::ui::program_follow_scroll(popup.scroll_offset, cursor_row, viewport)
             .min(max_scroll);
-        if let Some(popup) = self.canvas_popup.as_mut() {
+        if let Some(popup) = self.program_popup.as_mut() {
             popup.scroll_offset = next;
         }
     }
 
-    /// Center the cursor row in the canvas popup viewport (emacs C-l semantics).
+    /// Center the cursor row in the program popup viewport (emacs C-l semantics).
     /// Places the visual cursor row near the middle of the current viewport
     /// (clamped at the top or bottom when near the edges of the buffer).
-    fn center_canvas_cursor(&mut self) {
-        let Some(inner) = self.layout.canvas_inner_area else {
+    fn center_program_cursor(&mut self) {
+        let Some(inner) = self.layout.program_inner_area else {
             return;
         };
         let width = inner.width as usize;
@@ -8911,27 +8911,27 @@ impl App {
         if width == 0 || viewport == 0 {
             return;
         }
-        let Some(popup) = self.canvas_popup.as_ref() else {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         let cursor_row =
-            crate::ui::canvas_cursor_visual_row(Some(self), &popup.buffer, popup.cursor, width);
-        let total_rows = crate::ui::canvas_total_visual_rows(Some(self), &popup.buffer, width);
+            crate::ui::program_cursor_visual_row(Some(self), &popup.buffer, popup.cursor, width);
+        let total_rows = crate::ui::program_total_visual_rows(Some(self), &popup.buffer, width);
         let max_scroll = total_rows.saturating_sub(viewport);
         let half = viewport / 2;
         // Aim for the cursor to land roughly in the center of the window.
         let desired = cursor_row.saturating_sub(half);
         let next = desired.min(max_scroll);
-        if let Some(popup) = self.canvas_popup.as_mut() {
+        if let Some(popup) = self.program_popup.as_mut() {
             popup.scroll_offset = next;
         }
     }
 
-    /// Scroll the canvas popup by `delta` wrapped rows (negative scrolls up)
+    /// Scroll the program popup by `delta` wrapped rows (negative scrolls up)
     /// without moving the caret — the mouse-wheel path. Bounds against the
     /// last-rendered viewport so it never scrolls past the end of the content.
-    fn scroll_canvas_popup(&mut self, delta: isize) {
-        let Some(inner) = self.layout.canvas_inner_area else {
+    fn scroll_program_popup(&mut self, delta: isize) {
+        let Some(inner) = self.layout.program_inner_area else {
             return;
         };
         let width = inner.width as usize;
@@ -8939,10 +8939,10 @@ impl App {
         if width == 0 || viewport == 0 {
             return;
         }
-        let Some(popup) = self.canvas_popup.as_ref() else {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
-        let total_rows = crate::ui::canvas_total_visual_rows(Some(self), &popup.buffer, width);
+        let total_rows = crate::ui::program_total_visual_rows(Some(self), &popup.buffer, width);
         let max_scroll = total_rows.saturating_sub(viewport);
         let current = popup.scroll_offset;
         let next = if delta < 0 {
@@ -8950,30 +8950,30 @@ impl App {
         } else {
             current.saturating_add(delta as usize).min(max_scroll)
         };
-        if let Some(popup) = self.canvas_popup.as_mut() {
+        if let Some(popup) = self.program_popup.as_mut() {
             popup.scroll_offset = next;
         }
     }
 
-    fn delete_canvas_back(&mut self) {
+    fn delete_program_back(&mut self) {
         let has_selection = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .and_then(Self::canvas_selection_range)
+            .and_then(Self::program_selection_range)
             .is_some();
         if has_selection {
-            self.push_canvas_undo_state();
-            let _ = self.delete_canvas_selection();
+            self.push_program_undo_state();
+            let _ = self.delete_program_selection();
             return;
         }
-        let Some(popup) = self.canvas_popup.as_ref() else {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         if popup.cursor == 0 {
             return;
         }
         let (char_start, char_end) =
-            if let Some(range) = canvas_smart_clip_range_before_or_containing(
+            if let Some(range) = program_smart_clip_range_before_or_containing(
                 &popup.buffer,
                 popup.cursor,
             ) {
@@ -8986,8 +8986,8 @@ impl App {
             let end = byte_pos(&popup.buffer, char_end);
             (start, end)
         };
-        self.push_canvas_undo_state();
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.buffer.replace_range(start..end, "");
@@ -8995,28 +8995,28 @@ impl App {
         popup.preferred_col = None;
         popup.selection = None;
         popup.smart_clip = None;
-        Self::update_canvas_smart_clip_after_cursor_move(popup);
+        Self::update_program_smart_clip_after_cursor_move(popup);
     }
 
-    fn delete_canvas_forward(&mut self) {
+    fn delete_program_forward(&mut self) {
         let has_selection = self
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .and_then(Self::canvas_selection_range)
+            .and_then(Self::program_selection_range)
             .is_some();
         if has_selection {
-            self.push_canvas_undo_state();
-            let _ = self.delete_canvas_selection();
+            self.push_program_undo_state();
+            let _ = self.delete_program_selection();
             return;
         }
-        let Some(popup) = self.canvas_popup.as_ref() else {
+        let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
         if popup.cursor >= popup.buffer.chars().count() {
             return;
         }
         let (char_start, char_end) =
-            if let Some(range) = canvas_smart_clip_range_at_or_containing(
+            if let Some(range) = program_smart_clip_range_at_or_containing(
                 &popup.buffer,
                 popup.cursor,
             ) {
@@ -9029,8 +9029,8 @@ impl App {
             let end = byte_pos(&popup.buffer, char_end);
             (start, end)
         };
-        self.push_canvas_undo_state();
-        let Some(popup) = self.canvas_popup.as_mut() else {
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
             return;
         };
         popup.buffer.replace_range(start..end, "");
@@ -9038,7 +9038,7 @@ impl App {
         popup.preferred_col = None;
         popup.selection = None;
         popup.smart_clip = None;
-        Self::update_canvas_smart_clip_after_cursor_move(popup);
+        Self::update_program_smart_clip_after_cursor_move(popup);
     }
 
     async fn run_action(&mut self, action: KeyAction) {
@@ -9181,14 +9181,14 @@ impl App {
                 // The "N archived" disclosure row isn't a delete target.
                 Selection::ArchivedRow(_) => {}
             },
-            OpenCanvas => {
-                self.toggle_canvas_popup().await;
+            OpenProgram => {
+                self.toggle_program_popup().await;
             }
-            UndoCanvas => {
-                self.undo_canvas_edit();
+            UndoProgram => {
+                self.undo_program_edit();
             }
-            SaveCanvas => {
-                self.save_canvas_popup().await;
+            SaveProgram => {
+                self.save_program_popup().await;
             }
             OpenDiff => {
                 if let Some(id) = self.selected_id() {
@@ -10129,7 +10129,7 @@ impl App {
             "delete" | "kill" | "rm" => self.run_action(KeyAction::OpenDeleteConfirm).await,
             "rename" => self.run_action(KeyAction::OpenRename).await,
             "fork" => self.run_action(KeyAction::OpenFork).await,
-            "canvas" | "edit-canvas" => self.run_action(KeyAction::OpenCanvas).await,
+            "program" | "edit-program" => self.run_action(KeyAction::OpenProgram).await,
             "zoom" | "fullscreen" => self.run_action(KeyAction::ToggleZoom).await,
             "rain" | "matrix" | "matrix-rain" => {
                 self.matrix_rain_hidden = !self.matrix_rain_hidden;
@@ -11084,7 +11084,7 @@ fn byte_pos(s: &str, char_idx: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn canvas_cursor_at_modal_point(
+fn program_cursor_at_modal_point(
     app: Option<&App>,
     buffer: &str,
     modal: ratatui::layout::Rect,
@@ -11095,11 +11095,11 @@ fn canvas_cursor_at_modal_point(
     let inner_x = modal
         .x
         .saturating_add(1)
-        .saturating_add(CANVAS_CONTENT_PADDING_X);
+        .saturating_add(PROGRAM_CONTENT_PADDING_X);
     let inner_y = modal
         .y
         .saturating_add(1)
-        .saturating_add(CANVAS_CONTENT_PADDING_Y);
+        .saturating_add(PROGRAM_CONTENT_PADDING_Y);
     if row < inner_y {
         return None;
     }
@@ -11109,14 +11109,14 @@ fn canvas_cursor_at_modal_point(
     // offset instead of being treated as a whole logical line.
     let target_row = (row.saturating_sub(inner_y) as usize).saturating_add(scroll_offset);
     let target_col = col.saturating_sub(inner_x) as usize;
-    let width = ui::canvas_modal_inner_width(modal);
-    Some(canvas_normalize_canvas_cursor(
+    let width = ui::program_modal_inner_width(modal);
+    Some(program_normalize_program_cursor(
         buffer,
-        ui::canvas_visual_to_cursor(app, buffer, target_row, target_col, width),
+        ui::program_visual_to_cursor(app, buffer, target_row, target_col, width),
     ))
 }
 
-fn canvas_list_marker_content_start(raw_line: &str) -> Option<usize> {
+fn program_list_marker_content_start(raw_line: &str) -> Option<usize> {
     let trimmed = raw_line.trim();
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
         Some(raw_line.chars().take_while(|ch| ch.is_whitespace()).count() + 2)
@@ -11125,7 +11125,7 @@ fn canvas_list_marker_content_start(raw_line: &str) -> Option<usize> {
     }
 }
 
-fn canvas_list_marker_cursor(buffer: &str, cursor: usize) -> Option<usize> {
+fn program_list_marker_cursor(buffer: &str, cursor: usize) -> Option<usize> {
     let mut line_start = 0usize;
     for (idx, ch) in buffer.chars().enumerate() {
         if idx >= cursor {
@@ -11140,16 +11140,16 @@ fn canvas_list_marker_cursor(buffer: &str, cursor: usize) -> Option<usize> {
         .skip(line_start)
         .take_while(|ch| *ch != '\n')
         .collect();
-    canvas_list_marker_content_start(&raw_line).map(|offset| line_start + offset)
+    program_list_marker_content_start(&raw_line).map(|offset| line_start + offset)
 }
 
-fn canvas_normalize_canvas_cursor(buffer: &str, cursor: usize) -> usize {
-    canvas_list_marker_cursor(buffer, cursor)
+fn program_normalize_program_cursor(buffer: &str, cursor: usize) -> usize {
+    program_list_marker_cursor(buffer, cursor)
         .map(|marker_start| marker_start.max(cursor))
         .unwrap_or(cursor)
 }
 
-fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<String> {
+fn program_smart_clip_query(popup: &ProgramPopup, trigger_start: usize) -> Option<String> {
     if popup.cursor <= trigger_start {
         return None;
     }
@@ -11172,7 +11172,7 @@ fn canvas_smart_clip_query(popup: &CanvasPopup, trigger_start: usize) -> Option<
     Some(query)
 }
 
-fn canvas_search_matches(buffer: &str, query: &str) -> Vec<(usize, usize)> {
+fn program_search_matches(buffer: &str, query: &str) -> Vec<(usize, usize)> {
     if query.is_empty() {
         return Vec::new();
     }
@@ -11201,7 +11201,7 @@ fn canvas_search_matches(buffer: &str, query: &str) -> Vec<(usize, usize)> {
 /// highlighted and the cursor navigates to it.  Clips that are already covered by
 /// an existing raw-buffer match (e.g. the query happens to appear inside the clip
 /// syntax itself) are skipped to avoid duplicate matches at overlapping ranges.
-fn canvas_search_add_clip_label_matches(
+fn program_search_add_clip_label_matches(
     app: &App,
     buffer: &str,
     query: &str,
@@ -11226,7 +11226,7 @@ fn canvas_search_add_clip_label_matches(
             .iter()
             .any(|&(ms, me)| ms < clip_char_end && me > clip_char_start);
         if !already_covered {
-            let (_, label) = crate::ui::canvas_smart_clip_label(Some(app), raw_clip);
+            let (_, label) = crate::ui::program_smart_clip_label(Some(app), raw_clip);
             if label.contains(query) {
                 matches.push((clip_char_start, clip_char_end));
             }
@@ -11237,18 +11237,18 @@ fn canvas_search_add_clip_label_matches(
     }
 }
 
-fn canvas_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
-    if canvas_smart_clip_instance_id(clip).is_some() {
+fn program_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
+    if program_smart_clip_instance_id(clip).is_some() {
         return clip.to_string();
     }
     let Some(body) = clip.strip_prefix("@{").and_then(|s| s.strip_suffix('}')) else {
         return clip.to_string();
     };
-    format!("@{{{} clip_id={}}}", body, canvas_next_smart_clip_id(buffer))
+    format!("@{{{} clip_id={}}}", body, program_next_smart_clip_id(buffer))
 }
 
-fn canvas_normalize_smart_clip_instance_ids(markdown: &str) -> String {
-    let ranges = canvas_smart_clip_ranges(markdown);
+fn program_normalize_smart_clip_instance_ids(markdown: &str) -> String {
+    let ranges = program_smart_clip_ranges(markdown);
     if ranges.is_empty() {
         return markdown.to_string();
     }
@@ -11257,7 +11257,7 @@ fn canvas_normalize_smart_clip_instance_ids(markdown: &str) -> String {
     for range in &ranges {
         let start_b = byte_pos(markdown, range.start + 2);
         let end_b = byte_pos(markdown, range.end.saturating_sub(1));
-        if let Some(id) = canvas_smart_clip_instance_id(&markdown[start_b..end_b]) {
+        if let Some(id) = program_smart_clip_instance_id(&markdown[start_b..end_b]) {
             if let Some(num) = id.strip_prefix("clip_").and_then(|s| s.parse::<usize>().ok()) {
                 max = max.max(num);
             }
@@ -11276,7 +11276,7 @@ fn canvas_normalize_smart_clip_instance_ids(markdown: &str) -> String {
         normalized.push_str(&markdown[last_b..clip_start_b]);
 
         let body = &markdown[body_start_b..body_end_b];
-        let existing = canvas_smart_clip_instance_id(body).map(str::to_string);
+        let existing = program_smart_clip_instance_id(body).map(str::to_string);
         if existing.as_ref().is_some_and(|id| used.insert(id.clone())) {
             normalized.push_str(&markdown[clip_start_b..clip_end_b]);
         } else {
@@ -11287,7 +11287,7 @@ fn canvas_normalize_smart_clip_instance_ids(markdown: &str) -> String {
                     break candidate;
                 }
             };
-            let body_without_id = canvas_smart_clip_body_without_instance_id(body);
+            let body_without_id = program_smart_clip_body_without_instance_id(body);
             normalized.push_str("@{");
             normalized.push_str(&body_without_id);
             if !body_without_id.is_empty() {
@@ -11303,12 +11303,12 @@ fn canvas_normalize_smart_clip_instance_ids(markdown: &str) -> String {
     normalized
 }
 
-fn canvas_next_smart_clip_id(buffer: &str) -> String {
+fn program_next_smart_clip_id(buffer: &str) -> String {
     let mut max = 0usize;
-    for range in canvas_smart_clip_ranges(buffer) {
+    for range in program_smart_clip_ranges(buffer) {
         let start_b = byte_pos(buffer, range.start + 2);
         let end_b = byte_pos(buffer, range.end.saturating_sub(1));
-        if let Some(id) = canvas_smart_clip_instance_id(&buffer[start_b..end_b]) {
+        if let Some(id) = program_smart_clip_instance_id(&buffer[start_b..end_b]) {
             if let Some(num) = id.strip_prefix("clip_").and_then(|s| s.parse::<usize>().ok()) {
                 max = max.max(num);
             }
@@ -11317,14 +11317,14 @@ fn canvas_next_smart_clip_id(buffer: &str) -> String {
     format!("clip_{}", max + 1)
 }
 
-fn canvas_smart_clip_instance_id(raw_clip: &str) -> Option<&str> {
+fn program_smart_clip_instance_id(raw_clip: &str) -> Option<&str> {
     raw_clip.split_whitespace().find_map(|part| {
         part.strip_prefix("clip_id=")
             .filter(|value| !value.is_empty())
     })
 }
 
-fn canvas_smart_clip_body_without_instance_id(raw_clip: &str) -> String {
+fn program_smart_clip_body_without_instance_id(raw_clip: &str) -> String {
     raw_clip
         .split_whitespace()
         .filter(|part| !part.starts_with("clip_id="))
@@ -11333,56 +11333,56 @@ fn canvas_smart_clip_body_without_instance_id(raw_clip: &str) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CanvasSmartClipRange {
+struct ProgramSmartClipRange {
     start: usize,
     end: usize,
 }
 
-fn canvas_cursor_left(buffer: &str, cursor: usize) -> usize {
-    let cursor = canvas_normalize_canvas_cursor(buffer, cursor);
-    if let Some(marker_start) = canvas_list_marker_cursor(buffer, cursor) {
+fn program_cursor_left(buffer: &str, cursor: usize) -> usize {
+    let cursor = program_normalize_program_cursor(buffer, cursor);
+    if let Some(marker_start) = program_list_marker_cursor(buffer, cursor) {
         if cursor <= marker_start {
             return marker_start;
         }
     }
-    canvas_normalize_canvas_cursor(
+    program_normalize_program_cursor(
         buffer,
-        canvas_smart_clip_range_before_or_containing(buffer, cursor)
+        program_smart_clip_range_before_or_containing(buffer, cursor)
             .map(|range| range.start)
             .unwrap_or_else(|| cursor.saturating_sub(1)),
     )
 }
 
-fn canvas_cursor_right(buffer: &str, cursor: usize) -> usize {
+fn program_cursor_right(buffer: &str, cursor: usize) -> usize {
     let len = buffer.chars().count();
-    let cursor = canvas_normalize_canvas_cursor(buffer, cursor);
-    canvas_normalize_canvas_cursor(
+    let cursor = program_normalize_program_cursor(buffer, cursor);
+    program_normalize_program_cursor(
         buffer,
-        canvas_smart_clip_range_at_or_containing(buffer, cursor)
+        program_smart_clip_range_at_or_containing(buffer, cursor)
             .map(|range| range.end)
             .unwrap_or_else(|| (cursor + 1).min(len)),
     )
 }
 
-fn canvas_smart_clip_range_at_or_containing(
+fn program_smart_clip_range_at_or_containing(
     buffer: &str,
     cursor: usize,
-) -> Option<CanvasSmartClipRange> {
-    canvas_smart_clip_ranges(buffer)
+) -> Option<ProgramSmartClipRange> {
+    program_smart_clip_ranges(buffer)
         .into_iter()
         .find(|range| cursor >= range.start && cursor < range.end)
 }
 
-fn canvas_smart_clip_range_before_or_containing(
+fn program_smart_clip_range_before_or_containing(
     buffer: &str,
     cursor: usize,
-) -> Option<CanvasSmartClipRange> {
-    canvas_smart_clip_ranges(buffer)
+) -> Option<ProgramSmartClipRange> {
+    program_smart_clip_ranges(buffer)
         .into_iter()
         .find(|range| cursor > range.start && cursor <= range.end)
 }
 
-fn canvas_smart_clip_ranges(buffer: &str) -> Vec<CanvasSmartClipRange> {
+fn program_smart_clip_ranges(buffer: &str) -> Vec<ProgramSmartClipRange> {
     let chars: Vec<char> = buffer.chars().collect();
     let mut ranges = Vec::new();
     let mut idx = 0usize;
@@ -11396,7 +11396,7 @@ fn canvas_smart_clip_ranges(buffer: &str) -> Vec<CanvasSmartClipRange> {
             end += 1;
         }
         if end < chars.len() {
-            ranges.push(CanvasSmartClipRange {
+            ranges.push(ProgramSmartClipRange {
                 start: idx,
                 end: end + 1,
             });
@@ -11408,13 +11408,13 @@ fn canvas_smart_clip_ranges(buffer: &str) -> Vec<CanvasSmartClipRange> {
     ranges
 }
 
-fn canvas_popup_from_document(
-    canvas: agentd_protocol::CanvasDocument,
+fn program_popup_from_document(
+    program: agentd_protocol::ProgramDocument,
     now: Instant,
-) -> CanvasPopup {
-    let markdown = canvas.markdown.clone();
-    CanvasPopup {
-        canvas,
+) -> ProgramPopup {
+    let markdown = program.markdown.clone();
+    ProgramPopup {
+        program,
         buffer: markdown.clone(),
         saved_markdown: markdown,
         undo_stack: Vec::new(),
@@ -11433,7 +11433,7 @@ fn canvas_popup_from_document(
 /// Resolve a char offset into the buffer to its `(line index, column)` where
 /// column is the char offset within that line and `'\n'` counts as one char.
 /// `lines` must be the buffer split on `'\n'` (so the count is preserved).
-fn canvas_offset_to_line_col(lines: &[String], offset: usize) -> (usize, usize) {
+fn program_offset_to_line_col(lines: &[String], offset: usize) -> (usize, usize) {
     let mut consumed = 0usize;
     for (i, line) in lines.iter().enumerate() {
         let len = line.chars().count();
@@ -11446,8 +11446,8 @@ fn canvas_offset_to_line_col(lines: &[String], offset: usize) -> (usize, usize) 
     (last, lines.get(last).map(|l| l.chars().count()).unwrap_or(0))
 }
 
-/// Inverse of [`canvas_offset_to_line_col`]: the char offset of `(line, col)`.
-fn canvas_line_col_to_offset(lines: &[String], line: usize, col: usize) -> usize {
+/// Inverse of [`program_offset_to_line_col`]: the char offset of `(line, col)`.
+fn program_line_col_to_offset(lines: &[String], line: usize, col: usize) -> usize {
     let mut offset = 0usize;
     for l in lines.iter().take(line) {
         offset += l.chars().count() + 1;
@@ -11455,7 +11455,7 @@ fn canvas_line_col_to_offset(lines: &[String], line: usize, col: usize) -> usize
     offset + col
 }
 
-fn canvas_line_start(s: &str, cursor: usize) -> usize {
+fn program_line_start(s: &str, cursor: usize) -> usize {
     let mut line_start = 0usize;
     for (idx, ch) in s.chars().enumerate() {
         if idx >= cursor {
@@ -11465,7 +11465,7 @@ fn canvas_line_start(s: &str, cursor: usize) -> usize {
             line_start = idx + 1;
         }
     }
-    if let Some(marker_start) = canvas_list_marker_cursor(s, cursor) {
+    if let Some(marker_start) = program_list_marker_cursor(s, cursor) {
         if marker_start >= line_start {
             return marker_start;
         }
@@ -11473,7 +11473,7 @@ fn canvas_line_start(s: &str, cursor: usize) -> usize {
     line_start
 }
 
-fn canvas_line_end(s: &str, cursor: usize) -> usize {
+fn program_line_end(s: &str, cursor: usize) -> usize {
     for (idx, ch) in s.chars().enumerate().skip(cursor) {
         if ch == '\n' {
             return idx;
@@ -11734,13 +11734,13 @@ mod tests {
             shortcut_hints: Vec::new(),
             minibuffer_harness_hits: Vec::new(),
             modal_area: None,
-            canvas_title_run_hit: None,
-            canvas_title_toggle_hit: None,
-            canvas_title_close_hit: None,
-            canvas_selection_run_hit: None,
-            canvas_inner_area: None,
-            canvas_clip_hits: Vec::new(),
-            canvas_template_hits: Vec::new(),
+            program_title_run_hit: None,
+            program_title_toggle_hit: None,
+            program_title_close_hit: None,
+            program_selection_run_hit: None,
+            program_inner_area: None,
+            program_clip_hits: Vec::new(),
+            program_template_hits: Vec::new(),
             browser_preview_area: None,
             browser_preview_close: None,
             terminal_scrollbar: None,
@@ -11779,7 +11779,7 @@ mod tests {
             transcript_scroll: 0,
             minibuffer: None,
             harnesses: Vec::new(),
-            canvas_templates: Vec::new(),
+            program_templates: Vec::new(),
             theme: crate::theme::Theme::default(),
             help_visible: false,
             profile: Profile::Emacs,
@@ -11830,10 +11830,10 @@ mod tests {
             resizing_main_window: None,
             list_collapsed: false,
             tasks_popup: None,
-            canvas_popup: None,
-            canvas_popups: HashMap::new(),
-            canvas_runs: HashMap::new(),
-            canvas_clipboard: None,
+            program_popup: None,
+            program_popups: HashMap::new(),
+            program_runs: HashMap::new(),
+            program_clipboard: None,
             remote_control_popup: None,
             remote_control_task: None,
             editor_states: HashMap::new(),
@@ -11912,10 +11912,10 @@ mod tests {
         }
     }
 
-    fn canvas_popup_for_test(session_id: &str, markdown: &str, cursor: usize) -> CanvasPopup {
+    fn program_popup_for_test(session_id: &str, markdown: &str, cursor: usize) -> ProgramPopup {
         let now = Instant::now();
-    CanvasPopup {
-        canvas: agentd_protocol::CanvasDocument {
+    ProgramPopup {
+        program: agentd_protocol::ProgramDocument {
             session_id: session_id.to_string(),
             markdown: markdown.to_string(),
             version: 1,
@@ -11938,22 +11938,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_scroll_offset_follows_cursor_down_and_back() {
+    async fn program_scroll_offset_follows_cursor_down_and_back() {
         let (mut app, _dir, _server) = empty_app().await;
         // Twenty short, non-wrapping lines rendered into a 5-row-tall viewport.
         let markdown = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
-        app.canvas_popup = Some(canvas_popup_for_test("s1", &markdown, 0));
-        app.layout.canvas_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 5));
+        app.program_popup = Some(program_popup_for_test("s1", &markdown, 0));
+        app.layout.program_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 5));
 
         // (3) Short content / cursor near the top keeps the offset pinned to 0.
-        app.follow_canvas_scroll();
-        assert_eq!(app.canvas_popup.as_ref().unwrap().scroll_offset, 0);
+        app.follow_program_scroll();
+        assert_eq!(app.program_popup.as_ref().unwrap().scroll_offset, 0);
 
         // (1) Cursor jumps to the final line: the window scrolls so the cursor
         // (visual row 19) stays inside the 5-row viewport.
-        app.canvas_popup.as_mut().unwrap().cursor = markdown.chars().count();
-        app.follow_canvas_scroll();
-        let offset = app.canvas_popup.as_ref().unwrap().scroll_offset;
+        app.program_popup.as_mut().unwrap().cursor = markdown.chars().count();
+        app.follow_program_scroll();
+        let offset = app.program_popup.as_ref().unwrap().scroll_offset;
         assert!(offset > 0, "offset should advance below the fold, got {offset}");
         assert!(
             (offset..offset + 5).contains(&19),
@@ -11962,13 +11962,13 @@ mod tests {
         );
 
         // (2) Cursor returns to the top: the window snaps back to offset 0.
-        app.canvas_popup.as_mut().unwrap().cursor = 0;
-        app.follow_canvas_scroll();
-        assert_eq!(app.canvas_popup.as_ref().unwrap().scroll_offset, 0);
+        app.program_popup.as_mut().unwrap().cursor = 0;
+        app.follow_program_scroll();
+        assert_eq!(app.program_popup.as_ref().unwrap().scroll_offset, 0);
     }
 
     #[tokio::test]
-    async fn canvas_clip_click_resolves_and_focuses_session() {
+    async fn program_clip_click_resolves_and_focuses_session() {
         let (mut app, _dir, _server) = empty_app().await;
         let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
         let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -11976,8 +11976,8 @@ mod tests {
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
 
-        // Pretend the last canvas render captured a clip for s2 at row 3, cols 4..16.
-        app.layout.canvas_clip_hits = vec![CanvasClipHit {
+        // Pretend the last program render captured a clip for s2 at row 3, cols 4..16.
+        app.layout.program_clip_hits = vec![ProgramClipHit {
             col_start: 4,
             col_end: 16,
             row: 3,
@@ -11985,20 +11985,20 @@ mod tests {
         }];
 
         // A cell inside the chip resolves to its session; outside it does not.
-        assert_eq!(app.canvas_clip_session_at(10, 3), Some("s2".to_string()));
-        assert_eq!(app.canvas_clip_session_at(2, 3), None);
-        assert_eq!(app.canvas_clip_session_at(10, 4), None);
+        assert_eq!(app.program_clip_session_at(10, 3), Some("s2".to_string()));
+        assert_eq!(app.program_clip_session_at(2, 3), None);
+        assert_eq!(app.program_clip_session_at(10, 4), None);
 
         // Resolving + focusing (what the click handler does) selects that session.
-        let target = app.canvas_clip_session_at(10, 3).expect("clip resolves");
+        let target = app.program_clip_session_at(10, 3).expect("clip resolves");
         app.focus = PaneFocus::List;
         app.select_session(target);
         assert_eq!(app.selection.session_id(), Some("s2"));
     }
 
     #[test]
-    fn canvas_template_hit_contains_spans_box_rows() {
-        let hit = CanvasTemplateHit {
+    fn program_template_hit_contains_spans_box_rows() {
+        let hit = ProgramTemplateHit {
             col_start: 4,
             col_end: 18,
             row_start: 3,
@@ -12016,40 +12016,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_template_button_fills_empty_buffer() {
+    async fn program_template_button_fills_empty_buffer() {
         let (mut app, _dir, _server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "", 0));
 
-        app.apply_canvas_template("tasks".into(), "# Todo\n\n# Done\n".into());
+        app.apply_program_template("tasks".into(), "# Todo\n\n# Done\n".into());
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "# Todo\n\n# Done\n");
         // Cursor lands at the end of the inserted template.
         assert_eq!(popup.cursor, "# Todo\n\n# Done\n".chars().count());
         // The template id is stamped onto the document for persistence.
-        assert_eq!(popup.canvas.template_id.as_deref(), Some("tasks"));
+        assert_eq!(popup.program.template_id.as_deref(), Some("tasks"));
         // The prior (empty) state is recorded so the fill can be undone.
         assert_eq!(popup.undo_stack.len(), 1);
 
-        app.undo_canvas_edit();
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "");
+        app.undo_program_edit();
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "");
     }
 
     /// Clicking a clip that points at a session with no navigable list row —
     /// the canonical case being a subagent, which renders only as a child of
     /// its parent (and never at all when the parent is the hidden
     /// orchestrator) — must switch to it *persistently*. Two prior bugs made
-    /// it flicker back to the canvas: (1) the click never synced the active
+    /// it flicker back to the program: (1) the click never synced the active
     /// window pane, so the main view kept rendering the old session, and
     /// (2) the next `refresh_sessions → ensure_selection_valid` reverted the
     /// selection because the subagent isn't in `list_items()`, which also
-    /// popped the stashed canvas back open.
+    /// popped the stashed program back open.
     #[tokio::test]
-    async fn canvas_clip_click_to_subagent_persists_across_refresh() {
+    async fn program_clip_click_to_subagent_persists_across_refresh() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (mut app, _dir, _server) = empty_app().await;
         let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        // The orchestrator (the fleet dispatcher whose canvas holds the clips)
+        // The orchestrator (the fleet dispatcher whose program holds the clips)
         // is hidden from the list, so its subagent children never get a row.
         let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
         orch.id = "orch".into();
@@ -12058,11 +12058,11 @@ mod tests {
         sub.parent_session_id = Some("orch".into());
         app.sessions = vec![s1, orch, sub];
         app.orchestrator_id = Some("orch".into());
-        // The canvas-owner session is selected and its canvas is open; the
+        // The program-owner session is selected and its program is open; the
         // active window pane points at it (test_app's initial leaf is s1).
         app.selection = Selection::Session("s1".into());
         app.sync_active_window_selection();
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "see @{session:sub1}", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "see @{session:sub1}", 0));
         // The subagent isn't reachable through the list at all.
         assert!(
             !app
@@ -12072,10 +12072,10 @@ mod tests {
             "subagent must not have a navigable list row"
         );
 
-        // Geometry the last canvas render would have captured: a modal area
+        // Geometry the last program render would have captured: a modal area
         // and a clip hit for the subagent.
         app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
-        app.layout.canvas_clip_hits = vec![CanvasClipHit {
+        app.layout.program_clip_hits = vec![ProgramClipHit {
             col_start: 4,
             col_end: 16,
             row: 3,
@@ -12084,14 +12084,14 @@ mod tests {
 
         // Click the clip.
         let consumed = app
-            .handle_canvas_mouse(&MouseEvent {
+            .handle_program_mouse(&MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 10,
                 row: 3,
                 modifiers: crossterm::event::KeyModifiers::empty(),
             })
             .await;
-        assert!(consumed, "clip click is handled by the canvas mouse router");
+        assert!(consumed, "clip click is handled by the program mouse router");
         assert_eq!(app.selection.session_id(), Some("sub1"));
         // The active window pane drives the main view; it must point at the
         // target, or the click wouldn't actually reveal the session.
@@ -12113,24 +12113,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_c_l_centers_cursor_row_in_viewport() {
+    async fn program_c_l_centers_cursor_row_in_viewport() {
         let (mut app, _dir, _server) = empty_app().await;
         // 30 short lines into a 7-row viewport.
         let markdown = (0..30).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
-        app.canvas_popup = Some(canvas_popup_for_test("s1", &markdown, 0));
-        app.layout.canvas_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 7));
+        app.program_popup = Some(program_popup_for_test("s1", &markdown, 0));
+        app.layout.program_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 7));
 
         // Start near top: center should be near 0 (clamped).
-        app.center_canvas_cursor();
-        let off0 = app.canvas_popup.as_ref().unwrap().scroll_offset;
+        app.center_program_cursor();
+        let off0 = app.program_popup.as_ref().unwrap().scroll_offset;
         assert!(off0 <= 3, "near-top center should keep offset small, got {off0}");
 
         // Move cursor far down (visual row ~29).
         let total_chars = markdown.chars().count();
-        app.canvas_popup.as_mut().unwrap().cursor = total_chars;
-        app.center_canvas_cursor();
-        let off = app.canvas_popup.as_ref().unwrap().scroll_offset;
-        let cursor_row = crate::ui::canvas_cursor_visual_row(
+        app.program_popup.as_mut().unwrap().cursor = total_chars;
+        app.center_program_cursor();
+        let off = app.program_popup.as_ref().unwrap().scroll_offset;
+        let cursor_row = crate::ui::program_cursor_visual_row(
             Some(&app),
             &markdown,
             total_chars,
@@ -12148,203 +12148,203 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_open_state_is_preserved_per_session() {
+    async fn program_open_state_is_preserved_per_session() {
         let (mut app, _dir, server) = empty_app().await;
         let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
         let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
         s2.id = "s2".into();
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
 
         app.selection = Selection::Session("s2".into());
-        app.sync_canvas_popup_with_selection();
-        assert!(app.canvas_popup.is_none());
-        assert!(app.canvas_popups.contains_key("s1"));
+        app.sync_program_popup_with_selection();
+        assert!(app.program_popup.is_none());
+        assert!(app.program_popups.contains_key("s1"));
 
         app.selection = Selection::Session("s1".into());
-        app.sync_canvas_popup_with_selection();
-        let popup = app.canvas_popup.as_ref().expect("s1 canvas restored");
+        app.sync_program_popup_with_selection();
+        let popup = app.program_popup.as_ref().expect("s1 program restored");
         assert_eq!(popup.buffer, "draft");
         assert_eq!(popup.cursor, 3);
-        assert!(!app.canvas_popups.contains_key("s1"));
+        assert!(!app.program_popups.contains_key("s1"));
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_selection_cut_and_insert_replaces_selection() {
+    async fn program_selection_cut_and_insert_replaces_selection() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(3);
-        app.cut_canvas_selection();
-        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abf");
-        app.insert_canvas_text("XY");
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abXYf");
+        app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
+        app.begin_program_selection();
+        app.move_program_cursor(3);
+        app.cut_program_selection();
+        assert_eq!(app.program_clipboard.as_deref(), Some("cde"));
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "abf");
+        app.insert_program_text("XY");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "abXYf");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_g_does_not_close_popup() {
+    async fn program_ctrl_g_does_not_close_popup() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
             .await;
 
-        assert!(app.canvas_popup.is_some());
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
+        assert!(app.program_popup.is_some());
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "draft");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_g_clears_active_selection() {
+    async fn program_ctrl_g_clears_active_selection() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(3);
+        app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
+        app.begin_program_selection();
+        app.move_program_cursor(3);
         assert!(
-            app.canvas_popup.as_ref().unwrap().selection.is_some(),
+            app.program_popup.as_ref().unwrap().selection.is_some(),
             "selection should be active before C-g"
         );
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert!(popup.selection.is_none(), "C-g should clear the selection");
         // Cancelling the mark must not mutate the buffer or move text around.
         assert_eq!(popup.buffer, "abcdef");
-        assert_eq!(app.canvas_clipboard, None);
+        assert_eq!(app.program_clipboard, None);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_g_dismisses_smart_clip_picker() {
+    async fn program_ctrl_g_dismisses_smart_clip_picker() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
         // Typing the trigger opens the inline smart-clip picker.
-        app.insert_canvas_text("@");
-        assert!(app.canvas_smart_clip_active(), "typing @ opens the picker");
+        app.insert_program_text("@");
+        assert!(app.program_smart_clip_active(), "typing @ opens the picker");
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
             .await;
 
-        assert!(!app.canvas_smart_clip_active(), "C-g dismisses the picker");
-        assert!(app.canvas_popup.is_some(), "C-g must not close the canvas");
+        assert!(!app.program_smart_clip_active(), "C-g dismisses the picker");
+        assert!(app.program_popup.is_some(), "C-g must not close the program");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_meta_w_copies_selection_without_mutating() {
+    async fn program_meta_w_copies_selection_without_mutating() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(3);
+        app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
+        app.begin_program_selection();
+        app.move_program_cursor(3);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT))
             .await;
 
         // M-w is kill-ring-save: it copies but never deletes.
-        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
-        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(app.program_clipboard.as_deref(), Some("cde"));
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "abcdef", "M-w must not mutate the buffer");
         assert!(popup.selection.is_none(), "M-w deactivates the selection");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_c_copies_selection_like_meta_w() {
+    async fn program_ctrl_c_copies_selection_like_meta_w() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(3);
+        app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
+        app.begin_program_selection();
+        app.move_program_cursor(3);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
             .await;
 
-        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
-        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(app.program_clipboard.as_deref(), Some("cde"));
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "abcdef", "C-c must not mutate the buffer");
         assert!(popup.selection.is_none(), "C-c deactivates the selection");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_super_c_copies_selection_like_meta_w() {
+    async fn program_super_c_copies_selection_like_meta_w() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(3);
+        app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
+        app.begin_program_selection();
+        app.move_program_cursor(3);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER))
             .await;
 
-        assert_eq!(app.canvas_clipboard.as_deref(), Some("cde"));
-        let popup = app.canvas_popup.as_ref().unwrap();
+        assert_eq!(app.program_clipboard.as_deref(), Some("cde"));
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "abcdef", "Cmd-C must not mutate the buffer");
         assert!(popup.selection.is_none(), "Cmd-C deactivates the selection");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_slash_undo_reverts_last_edit() {
+    async fn program_ctrl_slash_undo_reverts_last_edit() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 5));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 5));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft!");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "draft!");
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
             .await;
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "draft");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_c_x_u_undo_reverts_last_edit() {
+    async fn program_c_x_u_undo_reverts_last_edit() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 5));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 5));
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft",
             "with no edits, C-x u is currently a no-op"
         );
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft!");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "draft!");
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft",
-            "C-x u should undo the previous canvas edit"
+            "C-x u should undo the previous program edit"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_c_x_u_undo_reverts_multiple_edits_in_order() {
+    async fn program_c_x_u_undo_reverts_multiple_edits_in_order() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 5));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 5));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft!?",
             "both edits should be appended"
         );
@@ -12354,7 +12354,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft!",
             "first C-x u should undo only the most recent edit"
         );
@@ -12364,7 +12364,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft",
             "second C-x u should undo the next edit"
         );
@@ -12372,71 +12372,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_copy_with_no_selection_is_noop() {
+    async fn program_copy_with_no_selection_is_noop() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdef", 2));
+        app.program_popup = Some(program_popup_for_test("s1", "abcdef", 2));
 
         // No active selection: M-w and C-c must not panic, must not copy, and
         // must leave the buffer untouched.
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::ALT))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
             .await;
 
-        assert_eq!(app.canvas_clipboard, None, "nothing should be copied");
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "abcdef");
+        assert_eq!(app.program_clipboard, None, "nothing should be copied");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "abcdef");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_esc_does_not_close_popup() {
+    async fn program_esc_does_not_close_popup() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
 
-        // Esc is not a canvas-hide affordance — the surface stays open and
+        // Esc is not a program-hide affordance — the surface stays open and
         // its buffer is untouched. Show/hide is C-x Space only.
-        assert!(app.canvas_popup.is_some());
-        assert_eq!(app.canvas_popup.as_ref().unwrap().buffer, "draft");
+        assert!(app.program_popup.is_some());
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "draft");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_esc_still_cancels_smart_clip_picker() {
+    async fn program_esc_still_cancels_smart_clip_picker() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
         // Type the smart-clip trigger so the inline picker is active.
-        app.insert_canvas_text("@");
+        app.insert_program_text("@");
         assert!(
-            app.canvas_smart_clip_active(),
+            app.program_smart_clip_active(),
             "typing @ should open the smart-clip picker"
         );
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
 
-        // Esc dismisses just the picker; the canvas surface remains open.
-        assert!(!app.canvas_smart_clip_active(), "Esc should cancel the picker");
-        assert!(app.canvas_popup.is_some(), "Esc must not close the canvas");
+        // Esc dismisses just the picker; the program surface remains open.
+        assert!(!app.program_smart_clip_active(), "Esc should cancel the picker");
+        assert!(app.program_popup.is_some(), "Esc must not close the program");
         server.abort();
     }
 
-    /// Regression for the canvas/palette input-routing bug: with the
-    /// canvas open, `C-x x` opens the command palette over it, and the
+    /// Regression for the program/palette input-routing bug: with the
+    /// program open, `C-x x` opens the command palette over it, and the
     /// keys typed afterwards must fill the palette input — not leak into
-    /// the canvas buffer underneath. The top-level dispatch used to route
-    /// every key to the canvas whenever `canvas_popup` was `Some`, so the
-    /// palette was unusable while a canvas was focused.
+    /// the program buffer underneath. The top-level dispatch used to route
+    /// every key to the program whenever `program_popup` was `Some`, so the
+    /// palette was unusable while a program was focused.
     #[tokio::test]
-    async fn canvas_open_command_palette_captures_typed_chars() {
+    async fn program_open_command_palette_captures_typed_chars() {
         let (mut app, _dir, server) = empty_app().await;
         // No orchestrator session → `C-x x` opens the M-x command palette.
         app.orchestrator_id = None;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
 
-        // `C-x x` while the canvas is focused opens the command palette.
+        // `C-x x` while the program is focused opens the command palette.
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
@@ -12446,7 +12446,7 @@ mod tests {
                 app.minibuffer.as_ref().map(|m| &m.intent),
                 Some(MinibufferIntent::CommandPalette)
             ),
-            "C-x x must open the command palette over the canvas"
+            "C-x x must open the command palette over the program"
         );
 
         // Subsequent keystrokes must land in the palette input...
@@ -12460,24 +12460,24 @@ mod tests {
             Some("hi"),
             "typing must fill the command palette input"
         );
-        // ...and must NOT leak into the canvas buffer underneath.
+        // ...and must NOT leak into the program buffer underneath.
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft",
-            "typing into the palette must not insert into the canvas"
+            "typing into the palette must not insert into the program"
         );
         server.abort();
     }
 
     /// Same routing precedence for the operator/orchestrator panel: when
     /// `C-x x` opens the persistent orchestrator input over a focused
-    /// canvas, keys must go to the orchestrator (its PTY), not the canvas.
+    /// program, keys must go to the orchestrator (its PTY), not the program.
     #[tokio::test]
-    async fn canvas_open_orchestrator_panel_captures_typed_chars() {
+    async fn program_open_orchestrator_panel_captures_typed_chars() {
         let (mut app, _dir, server) = empty_app().await;
         // An orchestrator session → `C-x x` opens the operator input panel.
         app.orchestrator_id = Some("orch".to_string());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
@@ -12488,12 +12488,12 @@ mod tests {
                 app.minibuffer.as_ref().map(|m| &m.intent),
                 Some(MinibufferIntent::Orchestrator)
             ),
-            "C-x x must open the orchestrator panel over the canvas"
+            "C-x x must open the orchestrator panel over the program"
         );
 
         // A plain keystroke is forwarded to the orchestrator's PTY, which
         // snaps its scrollback back to live — an observable side effect of
-        // the orchestrator path running instead of the canvas path.
+        // the orchestrator path running instead of the program path.
         app.orchestrator_scrollback = 7;
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
@@ -12502,120 +12502,120 @@ mod tests {
             "typing must route to the orchestrator PTY (snaps scrollback to live)"
         );
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft",
-            "typing into the orchestrator must not insert into the canvas"
+            "typing into the orchestrator must not insert into the program"
         );
         server.abort();
     }
 
     /// Counterpart guard: with NO minibuffer/palette overlay open, the
-    /// canvas keeps capturing keystrokes as before.
+    /// program keeps capturing keystrokes as before.
     #[tokio::test]
-    async fn canvas_typing_with_no_overlay_still_inserts() {
+    async fn program_typing_with_no_overlay_still_inserts() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 5));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 5));
         assert!(app.minibuffer.is_none(), "precondition: no overlay open");
 
         app.on_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
 
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().buffer,
+            app.program_popup.as_ref().unwrap().buffer,
             "draft!",
-            "with no overlay, a typed char inserts into the canvas"
+            "with no overlay, a typed char inserts into the program"
         );
         assert!(app.minibuffer.is_none());
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_s_starts_canvas_search() {
+    async fn program_ctrl_s_starts_program_search() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 0));
-        app.canvas_popup.as_mut().unwrap().buffer = "draft changed".to_string();
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        app.program_popup.as_mut().unwrap().buffer = "draft changed".to_string();
 
         let handled = tokio::time::timeout(
             Duration::from_millis(100),
-            app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
         )
         .await;
 
-        assert!(handled.is_ok(), "raw C-s should not call canvas save");
-        let popup = app.canvas_popup.as_ref().unwrap();
+        assert!(handled.is_ok(), "raw C-s should not call program save");
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "draft changed");
         assert_eq!(popup.saved_markdown, "draft");
-        assert!(popup.search.is_some(), "C-s starts canvas search");
+        assert!(popup.search.is_some(), "C-s starts program search");
         assert_eq!(popup.search.as_ref().unwrap().query, "");
         assert!(popup.search.as_ref().unwrap().matches.is_empty());
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_incremental_search_navigates_matches() {
+    async fn program_incremental_search_navigates_matches() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta alpha", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta alpha", 0));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search active");
         assert_eq!(search.query, "alpha");
         assert_eq!(search.matches, vec![(0, 5), (11, 16)]);
         assert_eq!(search.selected, 0);
         assert_eq!(popup.cursor, 0);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search still active");
         assert_eq!(search.selected, 1);
         assert_eq!(popup.cursor, 11);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
             .await;
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search still active");
         assert_eq!(search.selected, 0);
         assert_eq!(popup.cursor, 0);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await;
-        assert!(app.canvas_popup.as_ref().unwrap().search.is_none());
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 0);
+        assert!(app.program_popup.as_ref().unwrap().search.is_none());
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 0);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_incremental_search_starts_at_or_after_anchor_cursor() {
+    async fn program_incremental_search_starts_at_or_after_anchor_cursor() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "one alpha two alpha", 10));
+        app.program_popup = Some(program_popup_for_test("s1", "one alpha two alpha", 10));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search active");
         assert_eq!(search.query, "alpha");
         assert_eq!(search.matches, vec![(4, 9), (14, 19)]);
@@ -12625,34 +12625,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_incremental_search_cancel_restores_anchor_cursor() {
+    async fn program_incremental_search_cancel_restores_anchor_cursor() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha alpha", 6));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha alpha", 6));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
 
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 6, "during search the first match >= anchor is selected (cursor moves)");
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 6, "during search the first match >= anchor is selected (cursor moves)");
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
             .await;
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert!(popup.search.is_none(), "C-g exits search");
         assert_eq!(popup.cursor, 6);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_search_finds_smart_clip_by_label() {
+    async fn program_search_finds_smart_clip_by_label() {
         // Buffer: "hello @{session:stest} world"
         // Session "stest" has title "my-task" and harness "shell", state Done.
         // Searching "my-task" should find the clip (label "✓ my-task · shell")
@@ -12667,16 +12667,16 @@ mod tests {
         session.harness = "shell".into();
         session.state = agentd_protocol::SessionState::Done;
         app.sessions = vec![session];
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "hello @{session:stest} world", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "hello @{session:stest} world", 0));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
         for ch in "my-task".chars() {
-            app.handle_canvas_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+            app.handle_program_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .await;
         }
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search active");
         assert_eq!(search.query, "my-task");
         assert!(
@@ -12691,7 +12691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_search_highlights_raw_text_match_inside_smart_clip() {
+    async fn program_search_highlights_raw_text_match_inside_smart_clip() {
         // Buffer: "hello @{session:stest} world"
         // Searching "stest" — it appears literally inside the raw clip body.
         // The raw-buffer match must be found and its start must sit inside the
@@ -12700,16 +12700,16 @@ mod tests {
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "stest".into();
         app.sessions = vec![session];
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "hello @{session:stest} world", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "hello @{session:stest} world", 0));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
         for ch in "stest".chars() {
-            app.handle_canvas_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+            app.handle_program_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .await;
         }
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search active");
         assert_eq!(search.query, "stest");
         assert!(
@@ -12727,15 +12727,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_incremental_search_paste_extends_query_not_buffer() {
+    async fn program_incremental_search_paste_extends_query_not_buffer() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta alpha", 6));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta alpha", 6));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
         app.on_paste("alpha".to_string()).await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search remains active");
         assert_eq!(popup.buffer, "alpha beta alpha");
         assert_eq!(search.query, "alpha");
@@ -12746,15 +12746,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_tab_indents_list_item() {
+    async fn program_tab_indents_list_item() {
         let (mut app, _dir, server) = empty_app().await;
         // Cursor at the end of "- item" (char offset 6).
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "- item", 6));
+        app.program_popup = Some(program_popup_for_test("s1", "- item", 6));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "  - item", "Tab adds one indent level");
         // The cursor rides along with the text it was on (still end of line).
         assert_eq!(popup.cursor, 8);
@@ -12762,47 +12762,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_shift_tab_outdents_list_item() {
+    async fn program_shift_tab_outdents_list_item() {
         let (mut app, _dir, server) = empty_app().await;
         // Cursor at the end of "  - item" (char offset 8).
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "  - item", 8));
+        app.program_popup = Some(program_popup_for_test("s1", "  - item", 8));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "- item", "Shift-Tab removes one indent level");
         assert_eq!(popup.cursor, 6);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_shift_tab_at_top_level_is_noop() {
+    async fn program_shift_tab_at_top_level_is_noop() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "- item", 3));
+        app.program_popup = Some(program_popup_for_test("s1", "- item", 3));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "- item", "outdent at column 0 clamps to a no-op");
         assert_eq!(popup.cursor, 3, "cursor is undisturbed by a clamped outdent");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_tab_indents_multi_line_selection() {
+    async fn program_tab_indents_multi_line_selection() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "- one\n- two", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "- one\n- two", 0));
         // Select from the start of the buffer through the end of the second
         // list line so both lines fall inside the selection.
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(11);
+        app.begin_program_selection();
+        app.move_program_cursor(11);
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .await;
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(
             popup.buffer, "  - one\n  - two",
             "Tab indents every selected list line"
@@ -12811,22 +12811,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_nested_list_item_renders_more_indented() {
+    async fn program_nested_list_item_renders_more_indented() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "- parent\n  - child", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "- parent\n  - child", 0));
         {
-            let popup = app.canvas_popup.as_mut().unwrap();
-            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let text = rendered_text(term.backend().buffer());
 
         let parent_line = text
@@ -12846,45 +12846,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_render_registers_run_affordance_hits() {
+    async fn program_render_registers_run_affordance_hits() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
         {
-            let popup = app.canvas_popup.as_mut().unwrap();
-            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
-        app.begin_canvas_selection();
-        app.move_canvas_cursor(5);
+        app.begin_program_selection();
+        app.move_program_cursor(5);
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let text = rendered_text(term.backend().buffer());
 
         assert!(text.contains("▶"), "title run icon should render: {text:?}");
-        assert!(text.contains("▣"), "canvas mode toggle should render: {text:?}");
+        assert!(text.contains("▣"), "program mode toggle should render: {text:?}");
         assert!(
-            !text.contains("<canvas>"),
-            "title should no longer render a literal canvas label: {text:?}"
+            !text.contains("<program>"),
+            "title should no longer render a literal program label: {text:?}"
         );
         assert!(text.contains("Run"), "selection run menu should render: {text:?}");
-        assert!(app.layout.canvas_title_run_hit.is_some());
-        assert!(app.layout.canvas_title_toggle_hit.is_some());
-        assert!(app.layout.canvas_selection_run_hit.is_some());
+        assert!(app.layout.program_title_run_hit.is_some());
+        assert!(app.layout.program_title_toggle_hit.is_some());
+        assert!(app.layout.program_selection_run_hit.is_some());
         server.abort();
     }
 
     /// The widget indicator's leading "─" stitches the square into the title
-    /// bar's top border, so it must carry the *canvas* border color (accent_alt),
+    /// bar's top border, so it must carry the *program* border color (accent_alt),
     /// not the session view's green `pane_border_style`. Regression: it painted
-    /// a green dash on the canvas's accent border.
+    /// a green dash on the program's accent border.
     #[tokio::test]
-    async fn canvas_widget_icon_dash_matches_canvas_border_color() {
+    async fn program_widget_icon_dash_matches_program_border_color() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
@@ -12904,16 +12904,16 @@ mod tests {
                 },
             )]),
         );
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "# canvas\n\nbody", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "# program\n\nbody", 0));
         {
-            let popup = app.canvas_popup.as_mut().unwrap();
-            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
 
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
 
         // The widget title actually painted (otherwise this test is vacuous).
         assert!(
@@ -12921,11 +12921,11 @@ mod tests {
             "widget title square should register a hit"
         );
 
-        let modal = app.layout.modal_area.expect("canvas modal area");
+        let modal = app.layout.modal_area.expect("program modal area");
         let accent = app.theme.accent_alt;
         let buf = term.backend().buffer();
         let y = modal.y;
-        // Every "─" on the canvas's top border — including the indicator's
+        // Every "─" on the program's top border — including the indicator's
         // leading dash — must use the accent border color, never the green
         // session-view border.
         let mismatched: Vec<u16> = (modal.x..modal.x + modal.width)
@@ -12934,17 +12934,17 @@ mod tests {
             .collect();
         assert!(
             mismatched.is_empty(),
-            "canvas top-border dashes must match the accent border color; mismatched cols: {mismatched:?}"
+            "program top-border dashes must match the accent border color; mismatched cols: {mismatched:?}"
         );
         server.abort();
     }
 
-    /// Hovering/pinning a session's sticky widget while its canvas is open must
-    /// reveal the widget body *on top of* the canvas. Regression: the canvas's
+    /// Hovering/pinning a session's sticky widget while its program is open must
+    /// reveal the widget body *on top of* the program. Regression: the program's
     /// own `Clear` wiped the widget the session view had drawn underneath, so the
-    /// widget was never visible while the canvas was shown.
+    /// widget was never visible while the program was shown.
     #[tokio::test]
-    async fn canvas_reveals_pinned_widget_over_canvas() {
+    async fn program_reveals_pinned_widget_over_program() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
@@ -12967,39 +12967,39 @@ mod tests {
         // Pin the widget so it is visible without simulating a hover.
         app.dynamic_ui_selected
             .insert(("s1".to_string(), "w1".to_string()));
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "# canvas\n\nbody", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "# program\n\nbody", 0));
         {
-            let popup = app.canvas_popup.as_mut().unwrap();
-            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
 
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let text = rendered_text(term.backend().buffer());
 
         assert!(
             text.contains("ZZWIDGET"),
-            "pinned widget body should render on top of the canvas: {text:?}"
+            "pinned widget body should render on top of the program: {text:?}"
         );
         server.abort();
     }
 
-    /// The Run button now lives in the LEFT cluster of the canvas title bar,
+    /// The Run button now lives in the LEFT cluster of the program title bar,
     /// between the session name and the ` * modified` marker — not pinned to the
     /// right side any more.
     #[tokio::test]
-    async fn canvas_title_run_button_sits_in_left_cluster() {
+    async fn program_title_run_button_sits_in_left_cluster() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha", 0));
         {
-            let popup = app.canvas_popup.as_mut().unwrap();
-            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
             // Diverge the buffer from the saved markdown so the ` * modified`
             // marker renders to the right of the Run button.
             popup.buffer = "alpha beta".into();
@@ -13008,13 +13008,13 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let buf = term.backend().buffer();
         let modal = app.layout.modal_area.expect("modal area");
 
         let run = app
             .layout
-            .canvas_title_run_hit
+            .program_title_run_hit
             .expect("run hit registered");
         assert_eq!(run.2, modal.y, "run sits on the title border row");
         assert!(
@@ -13040,35 +13040,35 @@ mod tests {
         server.abort();
     }
 
-    /// The canvas session-actions button reuses the session chat view's
+    /// The program session-actions button reuses the session chat view's
     /// geometry — the same `view_close_button_range` slot — but as of #556 it
-    /// paints in the canvas border color (`accent_alt`) so the ☰ reads as part
-    /// of the canvas frame, not in the shared session-view `matrix_close` hue.
+    /// paints in the program border color (`accent_alt`) so the ☰ reads as part
+    /// of the program frame, not in the shared session-view `matrix_close` hue.
     #[tokio::test]
-    async fn canvas_title_actions_reuse_session_geometry_in_canvas_border_color() {
+    async fn program_title_actions_reuse_session_geometry_in_program_border_color() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
-        app.canvas_popup.as_mut().unwrap().revealed_at =
-            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
-        // Canvas border color (#556): `canvas_border_style` paints the frame in
+        app.program_popup = Some(program_popup_for_test("s1", "alpha", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        // Program border color (#556): `program_border_style` paints the frame in
         // `accent_alt`, and the render path passes that hue through to the ☰.
-        let canvas_border_color = app.theme.accent_alt;
+        let program_border_color = app.theme.accent_alt;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let buf = term.backend().buffer();
         let modal = app.layout.modal_area.expect("modal area");
 
         assert_eq!(
-            app.layout.canvas_title_close_hit,
+            app.layout.program_title_close_hit,
             Some(crate::ui::view_close_button_range(modal)),
-            "canvas actions must reuse the session-view action geometry"
+            "program actions must reuse the session-view action geometry"
         );
         let (cx, ce, cy) = crate::ui::view_close_button_range(modal);
         let glyph_cell = (cx..ce)
@@ -13077,34 +13077,34 @@ mod tests {
             .expect("hamburger glyph paints in its range");
         assert_eq!(
             glyph_cell.style().fg,
-            Some(canvas_border_color),
-            "canvas action glyph should use the canvas border color (#556)"
+            Some(program_border_color),
+            "program action glyph should use the program border color (#556)"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_run_button_spins_while_running() {
+    async fn program_run_button_spins_while_running() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
         {
-            let popup = app.canvas_popup.as_mut().unwrap();
-            popup.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
 
-        app.start_canvas_run("s1", "alpha beta", false, "");
+        app.start_program_run("s1", "alpha beta", false, "");
 
         let backend = ratatui::backend::TestBackend::new(120, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let run = app
             .layout
-            .canvas_title_run_hit
+            .program_title_run_hit
             .expect("run hit registered");
         let run_glyph = term
             .backend()
@@ -13117,7 +13117,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_session_hover_card_shows_session_output() {
+    async fn program_session_hover_card_shows_session_output() {
         use crate::pty_render::ItemHistory;
 
         let (mut app, _dir, server) = empty_app().await;
@@ -13128,9 +13128,9 @@ mod tests {
         s2.title = Some("Worker".into());
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "talk @{session:s2}", 0));
-        app.canvas_popup.as_mut().unwrap().revealed_at =
-            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        app.program_popup = Some(program_popup_for_test("s1", "talk @{session:s2}", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
 
         let mut history = ItemHistory::new();
         history.feed_pty(b"SESS_PREVIEW_MARKER\nsecond line");
@@ -13139,17 +13139,17 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let hit = app
             .layout
-            .canvas_clip_hits
+            .program_clip_hits
             .first()
             .cloned()
             .expect("clip hit for s2");
         app.mouse_pos = Some((hit.col_start, hit.row));
 
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas hover card should render");
+            .expect("program hover card should render");
         let text = rendered_text(term.backend().buffer());
         assert!(
             text.contains("SESS_PREVIEW_"),
@@ -13163,7 +13163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_session_hover_card_works_on_unfocused_split_canvas() {
+    async fn program_session_hover_card_works_on_unfocused_split_program() {
         use crate::pty_render::ItemHistory;
 
         let (mut app, _dir, server) = empty_app().await;
@@ -13189,9 +13189,9 @@ mod tests {
         };
         app.active_window_id = 2;
         app.selection = Selection::Session("s2".into());
-        let mut inactive_canvas = canvas_popup_for_test("s1", "talk @{session:s3}", 0);
-        inactive_canvas.revealed_at = Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
-        app.canvas_popups.insert("s1".into(), inactive_canvas);
+        let mut inactive_program = program_popup_for_test("s1", "talk @{session:s3}", 0);
+        inactive_program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.program_popups.insert("s1".into(), inactive_program);
 
         let mut history = ItemHistory::new();
         history.feed_pty(b"UNFOCUSED_SPLIT_PREVIEW\nsecond line");
@@ -13200,7 +13200,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(160, 40);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
 
         let pane = app
             .layout
@@ -13210,30 +13210,30 @@ mod tests {
             .expect("inactive split pane")
             .area;
         let inner = pane.inner(ratatui::layout::Margin {
-            horizontal: 1 + CANVAS_CONTENT_PADDING_X,
-            vertical: 1 + CANVAS_CONTENT_PADDING_Y,
+            horizontal: 1 + PROGRAM_CONTENT_PADDING_X,
+            vertical: 1 + PROGRAM_CONTENT_PADDING_Y,
         });
-        let popup = app.canvas_popups.get("s1").expect("stashed s1 canvas");
-        let hit = crate::ui::canvas_session_clip_hits(Some(&app), &popup.buffer, 0, inner)
+        let popup = app.program_popups.get("s1").expect("stashed s1 program");
+        let hit = crate::ui::program_session_clip_hits(Some(&app), &popup.buffer, 0, inner)
             .into_iter()
             .find(|hit| hit.session_id == "s3")
-            .expect("inactive canvas clip hit");
+            .expect("inactive program clip hit");
         app.mouse_pos = Some((hit.col_start, hit.row));
 
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("inactive canvas hover card should render");
+            .expect("inactive program hover card should render");
         let text = rendered_text(term.backend().buffer());
         assert!(
             text.contains("UNFOCUSED_SPLIT_"),
-            "hovering a clip in an unfocused split canvas should show the session tail"
+            "hovering a clip in an unfocused split program should show the session tail"
         );
         server.abort();
     }
 
     /// Seed `app` with one selected session that owns a single sticky widget,
-    /// plus a fully-revealed canvas popup over it. Returns the keep-alive dir
+    /// plus a fully-revealed program popup over it. Returns the keep-alive dir
     /// and mock-daemon handle.
-    async fn canvas_with_widget_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+    async fn program_with_widget_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
         use agentd_protocol::{UiPanel, UiPlacement};
         let (mut app, dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -13254,20 +13254,20 @@ mod tests {
                 },
             )]),
         );
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
-        app.canvas_popup.as_mut().unwrap().revealed_at =
-            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        app.program_popup = Some(program_popup_for_test("s1", "alpha", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         (app, dir, server)
     }
 
     #[tokio::test]
-    async fn canvas_title_renders_action_button_and_widget_icons() {
-        let (mut app, _dir, server) = canvas_with_widget_app().await;
+    async fn program_title_renders_action_button_and_widget_icons() {
+        let (mut app, _dir, server) = program_with_widget_app().await;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let buf = term.backend().buffer();
         let modal = app.layout.modal_area.expect("modal area");
 
@@ -13275,12 +13275,12 @@ mod tests {
         // glyph paints inside that range.
         let close = app
             .layout
-            .canvas_title_close_hit
+            .program_title_close_hit
             .expect("actions hit registered");
         assert_eq!(
             close,
             crate::ui::view_close_button_range(modal),
-            "canvas actions must reuse the session-view action geometry"
+            "program actions must reuse the session-view action geometry"
         );
         let close_text: String = (close.0..close.1)
             .filter_map(|x| buf.cell((x, close.2)).map(|c| c.symbol().to_string()))
@@ -13293,7 +13293,7 @@ mod tests {
         // The sticky widget registers a title-bar indicator via the SHARED
         // `render_session_widget_title` helper, so it lands in
         // `dynamic_ui_widget_hits` — the same list the pane title bar uses. The
-        // session view and the canvas both render it at identical geometry.
+        // session view and the program both render it at identical geometry.
         let widget_hits: Vec<_> = app
             .layout
             .dynamic_ui_widget_hits
@@ -13334,7 +13334,7 @@ mod tests {
         // widget icon sits left of the rightmost actions button.
         let run = app
             .layout
-            .canvas_title_run_hit
+            .program_title_run_hit
             .expect("run hit registered");
         assert!(
             run.1 <= w.start_col,
@@ -13355,21 +13355,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_title_action_button_click_opens_session_menu() {
+    async fn program_title_action_button_click_opens_session_menu() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let (mut app, _dir, server) = canvas_with_widget_app().await;
+        let (mut app, _dir, server) = program_with_widget_app().await;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let close = app
             .layout
-            .canvas_title_close_hit
+            .program_title_close_hit
             .expect("actions hit registered");
 
         // Clicking the hamburger opens the same session actions menu as the
-        // normal session view; it no longer dismisses the canvas.
+        // normal session view; it no longer dismisses the program.
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: close.0 + 1,
@@ -13379,8 +13379,8 @@ mod tests {
         .await;
 
         assert!(
-            app.canvas_popup.as_ref().is_some_and(|p| !p.closing),
-            "clicking the actions button should leave the canvas open"
+            app.program_popup.as_ref().is_some_and(|p| !p.closing),
+            "clicking the actions button should leave the program open"
         );
         assert!(
             app.session_title_menu
@@ -13392,14 +13392,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_title_widget_icon_click_toggles_pin() {
+    async fn program_title_widget_icon_click_toggles_pin() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
-        let (mut app, _dir, server) = canvas_with_widget_app().await;
+        let (mut app, _dir, server) = program_with_widget_app().await;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
         let hit = app
             .layout
             .dynamic_ui_widget_hits
@@ -13425,7 +13425,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_title_run_button_click_runs_canvas() {
+    async fn program_title_run_button_click_runs_program() {
         use agentd_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
@@ -13460,7 +13460,7 @@ mod tests {
                     .to_string();
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 let _ = seen_tx.send((method.clone(), params.clone()));
-                let canvas = serde_json::json!({
+                let program = serde_json::json!({
                     "session_id": "s1",
                     "markdown": "alpha",
                     "version": 2,
@@ -13468,10 +13468,10 @@ mod tests {
                     "template_id": null,
                 });
                 let result = match method.as_str() {
-                    ipc_method::CANVAS_EXECUTE => {
-                        serde_json::json!({ "canvas": canvas, "prompt": "sent", "active_run": null })
+                    ipc_method::PROGRAM_EXECUTE => {
+                        serde_json::json!({ "program": program, "prompt": "sent", "active_run": null })
                     }
-                    ipc_method::CANVAS_UPDATE => serde_json::json!({ "canvas": canvas }),
+                    ipc_method::PROGRAM_UPDATE => serde_json::json!({ "program": program }),
                     _ => Value::Null,
                 };
                 let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
@@ -13490,22 +13490,22 @@ mod tests {
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
-        app.canvas_popup.as_mut().unwrap().revealed_at =
-            Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
+        app.program_popup = Some(program_popup_for_test("s1", "alpha", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("canvas should render");
+            .expect("program should render");
 
         let run = app
             .layout
-            .canvas_title_run_hit
+            .program_title_run_hit
             .expect("run hit registered");
         let close = app
             .layout
-            .canvas_title_close_hit
+            .program_title_close_hit
             .expect("close hit registered");
         // Run sits left of the close button (the rightmost control).
         assert!(
@@ -13521,26 +13521,26 @@ mod tests {
         })
         .await;
 
-        let (method, params) = seen_rx.recv().await.expect("canvas execute request");
+        let (method, params) = seen_rx.recv().await.expect("program execute request");
         assert_eq!(
             method,
-            ipc_method::CANVAS_EXECUTE,
-            "clicking the title Run button should execute the canvas"
+            ipc_method::PROGRAM_EXECUTE,
+            "clicking the title Run button should execute the program"
         );
         assert!(
             params.get("selection").map(Value::is_null).unwrap_or(true),
-            "the title Run button runs the whole canvas, not a selection: {params:?}"
+            "the title Run button runs the whole program, not a selection: {params:?}"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_run_for_orchestrator_does_not_panic_and_submit_does_not_clear_other_shimmers() {
+    async fn program_run_for_orchestrator_does_not_panic_and_submit_does_not_clear_other_shimmers() {
         // TDD for the reported panic (screenshot 2026-06-27 9.43.19),
-        // "Canvas click 'run' on smith session does type the prompt, but not submit",
-        // and "On smith session canvas, when submit the prompt, all shimmer animation clears".
+        // "Program click 'run' on smith session does type the prompt, but not submit",
+        // and "On smith session program, when submit the prompt, all shimmer animation clears".
         // Orchestrator (smith minibuffer) sessions must not participate in normal
-        // canvas run shimmer, and activity on them must not wipe User/Subagent shimmers.
+        // program run shimmer, and activity on them must not wipe User/Subagent shimmers.
         let (mut app, _dir, server) = empty_app().await;
 
         let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
@@ -13552,25 +13552,25 @@ mod tests {
 
         // Exercise the run start path that could panic or set bad state for orchestrator.
         let body = "# do the task\nImplement the thing".to_string();
-        app.start_canvas_run("orch1", &body, false, "");
+        app.start_program_run("orch1", &body, false, "");
 
-        // Normal user session canvas run must still be tracked.
-        app.start_canvas_run("user1", "# user canvas task", false, "");
+        // Normal user session program run must still be tracked.
+        app.start_program_run("user1", "# user program task", false, "");
         assert!(
-            app.canvas_runs.contains_key("user1"),
-            "user canvas run must be tracked"
+            app.program_runs.contains_key("user1"),
+            "user program run must be tracked"
         );
 
         // Simulate orchestrator submit / state update clearing only its own entry
-        // (the unconditional removes in on_canvas_state / result paths).
-        app.canvas_runs.remove("orch1");
+        // (the unconditional removes in on_program_state / result paths).
+        app.program_runs.remove("orch1");
         assert!(
-            app.canvas_runs.contains_key("user1"),
+            app.program_runs.contains_key("user1"),
             "user shimmer must survive orchestrator activity/submit"
         );
 
         // Orchestrator should not have left a popup in normal flows.
-        if let Some(p) = app.canvas_popup.as_ref() {
+        if let Some(p) = app.program_popup.as_ref() {
             assert_ne!(p.saved_markdown, "should not be here for orchestrator");
         }
 
@@ -13578,7 +13578,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_title_canvas_toggle_opens_canvas_from_chat_mode() {
+    async fn session_title_program_toggle_opens_program_from_chat_mode() {
         use agentd_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
@@ -13610,7 +13610,7 @@ mod tests {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let canvas = serde_json::json!({
+                let program = serde_json::json!({
                     "session_id": "s1",
                     "markdown": "draft",
                     "version": 1,
@@ -13618,7 +13618,7 @@ mod tests {
                     "template_id": null,
                 });
                 let result = match method.as_str() {
-                    ipc_method::CANVAS_GET => serde_json::json!({ "canvas": canvas }),
+                    ipc_method::PROGRAM_GET => serde_json::json!({ "program": program }),
                     _ => Value::Null,
                 };
                 let resp = serde_json::json!({
@@ -13645,7 +13645,7 @@ mod tests {
         let text = rendered_text(term.backend().buffer());
         assert!(text.contains("●"), "chat mode should keep the status glyph: {text:?}");
         let view = app.layout.view_area.expect("view area");
-        let (x_start, _x_end, y) = crate::ui::view_canvas_toggle_button_range(view);
+        let (x_start, _x_end, y) = crate::ui::view_program_toggle_button_range(view);
 
         app.on_mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -13661,12 +13661,12 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::empty(),
         })
         .await;
-        assert!(app.canvas_popup.is_some(), "clicking the title toggle should open canvas");
+        assert!(app.program_popup.is_some(), "clicking the title toggle should open program");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_execute_selection_saves_then_runs_selected_text() {
+    async fn program_execute_selection_saves_then_runs_selected_text() {
         use agentd_protocol::ipc_method;
         use serde_json::Value;
         use tempfile::tempdir;
@@ -13701,7 +13701,7 @@ mod tests {
                     .to_string();
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 let _ = seen_tx.send((method.clone(), params.clone()));
-                let canvas = serde_json::json!({
+                let program = serde_json::json!({
                     "session_id": "s1",
                     "markdown": params
                         .get("markdown")
@@ -13712,9 +13712,9 @@ mod tests {
                     "template_id": null,
                 });
                 let result = match method.as_str() {
-                    ipc_method::CANVAS_UPDATE => serde_json::json!({ "canvas": canvas }),
-                    ipc_method::CANVAS_EXECUTE => {
-                        serde_json::json!({ "canvas": canvas, "prompt": "sent" })
+                    ipc_method::PROGRAM_UPDATE => serde_json::json!({ "program": program }),
+                    ipc_method::PROGRAM_EXECUTE => {
+                        serde_json::json!({ "program": program, "prompt": "sent" })
                     }
                     _ => Value::Null,
                 };
@@ -13734,19 +13734,19 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(client, Vec::new());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta", 0));
-        app.canvas_popup.as_mut().unwrap().buffer = "alpha beta changed".to_string();
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        app.program_popup.as_mut().unwrap().buffer = "alpha beta changed".to_string();
 
-        assert!(app.execute_canvas_popup(Some("beta".to_string())).await);
+        assert!(app.execute_program_popup(Some("beta".to_string())).await);
 
-        let (first_method, first_params) = seen_rx.recv().await.expect("canvas update request");
-        let (second_method, second_params) = seen_rx.recv().await.expect("canvas execute request");
-        assert_eq!(first_method, ipc_method::CANVAS_UPDATE);
+        let (first_method, first_params) = seen_rx.recv().await.expect("program update request");
+        let (second_method, second_params) = seen_rx.recv().await.expect("program execute request");
+        assert_eq!(first_method, ipc_method::PROGRAM_UPDATE);
         assert_eq!(
             first_params.get("markdown").and_then(Value::as_str),
             Some("alpha beta changed")
         );
-        assert_eq!(second_method, ipc_method::CANVAS_EXECUTE);
+        assert_eq!(second_method, ipc_method::PROGRAM_EXECUTE);
         assert_eq!(
             second_params.get("selection").and_then(Value::as_str),
             Some("beta")
@@ -13759,41 +13759,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_state_notification_adopts_latest_when_clean() {
+    async fn program_state_notification_adopts_latest_when_clean() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "# Todo\n- a\n", 0));
-        // The owning agent edited the canvas on the daemon.
-        app.on_canvas_state(agentd_protocol::CanvasDocument {
+        app.program_popup = Some(program_popup_for_test("s1", "# Todo\n- a\n", 0));
+        // The owning agent edited the program on the daemon.
+        app.on_program_state(agentd_protocol::ProgramDocument {
             session_id: "s1".into(),
             markdown: "# Todo\n- a\n- agent added\n".into(),
             version: 2,
             updated_at_ms: 0,
             template_id: None,
         }, None);
-        let popup = app.canvas_popup.as_ref().unwrap();
-        assert_eq!(popup.canvas.version, 2);
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.program.version, 2);
         assert_eq!(popup.buffer, "# Todo\n- a\n- agent added\n");
         assert_eq!(popup.saved_markdown, "# Todo\n- a\n- agent added\n");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_state_notification_recomputes_active_search_when_clean() {
+    async fn program_state_notification_recomputes_active_search_when_clean() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
         for ch in "alpha".chars() {
-            app.handle_canvas_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+            app.handle_program_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
                 .await;
         }
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().search.as_ref().unwrap().matches,
+            app.program_popup.as_ref().unwrap().search.as_ref().unwrap().matches,
             vec![(0, 5)]
         );
 
-        app.on_canvas_state(agentd_protocol::CanvasDocument {
+        app.on_program_state(agentd_protocol::ProgramDocument {
             session_id: "s1".into(),
             markdown: "zero alpha".into(),
             version: 2,
@@ -13801,7 +13801,7 @@ mod tests {
             template_id: None,
         }, None);
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search remains active");
         assert_eq!(search.query, "alpha");
         assert_eq!(search.matches, vec![(5, 10)]);
@@ -13811,16 +13811,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_state_notification_clamps_active_search_anchor_when_clean() {
+    async fn program_state_notification_clamps_active_search_anchor_when_clean() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha beta", 10));
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 10));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
             .await;
 
-        app.on_canvas_state(agentd_protocol::CanvasDocument {
+        app.on_program_state(agentd_protocol::ProgramDocument {
             session_id: "s1".into(),
             markdown: "tiny".into(),
             version: 2,
@@ -13828,7 +13828,7 @@ mod tests {
             template_id: None,
         }, None);
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search remains active");
         assert_eq!(search.query, "z");
         assert_eq!(search.anchor_cursor, 4);
@@ -13838,9 +13838,9 @@ mod tests {
     }
 
     #[test]
-    fn canvas_blocks_split_on_blank_lines() {
+    fn program_blocks_split_on_blank_lines() {
         let md = "# Todo\n- a\n- b\n\n# Done\n";
-        let blocks = canvas_blocks(md);
+        let blocks = program_blocks(md);
         assert_eq!(blocks.len(), 2);
         // First block spans source lines 0..3 ("# Todo", "- a", "- b").
         assert_eq!((blocks[0].start_line, blocks[0].end_line), (0, 3));
@@ -13851,29 +13851,29 @@ mod tests {
     }
 
     #[test]
-    fn canvas_blocks_normalize_indentation_in_signature() {
+    fn program_blocks_normalize_indentation_in_signature() {
         // Signatures trim each line so cosmetic indentation does not change a
         // block's identity (keeps shimmer stable across whitespace-only edits).
-        let blocks = canvas_blocks("  - a\n    - b\n");
+        let blocks = program_blocks("  - a\n    - b\n");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].signature, "- a\n- b");
     }
 
     #[test]
-    fn canvas_run_pending_signatures_cover_each_block() {
-        let sigs = canvas_run_pending_signatures("# Todo\n- a\n\n# Done\n");
+    fn program_run_pending_signatures_cover_each_block() {
+        let sigs = program_run_pending_signatures("# Todo\n- a\n\n# Done\n");
         assert_eq!(sigs.len(), 2);
         assert!(sigs.contains("# Todo\n- a"));
         assert!(sigs.contains("# Done"));
         // An empty body has nothing to shimmer.
-        assert!(canvas_run_pending_signatures("   \n").is_empty());
+        assert!(program_run_pending_signatures("   \n").is_empty());
     }
 
     #[tokio::test]
-    async fn canvas_run_waits_for_daemon_clear_state() {
+    async fn program_run_waits_for_daemon_clear_state() {
         let (mut app, _dir, server) = empty_app().await;
-        app.start_canvas_run("s1", "# Todo\n- a\n", false, "");
-        assert!(app.canvas_runs.contains_key("s1"));
+        app.start_program_run("s1", "# Todo\n- a\n", false, "");
+        assert!(app.program_runs.contains_key("s1"));
 
         async fn feed(app: &mut App, session: &str, event: SessionEvent) {
             app.on_notification(Notification {
@@ -13902,11 +13902,11 @@ mod tests {
             },
         )
         .await;
-        assert!(app.canvas_runs.contains_key("s1"));
+        assert!(app.program_runs.contains_key("s1"));
 
         // Raw session output is not authoritative in the TUI: for PTY-backed
         // runs it may be prompt echo from delivery. The daemon owns the shared
-        // lifecycle and reports clears through canvas/state.
+        // lifecycle and reports clears through program/state.
         feed(
             &mut app,
             "s1",
@@ -13915,14 +13915,14 @@ mod tests {
             },
         )
         .await;
-        assert!(app.canvas_runs.contains_key("s1"));
+        assert!(app.program_runs.contains_key("s1"));
 
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::CANVAS_STATE.into(),
+            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
             params: Some(
-                serde_json::to_value(agentd_protocol::CanvasStateNotificationPayload {
-                    canvas: agentd_protocol::CanvasDocument {
+                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
+                    program: agentd_protocol::ProgramDocument {
                         session_id: "s1".into(),
                         markdown: "# Todo\n- a\n".into(),
                         version: 1,
@@ -13936,32 +13936,32 @@ mod tests {
         })
         .await;
         assert!(
-            !app.canvas_runs.contains_key("s1"),
-            "shimmer should clear when daemon canvas state reports no active run"
+            !app.program_runs.contains_key("s1"),
+            "shimmer should clear when daemon program state reports no active run"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_run_expires_at_deadline() {
+    async fn program_run_expires_at_deadline() {
         let (mut app, _dir, server) = empty_app().await;
-        app.start_canvas_run("s1", "# Todo\n", false, "");
+        app.start_program_run("s1", "# Todo\n", false, "");
         // A missed first-output signal must never strand the animation.
-        app.canvas_runs.get_mut("s1").unwrap().deadline =
+        app.program_runs.get_mut("s1").unwrap().deadline =
             Instant::now() - Duration::from_millis(1);
-        app.expire_canvas_runs(Instant::now());
-        assert!(!app.canvas_runs.contains_key("s1"));
+        app.expire_program_runs(Instant::now());
+        assert!(!app.program_runs.contains_key("s1"));
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_rerun_preserves_agent_progress() {
+    async fn program_rerun_preserves_agent_progress() {
         let (mut app, _dir, server) = empty_app().await;
         // Run 1 over a list where each item is its own block (blank-separated):
         // every block shimmers.
         let original = "# Todo\n\n- alpha\n\n- beta\n\n- gamma\n";
-        app.start_canvas_run("s1", original, false, "");
-        let pending1 = &app.canvas_runs["s1"].pending;
+        app.start_program_run("s1", original, false, "");
+        let pending1 = &app.program_runs["s1"].pending;
         assert!(pending1.contains("- alpha"));
         assert!(pending1.contains("- beta"));
         assert!(pending1.contains("- gamma"));
@@ -13970,9 +13970,9 @@ mod tests {
         // last daemon-synced content. The user then edits "gamma" and re-Runs.
         let after_agent = "# Todo\n\n- alpha done\n\n- beta\n\n- gamma\n";
         let after_user_edit = "# Todo\n\n- alpha done\n\n- beta\n\n- gamma rework\n";
-        app.start_canvas_run("s1", after_user_edit, false, after_agent);
+        app.start_program_run("s1", after_user_edit, false, after_agent);
 
-        let pending2 = &app.canvas_runs["s1"].pending;
+        let pending2 = &app.program_runs["s1"].pending;
         // The agent's settled block does NOT re-shimmer.
         assert!(
             !pending2.contains("- alpha done"),
@@ -13986,41 +13986,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_selection_run_shimmers_whole_selection() {
+    async fn program_selection_run_shimmers_whole_selection() {
         // A selection run is explicitly scoped by the user, so even mid-flight
         // it shimmers its whole region rather than preserving prior narrowing.
         let (mut app, _dir, server) = empty_app().await;
-        app.start_canvas_run("s1", "# Todo\n\n- alpha\n", false, "");
-        app.start_canvas_run("s1", "- alpha\n\n- beta\n", true, "- alpha\n");
-        let pending = &app.canvas_runs["s1"].pending;
+        app.start_program_run("s1", "# Todo\n\n- alpha\n", false, "");
+        app.start_program_run("s1", "- alpha\n\n- beta\n", true, "- alpha\n");
+        let pending = &app.program_runs["s1"].pending;
         assert!(pending.contains("- alpha"));
         assert!(pending.contains("- beta"));
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_state_notification_preserves_unsaved_edits() {
+    async fn program_state_notification_preserves_unsaved_edits() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "# Todo\n- a\n", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "# Todo\n- a\n", 0));
         // The user is mid-edit (buffer diverges from the saved content).
-        app.canvas_popup.as_mut().unwrap().buffer = "# Todo\n- a\n- human typing\n".into();
-        app.on_canvas_state(agentd_protocol::CanvasDocument {
+        app.program_popup.as_mut().unwrap().buffer = "# Todo\n- a\n- human typing\n".into();
+        app.on_program_state(agentd_protocol::ProgramDocument {
             session_id: "s1".into(),
             markdown: "# Todo\n- a\n- agent added\n".into(),
             version: 2,
             updated_at_ms: 0,
             template_id: None,
         }, None);
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         // Unsaved edits are untouched and the base version stays stale, so the
         // save path detects the conflict and merges both sides.
         assert_eq!(popup.buffer, "# Todo\n- a\n- human typing\n");
-        assert_eq!(popup.canvas.version, 1);
+        assert_eq!(popup.program.version, 1);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_save_merges_disjoint_edits_on_conflict() {
+    async fn program_save_merges_disjoint_edits_on_conflict() {
         use agentd_protocol::ipc_method;
         use serde_json::Value;
         use tempfile::tempdir;
@@ -14057,7 +14057,7 @@ mod tests {
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 let _ = seen_tx.send((method.clone(), params.clone()));
                 let resp = match method.as_str() {
-                    m if m == ipc_method::CANVAS_UPDATE => {
+                    m if m == ipc_method::PROGRAM_UPDATE => {
                         update_calls += 1;
                         if update_calls == 1 {
                             // The human's base version is stale → conflict.
@@ -14066,7 +14066,7 @@ mod tests {
                                 "id": id,
                                 "error": {
                                     "code": -32603,
-                                    "message": "canvas conflict: current version is 2, attempted base version is 1"
+                                    "message": "program conflict: current version is 2, attempted base version is 1"
                                 }
                             })
                         } else {
@@ -14077,7 +14077,7 @@ mod tests {
                             serde_json::json!({
                                 "jsonrpc": "2.0",
                                 "id": id,
-                                "result": { "canvas": {
+                                "result": { "program": {
                                     "session_id": "s1",
                                     "markdown": md,
                                     "version": 3,
@@ -14087,11 +14087,11 @@ mod tests {
                             })
                         }
                     }
-                    m if m == ipc_method::CANVAS_GET => serde_json::json!({
+                    m if m == ipc_method::PROGRAM_GET => serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": id,
                         "result": {
-                            "canvas": {
+                            "program": {
                                 "session_id": "s1",
                                 "markdown": "alpha\nbeta\ngamma\n",
                                 "version": 2,
@@ -14117,46 +14117,46 @@ mod tests {
         let mut app = test_app(client, Vec::new());
         // Ancestor "alpha\nbeta\n"; the human edits line 1 while the agent
         // appended "gamma" (a disjoint region) → a clean 3-way merge.
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha\nbeta\n", 0));
-        app.canvas_popup.as_mut().unwrap().buffer = "alpha CHANGED\nbeta\n".to_string();
+        app.program_popup = Some(program_popup_for_test("s1", "alpha\nbeta\n", 0));
+        app.program_popup.as_mut().unwrap().buffer = "alpha CHANGED\nbeta\n".to_string();
 
-        assert!(app.save_canvas_popup().await);
+        assert!(app.save_program_popup().await);
 
         let (m1, p1) = seen_rx.recv().await.expect("first update");
-        assert_eq!(m1, ipc_method::CANVAS_UPDATE);
+        assert_eq!(m1, ipc_method::PROGRAM_UPDATE);
         assert_eq!(p1.get("base_version").and_then(Value::as_u64), Some(1));
-        let (m2, _p2) = seen_rx.recv().await.expect("canvas get");
-        assert_eq!(m2, ipc_method::CANVAS_GET);
+        let (m2, _p2) = seen_rx.recv().await.expect("program get");
+        assert_eq!(m2, ipc_method::PROGRAM_GET);
         let (m3, p3) = seen_rx.recv().await.expect("second update");
-        assert_eq!(m3, ipc_method::CANVAS_UPDATE);
+        assert_eq!(m3, ipc_method::PROGRAM_UPDATE);
         assert_eq!(p3.get("base_version").and_then(Value::as_u64), Some(2));
         assert_eq!(
             p3.get("markdown").and_then(Value::as_str),
             Some("alpha CHANGED\nbeta\ngamma\n")
         );
 
-        let popup = app.canvas_popup.as_ref().unwrap();
-        assert_eq!(popup.canvas.version, 3);
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.program.version, 3);
         assert_eq!(popup.saved_markdown, "alpha CHANGED\nbeta\ngamma\n");
         server.abort();
     }
 
     #[tokio::test]
-    async fn open_canvas_session_ids_include_active_and_cached_canvases() {
+    async fn open_program_session_ids_include_active_and_cached_programes() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s2", "active", 0));
-        app.canvas_popups
-            .insert("s1".into(), canvas_popup_for_test("s1", "cached", 0));
-        let mut closing = canvas_popup_for_test("s3", "closing", 0);
+        app.program_popup = Some(program_popup_for_test("s2", "active", 0));
+        app.program_popups
+            .insert("s1".into(), program_popup_for_test("s1", "cached", 0));
+        let mut closing = program_popup_for_test("s3", "closing", 0);
         closing.closing = true;
-        app.canvas_popups.insert("s3".into(), closing);
+        app.program_popups.insert("s3".into(), closing);
 
-        assert_eq!(app.open_canvas_session_ids(), vec!["s1", "s2"]);
+        assert_eq!(app.open_program_session_ids(), vec!["s1", "s2"]);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_at_trigger_filters_and_accepts_harness_smart_clip() {
+    async fn program_at_trigger_filters_and_accepts_harness_smart_clip() {
         let (mut app, _dir, server) = empty_app().await;
         app.harnesses = vec![agentd_protocol::HarnessInfo {
             name: "codex".to_string(),
@@ -14165,18 +14165,18 @@ mod tests {
             description: Some("coding agent".to_string()),
             capabilities: Default::default(),
         }];
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "", 0));
 
-        app.insert_canvas_text("@");
-        assert!(app.canvas_popup.as_ref().unwrap().smart_clip.is_some());
-        app.insert_canvas_text("co");
-        let candidates = app.canvas_smart_clip_candidates(app.canvas_popup.as_ref().unwrap());
+        app.insert_program_text("@");
+        assert!(app.program_popup.as_ref().unwrap().smart_clip.is_some());
+        app.insert_program_text("co");
+        let candidates = app.program_smart_clip_candidates(app.program_popup.as_ref().unwrap());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].clip, "@{harness:codex}");
 
-        app.accept_canvas_smart_clip();
+        app.accept_program_smart_clip();
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "@{harness:codex clip_id=clip_1}");
         assert_eq!(
             popup.cursor,
@@ -14187,7 +14187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepted_canvas_smart_clips_get_unique_instance_ids() {
+    async fn accepted_program_smart_clips_get_unique_instance_ids() {
         let (mut app, _dir, server) = empty_app().await;
         app.harnesses = vec![agentd_protocol::HarnessInfo {
             name: "codex".to_string(),
@@ -14196,17 +14196,17 @@ mod tests {
             description: Some("coding agent".to_string()),
             capabilities: Default::default(),
         }];
-        app.canvas_popup = Some(canvas_popup_for_test(
+        app.program_popup = Some(program_popup_for_test(
             "s1",
             "@{harness:codex clip_id=clip_1} ",
             "@{harness:codex clip_id=clip_1} ".chars().count(),
         ));
 
-        app.insert_canvas_text("@");
-        app.insert_canvas_text("co");
-        app.accept_canvas_smart_clip();
+        app.insert_program_text("@");
+        app.insert_program_text("co");
+        app.accept_program_smart_clip();
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(
             popup.buffer,
             "@{harness:codex clip_id=clip_1} @{harness:codex clip_id=clip_2}"
@@ -14215,7 +14215,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_smart_clip_candidates_are_grouped_by_type() {
+    async fn program_smart_clip_candidates_are_grouped_by_type() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.title = Some("issue 132".to_string());
@@ -14227,107 +14227,107 @@ mod tests {
             description: Some("coding agent".to_string()),
             capabilities: Default::default(),
         }];
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "", 0));
 
-        app.insert_canvas_text("@");
-        let candidates = app.canvas_smart_clip_candidates(app.canvas_popup.as_ref().unwrap());
+        app.insert_program_text("@");
+        let candidates = app.program_smart_clip_candidates(app.program_popup.as_ref().unwrap());
 
         assert_eq!(candidates.len(), 2);
-        assert_eq!(candidates[0].group, CanvasSmartClipGroup::Session);
+        assert_eq!(candidates[0].group, ProgramSmartClipGroup::Session);
         assert_eq!(candidates[0].label, "issue 132");
         assert_eq!(candidates[0].detail, "shell · running");
-        assert_eq!(candidates[1].group, CanvasSmartClipGroup::Harness);
+        assert_eq!(candidates[1].group, ProgramSmartClipGroup::Harness);
         assert_eq!(candidates[1].label, "codex");
         assert_eq!(candidates[1].detail, "");
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_smart_clip_search_cancels_on_separator() {
+    async fn program_smart_clip_search_cancels_on_separator() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "", 0));
 
-        app.insert_canvas_text("@");
-        app.insert_canvas_text("abc");
-        assert!(app.canvas_popup.as_ref().unwrap().smart_clip.is_some());
-        app.insert_canvas_text(" ");
+        app.insert_program_text("@");
+        app.insert_program_text("abc");
+        assert!(app.program_popup.as_ref().unwrap().smart_clip.is_some());
+        app.insert_program_text(" ");
 
-        let popup = app.canvas_popup.as_ref().unwrap();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "@abc ");
         assert!(popup.smart_clip.is_none());
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_cursor_moves_over_smart_clip_as_one_unit() {
+    async fn program_cursor_moves_over_smart_clip_as_one_unit() {
         let (mut app, _dir, server) = empty_app().await;
         let clip = "@{harness:codex}";
         let before = "a ";
-        app.canvas_popup = Some(canvas_popup_for_test(
+        app.program_popup = Some(program_popup_for_test(
             "s1",
             &format!("{before}{clip} z"),
             before.chars().count(),
         ));
 
-        app.move_canvas_cursor(1);
+        app.move_program_cursor(1);
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             before.chars().count() + clip.chars().count()
         );
 
-        app.move_canvas_cursor(-1);
+        app.move_program_cursor(-1);
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             before.chars().count()
         );
 
-        app.canvas_popup.as_mut().unwrap().cursor = before.chars().count() + 3;
-        app.move_canvas_cursor(1);
+        app.program_popup.as_mut().unwrap().cursor = before.chars().count() + 3;
+        app.move_program_cursor(1);
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             before.chars().count() + clip.chars().count()
         );
         server.abort();
     }
 
     // Vertical cursor navigation and mouse hit-testing must move through the
-    // *visual* (word-wrapped) rows the canvas body paints, not jump over a whole
+    // *visual* (word-wrapped) rows the program body paints, not jump over a whole
     // logical line. With an inner content width of 5 the single-word line
     // "abcdefghij" wraps into two visual rows: "abcde" (offsets 0–4) and "fghij"
     // (offsets 5–9). Nav reads the width from the inner area captured at the last
     // render; hit-testing derives it from the modal rect.
 
     #[tokio::test]
-    async fn canvas_down_moves_to_next_visual_row_within_logical_line() {
+    async fn program_down_moves_to_next_visual_row_within_logical_line() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij", 2));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+        app.program_popup = Some(program_popup_for_test("s1", "abcdefghij", 2));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 5, 20));
 
-        app.move_canvas_cursor_vertical(1);
+        app.move_program_cursor_vertical(1);
 
         // Down lands on the wrapped continuation row at the same column (offset
         // 5 + 2 = 7), staying inside the one logical line — not at its end.
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 7);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 7);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_up_from_continuation_row_stays_in_logical_line() {
+    async fn program_up_from_continuation_row_stays_in_logical_line() {
         let (mut app, _dir, server) = empty_app().await;
         // Cursor on the second visual row ("fghij") at column 2 → offset 7.
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij", 7));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+        app.program_popup = Some(program_popup_for_test("s1", "abcdefghij", 7));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 5, 20));
 
-        app.move_canvas_cursor_vertical(-1);
+        app.move_program_cursor_vertical(-1);
 
         // Up moves to the first visual row of the *same* logical line (offset 2),
         // rather than doing nothing because there is no logical line above.
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 2);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 2);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_down_from_line_start_with_clip_does_not_land_on_at_sign() {
+    async fn program_down_from_line_start_with_clip_does_not_land_on_at_sign() {
         // "hello @{session:s1}" renders as "hello  session s1 " (18 visible
         // chars with chip padding). At width 7 the chip's rendering wraps
         // across visual rows 1 and 2 of the logical line. The cursor starts
@@ -14339,15 +14339,15 @@ mod tests {
         let clip = "@{session:s1}";
         let markdown = format!("hello {clip}\nnext");
         // cursor starts at 0: beginning of the first line (before "hello")
-        app.canvas_popup = Some(canvas_popup_for_test("s1", &markdown, 0));
+        app.program_popup = Some(program_popup_for_test("s1", &markdown, 0));
         // width 7 forces "hello  session s1 " to wrap across 3 visual rows
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 7, 20));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 7, 20));
 
-        app.move_canvas_cursor_vertical(1);
+        app.move_program_cursor_vertical(1);
 
         let at_sign_offset = "hello ".chars().count(); // 6
         assert_ne!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             at_sign_offset,
             "Down from line start must not land on the '@' of a clip (cursor would not have moved down)"
         );
@@ -14355,31 +14355,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_a_then_ctrl_f_does_not_skip_list_marker() {
+    async fn program_ctrl_a_then_ctrl_f_does_not_skip_list_marker() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "* alpha beta gamma", 0));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 12));
+        app.program_popup = Some(program_popup_for_test("s1", "* alpha beta gamma", 0));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 5, 12));
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             2,
             "Ctrl-A must jump to list content, not the list marker"
         );
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             3,
             "first Ctrl-F must move to the first content char, not jump over it"
         );
 
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+        app.handle_program_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
             .await;
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             4,
             "single-step right should behave like Ctrl-F from list content start"
         );
@@ -14388,28 +14388,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_horizontal_motion_skips_hidden_list_marker_offsets() {
+    async fn program_horizontal_motion_skips_hidden_list_marker_offsets() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "* alpha", 0));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 6, 12));
+        app.program_popup = Some(program_popup_for_test("s1", "* alpha", 0));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 6, 12));
 
-        app.move_canvas_cursor(1);
+        app.move_program_cursor(1);
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             3,
             "right from the rendered list start should not stop inside hidden '* '"
         );
 
-        app.move_canvas_cursor(-1);
+        app.move_program_cursor(-1);
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             2,
             "left from the first content char should land on content start, not hidden marker"
         );
 
-        app.move_canvas_cursor(-1);
+        app.move_program_cursor(-1);
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             2,
             "left at list content start should stay visible instead of entering '* '"
         );
@@ -14417,18 +14417,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_click_on_list_prefix_normalizes_to_content_start() {
+    async fn program_click_on_list_prefix_normalizes_to_content_start() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "* alpha beta gamma", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "* alpha beta gamma", 0));
         let modal = Rect::new(0, 0, 9, 20);
 
         // Click leftmost painted column on the first row. Without normalization
         // this resolves to cursor 0 (inside the hidden '* ' marker), then
         // moves with the next keypress.
-        app.place_canvas_cursor(modal, 1, 2);
+        app.place_program_cursor(modal, 1, 2);
 
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             2,
             "clicking list marker area should land on list content start"
         );
@@ -14436,34 +14436,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_click_on_wrapped_list_continuation_row_maps_to_offset() {
+    async fn program_click_on_wrapped_list_continuation_row_maps_to_offset() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "* alpha beta gamma", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "* alpha beta gamma", 0));
         let modal = Rect::new(0, 0, 9, 20);
 
         // inner width = 9 - 2 border - 2 pad = 6.
         // This line wraps and places continuation rows; clicking continuation
         // row 2 must stay inside the list content, not land before marker.
-        app.place_canvas_cursor(modal, 2, 3);
+        app.place_program_cursor(modal, 2, 3);
         assert!(
-            app.canvas_popup.as_ref().unwrap().cursor >= 2,
+            app.program_popup.as_ref().unwrap().cursor >= 2,
             "wrapped list hit-testing should remain within list content"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_ctrl_a_from_wrapped_list_continuation_row_preserves_content_start() {
+    async fn program_ctrl_a_from_wrapped_list_continuation_row_preserves_content_start() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "* alpha beta gamma", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "* alpha beta gamma", 0));
         let modal = Rect::new(0, 0, 9, 20);
 
-        app.place_canvas_cursor(modal, 2, 3);
-        app.handle_canvas_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+        app.place_program_cursor(modal, 2, 3);
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
             .await;
 
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             2,
             "Ctrl-A must land on list content even when cursor starts on wrapped row"
         );
@@ -14471,15 +14471,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_down_moves_between_wrapped_rows_inside_list_content() {
+    async fn program_down_moves_between_wrapped_rows_inside_list_content() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "* abcdefghij", 4));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+        app.program_popup = Some(program_popup_for_test("s1", "* abcdefghij", 4));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 5, 20));
 
-        app.move_canvas_cursor_vertical(1);
+        app.move_program_cursor_vertical(1);
 
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             9,
             "Down should preserve the content column across wrapped bullet rows"
         );
@@ -14487,15 +14487,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_right_skips_collapsed_wrap_space() {
+    async fn program_right_skips_collapsed_wrap_space() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcd efgh", 4));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 4, 20));
+        app.program_popup = Some(program_popup_for_test("s1", "abcd efgh", 4));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 4, 20));
 
-        app.move_canvas_cursor(1);
+        app.move_program_cursor(1);
 
         assert_eq!(
-            app.canvas_popup.as_ref().unwrap().cursor,
+            app.program_popup.as_ref().unwrap().cursor,
             6,
             "Right should skip word-wrap break whitespace that does not occupy a painted cell"
         );
@@ -14503,18 +14503,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_cursor_position_matches_painted_wrapped_list_content() {
+    async fn program_cursor_position_matches_painted_wrapped_list_content() {
         let (app, _dir, server) = empty_app().await;
         let markdown = "* alpha beta gamma";
         let cursor = "* alpha ".chars().count();
         let width = 6u16;
         let (row, col) =
-            crate::ui::canvas_cursor_visual_pos(Some(&app), markdown, cursor, width as usize);
+            crate::ui::program_cursor_visual_pos(Some(&app), markdown, cursor, width as usize);
 
         let backend = ratatui::backend::TestBackend::new(width, 6);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| {
-            let lines = crate::ui::render_canvas_markdown_lines_for_test(&app, markdown);
+            let lines = crate::ui::render_program_markdown_lines_for_test(&app, markdown);
             let para = ratatui::widgets::Paragraph::new(lines)
                 .wrap(ratatui::widgets::Wrap { trim: false });
             f.render_widget(para, Rect::new(0, 0, width, 6));
@@ -14535,7 +14535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_cursor_advances_when_space_appended_to_list_item() {
+    async fn program_cursor_advances_when_space_appended_to_list_item() {
         let (app, _dir, server) = empty_app().await;
         let width = 40u16;
 
@@ -14544,13 +14544,13 @@ mod tests {
         // must move by one too — otherwise the caret desyncs from the edit point.
         let before = "* foo";
         let after = "* foo ";
-        let (_, col_before) = crate::ui::canvas_cursor_visual_pos(
+        let (_, col_before) = crate::ui::program_cursor_visual_pos(
             Some(&app),
             before,
             before.chars().count(),
             width as usize,
         );
-        let (_, col_after) = crate::ui::canvas_cursor_visual_pos(
+        let (_, col_after) = crate::ui::program_cursor_visual_pos(
             Some(&app),
             after,
             after.chars().count(),
@@ -14575,67 +14575,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_vertical_nav_preserves_preferred_column_across_wrap() {
+    async fn program_vertical_nav_preserves_preferred_column_across_wrap() {
         let (mut app, _dir, server) = empty_app().await;
         // "abcdefghij" wraps to two visual rows; "XY" is a short line below it.
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij\nXY", 3));
-        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 5, 20));
+        app.program_popup = Some(program_popup_for_test("s1", "abcdefghij\nXY", 3));
+        app.layout.program_inner_area = Some(Rect::new(2, 2, 5, 20));
 
         // Down crosses the wrapped boundary: row 1 of the logical line, col 3.
-        app.move_canvas_cursor_vertical(1);
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 8);
-        assert_eq!(app.canvas_popup.as_ref().unwrap().preferred_col, Some(3));
+        app.move_program_cursor_vertical(1);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 8);
+        assert_eq!(app.program_popup.as_ref().unwrap().preferred_col, Some(3));
 
         // Down again onto the short "XY" line clamps to its end (offset 13) but
         // the preferred column is remembered, not overwritten by the clamp.
-        app.move_canvas_cursor_vertical(1);
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 13);
-        assert_eq!(app.canvas_popup.as_ref().unwrap().preferred_col, Some(3));
+        app.move_program_cursor_vertical(1);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 13);
+        assert_eq!(app.program_popup.as_ref().unwrap().preferred_col, Some(3));
 
         // Up returns to the long row and restores column 3 (offset 8).
-        app.move_canvas_cursor_vertical(-1);
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 8);
-        assert_eq!(app.canvas_popup.as_ref().unwrap().preferred_col, Some(3));
+        app.move_program_cursor_vertical(-1);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 8);
+        assert_eq!(app.program_popup.as_ref().unwrap().preferred_col, Some(3));
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_click_on_wrapped_continuation_row_maps_to_offset() {
+    async fn program_click_on_wrapped_continuation_row_maps_to_offset() {
         let (mut app, _dir, server) = empty_app().await;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "abcdefghij", 0));
+        app.program_popup = Some(program_popup_for_test("s1", "abcdefghij", 0));
         // inner content origin = (modal.x + 1 + pad, modal.y + 1 + pad) = (2, 2);
         // inner width = 9 - 2 border - 2 pad = 5. "fghij" paints at y = 3.
         let modal = Rect::new(0, 0, 9, 20);
 
         // Click column 2 of the continuation row (screen col 4, row 3) → offset 7.
-        app.place_canvas_cursor(modal, 4, 3);
+        app.place_program_cursor(modal, 4, 3);
 
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 7);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 7);
         server.abort();
     }
 
     #[tokio::test]
-    async fn canvas_click_maps_through_scroll_offset_on_wrapped_row() {
+    async fn program_click_maps_through_scroll_offset_on_wrapped_row() {
         let (mut app, _dir, server) = empty_app().await;
         // Three logical lines; the first wraps to two visual rows (0,1), then
         // "second" is row 2 and "third" is row 3. Scroll one wrapped row off the
         // top so the viewport starts at visual row 1.
         let markdown = "abcdefghij\nsecond\nthird";
-        app.canvas_popup = Some(canvas_popup_for_test("s1", markdown, 0));
-        app.canvas_popup.as_mut().unwrap().scroll_offset = 1;
+        app.program_popup = Some(program_popup_for_test("s1", markdown, 0));
+        app.program_popup.as_mut().unwrap().scroll_offset = 1;
         let modal = Rect::new(0, 0, 9, 20);
 
         // Click the top visible screen row (y = 2). With scroll 1 that is visual
         // row 1 = "fghij" col 0 → offset 5, not the unscrolled row 0.
-        app.place_canvas_cursor(modal, 2, 2);
+        app.place_program_cursor(modal, 2, 2);
 
-        assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 5);
+        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 5);
         server.abort();
     }
 
     #[test]
-    fn canvas_normalizes_missing_and_duplicate_smart_clip_instance_ids() {
-        let normalized = canvas_normalize_smart_clip_instance_ids(
+    fn program_normalizes_missing_and_duplicate_smart_clip_instance_ids() {
+        let normalized = program_normalize_smart_clip_instance_ids(
             "a @{harness:codex} b @{harness:claude clip_id=clip_7} c @{harness:codex clip_id=clip_7}",
         );
 
@@ -14646,48 +14646,48 @@ mod tests {
     }
 
     #[test]
-    fn canvas_line_start_skips_list_markers_for_cursor_commands() {
-        assert_eq!(canvas_line_start("- alpha", 0), 2);
-        assert_eq!(canvas_line_start("* alpha", 4), 2);
-        assert_eq!(canvas_line_start("  - alpha", 0), 4);
-        assert_eq!(canvas_line_start("- alpha", 7), 2);
-        assert_eq!(canvas_line_start("plain", 0), 0);
+    fn program_line_start_skips_list_markers_for_cursor_commands() {
+        assert_eq!(program_line_start("- alpha", 0), 2);
+        assert_eq!(program_line_start("* alpha", 4), 2);
+        assert_eq!(program_line_start("  - alpha", 0), 4);
+        assert_eq!(program_line_start("- alpha", 7), 2);
+        assert_eq!(program_line_start("plain", 0), 0);
     }
 
     #[tokio::test]
-    async fn canvas_delete_removes_smart_clip_as_one_unit() {
+    async fn program_delete_removes_smart_clip_as_one_unit() {
         let (mut app, _dir, server) = empty_app().await;
         let clip = "@{harness:codex}";
         let before = "a ";
         let initial = format!("{before}{clip} z");
-        app.canvas_popup = Some(canvas_popup_for_test(
+        app.program_popup = Some(program_popup_for_test(
             "s1",
             &initial,
             before.chars().count() + clip.chars().count(),
         ));
 
-        app.delete_canvas_back();
-        let popup = app.canvas_popup.as_ref().unwrap();
+        app.delete_program_back();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "a  z");
         assert_eq!(popup.cursor, before.chars().count());
 
-        app.canvas_popup = Some(canvas_popup_for_test(
+        app.program_popup = Some(program_popup_for_test(
             "s1",
             &initial,
             before.chars().count(),
         ));
-        app.delete_canvas_forward();
-        let popup = app.canvas_popup.as_ref().unwrap();
+        app.delete_program_forward();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "a  z");
         assert_eq!(popup.cursor, before.chars().count());
 
-        app.canvas_popup = Some(canvas_popup_for_test(
+        app.program_popup = Some(program_popup_for_test(
             "s1",
             &initial,
             before.chars().count() + 3,
         ));
-        app.delete_canvas_forward();
-        let popup = app.canvas_popup.as_ref().unwrap();
+        app.delete_program_forward();
+        let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.buffer, "a  z");
         assert_eq!(popup.cursor, before.chars().count());
         server.abort();
@@ -15084,7 +15084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_open_state_survives_split_focus_changes() {
+    async fn program_open_state_survives_split_focus_changes() {
         let (mut app, _dir, server) = captured_app().await;
         let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
         second.id = "s2".into();
@@ -15118,32 +15118,32 @@ mod tests {
             },
         ];
         app.layout.modal_area = Some(Rect::new(20, 0, 40, 20));
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
 
         app.handle_left_click(65, 5).await;
 
         assert_eq!(app.active_window_id, 2);
         assert_eq!(app.selection, Selection::Session("s2".into()));
-        assert!(app.canvas_popup.is_none());
+        assert!(app.program_popup.is_none());
         assert!(
-            app.canvas_popups.contains_key("s1"),
-            "clicking another split should stash, not close, the open canvas"
+            app.program_popups.contains_key("s1"),
+            "clicking another split should stash, not close, the open program"
         );
 
         app.active_window_id = 1;
         app.selection = Selection::Session("s1".into());
-        app.sync_canvas_popup_with_selection();
-        assert!(app.canvas_popup.is_some());
+        app.sync_program_popup_with_selection();
+        assert!(app.program_popup.is_some());
 
         app.run_action(KeyAction::SwitchFocus).await;
-        app.sync_canvas_popup_with_selection();
+        app.sync_program_popup_with_selection();
 
         assert_eq!(app.active_window_id, 2);
         assert_eq!(app.selection, Selection::Session("s2".into()));
-        assert!(app.canvas_popup.is_none());
+        assert!(app.program_popup.is_none());
         assert!(
-            app.canvas_popups.contains_key("s1"),
-            "C-x o should keep split 1's canvas attached to split 1's session"
+            app.program_popups.contains_key("s1"),
+            "C-x o should keep split 1's program attached to split 1's session"
         );
         server.abort();
     }
@@ -15187,7 +15187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canvas_stays_open_when_clicking_selected_session_in_list() {
+    async fn program_stays_open_when_clicking_selected_session_in_list() {
         let (mut app, _dir, server) = empty_app().await;
         let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
         s1.id = "s1".into();
@@ -15197,29 +15197,29 @@ mod tests {
         s2.position = 1;
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
         app.layout = test_layout();
         app.layout.list_row_count = app.list_items().len();
         app.layout.list_items_area = Some(Rect::new(1, 1, 18, 8));
-        // The canvas modal sits over the view pane; the click lands in the list.
+        // The program modal sits over the view pane; the click lands in the list.
         app.layout.modal_area = Some(Rect::new(20, 0, 40, 20));
 
         // Click the already-selected session's row in the list.
         app.handle_left_click(10, 1).await;
 
-        // A list click neither closes nor hides the canvas of the selected
+        // A list click neither closes nor hides the program of the selected
         // session — only the title-glyph toggle / C-x Space do.
         let popup = app
-            .canvas_popup
+            .program_popup
             .as_ref()
-            .expect("canvas stays open after a list click");
-        assert!(!popup.closing, "list click must not start closing the canvas");
+            .expect("program stays open after a list click");
+        assert!(!popup.closing, "list click must not start closing the program");
         assert_eq!(popup.buffer, "draft");
         server.abort();
     }
 
     #[tokio::test]
-    async fn clicking_another_session_in_list_stashes_canvas_not_closes() {
+    async fn clicking_another_session_in_list_stashes_program_not_closes() {
         let (mut app, _dir, server) = empty_app().await;
         let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
         s1.id = "s1".into();
@@ -15229,7 +15229,7 @@ mod tests {
         s2.position = 1;
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
         app.layout = test_layout();
         app.layout.list_row_count = app.list_items().len();
         app.layout.list_items_area = Some(Rect::new(1, 1, 18, 8));
@@ -15239,28 +15239,28 @@ mod tests {
         app.handle_left_click(10, 2).await;
 
         assert_eq!(app.selection, Selection::Session("s2".into()));
-        // The prior session's canvas is preserved (stashed), not destroyed —
+        // The prior session's program is preserved (stashed), not destroyed —
         // it reappears on return. A list click is never a close gesture.
         let stashed = app
-            .canvas_popups
+            .program_popups
             .get("s1")
-            .expect("the prior session's canvas is stashed, not closed");
-        assert!(!stashed.closing, "a list click must never close the canvas");
+            .expect("the prior session's program is stashed, not closed");
+        assert!(!stashed.closing, "a list click must never close the program");
         assert_eq!(stashed.buffer, "draft");
         server.abort();
     }
 
-    // End-to-end guard for the #488 fix: a session-list click while a canvas
+    // End-to-end guard for the #488 fix: a session-list click while a program
     // is open must switch sessions. The sibling tests
-    // (`clicking_another_session_in_list_stashes_canvas_not_closes`, …) call
+    // (`clicking_another_session_in_list_stashes_program_not_closes`, …) call
     // `handle_left_click` directly, which skips the `on_mouse` →
-    // `handle_canvas_mouse` dispatch that decides whether the canvas swallows
+    // `handle_program_mouse` dispatch that decides whether the program swallows
     // the click. This drives a real render (so `modal_area` / `list_items_area`
     // are live geometry, not hand-set) and the full Down/Up mouse path, so a
     // regression that re-swallows outside clicks would be caught here even if
     // `handle_left_click` stayed correct in isolation.
     #[tokio::test]
-    async fn on_mouse_list_click_switches_session_with_canvas_open() {
+    async fn on_mouse_list_click_switches_session_with_program_open() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (mut app, _dir, server) = empty_app().await;
         let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -15273,7 +15273,7 @@ mod tests {
         app.selection = Selection::Session("s1".into());
         app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
         app.active_window_id = 1;
-        app.canvas_popup = Some(canvas_popup_for_test("s1", "draft", 3));
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
 
         // Render the real layout so modal_area / list_items_area reflect the
         // live geometry the mouse handler will see.
@@ -15306,13 +15306,13 @@ mod tests {
         assert_eq!(
             app.selection,
             Selection::Session("s2".into()),
-            "clicking s2 in the list while a canvas is open must switch to s2"
+            "clicking s2 in the list while a program is open must switch to s2"
         );
-        // ...and stashed s1's canvas rather than destroying it (navigation
-        // never closes a canvas; only the toggle / C-x Space do).
+        // ...and stashed s1's program rather than destroying it (navigation
+        // never closes a program; only the toggle / C-x Space do).
         assert!(
-            app.canvas_popups.contains_key("s1"),
-            "s1's canvas must be stashed, not discarded, when the click switches away"
+            app.program_popups.contains_key("s1"),
+            "s1's program must be stashed, not discarded, when the click switches away"
         );
         server.abort();
     }
