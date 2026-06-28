@@ -8653,9 +8653,21 @@ impl App {
                 )
             })
         };
-        let Some((cursor, target_col)) = computed else {
+        let Some((mut cursor, target_col)) = computed else {
             return;
         };
+        // When the clip's rendered chip spans the target visual row, the inner
+        // loop in canvas_visual_to_cursor finds no raw position on that row and
+        // picks the '@' that opens the clip syntax instead — a position that is
+        // still on the *previous* visual row, making the cursor appear stuck.
+        // Advance past the entire clip so the cursor actually moves forward.
+        if let Some(range) = self
+            .canvas_popup
+            .as_ref()
+            .and_then(|p| canvas_smart_clip_range_at_or_containing(&p.buffer, cursor))
+        {
+            cursor = range.end;
+        }
         let Some(popup) = self.canvas_popup.as_mut() else {
             return;
         };
@@ -13867,6 +13879,34 @@ mod tests {
         // Up moves to the first visual row of the *same* logical line (offset 2),
         // rather than doing nothing because there is no logical line above.
         assert_eq!(app.canvas_popup.as_ref().unwrap().cursor, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn canvas_down_from_line_start_with_clip_does_not_land_on_at_sign() {
+        // "hello @{session:s1}" renders as "hello  session s1 " (18 visible
+        // chars with chip padding). At width 7 the chip's rendering wraps
+        // across visual rows 1 and 2 of the logical line. The cursor starts
+        // at position 0 (before any text). Pressing Down must not land on the
+        // '@' at offset 6 — the '@' is still on visual row 0 (the same row
+        // the cursor is on), so landing there means the cursor did not actually
+        // move down. It must skip past the clip so it advances to a new position.
+        let (mut app, _dir, server) = empty_app().await;
+        let clip = "@{session:s1}";
+        let markdown = format!("hello {clip}\nnext");
+        // cursor starts at 0: beginning of the first line (before "hello")
+        app.canvas_popup = Some(canvas_popup_for_test("s1", &markdown, 0));
+        // width 7 forces "hello  session s1 " to wrap across 3 visual rows
+        app.layout.canvas_inner_area = Some(Rect::new(2, 2, 7, 20));
+
+        app.move_canvas_cursor_vertical(1);
+
+        let at_sign_offset = "hello ".chars().count(); // 6
+        assert_ne!(
+            app.canvas_popup.as_ref().unwrap().cursor,
+            at_sign_offset,
+            "Down from line start must not land on the '@' of a clip (cursor would not have moved down)"
+        );
         server.abort();
     }
 
