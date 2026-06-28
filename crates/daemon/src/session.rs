@@ -541,6 +541,43 @@ fn canvas_pty_submit_bytes(prompt: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build the [`SessionStartParams`] an adapter receives at `session.start`
+/// from a freshly handled create request.
+///
+/// The initial `prompt` is forwarded verbatim here, and this `session.start`
+/// payload is the *only* channel by which a newly created session's seed
+/// prompt reaches its harness. Every adapter starts its first turn from
+/// `params.prompt`: headless adapters push it onto their run queue and run it
+/// immediately, while interactive PTY harnesses receive it as a native launch
+/// argument or a queued submit. There is no separate daemon-side PTY write of
+/// the seed prompt — so unlike the canvas `Run` path (see
+/// `canvas_pty_submit_bytes`), there is no CR/LF terminator to get right here.
+/// If this forward is dropped, a created session sits idle in `AwaitingInput`
+/// with no way to start its turn except a manual follow-up `send_input`. See
+/// `specs/0046-session-create-initial-prompt-submits.md`.
+#[allow(clippy::too_many_arguments)]
+fn start_params_for_create(
+    session_id: String,
+    cwd: String,
+    prompt: Option<String>,
+    model: Option<String>,
+    mode: Option<String>,
+    pty_size: Option<PtySize>,
+    env: HashMap<String, String>,
+    args: Vec<String>,
+) -> SessionStartParams {
+    SessionStartParams {
+        session_id,
+        cwd,
+        prompt,
+        model,
+        mode,
+        pty_size,
+        env,
+        args,
+    }
+}
+
 fn canvas_run_instructions() -> Vec<String> {
     vec![
         "Execute this construct canvas as an autonomous run.".to_string(),
@@ -1965,16 +2002,16 @@ impl SessionManager {
         }
         summary.has_pty = info.capabilities.supports_pty;
         self.storage.save_summary(&summary)?;
-        let start_params = SessionStartParams {
-            session_id: id.clone(),
-            cwd: summary.cwd.clone(),
-            prompt: params.prompt.clone(),
-            model: summary.model.clone(),
-            mode: params.mode.clone(),
-            pty_size: params.pty_size,
-            env: env_with_meta,
-            args: params.args.clone(),
-        };
+        let start_params = start_params_for_create(
+            id.clone(),
+            summary.cwd.clone(),
+            params.prompt.clone(),
+            summary.model.clone(),
+            params.mode.clone(),
+            params.pty_size,
+            env_with_meta,
+            params.args.clone(),
+        );
         // Persist so a daemon restart can re-spawn with the same shape.
         let _ = self.storage.save_start_params(&id, &start_params);
         // Reflect Pending → Running on start (the adapter may also emit a status).
@@ -4391,6 +4428,43 @@ mod tests {
         assert_eq!(bytes.last(), Some(&b'\r'));
         assert!(!bytes.contains(&b'\n'));
         assert_eq!(&bytes[..bytes.len() - 1], b"run the canvas");
+    }
+
+    #[test]
+    fn create_forwards_initial_prompt_to_session_start() {
+        // The seed prompt must reach the adapter via session.start params —
+        // that is the only channel by which a freshly created session starts
+        // its first turn (headless adapters run it off their queue;
+        // interactive PTY harnesses get it as a launch arg). Dropping it here
+        // reproduces the reported symptom where a created subagent sits idle
+        // in AwaitingInput until a manual follow-up send_input.
+        let start = start_params_for_create(
+            "s1".to_string(),
+            "/tmp".to_string(),
+            Some("do the task".to_string()),
+            None,
+            Some("headless".to_string()),
+            None,
+            HashMap::new(),
+            Vec::new(),
+        );
+        assert_eq!(start.prompt.as_deref(), Some("do the task"));
+        assert_eq!(start.session_id, "s1");
+        assert_eq!(start.mode.as_deref(), Some("headless"));
+
+        // A create with no prompt stays None, so the adapter correctly idles
+        // in AwaitingInput waiting for the first send_input.
+        let empty = start_params_for_create(
+            "s2".to_string(),
+            "/tmp".to_string(),
+            None,
+            None,
+            None,
+            None,
+            HashMap::new(),
+            Vec::new(),
+        );
+        assert_eq!(empty.prompt, None);
     }
 
     #[test]

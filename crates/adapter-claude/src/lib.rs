@@ -326,6 +326,24 @@ fn emit_new_claude_transcript_lines(path: &Path, next_line: &mut usize, emit: &E
     *next_line = seen;
 }
 
+/// Seed the headless run queue from the session's initial prompt.
+///
+/// A non-empty seed prompt becomes the first queued turn, so the run loop
+/// pops and runs it immediately (emitting `Running`) instead of idling in
+/// `AwaitingInput` — i.e. a created session with a prompt *starts its turn*
+/// rather than buffering the prompt unsubmitted. A blank or absent prompt
+/// seeds nothing, so the session correctly waits for the first `send_input`.
+/// See `specs/0046-session-create-initial-prompt-submits.md`.
+fn initial_pending(prompt: &Option<String>) -> VecDeque<String> {
+    let mut pending = VecDeque::new();
+    if let Some(p) = prompt {
+        if !p.trim().is_empty() {
+            pending.push_back(p.clone());
+        }
+    }
+    pending
+}
+
 async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
     let AdapterContext {
         session_id: agentd_session_id,
@@ -344,12 +362,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
     let env = params.env.clone();
 
     let mut session_id: Option<String> = None;
-    let mut pending: VecDeque<String> = VecDeque::new();
-    if let Some(p) = params.prompt.clone() {
-        if !p.trim().is_empty() {
-            pending.push_back(p);
-        }
-    }
+    let mut pending: VecDeque<String> = initial_pending(&params.prompt);
 
     let exit_code = loop {
         // Pick next user message, or wait for one.
@@ -790,6 +803,22 @@ mod tests {
             claude_project_slug(Path::new("/Users/moon/agentd/.claude/worktrees/test")),
             "-Users-moon-agentd--claude-worktrees-test"
         );
+    }
+
+    #[test]
+    fn initial_prompt_seeds_run_queue_so_first_turn_runs() {
+        // A created session with a non-empty prompt must run it on the first
+        // loop iteration (submitted), not sit idle in AwaitingInput waiting
+        // for input (buffered) — this is the headless side of the
+        // create-starts-the-turn contract.
+        let q = initial_pending(&Some("do the task".to_string()));
+        assert_eq!(q.len(), 1);
+        assert_eq!(q.front().map(String::as_str), Some("do the task"));
+
+        // A blank or absent prompt seeds nothing, so the session correctly
+        // idles in AwaitingInput until the first send_input.
+        assert!(initial_pending(&None).is_empty());
+        assert!(initial_pending(&Some("   ".to_string())).is_empty());
     }
 
     #[test]
