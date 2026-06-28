@@ -12911,11 +12911,12 @@ mod tests {
         server.abort();
     }
 
-    /// The canvas session-actions button must reuse the session chat view's
-    /// geometry AND styling: same `view_close_button_range` slot, painted in
-    /// the shared `matrix_close` color rather than the canvas accent.
+    /// The canvas session-actions button reuses the session chat view's
+    /// geometry — the same `view_close_button_range` slot — but as of #556 it
+    /// paints in the canvas border color (`accent_alt`) so the ☰ reads as part
+    /// of the canvas frame, not in the shared session-view `matrix_close` hue.
     #[tokio::test]
-    async fn canvas_title_actions_matches_session_view_styling() {
+    async fn canvas_title_actions_reuse_session_geometry_in_canvas_border_color() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "s1".into();
@@ -12924,7 +12925,9 @@ mod tests {
         app.canvas_popup = Some(canvas_popup_for_test("s1", "alpha", 0));
         app.canvas_popup.as_mut().unwrap().revealed_at =
             Instant::now() - Duration::from_millis(CANVAS_REVEAL_MS);
-        let matrix_close = app.theme.matrix_close;
+        // Canvas border color (#556): `canvas_border_style` paints the frame in
+        // `accent_alt`, and the render path passes that hue through to the ☰.
+        let canvas_border_color = app.theme.accent_alt;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
@@ -12945,8 +12948,8 @@ mod tests {
             .expect("hamburger glyph paints in its range");
         assert_eq!(
             glyph_cell.style().fg,
-            Some(matrix_close),
-            "canvas action glyph should use the shared session-view action color"
+            Some(canvas_border_color),
+            "canvas action glyph should use the canvas border color (#556)"
         );
         server.abort();
     }
