@@ -2903,6 +2903,7 @@ fn apply_pane_title_right_cluster<'a>(
     border_style: Style,
     show_close: bool,
     session_actions: bool,
+    focused: bool,
     mut block: Block<'a>,
 ) -> Block<'a> {
     // Harness name right-aligned on the top border so it visually detaches from
@@ -2932,17 +2933,14 @@ fn apply_pane_title_right_cluster<'a>(
             )
         })
     });
-    // Right-aligned close button on the top border. Hover is hit-tested against
-    // `app.mouse_pos` so the glyph bolds when the cursor is over it — the click
-    // handlers in `app.rs` mirror the same `view_close_button_range` geometry.
+    // Right-aligned close / session-actions button on the top border. Hover is
+    // hit-tested against `app.mouse_pos` so the glyph bolds when the cursor is
+    // over it — the click handlers in `app.rs` mirror the same
+    // `view_close_button_range` geometry. When the pane is unfocused the glyph
+    // dims to match the unfocused title-bar border, so an inactive pane's menu
+    // icon no longer reads at full brightness.
     let close_hovered = show_close && hovered_view_close_button(app, area);
-    let close_style = if close_hovered {
-        Style::default()
-            .fg(app.theme.text)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(app.theme.matrix_close)
-    };
+    let close_style = session_menu_icon_style(&app.theme, close_hovered, focused);
     let close_label = if session_actions { " ☰ " } else { " x " };
     let close = Line::from(Span::styled(close_label, close_style))
         .alignment(ratatui::layout::Alignment::Right);
@@ -2956,6 +2954,27 @@ fn apply_pane_title_right_cluster<'a>(
         block = block.title(close);
     }
     block
+}
+
+/// Style for the session-title actions glyph (the ` ☰ ` / ` x ` button at the
+/// right edge of a pane title bar, shared by the chat/PTY session view and the
+/// canvas view via `apply_pane_title_right_cluster`).
+///
+/// Hover wins: the glyph bolds in themed text color when the cursor is over it.
+/// Otherwise it paints in `matrix_close`, but dims (`Modifier::DIM`) when the
+/// pane is unfocused so it tracks the unfocused title-bar border instead of
+/// staying at full brightness on an inactive pane.
+fn session_menu_icon_style(theme: &Theme, hovered: bool, focused: bool) -> Style {
+    if hovered {
+        Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
+    } else {
+        let style = Style::default().fg(theme.matrix_close);
+        if focused {
+            style
+        } else {
+            style.add_modifier(Modifier::DIM)
+        }
+    }
 }
 
 fn render_session_title_menu(f: &mut Frame, app: &App) {
@@ -3086,6 +3105,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         border_style,
         show_close,
         true,
+        focused,
         block,
     );
     let inner = block.inner(area);
@@ -7492,8 +7512,16 @@ fn render_canvas_popup_at(
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title);
-    let block =
-        apply_pane_title_right_cluster(app, rect, summary_ref, border_style, show_close, true, block);
+    let block = apply_pane_title_right_cluster(
+        app,
+        rect,
+        summary_ref,
+        border_style,
+        show_close,
+        true,
+        active,
+        block,
+    );
     if active {
         // Run lives in the left cluster; the close button and widget icons reuse
         // the shared session-view geometry (`view_close_button_range` and
@@ -10079,6 +10107,42 @@ mod tests {
             "inactive canvas border should dim without switching hue"
         );
         assert_ne!(active_canvas.fg, pane_border_style(&theme, true).fg);
+    }
+
+    #[test]
+    fn session_menu_icon_dims_when_pane_unfocused() {
+        // The session-actions menu glyph (` ☰ `) at the right of the pane title
+        // bar is shared by both the chat/PTY session view (`render_detail`) and
+        // the canvas view via `apply_pane_title_right_cluster`. When the pane is
+        // focused it stays at full brightness; when unfocused it dims to match
+        // the unfocused title-bar border. Hover always wins regardless of focus.
+        let theme = Theme::default();
+
+        let focused = session_menu_icon_style(&theme, false, true);
+        let unfocused = session_menu_icon_style(&theme, false, false);
+        let hovered_focused = session_menu_icon_style(&theme, true, true);
+        let hovered_unfocused = session_menu_icon_style(&theme, true, false);
+
+        // Same base color whether focused or not — only brightness changes.
+        assert_eq!(focused.fg, Some(theme.matrix_close));
+        assert_eq!(unfocused.fg, Some(theme.matrix_close));
+
+        // Focused: bright (no DIM). Unfocused: dimmed.
+        assert!(
+            !focused.add_modifier.contains(Modifier::DIM),
+            "focused menu icon should stay at full brightness"
+        );
+        assert!(
+            unfocused.add_modifier.contains(Modifier::DIM),
+            "unfocused menu icon should be dimmed"
+        );
+
+        // Hover overrides focus state entirely: bold themed text, never dimmed.
+        for hovered in [hovered_focused, hovered_unfocused] {
+            assert_eq!(hovered.fg, Some(theme.text));
+            assert!(hovered.add_modifier.contains(Modifier::BOLD));
+            assert!(!hovered.add_modifier.contains(Modifier::DIM));
+        }
     }
 
     #[test]
