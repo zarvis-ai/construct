@@ -5102,6 +5102,20 @@ impl App {
         if self.handle_canvas_mouse(&ev).await {
             return;
         }
+        // URL clicks must be intercepted before the child-mouse-forward path so
+        // that clicking a hovered URL inside a mouse-grabbing session (e.g. Claude
+        // Code in full-screen mode) actually opens the browser.  The hover
+        // underline is rendered every frame — if we show the link as clickable it
+        // must respond to clicks regardless of whether the child owns the mouse.
+        if matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) {
+            if let Some(hit) = self.url_hit_at(ev.column, ev.row) {
+                match open_url(&hit.url) {
+                    Ok(()) => self.set_status(format!("opened {}", hit.url)),
+                    Err(e) => self.set_status(format!("open URL failed: {e}")),
+                }
+                return;
+            }
+        }
         if self.session_title_menu.is_none()
             && self.resizing_list.is_none()
             && self.resizing_pin_strip.is_none()
@@ -5980,11 +5994,18 @@ impl App {
             c >= r.x && c < r.x + r.width && y >= r.y && y < r.y + r.height
         }
         if let Some(view) = self.layout.view_area {
-            let inner = ratatui::layout::Rect {
-                x: view.x.saturating_add(1),
-                y: view.y.saturating_add(1),
-                width: view.width.saturating_sub(2),
-                height: view.height.saturating_sub(2),
+            // Zoomed mode renders edge-to-edge without any border; the view area
+            // IS the content area.  Normal (split) mode wraps content in a 1-cell
+            // border on all sides, so we shrink by 1 in that case only.
+            let inner = if matches!(self.zoom, ZoomMode::None) {
+                ratatui::layout::Rect {
+                    x: view.x.saturating_add(1),
+                    y: view.y.saturating_add(1),
+                    width: view.width.saturating_sub(2),
+                    height: view.height.saturating_sub(2),
+                }
+            } else {
+                view
             };
             if contains(inner, col, row) {
                 return Some(inner);
@@ -18503,6 +18524,30 @@ mod drain_gate_tests {
         assert_eq!(hit.ranges[1].row, 1);
         assert_eq!(hit.ranges[1].start_col, 0);
         assert_eq!(hit.ranges[1].end_col, 12);
+    }
+
+    /// Zoomed mode renders without borders, so the content fills `view_area`
+    /// starting at (x, y) rather than (x+1, y+1).  A URL at column 0 / row 0
+    /// must be hit-testable when the bounds rect starts at the origin.
+    #[test]
+    fn url_hit_detects_url_at_first_row_and_col_of_borderless_area() {
+        let frame = vec![
+            "https://example.com/zoomed      ".to_string(),
+            "                                ".to_string(),
+        ];
+        // Simulate zoomed-mode bounds: full area, no border shrink.
+        let zoomed_bounds = Rect::new(0, 0, 32, 2);
+        let hit = super::url_hit_in_frame(&frame, 0, 0, zoomed_bounds)
+            .expect("URL at (col=0, row=0) must be clickable with borderless bounds");
+        assert_eq!(hit.url, "https://example.com/zoomed");
+
+        // With normal-mode bounds (border shrunk by 1 on each side), the same
+        // click at (0, 0) falls outside the inner area and returns None.
+        let bordered_bounds = Rect::new(1, 1, 30, 0);
+        assert!(
+            super::url_hit_in_frame(&frame, 0, 0, bordered_bounds).is_none(),
+            "click at (0, 0) must not hit when bounds are border-shrunk"
+        );
     }
 }
 
