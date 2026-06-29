@@ -9,6 +9,7 @@ mod app;
 mod keymap;
 mod matrix_rain;
 mod mouse_forward;
+mod text_util;
 mod pty_render;
 mod theme;
 mod tui_state;

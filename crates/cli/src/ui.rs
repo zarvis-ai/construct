@@ -7,6 +7,7 @@ use crate::app::{
     WindowPaneHit, WindowSplitDirection, ZoomMode,
 };
 use crate::keymap::KeyAction;
+use crate::text_util::wrap_to_width;
 use crate::theme::Theme;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
 use ratatui::buffer::Buffer;
@@ -1769,39 +1770,6 @@ const MONOLOG_VPAD: u16 = 1;
 /// Word-wrap `text` to `max_w` display columns: break at spaces where possible,
 /// hard-break overlong words, honor embedded newlines. Returns the lines so the
 /// caller can size a tight box around them.
-fn wrap_to_width(text: &str, max_w: usize) -> Vec<String> {
-    let max_w = max_w.max(1);
-    let mut lines = Vec::new();
-    for raw in text.split('\n') {
-        let mut cur = String::new();
-        let mut cur_w = 0usize;
-        let mut last_space: Option<usize> = None;
-        for ch in raw.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if cur_w + cw > max_w && cur_w > 0 {
-                if let Some(sp) = last_space {
-                    let rest = cur[sp + 1..].to_string();
-                    cur.truncate(sp);
-                    lines.push(std::mem::take(&mut cur));
-                    cur = rest;
-                    cur_w = UnicodeWidthStr::width(cur.as_str());
-                } else {
-                    lines.push(std::mem::take(&mut cur));
-                    cur_w = 0;
-                }
-                last_space = None;
-            }
-            if ch == ' ' {
-                last_space = Some(cur.len());
-            }
-            cur.push(ch);
-            cur_w += cw;
-        }
-        lines.push(cur);
-    }
-    lines
-}
-
 /// Overlay the operator's latest monolog on top of the (still-running) matrix
 /// rain as a bright typewriter line in a padded clear-box, removing it at once
 /// after the type → hold window (no fade). Returns `true` if it drew this

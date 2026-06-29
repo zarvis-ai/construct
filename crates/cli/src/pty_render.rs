@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+use crate::text_util::wrap_display_width;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Kind of a structured chat [`Item::Message`], driving its styling.
@@ -1962,66 +1963,6 @@ fn compact_tool_args(args: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn wrap_display_width(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-
-    for word in text.split(' ').filter(|w| !w.is_empty()) {
-        let word_width = UnicodeWidthStr::width(word);
-        if current.is_empty() {
-            if word_width <= width {
-                current.push_str(word);
-                current_width = word_width;
-            } else {
-                lines.extend(split_word_display_width(word, width));
-                current_width = 0;
-            }
-        } else if current_width + 1 + word_width <= width {
-            current.push(' ');
-            current.push_str(word);
-            current_width += 1 + word_width;
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current_width = 0;
-            if word_width <= width {
-                current.push_str(word);
-                current_width = word_width;
-            } else {
-                lines.extend(split_word_display_width(word, width));
-            }
-        }
-    }
-
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-fn split_word_display_width(word: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    let mut current_width = 0usize;
-    for ch in word.chars() {
-        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0).max(1);
-        if !current.is_empty() && current_width + ch_width > width {
-            lines.push(std::mem::take(&mut current));
-            current_width = 0;
-        }
-        current.push(ch);
-        current_width += ch_width;
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
 }
 
 #[cfg(test)]
