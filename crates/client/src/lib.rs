@@ -3,8 +3,8 @@
 use agentd_protocol::jsonrpc::{self, MessageKind};
 use agentd_protocol::{
     ipc_method, transport, ProgramEditParams, ProgramExecuteParams, ProgramExecuteResult,
-    ProgramGetParams, ProgramGetResult, ProgramListTemplatesResult, ProgramUpdateParams,
-    ProgramUpdateResult,
+    ProgramGetParams, ProgramGetResult, ProgramListTemplatesResult, ProgramUpdateActor,
+    ProgramUpdateParams, ProgramUpdateResult,
     ChatViewerActiveResult, ClientView, CreateSessionParams, DiffResult, ErrorObject,
     GroupCreateParams, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, GroupSummary, HarnessInfo, MoveDirection, Notification, PingResult,
@@ -352,6 +352,8 @@ impl Client {
     /// `shell` harness (which takes a command, not conversation context), the
     /// fork's initial prompt is seeded with a rendered summary of the source
     /// transcript so an agent harness can pick up where the original left off.
+    /// The source's Program document is copied to the fork as durable
+    /// orchestration state; active execution/run state is not copied.
     /// Returns the new session id.
     pub async fn fork_session(
         &self,
@@ -408,7 +410,8 @@ impl Client {
             src.mode.clone()
         };
 
-        self.create(CreateSessionParams {
+        let new_id = self
+            .create(CreateSessionParams {
             harness: harness.to_string(),
             cwd: src.cwd.clone(),
             prompt,
@@ -423,8 +426,24 @@ impl Client {
             parent_session_id: None,        // sibling, not a subagent
             group_id: src.group_id.clone(), // same group → rendered alongside the source
             position_after_session_id: Some(src.id.clone()),
-        })
-        .await
+            })
+            .await?;
+
+        let source_program = self.program_get(source_id).await?.program;
+        if !source_program.markdown.is_empty() || source_program.template_id.is_some() {
+            self.program_update(ProgramUpdateParams {
+                session_id: new_id.clone(),
+                markdown: source_program.markdown,
+                base_version: None,
+                actor: ProgramUpdateActor::Human,
+                template_id: source_program.template_id,
+                note: Some(format!("copied from fork source {}", short_id(source_id))),
+                shimmer: None,
+            })
+            .await?;
+        }
+
+        Ok(new_id)
     }
     pub async fn send_input(&self, id: &str, text: String) -> Result<()> {
         let _: serde_json::Value = self
