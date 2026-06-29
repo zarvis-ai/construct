@@ -9575,6 +9575,11 @@ fn program_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
     format!("{} {} · {}", s.state.glyph(), primary_label(s), harness_label(s))
 }
 
+fn program_harness_clip_label(h: &agentd_protocol::HarnessInfo) -> String {
+    let status_icon = if h.available { "✓" } else { "✗" };
+    format!("{status_icon} {}", h.name)
+}
+
 pub(crate) fn program_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
     let (kind, id) = program_smart_clip_target(raw_clip);
     let label = match kind {
@@ -9588,10 +9593,7 @@ pub(crate) fn program_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str)
             .unwrap_or_else(|| format!("session {id}")),
         "harness" => app
             .and_then(|app| {
-                app.harnesses.iter().find(|h| h.name == id).map(|h| {
-                    let status = if h.available { "available" } else { "missing" };
-                    format!("harness {} · {status}", h.name)
-                })
+                app.harnesses.iter().find(|h| h.name == id).map(program_harness_clip_label)
             })
             .unwrap_or_else(|| format!("harness {id}")),
         "session-response" => format!("response {id}"),
@@ -10055,6 +10057,27 @@ mod tests {
         );
         assert_eq!(kind, "session");
         assert_eq!(label, "✓ Build · claude");
+    }
+
+    #[test]
+    fn program_harness_clip_label_shows_status_icon_and_name() {
+        let available = agentd_protocol::HarnessInfo {
+            name: "codex".into(),
+            available: true,
+            binary: None,
+            description: None,
+            capabilities: Default::default(),
+        };
+        let missing = agentd_protocol::HarnessInfo {
+            name: "claude".into(),
+            available: false,
+            binary: None,
+            description: None,
+            capabilities: Default::default(),
+        };
+
+        assert_eq!(program_harness_clip_label(&available), "✓ codex");
+        assert_eq!(program_harness_clip_label(&missing), "✗ claude");
     }
 
     #[test]
