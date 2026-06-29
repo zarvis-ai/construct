@@ -959,6 +959,13 @@ pub struct App {
     /// Presence means the program should be restored when that session is
     /// focused again, including unsaved draft text and cursor state.
     pub program_popups: HashMap<String, ProgramPopup>,
+    /// Remembered caret + scroll for each session's program, captured when the
+    /// program view is hidden so reopening it lands on the same position. This
+    /// is intentionally distinct from `program_popups`: that map drives split-
+    /// window rendering, so a fully-hidden program must not live there (it would
+    /// re-render in a split), yet its caret/scroll must still survive a
+    /// hide→show cycle. Keyed by session id; consumed on the next open.
+    pub program_view_memory: HashMap<String, ProgramViewMemory>,
     /// In-flight program Run animations, keyed by session id (spec 0042). An
     /// entry means a program Run is believed to still be executing for that
     /// session; it drives the shimmer over the executed Markdown.
@@ -1465,6 +1472,24 @@ pub struct ProgramPopup {
     /// Vertical scroll offset measured in wrapped (visual) rows — the number of
     /// rows skipped off the top so the body can scroll when it overflows the
     /// viewport. Cursor moves follow the caret; the mouse wheel scrolls freely.
+    pub scroll_offset: usize,
+}
+
+/// Caret + scroll of a program view, remembered across a hide→show cycle. When
+/// the program is hidden the active popup is dropped (it must not linger in
+/// `program_popups`, which renders split windows); this snapshot lets a later
+/// reopen restore the exact position the user left, even though the document is
+/// re-fetched fresh from the daemon.
+#[derive(Debug, Clone)]
+pub struct ProgramViewMemory {
+    /// Caret as a char offset into the buffer. Clamped to the (possibly changed)
+    /// buffer length on restore.
+    pub cursor: usize,
+    /// Preferred column for vertical motion, carried so an up/down right after
+    /// reopening behaves as it did before hiding.
+    pub preferred_col: Option<usize>,
+    /// Vertical scroll offset in wrapped rows. An out-of-range value is clamped
+    /// by the renderer, so a shrunk document can't scroll past its end.
     pub scroll_offset: usize,
 }
 
@@ -2186,6 +2211,7 @@ async fn run_with_socket_initial_selection(
         tasks_popup: None,
         program_popup: None,
         program_popups: HashMap::new(),
+        program_view_memory: HashMap::new(),
         program_runs: HashMap::new(),
         program_clipboard: None,
         remote_control_popup: None,
@@ -6061,7 +6087,11 @@ impl App {
     }
 
     fn dismiss_modal(&mut self) {
-        if self.program_popup.take().is_some() {
+        if self.program_popup.is_some() {
+            // Remember caret + scroll so reopening restores them, matching the
+            // toggle-close path.
+            self.remember_program_view_state();
+            self.program_popup = None;
             return;
         }
         if self.tasks_popup.take().is_some() {
@@ -7112,7 +7142,12 @@ impl App {
                     }
                 }
                 self.program_popups.remove(&result.program.session_id);
-                self.program_popup = Some(program_popup_from_document(result.program, now));
+                let mut popup = program_popup_from_document(result.program, now);
+                // Restore the caret + scroll the user left when this program was
+                // last hidden, so hide→show is position-preserving rather than
+                // jumping back to the top.
+                self.restore_program_view_state(&mut popup);
+                self.program_popup = Some(popup);
                 // Opening a program focuses the view pane so its keystrokes are
                 // captured immediately for editing. `C-x o` then hands focus
                 // back to the list for navigation while the program stays
@@ -7565,11 +7600,44 @@ impl App {
         if !self.save_program_popup().await {
             return;
         }
+        // Capture caret + scroll before the popup fades so reopening this
+        // session's program restores them (the popup itself is dropped once the
+        // close animation lapses — see `render_program_popup`).
+        self.remember_program_view_state();
         if let Some(popup) = self.program_popup.as_mut() {
             self.program_popups.remove(&popup.program.session_id);
             let now = Instant::now();
             popup.closing = true;
             popup.hide_after = now + Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+    }
+
+    /// Snapshot the active program's caret + scroll into `program_view_memory`
+    /// so a later reopen of the same session's program restores them. Every
+    /// path that hides the program calls this before the popup is dropped.
+    fn remember_program_view_state(&mut self) {
+        if let Some(popup) = self.program_popup.as_ref() {
+            self.program_view_memory.insert(
+                popup.program.session_id.clone(),
+                ProgramViewMemory {
+                    cursor: popup.cursor,
+                    preferred_col: popup.preferred_col,
+                    scroll_offset: popup.scroll_offset,
+                },
+            );
+        }
+    }
+
+    /// Reapply a remembered caret + scroll (captured when the program was last
+    /// hidden) onto a freshly-loaded popup, so a hide→show cycle lands on the
+    /// same position. Consumes the entry. The cursor is clamped to the buffer
+    /// (the document may have changed on the daemon); an out-of-range scroll is
+    /// clamped by the renderer.
+    fn restore_program_view_state(&mut self, popup: &mut ProgramPopup) {
+        if let Some(memory) = self.program_view_memory.remove(&popup.program.session_id) {
+            popup.cursor = memory.cursor.min(popup.buffer.chars().count());
+            popup.preferred_col = memory.preferred_col;
+            popup.scroll_offset = memory.scroll_offset;
         }
     }
 
@@ -11131,6 +11199,7 @@ mod tests {
             tasks_popup: None,
             program_popup: None,
             program_popups: HashMap::new(),
+            program_view_memory: HashMap::new(),
             program_runs: HashMap::new(),
             program_clipboard: None,
             remote_control_popup: None,
@@ -11265,6 +11334,64 @@ mod tests {
         app.program_popup.as_mut().unwrap().cursor = 0;
         app.follow_program_scroll();
         assert_eq!(app.program_popup.as_ref().unwrap().scroll_offset, 0);
+    }
+
+    #[tokio::test]
+    async fn program_hide_then_show_restores_cursor_and_scroll() {
+        let (mut app, _dir, server) = empty_app().await;
+        let markdown = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+
+        // Active program with the user parked partway down: a non-zero caret,
+        // a remembered preferred column, and a freely-scrolled viewport.
+        let mut popup = program_popup_for_test("s1", &markdown, 42);
+        popup.scroll_offset = 7;
+        popup.preferred_col = Some(3);
+        app.program_popup = Some(popup);
+
+        // Hide: capture the position, then drop the popup the way the close
+        // animation eventually does.
+        app.remember_program_view_state();
+        app.program_popup = None;
+        assert!(
+            app.program_view_memory.contains_key("s1"),
+            "hiding must remember the program's caret + scroll"
+        );
+
+        // Show: a fresh popup is rebuilt from the daemon document (caret 0,
+        // scroll 0); restore must put the user back where they were.
+        let mut reopened = program_popup_for_test("s1", &markdown, 0);
+        assert_eq!(reopened.cursor, 0);
+        assert_eq!(reopened.scroll_offset, 0);
+        app.restore_program_view_state(&mut reopened);
+        assert_eq!(reopened.cursor, 42, "caret survives hide→show");
+        assert_eq!(reopened.scroll_offset, 7, "scroll survives hide→show");
+        assert_eq!(reopened.preferred_col, Some(3), "preferred column survives");
+        assert!(
+            !app.program_view_memory.contains_key("s1"),
+            "restoring consumes the remembered position"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_show_clamps_restored_cursor_to_shrunk_buffer() {
+        let (mut app, _dir, server) = empty_app().await;
+
+        // Hidden with the caret deep in a long document.
+        let mut popup = program_popup_for_test("s1", "a very long original line", 24);
+        popup.scroll_offset = 4;
+        app.program_popup = Some(popup);
+        app.remember_program_view_state();
+        app.program_popup = None;
+
+        // The document shrank on the daemon while hidden; the restored caret is
+        // clamped to the new buffer rather than pointing past its end.
+        let mut reopened = program_popup_for_test("s1", "short", 0);
+        app.restore_program_view_state(&mut reopened);
+        assert_eq!(reopened.cursor, "short".chars().count());
+
+        server.abort();
     }
 
     #[tokio::test]
