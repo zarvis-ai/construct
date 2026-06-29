@@ -9328,6 +9328,17 @@ impl App {
             SaveProgram => {
                 self.save_program_popup().await;
             }
+            RunProgram => {
+                // Keyboard equivalent of the title-bar ▶ button and the
+                // selection ▶ Run button: run just the highlighted selection
+                // when one is active, otherwise run the whole program. No-op
+                // (with a status hint) when no program surface is open.
+                let selection = self
+                    .program_popup
+                    .as_ref()
+                    .and_then(Self::selected_program_text);
+                self.execute_program_popup(selection).await;
+            }
             OpenDiff => {
                 if let Some(id) = self.selected_id() {
                     match self.client.diff(&id).await {
