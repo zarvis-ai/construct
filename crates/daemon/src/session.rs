@@ -628,29 +628,24 @@ fn program_run_context(
     }
 }
 
-/// Ids of the post-edit blocks produced by edits flagged `keep_pending`
-/// (spec 0053): the blocks whose work an edit keeps in flight. Anchors on the
-/// first non-blank line of each such edit's `new_string` and returns the id of
-/// every post-edit block containing that line — so a move/annotate adds the
-/// resulting block's new id in the same narrowing call that drops the old one,
-/// and the pending set never transiently empties.
+/// Ids of every block an edit flagged `keep_pending` introduces (spec 0053):
+/// the blocks whose work the edit keeps in flight. Block ids are content-
+/// derived, so each block parsed from a keep_pending edit's `new_string` in
+/// isolation has the same id as in the post-edit document — and `new_string`
+/// may span several blocks (e.g. a heading plus a moved item), so ALL of them
+/// are returned, not just the first. The caller drops ids that already existed
+/// pre-edit (so a re-stated heading is not re-lit) and `narrow_program_run`
+/// ignores any id absent from the post-edit document, so the net effect is to
+/// re-add exactly the new/changed blocks in the same narrowing call that drops
+/// the old ones — the pending set never transiently empties.
 fn program_edit_keep_ids(
     edits: &[agentd_protocol::ProgramEdit],
-    markdown: &str,
 ) -> std::collections::HashSet<String> {
-    let anchors: Vec<String> = edits
+    edits
         .iter()
         .filter(|e| e.keep_pending)
-        .filter_map(|e| e.new_string.lines().find(|l| !l.trim().is_empty()))
-        .map(|l| l.trim().to_string())
-        .collect();
-    if anchors.is_empty() {
-        return Default::default();
-    }
-    agentd_protocol::program_block_spans(markdown)
-        .into_iter()
-        .filter(|b| b.signature.lines().any(|l| anchors.iter().any(|a| a == l)))
-        .map(|b| b.id)
+        .flat_map(|e| agentd_protocol::program_block_spans(&e.new_string))
+        .map(|span| span.id)
         .collect()
 }
 
@@ -1594,21 +1589,36 @@ impl SessionManager {
         self.get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
+        // Block ids of the pre-edit document, to tell which keep_pending blocks
+        // are genuinely new (so a re-stated, unchanged heading is not re-lit).
+        let before_ids: std::collections::HashSet<String> = self
+            .storage
+            .read_program(&params.session_id)
+            .map(|p| {
+                agentd_protocol::program_block_spans(&p.markdown)
+                    .into_iter()
+                    .map(|span| span.id)
+                    .collect()
+            })
+            .unwrap_or_default();
         let program =
             self.storage
                 .edit_program(&params.session_id, &params.edits, params.actor, params.note)?;
         // Apply the partial shimmer declaration against the post-edit document
         // (spec 0053): changed blocks drop their prior shimmer; declared ids set
         // pending/settled; ids that no longer exist are ignored (fail closed).
-        // Edits flagged `keep_pending` atomically re-add the id of the block
-        // they produce, so moving/annotating a still-pending block keeps it
-        // shimmering without the pending set transiently emptying. Explicit
-        // declarations in `shimmer` win over the keep_pending default.
+        // Edits flagged `keep_pending` atomically re-add every block they
+        // introduce — including the moved item when the new_string also restates
+        // its heading — so moving/annotating a still-pending block keeps it
+        // shimmering without the pending set transiently emptying. Blocks that
+        // already existed pre-edit are skipped (no re-light of an unchanged
+        // heading), and explicit declarations in `shimmer` win.
         let mut decls = params.shimmer.clone();
-        for id in program_edit_keep_ids(&params.edits, &program.markdown) {
-            if !decls.iter().any(|d| d.id == id) {
-                decls.push(agentd_protocol::ProgramShimmerDecl { id, shimmer: true });
+        for id in program_edit_keep_ids(&params.edits) {
+            if before_ids.contains(&id) || decls.iter().any(|d| d.id == id) {
+                continue;
             }
+            decls.push(agentd_protocol::ProgramShimmerDecl { id, shimmer: true });
         }
         self.narrow_program_run(&params.session_id, &program.markdown, &decls);
         let blocks = self.program_blocks_projection(&params.session_id, &program.markdown);
@@ -6585,6 +6595,79 @@ mod tests {
         let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
         assert!(shim("do the thing"), "keep_pending kept the moved block pending");
         assert!(!shim("# Tasks"), "the settled heading stays settled");
+    }
+
+    // keep_pending whose new_string spans MULTIPLE blocks (a heading-anchored
+    // insert: "# In progress\n\n* task") must keep the inserted *item*, not just
+    // the first block (the heading). And it must not re-light the re-stated,
+    // unchanged heading. This is the canonical "move task into In progress"
+    // orchestration step.
+    #[tokio::test]
+    async fn program_edit_keep_pending_lights_inserted_item_not_anchor_heading() {
+        let md = "# Todo\n\n* ship X\n\n# In progress\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let g = mgr.program_get(&id).await.expect("get");
+        let id_of = |n: &str| g.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone();
+        // Planning pass: settle headings, keep the todo task pending.
+        mgr.program_edit(ProgramEditParams {
+            session_id: id.clone(),
+            edits: vec![agentd_protocol::ProgramEdit {
+                old_string: "# Todo".into(),
+                new_string: "# Todo".into(),
+                replace_all: false,
+                keep_pending: false,
+            }],
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            note: None,
+            shimmer: vec![
+                agentd_protocol::ProgramShimmerDecl { id: id_of("# Todo"), shimmer: false },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("# In progress"), shimmer: false },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("ship X"), shimmer: true },
+            ],
+        })
+        .await
+        .expect("planning");
+        // Remove from Todo, then insert under the In progress heading via a
+        // heading-anchored edit whose new_string spans heading + new item.
+        mgr.program_edit(ProgramEditParams {
+            session_id: id.clone(),
+            edits: vec![agentd_protocol::ProgramEdit {
+                old_string: "* ship X\n".into(),
+                new_string: "".into(),
+                replace_all: false,
+                keep_pending: false,
+            }],
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            note: None,
+            shimmer: vec![],
+        })
+        .await
+        .expect("remove from todo");
+        let res = mgr
+            .program_edit(ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: "# In progress\n".into(),
+                    new_string: "# In progress\n\n* ship X — @{session:s9}\n".into(),
+                    replace_all: false,
+                    keep_pending: true,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                note: None,
+                shimmer: vec![],
+            })
+            .await
+            .expect("insert under heading");
+        let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
+        assert!(
+            shim("ship X — @{session:s9}"),
+            "keep_pending lights the inserted item even though it isn't new_string's first block"
+        );
+        assert!(
+            !shim("# In progress"),
+            "the re-stated, unchanged heading is not re-lit"
+        );
     }
 
     // Finer block granularity: a section of consecutive list items (no blank
