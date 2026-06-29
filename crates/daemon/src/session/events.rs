@@ -329,7 +329,7 @@ impl SessionManager {
             let s = entry.summary.read().await;
             s.state
         };
-        self.mark_program_run_output_seen(&entry.id);
+        self.note_session_state_for_program_run(&entry.id, new_state);
 
         if session_event_is_program_output(&event) {
             self.mark_program_run_output_seen(&entry.id);
