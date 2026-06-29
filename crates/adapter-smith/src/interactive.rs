@@ -3890,78 +3890,27 @@ async fn run_one_tool(
     hooks: &crate::hooks::Hooks,
     base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
-    let mut call = call.clone();
-    let tool = match registry.get(&call.name) {
-        Some(t) => t,
-        None => {
-            // Items model synthesizes the block from these events.
-            emit.emit(SessionEvent::ToolUse {
-                tool: call.name.clone(),
-                args: call.input.clone(),
-                call_id: Some(call.id.clone()),
-            });
-            emit.emit(SessionEvent::ToolResult {
-                tool: call.name.clone(),
-                ok: false,
-                output: format!("unknown tool: {}", call.name),
-                call_id: Some(call.id.clone()),
-            });
-            return Ok(ToolOutcome {
-                ok: false,
-                output: format!("unknown tool: {}", call.name),
-            });
-        }
-    };
+    let prepared = crate::tools::execution::prepare_tool_call(
+        call,
+        registry.as_ref(),
+        tool_ctx,
+        emit,
+        hooks,
+        base_hook_payload,
+    )
+    .await?;
+    let mut call = prepared.call;
+    let args_summary = prepared.args_summary;
 
-    let mutation = hooks
-        .mutate(
-            "pre_tool_use_mutate",
-            &tool_ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "args": call.input,
-                    "args_summary": tool.args_summary(&call.input),
-                    "risk": tool.risk(),
-                }),
-            ),
-        )
-        .await;
-    if let Some(args) = mutation.get("args") {
-        call.input = args.clone();
-    }
-    let args_summary = tool.args_summary(&call.input);
+    let tool = registry
+        .get(&call.name)
+        .expect("tool exists after execute_tool_call preflight");
     // No inline PTY writes for the tool's header/body/result —
     // the items-model renderer synthesizes the whole block from
     // the structured events emitted below. Leaving the PTY
     // stream as pure chat content means the user's live prompt
     // + typing remain visible during the tool's wait (the
     // previous fence implementation stripped them).
-    emit.emit(SessionEvent::ToolUse {
-        tool: call.name.clone(),
-        args: call.input.clone(),
-        call_id: Some(call.id.clone()),
-    });
-    hooks
-        .run(
-            "pre_tool_use",
-            &tool_ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "args": call.input,
-                    "args_summary": args_summary,
-                    "risk": tool.risk(),
-                }),
-            ),
-        )
-        .await;
     // Task-lifecycle event for the daemon's per-session task
     // registry — surfaces in `/tasks` + MCP `agentd_get_tasks`.
     emit.emit(SessionEvent::TaskStart {
@@ -4153,60 +4102,24 @@ async fn run_one_tool(
             })
         }
     };
-    match &outcome {
-        Ok(o) => {
-            emit.emit(SessionEvent::ToolResult {
-                tool: call.name.clone(),
-                ok: o.ok,
-                output: o.output.clone(),
-                call_id: Some(call.id.clone()),
-            });
-            // Foreground-completed (non-bg) paths fire TaskEnd
-            // here; the backgrounded path fires it later when the
-            // BackgroundCompletion arrives via the agent loop.
-            if o.output != crate::tasks::BG_PLACEHOLDER_OUTPUT {
-                let preview: String = o.output.chars().take(200).collect();
-                emit.emit(SessionEvent::TaskEnd {
-                    call_id: call.id.clone(),
-                    ok: o.ok,
-                    output_preview: preview,
-                });
-            }
-        }
-        Err(reason) => {
-            emit.emit(SessionEvent::ToolResult {
-                tool: call.name.clone(),
-                ok: false,
-                output: format!("({reason})"),
-                call_id: Some(call.id.clone()),
-            });
-            emit.emit(SessionEvent::TaskEnd {
-                call_id: call.id.clone(),
-                ok: false,
-                output_preview: format!("({reason})"),
-            });
-        }
-    }
-    let (ok, output) = match &outcome {
-        Ok(o) => (o.ok, o.output.clone()),
-        Err(reason) => (false, format!("({reason})")),
-    };
-    hooks
-        .run(
-            "post_tool_use",
-            &tool_ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "ok": ok,
-                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
-                }),
-            ),
-        )
-        .await;
+    let (_ok, _output) = crate::tools::execution::emit_tool_result_events(
+        &call.id,
+        &call.name,
+        emit,
+        &outcome,
+        true,
+        Some(crate::tasks::BG_PLACEHOLDER_OUTPUT),
+    )
+    .await;
+    crate::tools::execution::emit_post_tool_use(
+        &call,
+        tool_ctx,
+        emit,
+        hooks,
+        base_hook_payload,
+        &outcome,
+    )
+    .await;
     outcome
 }
 
@@ -4365,63 +4278,29 @@ async fn run_safe_call_silent(
         tool: call.name.clone(),
         args_summary: args_summary_for_event.clone(),
     });
+    let tool = registry.get(&call.name).expect("tool exists after preflight");
     let outcome = tool
         .run(call.input.clone(), ctx)
         .await
         .map_err(|e| format!("tool error: {e}"));
-    match &outcome {
-        Ok(o) => {
-            emit.emit(SessionEvent::ToolResult {
-                tool: call.name.clone(),
-                ok: o.ok,
-                output: o.output.clone(),
-                call_id: Some(call.id.clone()),
-            });
-            // The supervisor may auto-bg this call later — only fire
-            // TaskEnd for genuinely-foreground completions. The
-            // outer agent loop handles TaskEnd for the bg path via
-            // BackgroundCompletion.
-            let preview: String = o.output.chars().take(200).collect();
-            emit.emit(SessionEvent::TaskEnd {
-                call_id: call.id.clone(),
-                ok: o.ok,
-                output_preview: preview,
-            });
-        }
-        Err(reason) => {
-            emit.emit(SessionEvent::ToolResult {
-                tool: call.name.clone(),
-                ok: false,
-                output: format!("({reason})"),
-                call_id: Some(call.id.clone()),
-            });
-            emit.emit(SessionEvent::TaskEnd {
-                call_id: call.id.clone(),
-                ok: false,
-                output_preview: format!("({reason})"),
-            });
-        }
-    }
-    let (ok, output) = match &outcome {
-        Ok(o) => (o.ok, o.output.clone()),
-        Err(reason) => (false, format!("({reason})")),
-    };
-    hooks
-        .run(
-            "post_tool_use",
-            &ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "ok": ok,
-                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
-                }),
-            ),
-        )
-        .await;
+    let (_ok, _output) = crate::tools::execution::emit_tool_result_events(
+        &call.id,
+        &call.name,
+        emit,
+        &outcome,
+        true,
+        None,
+    )
+    .await;
+    crate::tools::execution::emit_post_tool_use(
+        &call,
+        ctx,
+        emit,
+        hooks,
+        base_hook_payload,
+        &outcome,
+    )
+    .await;
     outcome
 }
 

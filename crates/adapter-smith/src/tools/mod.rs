@@ -16,6 +16,7 @@ pub mod fs;
 pub mod proc;
 pub mod shell;
 pub mod subagent;
+pub mod execution;
 
 /// Per-tool result. `output` is the full tool output as the user should
 /// see it in the transcript; the agent loop separately calls

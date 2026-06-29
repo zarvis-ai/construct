@@ -1189,71 +1189,21 @@ async fn run_one_tool(
     hooks: &crate::hooks::Hooks,
     base_hook_payload: &serde_json::Value,
 ) -> std::result::Result<ToolOutcome, String> {
-    let mut call = call.clone();
-    let tool = match registry.get(&call.name) {
-        Some(t) => t,
-        None => {
-            emit.emit(SessionEvent::ToolUse {
-                tool: call.name.clone(),
-                args: call.input.clone(),
-                call_id: Some(call.id.clone()),
-            });
-            emit.emit(SessionEvent::ToolResult {
-                tool: call.name.clone(),
-                ok: false,
-                output: format!("unknown tool: {}", call.name),
-                call_id: Some(call.id.clone()),
-            });
-            return Ok(ToolOutcome {
-                ok: false,
-                output: format!("unknown tool: {}", call.name),
-            });
-        }
-    };
+    let prepared = crate::tools::execution::prepare_tool_call(
+        call,
+        registry,
+        tool_ctx,
+        emit,
+        hooks,
+        base_hook_payload,
+    )
+    .await?;
+    let mut call = prepared.call;
+    let args_summary = prepared.args_summary;
 
-    let mutation = hooks
-        .mutate(
-            "pre_tool_use_mutate",
-            &tool_ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "args": call.input,
-                    "args_summary": tool.args_summary(&call.input),
-                    "risk": tool.risk(),
-                }),
-            ),
-        )
-        .await;
-    if let Some(args) = mutation.get("args") {
-        call.input = args.clone();
-    }
-    let args_summary = tool.args_summary(&call.input);
-    emit.emit(SessionEvent::ToolUse {
-        tool: call.name.clone(),
-        args: call.input.clone(),
-        call_id: Some(call.id.clone()),
-    });
-    hooks
-        .run(
-            "pre_tool_use",
-            &tool_ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "args": call.input,
-                    "args_summary": args_summary,
-                    "risk": tool.risk(),
-                }),
-            ),
-        )
-        .await;
+    let tool = registry
+        .get(&call.name)
+        .expect("tool exists after execute_tool_call preflight");
 
     let is_risky = matches!(
         crate::tools::effective_risk(tool, &call.input, &tool_ctx.cwd),
@@ -1455,40 +1405,24 @@ async fn run_one_tool(
         tool_ctx
     };
     let outcome = run_with_interrupt(tool, call.input.clone(), run_ctx, inbox).await;
-    match &outcome {
-        Ok(o) => emit.emit(SessionEvent::ToolResult {
-            tool: call.name.clone(),
-            ok: o.ok,
-            output: o.output.clone(),
-            call_id: Some(call.id.clone()),
-        }),
-        Err(reason) => emit.emit(SessionEvent::ToolResult {
-            tool: call.name.clone(),
-            ok: false,
-            output: format!("({reason})"),
-            call_id: Some(call.id.clone()),
-        }),
-    }
-    let (ok, output) = match &outcome {
-        Ok(o) => (o.ok, o.output.clone()),
-        Err(reason) => (false, format!("({reason})")),
-    };
-    hooks
-        .run(
-            "post_tool_use",
-            &tool_ctx.cwd,
-            emit,
-            crate::hooks::merge_payload(
-                base_hook_payload.clone(),
-                json!({
-                    "call_id": call.id,
-                    "tool": call.name,
-                    "ok": ok,
-                    "output": truncate_for_model(&output, TOOL_OUTPUT_BUDGET),
-                }),
-            ),
-        )
-        .await;
+    crate::tools::execution::emit_tool_result_events(
+        &call.id,
+        &call.name,
+        emit,
+        &outcome,
+        false,
+        None,
+    )
+    .await;
+    crate::tools::execution::emit_post_tool_use(
+        &call,
+        tool_ctx,
+        emit,
+        hooks,
+        base_hook_payload,
+        &outcome,
+    )
+    .await;
     outcome
 }
 
