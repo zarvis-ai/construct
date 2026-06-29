@@ -6074,6 +6074,8 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   focus + view
     C-x o           other window (list → windows → list)
+    C-2 .. C-5      focus split window 1..4 directly (C-2 = first window)
+    Shift+arrow     focus the adjacent split window (in a split layout)
     RET (on list)   focus the selected session's view
     C-x 2 / C-x 3   split current main window below / right
     C-x 0 / C-x 1   delete current window / delete other windows
@@ -6106,8 +6108,10 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
   reorder list
     C-x C-p         move selected session up   (Meta-free, works everywhere)
     C-x C-n         move selected session down
-    Shift-up/down   same, in terminals that pass Shift to arrows
-                    (iTerm2/WezTerm/Alacritty yes; macOS Terminal.app no)
+    Shift-up/down   same, when the list is focused, in terminals that pass
+                    Shift to arrows (iTerm2/WezTerm/Alacritty yes; macOS
+                    Terminal.app no). In a focused split, Shift+arrow moves
+                    focus between panes instead (see focus + view).
 
   mouse
     drag text       select visible TUI text and copy to terminal clipboard

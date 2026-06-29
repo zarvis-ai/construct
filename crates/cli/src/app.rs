@@ -256,6 +256,16 @@ pub enum PaneFocus {
     View,
 }
 
+/// A spatial direction for moving keyboard focus between split panes
+/// (emacs `windmove`). Used by the `Shift+Arrow` bindings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusDir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowSplitDirection {
     Below,
@@ -4150,6 +4160,79 @@ impl App {
         out
     }
 
+    /// Focus the Nth pane (0-based) in the same `[list, …split windows]`
+    /// ordering that `C-x o` cycles through: index 0 is the session list,
+    /// index `k >= 1` is the `(k - 1)`th split window. Returns `false`
+    /// (a no-op) when the requested pane doesn't exist — e.g. `C-5` with
+    /// only two split windows open. Bound to `C-2`..`C-5` (so `C-2`
+    /// focuses the first split window).
+    fn focus_pane_by_index(&mut self, index: usize) -> bool {
+        if index == 0 {
+            // Pane 1 is the session list.
+            self.collapse_orchestrator_panel_on_focus_change();
+            if matches!(self.zoom, ZoomMode::View) {
+                self.zoom = ZoomMode::List;
+            }
+            self.focus = PaneFocus::List;
+            self.set_status("focus: list".into());
+            return true;
+        }
+        let ids = self.leaf_window_ids();
+        let Some(id) = ids.get(index - 1).copied() else {
+            return false;
+        };
+        self.collapse_orchestrator_panel_on_focus_change();
+        // Asking for a window implies the view side should be visible.
+        if matches!(self.zoom, ZoomMode::List) {
+            self.zoom = ZoomMode::View;
+        }
+        self.focus_main_window(id);
+        self.set_status(format!("focus: window {id}"));
+        true
+    }
+
+    /// Find the split window spatially adjacent to the active window in the
+    /// given direction, using last-frame pane geometry. Returns the target
+    /// window id, or `None` when there's no neighbor that way (emacs
+    /// `windmove` semantics). Only considers panes whose perpendicular span
+    /// overlaps the active pane, and picks the closest one in the travel
+    /// direction.
+    fn adjacent_window_id(&self, dir: FocusDir) -> Option<u64> {
+        let panes = &self.layout.main_window_areas;
+        let cur = panes.iter().find(|p| p.id == self.active_window_id)?.area;
+        let mut best: Option<(u64, u16)> = None;
+        for p in panes {
+            if p.id == self.active_window_id {
+                continue;
+            }
+            let a = p.area;
+            let v_overlap = a.top() < cur.bottom() && a.bottom() > cur.top();
+            let h_overlap = a.left() < cur.right() && a.right() > cur.left();
+            let (in_dir, dist) = match dir {
+                FocusDir::Left => (v_overlap && a.x < cur.x, cur.x.saturating_sub(a.x)),
+                FocusDir::Right => (v_overlap && a.x > cur.x, a.x.saturating_sub(cur.x)),
+                FocusDir::Up => (h_overlap && a.y < cur.y, cur.y.saturating_sub(a.y)),
+                FocusDir::Down => (h_overlap && a.y > cur.y, a.y.saturating_sub(cur.y)),
+            };
+            if in_dir && best.is_none_or(|(_, d)| dist < d) {
+                best = Some((p.id, dist));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
+    /// Move keyboard focus to the split window adjacent to the active one in
+    /// `dir`. Returns `false` (a no-op) when there's no neighbor that way.
+    fn focus_adjacent_window(&mut self, dir: FocusDir) -> bool {
+        let Some(id) = self.adjacent_window_id(dir) else {
+            return false;
+        };
+        self.collapse_orchestrator_panel_on_focus_change();
+        self.focus_main_window(id);
+        self.set_status(format!("focus: window {id}"));
+        true
+    }
+
     fn focus_main_window(&mut self, id: u64) {
         if let Some(selection) = self.selection_for_window(id) {
             let changed_selection = self.selection != selection;
@@ -6271,6 +6354,52 @@ impl App {
         if self.should_autofocus_view_from_list(key) {
             self.collapse_orchestrator_panel_on_focus_change();
             self.focus = PaneFocus::View;
+        }
+
+        // Emacs-style fast split-pane focus. Handled here — ahead of both the
+        // PTY-capture forwarding and the chord dispatch below — so these keys
+        // escape a focused child's PTY the same way `C-x o` does (it's a `C-x`
+        // chord; these aren't, so they need an explicit intercept like the
+        // PageUp/PageDown scrollback keys further down). Only fired when no
+        // chord is in flight and the action actually has a target pane;
+        // otherwise we fall through and the key keeps its normal meaning
+        // (PTY input / list reorder / unbound).
+        if self.chord_state.is_empty() {
+            // `C-2`..`C-5` focus a pane directly (pane 1 = list, pane 2 = the
+            // first split window, …). Terminals that don't deliver Ctrl+digit
+            // (some legacy ones fold it onto Ctrl+@) simply never reach here.
+            if key.modifiers == KeyModifiers::CONTROL {
+                if let KeyCode::Char(c @ '2'..='5') = key.code {
+                    let pane_index = c as usize - '1' as usize; // '2' -> 1 … '5' -> 4
+                    if self.focus_pane_by_index(pane_index) {
+                        self.chord_label.clear();
+                        return;
+                    }
+                }
+            }
+            // `Shift+Arrow` moves focus to the spatially adjacent split window.
+            // Scoped to an unzoomed, view-focused split layout so it only
+            // shadows the child's / list's own Shift+Arrow when there's a real
+            // multi-pane layout to navigate; a no-neighbor press is a no-op
+            // (consumed) per the binding's contract.
+            if key.modifiers == KeyModifiers::SHIFT
+                && self.focus == PaneFocus::View
+                && matches!(self.zoom, ZoomMode::None)
+                && self.is_split_layout()
+            {
+                let dir = match key.code {
+                    KeyCode::Up => Some(FocusDir::Up),
+                    KeyCode::Down => Some(FocusDir::Down),
+                    KeyCode::Left => Some(FocusDir::Left),
+                    KeyCode::Right => Some(FocusDir::Right),
+                    _ => None,
+                };
+                if let Some(dir) = dir {
+                    self.focus_adjacent_window(dir);
+                    self.chord_label.clear();
+                    return;
+                }
+            }
         }
 
         // When the PTY is capturing keystrokes (View focus + terminal mode +
@@ -13156,6 +13285,130 @@ mod tests {
             app.session_transitions.is_empty(),
             "window focus changes must not glitch"
         );
+        server.abort();
+    }
+
+    /// A 3-leaf window tree: `[1, 2, 3]` in `leaf_window_ids` order.
+    fn three_window_tree() -> MainWindowTree {
+        MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Right,
+                ratio_percent: 50,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 2,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 3,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn c_digit_focuses_pane_by_index() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = three_window_tree();
+        app.focus = PaneFocus::List;
+
+        // C-2 -> first split window, C-3 -> second, C-4 -> third.
+        assert!(app.focus_pane_by_index(1));
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.active_window_id, 1);
+
+        assert!(app.focus_pane_by_index(2));
+        assert_eq!(app.active_window_id, 2);
+
+        assert!(app.focus_pane_by_index(3));
+        assert_eq!(app.active_window_id, 3);
+
+        // C-5 with only three windows is a no-op — focus stays put.
+        assert!(!app.focus_pane_by_index(4));
+        assert_eq!(app.active_window_id, 3);
+        assert_eq!(app.focus, PaneFocus::View);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn focus_pane_index_zero_is_the_list() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = three_window_tree();
+        app.focus = PaneFocus::View;
+        app.active_window_id = 2;
+
+        // Pane 1 (index 0) is the session list.
+        assert!(app.focus_pane_by_index(0));
+        assert_eq!(app.focus, PaneFocus::List);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shift_arrow_focuses_spatially_adjacent_window() {
+        let (mut app, _dir, server) = captured_app().await;
+        // A 2x2 grid of panes:
+        //   w1 (top-left)    w2 (top-right)
+        //   w3 (bottom-left) w4 (bottom-right)
+        app.layout.main_window_areas = vec![
+            WindowPaneHit {
+                id: 1,
+                area: Rect::new(0, 0, 40, 10),
+                inner_area: Rect::new(1, 1, 38, 8),
+            },
+            WindowPaneHit {
+                id: 2,
+                area: Rect::new(40, 0, 40, 10),
+                inner_area: Rect::new(41, 1, 38, 8),
+            },
+            WindowPaneHit {
+                id: 3,
+                area: Rect::new(0, 10, 40, 10),
+                inner_area: Rect::new(1, 11, 38, 8),
+            },
+            WindowPaneHit {
+                id: 4,
+                area: Rect::new(40, 10, 40, 10),
+                inner_area: Rect::new(41, 11, 38, 8),
+            },
+        ];
+
+        // From the top-left pane: right -> w2, down -> w3, no up/left neighbor.
+        app.active_window_id = 1;
+        assert_eq!(app.adjacent_window_id(FocusDir::Right), Some(2));
+        assert_eq!(app.adjacent_window_id(FocusDir::Down), Some(3));
+        assert_eq!(app.adjacent_window_id(FocusDir::Up), None);
+        assert_eq!(app.adjacent_window_id(FocusDir::Left), None);
+
+        // From the bottom-right pane: left -> w3, up -> w2.
+        app.active_window_id = 4;
+        assert_eq!(app.adjacent_window_id(FocusDir::Left), Some(3));
+        assert_eq!(app.adjacent_window_id(FocusDir::Up), Some(2));
+
+        // The mutating wrapper actually moves focus, and reports no-op moves.
+        app.active_window_id = 1;
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        assert!(app.focus_adjacent_window(FocusDir::Right));
+        assert_eq!(app.active_window_id, 2);
+        assert_eq!(app.focus, PaneFocus::View);
+        assert!(!app.focus_adjacent_window(FocusDir::Right));
+        assert_eq!(app.active_window_id, 2);
         server.abort();
     }
 
