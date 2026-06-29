@@ -1026,513 +1026,477 @@ async fn dispatch(
     conn_id: u64,
     req: Request,
 ) -> Response {
-    let id = req.id.clone();
     macro_rules! ok {
-        ($v:expr) => {
+        ($request:expr, $v:expr) => {{
             match serde_json::to_value($v) {
-                Ok(v) => Response::ok(id.clone(), v),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        };
-    }
-    macro_rules! params {
-        ($t:ty) => {{
-            match parse_params::<$t>(req.params.clone()) {
-                Ok(p) => p,
-                Err(e) => return Response::err(id.clone(), e),
+                Ok(v) => Response::ok($request.id.clone(), v),
+                Err(e) => {
+                    Response::err($request.id.clone(), ErrorObject::internal(e.to_string()))
+                }
             }
         }};
     }
-    match req.method.as_str() {
-        m if m == ipc_method::PING => ok!(&PingResult {
+    macro_rules! params {
+        ($request:expr, $t:ty) => {{
+            match parse_params::<$t>($request.params.clone()) {
+                Ok(p) => p,
+                Err(e) => return Response::err($request.id.clone(), e),
+            }
+        }};
+    }
+    macro_rules! dispatch_entry {
+        ($method:expr, $body:block) => {
+            if req.method == $method {
+                return { $body };
+            }
+        };
+    }
+
+    dispatch_entry!(ipc_method::PING, {
+        ok!(req, &PingResult {
             pong: true,
             version: IPC_VERSION.to_string(),
-        }),
-        m if m == ipc_method::HARNESS_LIST => ok!(&manager.harnesses()),
-        m if m == ipc_method::PROGRAM_GET => {
-            let p = params!(ProgramGetParams);
-            match manager.program_get(&p.session_id).await {
-                Ok(result) => ok!(&result),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::PROGRAM_UPDATE => {
-            let p = params!(ProgramUpdateParams);
-            match manager.program_update(p).await {
-                Ok(result) => ok!(&result),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::PROGRAM_EDIT => {
-            let p = params!(ProgramEditParams);
-            match manager.program_edit(p).await {
-                Ok(result) => ok!(&result),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::PROGRAM_EXECUTE => {
-            let p = params!(ProgramExecuteParams);
-            match manager.program_execute(p).await {
-                Ok(result) => ok!(&result),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::PROGRAM_LIST_TEMPLATES => match manager.program_templates() {
-            Ok(result) => ok!(&result),
-            Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-        },
-        m if m == ipc_method::SESSION_LIST => ok!(&manager.list().await),
-        m if m == ipc_method::SESSION_CREATE => {
-            let p = params!(CreateSessionParams);
-            match manager.create(p).await {
-                Ok(sid) => Response::ok(id.clone(), json!({ "session_id": sid })),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::SESSION_GET => {
-            let p = params!(SessionIdParams);
-            match manager.detail(&p.session_id).await {
-                Ok(d) => ok!(&d),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::SESSION_SET_VIEW => {
-            let p = params!(SessionSetViewParams);
-            manager.set_conn_view(conn_id, p.session_id, p.view);
-            Response::ok(id.clone(), serde_json::Value::Null)
-        }
-        m if m == ipc_method::SESSION_CHAT_VIEWER_ACTIVE => {
-            let p = params!(SessionIdParams);
-            ok!(&ChatViewerActiveResult {
-                active: manager.chat_viewer_active(&p.session_id),
             })
+    });
+    dispatch_entry!(ipc_method::HARNESS_LIST, {
+        ok!(req, &manager.harnesses())
+    });
+    dispatch_entry!(ipc_method::PROGRAM_GET, {
+        let p = params!(req, ProgramGetParams);
+        match manager.program_get(&p.session_id).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_INPUT => {
-            let p = params!(SessionInputParams);
-            match manager.send_input(&p.session_id, p.text).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+    });
+    dispatch_entry!(ipc_method::PROGRAM_UPDATE, {
+        let p = params!(req, ProgramUpdateParams);
+        match manager.program_update(p).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::PROGRAM_EDIT, {
+        let p = params!(req, ProgramEditParams);
+        match manager.program_edit(p).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::PROGRAM_EXECUTE, {
+        let p = params!(req, ProgramExecuteParams);
+        match manager.program_execute(p).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::PROGRAM_LIST_TEMPLATES, {
+        match manager.program_templates() {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::SESSION_LIST, {
+        ok!(req, &manager.list().await)
+    });
+    dispatch_entry!(ipc_method::SESSION_CREATE, {
+        let p = params!(req, CreateSessionParams);
+        match manager.create(p).await {
+            Ok(sid) => Response::ok(req.id.clone(), json!({ "session_id": sid })),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::SESSION_GET, {
+        let p = params!(req, SessionIdParams);
+        match manager.detail(&p.session_id).await {
+            Ok(d) => ok!(req, &d),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::SESSION_SET_VIEW, {
+        let p = params!(req, SessionSetViewParams);
+        manager.set_conn_view(conn_id, p.session_id, p.view);
+        Response::ok(req.id.clone(), serde_json::Value::Null)
+    });
+    dispatch_entry!(ipc_method::SESSION_CHAT_VIEWER_ACTIVE, {
+        let p = params!(req, SessionIdParams);
+        ok!(req, &ChatViewerActiveResult {
+            active: manager.chat_viewer_active(&p.session_id),
+        })
+    });
+    dispatch_entry!(ipc_method::SESSION_INPUT, {
+        let p = params!(req, SessionInputParams);
+        match manager.send_input(&p.session_id, p.text).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::SESSION_ATTACH_CLIPBOARD, {
+        let p = params!(req, SessionAttachClipboardParams);
+        match manager.attach_clipboard(p).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::SESSION_PTY_INPUT, {
+        let p = params!(req, SessionPtyInputParams);
+        let bytes = match p.decode() {
+            Ok(b) => b,
+            Err(e) => {
+                return Response::err(req.id.clone(), ErrorObject::invalid_params(e.to_string()));
             }
+        };
+        manager.note_pty_activity(&p.session_id, kind, None).await;
+        match manager.pty_input(&p.session_id, bytes).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_ATTACH_CLIPBOARD => {
-            let p = params!(SessionAttachClipboardParams);
-            match manager.attach_clipboard(p).await {
-                Ok(result) => ok!(&result),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_PTY_RESIZE, {
+        let p = params!(req, SessionPtyResizeParams);
+        manager
+            .note_pty_activity(&p.session_id, kind, Some((p.cols, p.rows)))
+            .await;
+        match manager.pty_resize(&p.session_id, p.cols, p.rows).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_PTY_INPUT => {
-            let p = params!(SessionPtyInputParams);
-            let bytes = match p.decode() {
-                Ok(b) => b,
-                Err(e) => {
-                    return Response::err(id.clone(), ErrorObject::invalid_params(e.to_string()));
-                }
-            };
-            // Mark this client kind as the active one for the
-            // session and re-resize the PTY to its last-known
-            // viewport. The OS PTY only has one size; "active
-            // wins" lets users alternate between TUI and phone
-            // without losing their preferred geometry.
-            manager.note_pty_activity(&p.session_id, kind, None).await;
-            match manager.pty_input(&p.session_id, bytes).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_PTY_REPLAY, {
+        let p = params!(req, PtyReplayParams);
+        match manager
+            .pty_replay_range(&p.session_id, p.max_bytes, p.before_offset)
+            .await
+        {
+            Ok(r) => ok!(req, &r),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_PTY_RESIZE => {
-            let p = params!(SessionPtyResizeParams);
-            // Resize is an explicit "I want this viewport"
-            // signal — store it for this client kind, mark
-            // active, and apply.
-            manager
-                .note_pty_activity(&p.session_id, kind, Some((p.cols, p.rows)))
-                .await;
-            match manager.pty_resize(&p.session_id, p.cols, p.rows).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_INTERRUPT, {
+        let p = params!(req, SessionIdParams);
+        match manager.interrupt(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_PTY_REPLAY => {
-            let p = params!(PtyReplayParams);
-            match manager
-                .pty_replay_range(&p.session_id, p.max_bytes, p.before_offset)
-                .await
-            {
-                Ok(r) => ok!(&r),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_STOP, {
+        let p = params!(req, SessionIdParams);
+        match manager.stop(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_INTERRUPT => {
-            let p = params!(SessionIdParams);
-            match manager.interrupt(&p.session_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_KILL, {
+        let p = params!(req, SessionIdParams);
+        match manager.kill(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_STOP => {
-            let p = params!(SessionIdParams);
-            match manager.stop(&p.session_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_DELETE, {
+        let p = params!(req, SessionIdParams);
+        match manager.delete(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_KILL => {
-            let p = params!(SessionIdParams);
-            match manager.kill(&p.session_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_ARCHIVE, {
+        let p = params!(req, SessionIdParams);
+        match manager.archive(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_DELETE => {
-            let p = params!(SessionIdParams);
-            match manager.delete(&p.session_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_WIDGET_DELETE, {
+        let p = params!(req, agentd_protocol::SessionWidgetDeleteParams);
+        match manager.delete_widget(p).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_ARCHIVE => {
-            let p = params!(SessionIdParams);
-            match manager.archive(&p.session_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_RESTART, {
+        let p = params!(req, SessionIdParams);
+        match manager.clone().restart(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_WIDGET_DELETE => {
-            let p = params!(agentd_protocol::SessionWidgetDeleteParams);
-            match manager.delete_widget(p).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_SET_PINNED, {
+        let p = params!(req, SessionSetPinnedParams);
+        match manager.set_pinned(&p.session_id, p.pinned).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_RESTART => {
-            let p = params!(SessionIdParams);
-            match manager.clone().restart(&p.session_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_SET_TITLE, {
+        let p = params!(req, SessionSetTitleParams);
+        match manager.set_title(&p.session_id, p.title).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_SET_PINNED => {
-            let p = params!(SessionSetPinnedParams);
-            match manager.set_pinned(&p.session_id, p.pinned).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_SET_APPROVAL_MODE, {
+        let p = params!(req, SessionSetApprovalModeParams);
+        match manager.set_approval_mode(&p.session_id, p.mode).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_SET_TITLE => {
-            let p = params!(SessionSetTitleParams);
-            match manager.set_title(&p.session_id, p.title).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_TOOL_DECISION, {
+        let p = params!(req, SessionToolDecisionParams);
+        match manager
+            .tool_decision(&p.session_id, p.call_id, p.decision)
+            .await
+        {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_SET_APPROVAL_MODE => {
-            let p = params!(SessionSetApprovalModeParams);
-            match manager.set_approval_mode(&p.session_id, p.mode).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_TOOL_ACTION, {
+        let p = params!(req, SessionToolActionParams);
+        match manager.tool_action(&p.session_id, p.call_id, p.action).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_TOOL_DECISION => {
-            let p = params!(SessionToolDecisionParams);
-            match manager
-                .tool_decision(&p.session_id, p.call_id, p.decision)
-                .await
-            {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::SESSION_TOOL_ACTION => {
-            let p = params!(SessionToolActionParams);
-            match manager
-                .tool_action(&p.session_id, p.call_id, p.action)
-                .await
-            {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::SESSION_LIST_TASKS => {
-            let p = params!(agentd_protocol::ListTasksParams);
-            match manager.list_tasks(&p.session_id).await {
-                Ok(tasks) => Response::ok(
-                    id.clone(),
-                    serde_json::to_value(agentd_protocol::ListTasksResult { tasks })
-                        .unwrap_or(serde_json::Value::Null),
-                ),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::SESSION_EMIT_EVENT => {
-            let p = params!(agentd_protocol::SessionEmitEventParams);
-            match manager.emit_session_event(p).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::LOOP_CREATE => {
-            let p = params!(agentd_protocol::LoopCreateParams);
-            match manager.loop_create(p).await {
-                Ok(l) => Response::ok(
-                    id.clone(),
-                    serde_json::to_value(&l).unwrap_or(serde_json::Value::Null),
-                ),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::LOOP_LIST => {
-            let p = params!(agentd_protocol::LoopListParams);
-            let loops = manager.loop_list(p.session_id.as_deref()).await;
-            Response::ok(
-                id.clone(),
-                serde_json::to_value(agentd_protocol::LoopListResult { loops })
+    });
+    dispatch_entry!(ipc_method::SESSION_LIST_TASKS, {
+        let p = params!(req, agentd_protocol::ListTasksParams);
+        match manager.list_tasks(&p.session_id).await {
+            Ok(tasks) => Response::ok(
+                req.id.clone(),
+                serde_json::to_value(agentd_protocol::ListTasksResult { tasks })
                     .unwrap_or(serde_json::Value::Null),
-            )
+            ),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::LOOP_UPDATE => {
-            let p = params!(agentd_protocol::LoopUpdateParams);
-            match manager.loop_update(p).await {
-                Ok(l) => Response::ok(
-                    id.clone(),
-                    serde_json::to_value(&l).unwrap_or(serde_json::Value::Null),
-                ),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_EMIT_EVENT, {
+        let p = params!(req, agentd_protocol::SessionEmitEventParams);
+        match manager.emit_session_event(p).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::LOOP_REMOVE => {
-            let p = params!(agentd_protocol::LoopRemoveParams);
-            match manager.loop_remove(&p.loop_id).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::LOOP_CREATE, {
+        let p = params!(req, agentd_protocol::LoopCreateParams);
+        match manager.loop_create(p).await {
+            Ok(l) => Response::ok(
+                req.id.clone(),
+                serde_json::to_value(&l).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_MOVE => {
-            let p = params!(SessionMoveParams);
-            match manager.move_session(&p.session_id, p.direction).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::LOOP_LIST, {
+        let p = params!(req, agentd_protocol::LoopListParams);
+        let loops = manager.loop_list(p.session_id.as_deref()).await;
+        Response::ok(
+            req.id.clone(),
+            serde_json::to_value(agentd_protocol::LoopListResult { loops })
+                .unwrap_or(serde_json::Value::Null),
+        )
+    });
+    dispatch_entry!(ipc_method::LOOP_UPDATE, {
+        let p = params!(req, agentd_protocol::LoopUpdateParams);
+        match manager.loop_update(p).await {
+            Ok(l) => Response::ok(
+                req.id.clone(),
+                serde_json::to_value(&l).unwrap_or(serde_json::Value::Null),
+            ),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_SET_GROUP => {
-            let p = params!(SessionSetGroupParams);
-            match manager
-                .set_session_group(&p.session_id, p.group_id, p.position)
-                .await
-            {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::LOOP_REMOVE, {
+        let p = params!(req, agentd_protocol::LoopRemoveParams);
+        match manager.loop_remove(&p.loop_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_SET_PROJECT => {
-            let p = params!(SessionSetProjectParams);
-            match manager
-                .set_session_group(&p.session_id, p.project_id, p.position)
-                .await
-            {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_MOVE, {
+        let p = params!(req, SessionMoveParams);
+        match manager.move_session(&p.session_id, p.direction).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::GROUP_LIST => ok!(&manager.list_groups().await),
-        m if m == ipc_method::PROJECT_LIST => ok!(&manager.list_groups().await),
-        m if m == ipc_method::GROUP_CREATE => {
-            let p = params!(GroupCreateParams);
-            match manager.create_group(p.name).await {
-                Ok(gid) => ok!(&GroupCreateResult { group_id: gid }),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_SET_GROUP, {
+        let p = params!(req, SessionSetGroupParams);
+        match manager
+            .set_session_group(&p.session_id, p.group_id, p.position)
+            .await
+        {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::PROJECT_CREATE => {
-            let p = params!(ProjectCreateParams);
-            match manager.create_group(p.name).await {
-                Ok(gid) => ok!(&ProjectCreateResult { project_id: gid }),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SESSION_SET_PROJECT, {
+        let p = params!(req, SessionSetProjectParams);
+        match manager
+            .set_session_group(&p.session_id, p.project_id, p.position)
+            .await
+        {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::GROUP_RENAME => {
-            let p = params!(GroupRenameParams);
-            match manager.rename_group(&p.group_id, p.name).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::GROUP_LIST, {
+        ok!(req, &manager.list_groups().await)
+    });
+    dispatch_entry!(ipc_method::PROJECT_LIST, {
+        ok!(req, &manager.list_groups().await)
+    });
+    dispatch_entry!(ipc_method::GROUP_CREATE, {
+        let p = params!(req, GroupCreateParams);
+        match manager.create_group(p.name).await {
+            Ok(gid) => ok!(req, &GroupCreateResult { group_id: gid }),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::PROJECT_RENAME => {
-            let p = params!(ProjectRenameParams);
-            match manager.rename_group(&p.project_id, p.name).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::PROJECT_CREATE, {
+        let p = params!(req, ProjectCreateParams);
+        match manager.create_group(p.name).await {
+            Ok(gid) => ok!(req, &ProjectCreateResult { project_id: gid }),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::GROUP_DELETE => {
-            // Accept the new `GroupDeleteParams` shape (with optional
-            // `delete_members`); older clients sending the bare
-            // `{"group_id": "…"}` payload deserialize too because
-            // `delete_members` is `#[serde(default)]`.
-            let p = params!(GroupDeleteParams);
-            match manager.delete_group(&p.group_id, p.delete_members).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::GROUP_RENAME, {
+        let p = params!(req, GroupRenameParams);
+        match manager.rename_group(&p.group_id, p.name).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::PROJECT_DELETE => {
-            let p = params!(ProjectDeleteParams);
-            match manager.delete_group(&p.project_id, p.delete_members).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::PROJECT_RENAME, {
+        let p = params!(req, ProjectRenameParams);
+        match manager.rename_group(&p.project_id, p.name).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::GROUP_SET_COLLAPSED => {
-            let p = params!(GroupSetCollapsedParams);
-            match manager.set_group_collapsed(&p.group_id, p.collapsed).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::GROUP_DELETE, {
+        let p = params!(req, GroupDeleteParams);
+        match manager.delete_group(&p.group_id, p.delete_members).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::PROJECT_SET_COLLAPSED => {
-            let p = params!(ProjectSetCollapsedParams);
-            match manager
-                .set_group_collapsed(&p.project_id, p.collapsed)
-                .await
-            {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::PROJECT_DELETE, {
+        let p = params!(req, ProjectDeleteParams);
+        match manager.delete_group(&p.project_id, p.delete_members).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::GROUP_MOVE => {
-            let p = params!(GroupMoveParams);
-            match manager.move_group(&p.group_id, p.direction).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::GROUP_SET_COLLAPSED, {
+        let p = params!(req, GroupSetCollapsedParams);
+        match manager.set_group_collapsed(&p.group_id, p.collapsed).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::PROJECT_MOVE => {
-            let p = params!(ProjectMoveParams);
-            match manager.move_group(&p.project_id, p.direction).await {
-                Ok(()) => Response::ok(id.clone(), serde_json::Value::Null),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::PROJECT_SET_COLLAPSED, {
+        let p = params!(req, ProjectSetCollapsedParams);
+        match manager.set_group_collapsed(&p.project_id, p.collapsed).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_DIFF => {
-            let p = params!(SessionIdParams);
-            match manager.diff(&p.session_id).await {
-                Ok(patch) => Response::ok(id.clone(), json!({ "patch": patch })),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::GROUP_MOVE, {
+        let p = params!(req, GroupMoveParams);
+        match manager.move_group(&p.group_id, p.direction).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SESSION_TRANSCRIPT => {
-            let p = params!(TranscriptParams);
-            match manager
-                .transcript(&p.session_id, p.from, p.limit, p.tail)
-                .await
-            {
-                Ok(r) => ok!(&r),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::PROJECT_MOVE, {
+        let p = params!(req, ProjectMoveParams);
+        match manager.move_group(&p.project_id, p.direction).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::SUBSCRIBE_EVENTS => {
-            let p = params!(SubscribeParams);
-            let _ = sub_cmd_tx.send(SubCmd::Subscribe(p.session_id)).await;
-            Response::ok(id.clone(), serde_json::Value::Null)
+    });
+    dispatch_entry!(ipc_method::SESSION_DIFF, {
+        let p = params!(req, SessionIdParams);
+        match manager.diff(&p.session_id).await {
+            Ok(patch) => Response::ok(req.id.clone(), json!({ "patch": patch })),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::UNSUBSCRIBE_EVENTS => {
-            let _ = sub_cmd_tx.send(SubCmd::Unsubscribe).await;
-            Response::ok(id.clone(), serde_json::Value::Null)
+    });
+    dispatch_entry!(ipc_method::SESSION_TRANSCRIPT, {
+        let p = params!(req, TranscriptParams);
+        match manager.transcript(&p.session_id, p.from, p.limit, p.tail).await {
+            Ok(r) => ok!(req, &r),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::REMOTE_START => {
-            // Params default to "tunnel mode" (the user-typed
-            // `/remote-control` path). `local_only=true` is the
-            // `/remote-control-debug` path — bind the local
-            // listener only, never wait for cloudflared.
-            let params: agentd_protocol::RemoteStartParams = match parse_params(req.params.clone())
-            {
-                Ok(p) => p,
-                Err(e) => return Response::err(id.clone(), e),
-            };
-            match manager.clone().start_remote(None, params).await {
-                Ok(r) => ok!(&r),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::SUBSCRIBE_EVENTS, {
+        let p = params!(req, SubscribeParams);
+        let _ = sub_cmd_tx.send(SubCmd::Subscribe(p.session_id)).await;
+        Response::ok(req.id.clone(), serde_json::Value::Null)
+    });
+    dispatch_entry!(ipc_method::UNSUBSCRIBE_EVENTS, {
+        let _ = sub_cmd_tx.send(SubCmd::Unsubscribe).await;
+        Response::ok(req.id.clone(), serde_json::Value::Null)
+    });
+    dispatch_entry!(ipc_method::REMOTE_START, {
+        let params: agentd_protocol::RemoteStartParams = match parse_params(req.params.clone()) {
+            Ok(p) => p,
+            Err(e) => return Response::err(req.id.clone(), e),
+        };
+        match manager.clone().start_remote(None, params).await {
+            Ok(r) => ok!(req, &r),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::REMOTE_STOP => {
-            // No params (`remote.stop` is a verb). Returns the
-            // `was_running` flag so the CLI can render different
-            // status messages for "we stopped it" vs "nothing to
-            // stop" — both are Ok responses, not errors.
-            match manager.clone().stop_remote().await {
-                Ok(r) => ok!(&r),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
+    });
+    dispatch_entry!(ipc_method::REMOTE_STOP, {
+        match manager.clone().stop_remote().await {
+            Ok(r) => ok!(req, &r),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::DAEMON_RESTART => {
-            // Hand off to main's `tokio::select!` arm which calls
-            // `exec()` on the resolved exe (the daemon's own binary, or
-            // the caller-supplied `exe` path). The reply races the
-            // kernel: we send it back here, then the IPC socket closes
-            // when exec() replaces the process image. Clients detect
-            // that as a disconnect and reconnect.
-            // Params are optional; older clients send `null` (no exe
-            // override), which fails to deserialize — treat that as
-            // None / default.
-            let params = parse_params::<agentd_protocol::DaemonRestartParams>(req.params.clone())
-                .unwrap_or_default();
-            let action = if params.restart_sessions {
-                crate::session::RestartAction::RestartSessions
-            } else {
-                crate::session::RestartAction::Restart
-            };
-            match manager.request_daemon_restart(params.exe.map(std::path::PathBuf::from), action) {
-                Ok(cmd) => {
-                    // Cloudflared survives the daemon's exec()
-                    // because it's spawned in a separate process
-                    // group. The new daemon adopts it via the
-                    // persisted snapshot, so the public URL +
-                    // password stay valid across the restart. We
-                    // report that to the caller — `false` only if
-                    // remote was never running, or if the snapshot
-                    // is missing for some reason.
-                    let tunnel_preserved = manager
-                        .remote_slot()
-                        .ok()
-                        .and_then(|g| g.as_ref().map(|h| h.state.tunnel_pid()))
-                        .map(|pid| pid != 0)
-                        .unwrap_or(false);
-                    let r = agentd_protocol::DaemonRestartResult {
-                        exe: cmd.exe.display().to_string(),
-                        pid: std::process::id(),
-                        tunnel_preserved,
-                    };
-                    ok!(&r)
-                }
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
-            }
-        }
-        m if m == ipc_method::DAEMON_SHUTDOWN => {
-            // Hand off to main's lifecycle arm with the Stop action: it
-            // gracefully stops every adapter (leaving sessions resumable
-            // on the next start) and exits without re-exec'ing. Like
-            // restart, the reply races the kernel — we send it back here,
-            // then the IPC socket closes as the process exits.
-            match manager.request_daemon_restart(None, crate::session::RestartAction::Stop) {
-                Ok(_) => ok!(&agentd_protocol::DaemonShutdownResult {
+    });
+    dispatch_entry!(ipc_method::DAEMON_RESTART, {
+        let params = parse_params::<agentd_protocol::DaemonRestartParams>(req.params.clone())
+            .unwrap_or_default();
+        let action = if params.restart_sessions {
+            crate::session::RestartAction::RestartSessions
+        } else {
+            crate::session::RestartAction::Restart
+        };
+        match manager.request_daemon_restart(params.exe.map(std::path::PathBuf::from), action) {
+            Ok(cmd) => {
+                let tunnel_preserved = manager
+                    .remote_slot()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|h| h.state.tunnel_pid()))
+                    .map(|pid| pid != 0)
+                    .unwrap_or(false);
+                let r = agentd_protocol::DaemonRestartResult {
+                    exe: cmd.exe.display().to_string(),
                     pid: std::process::id(),
-                }),
-                Err(e) => Response::err(id.clone(), ErrorObject::internal(e.to_string())),
+                    tunnel_preserved,
+                };
+                ok!(req, &r)
             }
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        m if m == ipc_method::DEV_SET_ASSETS => {
-            // Dev-only hot-reload of the web UI: point the running daemon
-            // at a worktree's `assets/` dir (or `None` to revert). A
-            // no-op in release builds (`set_dev_assets` ignores it), so
-            // production always serves the embedded assets.
-            let p = params!(agentd_protocol::DevSetAssetsParams);
-            manager.set_dev_assets(p.dir.map(std::path::PathBuf::from));
-            ok!(&agentd_protocol::DevAssetsResult {
-                dir: manager.dev_assets().map(|d| d.display().to_string()),
-            })
+    });
+    dispatch_entry!(ipc_method::DAEMON_SHUTDOWN, {
+        match manager.request_daemon_restart(None, crate::session::RestartAction::Stop) {
+            Ok(_) => ok!(req, &agentd_protocol::DaemonShutdownResult {
+                pid: std::process::id(),
+            }),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
-        other => Response::err(id.clone(), ErrorObject::method_not_found(other)),
-    }
+    });
+    dispatch_entry!(ipc_method::DEV_SET_ASSETS, {
+        let p = params!(req, agentd_protocol::DevSetAssetsParams);
+        manager.set_dev_assets(p.dir.map(std::path::PathBuf::from));
+        ok!(req, &agentd_protocol::DevAssetsResult {
+            dir: manager.dev_assets().map(|d| d.display().to_string()),
+        })
+    });
+
+    Response::err(req.id.clone(), ErrorObject::method_not_found(req.method.as_str()))
 }
 
 #[cfg(test)]
