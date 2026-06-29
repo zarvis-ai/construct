@@ -5363,25 +5363,44 @@ impl App {
                     self.resizing_list = Some((ev.column, self.list_panel_w));
                     return;
                 }
-                if let Some(hit) = self
-                    .layout
-                    .main_window_dividers
-                    .iter()
-                    .find(|hit| Self::rect_contains(hit.area, ev.column, ev.row))
-                    .copied()
-                {
-                    let anchor = match hit.direction {
-                        WindowSplitDirection::Right => ev.column,
-                        WindowSplitDirection::Below => ev.row,
-                    };
-                    self.resizing_main_window = Some((
-                        hit.parent,
-                        hit.direction,
-                        anchor,
-                        hit.ratio_percent,
-                        hit.parent_area,
-                    ));
-                    return;
+                // A `Below` split's resize divider is two rows tall — the upper
+                // pane's bottom border *and* the lower pane's top border. That
+                // lower row is the lower pane's title bar, where its program
+                // status-glyph toggle sits. The toggle fires from the regular
+                // click pipeline on mouse-up (`handle_left_click`); without this
+                // exception the resize hit-test below would claim the mouse-down
+                // first and the click never reached the toggle, so "show
+                // program" silently failed on every non-top split pane. (Hide
+                // kept working because the active program's own mouse handler
+                // intercepts that click earlier.) The session-actions button is
+                // already protected by the mouse-down handler above; let the
+                // toggle glyph fall through the same way.
+                let on_pane_program_toggle = self.layout.main_window_areas.iter().any(|pane| {
+                    let (x_start, x_end, y) =
+                        crate::ui::view_program_toggle_button_range(pane.area);
+                    ev.row == y && ev.column >= x_start && ev.column < x_end
+                });
+                if !on_pane_program_toggle {
+                    if let Some(hit) = self
+                        .layout
+                        .main_window_dividers
+                        .iter()
+                        .find(|hit| Self::rect_contains(hit.area, ev.column, ev.row))
+                        .copied()
+                    {
+                        let anchor = match hit.direction {
+                            WindowSplitDirection::Right => ev.column,
+                            WindowSplitDirection::Below => ev.row,
+                        };
+                        self.resizing_main_window = Some((
+                            hit.parent,
+                            hit.direction,
+                            anchor,
+                            hit.ratio_percent,
+                            hit.parent_area,
+                        ));
+                        return;
+                    }
                 }
                 // View ↔ pin-strip horizontal divider: clicking the
                 // view's bottom border (or equivalently the pin
@@ -12935,6 +12954,161 @@ mod tests {
         })
         .await;
         assert!(app.program_popup.is_some(), "clicking the title toggle should open program");
+        server.abort();
+    }
+
+    // Regression: in a `Below` (stacked) split the resize divider's grab zone is
+    // two rows tall — the upper pane's bottom border *and* the lower pane's top
+    // border. That lower row is the lower pane's title bar, where its program
+    // status-glyph toggle sits. The mouse-down hit-test used to start a window
+    // resize and swallow the click, so "show program" silently failed on every
+    // non-top split pane (hide kept working because the active program's own
+    // mouse handler intercepts that click earlier).
+    #[tokio::test]
+    async fn split_below_nontop_toggle_opens_program() {
+        use agentd_protocol::ipc_method;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                // Echo back the requested session so the opened popup is keyed to
+                // whichever pane was clicked.
+                let session_id = req
+                    .get("params")
+                    .and_then(|p| p.get("session_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("s2")
+                    .to_string();
+                let program = serde_json::json!({
+                    "session_id": session_id,
+                    "markdown": "draft",
+                    "version": 1,
+                    "updated_at_ms": 0,
+                    "template_id": null,
+                });
+                let result = match method.as_str() {
+                    ipc_method::PROGRAM_GET => serde_json::json!({ "program": program }),
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": result,
+                });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s1.has_pty = true;
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s2.id = "s2".into();
+        s2.has_pty = true;
+        let mut app = test_app(client, vec![s1, s2]);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Below,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.selection = Selection::Session("s1".into());
+        app.focus = PaneFocus::View;
+
+        // Render so the real split geometry — pane areas *and* the resize
+        // divider — is captured into the layout, just like a live frame.
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("split should render");
+
+        let bottom = app
+            .layout
+            .main_window_areas
+            .iter()
+            .find(|h| h.id == 2)
+            .copied()
+            .expect("bottom split pane registered");
+        let (x_start, _x_end, y) = crate::ui::view_program_toggle_button_range(bottom.area);
+
+        // Precondition: the toggle row really does sit inside a resize divider —
+        // otherwise this test would not exercise the bug it guards against.
+        assert!(
+            app.layout
+                .main_window_dividers
+                .iter()
+                .any(|d| App::rect_contains(d.area, x_start, y)),
+            "expected the bottom pane's toggle row to overlap the split divider"
+        );
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            app.resizing_main_window.is_none(),
+            "clicking the toggle glyph must not start a window resize"
+        );
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: x_start,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert_eq!(app.active_window_id, 2, "clicking the bottom pane focuses it");
+        let popup = app
+            .program_popup
+            .as_ref()
+            .expect("showing the program should open a popup on the non-top pane");
+        assert_eq!(
+            popup.program.session_id, "s2",
+            "the clicked pane's own program opened"
+        );
         server.abort();
     }
 
