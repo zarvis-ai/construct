@@ -1141,6 +1141,14 @@ pub struct ProgramEdit {
     pub new_string: String,
     #[serde(default)]
     pub replace_all: bool,
+    /// Keep the block this edit produces in the program-run shimmer set, in the
+    /// same call (spec 0053). Editing a block changes its text and therefore its
+    /// id, so its prior shimmer does not carry over; setting this re-adds the
+    /// resulting block's new id atomically — so a move/annotate of a still-
+    /// pending block never transiently empties the pending set. Use it whenever
+    /// an edit changes a block whose work is still in flight.
+    #[serde(default)]
+    pub keep_pending: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

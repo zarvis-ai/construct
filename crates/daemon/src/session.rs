@@ -581,7 +581,7 @@ fn start_params_for_create(
 fn program_run_instructions() -> Vec<String> {
     vec![
         "Execute this construct program as an autonomous run.".to_string(),
-        "Shimmer semantics: a shimmering block means 'work on this block is still pending in this run — queued, in progress, or not yet done; outcome unknown'. No shimmer means 'settled — done, skipped, or no work needed'. Pending is about the state of the work, not how it runs: it applies the same whether you do the block yourself, delegate it, or drive it some other way, and a block counts as pending the moment you decide to act on it. A Run starts every executed block shimmering. Shimmer is a declared per-block state addressed by a stable block id: read each block's id from the program get tool (or from the `blocks` returned by an edit/update), then declare a block pending or settled with the construct_program_edit `shimmer` list, e.g. `shimmer: [{id, shimmer: true|false}]`. The list is partial — it may target any block, not only the ones your edits change — and declaring a block settled clears it WITHOUT changing its text. Editing a block's text changes its id, so to keep an edited block shimmering, declare its new id shimmer: true in that same edit. Never leave a settled block shimmering, and never drop shimmer from a block whose work is still in flight.".to_string(),
+        "Shimmer semantics: a shimmering block means 'work on this block is still pending in this run — queued, in progress, or not yet done; outcome unknown'. No shimmer means 'settled — done, skipped, or no work needed'. Pending is about the state of the work, not how it runs: it applies the same whether you do the block yourself, delegate it, or drive it some other way, and a block counts as pending the moment you decide to act on it. A Run starts every executed block shimmering. Shimmer is a declared per-block state addressed by a stable block id: read each block's id from the program get tool (or from the `blocks` returned by an edit/update), then declare a block pending or settled with the construct_program_edit `shimmer` list, e.g. `shimmer: [{id, shimmer: true|false}]`. The list is partial — it may target any block, not only the ones your edits change — and declaring a block settled clears it WITHOUT changing its text. Editing a block's text changes its id, so to keep an edited block shimmering — e.g. when you move a still-in-flight task into an In progress section or append a @{session} clip — set keep_pending: true on that edit; it re-adds the resulting block's new id in the same call, so you need not know the new id and the block never goes dark. Never leave a settled block shimmering, and never drop shimmer from a block whose work is still in flight.".to_string(),
         "Planning pass — this MUST be your first program action, before doing or delegating any work: read the program with the get tool to obtain every block's id, then make one construct_program_edit whose `shimmer` list declares each still-pending block's id shimmer: true and each settled block's id shimmer: false. This needs no change to the blocks' text — declaring an id settled clears it. Doing this first makes the program reflect your plan within seconds of the Run instead of only after the first task completes; skipping it strands settled blocks shimmering and risks dropping shimmer from blocks still in flight.".to_string(),
         "Treat program_run.markdown as free-form instructions and state for this turn, not as a request for a one-shot status report or as a fixed task-management schema.".to_string(),
         "Infer the user's intended objective from the document structure and prose, then keep taking useful next actions while there is actionable work you can do.".to_string(),
@@ -628,6 +628,32 @@ fn program_block_ids(body: &str) -> std::collections::HashSet<String> {
     agentd_protocol::program_block_spans(body)
         .into_iter()
         .map(|span| span.id)
+        .collect()
+}
+
+/// Ids of the post-edit blocks produced by edits flagged `keep_pending`
+/// (spec 0053): the blocks whose work an edit keeps in flight. Anchors on the
+/// first non-blank line of each such edit's `new_string` and returns the id of
+/// every post-edit block containing that line — so a move/annotate adds the
+/// resulting block's new id in the same narrowing call that drops the old one,
+/// and the pending set never transiently empties.
+fn program_edit_keep_ids(
+    edits: &[agentd_protocol::ProgramEdit],
+    markdown: &str,
+) -> std::collections::HashSet<String> {
+    let anchors: Vec<String> = edits
+        .iter()
+        .filter(|e| e.keep_pending)
+        .filter_map(|e| e.new_string.lines().find(|l| !l.trim().is_empty()))
+        .map(|l| l.trim().to_string())
+        .collect();
+    if anchors.is_empty() {
+        return Default::default();
+    }
+    agentd_protocol::program_block_spans(markdown)
+        .into_iter()
+        .filter(|b| b.signature.lines().any(|l| anchors.iter().any(|a| a == l)))
+        .map(|b| b.id)
         .collect()
 }
 
@@ -895,13 +921,23 @@ impl SessionManager {
     fn program_run_snapshot(&self, session_id: &str) -> Option<ProgramRunProgress> {
         let now_ms = Utc::now().timestamp_millis();
         let mut runs = self.program_runs.lock().ok()?;
-        if runs.get(session_id).is_some_and(|run| {
-            run.expires_at_ms <= now_ms || run.pending_block_ids.is_empty()
-        }) {
+        let expired = runs
+            .get(session_id)
+            .is_some_and(|run| run.expires_at_ms <= now_ms);
+        if expired {
             runs.remove(session_id);
             return None;
         }
-        runs.get(session_id).cloned()
+        // An empty pending set means nothing shimmers right now, so report no
+        // active run — but KEEP the record so a follow-up declaration can revive
+        // it within the same turn (spec 0053): a move/annotate that changes a
+        // still-pending block transiently empties the set before the new id is
+        // declared, and that must not destroy the run. The record is reaped when
+        // the owning session goes idle/terminal or the inactivity backstop fires.
+        match runs.get(session_id) {
+            Some(run) if !run.pending_block_ids.is_empty() => Some(run.clone()),
+            _ => None,
+        }
     }
 
     /// Build the per-block projection (spec 0053): each block of `markdown` with
@@ -1036,7 +1072,12 @@ impl SessionManager {
                     run.pending_block_ids.retain(|id| id != &decl.id);
                 }
             }
-            if run.expires_at_ms <= now_ms || run.pending_block_ids.is_empty() {
+            // Reap only on the inactivity backstop. An empty pending set does
+            // NOT remove the run mid-turn (spec 0053): a still-running agent may
+            // re-declare a moved block's new id next, and destroying the run
+            // would make that revival a no-op. Idle/terminal reaping is owned by
+            // note_session_state_for_program_run.
+            if run.expires_at_ms <= now_ms {
                 runs.remove(session_id);
             }
         }
@@ -1065,7 +1106,9 @@ impl SessionManager {
                 .into_iter()
                 .filter(|id| current.contains(id))
                 .collect();
-            if run.expires_at_ms <= now_ms || run.pending_block_ids.is_empty() {
+            // Reap only on the inactivity backstop (spec 0053); an empty
+            // declaration mid-turn keeps the run alive for revival.
+            if run.expires_at_ms <= now_ms {
                 runs.remove(session_id);
             }
         }
@@ -1118,11 +1161,17 @@ impl SessionManager {
                         // Idle but still alive. For an unmanaged run (a
                         // non-declaring harness's optimistic shimmer, never
                         // narrowed) this is the turn-end stop signal. For a
-                        // managed run it is NOT: a self-scheduling agent goes
-                        // idle while delegated/background work is still pending,
-                        // so keep shimmering and let a later declaration or the
-                        // inactivity backstop clear it. See spec 0042.
-                        if run.seen_running && !run.agent_managed {
+                        // managed run it is NOT — unless its pending set is empty:
+                        // a self-scheduling agent goes idle while delegated work
+                        // is still pending (keep shimmering), but a managed run
+                        // with nothing pending has either finished or only
+                        // transiently emptied, and an idle turn means there is no
+                        // pending declaration to revive — so reap it rather than
+                        // letting an empty record linger to the backstop. See
+                        // specs 0042 and 0053.
+                        if run.seen_running
+                            && (!run.agent_managed || run.pending_block_ids.is_empty())
+                        {
                             clear = true;
                         }
                     }
@@ -1820,7 +1869,17 @@ impl SessionManager {
         // Apply the partial shimmer declaration against the post-edit document
         // (spec 0053): changed blocks drop their prior shimmer; declared ids set
         // pending/settled; ids that no longer exist are ignored (fail closed).
-        self.narrow_program_run(&params.session_id, &program.markdown, &params.shimmer);
+        // Edits flagged `keep_pending` atomically re-add the id of the block
+        // they produce, so moving/annotating a still-pending block keeps it
+        // shimmering without the pending set transiently emptying. Explicit
+        // declarations in `shimmer` win over the keep_pending default.
+        let mut decls = params.shimmer.clone();
+        for id in program_edit_keep_ids(&params.edits, &program.markdown) {
+            if !decls.iter().any(|d| d.id == id) {
+                decls.push(agentd_protocol::ProgramShimmerDecl { id, shimmer: true });
+            }
+        }
+        self.narrow_program_run(&params.session_id, &program.markdown, &decls);
         let blocks = self.program_blocks_projection(&params.session_id, &program.markdown);
         let active_run = self.program_run_snapshot(&params.session_id);
         self.broadcast_program_state(program.clone());
@@ -6287,6 +6346,7 @@ mod tests {
                     old_string: "# Rule".into(),
                     new_string: "# Rule".into(),
                     replace_all: false,
+                    keep_pending: false,
                 }],
                 actor: agentd_protocol::ProgramUpdateActor::Agent,
                 note: None,
@@ -6393,6 +6453,7 @@ mod tests {
                     old_string: "# A".into(),
                     new_string: "# A".into(),
                     replace_all: false,
+                    keep_pending: false,
                 }],
                 actor: agentd_protocol::ProgramUpdateActor::Agent,
                 note: None,
@@ -6420,6 +6481,176 @@ mod tests {
         // "# B" was never declared and keeps its run-start shimmer.
         assert!(!shimmering("# A"));
         assert!(shimmering("# B"));
+    }
+
+    // Helper: planning-pass declaration carried by a no-op anchored edit.
+    async fn declare(
+        mgr: &SessionManager,
+        id: &str,
+        anchor: &str,
+        decls: Vec<agentd_protocol::ProgramShimmerDecl>,
+    ) -> ProgramUpdateResult {
+        mgr.program_edit(ProgramEditParams {
+            session_id: id.to_string(),
+            edits: vec![agentd_protocol::ProgramEdit {
+                old_string: anchor.to_string(),
+                new_string: anchor.to_string(),
+                replace_all: false,
+                keep_pending: false,
+            }],
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            note: None,
+            shimmer: decls,
+        })
+        .await
+        .expect("declare")
+    }
+
+    // The bug from the 'construct improvements' session: a move that changes a
+    // still-pending block's text empties the pending set BEFORE the new id is
+    // declared. The run must NOT be destroyed (spec 0053) — a follow-up
+    // re-declaration of the new id revives the shimmer. Before this fix the run
+    // was reaped on the transient empty and the re-declare was a silent no-op.
+    #[tokio::test]
+    async fn program_run_survives_transient_empty_and_revives() {
+        let md = "# Tasks\n\n* do the thing\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let get = mgr.program_get(&id).await.expect("get");
+        let id_of = |n: &str| {
+            get.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone()
+        };
+        // Planning pass: only the task is pending (heading settled).
+        declare(
+            &mgr,
+            &id,
+            "# Tasks",
+            vec![
+                agentd_protocol::ProgramShimmerDecl { id: id_of("# Tasks"), shimmer: false },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("do the thing"), shimmer: true },
+            ],
+        )
+        .await;
+
+        // Move/annotate the task WITHOUT keep_pending and WITHOUT re-declaring:
+        // its old id drops and the pending set transiently empties.
+        mgr.program_edit(ProgramEditParams {
+            session_id: id.clone(),
+            edits: vec![agentd_protocol::ProgramEdit {
+                old_string: "* do the thing".into(),
+                new_string: "* do the thing — @{session:sub1}".into(),
+                replace_all: false,
+                keep_pending: false,
+            }],
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            note: None,
+            shimmer: vec![],
+        })
+        .await
+        .expect("move");
+
+        // Nothing shimmers right now (pending emptied) ...
+        let mid = mgr.program_get(&id).await.expect("get mid");
+        assert!(
+            mid.blocks.iter().all(|b| !b.shimmer),
+            "transient empty: nothing pending"
+        );
+        // ... but the run RECORD survived. Re-declare the moved block's new id.
+        let new_id = mid
+            .blocks
+            .iter()
+            .find(|b| b.text.contains("do the thing"))
+            .unwrap()
+            .id
+            .clone();
+        let res = declare(
+            &mgr,
+            &id,
+            "# Tasks",
+            vec![agentd_protocol::ProgramShimmerDecl { id: new_id, shimmer: true }],
+        )
+        .await;
+        assert!(
+            res.blocks.iter().find(|b| b.text.contains("do the thing")).unwrap().shimmer,
+            "the run survived the transient empty and the re-declaration re-lit the block"
+        );
+    }
+
+    // keep_pending on a text-changing edit re-adds the resulting block's new id
+    // in the SAME call, so moving/annotating a still-pending block keeps it
+    // shimmering atomically — the pending set never transiently empties.
+    #[tokio::test]
+    async fn program_edit_keep_pending_keeps_moved_block_shimmering() {
+        let md = "# Tasks\n\n* do the thing\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let get = mgr.program_get(&id).await.expect("get");
+        let id_of = |n: &str| {
+            get.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone()
+        };
+        // Planning pass: heading settled, task pending.
+        declare(
+            &mgr,
+            &id,
+            "# Tasks",
+            vec![
+                agentd_protocol::ProgramShimmerDecl { id: id_of("# Tasks"), shimmer: false },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("do the thing"), shimmer: true },
+            ],
+        )
+        .await;
+
+        // Move the task WITH keep_pending — its id changes but it stays pending
+        // in one call (no transient empty, no need to know the new id).
+        let res = mgr
+            .program_edit(ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: "* do the thing".into(),
+                    new_string: "* do the thing — @{session:sub1}".into(),
+                    replace_all: false,
+                    keep_pending: true,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                note: None,
+                shimmer: vec![],
+            })
+            .await
+            .expect("move keep_pending");
+        let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
+        assert!(shim("do the thing"), "keep_pending kept the moved block pending");
+        assert!(!shim("# Tasks"), "the settled heading stays settled");
+    }
+
+    // An empty managed run is reaped when the owning session goes idle, so an
+    // empty record does not linger to the backstop — and a later declaration no
+    // longer revives it (contrast with the mid-turn survival above).
+    #[tokio::test]
+    async fn program_run_empty_clears_when_owning_session_idle() {
+        use agentd_protocol::SessionState;
+        let md = "# A\n\n# B\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        let b = agentd_protocol::program_block_id("# B");
+        // Settle every block → pending empties; the record survives mid-turn.
+        mgr.narrow_program_run(
+            &id,
+            md,
+            &[
+                agentd_protocol::ProgramShimmerDecl { id: agentd_protocol::program_block_id("# A"), shimmer: false },
+                agentd_protocol::ProgramShimmerDecl { id: b.clone(), shimmer: false },
+            ],
+        );
+        assert!(mgr.program_run_snapshot(&id).is_none(), "empty pending shows no shimmer");
+        // Owning session goes idle with nothing pending → the empty run is reaped.
+        mgr.note_session_state_for_program_run(&id, SessionState::AwaitingInput);
+        // A re-declaration can no longer revive it: the record is gone.
+        mgr.narrow_program_run(&id, md, &[agentd_protocol::ProgramShimmerDecl { id: b, shimmer: true }]);
+        assert!(
+            mgr.program_run_snapshot(&id).is_none(),
+            "reaped on idle; a re-declaration does not revive a cleared run"
+        );
     }
 
     // A run the agent is actively managing (it has narrowed it with a
