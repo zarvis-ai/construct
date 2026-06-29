@@ -277,6 +277,8 @@ pub async fn run_scheduler(
     loop {
         interval.tick().await;
         let now_ms = Utc::now().timestamp_millis();
+        // Flip interactive TUI sessions gone quiet to AwaitingInput (spec 0054).
+        manager.poll_pty_quiescence().await;
         let (due, expired) = registry.due_and_expired(now_ms).await;
         for l in expired {
             tracing::info!(

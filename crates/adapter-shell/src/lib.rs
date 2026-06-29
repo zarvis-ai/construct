@@ -63,6 +63,8 @@ pub async fn run() -> anyhow::Result<()> {
                 rows: 30,
             }),
             status_detail: Some(label),
+            // Shell is line-oriented: detect the prompt via the foreground group.
+            detect_prompt_via_pgroup: true,
         };
         let _ = SessionState::Running; // silence dead-import lint if any
         let _ = run_session(spec, ctx).await;

@@ -780,6 +780,9 @@ pub mod ipc_method {
     /// they left off.
     pub const SESSION_RESTART: &str = "session.restart";
     pub const SESSION_SET_PINNED: &str = "session.set_pinned";
+    /// Clear a session's `needs_attention` marker and record it as the focused
+    /// session (so a concurrent non-`Running` transition won't re-raise it).
+    pub const SESSION_MARK_SEEN: &str = "session.mark_seen";
     pub const SESSION_SET_TITLE: &str = "session.set_title";
     pub const SESSION_SET_APPROVAL_MODE: &str = "session.set_approval_mode";
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";
@@ -1363,6 +1366,13 @@ pub struct SessionSummary {
     /// false for all other session kinds.
     #[serde(default)]
     pub operator_loop_disabled: bool,
+    /// Sticky "this session needs you" marker. The daemon raises it when the
+    /// session leaves `Running` for a non-running state (awaiting input / done
+    /// / errored) while it isn't the focused session, and clears it when the
+    /// operator switches to it or it returns to `Running`. Persisted so it
+    /// survives daemon/client restart. Orthogonal to `state` — not a run state.
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

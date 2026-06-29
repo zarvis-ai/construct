@@ -56,6 +56,10 @@ const RESPAWN_REDRAW_MAX_WAIT: Duration = Duration::from_secs(6);
 /// settle lets its render/state update land so the trailing `\r` is read as
 /// a clean submit keypress rather than being coalesced into the paste.
 const PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY: Duration = Duration::from_millis(120);
+/// How long an interactive full-screen TUI harness's PTY may be silent before
+/// the daemon treats it as awaiting input. Line-oriented shells use
+/// foreground-process-group detection in the adapter and are exempt.
+const PTY_QUIESCENCE: Duration = Duration::from_secs(10);
 const PROGRAM_RUN_MAX_MS: i64 = 10 * 60 * 1000;
 
 /// Whether the post-resume force-redraw should fire now: the child has
@@ -749,6 +753,10 @@ pub struct SessionManager {
     config: Arc<Config>,
     adapter_runtime_dir: PathBuf,
     sessions: RwLock<HashMap<String, Arc<SessionEntry>>>,
+    /// The session the operator most recently switched to (via `mark_seen`).
+    /// Suppresses the `needs_attention` marker for the session being actively
+    /// viewed. In-memory only; global (last switch wins). See spec 0054.
+    focused_session: std::sync::Mutex<Option<String>>,
     groups: RwLock<HashMap<String, Arc<GroupEntry>>>,
     broadcast: broadcast::Sender<BroadcastMsg>,
     /// Recurring-prompt loops attached to sessions. The scheduler
@@ -1300,6 +1308,7 @@ impl SessionManager {
                 config,
                 adapter_runtime_dir,
                 sessions: RwLock::new(sessions),
+                focused_session: std::sync::Mutex::new(None),
                 groups: RwLock::new(groups),
                 broadcast,
                 loops,
@@ -2100,6 +2109,7 @@ impl SessionManager {
             kind: params.kind,
             archived: false,
             operator_loop_disabled: params.kind == agentd_protocol::SessionKind::Orchestrator,
+            needs_attention: false,
         };
         self.storage.save_summary(&summary)?;
 
@@ -2942,10 +2952,29 @@ impl SessionManager {
                 }
             }
             let now = Utc::now();
-            // Track activity for the "session looks busy" signal. In-memory
-            // only; the value gets persisted next time a lifecycle event
-            // triggers save_summary.
-            entry.summary.write().await.last_pty_at_ms = Some(now.timestamp_millis());
+            // Track activity for the "session looks busy" signal, and undo a
+            // quiescence-driven AwaitingInput the moment output resumes — so the
+            // session reads as Running again and its marker clears.
+            let resumed = {
+                let mut s = entry.summary.write().await;
+                s.last_pty_at_ms = Some(now.timestamp_millis());
+                if harness_uses_quiescence(&s) && s.state == SessionState::AwaitingInput {
+                    s.state = SessionState::Running;
+                    s.pending_input = false;
+                    s.needs_attention = false;
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            };
+            if let Some(snapshot) = resumed {
+                let _ = self.storage.save_summary(&snapshot);
+                let _ = self
+                    .broadcast
+                    .send(BroadcastMsg::State(StateNotificationPayload {
+                        session: snapshot,
+                    }));
+            }
             // Latest seq for ordering only; not persisted.
             let seq = entry.transcript_count.load(Ordering::Relaxed);
             let _ = self
@@ -2970,10 +2999,13 @@ impl SessionManager {
             tracing::warn!(session = %entry.id, error = ?e, "append_event failed");
         }
         // Update summary based on event semantics.
+        let is_focused =
+            self.focused_session.lock().unwrap().as_deref() == Some(entry.id.as_str());
         {
             let mut s = entry.summary.write().await;
             s.last_event_at = Some(now);
             s.event_count = seq;
+            let prev_state = s.state;
             match &event {
                 SessionEvent::Status { state, .. } => {
                     s.state = *state;
@@ -3032,6 +3064,22 @@ impl SessionManager {
                     // Task-lifecycle, editor-state, and compaction
                     // events are recorded by other handlers — they
                     // don't move the session's top-level state.
+                }
+            }
+            // Maintain the sticky "needs you" marker off state transitions:
+            // raise it when the session stops being Running (unless the operator
+            // is already viewing it), clear it when it resumes. See spec 0054.
+            if s.state != prev_state {
+                match s.state {
+                    SessionState::Running => s.needs_attention = false,
+                    SessionState::AwaitingInput
+                    | SessionState::Done
+                    | SessionState::Errored => {
+                        if !is_focused {
+                            s.needs_attention = true;
+                        }
+                    }
+                    SessionState::Pending | SessionState::Paused => {}
                 }
             }
             let snapshot = s.clone();
@@ -4200,6 +4248,64 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Clear a session's `needs_attention` marker and record it as the
+    /// currently-focused session, so a concurrent non-`Running` transition
+    /// won't immediately re-raise the marker for the session being viewed.
+    pub async fn mark_seen(&self, id: &str) -> Result<()> {
+        *self.focused_session.lock().unwrap() = Some(id.to_string());
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            if !s.needs_attention {
+                // Already clear — focus is recorded above; skip the churn.
+                return Ok(());
+            }
+            s.needs_attention = false;
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        Ok(())
+    }
+
+    /// Daemon-side idle detection for interactive full-screen TUI harnesses:
+    /// they never emit `AwaitingInput`, so when their PTY has produced no output
+    /// for [`PTY_QUIESCENCE`] we synthesize the transition. Shells use
+    /// foreground-process-group detection in the adapter and are excluded.
+    pub(crate) async fn poll_pty_quiescence(&self) {
+        let now_ms = Utc::now().timestamp_millis();
+        let threshold = PTY_QUIESCENCE.as_millis() as i64;
+        let entries: Vec<Arc<SessionEntry>> =
+            self.sessions.read().await.values().cloned().collect();
+        for entry in entries {
+            let stale = {
+                let s = entry.summary.read().await;
+                harness_uses_quiescence(&s)
+                    && s.state == SessionState::Running
+                    && s
+                        .last_pty_at_ms
+                        .is_some_and(|last| now_ms.saturating_sub(last) >= threshold)
+            };
+            if stale {
+                self.handle_event(
+                    &entry,
+                    SessionEvent::Status {
+                        state: SessionState::AwaitingInput,
+                        detail: None,
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
     async fn persist_approval_mode(
         &self,
         entry: &Arc<SessionEntry>,
@@ -4492,6 +4598,19 @@ async fn generate_auto_title(
     tracing::info!(session = %entry.id, %title, "auto-title applied");
 }
 
+/// PTY harnesses whose child is a full-screen TUI that holds the terminal's
+/// foreground process group for its whole lifetime — so it never returns to a
+/// detectable shell prompt and never emits `AwaitingInput` itself. The daemon
+/// falls back to output-quiescence detection for these; shells are excluded
+/// (they use foreground-pgroup detection in the adapter).
+fn harness_uses_quiescence(s: &SessionSummary) -> bool {
+    s.has_pty
+        && matches!(
+            s.harness.as_str(),
+            "claude" | "codex" | "antigravity" | "grok"
+        )
+}
+
 fn effective_mode(params: &CreateSessionParams) -> String {
     match params.mode.as_ref() {
         Some(mode) => mode.clone(),
@@ -4643,6 +4762,7 @@ mod tests {
             kind,
             archived: false,
             operator_loop_disabled: false,
+            needs_attention: false,
         }
     }
 
@@ -4999,6 +5119,7 @@ mod tests {
                 kind,
                 archived: false,
                 operator_loop_disabled: false,
+                needs_attention: false,
             }),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
@@ -5756,6 +5877,7 @@ mod tests {
             kind: agentd_protocol::SessionKind::User,
             archived: false,
             operator_loop_disabled: false,
+            needs_attention: false,
         };
         let entry = Arc::new(SessionEntry {
             id: id.clone(),
@@ -5818,6 +5940,127 @@ mod tests {
             SessionState::Running,
             "Error during shutdown must NOT transition state either",
         );
+    }
+
+    /// Output-quiescence detection applies only to PTY full-screen TUI LLM
+    /// harnesses; shells (foreground-pgroup) and headless sessions are excluded.
+    #[test]
+    fn quiescence_targets_tui_llm_harnesses() {
+        let mut s = placement_summary("q", 0, None, agentd_protocol::SessionKind::User);
+        s.has_pty = true;
+        for h in ["claude", "codex", "antigravity", "grok"] {
+            s.harness = h.into();
+            assert!(harness_uses_quiescence(&s), "{h} should use quiescence");
+        }
+        s.harness = "shell".into();
+        assert!(
+            !harness_uses_quiescence(&s),
+            "shell uses foreground-pgroup detection, not quiescence",
+        );
+        s.harness = "claude".into();
+        s.has_pty = false;
+        assert!(
+            !harness_uses_quiescence(&s),
+            "headless (no PTY) sessions emit their own AwaitingInput",
+        );
+    }
+
+    /// The `needs_attention` marker tracks "this session needs you": raised when
+    /// a session leaves `Running` while unfocused, cleared by `mark_seen` or a
+    /// return to `Running`, and suppressed for the focused session. Spec 0054.
+    #[tokio::test]
+    async fn needs_attention_marker_lifecycle() {
+        use tempfile::tempdir;
+        use tokio::sync::RwLock;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        let manager = Arc::new(mgr);
+
+        let make_entry = |id: &str| {
+            let mut summary =
+                placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            summary.harness = "claude".into();
+            summary.has_pty = true;
+            summary.state = SessionState::Running;
+            Arc::new(SessionEntry {
+                id: id.to_string(),
+                summary: RwLock::new(summary),
+                transcript_count: AtomicU64::new(0),
+                adapter: tokio::sync::Mutex::new(None),
+                pty: tokio::sync::Mutex::new(PtyState::default()),
+                deleted: AtomicBool::new(false),
+                archived: AtomicBool::new(false),
+                title_gen_attempted: AtomicBool::new(false),
+                pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+                tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+                pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+            })
+        };
+
+        let entry = make_entry("mtest");
+        let other = make_entry("other");
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert("mtest".into(), entry.clone());
+            sessions.insert("other".into(), other.clone());
+        }
+
+        let awaiting = || SessionEvent::Status {
+            state: SessionState::AwaitingInput,
+            detail: None,
+        };
+        let running = || SessionEvent::Status {
+            state: SessionState::Running,
+            detail: None,
+        };
+
+        // Leaving Running while unfocused raises the marker.
+        manager.handle_event(&entry, awaiting()).await;
+        assert!(
+            entry.summary.read().await.needs_attention,
+            "AwaitingInput while unfocused must raise the marker",
+        );
+
+        // Switching to it (mark_seen) clears the marker and records focus.
+        manager.mark_seen("mtest").await.expect("mark_seen");
+        assert!(!entry.summary.read().await.needs_attention);
+
+        // A stop that lands while it's the focused session must NOT re-raise.
+        manager.handle_event(&entry, running()).await;
+        manager.handle_event(&entry, awaiting()).await;
+        assert!(
+            !entry.summary.read().await.needs_attention,
+            "the focused session must stay quiet when it stops",
+        );
+
+        // Focus moves elsewhere → the next stop raises the marker again.
+        manager.mark_seen("other").await.expect("mark_seen other");
+        manager.handle_event(&entry, running()).await;
+        manager.handle_event(&entry, awaiting()).await;
+        assert!(
+            entry.summary.read().await.needs_attention,
+            "an unfocused session that stops must raise the marker",
+        );
+
+        // A return to Running clears it.
+        manager.handle_event(&entry, running()).await;
+        assert!(
+            !entry.summary.read().await.needs_attention,
+            "resuming work clears the marker",
+        );
+
+        // A clean finish raises it (still unfocused).
+        manager
+            .handle_event(&entry, SessionEvent::Done { exit_code: 0 })
+            .await;
+        assert!(entry.summary.read().await.needs_attention);
     }
 
     fn create_params(mode: Option<&str>, pty: Option<PtySize>) -> CreateSessionParams {

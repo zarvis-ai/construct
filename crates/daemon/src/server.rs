@@ -1227,6 +1227,13 @@ async fn dispatch(
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
     });
+    dispatch_entry!(ipc_method::SESSION_MARK_SEEN, {
+        let p = params!(req, SessionIdParams);
+        match manager.mark_seen(&p.session_id).await {
+            Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
     dispatch_entry!(ipc_method::SESSION_SET_TITLE, {
         let p = params!(req, SessionSetTitleParams);
         match manager.set_title(&p.session_id, p.title).await {

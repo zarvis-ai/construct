@@ -3194,6 +3194,8 @@ impl App {
         if transition && self.selection.session_id() != Some(id.as_str()) {
             self.start_session_transition();
         }
+        // Switching to a session consumes its "needs you" marker.
+        self.report_seen(&id);
         self.selection = Selection::Session(id);
         self.transcript.clear();
         self.transcript_session = None;
@@ -3230,6 +3232,17 @@ impl App {
         let client = self.client.clone();
         tokio::spawn(async move {
             let _ = client.set_view(&sid, view).await;
+        });
+    }
+
+    /// Tell the daemon we've switched to (and thus consumed) a session, so it
+    /// clears that session's `needs_attention` marker and records it as the
+    /// focused session. Fire-and-forget.
+    fn report_seen(&self, id: &str) {
+        let client = self.client.clone();
+        let id = id.to_string();
+        tokio::spawn(async move {
+            let _ = client.mark_seen(&id).await;
         });
     }
 
@@ -4841,6 +4854,20 @@ impl App {
                             self.sessions.push(payload.session);
                             self.sessions
                                 .sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                        }
+                        // If the session that just changed is the one we're
+                        // viewing, consume its marker right away — covers a stop
+                        // that lands while it's focused and re-asserts focus
+                        // after a daemon restart.
+                        if self.selection.session_id() == Some(id.as_str())
+                            && self
+                                .sessions
+                                .iter()
+                                .find(|s| s.id == id)
+                                .map(|s| s.needs_attention)
+                                .unwrap_or(false)
+                        {
+                            self.report_seen(&id);
                         }
                         self.refresh_orchestrator_id();
                         // Newly pinned PTY session: bootstrap so its tile
@@ -12081,6 +12108,7 @@ mod tests {
             kind,
             archived: false,
             operator_loop_disabled: false,
+            needs_attention: false,
         }
     }
 

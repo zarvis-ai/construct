@@ -365,6 +365,8 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             rows: 30,
         }),
         status_detail: Some(format!("{label} (interactive)")),
+        // Full-screen TUI: holds the foreground group; use daemon quiescence.
+        detect_prompt_via_pgroup: false,
     };
 
     let cwd = PathBuf::from(&params.cwd);

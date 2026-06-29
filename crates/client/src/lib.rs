@@ -622,6 +622,18 @@ impl Client {
             .await?;
         Ok(())
     }
+    /// Clear a session's `needs_attention` marker and mark it focused.
+    pub async fn mark_seen(&self, id: &str) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_MARK_SEEN,
+                &SessionIdParams {
+                    session_id: id.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
     pub async fn set_title(&self, id: &str, title: Option<String>) -> Result<()> {
         let _: serde_json::Value = self
             .request(

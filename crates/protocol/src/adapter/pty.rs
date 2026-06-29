@@ -11,6 +11,7 @@ use crate::{PtySize, SessionEvent, SessionState};
 use portable_pty::{native_pty_system, CommandBuilder};
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 const READ_BUF: usize = 8 * 1024;
@@ -24,6 +25,13 @@ pub struct PtySpec {
     pub size: PtySize,
     /// Free-form label that's emitted in the initial Status event's `detail`.
     pub status_detail: Option<String>,
+    /// Detect prompt-vs-busy from the PTY's foreground process group: when the
+    /// terminal's foreground group is the child's own group the child is at its
+    /// prompt (`AwaitingInput`); when a launched command holds the foreground a
+    /// command is `Running`. Only meaningful for line-oriented shells — a
+    /// full-screen TUI child holds the foreground group for its whole lifetime,
+    /// so leave this `false` for those and rely on daemon-side quiescence.
+    pub detect_prompt_via_pgroup: bool,
 }
 
 /// Drive a PTY-backed session. Emits `Status(Running)` → byte stream
@@ -84,6 +92,9 @@ pub async fn run_session(spec: PtySpec, ctx: AdapterContext) -> i32 {
     };
 
     let mut killer = child.clone_killer();
+    // Captured for foreground-process-group prompt detection. portable-pty puts
+    // the child in its own session/group as leader, so its pid is its pgid.
+    let child_pid = child.process_id();
     let master = pair.master;
     let slave = pair.slave;
 
@@ -147,6 +158,14 @@ pub async fn run_session(spec: PtySpec, ctx: AdapterContext) -> i32 {
         detail: spec.status_detail.clone(),
     });
 
+    // Foreground-process-group prompt detection (shells only). When the
+    // terminal's foreground group is the child's own group the shell is at its
+    // prompt (AwaitingInput); a launched command's group means Running. The
+    // first tick fires ~immediately, reflecting the freshly-spawned prompt.
+    let mut pgrp_timer = tokio::time::interval(Duration::from_millis(400));
+    pgrp_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut pgrp_state: Option<SessionState> = None;
+
     let mut read_closed = false;
     let mut inbox_closed = false;
     let exit_code: i32;
@@ -187,6 +206,18 @@ pub async fn run_session(spec: PtySpec, ctx: AdapterContext) -> i32 {
                     Some(AdapterInboxMsg::ToolDecision { .. })
                     | Some(AdapterInboxMsg::SetApprovalMode(_))
                     | Some(AdapterInboxMsg::ToolAction { .. }) => {}
+                }
+            }
+            _ = pgrp_timer.tick(), if spec.detect_prompt_via_pgroup => {
+                let desired = match (master.process_group_leader(), child_pid) {
+                    (Some(fg), Some(pid)) if fg == pid as i32 => SessionState::AwaitingInput,
+                    (Some(_), Some(_)) => SessionState::Running,
+                    // Unknown (race during spawn/exit) → don't flip.
+                    _ => continue,
+                };
+                if pgrp_state != Some(desired) {
+                    pgrp_state = Some(desired);
+                    emit.emit(SessionEvent::Status { state: desired, detail: None });
                 }
             }
             res = &mut wait_handle => {

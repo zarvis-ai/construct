@@ -359,7 +359,8 @@ async fn main() -> Result<()> {
             }
             for s in list {
                 println!(
-                    "{glyph} {id}  {harness:<7}  {state:<14}  {cwd}{title}",
+                    "{marker}{glyph} {id}  {harness:<7}  {state:<14}  {cwd}{title}",
+                    marker = if s.needs_attention { "● " } else { "  " },
                     glyph = s.state.glyph(),
                     id = &s.id[..s.id.len().min(10)],
                     harness = s.harness,

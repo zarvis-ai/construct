@@ -1347,9 +1347,12 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         indent_prefix.chars().count() + usize::from(expand_glyph.is_some()) + 1 + 3;
                     let harness = harness_label(s);
                     let harness_w = harness.chars().count();
+                    // Reserve room for the trailing unblock marker (" ●") so the
+                    // right-aligned harness label doesn't shift when it shows.
+                    let marker_w = if s.needs_attention && !s.archived { 2 } else { 0 };
                     // Always leave at least one cell of gap between the name
                     // and the right-aligned harness.
-                    let name_avail = row_w.saturating_sub(prefix_w + 1 + harness_w);
+                    let name_avail = row_w.saturating_sub(prefix_w + 1 + harness_w + marker_w);
                     let raw_name = primary_label(s);
                     let scroll = if is_selected && focused {
                         // ~6 chars/sec (was 5; +20% per user feedback).
@@ -1359,7 +1362,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     };
                     let name_display = fit_name(&raw_name, name_avail, scroll);
                     let name_display_w = name_display.chars().count();
-                    let gap = row_w.saturating_sub(prefix_w + name_display_w + harness_w);
+                    let gap =
+                        row_w.saturating_sub(prefix_w + name_display_w + harness_w + marker_w);
                     let gap_str: String = " ".repeat(gap);
                     // Archived sessions read as muted — they're terminated and
                     // only visible because the "show archived" toggle is on.
@@ -1384,6 +1388,12 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                             state_style(&app.theme, s.state),
                         ),
                         Span::styled(name_display, name_style),
+                        // Unblock marker: a blue dot trailing the title when the
+                        // session needs the operator (spec 0054).
+                        Span::styled(
+                            if marker_w > 0 { " ●" } else { "" }.to_string(),
+                            Style::default().fg(app.theme.info),
+                        ),
                         Span::raw(gap_str),
                         Span::styled(harness, harness_style(&app.theme)),
                     ]);
@@ -9975,6 +9985,7 @@ mod tests {
             kind: agentd_protocol::SessionKind::User,
             archived: false,
             operator_loop_disabled: false,
+            needs_attention: false,
         }
     }
 
