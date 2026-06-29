@@ -20,6 +20,14 @@ on you."
   the session is not the one the operator is currently focused on. It is
   cleared when the operator switches to (focuses) the session, and also when
   the session returns to `Running` (it is no longer waiting).
+- **The stop must follow activity the operator hasn't seen.** A session going
+  non-running only flags if genuine session activity (output, messages, tool
+  calls, a terminal event) arrived *while the session was not focused* since the
+  operator last looked. Activity in the focused session does not count — in
+  particular the operator's own keystrokes echoing at a prompt. Otherwise:
+  focus an idle session, type and clear it without submitting, switch away, and
+  the echo-then-idle would falsely flag it. This "unseen activity since seen"
+  signal is in-memory and reset whenever the operator views the session.
 - **Every harness must reach an accurate non-running state.** Harnesses that
   emit structured lifecycle events already do. Interactive PTY harnesses, which
   otherwise sit in `Running` forever, get daemon-side detection via a hybrid:

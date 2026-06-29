@@ -61,7 +61,7 @@ const PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY: Duration = Duration::from_millis(120);
 /// How long an interactive full-screen TUI harness's PTY may be silent before
 /// the daemon treats it as awaiting input. Line-oriented shells use
 /// foreground-process-group detection in the adapter and are exempt.
-const PTY_QUIESCENCE: Duration = Duration::from_secs(10);
+const PTY_QUIESCENCE: Duration = Duration::from_secs(2);
 const PROGRAM_RUN_MAX_MS: i64 = 10 * 60 * 1000;
 
 /// Whether the post-resume force-redraw should fire now: the child has
@@ -358,6 +358,13 @@ pub struct SessionEntry {
     /// size. The other client's view temporarily looks wrong until
     /// they re-engage. See `SessionManager::note_pty_activity`.
     pub pty_client_policy: std::sync::Mutex<PtyClientPolicy>,
+    /// In-memory "the session did something while you weren't looking" flag.
+    /// Set when genuine activity (PTY output, messages, tool calls, terminal
+    /// events) arrives while the session is NOT the focused one; cleared by
+    /// `mark_seen`. Gates the `needs_attention` marker so a session going idle
+    /// only flags when there was unseen activity — not from the operator's own
+    /// keystrokes echoing in a focused session. Not persisted. See spec 0054.
+    unseen_activity: AtomicBool,
 }
 
 /// Tracking state for the per-session "active client wins" PTY
@@ -980,6 +987,7 @@ impl SessionManager {
                 pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+                unseen_activity: AtomicBool::new(false),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -1941,6 +1949,7 @@ impl SessionManager {
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+            unseen_activity: AtomicBool::new(false),
         });
 
         // Record the user's initial prompt as the first transcript event so
@@ -2674,6 +2683,12 @@ impl SessionManager {
                 }
             }
             let now = Utc::now();
+            // PTY output the operator isn't looking at is unseen activity — it's
+            // what makes a later idle "need you". Output in the focused session
+            // (their own keystrokes echoing) must not count. See spec 0054.
+            if self.focused_session.lock().unwrap().as_deref() != Some(entry.id.as_str()) {
+                entry.unseen_activity.store(true, Ordering::Relaxed);
+            }
             // Track activity for the "session looks busy" signal, and undo a
             // quiescence-driven AwaitingInput the moment output resumes — so the
             // session reads as Running again and its marker clears.
@@ -2723,6 +2738,11 @@ impl SessionManager {
         // Update summary based on event semantics.
         let is_focused =
             self.focused_session.lock().unwrap().as_deref() == Some(entry.id.as_str());
+        // Genuine activity in an unfocused session is what makes a later stop
+        // "need you" — record it so the marker logic below can require it.
+        if !is_focused && event_is_unseen_activity(&event) {
+            entry.unseen_activity.store(true, Ordering::Relaxed);
+        }
         {
             let mut s = entry.summary.write().await;
             s.last_event_at = Some(now);
@@ -2797,7 +2817,10 @@ impl SessionManager {
                     SessionState::AwaitingInput
                     | SessionState::Done
                     | SessionState::Errored => {
-                        if !is_focused {
+                        // Only flag if something happened while the operator
+                        // wasn't looking — not their own input echo in a focused
+                        // session they then switched away from. See spec 0054.
+                        if !is_focused && entry.unseen_activity.load(Ordering::Relaxed) {
                             s.needs_attention = true;
                         }
                     }
@@ -3979,6 +4002,8 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        // Viewing the session also consumes any unseen activity.
+        entry.unseen_activity.store(false, Ordering::Relaxed);
         let snapshot = {
             let mut s = entry.summary.write().await;
             if !s.needs_attention {
@@ -4331,6 +4356,23 @@ fn harness_uses_quiescence(s: &SessionSummary) -> bool {
             s.harness.as_str(),
             "claude" | "codex" | "antigravity" | "grok"
         )
+}
+
+/// Events that represent genuine session activity the operator would want to
+/// see, used to gate the `needs_attention` marker (spec 0054): a session going
+/// idle only flags when one of these arrived while it wasn't the focused one.
+fn event_is_unseen_activity(e: &SessionEvent) -> bool {
+    matches!(
+        e,
+        SessionEvent::Pty { .. }
+            | SessionEvent::Message { .. }
+            | SessionEvent::Reasoning { .. }
+            | SessionEvent::ToolUse { .. }
+            | SessionEvent::ToolResult { .. }
+            | SessionEvent::Diff { .. }
+            | SessionEvent::Done { .. }
+            | SessionEvent::Error { .. }
+    )
 }
 
 fn effective_mode(params: &CreateSessionParams) -> String {
@@ -4852,6 +4894,7 @@ mod tests {
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+            unseen_activity: AtomicBool::new(false),
         })
     }
 
@@ -5613,6 +5656,7 @@ mod tests {
             pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+            unseen_activity: AtomicBool::new(false),
         });
         manager
             .sessions
@@ -5688,8 +5732,9 @@ mod tests {
     }
 
     /// The `needs_attention` marker tracks "this session needs you": raised when
-    /// a session leaves `Running` while unfocused, cleared by `mark_seen` or a
-    /// return to `Running`, and suppressed for the focused session. Spec 0054.
+    /// a session with unseen activity leaves `Running` while unfocused, cleared
+    /// by `mark_seen` or a return to `Running`, suppressed for the focused
+    /// session. Spec 0054.
     #[tokio::test]
     async fn needs_attention_marker_lifecycle() {
         use tempfile::tempdir;
@@ -5723,6 +5768,7 @@ mod tests {
                 pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+                unseen_activity: AtomicBool::new(false),
             })
         };
 
@@ -5742,8 +5788,15 @@ mod tests {
             state: SessionState::Running,
             detail: None,
         };
+        // Genuine agent output — what the marker requires before a stop counts
+        // as "needs you".
+        let content = || SessionEvent::Message {
+            role: agentd_protocol::MessageRole::Assistant,
+            text: "out".into(),
+        };
 
-        // Leaving Running while unfocused raises the marker.
+        // Unfocused activity + leaving Running raises the marker.
+        manager.handle_event(&entry, content()).await;
         manager.handle_event(&entry, awaiting()).await;
         assert!(
             entry.summary.read().await.needs_attention,
@@ -5762,8 +5815,10 @@ mod tests {
             "the focused session must stay quiet when it stops",
         );
 
-        // Focus moves elsewhere → the next stop raises the marker again.
+        // Focus moves elsewhere → fresh unfocused activity + the next stop
+        // raises the marker again.
         manager.mark_seen("other").await.expect("mark_seen other");
+        manager.handle_event(&entry, content()).await;
         manager.handle_event(&entry, running()).await;
         manager.handle_event(&entry, awaiting()).await;
         assert!(
@@ -5783,6 +5838,82 @@ mod tests {
             .handle_event(&entry, SessionEvent::Done { exit_code: 0 })
             .await;
         assert!(entry.summary.read().await.needs_attention);
+    }
+
+    /// Regression: focusing an inactive interactive session, typing at its
+    /// prompt (PTY echo) then switching away without submitting must NOT raise
+    /// the marker when quiescence later flips it back to AwaitingInput — the
+    /// only activity was the operator's own keystrokes while looking. Spec 0054.
+    #[tokio::test]
+    async fn marker_ignores_own_typing_in_focused_session() {
+        use tempfile::tempdir;
+        use tokio::sync::RwLock;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        let manager = Arc::new(mgr);
+
+        let build = |id: &str, state: SessionState| {
+            let mut summary =
+                placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            summary.harness = "claude".into();
+            summary.has_pty = true;
+            summary.state = state;
+            Arc::new(SessionEntry {
+                id: id.to_string(),
+                summary: RwLock::new(summary),
+                transcript_count: AtomicU64::new(0),
+                adapter: tokio::sync::Mutex::new(None),
+                pty: tokio::sync::Mutex::new(PtyState::default()),
+                deleted: AtomicBool::new(false),
+                archived: AtomicBool::new(false),
+                title_gen_attempted: AtomicBool::new(false),
+                pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+                tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+                pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+                unseen_activity: AtomicBool::new(false),
+            })
+        };
+
+        // An inactive interactive session (at its prompt) plus somewhere to go.
+        let s = build("s", SessionState::AwaitingInput);
+        let other = build("other", SessionState::Running);
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert("s".into(), s.clone());
+            sessions.insert("other".into(), other.clone());
+        }
+
+        // Focus it, then type at the prompt (PTY echo while focused). The echo
+        // flips it to Running (busy look) but is NOT unseen activity.
+        manager.mark_seen("s").await.expect("mark_seen s");
+        manager.handle_event(&s, SessionEvent::pty(b"sleep 30")).await;
+        assert_eq!(s.summary.read().await.state, SessionState::Running);
+
+        // Switch away without submitting.
+        manager.mark_seen("other").await.expect("mark_seen other");
+
+        // The quiescence sweep flips it back to AwaitingInput.
+        manager
+            .handle_event(
+                &s,
+                SessionEvent::Status {
+                    state: SessionState::AwaitingInput,
+                    detail: None,
+                },
+            )
+            .await;
+
+        assert!(
+            !s.summary.read().await.needs_attention,
+            "own keystrokes in a focused session must not raise the marker on idle",
+        );
     }
 
     fn create_params(mode: Option<&str>, pty: Option<PtySize>) -> CreateSessionParams {
