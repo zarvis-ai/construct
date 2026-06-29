@@ -26,7 +26,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 mod program_run;
+mod groups;
 mod widgets;
+mod pty;
 
 const BROADCAST_CAP: usize = 4096;
 const ADAPTER_DRAIN_CAP: usize = 256;
@@ -224,82 +226,6 @@ fn position_after_visible_session(
         position: source.position.saturating_add(1),
         updates: Vec::new(),
     })
-}
-
-/// Returns the `group_id` of the region immediately above the given region
-/// in display order. `Some(None)` = ungrouped; `Some(Some(id))` = group N-1.
-/// `None` = there is nothing above (ungrouped is already at the top).
-fn region_above(region: Option<&str>, groups: &[GroupSummary]) -> Option<Option<String>> {
-    match region {
-        None => None,
-        Some(id) => {
-            let idx = groups.iter().position(|g| g.id == id)?;
-            if idx == 0 {
-                Some(None)
-            } else {
-                Some(Some(groups[idx - 1].id.clone()))
-            }
-        }
-    }
-}
-
-/// Returns the `group_id` of the region immediately below the given region
-/// in display order. `Some(Some(id))` = next group. `None` = nothing below.
-fn region_below(region: Option<&str>, groups: &[GroupSummary]) -> Option<Option<String>> {
-    match region {
-        None => groups.first().map(|g| Some(g.id.clone())),
-        Some(id) => {
-            let idx = groups.iter().position(|g| g.id == id)?;
-            groups.get(idx + 1).map(|g| Some(g.id.clone()))
-        }
-    }
-}
-
-/// True if the group `id` exists and is currently collapsed.
-fn group_collapsed(id: &str, groups: &[GroupSummary]) -> bool {
-    groups
-        .iter()
-        .find(|g| g.id == id)
-        .map(|g| g.collapsed)
-        .unwrap_or(false)
-}
-
-/// Like [`region_above`], but skips over collapsed groups. A collapsed
-/// project hides its member sessions, so reordering a visible session past it
-/// should jump the entire project in one step rather than swapping with each
-/// hidden member. Returns the first non-collapsed region above (the ungrouped
-/// region is never collapsed), or `None` if there is nothing above.
-fn region_above_skipping_collapsed(
-    region: Option<&str>,
-    groups: &[GroupSummary],
-) -> Option<Option<String>> {
-    let mut target = region_above(region, groups);
-    loop {
-        match target {
-            Some(Some(gid)) if group_collapsed(&gid, groups) => {
-                target = region_above(Some(gid.as_str()), groups);
-            }
-            other => return other,
-        }
-    }
-}
-
-/// Like [`region_below`], but skips over collapsed groups so a reorder jumps
-/// the whole collapsed project in one step. See
-/// [`region_above_skipping_collapsed`].
-fn region_below_skipping_collapsed(
-    region: Option<&str>,
-    groups: &[GroupSummary],
-) -> Option<Option<String>> {
-    let mut target = region_below(region, groups);
-    loop {
-        match target {
-            Some(Some(gid)) if group_collapsed(&gid, groups) => {
-                target = region_below(Some(gid.as_str()), groups);
-            }
-            other => return other,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -2997,275 +2923,6 @@ impl SessionManager {
         });
     }
 
-    pub async fn pty_input(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
-        self.pty_input_inner(id, bytes, true).await
-    }
-
-    async fn pty_input_without_capture(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
-        self.pty_input_inner(id, bytes, false).await
-    }
-
-    async fn program_submit_typed_prompt(&self, id: &str, prompt: &str) -> Result<()> {
-        // Deliver the prompt as a bracketed paste (`ESC[200~` … `ESC[201~`)
-        // rather than raw keystrokes. External agent TUIs (claude/codex/
-        // antigravity) enable DEC mode 2004 and only run their multiline
-        // guard on a real bracketed paste: framed this way they buffer the
-        // whole multi-line body as one input instead of submitting on the
-        // first embedded newline. Crucially the `ESC[201~` end marker tells
-        // the harness exactly where the paste stops, so the Enter we send
-        // afterward is read as a submit keypress — without it the prompt
-        // landed in the input box but never submitted.
-        self.pty_input_without_capture(id, program_bracketed_paste_bytes(prompt))
-            .await?;
-        tokio::time::sleep(PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY).await;
-        self.pty_input_without_capture(id, vec![b'\r']).await?;
-        Ok(())
-    }
-
-    async fn pty_input_inner(&self, id: &str, bytes: Vec<u8>, capture: bool) -> Result<()> {
-        let entry = self
-            .get_entry(id)
-            .await
-            .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        // Capture submitted PTY lines before forwarding them. Some interactive
-        // harnesses do not echo user text as structured `Message` events, so
-        // chat-mode transcript history otherwise loses those turns.
-        if capture {
-            let input_lines = self.capture_pty_input_lines(&entry, &bytes).await;
-            let harness = entry.summary.read().await.harness.clone();
-            for line in input_lines {
-                if should_record_pty_user_message(&harness) {
-                    self.handle_event(
-                        &entry,
-                        SessionEvent::Message {
-                            role: MessageRole::User,
-                            text: line,
-                        },
-                    )
-                    .await;
-                } else if !entry.title_gen_attempted.load(Ordering::SeqCst)
-                    && line.chars().count() >= 2
-                {
-                    self.maybe_spawn_auto_title(entry.clone(), line);
-                }
-            }
-        }
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionPtyInputParams::from_bytes(
-            id, &bytes,
-        ))?;
-        adapter
-            .request(ahp_method::SESSION_PTY_INPUT, params)
-            .await?;
-        Ok(())
-    }
-
-    /// Feed PTY-input bytes through a minimal terminal-input parser (printable
-    /// ASCII + backspace + CR/LF; CSI/SS3 sequences skipped) and return every
-    /// submitted non-empty line. The parser is intentionally small: it is for
-    /// transcript/user-title capture, not full terminal editing semantics.
-    async fn capture_pty_input_lines(
-        &self,
-        entry: &Arc<SessionEntry>,
-        bytes: &[u8],
-    ) -> Vec<String> {
-        let mut cap = entry.pty_input_capture.lock().await;
-        let mut lines = Vec::new();
-        for &b in bytes {
-            match cap.esc {
-                0 => match b {
-                    b'\n' if cap.last_was_cr => {
-                        cap.last_was_cr = false;
-                    }
-                    b'\r' | b'\n' => {
-                        let s = cap.buf.trim().to_string();
-                        cap.last_was_cr = b == b'\r';
-                        cap.buf.clear();
-                        if s.chars().count() >= 2 {
-                            lines.push(s);
-                        }
-                    }
-                    0x1b => cap.esc = 1,
-                    0x08 | 0x7f => {
-                        cap.last_was_cr = false;
-                        cap.buf.pop();
-                    }
-                    _ if (0x20..0x7f).contains(&b) => {
-                        cap.last_was_cr = false;
-                        cap.buf.push(b as char);
-                    }
-                    _ => {
-                        cap.last_was_cr = false;
-                    }
-                },
-                1 => match b {
-                    b'[' => cap.esc = 2,
-                    b'O' => cap.esc = 3,
-                    _ => cap.esc = 0,
-                },
-                2 => {
-                    // CSI: parameter bytes + final byte in `@`..=`~`.
-                    if (0x40..=0x7e).contains(&b) {
-                        cap.esc = 0;
-                    }
-                }
-                3 => {
-                    // SS3: one byte.
-                    cap.esc = 0;
-                }
-                _ => cap.esc = 0,
-            }
-        }
-        lines
-    }
-
-    /// Record that a given client kind just acted on a session's
-    /// PTY (typed input or sent a resize). Updates the kind's
-    /// last-known viewport (if `resize_to` was supplied), flips
-    /// `last_active` to that kind, and — if the kind switched
-    /// since last time — issues a `pty_resize` to match the kind's
-    /// stored viewport. No-op when only one kind is attached.
-    ///
-    /// This is the daemon-side half of the "active client wins"
-    /// PTY-size policy. The complementary half lives in
-    /// `server::dispatch`'s `SESSION_PTY_INPUT` and
-    /// `SESSION_PTY_RESIZE` arms, which call this method before
-    /// forwarding the actual request to the PTY.
-    pub async fn note_pty_activity(
-        self: &Arc<Self>,
-        id: &str,
-        kind: crate::server::ClientKind,
-        resize_to: Option<(u16, u16)>,
-    ) {
-        let Some(entry) = self.get_entry(id).await else {
-            return;
-        };
-        let to_apply = {
-            let mut policy = entry
-                .pty_client_policy
-                .lock()
-                .expect("pty_client_policy mutex poisoned");
-            if let Some(sz) = resize_to {
-                match kind {
-                    crate::server::ClientKind::Tui => policy.tui_size = Some(sz),
-                    crate::server::ClientKind::Remote => policy.remote_size = Some(sz),
-                }
-            }
-            let switched = policy.last_active != Some(kind);
-            policy.last_active = Some(kind);
-            // Only re-resize on a *switch*, or when this call was
-            // itself a pty_resize. Plain pty_input from the same
-            // kind that's already active is a no-op for the size
-            // policy (the per-call pty_resize handler still runs
-            // separately).
-            if switched || resize_to.is_some() {
-                match kind {
-                    crate::server::ClientKind::Tui => policy.tui_size,
-                    crate::server::ClientKind::Remote => policy.remote_size,
-                }
-            } else {
-                None
-            }
-        };
-        if let Some((cols, rows)) = to_apply {
-            // Best-effort. The pty_resize dedup inside
-            // `SessionManager::pty_resize` handles the case where
-            // the OS PTY is already at this size.
-            if let Err(e) = self.pty_resize(id, cols, rows).await {
-                tracing::debug!(session = %id, error = %e, "policy-driven pty_resize failed");
-            }
-        }
-    }
-
-    pub async fn pty_resize(&self, id: &str, cols: u16, rows: u16) -> Result<()> {
-        let entry = self
-            .get_entry(id)
-            .await
-            .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let size = PtySize { cols, rows };
-        // Dedup: if the adapter's PTY is already at this size, skip
-        // the SIGWINCH. A no-op resize on a normal-screen TUI like
-        // codex still causes the child to redraw its viewport (which
-        // for codex means re-emitting its full transcript), so every
-        // spurious resize looks like a "history replay" to the user.
-        // Sources of spurious resizes: TUI bootstrap calling
-        // `pty_resize` with the same dims it already sent, and
-        // multiple SIGWINCH'd frames during a terminal-window drag
-        // that all land on the same final size.
-        {
-            let mut pty = entry.pty.lock().await;
-            if pty.size == Some(size) {
-                return Ok(());
-            }
-            pty.size = Some(size);
-        }
-        // Cache the size so the next daemon respawn can re-spawn the
-        // adapter's PTY at the right dimensions from the start.
-        if let Err(e) = self.storage.save_pty_size(id, size) {
-            tracing::warn!(session = %id, error = ?e, "save_pty_size failed");
-        }
-        // Tell other attached clients the new geometry (transient, not
-        // persisted) so a passive viewer (e.g. a narrower web terminal) can
-        // render at the real width instead of wrapping. Only fires on an
-        // actual change — the dedup above already returned for a no-op.
-        self.broadcast_widget_event(id, SessionEvent::PtyResize { cols, rows });
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionPtyResizeParams {
-            session_id: id.to_string(),
-            cols,
-            rows,
-        })?;
-        adapter
-            .request(ahp_method::SESSION_PTY_RESIZE, params)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn pty_replay(&self, id: &str) -> Result<PtyReplayResult> {
-        self.pty_replay_range(id, None, None).await
-    }
-
-    pub async fn pty_replay_range(
-        &self,
-        id: &str,
-        max_bytes: Option<usize>,
-        before_offset: Option<u64>,
-    ) -> Result<PtyReplayResult> {
-        use base64::Engine;
-        let entry = self
-            .get_entry(id)
-            .await
-            .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let size = entry.pty.lock().await.size;
-        // Pull scrollback from the on-disk `pty.log`, not the (now-removed)
-        // in-memory ring. Requests are capped by `PTY_REPLAY_CAP`; clients can
-        // ask for older adjacent ranges and replay their local chunks in order.
-        let requested = max_bytes.unwrap_or(PTY_REPLAY_CAP).min(PTY_REPLAY_CAP);
-        let (bytes, start_offset, end_offset, total_bytes) = self
-            .storage
-            .read_pty_range_before(id, requested, before_offset)
-            .unwrap_or_else(|e| {
-                tracing::warn!(session = %id, error = ?e, "pty_log range read failed");
-                (Vec::new(), 0, 0, 0)
-            });
-        Ok(PtyReplayResult {
-            data: base64::engine::general_purpose::STANDARD.encode(bytes),
-            start_offset,
-            end_offset,
-            total_bytes,
-            size,
-        })
-    }
 
     pub async fn interrupt(&self, id: &str) -> Result<()> {
         let entry = self
@@ -3552,7 +3209,8 @@ impl SessionManager {
                 }
                 // At top of region — try to exit into the previous region,
                 // skipping collapsed projects.
-                let prev = region_above_skipping_collapsed(me.group_id.as_deref(), &all_groups);
+                let prev =
+                    groups::region_above_skipping_collapsed(me.group_id.as_deref(), &all_groups);
                 let Some(prev_region) = prev else {
                     return Ok(());
                 };
@@ -3571,7 +3229,8 @@ impl SessionManager {
                 }
                 // At bottom of region — try to enter the next region,
                 // skipping collapsed projects.
-                let next = region_below_skipping_collapsed(me.group_id.as_deref(), &all_groups);
+                let next =
+                    groups::region_below_skipping_collapsed(me.group_id.as_deref(), &all_groups);
                 let Some(next_region) = next else {
                     return Ok(());
                 };
@@ -3617,290 +3276,6 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Re-tag a session into a new region (group_id) and set its position
-    /// so it lands at the top or bottom of that region.
-    /// Public wrapper around [`move_session_into_region`] for clients
-    /// that want to change a session's group membership (or ungroup
-    /// it) without first having to fetch the sessions list themselves.
-    pub async fn set_session_group(
-        &self,
-        session_id: &str,
-        new_group_id: Option<String>,
-        position: agentd_protocol::SessionGroupPosition,
-    ) -> Result<()> {
-        let all_sessions = self.list().await;
-        let edge = match position {
-            agentd_protocol::SessionGroupPosition::Top => RegionEdge::Top,
-            agentd_protocol::SessionGroupPosition::Bottom => RegionEdge::Bottom,
-        };
-        self.move_session_into_region(session_id, &new_group_id, edge, &all_sessions)
-            .await
-    }
-
-    async fn move_session_into_region(
-        &self,
-        session_id: &str,
-        new_group_id: &Option<String>,
-        edge: RegionEdge,
-        all_sessions: &[SessionSummary],
-    ) -> Result<()> {
-        // Pick a position that puts us at the requested edge of the region.
-        let region_positions: Vec<i64> = all_sessions
-            .iter()
-            .filter(|s| s.id != session_id && s.group_id == *new_group_id)
-            .map(|s| s.position)
-            .collect();
-        let new_pos = match edge {
-            RegionEdge::Top => {
-                let min = region_positions.iter().min().copied().unwrap_or(0);
-                min - 1
-            }
-            RegionEdge::Bottom => {
-                let max = region_positions.iter().max().copied().unwrap_or(0);
-                max + 1
-            }
-        };
-
-        let entry = self
-            .get_entry(session_id)
-            .await
-            .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
-        let snapshot = {
-            let mut s = entry.summary.write().await;
-            s.group_id = new_group_id.clone();
-            s.position = new_pos;
-            s.clone()
-        };
-        self.storage.save_summary(&snapshot)?;
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::State(StateNotificationPayload {
-                session: snapshot,
-            }));
-        Ok(())
-    }
-
-    // ----- Groups -----
-
-    pub async fn list_groups(&self) -> Vec<GroupSummary> {
-        let guard = self.groups.read().await;
-        let mut out = Vec::with_capacity(guard.len());
-        for entry in guard.values() {
-            out.push(entry.summary().await);
-        }
-        out.sort_by_key(|g| g.position);
-        out
-    }
-
-    pub async fn create_group(&self, name: String) -> Result<String> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(anyhow!("group name is empty"));
-        }
-        let id = format!("g{}", uuid::Uuid::new_v4().simple());
-        let now = Utc::now();
-        let summary = GroupSummary {
-            id: id.clone(),
-            name: name.to_string(),
-            created_at: now,
-            position: -now.timestamp_millis(),
-            collapsed: false,
-        };
-        self.storage.save_group(&summary)?;
-        self.groups.write().await.insert(
-            id.clone(),
-            Arc::new(GroupEntry {
-                summary: RwLock::new(summary.clone()),
-            }),
-        );
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
-                group: summary,
-            }));
-        Ok(id)
-    }
-
-    pub async fn rename_group(&self, id: &str, name: String) -> Result<()> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(anyhow!("group name is empty"));
-        }
-        let entry = self
-            .groups
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("group not found: {}", id))?;
-        let snapshot = {
-            let mut s = entry.summary.write().await;
-            s.name = name.to_string();
-            s.clone()
-        };
-        self.storage.save_group(&snapshot)?;
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
-                group: snapshot,
-            }));
-        Ok(())
-    }
-
-    pub async fn set_group_collapsed(&self, id: &str, collapsed: bool) -> Result<()> {
-        let entry = self
-            .groups
-            .read()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| anyhow!("group not found: {}", id))?;
-        let snapshot = {
-            let mut s = entry.summary.write().await;
-            s.collapsed = collapsed;
-            s.clone()
-        };
-        self.storage.save_group(&snapshot)?;
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
-                group: snapshot,
-            }));
-        Ok(())
-    }
-
-    /// Delete a group. When `delete_members` is false (default), member
-    /// sessions are orphaned: their `group_id` clears to `None` and they
-    /// survive. When true, every member session is fully deleted first
-    /// (adapter killed, on-disk session dir removed, worktree torn down)
-    /// before the group itself is removed.
-    pub async fn delete_group(&self, id: &str, delete_members: bool) -> Result<()> {
-        // Collect member ids BEFORE we drop the group entry so we don't
-        // race with a concurrent set_session_group that might re-parent
-        // them under a different group while we're working.
-        let member_ids: Vec<String> = {
-            let sessions = self.sessions.read().await;
-            let mut ids = Vec::new();
-            for (sid, entry) in sessions.iter() {
-                let s = entry.summary.read().await;
-                if s.group_id.as_deref() == Some(id) {
-                    ids.push(sid.clone());
-                }
-            }
-            ids
-        };
-
-        let entry = self.groups.write().await.remove(id);
-        if entry.is_none() {
-            return Err(anyhow!("group not found: {}", id));
-        }
-
-        if delete_members {
-            // Cascade-delete: tear down each member session. Errors are
-            // logged but don't abort the cascade — a single broken
-            // session shouldn't strand the rest in a now-missing group.
-            for sid in &member_ids {
-                if let Err(e) = self.delete(sid).await {
-                    tracing::warn!(
-                        group = %id,
-                        session = %sid,
-                        error = %e,
-                        "group cascade-delete: member delete failed",
-                    );
-                }
-            }
-        } else {
-            // Orphan members: clear their group_id and rebroadcast.
-            for sid in &member_ids {
-                let Some(s_entry) = self.sessions.read().await.get(sid).cloned() else {
-                    continue;
-                };
-                let snapshot = {
-                    let mut s = s_entry.summary.write().await;
-                    s.group_id = None;
-                    s.clone()
-                };
-                let _ = self.storage.save_summary(&snapshot);
-                let _ = self
-                    .broadcast
-                    .send(BroadcastMsg::State(StateNotificationPayload {
-                        session: snapshot,
-                    }));
-            }
-        }
-        let _ = self.storage.remove_group(id);
-        let _ = self.broadcast.send(BroadcastMsg::GroupDeleted(
-            GroupDeletedNotificationPayload {
-                group_id: id.to_string(),
-            },
-        ));
-        Ok(())
-    }
-
-    /// Swap a group's position with its neighbor in the requested direction.
-    /// No-op at the edges.
-    pub async fn move_group(&self, id: &str, dir: MoveDirection) -> Result<()> {
-        let groups = self.list_groups().await; // sorted by position
-        let idx = groups
-            .iter()
-            .position(|g| g.id == id)
-            .ok_or_else(|| anyhow!("group not found: {}", id))?;
-        let neighbor_idx = match dir {
-            MoveDirection::Up => {
-                if idx == 0 {
-                    return Ok(());
-                }
-                idx - 1
-            }
-            MoveDirection::Down => {
-                if idx + 1 >= groups.len() {
-                    return Ok(());
-                }
-                idx + 1
-            }
-        };
-        let a_id = groups[idx].id.clone();
-        let b_id = groups[neighbor_idx].id.clone();
-        let a_pos = groups[idx].position;
-        let b_pos = groups[neighbor_idx].position;
-        let entry_a = self
-            .groups
-            .read()
-            .await
-            .get(&a_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("group missing"))?;
-        let entry_b = self
-            .groups
-            .read()
-            .await
-            .get(&b_id)
-            .cloned()
-            .ok_or_else(|| anyhow!("group missing"))?;
-        let snap_a = {
-            let mut s = entry_a.summary.write().await;
-            s.position = b_pos;
-            s.clone()
-        };
-        let snap_b = {
-            let mut s = entry_b.summary.write().await;
-            s.position = a_pos;
-            s.clone()
-        };
-        self.storage.save_group(&snap_a)?;
-        self.storage.save_group(&snap_b)?;
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
-                group: snap_a,
-            }));
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::GroupState(GroupStateNotificationPayload {
-                group: snap_b,
-            }));
-        Ok(())
-    }
 
     pub async fn set_title(&self, id: &str, title: Option<String>) -> Result<()> {
         let entry = self
@@ -4478,14 +3853,6 @@ mod tests {
         assert_eq!(extension_for_attachment(None, None, b"hello"), "txt");
     }
 
-    fn pty_caps() -> Capabilities {
-        Capabilities {
-            supports_pty: true,
-            supports_silent_resume: false,
-            ..Default::default()
-        }
-    }
-
     fn placement_summary(
         id: &str,
         position: i64,
@@ -4725,7 +4092,7 @@ mod tests {
     /// The respawn path must schedule a bump+restore for these.
     #[test]
     fn force_redraw_runs_for_pty_adapters_with_cached_size() {
-        let caps = pty_caps();
+        let caps = pty::pty_caps();
         let size = Some(PtySize {
             cols: 160,
             rows: 50,
@@ -4747,7 +4114,7 @@ mod tests {
     /// stored cursor.
     #[test]
     fn force_redraw_skipped_for_silent_resume_adapters() {
-        let mut caps = pty_caps();
+        let mut caps = pty::pty_caps();
         caps.supports_silent_resume = true;
         let size = Some(PtySize {
             cols: 160,
@@ -4761,7 +4128,7 @@ mod tests {
     /// The TUI's normal first-render pty_resize handles sizing.
     #[test]
     fn force_redraw_skipped_without_cached_size() {
-        let caps = pty_caps();
+        let caps = pty::pty_caps();
         assert_eq!(force_redraw_size_on_resume(&caps, None), None);
     }
 
@@ -4818,7 +4185,7 @@ mod tests {
     /// to `ioctl(TIOCSWINSZ)` — skip instead of forwarding garbage.
     #[test]
     fn force_redraw_skipped_for_degenerate_size() {
-        let caps = pty_caps();
+        let caps = pty::pty_caps();
         assert_eq!(
             force_redraw_size_on_resume(&caps, Some(PtySize { cols: 0, rows: 50 })),
             None
