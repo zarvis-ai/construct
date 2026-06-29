@@ -11,7 +11,7 @@ Program-block shimmer is a **declared per-block state addressed by a stable, con
 
 Definitions:
 
-- A **block** is a maximal run of consecutive non-blank Markdown lines (the same unit as `0042-program-run-progress-affordance`).
+- A **block** is a run of non-blank Markdown lines split at heading and list-item boundaries: each heading line, each list item (with its wrapped continuation lines), and each plain paragraph is its own block. A section of consecutive task items is therefore many blocks, not one — so an individual item can be declared pending or settled without disturbing its siblings, even when the items are written with no blank lines between them. (The same unit as `0042-program-run-progress-affordance`.)
 - A block's **id** is derived deterministically from its normalized content (its trimmed lines joined by newline). The id is **stable against position** — reordering, insertion or removal of other blocks, structural shifts, and concurrent edits elsewhere in the document all leave it unchanged. It is **not stable against editing the block's own content** (changing the text changes the id), and **two blocks with identical normalized content share one id** and therefore one shimmer state.
 
 Shimmer is carried across the four program surfaces as follows:

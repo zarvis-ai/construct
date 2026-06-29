@@ -6622,6 +6622,61 @@ mod tests {
         assert!(!shim("# Tasks"), "the settled heading stays settled");
     }
 
+    // Finer block granularity: a section of consecutive list items (no blank
+    // lines between them) is many blocks, so one item can settle while its
+    // siblings keep shimmering — and the heading is its own block too.
+    #[tokio::test]
+    async fn program_consecutive_items_shimmer_independently() {
+        let md = "# In progress\n* task A\n* task B\n* task C\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let g = mgr.program_get(&id).await.expect("get");
+        // Each line is its own block: heading + three items.
+        assert_eq!(g.blocks.len(), 4, "section splits into heading + 3 items");
+        let id_of = |n: &str| g.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone();
+        // Planning pass: settle the heading, keep all three items pending.
+        mgr.program_edit(ProgramEditParams {
+            session_id: id.clone(),
+            edits: vec![agentd_protocol::ProgramEdit {
+                old_string: "# In progress".into(),
+                new_string: "# In progress".into(),
+                replace_all: false,
+                keep_pending: false,
+            }],
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            note: None,
+            shimmer: vec![
+                agentd_protocol::ProgramShimmerDecl { id: id_of("# In progress"), shimmer: false },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("task A"), shimmer: true },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("task B"), shimmer: true },
+                agentd_protocol::ProgramShimmerDecl { id: id_of("task C"), shimmer: true },
+            ],
+        })
+        .await
+        .expect("planning");
+        // Settle ONLY task B (its work finished) — A and C must keep shimmering.
+        let res = mgr
+            .program_edit(ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: "# In progress".into(),
+                    new_string: "# In progress".into(),
+                    replace_all: false,
+                    keep_pending: false,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                note: None,
+                shimmer: vec![agentd_protocol::ProgramShimmerDecl { id: id_of("task B"), shimmer: false }],
+            })
+            .await
+            .expect("settle B");
+        let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
+        assert!(!shim("# In progress"), "heading is its own settled block");
+        assert!(shim("task A"), "task A keeps shimmering");
+        assert!(!shim("task B"), "only task B settled");
+        assert!(shim("task C"), "task C keeps shimmering");
+    }
+
     // An empty managed run is reaped when the owning session goes idle, so an
     // empty record does not linger to the backstop — and a later declaration no
     // longer revives it (contrast with the mid-turn survival above).

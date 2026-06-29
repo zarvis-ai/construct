@@ -14077,35 +14077,38 @@ mod tests {
     }
 
     #[test]
-    fn program_blocks_split_on_blank_lines() {
+    fn program_blocks_split_heading_and_each_item() {
+        // Heading + two consecutive items + a second heading → four blocks, so
+        // each item shimmers independently of its siblings and the heading.
         let md = "# Todo\n- a\n- b\n\n# Done\n";
         let blocks = program_blocks(md);
-        assert_eq!(blocks.len(), 2);
-        // First block spans source lines 0..3 ("# Todo", "- a", "- b").
-        assert_eq!((blocks[0].start_line, blocks[0].end_line), (0, 3));
-        // Second block is the "# Done" heading after the blank line.
-        assert_eq!(blocks[1].start_line, 4);
-        // Block identity (signature → id) is owned by the shared protocol parser.
+        assert_eq!(blocks.len(), 4);
+        assert_eq!((blocks[0].start_line, blocks[0].end_line), (0, 1)); // # Todo
+        assert_eq!((blocks[1].start_line, blocks[1].end_line), (1, 2)); // - a
+        assert_eq!((blocks[2].start_line, blocks[2].end_line), (2, 3)); // - b
+        assert_eq!(blocks[3].start_line, 4); // # Done after blank line
         let spans = agentd_protocol::program_block_spans(md);
-        assert_eq!(spans[0].signature, "# Todo\n- a\n- b");
-        assert_eq!(spans[1].signature, "# Done");
-        assert_eq!(blocks[1].id, agentd_protocol::program_block_id("# Done"));
+        assert_eq!(spans[0].signature, "# Todo");
+        assert_eq!(spans[1].signature, "- a");
+        assert_eq!(blocks[3].id, agentd_protocol::program_block_id("# Done"));
     }
 
     #[test]
     fn program_blocks_normalize_indentation_in_signature() {
-        // Signatures trim each line so cosmetic indentation does not change a
-        // block's identity (keeps shimmer stable across whitespace-only edits).
+        // Each item is its own block; signatures trim each line so cosmetic
+        // indentation does not change identity (stable shimmer across re-indent).
         let spans = agentd_protocol::program_block_spans("  - a\n    - b\n");
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].signature, "- a\n- b");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].signature, "- a");
+        assert_eq!(spans[1].signature, "- b");
     }
 
     #[test]
     fn program_run_pending_ids_cover_each_block() {
         let ids = program_run_pending_ids("# Todo\n- a\n\n# Done\n");
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&agentd_protocol::program_block_id("# Todo\n- a")));
+        assert_eq!(ids.len(), 3);
+        assert!(ids.contains(&agentd_protocol::program_block_id("# Todo")));
+        assert!(ids.contains(&agentd_protocol::program_block_id("- a")));
         assert!(ids.contains(&agentd_protocol::program_block_id("# Done")));
         // An empty body has nothing to shimmer.
         assert!(program_run_pending_ids("   \n").is_empty());

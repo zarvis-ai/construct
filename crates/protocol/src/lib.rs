@@ -901,8 +901,12 @@ pub struct ProgramDocument {
     pub template_id: Option<String>,
 }
 
-/// A program "block": a maximal run of consecutive non-blank Markdown lines.
-/// Blocks are the unit of program-run shimmer (see specs 0042 and 0053).
+/// A program "block": the unit of program-run shimmer (see specs 0042 and
+/// 0053). A run of non-blank Markdown lines is split at heading and list-item
+/// boundaries, so each heading, each list item, and each plain paragraph is its
+/// own block — letting an individual task card shimmer or settle independently
+/// of its siblings even when written without blank lines between them. Wrapped
+/// continuation lines stay with the item or paragraph they belong to.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramBlockSpan {
     /// Source-line range `[start_line, end_line)` into `markdown.lines()`.
@@ -953,8 +957,36 @@ pub fn program_block_id(signature: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Split Markdown into ordered blocks (maximal runs of non-blank lines). The
-/// daemon uses this to compute the shimmer pending set and the per-block
+/// True if a trimmed line is a Markdown ATX heading (`#`..`######` then a space).
+fn program_is_heading(trimmed: &str) -> bool {
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ')
+}
+
+/// True if a trimmed line begins a Markdown list item: a `-`/`*`/`+` bullet
+/// (with content or as a bare empty bullet) or an ordered `N.`/`N)` marker.
+fn program_is_list_item(trimmed: &str) -> bool {
+    if trimmed == "-" || trimmed == "*" || trimmed == "+" {
+        return true;
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        return true;
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 0 {
+        let rest = &trimmed[digits..];
+        if rest.starts_with(". ") || rest.starts_with(") ") || rest == "." || rest == ")" {
+            return true;
+        }
+    }
+    false
+}
+
+/// Split Markdown into ordered blocks, finer than paragraphs: a run of non-blank
+/// lines is broken at heading and list-item boundaries so each heading, list
+/// item, and paragraph is its own block (spec 0053). Wrapped continuation lines
+/// (non-blank, non-heading, non-item) stay with the item/paragraph above them.
+/// The daemon uses this to compute the shimmer pending set and the per-block
 /// projection; clients use it to map shimmer back onto source lines. Keeping a
 /// single shared parser guarantees daemon and clients agree on block identity.
 pub fn program_block_spans(markdown: &str) -> Vec<ProgramBlockSpan> {
@@ -975,17 +1007,39 @@ pub fn program_block_spans(markdown: &str) -> Vec<ProgramBlockSpan> {
         });
     };
     for (i, line) in raw_lines.iter().enumerate() {
-        if line.trim().is_empty() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            // Blank line ends the current block.
             if let Some(s) = start.take() {
                 push(s, i, &norm, &mut blocks);
                 norm.clear();
             }
-        } else {
-            if start.is_none() {
-                start = Some(i);
-            }
-            norm.push(line.trim().to_string());
+            continue;
         }
+        if program_is_heading(trimmed) {
+            // A heading ends the current block and is a single-line block.
+            if let Some(s) = start.take() {
+                push(s, i, &norm, &mut blocks);
+                norm.clear();
+            }
+            push(i, i + 1, &[trimmed.to_string()], &mut blocks);
+            continue;
+        }
+        if program_is_list_item(trimmed) {
+            // A list item ends the current block and begins a new one.
+            if let Some(s) = start.take() {
+                push(s, i, &norm, &mut blocks);
+                norm.clear();
+            }
+            start = Some(i);
+            norm.push(trimmed.to_string());
+            continue;
+        }
+        // Continuation / paragraph line: extend the current block (or open one).
+        if start.is_none() {
+            start = Some(i);
+        }
+        norm.push(trimmed.to_string());
     }
     if let Some(s) = start {
         push(s, raw_lines.len(), &norm, &mut blocks);
@@ -1980,16 +2034,37 @@ mod program_block_tests {
     }
 
     #[test]
-    fn spans_track_ranges_and_preserve_raw_text() {
-        // A heading glued to its items is one block (no blank line between).
+    fn spans_split_heading_and_items_into_separate_blocks() {
+        // A heading glued to two items (no blank lines) splits into the heading
+        // plus one block per item — so each card shimmers independently.
         let spans = program_block_spans("## In progress\n  * one\n* two\n\n## Done\n");
-        assert_eq!(spans.len(), 2);
-        assert_eq!((spans[0].start_line, spans[0].end_line), (0, 3));
+        assert_eq!(spans.len(), 4);
+        assert_eq!((spans[0].start_line, spans[0].end_line), (0, 1));
+        assert_eq!(spans[0].signature, "## In progress");
         // Signature trims each line; raw text keeps original indentation.
-        assert_eq!(spans[0].signature, "## In progress\n* one\n* two");
-        assert_eq!(spans[0].text, "## In progress\n  * one\n* two");
-        assert_eq!(spans[1].start_line, 4);
+        assert_eq!((spans[1].start_line, spans[1].end_line), (1, 2));
+        assert_eq!(spans[1].signature, "* one");
+        assert_eq!(spans[1].text, "  * one");
+        assert_eq!((spans[2].start_line, spans[2].end_line), (2, 3));
+        assert_eq!(spans[2].signature, "* two");
+        assert_eq!(spans[3].signature, "## Done");
+        assert_eq!(spans[3].start_line, 4);
+        // Distinct items have distinct ids.
+        assert_ne!(spans[1].id, spans[2].id);
         // Empty / whitespace-only input has no blocks.
         assert!(program_block_spans("  \n\n").is_empty());
+    }
+
+    #[test]
+    fn spans_keep_wrapped_continuation_with_its_item_and_paragraph() {
+        // A wrapped continuation line stays with the item above it; a multi-line
+        // paragraph stays whole; an ordered marker also starts an item.
+        let spans = program_block_spans(
+            "intro paragraph\nsecond line\n\n1. first step\n   wrapped detail\n2. second step\n",
+        );
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].signature, "intro paragraph\nsecond line");
+        assert_eq!(spans[1].signature, "1. first step\nwrapped detail");
+        assert_eq!(spans[2].signature, "2. second step");
     }
 }

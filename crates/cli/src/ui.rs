@@ -9851,10 +9851,11 @@ mod tests {
 
     #[test]
     fn program_shimmer_line_sessions_maps_block_to_its_session() {
-        // Two blocks; only the first shimmers. Every line of the shimmering
-        // block resolves to the session its clip references; the settled block
-        // and the blank separator resolve to nothing.
-        let md = "- working @{session:s1}\n- detail line\n\n- idle @{session:s2}";
+        // An item with a wrapped continuation line is one block; only it
+        // shimmers. Every line of the shimmering block resolves to the session
+        // its clip references; the settled item and the blank separator resolve
+        // to nothing.
+        let md = "- working @{session:s1}\n  detail line\n\n- idle @{session:s2}";
         let active = [true, true, false, false];
         let got = program_shimmer_line_sessions(None, md, &active);
         assert_eq!(
@@ -9877,7 +9878,7 @@ mod tests {
     #[test]
     fn program_shimmer_session_at_resolves_cursor_to_block_session() {
         let area = Rect::new(0, 0, 80, 6);
-        let md = "- working @{session:s1}\n- detail line\n\n- idle @{session:s2}";
+        let md = "- working @{session:s1}\n  detail line\n\n- idle @{session:s2}";
         let line_sessions = vec![Some("s1".to_string()), Some("s1".to_string()), None, None];
         // Both lines of the shimmering block resolve to s1.
         assert_eq!(
