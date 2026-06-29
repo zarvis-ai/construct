@@ -33,6 +33,18 @@ reordering from the list pane, or normal child input in a single-pane view). A
 directional move with no neighbor in that direction is a consumed no-op rather
 than a fall-through.
 
+Directional focus must also be reachable through the window-management escape
+prefix (an explicit chord), not only through the bare modified-arrow keys. Many
+terminals reserve some modified arrows for their own use and never deliver them
+to the application — notably the vertical pair (modified Up/Down) is commonly
+bound to line scrollback while the horizontal pair is forwarded — so a feature
+that exists *only* as a bare modified-arrow binding silently loses one axis on
+those terminals. The prefix-reached spelling is always delivered (it is the same
+prefix that already escapes PTY capture), so it is the reliable path and the
+bare modified-arrow form is an optimization for terminals that forward it. The
+prefix form, being an explicit request, may report "no window that way" rather
+than staying silent.
+
 ## Reason
 
 Cycling is fine for two panes but slow with several; jumping straight to a pane
@@ -81,3 +93,6 @@ those physical keys.
   happens (the key is consumed), instead of reordering the list.
 - Focus on the session list: the same directional keys reorder the selected
   session, because the focused-split context does not apply.
+- Two panes stacked vertically in a terminal that scrolls on modified Up/Down:
+  the bare modified-arrow never arrives, but the escape-prefix-plus-arrow chord
+  still moves focus between the top and bottom panes.

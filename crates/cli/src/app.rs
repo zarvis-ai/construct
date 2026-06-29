@@ -4233,6 +4233,22 @@ impl App {
         true
     }
 
+    /// Directional pane focus invoked from the keymap (`C-x <arrow>`). Unlike
+    /// the bare `Shift+<arrow>` intercept — which is a silent consumed no-op so
+    /// it doesn't beep when held down — an explicit chord reports when there's
+    /// no window that way, since the user deliberately asked for the move.
+    fn focus_window_in_dir(&mut self, dir: FocusDir) {
+        if !self.focus_adjacent_window(dir) {
+            let dir = match dir {
+                FocusDir::Up => "above",
+                FocusDir::Down => "below",
+                FocusDir::Left => "left",
+                FocusDir::Right => "right",
+            };
+            self.set_status(format!("no split window {dir}"));
+        }
+    }
+
     fn focus_main_window(&mut self, id: u64) {
         if let Some(selection) = self.selection_for_window(id) {
             let changed_selection = self.selection != selection;
@@ -6853,6 +6869,14 @@ impl App {
                 };
                 self.set_status(label);
             }
+            // `C-x <arrow>` — directional pane focus. The keyboard-reachable
+            // counterpart to `Shift+<arrow>`, dispatched through the keymap so
+            // it survives terminals that swallow `Shift+Up`/`Shift+Down` for
+            // scrollback (where the bare `Shift+Arrow` intercept never fires).
+            FocusWindowUp => self.focus_window_in_dir(FocusDir::Up),
+            FocusWindowDown => self.focus_window_in_dir(FocusDir::Down),
+            FocusWindowLeft => self.focus_window_in_dir(FocusDir::Left),
+            FocusWindowRight => self.focus_window_in_dir(FocusDir::Right),
             SplitWindowBelow => self.split_active_window(WindowSplitDirection::Below),
             SplitWindowRight => self.split_active_window(WindowSplitDirection::Right),
             DeleteWindow => self.delete_active_window(),
@@ -13409,6 +13433,233 @@ mod tests {
         assert_eq!(app.focus, PaneFocus::View);
         assert!(!app.focus_adjacent_window(FocusDir::Right));
         assert_eq!(app.active_window_id, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shift_arrow_on_key_moves_focus_in_all_four_directions() {
+        let (mut app, _dir, server) = captured_app().await;
+        // A 2x2 grid of panes, same geometry as the adjacency unit test.
+        app.layout.main_window_areas = vec![
+            WindowPaneHit {
+                id: 1,
+                area: Rect::new(0, 0, 40, 10),
+                inner_area: Rect::new(1, 1, 38, 8),
+            },
+            WindowPaneHit {
+                id: 2,
+                area: Rect::new(40, 0, 40, 10),
+                inner_area: Rect::new(41, 1, 38, 8),
+            },
+            WindowPaneHit {
+                id: 3,
+                area: Rect::new(0, 10, 40, 10),
+                inner_area: Rect::new(1, 11, 38, 8),
+            },
+            WindowPaneHit {
+                id: 4,
+                area: Rect::new(40, 10, 40, 10),
+                inner_area: Rect::new(41, 11, 38, 8),
+            },
+        ];
+        // A real split tree so `is_split_layout()` holds and each window has a
+        // selection to focus.
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Below,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Right,
+                ratio_percent: 50,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 1,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 2,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+            second: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Right,
+                ratio_percent: 50,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 3,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 4,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+        };
+        app.focus = PaneFocus::View;
+        app.zoom = ZoomMode::None;
+
+        // Drive the *full* on_key dispatch (not just `adjacent_window_id`) so we
+        // exercise the same path a real keypress takes.
+        app.active_window_id = 1;
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.active_window_id, 2, "Shift+Right: top-left -> top-right");
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(
+            app.active_window_id, 4,
+            "Shift+Down: top-right -> bottom-right"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(
+            app.active_window_id, 3,
+            "Shift+Left: bottom-right -> bottom-left"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(app.active_window_id, 1, "Shift+Up: bottom-left -> top-left");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shift_up_down_move_focus_with_real_rendered_geometry() {
+        let (mut app, _dir, server) = captured_app().await;
+        // A vertical (Below) split: window 1 on top, window 2 on the bottom.
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Below,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        app.focus = PaneFocus::View;
+        app.zoom = ZoomMode::None;
+        app.active_window_id = 1;
+
+        // Render a real frame so `main_window_areas` is populated by the actual
+        // renderer (not hand-built geometry) for the vertical split.
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render split");
+
+        // Shift+Down should move focus from the top window to the bottom one.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(
+            app.active_window_id, 2,
+            "Shift+Down should focus the window below"
+        );
+
+        // Re-render so geometry reflects the new active window, then Shift+Up
+        // should move focus back to the top window.
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render split");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+            .await;
+        assert_eq!(
+            app.active_window_id, 1,
+            "Shift+Up should focus the window above"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn c_x_arrow_chord_moves_split_focus_in_all_four_directions() {
+        // `C-x <arrow>` is the terminal-agnostic alias for `Shift+<arrow>`.
+        // Terminals (iTerm2, Terminal.app, GNOME Terminal) reserve Shift+Up/
+        // Down for scrollback and never deliver them, so this chord is the
+        // path that actually reaches the vertical-focus code there. Drive it
+        // through the full on_key dispatch, two keystrokes per move.
+        let (mut app, _dir, server) = captured_app().await;
+        // A 2x2 grid of panes.
+        app.layout.main_window_areas = vec![
+            WindowPaneHit {
+                id: 1,
+                area: Rect::new(0, 0, 40, 10),
+                inner_area: Rect::new(1, 1, 38, 8),
+            },
+            WindowPaneHit {
+                id: 2,
+                area: Rect::new(40, 0, 40, 10),
+                inner_area: Rect::new(41, 1, 38, 8),
+            },
+            WindowPaneHit {
+                id: 3,
+                area: Rect::new(0, 10, 40, 10),
+                inner_area: Rect::new(1, 11, 38, 8),
+            },
+            WindowPaneHit {
+                id: 4,
+                area: Rect::new(40, 10, 40, 10),
+                inner_area: Rect::new(41, 11, 38, 8),
+            },
+        ];
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Below,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Right,
+                ratio_percent: 50,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 1,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 2,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+            second: Box::new(MainWindowTree::Split {
+                direction: WindowSplitDirection::Right,
+                ratio_percent: 50,
+                first: Box::new(MainWindowTree::Leaf {
+                    id: 3,
+                    selection: Selection::Session("s1".into()),
+                }),
+                second: Box::new(MainWindowTree::Leaf {
+                    id: 4,
+                    selection: Selection::Session("s1".into()),
+                }),
+            }),
+        };
+        app.focus = PaneFocus::View;
+        app.zoom = ZoomMode::None;
+
+        // Helper: C-x then a plain arrow (no Shift) -> directional focus.
+        async fn cx_arrow(app: &mut App, arrow: KeyCode) {
+            app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+                .await;
+            app.on_key(KeyEvent::new(arrow, KeyModifiers::NONE)).await;
+        }
+
+        app.active_window_id = 1;
+        cx_arrow(&mut app, KeyCode::Right).await;
+        assert_eq!(app.active_window_id, 2, "C-x Right: top-left -> top-right");
+
+        cx_arrow(&mut app, KeyCode::Down).await;
+        assert_eq!(
+            app.active_window_id, 4,
+            "C-x Down: top-right -> bottom-right"
+        );
+
+        cx_arrow(&mut app, KeyCode::Left).await;
+        assert_eq!(
+            app.active_window_id, 3,
+            "C-x Left: bottom-right -> bottom-left"
+        );
+
+        cx_arrow(&mut app, KeyCode::Up).await;
+        assert_eq!(app.active_window_id, 1, "C-x Up: bottom-left -> top-left");
+
         server.abort();
     }
 

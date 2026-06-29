@@ -6076,6 +6076,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x o           other window (list → windows → list)
     C-2 .. C-5      focus split window 1..4 directly (C-2 = first window)
     Shift+arrow     focus the adjacent split window (in a split layout)
+    C-x arrow       same — reliable alias where the terminal eats Shift+up/down
     RET (on list)   focus the selected session's view
     C-x 2 / C-x 3   split current main window below / right
     C-x 0 / C-x 1   delete current window / delete other windows

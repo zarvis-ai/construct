@@ -51,6 +51,16 @@ pub enum KeyAction {
     /// Cycle keyboard focus across the panes (list ↔ view). Bound to `C-x o`
     /// in the emacs profile, matching `other-window`.
     SwitchFocus,
+    /// Move keyboard focus to the spatially adjacent split window in a
+    /// direction (emacs `windmove`). Reachable via the `C-x` prefix
+    /// (`C-x <arrow>`) so it works even when the terminal reserves
+    /// `Shift+<arrow>` for its own scrollback — which iTerm2, macOS
+    /// Terminal.app, and GNOME Terminal all do for `Shift+Up`/`Shift+Down`,
+    /// the reason the bare `Shift+Arrow` binding never reaches the app there.
+    FocusWindowUp,
+    FocusWindowDown,
+    FocusWindowLeft,
+    FocusWindowRight,
     /// Move keyboard focus into the selected session's view pane (from
     /// the list). Acts on Enter from the list — a one-way "drill in"
     /// counterpart to `SwitchFocus`'s toggle.
@@ -215,6 +225,16 @@ fn emacs() -> Keymap {
         // Enter from the list "drills in" to the session view; Tab is
         // intentionally left unbound for future use (e.g. completion).
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
+        // Directional pane focus (emacs `windmove`). `Shift+<arrow>` is the
+        // fast path, but terminals reserve `Shift+Up`/`Shift+Down` for
+        // scrollback (iTerm2, macOS Terminal.app, GNOME Terminal) and never
+        // deliver them, so the vertical axis silently dies there. The `C-x`
+        // prefix is always forwarded — it's how `C-x o` already escapes a
+        // focused child PTY — so `C-x <arrow>` is a reliable alias.
+        (Chord(vec![ctrl('x'), key(KeyCode::Up)]), FocusWindowUp),
+        (Chord(vec![ctrl('x'), key(KeyCode::Down)]), FocusWindowDown),
+        (Chord(vec![ctrl('x'), key(KeyCode::Left)]), FocusWindowLeft),
+        (Chord(vec![ctrl('x'), key(KeyCode::Right)]), FocusWindowRight),
         (Chord(vec![ctrl('x'), ch('2')]), SplitWindowBelow),
         (Chord(vec![ctrl('x'), ch('3')]), SplitWindowRight),
         (Chord(vec![ctrl('x'), ch('0')]), DeleteWindow),
@@ -328,6 +348,13 @@ fn vim() -> Keymap {
         // PTY-mode escape: C-x is the universal prefix here too, so `C-x o`
         // cycles focus and `C-x C-c` quits even when the PTY is capturing.
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
+        // Directional pane focus, `C-x <arrow>` — reliable alias for
+        // `Shift+<arrow>` where the terminal eats `Shift+Up`/`Shift+Down`
+        // (see the emacs profile for the rationale).
+        (Chord(vec![ctrl('x'), key(KeyCode::Up)]), FocusWindowUp),
+        (Chord(vec![ctrl('x'), key(KeyCode::Down)]), FocusWindowDown),
+        (Chord(vec![ctrl('x'), key(KeyCode::Left)]), FocusWindowLeft),
+        (Chord(vec![ctrl('x'), key(KeyCode::Right)]), FocusWindowRight),
         (Chord(vec![ctrl('x'), ch('2')]), SplitWindowBelow),
         (Chord(vec![ctrl('x'), ch('3')]), SplitWindowRight),
         (Chord(vec![ctrl('x'), ch('0')]), DeleteWindow),
@@ -460,6 +487,45 @@ mod tests {
             resolve(&km, vec![ctrl('x'), shift('}')]),
             KeymapResult::Action(KeyAction::ScrollBottom)
         ));
+    }
+
+    #[test]
+    fn c_x_arrow_focuses_windows_directionally_in_both_profiles() {
+        // `C-x <arrow>` is the terminal-agnostic alias for `Shift+<arrow>`
+        // directional pane focus — it must resolve in both profiles, because
+        // terminals (iTerm2, Terminal.app, GNOME Terminal) eat Shift+Up/Down
+        // for scrollback and the bare Shift+Arrow binding never arrives there.
+        for profile in [Profile::Emacs, Profile::Vim] {
+            let km = default_for(profile);
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), key(KeyCode::Up)]),
+                    KeymapResult::Action(KeyAction::FocusWindowUp)
+                ),
+                "C-x Up should focus the window above in {profile:?}"
+            );
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), key(KeyCode::Down)]),
+                    KeymapResult::Action(KeyAction::FocusWindowDown)
+                ),
+                "C-x Down should focus the window below in {profile:?}"
+            );
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), key(KeyCode::Left)]),
+                    KeymapResult::Action(KeyAction::FocusWindowLeft)
+                ),
+                "C-x Left should focus the window to the left in {profile:?}"
+            );
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), key(KeyCode::Right)]),
+                    KeymapResult::Action(KeyAction::FocusWindowRight)
+                ),
+                "C-x Right should focus the window to the right in {profile:?}"
+            );
+        }
     }
 
     #[test]
