@@ -7426,7 +7426,11 @@ impl App {
         }
     }
 
-    async fn execute_program_popup(&mut self, selection: Option<String>) -> bool {
+    async fn execute_program_popup(
+        &mut self,
+        selection: Option<String>,
+        selected_block_ids: Option<HashSet<String>>,
+    ) -> bool {
         let Some(session_id) = self
             .program_popup
             .as_ref()
@@ -7475,7 +7479,17 @@ impl App {
                 .map(|popup| popup.buffer.clone())
                 .unwrap_or_default(),
         };
-        self.start_program_run(&session_id, &run_body, is_selection, &prev_saved);
+        let selected_block_ids = selected_block_ids.or_else(|| {
+            self.program_popup
+                .as_ref()
+                .and_then(Self::selected_program_block_ids)
+        });
+        match selected_block_ids {
+            Some(pending) if is_selection => {
+                self.start_program_run_with_pending(&session_id, pending)
+            }
+            _ => self.start_program_run(&session_id, &run_body, is_selection, &prev_saved),
+        }
         let params = agentd_protocol::ProgramExecuteParams {
             session_id: session_id.clone(),
             selection,
@@ -7549,6 +7563,14 @@ impl App {
             // Fresh run, or a selection run scoped by the user: shimmer it all.
             _ => body_ids,
         };
+        self.start_program_run_with_pending(session_id, pending);
+    }
+
+    fn start_program_run_with_pending(&mut self, session_id: &str, pending: HashSet<String>) {
+        if pending.is_empty() {
+            self.program_runs.remove(session_id);
+            return;
+        }
         let now = Instant::now();
         self.program_runs.insert(
             session_id.to_string(),
@@ -7661,14 +7683,25 @@ impl App {
                         self.open_session_title_menu(session_id, modal);
                     }
                 } else {
-                    let selection = hit_selection_run
-                        .then(|| {
-                            self.program_popup
-                                .as_ref()
-                                .and_then(Self::selected_program_text)
+                    let selected = hit_selection_run.then(|| {
+                        self.program_popup.as_ref().and_then(|popup| {
+                            Some((
+                                Self::selected_program_text(popup)?,
+                                Self::selected_program_block_ids(popup)?,
+                            ))
                         })
-                        .flatten();
-                    self.execute_program_popup(selection).await;
+                    });
+                    let (selection, selected_block_ids) = selected
+                        .flatten()
+                        .map_or((None, None), |(text, ids)| (Some(text), Some(ids)));
+                    if hit_selection_run {
+                        if let Some(popup) = self.program_popup.as_mut() {
+                            popup.selection = None;
+                        }
+                        self.layout.program_selection_run_hit = None;
+                    }
+                    self.execute_program_popup(selection, selected_block_ids)
+                        .await;
                 }
             }
             return true;
@@ -8389,6 +8422,32 @@ impl App {
         Some(popup.buffer[start_b..end_b].to_string())
     }
 
+    fn selected_program_block_ids(popup: &ProgramPopup) -> Option<HashSet<String>> {
+        let (selection_start, selection_end) = Self::program_selection_range(popup)?;
+        let mut line_ranges = Vec::new();
+        let mut line_start = 0usize;
+        for line in popup.buffer.lines() {
+            let line_end = line_start.saturating_add(line.chars().count());
+            line_ranges.push((line_start, line_end));
+            line_start = line_end.saturating_add(1);
+        }
+
+        let mut ids = HashSet::new();
+        for block in program_blocks(&popup.buffer) {
+            let Some((block_start, _)) = line_ranges.get(block.start_line).copied() else {
+                continue;
+            };
+            let Some((_, block_end)) = line_ranges.get(block.end_line.saturating_sub(1)).copied()
+            else {
+                continue;
+            };
+            if selection_start < block_end && selection_end > block_start {
+                ids.insert(block.id);
+            }
+        }
+        Some(ids)
+    }
+
     fn push_program_undo_state(&mut self) {
         let popup = match self.program_popup.as_mut() {
             Some(popup) => popup,
@@ -9067,7 +9126,7 @@ impl App {
                     .program_popup
                     .as_ref()
                     .and_then(Self::selected_program_text);
-                self.execute_program_popup(selection).await;
+                self.execute_program_popup(selection, None).await;
             }
             OpenDiff => {
                 if let Some(id) = self.selected_id() {
@@ -12860,6 +12919,27 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn program_selection_block_ids_include_touched_full_blocks() {
+        let mut popup = program_popup_for_test("s1", "- alpha beta\n\n- gamma", 0);
+        popup.selection = Some(ProgramSelection {
+            anchor: 2,
+            head: 7,
+            dragged: false,
+        });
+
+        let ids = App::selected_program_block_ids(&popup).expect("selected block ids");
+
+        assert!(
+            ids.contains(&agentd_protocol::program_block_id("- alpha beta")),
+            "a partial text selection should shimmer its enclosing block"
+        );
+        assert!(
+            !ids.contains(&agentd_protocol::program_block_id("- gamma")),
+            "untouched blocks should not shimmer for a selection run"
+        );
+    }
+
     /// The widget indicator's leading "─" stitches the square into the title
     /// bar's top border, so it must carry the *program* border color (accent_alt),
     /// not the session view's green `pane_border_style`. Regression: it painted
@@ -13516,6 +13596,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_selection_run_click_clears_menu_and_runs_selection() {
+        use agentd_protocol::ipc_method;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let _ = seen_tx.send((method.clone(), params.clone()));
+                let program = serde_json::json!({
+                    "session_id": "s1",
+                    "markdown": "alpha beta",
+                    "version": 1,
+                    "updated_at_ms": 0,
+                    "template_id": null,
+                });
+                let result = match method.as_str() {
+                    ipc_method::PROGRAM_EXECUTE => {
+                        serde_json::json!({ "program": program, "prompt": "sent", "active_run": null })
+                    }
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut app = test_app(client, Vec::new());
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let run = app
+            .layout
+            .program_selection_run_hit
+            .expect("selection run hit registered");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: run.0,
+            row: run.2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert!(
+            app.program_popup
+                .as_ref()
+                .is_some_and(|popup| popup.selection.is_none()),
+            "selection Run click should clear selection so the context menu disappears"
+        );
+        assert!(
+            app.layout.program_selection_run_hit.is_none(),
+            "selection Run hitbox should clear with the context menu"
+        );
+        let (method, params) = seen_rx.recv().await.expect("program execute request");
+        assert_eq!(method, ipc_method::PROGRAM_EXECUTE);
+        assert_eq!(
+            params.get("selection").and_then(Value::as_str),
+            Some("alpha")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_run_for_orchestrator_does_not_panic_and_submit_does_not_clear_other_shimmers() {
         // TDD for the reported panic (screenshot 2026-06-27 9.43.19),
         // "Program click 'run' on smith session does type the prompt, but not submit",
@@ -13718,7 +13905,7 @@ mod tests {
         app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
         app.program_popup.as_mut().unwrap().buffer = "alpha beta changed".to_string();
 
-        assert!(app.execute_program_popup(Some("beta".to_string())).await);
+        assert!(app.execute_program_popup(Some("beta".to_string()), None).await);
 
         let (first_method, first_params) = seen_rx.recv().await.expect("program update request");
         let (second_method, second_params) = seen_rx.recv().await.expect("program execute request");
