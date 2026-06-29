@@ -4328,13 +4328,45 @@ impl App {
             .position(|it| it.matches(&self.selection))
             .unwrap_or(0);
         let n = items.len() as i32;
-        let next = ((cur as i32 + delta).rem_euclid(n)) as usize;
+        let mut next = ((cur as i32 + delta).rem_euclid(n)) as usize;
+        if Self::is_collapsed_ungrouped_archive_row(&items[next]) {
+            let direction = delta.signum();
+            let primary_beyond_archive = if direction > 0 {
+                items[next + 1..].iter().position(Self::is_primary_list_target)
+                    .map(|offset| next + 1 + offset)
+            } else {
+                items[..next]
+                    .iter()
+                    .rposition(Self::is_primary_list_target)
+            };
+            if let Some(index) = primary_beyond_archive {
+                next = index;
+            }
+        }
         match &items[next] {
             ListItem::Session { summary, .. } => self.select_session(summary.id.clone()),
             ListItem::GroupHeader { group, .. } => self.select_group(group.id.clone()),
             ListItem::ArchivedRow { section, .. } => self.select_archive_row(section.clone()),
         }
         self.sync_active_window_selection();
+    }
+
+    fn is_collapsed_ungrouped_archive_row(item: &ListItem) -> bool {
+        matches!(
+            item,
+            ListItem::ArchivedRow {
+                section: ArchiveSection::Ungrouped,
+                expanded: false,
+                ..
+            }
+        )
+    }
+
+    fn is_primary_list_target(item: &ListItem) -> bool {
+        matches!(
+            item,
+            ListItem::Session { summary, .. } if !summary.archived
+        ) || matches!(item, ListItem::GroupHeader { .. })
     }
 
     /// After any list mutation, make sure `self.selection` still refers to
@@ -17631,6 +17663,68 @@ mod tests {
             app.selection,
             Selection::ArchivedRow(ArchiveSection::Ungrouped)
         );
+    }
+
+    #[tokio::test]
+    async fn next_session_skips_collapsed_top_level_archived_row_before_project() {
+        use agentd_client::Client;
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let _server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut top_level = summary_with_kind(agentd_protocol::SessionKind::User);
+        top_level.id = "top-level".into();
+        top_level.position = 0;
+        let mut archived = summary_with_kind(agentd_protocol::SessionKind::User);
+        archived.id = "archived".into();
+        archived.position = 1;
+        archived.archived = true;
+        let mut project_member = summary_with_kind(agentd_protocol::SessionKind::User);
+        project_member.id = "project-member".into();
+        project_member.group_id = Some("project".into());
+
+        let mut app = test_app(client, vec![top_level, archived, project_member]);
+        app.groups = vec![GroupSummary {
+            id: "project".into(),
+            name: "Project".into(),
+            created_at: chrono::Utc::now(),
+            position: 0,
+            collapsed: false,
+        }];
+        app.focus = PaneFocus::List;
+        app.select_session("top-level".into());
+
+        let items = app.list_items();
+        assert_eq!(items.len(), 4);
+        assert!(matches!(
+            &items[0],
+            ListItem::Session { summary, .. } if summary.id == "top-level"
+        ));
+        assert!(matches!(
+            &items[1],
+            ListItem::ArchivedRow {
+                section: ArchiveSection::Ungrouped,
+                expanded: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &items[2],
+            ListItem::GroupHeader { group, .. } if group.id == "project"
+        ));
+
+        app.run_action(KeyAction::NextSession).await;
+        assert_eq!(app.selection, Selection::Group("project".into()));
     }
 
     #[tokio::test]
