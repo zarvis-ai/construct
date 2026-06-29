@@ -7629,6 +7629,18 @@ impl App {
         if !contains {
             return false;
         }
+        // A left click anywhere inside the program modal reclaims keyboard focus
+        // for the view pane. Without this, clicking the session list (focus →
+        // List) and then clicking back on the program placed the caret but left
+        // `focus == List`, so the `on_key` routing gate kept sending keystrokes
+        // to the list and typing into the program silently did nothing. Opening
+        // or hide→show-ing the program already focuses the view (see
+        // `open_program_popup`), which is why those workarounds restored typing.
+        // The session-clip handler below re-points focus at the list when the
+        // click switches sessions, so that case still behaves correctly.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.focus = PaneFocus::View;
+        }
         let title_run_hit = self.layout.program_title_run_hit;
         let title_toggle_hit = self.layout.program_title_toggle_hit;
         let title_close_hit = self.layout.program_title_close_hit;
@@ -11879,6 +11891,60 @@ mod tests {
             app.selection.session_id(),
             Some("s1"),
             "moving the program cursor must not change the list selection"
+        );
+
+        server.abort();
+    }
+
+    /// Regression: clicking the program body reclaims keyboard focus for the
+    /// view pane. The reported bug was: click the session list (focus → List),
+    /// then click back on the visible program — the caret moved but `focus`
+    /// stayed `List`, so the `on_key` routing gate kept sending keystrokes to
+    /// the list and typing into the program silently did nothing.
+    #[tokio::test]
+    async fn program_body_click_reclaims_view_focus() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = two_session_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "ab\ncd\nef", 0));
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        // Precondition the bug hit: the session list had grabbed keyboard focus
+        // while the program stayed visible in the view pane.
+        app.focus = PaneFocus::List;
+
+        let consumed = app
+            .handle_program_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+            .await;
+
+        assert!(
+            consumed,
+            "a click inside the program modal is handled by the program mouse router"
+        );
+        assert_eq!(
+            app.focus,
+            PaneFocus::View,
+            "clicking the program body must reclaim view focus so typing reaches it"
+        );
+
+        // End-to-end: with focus reclaimed, keystrokes now drive the program
+        // cursor rather than the list selection. (Cursor reset to 0 so the
+        // assertion is independent of where the click's caret landed.)
+        app.program_popup.as_mut().unwrap().cursor = 0;
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().cursor,
+            1,
+            "after the click, Right moves the program cursor (input routed to the program)"
+        );
+        assert_eq!(
+            app.selection.session_id(),
+            Some("s1"),
+            "typing into the reclaimed program must not move the list selection"
         );
 
         server.abort();
