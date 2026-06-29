@@ -6824,9 +6824,21 @@ mod tests {
             actor: agentd_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![
-                agentd_protocol::ProgramShimmerDecl { id: id_of("# Todo"), shimmer: false },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("# In progress"), shimmer: false },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("ship X"), shimmer: true },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("# Todo"),
+                    shimmer: false,
+                    tooltip: Some("Task list settled".into()),
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("# In progress"),
+                    shimmer: false,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("ship X"),
+                    shimmer: true,
+                    tooltip: Some("Shipping X".into()),
+                },
             ],
         })
         .await
