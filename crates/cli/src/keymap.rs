@@ -33,6 +33,10 @@ pub enum KeyAction {
     /// Undo the selected program edit. Bound to `C-x u` for consistency with
     /// emacs-style history commands.
     UndoProgram,
+    /// Run the selected session's program (or just the highlighted selection,
+    /// when text is selected). Bound to `C-x C-r` — the keyboard equivalent of
+    /// the title-bar ▶ button and the selection ▶ Run button.
+    RunProgram,
     OpenDiff,
     Interrupt,
     OpenCommandPalette,
@@ -233,6 +237,7 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch(' ')]), OpenProgram),
         (Chord(vec![ctrl('x'), ctrl('s')]), SaveProgram),
         (Chord(vec![ctrl('x'), ch('u')]), UndoProgram),
+        (Chord(vec![ctrl('x'), ctrl('r')]), RunProgram),
         (Chord(vec![ctrl('x'), ch('d')]), OpenDiff),
         (Chord(vec![ctrl('x'), ch('i')]), OpenSendInput),
         // `C-x r` opens the rename minibuffer (with current title pre-filled).
@@ -296,6 +301,7 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('x'), ch(' ')]), OpenProgram),
         (Chord(vec![ctrl('x'), ctrl('s')]), SaveProgram),
         (Chord(vec![ctrl('x'), ch('u')]), UndoProgram),
+        (Chord(vec![ctrl('x'), ctrl('r')]), RunProgram),
         (Chord(vec![ch('d')]), OpenDiff),
         (Chord(vec![ctrl('c')]), Interrupt),
         // `r` opens the rename minibuffer; refresh moved to M-x refresh.
@@ -522,6 +528,20 @@ mod tests {
                     KeymapResult::Action(KeyAction::UndoProgram)
                 ),
                 "C-x u should trigger UndoProgram in {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_x_ctrl_r_runs_program() {
+        for profile in [Profile::Emacs, Profile::Vim] {
+            let km = default_for(profile);
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), ctrl('r')]),
+                    KeymapResult::Action(KeyAction::RunProgram)
+                ),
+                "C-x C-r should trigger RunProgram in {profile:?}"
             );
         }
     }

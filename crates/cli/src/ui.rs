@@ -8336,7 +8336,7 @@ fn render_program_title_tooltip(
     }
     if let Some((xs, xe, y)) = app.layout.program_title_run_hit {
         if my == y && mx >= xs && mx < xe {
-            render_button_tooltip(f, &app.theme, " Run program ", mx, my);
+            render_button_tooltip(f, &app.theme, " Run program · C-x C-r ", mx, my);
             return;
         }
     }
