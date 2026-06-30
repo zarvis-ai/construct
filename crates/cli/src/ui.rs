@@ -3098,7 +3098,9 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         render_main_transition(f, inner, app, window_id);
         return;
     }
-    match app.view {
+    // Per-window view mode: `C-x t` toggles only the focused split, so each
+    // pane renders its own transcript/terminal mode rather than the global one.
+    match app.view_for_window(window_id) {
         ViewMode::Terminal => render_terminal_for_window(f, inner, app, window_id),
         ViewMode::Chat => render_chat(f, inner, app),
     }
@@ -5673,7 +5675,24 @@ fn render_chat(f: &mut Frame, area: Rect, app: &App) {
     // terminal-derived snapshots; Terminal view owns terminal rendering. C-x t
     // and headless sessions both use this path so transcript inspection and
     // non-PTY sessions share the same chat presentation.
-    let chat_lines = chat_lines(&app.theme, &app.transcript);
+    //
+    // Only the focused session's transcript is hydrated into `app.transcript`.
+    // In a split, `render_node` swaps `app.selection` to each pane in turn, so
+    // a non-focused pane's session won't match `transcript_session`. Guard on
+    // that so a non-focused chat pane renders the empty-state hint rather than
+    // another session's transcript.
+    let transcript_is_for_pane = app
+        .transcript_session
+        .as_deref()
+        .zip(app.selected_id())
+        .is_some_and(|(hydrated, pane)| hydrated == pane);
+    let empty = Vec::new();
+    let transcript = if transcript_is_for_pane {
+        &app.transcript
+    } else {
+        &empty
+    };
+    let chat_lines = chat_lines(&app.theme, transcript);
     let total = chat_lines.len();
     let height = area.height as usize;
     let max_scroll = total.saturating_sub(height);

@@ -847,6 +847,12 @@ pub struct App {
     pub view_scrollback: usize,
     /// Per-split-window PTY scrollback offsets, keyed by main-window id.
     pub window_scrollback: HashMap<u64, usize>,
+    /// Per-split-window view mode (transcript/chat vs live terminal), keyed by
+    /// main-window id. Lets `C-x t` toggle only the focused split: each pane
+    /// remembers its own mode across focus changes instead of sharing the
+    /// single global `view`. Absent an entry, a window falls back to its
+    /// session's natural mode (Terminal for PTY sessions, Chat otherwise).
+    pub window_views: HashMap<u64, ViewMode>,
     /// Show the terminal scrollback overlay until this instant, keyed by
     /// main-window id. Refreshed by wheel/key scrollback input for the window
     /// being scrolled and hidden automatically after a short idle delay,
@@ -2352,6 +2358,7 @@ async fn run_with_socket_initial_selection(
         list_scroll_offset: 0,
         view_scrollback: 0,
         window_scrollback: HashMap::new(),
+        window_views: HashMap::new(),
         terminal_scrollbar_visible_until: HashMap::new(),
         skip_redraw_after_event: false,
         notification_dirtied_view: true,
@@ -2426,7 +2433,7 @@ async fn run_with_socket_initial_selection(
     }
     // Default to Terminal view when the currently-selected session has a PTY.
     if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
-        app.view = ViewMode::Terminal;
+        app.set_active_view(ViewMode::Terminal);
     }
     app.restore_open_program_popups(&persisted.open_program_session_ids)
         .await;
@@ -3283,11 +3290,14 @@ impl App {
         self.transcript_scroll = u16::MAX;
         let active_window = Some(self.active_window_id);
         self.set_scrollback_for_window(active_window, 0);
-        self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
+        // Navigating to a new session in the focused pane resets it to that
+        // session's natural mode, recorded per-window so the pane keeps it.
+        let natural = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
             ViewMode::Terminal
         } else {
             ViewMode::Chat
         };
+        self.set_active_view(natural);
         // The program is a per-session surface: keep it attached to whatever
         // session is now selected. The outgoing session's program is stashed
         // and the incoming one revealed (if it has a program open). Navigation
@@ -3963,10 +3973,10 @@ impl App {
         // If this session has a PTY, prefer the live terminal view and
         // bootstrap the local emulator from the daemon's replay snapshot.
         if self.in_pty_session() {
-            self.view = ViewMode::Terminal;
+            self.set_active_view(ViewMode::Terminal);
             self.bootstrap_terminal(&id).await;
         } else {
-            self.view = ViewMode::Chat;
+            self.set_active_view(ViewMode::Chat);
         }
         if self.selection.session_id() == Some(id.as_str()) {
             self.start_session_transition();
@@ -4266,6 +4276,49 @@ impl App {
         matches!(self.main_windows, MainWindowTree::Split { .. })
     }
 
+    /// Natural view mode for a window's session: Terminal when the session has
+    /// a PTY, Chat otherwise. Used as the default when a window has no explicit
+    /// per-window override in `window_views`.
+    fn natural_view_for_window(&self, window_id: u64) -> ViewMode {
+        let has_pty = self
+            .selection_for_window(window_id)
+            .and_then(|sel| {
+                sel.session_id()
+                    .and_then(|sid| self.sessions.iter().find(|s| s.id == sid))
+                    .map(|s| s.has_pty)
+            })
+            .unwrap_or(false);
+        if has_pty {
+            ViewMode::Terminal
+        } else {
+            ViewMode::Chat
+        }
+    }
+
+    /// View mode for a specific split pane. The focused window uses the live
+    /// `self.view`; non-focused windows use their remembered per-window mode
+    /// (or, absent one, their session's natural mode). `None` and the active
+    /// window id both resolve to the live mode so single-window and zoomed
+    /// renders are unaffected.
+    pub fn view_for_window(&self, window_id: Option<u64>) -> ViewMode {
+        match window_id {
+            Some(id) if id != self.active_window_id => self
+                .window_views
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| self.natural_view_for_window(id)),
+            _ => self.view,
+        }
+    }
+
+    /// Set the focused window's view mode, remembering it per-window so each
+    /// split pane keeps an independent transcript/terminal mode across focus
+    /// changes.
+    fn set_active_view(&mut self, mode: ViewMode) {
+        self.view = mode;
+        self.window_views.insert(self.active_window_id, mode);
+    }
+
     fn leaf_window_ids(&self) -> Vec<u64> {
         fn collect(node: &MainWindowTree, out: &mut Vec<u64>) {
             match node {
@@ -4389,11 +4442,14 @@ impl App {
                 if !self.is_split_layout() {
                     self.view_scrollback = 0;
                 }
-                self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
-                    ViewMode::Terminal
-                } else {
-                    ViewMode::Chat
-                };
+                // Restore the focused window's view mode: a per-window `C-x t`
+                // toggle persists across focus changes; without one, fall back
+                // to the session's natural mode (Terminal for PTY sessions).
+                self.view = self
+                    .window_views
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| self.natural_view_for_window(id));
             }
             // Keep the program attached to the focused pane's session (stash
             // the outgoing one, reveal the incoming). A no-op when the
@@ -4656,11 +4712,12 @@ impl App {
             self.transcript_scroll = u16::MAX;
             let active_window = Some(self.active_window_id);
             self.set_scrollback_for_window(active_window, 0);
-            self.view = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
+            let natural = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
                 ViewMode::Terminal
             } else {
                 ViewMode::Chat
             };
+            self.set_active_view(natural);
         }
     }
 
@@ -7052,7 +7109,10 @@ impl App {
             }
             ToggleView => {
                 let has_pty = self.in_pty_session();
-                self.view = match (self.view, has_pty) {
+                // Scope the toggle to the focused split only: `set_active_view`
+                // records the new mode in `window_views` for the active window
+                // so sibling panes keep their own transcript/terminal mode.
+                let next = match (self.view, has_pty) {
                     (ViewMode::Chat, true) => {
                         // First time switching → bootstrap from replay snapshot.
                         if let Some(id) = self.selected_id() {
@@ -7062,6 +7122,7 @@ impl App {
                     }
                     _ => ViewMode::Chat,
                 };
+                self.set_active_view(next);
             }
             MoveSelectedUp => self.move_selected(true).await,
             MoveSelectedDown => self.move_selected(false).await,
@@ -8914,6 +8975,7 @@ mod tests {
             list_scroll_offset: 0,
             view_scrollback: 0,
             window_scrollback: HashMap::new(),
+            window_views: HashMap::new(),
             terminal_scrollbar_visible_until: HashMap::new(),
             skip_redraw_after_event: false,
             notification_dirtied_view: true,
@@ -13320,6 +13382,68 @@ mod tests {
         // A session not in any visible pane has no pane size (callers fall back
         // to the active pane).
         assert_eq!(app.session_pane_size("nope"), None);
+        server.abort();
+    }
+
+    /// Regression: `C-x t` (ToggleView) must flip only the focused split's
+    /// transcript/terminal mode, not every split. View mode is per-window
+    /// (`window_views`), and each pane is remembered across focus changes.
+    #[tokio::test]
+    async fn transcript_toggle_is_scoped_to_focused_split() {
+        let (mut app, _dir, server) = captured_app().await;
+        // Two PTY-backed sessions side by side; both default to Terminal.
+        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        second.id = "s2".into();
+        second.has_pty = true;
+        app.sessions.push(second);
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.selection = Selection::Session("s1".into());
+        app.view = ViewMode::Terminal;
+
+        // Both panes start in their natural (Terminal) mode.
+        assert_eq!(app.view_for_window(Some(1)), ViewMode::Terminal);
+        assert_eq!(app.view_for_window(Some(2)), ViewMode::Terminal);
+
+        // Toggle transcript mode on the focused split (window 1).
+        app.run_action(KeyAction::ToggleView).await;
+
+        // Only the focused split flips to Chat; the sibling stays Terminal.
+        assert_eq!(app.view, ViewMode::Chat);
+        assert_eq!(app.view_for_window(Some(1)), ViewMode::Chat);
+        assert_eq!(
+            app.view_for_window(Some(2)),
+            ViewMode::Terminal,
+            "C-x t must not change the unfocused split's view mode"
+        );
+
+        // Focus the sibling: it shows its own natural Terminal mode, while
+        // window 1 keeps the Chat mode it was toggled to.
+        app.focus_main_window(2);
+        assert_eq!(app.active_window_id, 2);
+        assert_eq!(app.view, ViewMode::Terminal);
+        assert_eq!(app.view_for_window(Some(1)), ViewMode::Chat);
+
+        // Toggling window 2 flips only it; window 1 is untouched.
+        app.run_action(KeyAction::ToggleView).await;
+        assert_eq!(app.view_for_window(Some(2)), ViewMode::Chat);
+        assert_eq!(app.view_for_window(Some(1)), ViewMode::Chat);
+
+        // Refocusing window 1 restores its remembered Chat mode.
+        app.focus_main_window(1);
+        assert_eq!(app.view, ViewMode::Chat);
+
         server.abort();
     }
 
