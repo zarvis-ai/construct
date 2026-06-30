@@ -11696,6 +11696,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_optimistic_run_lights_every_block_immediately() {
+        let (mut app, _dir, server) = empty_app().await;
+        let id = agentd_protocol::program_block_id;
+        let body = "# Todo\n\n- alpha\n\n- beta\n";
+
+        app.start_program_run("s1", body, false, "");
+
+        let run = app.program_runs.get("s1").expect("optimistic run exists");
+        assert!(run.pending.contains(&id("# Todo")));
+        assert!(run.pending.contains(&id("- alpha")));
+        assert!(run.pending.contains(&id("- beta")));
+        assert!(run.pending_tooltips.is_empty());
+        assert!(!run.first_output_seen);
+        assert!(run.deadline > Instant::now());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_optimistic_rerun_without_edits_preserves_existing_shimmer_only() {
+        let (mut app, _dir, server) = empty_app().await;
+        let id = agentd_protocol::program_block_id;
+        let body = "# Todo\n\n- settled\n\n- pending\n\n- also settled\n";
+
+        app.start_program_run("s1", body, false, "");
+        app.program_runs.get_mut("s1").expect("run").pending = HashSet::from([id("- pending")]);
+
+        app.start_program_run("s1", body, false, body);
+
+        let pending = &app.program_runs["s1"].pending;
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&id("- pending")));
+        assert!(!pending.contains(&id("- settled")));
+        assert!(!pending.contains(&id("- also settled")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_optimistic_rerun_adds_user_edit_to_existing_shimmer() {
+        let (mut app, _dir, server) = empty_app().await;
+        let id = agentd_protocol::program_block_id;
+        let synced = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
+        let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
+
+        app.start_program_run("s1", synced, false, "");
+        app.program_runs.get_mut("s1").expect("run").pending = HashSet::from([id("- pending")]);
+
+        app.start_program_run("s1", edited, false, synced);
+
+        let pending = &app.program_runs["s1"].pending;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&id("- pending")));
+        assert!(pending.contains(&id("- user changed")));
+        assert!(!pending.contains(&id("- settled")));
+        assert!(!pending.contains(&id("- untouched")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_optimistic_selection_run_replaces_existing_shimmer_scope() {
+        let (mut app, _dir, server) = empty_app().await;
+        let id = agentd_protocol::program_block_id;
+        let body = "# Todo\n\n- alpha\n\n- beta\n\n- gamma\n";
+
+        app.start_program_run("s1", body, false, "");
+        app.program_runs.get_mut("s1").expect("run").pending = HashSet::from([id("- alpha")]);
+
+        app.start_program_run("s1", "- beta\n\n- gamma\n", true, body);
+
+        let pending = &app.program_runs["s1"].pending;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&id("- beta")));
+        assert!(pending.contains(&id("- gamma")));
+        assert!(!pending.contains(&id("- alpha")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_optimistic_empty_run_clears_existing_shimmer() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.start_program_run("s1", "- pending\n", false, "");
+        assert!(app.program_runs.contains_key("s1"));
+
+        app.start_program_run("s1", "   \n", false, "- pending\n");
+
+        assert!(!app.program_runs.contains_key("s1"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_run_waits_for_daemon_clear_state() {
         let (mut app, _dir, server) = empty_app().await;
         app.start_program_run("s1", "# Todo\n- a\n", false, "");

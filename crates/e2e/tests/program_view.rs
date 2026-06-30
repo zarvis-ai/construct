@@ -254,6 +254,62 @@ async fn web_program_view_full_parity() {
     assert_eq!(run["shimmerActive"], true, "running lines should get the shimmer class: {run:?}");
     assert!(run["msg"].as_str().unwrap_or_default().contains("run sent (program"), "{run:?}");
 
+    // --- 6a. Run gives immediate optimistic affordance before execute returns.
+    let immediate_run: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              const md = "# Heading\n- alpha\n- beta\n";
+              window.__execs = [];
+              let resolveExecute;
+              window.__mockProgramHandlers["program.get"] = () => ({ program: { session_id: "s-run-immediate", markdown: md, version: 2, template_id: null }, active_run: null, blocks: [], revisions: [] });
+              window.__mockProgramHandlers["program.execute"] = (p) => {
+                window.__execs.push(p);
+                return new Promise((resolve) => {
+                  resolveExecute = () => {
+                    const ids = programBlockSpans(md).map((b) => b.id);
+                    const now = Date.now();
+                    resolve({ program: { session_id: "s-run-immediate", markdown: md, version: 2, template_id: null }, blocks: [], active_run: { run_id: "r-immediate", started_at_ms: now, expires_at_ms: now + 60000, pending_block_ids: ids, pending_block_tooltips: {}, seen_running: false, first_output_seen: false, agent_managed: false } });
+                  };
+                });
+              };
+              setSession("s-run-immediate", "shell");
+              await switchCurrentViewMode("program");
+              programTestClearSel();
+              const runPromise = programRun();
+              await new Promise((resolve) => requestAnimationFrame(resolve));
+              const before = {
+                execCount: window.__execs.length,
+                runPending: state.program.runById.get("s-run-immediate")?.pendingIds.size || 0,
+                shimmerActive: !!programInputEl.querySelector(".program-line.is-running"),
+                button: programRunBtn.dataset.running,
+                msg: programMsgEl.textContent,
+              };
+              resolveExecute();
+              await runPromise;
+              const after = {
+                runPending: state.program.runById.get("s-run-immediate")?.pendingIds.size || 0,
+                shimmerActive: !!programInputEl.querySelector(".program-line.is-running"),
+                button: programRunBtn.dataset.running,
+                msg: programMsgEl.textContent,
+              };
+              return { before, after };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate immediate optimistic run")
+        .into_value()
+        .expect("json");
+    assert_eq!(immediate_run["before"]["execCount"], 1, "{immediate_run:?}");
+    assert!(immediate_run["before"]["runPending"].as_u64().unwrap_or(0) >= 3, "{immediate_run:?}");
+    assert_eq!(immediate_run["before"]["shimmerActive"], true, "shimmer should be active before execute resolves: {immediate_run:?}");
+    assert_eq!(immediate_run["before"]["button"], "true", "Run button should pulse before execute resolves: {immediate_run:?}");
+    assert!(immediate_run["before"]["msg"].as_str().unwrap_or_default().contains("running program"), "{immediate_run:?}");
+    assert!(immediate_run["after"]["msg"].as_str().unwrap_or_default().contains("run sent (program"), "{immediate_run:?}");
+
     // --- 6b. Mid-flight re-Run preserves narrowed shimmer and pulses Run. ----
     let rerun: serde_json::Value = page
         .evaluate(
