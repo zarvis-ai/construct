@@ -8815,18 +8815,12 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         (Rect { x, y, width, height }, body_rows)
     };
 
-    // Clamp the persisted scroll so the highlighted row stays on screen.
+    // Clamp the persisted scroll so the highlighted row stays on screen, and so
+    // the leading project/archive headers above the first selectable session
+    // stay reachable when scrolling back up (see `session_picker_scroll`).
     let visible = body_rows as usize;
-    let total = rows.len();
-    let mut scroll = app.session_picker.as_ref().map(|d| d.scroll).unwrap_or(0);
-    if let Some(sr) = sel_raw {
-        if sr < scroll {
-            scroll = sr;
-        } else if sr >= scroll + visible {
-            scroll = sr + 1 - visible;
-        }
-    }
-    scroll = scroll.min(total.saturating_sub(visible));
+    let prev_scroll = app.session_picker.as_ref().map(|d| d.scroll).unwrap_or(0);
+    let scroll = crate::app::session_picker_scroll(&rows, sel_raw, prev_scroll, visible);
     if let Some(d) = app.session_picker.as_mut() {
         d.scroll = scroll;
     }

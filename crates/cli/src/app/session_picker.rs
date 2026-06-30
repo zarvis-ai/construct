@@ -85,6 +85,48 @@ impl SessionPickerRow {
     }
 }
 
+/// Resolve the first visible raw-row index for the dialog body.
+///
+/// `rows` is the full materialized row list, `sel_raw` the raw index of the
+/// highlighted (selectable) row, `prev_scroll` the persisted scroll offset, and
+/// `visible` how many body rows fit on screen. The result keeps the selected row
+/// on screen, scrolling the window just far enough in either direction.
+///
+/// Crucially, headers (a project name, an "N archived" disclosure) are *not*
+/// selectable, so the topmost selectable session can sit one or more rows below
+/// the top of the list. Anchoring the scroll to that session's raw index alone
+/// would clamp the leading header(s) — e.g. the very first project header at row
+/// 0 — permanently off the top, so they could never be scrolled back into view.
+/// To avoid that, after keeping the selection visible we pull the scroll up to
+/// the start of the header run that introduces the selected session, capped so
+/// the session itself stays on screen.
+pub fn session_picker_scroll(
+    rows: &[SessionPickerRow],
+    sel_raw: Option<usize>,
+    prev_scroll: usize,
+    visible: usize,
+) -> usize {
+    let visible = visible.max(1);
+    let total = rows.len();
+    let mut scroll = prev_scroll;
+    if let Some(sr) = sel_raw {
+        if sr < scroll {
+            scroll = sr;
+        } else if sr >= scroll + visible {
+            scroll = sr + 1 - visible;
+        }
+        // First non-selectable row of the contiguous header run directly above
+        // the selection (0 when the selection is the list's first selectable
+        // row). Reveal it without ever pushing the selection off the bottom.
+        let header_top = rows[..sr]
+            .iter()
+            .rposition(SessionPickerRow::is_selectable)
+            .map_or(0, |i| i + 1);
+        scroll = scroll.min(header_top.max((sr + 1).saturating_sub(visible)));
+    }
+    scroll.min(total.saturating_sub(visible))
+}
+
 impl App {
     pub fn session_picker_active(&self) -> bool {
         self.session_picker.is_some()
@@ -475,5 +517,119 @@ fn push_archive_section(
                 dimmed: !matched(s),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary() -> SessionSummary {
+        SessionSummary {
+            id: "s".into(),
+            harness: "shell".into(),
+            cwd: "/tmp".into(),
+            title: None,
+            state: agentd_protocol::SessionState::Running,
+            created_at: chrono::Utc::now(),
+            last_event_at: None,
+            cost_usd: None,
+            model: None,
+            worktree: None,
+            pending_input: false,
+            last_prompt: None,
+            event_count: 0,
+            has_pty: false,
+            mode: None,
+            pinned: false,
+            position: 0,
+            group_id: None,
+            parent_session_id: None,
+            last_pty_at_ms: None,
+            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            kind: agentd_protocol::SessionKind::User,
+            archived: false,
+            operator_loop_disabled: false,
+            needs_attention: false,
+        }
+    }
+
+    fn header() -> SessionPickerRow {
+        SessionPickerRow::GroupHeader {
+            name: "proj".into(),
+            expanded: true,
+            matches: 0,
+        }
+    }
+
+    fn session_row() -> SessionPickerRow {
+        SessionPickerRow::Session {
+            summary: summary(),
+            indented: true,
+            dimmed: false,
+        }
+    }
+
+    /// `header`, then `n` selectable session rows — the layout that triggered
+    /// the reported bug (a project header is the very first row).
+    fn header_then_sessions(n: usize) -> Vec<SessionPickerRow> {
+        let mut rows = vec![header()];
+        rows.extend(std::iter::repeat_with(session_row).take(n));
+        rows
+    }
+
+    #[test]
+    fn scrolling_up_to_first_session_exposes_leading_header() {
+        // Header at raw 0, sessions at raw 1..=20; a 5-row window scrolled to
+        // the bottom. Selecting the first session (raw 1) must pull the window
+        // all the way to row 0 so the project header is visible again — the old
+        // logic clamped to the session's own index (1) and hid it forever.
+        let rows = header_then_sessions(20);
+        assert_eq!(session_picker_scroll(&rows, Some(1), 16, 5), 0);
+    }
+
+    #[test]
+    fn first_open_keeps_header_visible() {
+        // Fresh open: selection on the first session, scroll already at the top.
+        let rows = header_then_sessions(20);
+        assert_eq!(session_picker_scroll(&rows, Some(1), 0, 5), 0);
+    }
+
+    #[test]
+    fn scrolling_down_anchors_selection_to_the_bottom_of_the_window() {
+        // Last session (raw 20) with a 5-row window scrolled from the top: the
+        // window follows down so the selection sits on the last visible line.
+        let rows = header_then_sessions(20);
+        assert_eq!(session_picker_scroll(&rows, Some(20), 0, 5), 16);
+    }
+
+    #[test]
+    fn selection_already_in_view_leaves_scroll_untouched() {
+        let rows = header_then_sessions(20);
+        assert_eq!(session_picker_scroll(&rows, Some(10), 8, 5), 8);
+    }
+
+    #[test]
+    fn scrolling_up_onto_a_groups_first_member_reveals_its_header() {
+        // 10 ungrouped sessions (raw 0..=9), a header (raw 10), then 5 grouped
+        // sessions (raw 11..=15). Scrolling up onto the group's first member
+        // (raw 11) reveals the header just above it.
+        let mut rows: Vec<SessionPickerRow> =
+            std::iter::repeat_with(session_row).take(10).collect();
+        rows.push(header());
+        rows.extend(std::iter::repeat_with(session_row).take(5));
+        assert_eq!(session_picker_scroll(&rows, Some(11), 12, 4), 10);
+    }
+
+    #[test]
+    fn no_selection_clamps_persisted_scroll_to_the_list() {
+        let rows = header_then_sessions(20);
+        // total = 21, visible = 5 → max scroll is 16.
+        assert_eq!(session_picker_scroll(&rows, None, 99, 5), 16);
+    }
+
+    #[test]
+    fn empty_list_scrolls_to_zero() {
+        assert_eq!(session_picker_scroll(&[], None, 7, 5), 0);
     }
 }

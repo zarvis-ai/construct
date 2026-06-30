@@ -37,7 +37,9 @@ mod program_popup;
 mod editor;
 mod mouse;
 mod session_picker;
-pub use session_picker::{SessionPickerDialog, SessionPickerPurpose, SessionPickerRow};
+pub use session_picker::{
+    session_picker_scroll, SessionPickerDialog, SessionPickerPurpose, SessionPickerRow,
+};
 
 pub const TERMINAL_SCROLLBAR_TTL: Duration = Duration::from_millis(1200);
 pub(crate) const DYNAMIC_UI_AUTOHIDE_SECS: u64 = 15;
