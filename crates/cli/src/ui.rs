@@ -1,10 +1,10 @@
 //! Ratatui rendering for the TUI.
 
 use crate::app::{
-    App, PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y, PROGRAM_REVEAL_MS, HarnessHit, HintZone,
-    ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferIntent, PaneFocus, ScreenPoint,
-    Selection, SessionTitleMenuAction, TextSelectionRange, ViewMode, WindowDividerHit,
-    WindowPaneHit, WindowSplitDirection, ZoomMode,
+    App, HarnessHit, HintZone, ListItem as AppListItem, MainWindowTree, Minibuffer,
+    MinibufferIntent, PaneFocus, ScreenPoint, Selection, SessionTitleMenuAction,
+    TextSelectionRange, ViewMode, WindowDividerHit, WindowPaneHit, WindowSplitDirection, ZoomMode,
+    PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y, PROGRAM_REVEAL_MS,
 };
 use crate::keymap::KeyAction;
 use crate::text_util::wrap_to_width;
@@ -616,9 +616,7 @@ fn render_tooltip_at(
 
 fn render_tooltip_rect(f: &mut Frame, theme: &Theme, label: &str, rect: Rect) {
     let block = theme.themed_block("");
-    let p = Paragraph::new(label)
-        .block(block)
-        .style(theme.text_style());
+    let p = Paragraph::new(label).block(block).style(theme.text_style());
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
 }
@@ -805,7 +803,11 @@ fn render_session_widget_title(
     // puts the hover test and the registered hit exactly on the visible glyph.
     let now = Instant::now();
     // Drop a lapsed hover preview so a stale square doesn't read as filled.
-    if app.dynamic_ui_hover.as_ref().is_some_and(|h| h.until <= now) {
+    if app
+        .dynamic_ui_hover
+        .as_ref()
+        .is_some_and(|h| h.until <= now)
+    {
         app.dynamic_ui_hover = None;
     }
     let mut icon_x = x_start.saturating_add(2);
@@ -962,10 +964,7 @@ fn render_view_program_toggle_tooltip(f: &mut Frame, app: &App) {
     let Some(s) = app.selected_session() else {
         return;
     };
-    let program_open = app
-        .open_program_session_ids()
-        .iter()
-        .any(|id| id == &s.id);
+    let program_open = app.open_program_session_ids().iter().any(|id| id == &s.id);
     let (cx, _, cy) = view_program_toggle_button_range(view_area);
     let label = if program_open {
         " Program mode: click to return to chat "
@@ -1102,7 +1101,11 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
         spans.push(Span::raw(s.to_string()));
     };
 
-    push_raw(&mut spans, &mut col, if is_fork { "Fork → [" } else { "New [" });
+    push_raw(
+        &mut spans,
+        &mut col,
+        if is_fork { "Fork → [" } else { "New [" },
+    );
     for (i, (name, available)) in entries.iter().enumerate() {
         if i > 0 {
             push_raw(&mut spans, &mut col, "|");
@@ -1353,7 +1356,11 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let harness_w = harness.chars().count();
                     // Reserve room for the trailing unblock marker (" ●") so the
                     // right-aligned harness label doesn't shift when it shows.
-                    let marker_w = if s.needs_attention && !s.archived { 2 } else { 0 };
+                    let marker_w = if s.needs_attention && !s.archived {
+                        2
+                    } else {
+                        0
+                    };
                     // Always leave at least one cell of gap between the name
                     // and the right-aligned harness.
                     let name_avail = row_w.saturating_sub(prefix_w + 1 + harness_w + marker_w);
@@ -1735,7 +1742,12 @@ fn render_matrix_rain(f: &mut Frame, rain_area: Rect, app: &mut App) {
             .max_by_key(|(_, state)| state.revealed_at)
             .and_then(|(_, state)| {
                 state.decoded.clone().map(|img| {
-                    (img, state.revealed_at, state.hide_after, state.hover_started.is_some())
+                    (
+                        img,
+                        state.revealed_at,
+                        state.hide_after,
+                        state.hover_started.is_some(),
+                    )
                 })
             });
         if let Some((img, revealed_at, hide_after, hovered)) = &thumb {
@@ -2968,9 +2980,7 @@ fn render_session_title_menu(f: &mut Frame, app: &App) {
             break;
         }
         let hovered = app.mouse_pos.is_some_and(|(mx, my)| {
-            my == row
-                && mx > area.x
-                && mx < area.x.saturating_add(area.width).saturating_sub(1)
+            my == row && mx > area.x && mx < area.x.saturating_add(area.width).saturating_sub(1)
         });
         let style = if hovered {
             Style::default()
@@ -2982,18 +2992,17 @@ fn render_session_title_menu(f: &mut Frame, app: &App) {
         } else {
             Style::default().fg(app.theme.text)
         };
-        let label_text =
-            if matches!(action, SessionTitleMenuAction::Archive)
-                && app
-                    .sessions
-                    .iter()
-                    .find(|s| s.id == menu.session_id)
-                    .is_some_and(|s| s.archived)
-            {
-                "unarchive"
-            } else {
-                action.label()
-            };
+        let label_text = if matches!(action, SessionTitleMenuAction::Archive)
+            && app
+                .sessions
+                .iter()
+                .find(|s| s.id == menu.session_id)
+                .is_some_and(|s| s.archived)
+        {
+            "unarchive"
+        } else {
+            action.label()
+        };
         let label = format!(" {label_text} ");
         let text = truncate_to_width(&label, area.width.saturating_sub(2) as usize);
         f.buffer_mut()
@@ -3689,7 +3698,11 @@ fn render_visible_dynamic_ui_panels(
     let now = std::time::Instant::now();
     app.dynamic_ui_temporary_until
         .retain(|_, until| *until > now);
-    if app.dynamic_ui_hover.as_ref().is_some_and(|h| h.until <= now) {
+    if app
+        .dynamic_ui_hover
+        .as_ref()
+        .is_some_and(|h| h.until <= now)
+    {
         app.dynamic_ui_hover = None;
     }
     let mut visible: Vec<_> = panels
@@ -5705,7 +5718,11 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         String::new()
     };
     let mut search_status = None;
-    if let Some(search) = app.program_popup.as_ref().and_then(|popup| popup.search.as_ref()) {
+    if let Some(search) = app
+        .program_popup
+        .as_ref()
+        .and_then(|popup| popup.search.as_ref())
+    {
         let selected = if search.matches.is_empty() {
             0
         } else {
@@ -5720,7 +5737,11 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         } else if search.query.is_empty() {
             format!("I-search ({selected}/{})", search.matches.len())
         } else {
-            format!("I-search: {} ({selected}/{})", search.query, search.matches.len())
+            format!(
+                "I-search: {} ({selected}/{})",
+                search.query,
+                search.matches.len()
+            )
         });
     }
     let status = search_status
@@ -6014,7 +6035,6 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     let para = Paragraph::new(Line::from(spans));
     f.render_widget(para, area);
 }
-
 
 fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
     // Target a comfortable reading width — long enough to keep each
@@ -7006,7 +7026,10 @@ pub fn short_event_label(ev: &SessionEvent) -> String {
             format!("approval-mode {}", mode.badge().unwrap_or("manual"))
         }
         SessionEvent::OperatorLoopChanged { enabled } => {
-            format!("operator-loop {}", if *enabled { "enabled" } else { "disabled" })
+            format!(
+                "operator-loop {}",
+                if *enabled { "enabled" } else { "disabled" }
+            )
         }
         SessionEvent::ModelChanged { model } => format!("model {model}"),
         SessionEvent::TaskStart { tool, call_id, .. } => format!("task-start {tool} {call_id}"),
@@ -7345,8 +7368,8 @@ struct ProgramShimmer {
 
 /// Build the shimmer overlay for a popup from its session's `ProgramRun`, or
 /// `None` if no run is active, it has lapsed, or every block has settled. A
-/// block shimmers while its stable id is in the run's pending set (spec 0053);
-/// editing a block changes its id, taking it out of the animation by default.
+/// block shimmers while its stable ref is in the run's pending set (spec 0053);
+/// editing a block advances its epoch, taking stale shimmer out by default.
 fn program_run_shimmer(
     app: &App,
     popup: &crate::app::ProgramPopup,
@@ -7358,8 +7381,34 @@ fn program_run_shimmer(
     }
     let mut active_lines = vec![false; popup.buffer.lines().count()];
     let mut any = false;
-    for block in crate::app::program_blocks(&popup.buffer) {
-        if run.pending.contains(&block.id) {
+    let clean = popup.buffer == popup.saved_markdown && !popup.blocks.is_empty();
+    if clean {
+        let has_stable_match = popup
+            .blocks
+            .iter()
+            .any(|block| run.pending.contains(&block.id));
+        for block in &popup.blocks {
+            let pending = if has_stable_match {
+                run.pending.contains(&block.id)
+            } else {
+                run.pending.contains(&block.id) || run.pending.contains(&block.content_id)
+            };
+            if pending {
+                for slot in active_lines
+                    .iter_mut()
+                    .take(block.end_line)
+                    .skip(block.start_line)
+                {
+                    *slot = true;
+                    any = true;
+                }
+            }
+        }
+    } else {
+        for block in crate::app::program_blocks(&popup.buffer) {
+            if !run.pending.contains(&block.id) {
+                continue;
+            }
             for slot in active_lines
                 .iter_mut()
                 .take(block.end_line)
@@ -7373,9 +7422,11 @@ fn program_run_shimmer(
     if !any {
         return None;
     }
-    let phase =
-        now.saturating_duration_since(run.started_at).as_secs_f32() * PROGRAM_SHIMMER_SPEED;
-    Some(ProgramShimmer { active_lines, phase })
+    let phase = now.saturating_duration_since(run.started_at).as_secs_f32() * PROGRAM_SHIMMER_SPEED;
+    Some(ProgramShimmer {
+        active_lines,
+        phase,
+    })
 }
 
 /// Overlay the Run shimmer onto already-rendered program lines: for each active
@@ -7614,8 +7665,7 @@ fn render_program_popup_at(
     if progress <= 0.0 {
         return;
     }
-    let visible_h = ((base_rect.height as f32 * progress).ceil() as u16)
-        .clamp(1, base_rect.height);
+    let visible_h = ((base_rect.height as f32 * progress).ceil() as u16).clamp(1, base_rect.height);
     if visible_h == 0 {
         return;
     }
@@ -7694,7 +7744,10 @@ fn render_program_popup_at(
     f.render_widget(block, rect);
 
     let selection = program_selection_range(popup);
-    let search = popup.search.as_ref().filter(|search| !search.matches.is_empty());
+    let search = popup
+        .search
+        .as_ref()
+        .filter(|search| !search.matches.is_empty());
     let search_matches = search.map(|search| search.matches.as_slice());
     let search_selected = search.map(|search| search.selected);
     let mut lines = render_program_markdown_lines(
@@ -8001,6 +8054,7 @@ fn render_program_shimmer_hover(
     let Some(block_id) = program_shimmer_block_at(
         Some(app),
         &popup.buffer,
+        (popup.buffer == popup.saved_markdown).then_some(popup.blocks.as_slice()),
         &shimmer.active_lines,
         scroll_offset,
         body,
@@ -8015,7 +8069,9 @@ fn render_program_shimmer_hover(
         .program_runs
         .get(&popup.program.session_id)
         .and_then(|run| run.pending_tooltips.get(&block_id))
-        .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| t.as_str())
+        .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| {
+            t.as_str()
+        })
         .to_string();
     // Prefer a cropped live terminal view of the session this block is working,
     // captioned with the status tooltip. The resolver helpers mirror the same
@@ -8119,6 +8175,7 @@ fn program_shimmer_session_at(
 fn program_shimmer_block_at(
     app: Option<&App>,
     markdown: &str,
+    blocks: Option<&[agentd_protocol::ProgramBlockView]>,
     active_lines: &[bool],
     scroll_offset: usize,
     area: Rect,
@@ -8151,6 +8208,14 @@ fn program_shimmer_block_at(
     let source_line = source_line?;
     if !active_lines.get(source_line).copied().unwrap_or(false) {
         return None;
+    }
+    if let Some(blocks) = blocks {
+        if let Some(block) = blocks
+            .iter()
+            .find(|block| (block.start_line..block.end_line).contains(&source_line))
+        {
+            return Some(block.id.clone());
+        }
     }
     crate::app::program_blocks(markdown)
         .into_iter()
@@ -8363,11 +8428,7 @@ fn program_mode_glyph() -> &'static str {
     "▣"
 }
 
-fn program_toggle_style(
-    app: &App,
-    popup: &crate::app::ProgramPopup,
-    active: bool,
-) -> Style {
+fn program_toggle_style(app: &App, popup: &crate::app::ProgramPopup, active: bool) -> Style {
     let style = if popup.closing {
         Style::default().fg(app.theme.muted)
     } else if active {
@@ -8476,9 +8537,13 @@ fn render_program_selection_context_menu(
         app.layout.program_selection_run_hit = None;
         return;
     }
-    let Some(pos) =
-        program_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, program_area)
-    else {
+    let Some(pos) = program_cursor_position(
+        Some(app),
+        &popup.buffer,
+        popup.cursor,
+        scroll_offset,
+        program_area,
+    ) else {
         app.layout.program_selection_run_hit = None;
         return;
     };
@@ -8534,7 +8599,6 @@ fn program_selection_context_menu_rect(pos: Position, total: Rect) -> Rect {
     }
 }
 
-
 fn render_program_smart_clip_picker(
     f: &mut Frame,
     app: &App,
@@ -8589,9 +8653,11 @@ fn render_program_smart_clip_picker(
     };
 
     let width = 46u16.min(program_area.width.max(1));
-    let x = cursor_pos
-        .x
-        .min(program_area.x.saturating_add(program_area.width.saturating_sub(width)));
+    let x = cursor_pos.x.min(
+        program_area
+            .x
+            .saturating_add(program_area.width.saturating_sub(width)),
+    );
     let below_y = cursor_pos.y.saturating_add(1);
     let above_y = cursor_pos.y.saturating_sub(row_count.saturating_add(2));
     let y = if below_y.saturating_add(row_count).saturating_add(2)
@@ -8628,7 +8694,12 @@ fn render_program_smart_clip_picker(
             Style::default().fg(app.theme.dim),
         )));
     } else {
-        for (raw_idx, row) in rows.iter().enumerate().skip(offset).take(row_count as usize) {
+        for (raw_idx, row) in rows
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(row_count as usize)
+        {
             let selected = sel_raw == Some(raw_idx);
             lines.push(render_program_smart_clip_row(app, row, selected, inner_w));
         }
@@ -8783,7 +8854,15 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         } else {
             above_y.max(prog.y)
         };
-        (Rect { x, y, width, height }, body_rows)
+        (
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            body_rows,
+        )
     } else if show_search {
         // Centered switcher with a FIXED height: size the body to the full,
         // unfiltered list (clamped) so the frame stays put while the live query
@@ -8791,7 +8870,9 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         let width = (area.width * 3 / 5)
             .clamp(40, 76)
             .min(area.width.saturating_sub(4));
-        let max_height = (area.height * 2 / 3).max(8).min(area.height.saturating_sub(2));
+        let max_height = (area.height * 2 / 3)
+            .max(8)
+            .min(area.height.saturating_sub(2));
         let fixed = 5u16; // 2 borders + search + separator + footer
         let body_avail = max_height.saturating_sub(fixed).max(1);
         let stable_rows = app.session_picker_rows_for_query("").len() as u16;
@@ -8799,20 +8880,38 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         let height = body_rows + fixed;
         let x = area.x + area.width.saturating_sub(width) / 2;
         let y = area.y + area.height.saturating_sub(height) / 2;
-        (Rect { x, y, width, height }, body_rows)
+        (
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            body_rows,
+        )
     } else {
         // Search-less but no anchor captured (defensive fallback): a centered,
         // content-sized, borders-only list.
         let width = (area.width * 3 / 5)
             .clamp(40, 76)
             .min(area.width.saturating_sub(4));
-        let max_height = (area.height * 2 / 3).max(8).min(area.height.saturating_sub(2));
+        let max_height = (area.height * 2 / 3)
+            .max(8)
+            .min(area.height.saturating_sub(2));
         let body_avail = max_height.saturating_sub(2).max(1);
         let body_rows = (rows.len() as u16).clamp(1, body_avail);
         let height = body_rows + 2;
         let x = area.x + area.width.saturating_sub(width) / 2;
         let y = area.y + area.height.saturating_sub(height) / 2;
-        (Rect { x, y, width, height }, body_rows)
+        (
+            Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            body_rows,
+        )
     };
 
     // Clamp the persisted scroll so the highlighted row stays on screen, and so
@@ -9420,7 +9519,11 @@ struct LineClip {
 /// the returned spans are in the same coordinate space as
 /// [`program_wrap_row_starts`]. The produced string is byte-for-byte what
 /// `program_inline_rendered_text` returns.
-fn program_inline_with_clips(app: Option<&App>, text: &str, base: usize) -> (String, Vec<LineClip>) {
+fn program_inline_with_clips(
+    app: Option<&App>,
+    text: &str,
+    base: usize,
+) -> (String, Vec<LineClip>) {
     let mut out = String::new();
     let mut clips = Vec::new();
     let mut visual = base;
@@ -9819,8 +9922,7 @@ fn render_program_inline_spans<'a>(
                 (ms < clip_char_end && me > clip_char_start).then_some(i)
             })
         });
-        let clip_is_active_match = clip_match_idx
-            .is_some_and(|idx| search_selected == Some(idx));
+        let clip_is_active_match = clip_match_idx.is_some_and(|idx| search_selected == Some(idx));
         spans.push(program_smart_clip_span(
             app,
             raw_clip,
@@ -9833,13 +9935,13 @@ fn render_program_inline_spans<'a>(
     if !rest.is_empty() {
         spans.extend(program_text_spans(
             &app.theme,
-        rest,
-        base + offset,
-        Style::default().fg(app.theme.text),
-        selection,
-        search_matches,
-        search_selected,
-    ));
+            rest,
+            base + offset,
+            Style::default().fg(app.theme.text),
+            selection,
+            search_matches,
+            search_selected,
+        ));
     }
     spans
 }
@@ -9860,10 +9962,13 @@ fn program_text_spans<'a>(
     let mut chunk_in_active_match: Option<bool> = None;
     for (idx, ch) in text.chars().enumerate() {
         let absolute_idx = base + idx;
-        let match_idx = search_matches.and_then(|matches| program_search_match_index(matches, absolute_idx));
+        let match_idx =
+            search_matches.and_then(|matches| program_search_match_index(matches, absolute_idx));
         let in_match = Some(match_idx.is_some());
-        let in_active_match = Some(search_selected.is_some_and(|selected| Some(selected) == match_idx));
-        let selected = selection.map(|(sel_start, sel_end)| absolute_idx >= sel_start && absolute_idx < sel_end);
+        let in_active_match =
+            Some(search_selected.is_some_and(|selected| Some(selected) == match_idx));
+        let selected = selection
+            .map(|(sel_start, sel_end)| absolute_idx >= sel_start && absolute_idx < sel_end);
         if chunk_selected.is_some_and(|current| Some(current) != selected)
             || chunk_in_match.is_some_and(|current| Some(current) != in_match)
             || chunk_in_active_match.is_some_and(|current| Some(current) != in_active_match)
@@ -9929,7 +10034,12 @@ fn program_search_match_index(matches: &[(usize, usize)], idx: usize) -> Option<
         .find_map(|(i, &(start, end))| (idx >= start && idx < end).then_some(i))
 }
 
-fn program_smart_clip_span<'a>(app: &App, raw_clip: &str, in_match: bool, is_active_match: bool) -> Span<'a> {
+fn program_smart_clip_span<'a>(
+    app: &App,
+    raw_clip: &str,
+    in_match: bool,
+    is_active_match: bool,
+) -> Span<'a> {
     let (kind, label) = program_smart_clip_label(Some(app), raw_clip);
     let bg = if is_active_match {
         app.theme.highlight_bg
@@ -9943,7 +10053,10 @@ fn program_smart_clip_span<'a>(app: &App, raw_clip: &str, in_match: bool, is_act
             _ => app.theme.inactive_highlight_bg,
         }
     };
-    let mut style = Style::default().fg(app.theme.highlight_fg).bg(bg).add_modifier(Modifier::BOLD);
+    let mut style = Style::default()
+        .fg(app.theme.highlight_fg)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
     if is_active_match {
         style = style.fg(app.theme.highlight_fg);
     }
@@ -9968,7 +10081,12 @@ fn program_smart_clip_target(raw_clip: &str) -> (&str, &str) {
 /// harness (not the model) and drops the redundant "session" prefix and the
 /// status word.
 fn program_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
-    format!("{} {} · {}", s.state.glyph(), primary_label(s), harness_label(s))
+    format!(
+        "{} {} · {}",
+        s.state.glyph(),
+        primary_label(s),
+        harness_label(s)
+    )
 }
 
 fn program_harness_clip_label(h: &agentd_protocol::HarnessInfo) -> String {
@@ -9976,7 +10094,10 @@ fn program_harness_clip_label(h: &agentd_protocol::HarnessInfo) -> String {
     format!("{status_icon} {}", h.name)
 }
 
-pub(crate) fn program_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str) -> (&'a str, String) {
+pub(crate) fn program_smart_clip_label<'a>(
+    app: Option<&App>,
+    raw_clip: &'a str,
+) -> (&'a str, String) {
     let (kind, id) = program_smart_clip_target(raw_clip);
     let label = match kind {
         "session" => app
@@ -9989,7 +10110,10 @@ pub(crate) fn program_smart_clip_label<'a>(app: Option<&App>, raw_clip: &'a str)
             .unwrap_or_else(|| format!("session {id}")),
         "harness" => app
             .and_then(|app| {
-                app.harnesses.iter().find(|h| h.name == id).map(program_harness_clip_label)
+                app.harnesses
+                    .iter()
+                    .find(|h| h.name == id)
+                    .map(program_harness_clip_label)
             })
             .unwrap_or_else(|| format!("harness {id}")),
         "session-response" => format!("response {id}"),
@@ -10276,7 +10400,10 @@ mod tests {
         assert!(w > h, "capped width should still exceed height: {w}x{h}");
         // Shorter card, still wider than tall.
         let (w, h) = session_hover_card_size(4, 3, 64);
-        assert!(w > h, "expected landscape card without preview, got {w}x{h}");
+        assert!(
+            w > h,
+            "expected landscape card without preview, got {w}x{h}"
+        );
     }
 
     #[test]
@@ -10299,7 +10426,10 @@ mod tests {
 
         let rect = session_hover_card_rect(modal, 50, 14, 125, 42).expect("card fits");
         assert_eq!(rect.x, 80, "right edge should stay inside the modal");
-        assert_eq!(rect.y, 28, "card should flip above the mouse near the bottom");
+        assert_eq!(
+            rect.y, 28,
+            "card should flip above the mouse near the bottom"
+        );
     }
 
     #[test]
@@ -10343,8 +10473,14 @@ mod tests {
             Some("s1".to_string())
         );
         // The settled block and out-of-body cells resolve to nothing.
-        assert_eq!(program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 3), None);
-        assert_eq!(program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 99), None);
+        assert_eq!(
+            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 3),
+            None
+        );
+        assert_eq!(
+            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 99),
+            None
+        );
     }
 
     #[test]
@@ -10438,8 +10574,14 @@ mod tests {
         // `<glyph> <name> · <harness>` — no "session" prefix, no model, no status word.
         assert_eq!(program_session_clip_label(&s), "● My Task · codex");
         let label = program_session_clip_label(&s);
-        assert!(!label.contains("session"), "dropped the session prefix: {label}");
-        assert!(!label.contains("running"), "dropped the status word: {label}");
+        assert!(
+            !label.contains("session"),
+            "dropped the session prefix: {label}"
+        );
+        assert!(
+            !label.contains("running"),
+            "dropped the status word: {label}"
+        );
     }
 
     #[test]
@@ -10501,7 +10643,9 @@ mod tests {
             ]
         );
         // A cell inside the first chip resolves to s1; the gap between chips does not.
-        assert!(hits.iter().any(|h| h.contains(5, 0) && h.session_id == "s1"));
+        assert!(hits
+            .iter()
+            .any(|h| h.contains(5, 0) && h.session_id == "s1"));
         assert!(!hits.iter().any(|h| h.contains(20, 0)));
     }
 
@@ -10928,7 +11072,10 @@ mod tests {
     fn program_cursor_position_subtracts_scroll_offset() {
         // Ten single-row lines at width 20; the cursor sits on logical line 7.
         let area = Rect::new(10, 0, 20, 5);
-        let markdown = (0..10).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let markdown = (0..10)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let cursor = markdown.find("L7").unwrap();
         // Scrolled past the first 5 rows, row 7 renders two rows into the view.
         assert_eq!(
@@ -10936,7 +11083,10 @@ mod tests {
             Some(Position { x: 10, y: 2 })
         );
         // Without scrolling, that row is below the 5-row window: no cell to draw.
-        assert_eq!(program_cursor_position(None, &markdown, cursor, 0, area), None);
+        assert_eq!(
+            program_cursor_position(None, &markdown, cursor, 0, area),
+            None
+        );
     }
 
     #[test]
@@ -10954,7 +11104,9 @@ mod tests {
     fn program_heading_rendering_keeps_markdown_marker() {
         let theme = Theme::default();
         assert_eq!(
-            line_text(&render_program_heading_line(&theme, 1, "# Todo", 0, None, None, None)),
+            line_text(&render_program_heading_line(
+                &theme, 1, "# Todo", 0, None, None, None
+            )),
             "# Todo"
         );
         assert_eq!(
@@ -10989,14 +11141,22 @@ mod tests {
             if span.content.as_ref() != "alpha" {
                 continue;
             }
-            if span.style.bg == Some(theme.highlight_bg) && span.style.fg == Some(theme.highlight_fg) {
+            if span.style.bg == Some(theme.highlight_bg)
+                && span.style.fg == Some(theme.highlight_fg)
+            {
                 active_highlight = true;
             } else if span.style.bg == Some(theme.highlight_bg) {
                 inactive_highlight = true;
             }
         }
-        assert!(active_highlight, "selected match should be bold + highlighted");
-        assert!(inactive_highlight, "non-active match should still be highlighted");
+        assert!(
+            active_highlight,
+            "selected match should be bold + highlighted"
+        );
+        assert!(
+            inactive_highlight,
+            "non-active match should still be highlighted"
+        );
     }
 
     #[test]
@@ -11005,7 +11165,10 @@ mod tests {
         let active_program = program_border_style(&theme, true);
         let inactive_program = program_border_style(&theme, false);
 
-        assert_eq!(pane_border_style(&theme, true).fg, Some(theme.border_focused));
+        assert_eq!(
+            pane_border_style(&theme, true).fg,
+            Some(theme.border_focused)
+        );
         assert_eq!(active_program.fg, Some(theme.accent_alt));
         assert_eq!(inactive_program.fg, active_program.fg);
         assert_ne!(inactive_program.fg, Some(theme.border));

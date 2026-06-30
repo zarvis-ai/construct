@@ -68,7 +68,7 @@ pub fn catalog() -> Vec<Value> {
         ),
         tool(
             "construct_program_get",
-            "Fetch a session's program Markdown document, version, retained revisions, and — when a Run is active — the per-block shimmer projection. The `blocks` array lists each block in document order with a stable `id`, its `text`, and its current `shimmer` state (true = pending, false = settled). Use these ids to declare shimmer back via construct_program_edit or construct_program_update. Defaults to the current session when `session_id` is omitted.",
+            "Fetch a session's program Markdown document, version, retained revisions, and — when a Run is active — the per-block shimmer projection. The `blocks` array lists each block in document order with a stable ref in `id`/`block_ref`, legacy `content_id`, its `text`, and current `shimmer` state (true = pending, false = settled). Use the stable `id` to declare shimmer back via construct_program_edit or construct_program_update. Defaults to the current session when `session_id` is omitted.",
             schema_obj(&[("session_id", "string", false)]),
         ),
         tool(
@@ -79,7 +79,7 @@ pub fn catalog() -> Vec<Value> {
         // ----- Write -----
         tool(
             "construct_program_edit",
-            "PREFERRED for changing a session's program: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST program content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_program_get and retry. Agent edits need no user confirmation. For moving or reclassifying text between headings, use ONE construct_program_edit call with multiple `edits` entries — one entry removes the text from its old location and another inserts it at the new location. Do not make a separate remove call followed by a separate add call; the Program view can otherwise show a transient missing block. Shimmer (the program-run progress animation) is declared per block by stable id: pass a `shimmer` array of `{id, shimmer}` entries to mark blocks pending (true) or settled (false). The list is PARTIAL and may target ANY block — not only the ones these edits change — so a planning pass can settle no-work blocks without touching their text; blocks you omit keep their current shimmer. Get block ids from construct_program_get or the `blocks` echoed by this call. Editing a block's text changes its id, so to keep an edited block shimmering set `keep_pending: true` on that edit (preferred — it re-adds the resulting block's new id atomically, so you need not know the new id and the block never goes dark; use this when moving an in-flight task into an In progress section or appending a @{session} clip). Ids that no longer match a block are ignored (that block changed underneath you). Every entry that sets `shimmer: true` MUST include a `tooltip`: a concise (≤10-word) description of that block's run status (e.g. \"Building PR\", \"Waiting on CI\"); it is shown when a user hovers the shimmering block. Tooltips are ignored for `shimmer: false`.",
+            "PREFERRED for changing a session's program: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST program content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_program_get and retry. Agent edits need no user confirmation. For moving or reclassifying text between headings, use ONE construct_program_edit call with multiple `edits` entries — one entry removes the text from its old location and another inserts it at the new location. Do not make a separate remove call followed by a separate add call; the Program view can otherwise show a transient missing block. Shimmer (the program-run progress animation) is declared per block by stable ref: pass a `shimmer` array of `{id, shimmer}` entries to mark blocks pending (true) or settled (false). The list is PARTIAL and may target ANY block — not only the ones these edits change — so a planning pass can settle no-work blocks without touching their text; blocks you omit keep their current shimmer. Get block ids from construct_program_get or the `blocks` echoed by this call. Editing a block's semantic text advances its content epoch and gives it a new ref, so to keep an edited block shimmering set `keep_pending: true` on that edit (preferred — it re-adds the resulting block's new ref atomically, so you need not know it and the block never goes dark; use this when moving an in-flight task into an In progress section or appending a @{session} clip). Ids that no longer match a block are ignored (that block changed underneath you). Every entry that sets `shimmer: true` MUST include a `tooltip`: a concise (≤10-word) description of that block's run status (e.g. \"Building PR\", \"Waiting on CI\"); it is shown when a user hovers the shimmering block. Tooltips are ignored for `shimmer: false`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -94,18 +94,18 @@ pub fn catalog() -> Vec<Value> {
                                 "old_string": { "type": "string" },
                                 "new_string": { "type": "string" },
                                 "replace_all": { "type": "boolean" },
-                                "keep_pending": { "type": "boolean", "description": "Keep the block this edit produces shimmering (still pending) — adds its new id in the same call. Set when an edit changes a block whose work is still in flight (e.g. moving a task to In progress or appending a @{session} clip)." }
+                                "keep_pending": { "type": "boolean", "description": "Keep the block this edit produces shimmering (still pending) — adds its new stable ref in the same call. Set when an edit changes a block whose work is still in flight (e.g. moving a task to In progress or appending a @{session} clip)." }
                             },
                             "required": ["old_string", "new_string"]
                         }
                     },
                     "shimmer": {
                         "type": "array",
-                        "description": "Partial per-block shimmer declaration applied after the edits. Each entry sets one block's pending state by its stable id (from construct_program_get or a prior call's `blocks`). Omitted blocks keep their current shimmer.",
+                        "description": "Partial per-block shimmer declaration applied after the edits. Each entry sets one block's pending state by its stable `id`/block ref (from construct_program_get or a prior call's `blocks`). Omitted blocks keep their current shimmer.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": { "type": "string", "description": "Stable block id" },
+                                "id": { "type": "string", "description": "Stable block ref from a block projection" },
                                 "shimmer": { "type": "boolean", "description": "true = pending (keep shimmering); false = settled (clear)" },
                                 "tooltip": { "type": "string", "description": "Required when shimmer is true: a concise (≤10-word) description of this block's run status, shown on hover (e.g. \"Building PR\", \"Waiting on CI\"). Ignored when shimmer is false." }
                             },
@@ -119,7 +119,7 @@ pub fn catalog() -> Vec<Value> {
         ),
         tool(
             "construct_program_update",
-            "Replace a session's ENTIRE program Markdown. Prefer construct_program_edit for targeted changes — it merges with concurrent human edits, whereas a whole-document replace can clobber them. Use this only for wholesale rewrites or initial population. Pass `base_version` from construct_program_get for optimistic conflict detection; on conflict, re-read the program and retry with a resolved document. Agent updates need no user confirmation. Because this replaces the whole document, you must also pass `shimmer`: a COMPLETE array of booleans, one per block of the new Markdown in document order (true = pending, false = settled). Blocks are maximal runs of non-blank lines; count them top to bottom. The array length must equal the block count or the call fails. You must also pass `tooltips`: an array the same length as `shimmer` where, for every block you mark pending (true), the matching entry is a concise (≤10-word) run-status string shown on hover (e.g. \"Building PR\"); entries for settled blocks may be null or empty.",
+            "Replace a session's ENTIRE program Markdown. Prefer construct_program_edit for targeted changes — it merges with concurrent human edits, whereas a whole-document replace can clobber them. Use this only for wholesale rewrites or initial population. Pass `base_version` from construct_program_get for optimistic conflict detection; on conflict, re-read the program and retry with a resolved document. Agent updates need no user confirmation. Because this replaces the whole document, you must also pass `shimmer`: a COMPLETE array of booleans, one per projected block of the new Markdown in document order (true = pending, false = settled). The array length must equal the block count or the call fails. You must also pass `tooltips`: an array the same length as `shimmer` where, for every block you mark pending (true), the matching entry is a concise (≤10-word) run-status string shown on hover (e.g. \"Building PR\"); entries for settled blocks may be null or empty.",
             json!({
                 "type": "object",
                 "properties": {
@@ -490,12 +490,11 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
         // ----- Write -----
         "construct_program_update" => {
             let sid = optional_session_arg(&args, session_id)?;
-            let shimmer: Vec<bool> = serde_json::from_value(
-                args.get("shimmer").cloned().ok_or_else(|| {
+            let shimmer: Vec<bool> =
+                serde_json::from_value(args.get("shimmer").cloned().ok_or_else(|| {
                     anyhow!("missing `shimmer`: a boolean per program block, in document order")
-                })?,
-            )
-            .map_err(|e| anyhow!("invalid `shimmer` (expected an array of booleans): {e}"))?;
+                })?)
+                .map_err(|e| anyhow!("invalid `shimmer` (expected an array of booleans): {e}"))?;
             // Per-block tooltips parallel to `shimmer` (spec 0057): required, and
             // every pending block must carry a non-empty tooltip.
             let tooltips: Vec<Option<String>> = serde_json::from_value(
@@ -551,7 +550,12 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             // (spec 0057); settling needs none.
             for decl in &shimmer {
                 if decl.shimmer
-                    && decl.tooltip.as_deref().map(str::trim).unwrap_or("").is_empty()
+                    && decl
+                        .tooltip
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
                 {
                     return Err(anyhow!(
                         "shimmer entry for block {} is shimmer:true but has no tooltip — a pending block needs a concise (≤10-word) run-status tooltip",
@@ -1003,7 +1007,9 @@ mod tests {
     fn program_edit_tool_guides_moves_into_one_call() {
         let tool = catalog()
             .into_iter()
-            .find(|tool| tool.get("name").and_then(|name| name.as_str()) == Some("construct_program_edit"))
+            .find(|tool| {
+                tool.get("name").and_then(|name| name.as_str()) == Some("construct_program_edit")
+            })
             .expect("program edit tool");
         let description = tool
             .get("description")

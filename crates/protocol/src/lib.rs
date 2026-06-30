@@ -707,8 +707,10 @@ pub fn is_pty_active_payload(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if b == 0x1b { // ESC
-            if i + 1 < bytes.len() && bytes[i + 1] == b'[' { // CSI
+        if b == 0x1b {
+            // ESC
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // CSI
                 let start = i;
                 i += 2;
                 let mut is_ignorable = false;
@@ -966,7 +968,7 @@ pub struct ProgramBlockSpan {
     /// Normalized content: each line trimmed, joined by `\n`. Equal-content
     /// blocks share a signature (and therefore an id) and settle together.
     pub signature: String,
-    /// Stable, content-derived block id (spec 0053): a hash of `signature`.
+    /// Legacy content-derived block id (spec 0053): a hash of `signature`.
     pub id: String,
     /// Raw block text: source lines `[start_line, end_line)` joined by `\n`
     /// (original indentation preserved), usable directly as an edit anchor.
@@ -975,10 +977,25 @@ pub struct ProgramBlockSpan {
 
 /// One block of a program with its current shimmer state — the per-block
 /// projection returned by program get/edit/update so an agent reads and
-/// declares shimmer by stable block id (spec 0053).
+/// declares shimmer by stable block ref (spec 0053).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProgramBlockView {
+    /// Stable daemon-owned block-instance reference for shimmer declarations.
+    /// Prefer this (or `id`, which mirrors it for compatibility with existing
+    /// agent instructions) over content-derived ids.
     pub id: String,
+    /// Stable block-instance id, independent of content and position.
+    #[serde(default)]
+    pub block_id: String,
+    /// Incremented when this block instance's semantic content changes.
+    #[serde(default)]
+    pub content_epoch: u64,
+    /// `block_id:content_epoch`; the authoritative shimmer key.
+    #[serde(default)]
+    pub block_ref: String,
+    /// Legacy content-derived id for compatibility and diagnostics.
+    #[serde(default)]
+    pub content_id: String,
     pub start_line: usize,
     pub end_line: usize,
     pub text: String,
@@ -992,7 +1009,7 @@ pub struct ProgramBlockView {
     pub tooltip: Option<String>,
 }
 
-/// A declaration that a program block (addressed by its stable id) is pending
+/// A declaration that a program block (addressed by its stable ref/id) is pending
 /// (`shimmer: true`) or settled (`shimmer: false`) — the unit of the per-block
 /// shimmer declaration carried by program edits (spec 0053). When declaring a
 /// block pending, a concise `tooltip` describing its run status is required of
@@ -1035,11 +1052,10 @@ pub fn normalize_program_tooltip(raw: &str) -> Option<String> {
     }
 }
 
-/// Stable, content-derived id for a program block (spec 0053). Derived from the
+/// Legacy content-derived id for a program block (spec 0053). Derived from the
 /// block's identity signature with a dependency-free FNV-1a hash so the daemon
-/// and every client compute the same id for the same content. The id is stable
-/// against position but changes when the block's own semantic text changes;
-/// equal content yields equal ids (such blocks shimmer and settle together).
+/// and every client compute the same fallback id for the same content. Stable
+/// block refs from `ProgramBlockView::id` are authoritative when available.
 pub fn program_block_id(signature: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in signature.as_bytes() {
@@ -1179,15 +1195,21 @@ pub struct ProgramRunProgress {
     pub run_id: String,
     pub started_at_ms: i64,
     pub expires_at_ms: i64,
-    /// Stable content-derived ids of the blocks still pending in this run
-    /// (spec 0053). A block shimmers exactly while its id is in this set.
+    /// Legacy content-derived ids of the blocks still pending in this run.
+    /// New payloads prefer `pending_block_refs`; this is kept for older clients
+    /// and dirty-buffer fallback rendering.
     #[serde(default)]
     pub pending_block_ids: Vec<String>,
-    /// Per-block run-status tooltips keyed by stable block id (spec 0057), kept
-    /// in sync with `pending_block_ids`: an entry exists only for a pending
-    /// block whose shimmer was declared with a tooltip. Settling a block, or
-    /// dropping it from the pending set, removes its entry. A pending block with
-    /// no entry (optimistic/legacy/keep_pending) renders the hardcoded fallback.
+    /// Stable block refs (`block_id:content_epoch`) still pending in this run.
+    /// New clients and agents should use this; `pending_block_ids` remains as a
+    /// legacy content-id projection for compatibility.
+    #[serde(default)]
+    pub pending_block_refs: Vec<String>,
+    /// Per-block run-status tooltips keyed by stable block ref when available,
+    /// or by legacy content id for fallback/older runs (spec 0057). Settling a
+    /// block, or dropping it from the pending set, removes its entry. A pending
+    /// block with no entry (optimistic/legacy/keep_pending) renders the
+    /// hardcoded fallback.
     #[serde(default)]
     pub pending_block_tooltips: HashMap<String, String>,
     #[serde(default)]
@@ -1280,7 +1302,7 @@ pub struct ProgramGetResult {
     pub revisions: Vec<ProgramRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_run: Option<ProgramRunProgress>,
-    /// Ordered per-block projection with each block's stable id and current
+    /// Ordered per-block projection with each block's stable ref/id and current
     /// shimmer state (spec 0053). Derived from the live markdown; not persisted.
     #[serde(default)]
     pub blocks: Vec<ProgramBlockView>,
@@ -1356,7 +1378,7 @@ pub struct ProgramEditParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
     /// Partial shimmer declaration applied after the edits (spec 0053): each
-    /// entry sets the pending state of a block addressed by its stable id, and
+    /// entry sets the pending state of a block addressed by its stable ref/id, and
     /// may target any block, not only blocks this edit changed. Ids that match
     /// no post-edit block are dropped (the block changed underneath the caller).
     #[serde(default)]
@@ -1398,6 +1420,10 @@ pub struct ProgramStateNotificationPayload {
     pub program: ProgramDocument,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_run: Option<ProgramRunProgress>,
+    /// Ordered per-block projection, included so clients can map stable
+    /// block refs to the rendered Markdown without re-deriving identity.
+    #[serde(default)]
+    pub blocks: Vec<ProgramBlockView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2177,16 +2203,15 @@ mod program_block_tests {
 
     #[test]
     fn block_id_ignores_smart_clip_instance_ids() {
-        let without_clip_id =
-            program_block_spans("* task — @{session:s1}\n").pop().unwrap();
-        let with_clip_id =
-            program_block_spans("* task — @{session:s1 clip_id=clip_4}\n")
-                .pop()
-                .unwrap();
-        let changed_clip_id =
-            program_block_spans("* task — @{session:s1 clip_id=clip_9}\n")
-                .pop()
-                .unwrap();
+        let without_clip_id = program_block_spans("* task — @{session:s1}\n")
+            .pop()
+            .unwrap();
+        let with_clip_id = program_block_spans("* task — @{session:s1 clip_id=clip_4}\n")
+            .pop()
+            .unwrap();
+        let changed_clip_id = program_block_spans("* task — @{session:s1 clip_id=clip_9}\n")
+            .pop()
+            .unwrap();
         assert_eq!(without_clip_id.signature, "* task — @{session:s1}");
         assert_eq!(
             with_clip_id.signature,
@@ -2195,10 +2220,9 @@ mod program_block_tests {
         assert_eq!(without_clip_id.id, with_clip_id.id);
         assert_eq!(with_clip_id.id, changed_clip_id.id);
 
-        let changed_target =
-            program_block_spans("* task — @{session:s2 clip_id=clip_4}\n")
-                .pop()
-                .unwrap();
+        let changed_target = program_block_spans("* task — @{session:s2 clip_id=clip_4}\n")
+            .pop()
+            .unwrap();
         assert_ne!(
             with_clip_id.id, changed_target.id,
             "changing the smart-clip target is still semantic content"
@@ -2276,7 +2300,9 @@ mod pty_activity_tests {
     #[test]
     fn test_is_pty_active_payload() {
         // Purely synchronized updates + style resets -> inactive
-        assert!(!is_pty_active_payload(b"\x1b[?2026h\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?2026l"));
+        assert!(!is_pty_active_payload(
+            b"\x1b[?2026h\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?2026l"
+        ));
         // Purely style resets -> inactive
         assert!(!is_pty_active_payload(b"\x1b[31m\x1b[0m"));
         // Empty -> inactive

@@ -50,8 +50,9 @@ async fn web_program_view_full_parity() {
     // Inject the shared mock helpers once (used by every mocked-ws block below).
     page.evaluate(SETUP_JS).await.expect("inject test helpers");
 
-    // --- 1. Real daemon round-trip: JS block ids must equal the daemon's, and
-    //        program.get/update over the web WS must actually work. -----------
+    // --- 1. Real daemon round-trip: JS block ids must equal the daemon's
+    //        legacy content ids, and program.get/update over the web WS must
+    //        actually work. Stable daemon refs travel in block.id. ------------
     let parity: serde_json::Value = page
         .evaluate(
             r###"
@@ -63,6 +64,7 @@ async fn web_program_view_full_parity() {
               const got = await rpc("program.get", { session_id: sid });
               return {
                 daemonIds: (got.blocks || []).map((b) => b.id),
+                daemonContentIds: (got.blocks || []).map((b) => b.content_id),
                 jsIds: programBlockSpans(got.program.markdown).map((b) => b.id),
                 markdownRoundTripped: got.program.markdown === md,
               };
@@ -74,8 +76,8 @@ async fn web_program_view_full_parity() {
         .into_value()
         .expect("json");
     assert_eq!(
-        parity["daemonIds"], parity["jsIds"],
-        "JS block ids must match the daemon's: {parity:?}"
+        parity["daemonContentIds"], parity["jsIds"],
+        "JS block ids must match the daemon's legacy content ids: {parity:?}"
     );
     assert!(
         parity["daemonIds"].as_array().map(|a| a.len()).unwrap_or(0) >= 4,

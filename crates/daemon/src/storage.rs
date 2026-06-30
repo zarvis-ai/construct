@@ -15,8 +15,8 @@
 //! ```
 
 use agentd_protocol::{
-    ProgramDocument, ProgramEdit, ProgramRevision, ProgramTemplate, ProgramUpdateActor, GroupSummary,
-    SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
+    GroupSummary, ProgramBlockView, ProgramDocument, ProgramEdit, ProgramRevision, ProgramTemplate,
+    ProgramUpdateActor, SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
 };
 use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
@@ -141,6 +141,17 @@ struct ProgramMeta {
     updated_at_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     template_id: Option<String>,
+    #[serde(default)]
+    next_block_ordinal: u64,
+    #[serde(default)]
+    blocks: Vec<ProgramBlockIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ProgramBlockIdentity {
+    block_id: String,
+    content_epoch: u64,
+    content_id: String,
 }
 
 pub struct Storage {
@@ -364,7 +375,11 @@ impl Storage {
         self.ensure_session_dir(id)?;
         self.migrate_legacy_program_files(id);
         let markdown = std::fs::read_to_string(self.program_path(id)).unwrap_or_default();
-        let meta = self.read_program_meta(id).unwrap_or_default();
+        let mut meta = self.read_program_meta(id).unwrap_or_default();
+        let changed = self.reconcile_program_block_identities(&mut meta, &markdown);
+        if changed {
+            self.save_program_meta_struct(id, &meta)?;
+        }
         Ok(ProgramDocument {
             session_id: id.to_string(),
             markdown,
@@ -372,6 +387,20 @@ impl Storage {
             updated_at_ms: meta.updated_at_ms,
             template_id: meta.template_id,
         })
+    }
+
+    pub fn read_program_with_blocks(
+        &self,
+        id: &str,
+    ) -> Result<(ProgramDocument, Vec<ProgramBlockView>)> {
+        let program = self.read_program(id)?;
+        let mut meta = self.read_program_meta(id).unwrap_or_default();
+        let changed = self.reconcile_program_block_identities(&mut meta, &program.markdown);
+        if changed {
+            self.save_program_meta_struct(id, &meta)?;
+        }
+        let blocks = self.program_block_views_from_meta(&meta, &program.markdown);
+        Ok((program, blocks))
     }
 
     pub fn update_program(
@@ -585,17 +614,96 @@ impl Storage {
 
     fn save_program_meta(&self, program: &ProgramDocument) -> Result<()> {
         self.ensure_session_dir(&program.session_id)?;
-        let meta = ProgramMeta {
-            version: program.version,
-            updated_at_ms: program.updated_at_ms,
-            template_id: program.template_id.clone(),
-        };
-        let path = self.program_meta_path(&program.session_id);
+        let mut meta = self
+            .read_program_meta(&program.session_id)
+            .unwrap_or_default();
+        meta.version = program.version;
+        meta.updated_at_ms = program.updated_at_ms;
+        meta.template_id = program.template_id.clone();
+        self.reconcile_program_block_identities(&mut meta, &program.markdown);
+        self.save_program_meta_struct(&program.session_id, &meta)
+    }
+
+    fn save_program_meta_struct(&self, id: &str, meta: &ProgramMeta) -> Result<()> {
+        self.ensure_session_dir(id)?;
+        let path = self.program_meta_path(id);
         let tmp = path.with_extension("json.tmp");
         let json = serde_json::to_string_pretty(&meta)?;
         std::fs::write(&tmp, json).with_context(|| format!("write {}", tmp.display()))?;
         std::fs::rename(&tmp, &path).with_context(|| format!("rename {}", path.display()))?;
         Ok(())
+    }
+
+    fn next_program_block_id(meta: &mut ProgramMeta) -> String {
+        let id = format!("pb_{:016x}", meta.next_block_ordinal);
+        meta.next_block_ordinal = meta.next_block_ordinal.saturating_add(1);
+        id
+    }
+
+    fn reconcile_program_block_identities(&self, meta: &mut ProgramMeta, markdown: &str) -> bool {
+        let spans = agentd_protocol::program_block_spans(markdown);
+        let old = meta.blocks.clone();
+        let mut used = vec![false; old.len()];
+        let mut next: Vec<ProgramBlockIdentity> = Vec::with_capacity(spans.len());
+        let mut changed = old.len() != spans.len();
+
+        for (i, span) in spans.iter().enumerate() {
+            let exact = old
+                .iter()
+                .enumerate()
+                .find(|(j, rec)| !used[*j] && rec.content_id == span.id)
+                .map(|(j, _)| j);
+            let idx = exact.or_else(|| old.get(i).filter(|_| !used[i]).map(|_| i));
+            let rec = if let Some(j) = idx {
+                used[j] = true;
+                let mut rec = old[j].clone();
+                if rec.content_id != span.id {
+                    rec.content_epoch = rec.content_epoch.saturating_add(1);
+                    rec.content_id = span.id.clone();
+                    changed = true;
+                }
+                rec
+            } else {
+                changed = true;
+                ProgramBlockIdentity {
+                    block_id: Self::next_program_block_id(meta),
+                    content_epoch: 0,
+                    content_id: span.id.clone(),
+                }
+            };
+            next.push(rec);
+        }
+        if meta.blocks != next {
+            changed = true;
+            meta.blocks = next;
+        }
+        changed
+    }
+
+    fn program_block_views_from_meta(
+        &self,
+        meta: &ProgramMeta,
+        markdown: &str,
+    ) -> Vec<ProgramBlockView> {
+        agentd_protocol::program_block_spans(markdown)
+            .into_iter()
+            .zip(meta.blocks.iter())
+            .map(|(span, rec)| {
+                let block_ref = format!("{}:{}", rec.block_id, rec.content_epoch);
+                ProgramBlockView {
+                    id: block_ref.clone(),
+                    block_id: rec.block_id.clone(),
+                    content_epoch: rec.content_epoch,
+                    block_ref,
+                    content_id: rec.content_id.clone(),
+                    start_line: span.start_line,
+                    end_line: span.end_line,
+                    text: span.text,
+                    shimmer: false,
+                    tooltip: None,
+                }
+            })
+            .collect()
     }
 
     fn append_program_revision(&self, id: &str, revision: ProgramRevision) -> Result<()> {
@@ -1333,7 +1441,10 @@ mod program_tests {
     #[test]
     fn apply_program_edits_appends_on_empty_old_string() {
         // Empty doc: append sets the content.
-        assert_eq!(apply_program_edits("", &[edit("", "first")]).unwrap(), "first");
+        assert_eq!(
+            apply_program_edits("", &[edit("", "first")]).unwrap(),
+            "first"
+        );
         // Non-empty without trailing newline: a separator is inserted.
         assert_eq!(
             apply_program_edits("# Todo", &[edit("", "- new")]).unwrap(),

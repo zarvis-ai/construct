@@ -5,15 +5,15 @@ use crate::config::Config;
 use crate::storage::Storage;
 use crate::worktree;
 use agentd_protocol::{
-    agent_context, ahp_method, ProgramDocument, ProgramEditParams, ProgramExecuteParams,
-    ProgramExecuteResult, ProgramGetResult, ProgramListTemplatesResult, ProgramRunProgress,
-    ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult, ClientView,
-    CreateSessionParams, DeletedNotificationPayload, EventNotificationPayload,
-    GroupDeletedNotificationPayload, GroupStateNotificationPayload, GroupSummary, HarnessInfo,
-    MessageRole, MoveDirection, PtyReplayResult, PtySize, SessionAttachClipboardParams,
-    SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionEvent,
-    SessionStartParams, SessionState, SessionSummary,
-    StateNotificationPayload, TimestampedEvent, TranscriptResult, PROGRAM_SMART_CLIP_DESCRIPTORS,
+    agent_context, ahp_method, ClientView, CreateSessionParams, DeletedNotificationPayload,
+    EventNotificationPayload, GroupDeletedNotificationPayload, GroupStateNotificationPayload,
+    GroupSummary, HarnessInfo, MessageRole, MoveDirection, ProgramDocument, ProgramEditParams,
+    ProgramExecuteParams, ProgramExecuteResult, ProgramGetResult, ProgramListTemplatesResult,
+    ProgramRunProgress, ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult,
+    PtyReplayResult, PtySize, SessionAttachClipboardParams, SessionAttachClipboardResult,
+    SessionDetail, SessionEmitEventParams, SessionEvent, SessionStartParams, SessionState,
+    SessionSummary, StateNotificationPayload, TimestampedEvent, TranscriptResult,
+    PROGRAM_SMART_CLIP_DESCRIPTORS,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -25,16 +25,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
 
-mod program_run;
-mod groups;
 mod events;
+mod groups;
 mod lifecycle;
-mod widgets;
+mod program_run;
 mod pty;
+mod widgets;
 
 #[cfg(test)]
 use lifecycle::{
-    force_redraw_size_on_resume, resume_redraw_ready, should_resume_on_startup, start_params_for_create,
+    force_redraw_size_on_resume, resume_redraw_ready, should_resume_on_startup,
+    start_params_for_create,
 };
 
 const BROADCAST_CAP: usize = 4096;
@@ -431,10 +432,15 @@ enum ProgramExecutionDelivery {
     PtySubmit,
 }
 
-fn program_execution_delivery(summary: &agentd_protocol::SessionSummary) -> ProgramExecutionDelivery {
+fn program_execution_delivery(
+    summary: &agentd_protocol::SessionSummary,
+) -> ProgramExecutionDelivery {
     if !summary.has_pty {
         ProgramExecutionDelivery::AdapterInput
-    } else if matches!(summary.harness.as_str(), "claude" | "codex" | "antigravity" | "grok") {
+    } else if matches!(
+        summary.harness.as_str(),
+        "claude" | "codex" | "antigravity" | "grok"
+    ) {
         ProgramExecutionDelivery::ExternalPtyTypedSubmit
     } else {
         ProgramExecutionDelivery::PtySubmit
@@ -473,7 +479,7 @@ fn program_pty_submit_bytes(prompt: &str) -> Vec<u8> {
 fn program_run_instructions() -> Vec<String> {
     vec![
         "Execute this construct program as an autonomous run.".to_string(),
-        "Shimmer semantics: a shimmering block means 'work on this block is still pending in this run — queued, in progress, or not yet done; outcome unknown'. No shimmer means 'settled — done, skipped, or no work needed'. Pending is about the state of the work, not how it runs: it applies the same whether you do the block yourself, delegate it, or drive it some other way, and a block counts as pending the moment you decide to act on it. A Run starts every executed block shimmering. Shimmer is a declared per-block state addressed by a stable block id: read each block's id from the program get tool (or from the `blocks` returned by an edit/update), then declare a block pending or settled with the construct_program_edit `shimmer` list, e.g. `shimmer: [{id, shimmer: true, tooltip: \"Building PR\"}]`. When you set a block shimmer: true you MUST include a `tooltip`: a concise (≤10-word) description of that block's run status, shown when a viewer hovers the shimmering block; it is ignored when settling. The list is partial — it may target any block, not only the ones your edits change — and declaring a block settled clears it WITHOUT changing its text. Editing a block's text changes its id, so to keep an edited block shimmering — e.g. when you move a still-in-flight task into an In progress section or append a @{session} clip — set keep_pending: true on that edit; it re-adds the resulting block's new id in the same call, so you need not know the new id and the block never goes dark. Never leave a settled block shimmering, and never drop shimmer from a block whose work is still in flight.".to_string(),
+        "Shimmer semantics: a shimmering block means 'work on this block is still pending in this run — queued, in progress, or not yet done; outcome unknown'. No shimmer means 'settled — done, skipped, or no work needed'. Pending is about the state of the work, not how it runs: it applies the same whether you do the block yourself, delegate it, or drive it some other way, and a block counts as pending the moment you decide to act on it. A Run starts every executed block shimmering. Shimmer is a declared per-block state addressed by a stable block ref: read each block's id from the program get tool (or from the `blocks` returned by an edit/update), then declare a block pending or settled with the construct_program_edit `shimmer` list, e.g. `shimmer: [{id, shimmer: true, tooltip: \"Building PR\"}]`. When you set a block shimmer: true you MUST include a `tooltip`: a concise (≤10-word) description of that block's run status, shown when a viewer hovers the shimmering block; it is ignored when settling. The list is partial — it may target any block, not only the ones your edits change — and declaring a block settled clears it WITHOUT changing its text. Editing a block's semantic text advances its content epoch and gives it a new ref, so to keep an edited block shimmering — e.g. when you move a still-in-flight task into an In progress section or append a @{session} clip — set keep_pending: true on that edit; it re-adds the resulting block's new ref in the same call, so you need not know it and the block never goes dark. Never leave a settled block shimmering, and never drop shimmer from a block whose work is still in flight.".to_string(),
         "Planning pass — this MUST be your first program action, before doing or delegating any work: read the program with the get tool to obtain every block's id, then make one construct_program_edit whose `shimmer` list declares each still-pending block's id shimmer: true (each with a concise ≤10-word `tooltip` of its run status) and each settled block's id shimmer: false. This needs no change to the blocks' text — declaring an id settled clears it. Doing this first makes the program reflect your plan within seconds of the Run instead of only after the first task completes; skipping it strands settled blocks shimmering and risks dropping shimmer from blocks still in flight.".to_string(),
         "Treat program_run.markdown as free-form instructions and state for this turn, not as a request for a one-shot status report or as a fixed task-management schema.".to_string(),
         "Infer the user's intended objective from the document structure and prose, then keep taking useful next actions while there is actionable work you can do.".to_string(),
@@ -488,7 +494,7 @@ fn program_run_instructions() -> Vec<String> {
 }
 
 fn program_execution_prompt() -> String {
-    "Run the current construct program autonomously. Before doing work, call agentd_context (or construct_context if you are using MCP) and read the program_run field for the latest program content, smart clip reference, and run instructions. If program_run is unavailable, read the current program with the program get tool before acting. Then, before starting or delegating any task, your first program action must be a single planning-pass construct_program_edit whose shimmer list declares every still-pending block's id shimmer: true and every settled block's id shimmer: false (read the block ids from the program get tool), so settled blocks stop shimmering immediately."
+    "Run the current construct program autonomously. Before doing work, call agentd_context (or construct_context if you are using MCP) and read the program_run field for the latest program content, smart clip reference, and run instructions. If program_run is unavailable, read the current program with the program get tool before acting. Then, before starting or delegating any task, your first program action must be a single planning-pass construct_program_edit whose shimmer list declares every still-pending block's stable id shimmer: true and every settled block's stable id shimmer: false (read the block ids from the program get tool), so settled blocks stop shimmering immediately."
         .to_string()
 }
 
@@ -515,10 +521,10 @@ fn program_run_context(
     }
 }
 
-/// Ids of every block an edit flagged `keep_pending` introduces (spec 0053):
-/// the blocks whose work the edit keeps in flight. Block ids are content-
+/// Legacy content ids of every block an edit flagged `keep_pending` introduces:
+/// the blocks whose work the edit keeps in flight. These ids are content-
 /// derived, so each block parsed from a keep_pending edit's `new_string` in
-/// isolation has the same id as in the post-edit document — and `new_string`
+/// isolation has the same content id as in the post-edit document — and `new_string`
 /// may span several blocks (e.g. a heading plus a moved item), so ALL of them
 /// are returned, not just the first. The caller drops ids that already existed
 /// pre-edit (so a re-stated heading is not re-lit) and `narrow_program_run`
@@ -1307,7 +1313,7 @@ impl SessionManager {
         self.get_entry(session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", session_id))?;
-        let program = self.storage.read_program(session_id)?;
+        let (program, _) = self.storage.read_program_with_blocks(session_id)?;
         let revisions = self.storage.read_program_revisions(session_id)?;
         let active_run = self.program_run_snapshot(session_id);
         let blocks = self.program_blocks_projection(session_id, &program.markdown);
@@ -1363,20 +1369,20 @@ impl SessionManager {
                 // Pair each pending block with its tooltip (spec 0057): the
                 // tooltip array is parallel to the shimmer array in document
                 // order, so index i carries block i's tooltip.
-                let pending: std::collections::HashMap<String, Option<String>> =
-                    agentd_protocol::program_block_spans(&program.markdown)
-                        .into_iter()
-                        .zip(decl)
-                        .enumerate()
-                        .filter(|(_, (_, on))| *on)
-                        .map(|(i, (span, _))| {
-                            let tip = shimmer_tooltips
-                                .as_ref()
-                                .and_then(|tips| tips.get(i))
-                                .and_then(|t| t.clone());
-                            (span.id, tip)
-                        })
-                        .collect();
+                let pending: std::collections::HashMap<String, Option<String>> = self
+                    .program_blocks_projection(&session_id, &program.markdown)
+                    .into_iter()
+                    .zip(decl)
+                    .enumerate()
+                    .filter(|(_, (_, on))| *on)
+                    .map(|(i, (block, _))| {
+                        let tip = shimmer_tooltips
+                            .as_ref()
+                            .and_then(|tips| tips.get(i))
+                            .and_then(|t| t.clone());
+                        (block.id, tip)
+                    })
+                    .collect();
                 self.set_program_run_pending(&session_id, &program.markdown, pending);
             }
             None => {
@@ -1400,19 +1406,19 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
         // Block ids of the pre-edit document, to tell which keep_pending blocks
         // are genuinely new (so a re-stated, unchanged heading is not re-lit).
-        let before_ids: std::collections::HashSet<String> = self
+        let before_blocks = self
             .storage
-            .read_program(&params.session_id)
-            .map(|p| {
-                agentd_protocol::program_block_spans(&p.markdown)
-                    .into_iter()
-                    .map(|span| span.id)
-                    .collect()
-            })
+            .read_program_with_blocks(&params.session_id)
+            .map(|(_, blocks)| blocks)
             .unwrap_or_default();
-        let program =
-            self.storage
-                .edit_program(&params.session_id, &params.edits, params.actor, params.note)?;
+        let before_refs: std::collections::HashSet<String> =
+            before_blocks.iter().map(|block| block.id.clone()).collect();
+        let program = self.storage.edit_program(
+            &params.session_id,
+            &params.edits,
+            params.actor,
+            params.note,
+        )?;
         // Apply the partial shimmer declaration against the post-edit document
         // (spec 0053): changed blocks drop their prior shimmer; declared ids set
         // pending/settled; ids that no longer exist are ignored (fail closed).
@@ -1422,16 +1428,20 @@ impl SessionManager {
         // shimmering without the pending set transiently emptying. Blocks that
         // already existed pre-edit are skipped (no re-light of an unchanged
         // heading), and explicit declarations in `shimmer` win.
+        let keep_content_ids = program_edit_keep_ids(&params.edits);
+        let post_blocks = self.program_blocks_projection(&params.session_id, &program.markdown);
         let mut decls = params.shimmer.clone();
-        for id in program_edit_keep_ids(&params.edits) {
-            if before_ids.contains(&id) || decls.iter().any(|d| d.id == id) {
+        for block in post_blocks.iter().filter(|block| {
+            keep_content_ids.contains(&block.content_id) && !before_refs.contains(&block.id)
+        }) {
+            if decls.iter().any(|d| d.id == block.id) {
                 continue;
             }
             // keep_pending re-adds the produced block's new id with no
             // agent tooltip (spec 0057); it renders the fallback until the
             // agent declares the new id with a tooltip.
             decls.push(agentd_protocol::ProgramShimmerDecl {
-                id,
+                id: block.id.clone(),
                 shimmer: true,
                 tooltip: None,
             });
@@ -1447,7 +1457,10 @@ impl SessionManager {
         })
     }
 
-    pub async fn program_execute(&self, params: ProgramExecuteParams) -> Result<ProgramExecuteResult> {
+    pub async fn program_execute(
+        &self,
+        params: ProgramExecuteParams,
+    ) -> Result<ProgramExecuteResult> {
         let entry = self
             .get_entry(&params.session_id)
             .await
@@ -1526,12 +1539,14 @@ impl SessionManager {
 
     fn broadcast_program_state(&self, program: ProgramDocument) {
         let active_run = self.program_run_snapshot(&program.session_id);
-        let _ = self
-            .broadcast
-            .send(BroadcastMsg::ProgramState(ProgramStateNotificationPayload {
+        let blocks = self.program_blocks_projection(&program.session_id, &program.markdown);
+        let _ = self.broadcast.send(BroadcastMsg::ProgramState(
+            ProgramStateNotificationPayload {
                 program,
                 active_run,
-            }));
+                blocks,
+            },
+        ));
     }
 
     fn program_run_context_path(&self, session_id: &str) -> PathBuf {
@@ -1791,7 +1806,6 @@ impl SessionManager {
             generate_auto_title(binary, prefix_args, entry, prompt, storage, broadcast_tx).await;
         });
     }
-
 
     pub async fn interrupt(&self, id: &str) -> Result<()> {
         let entry = self
@@ -2145,7 +2159,6 @@ impl SessionManager {
         Ok(())
     }
 
-
     pub async fn set_title(&self, id: &str, title: Option<String>) -> Result<()> {
         let entry = self
             .get_entry(id)
@@ -2271,8 +2284,7 @@ impl SessionManager {
                 let s = entry.summary.read().await;
                 harness_uses_quiescence(&s)
                     && s.state == SessionState::Running
-                    && s
-                        .last_pty_at_ms
+                    && s.last_pty_at_ms
                         .is_some_and(|last| now_ms.saturating_sub(last) >= threshold)
             };
             if stale {
@@ -3492,7 +3504,8 @@ mod tests {
         let instructions = program_run_instructions().join("\n");
 
         assert!(
-            instructions.contains("one construct_program_edit call containing multiple `edits` entries"),
+            instructions
+                .contains("one construct_program_edit call containing multiple `edits` entries"),
             "program runs should tell agents to move blocks in one edit call"
         );
         assert!(
@@ -3930,8 +3943,8 @@ mod tests {
 
     #[tokio::test]
     async fn pty_activity_filtering_avoids_quiescence_reset() {
-        use tempfile::tempdir;
         use std::sync::atomic::{AtomicBool, AtomicU64};
+        use tempfile::tempdir;
         use tokio::sync::RwLock;
 
         let tmp = tempdir().expect("tempdir");
@@ -3999,22 +4012,30 @@ mod tests {
                 SessionEvent::pty(b"\x1b[?2026h\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[?2026l"),
             )
             .await;
-        
+
         let sum = entry.summary.read().await;
-        assert_eq!(sum.state, SessionState::AwaitingInput, "should stay in AwaitingInput");
-        assert!(sum.last_pty_at_ms.is_none(), "should NOT update last_pty_at_ms");
+        assert_eq!(
+            sum.state,
+            SessionState::AwaitingInput,
+            "should stay in AwaitingInput"
+        );
+        assert!(
+            sum.last_pty_at_ms.is_none(),
+            "should NOT update last_pty_at_ms"
+        );
         drop(sum);
 
         // 2. Send active/visible PTY event (actual printable character).
         manager
-            .handle_event(
-                &entry,
-                SessionEvent::pty(b"visible output"),
-            )
+            .handle_event(&entry, SessionEvent::pty(b"visible output"))
             .await;
-        
+
         let sum = entry.summary.read().await;
-        assert_eq!(sum.state, SessionState::Running, "should transition to Running");
+        assert_eq!(
+            sum.state,
+            SessionState::Running,
+            "should transition to Running"
+        );
         assert!(sum.last_pty_at_ms.is_some(), "should update last_pty_at_ms");
     }
 
@@ -4038,8 +4059,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let make_entry = |id: &str| {
-            let mut summary =
-                placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = SessionState::Running;
@@ -4147,8 +4167,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let build = |id: &str, state: SessionState| {
-            let mut summary =
-                placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = state;
@@ -4180,7 +4199,9 @@ mod tests {
         // Focus it, then type at the prompt (PTY echo while focused). The echo
         // flips it to Running (busy look) but is NOT unseen activity.
         manager.mark_seen("s").await.expect("mark_seen s");
-        manager.handle_event(&s, SessionEvent::pty(b"sleep 30")).await;
+        manager
+            .handle_event(&s, SessionEvent::pty(b"sleep 30"))
+            .await;
         assert_eq!(s.summary.read().await.state, SessionState::Running);
 
         // Switch away without submitting.
@@ -4211,7 +4232,7 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let storage =
             Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
-            let config = Arc::new(crate::config::Config::default());
+        let config = Arc::new(crate::config::Config::default());
         let (mgr, _remote_rx, _restart_rx) =
             SessionManager::new(storage, config, tmp.path().join("run"))
                 .await
@@ -4219,8 +4240,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let build = |id: &str, state: SessionState| {
-            let mut summary =
-                placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = state;
@@ -4250,11 +4270,16 @@ mod tests {
         }
 
         // Both s1 and s2 are visible/focused.
-        manager.set_focused_sessions(&["s1".to_string(), "s2".to_string()]).await.expect("set_focused_sessions");
+        manager
+            .set_focused_sessions(&["s1".to_string(), "s2".to_string()])
+            .await
+            .expect("set_focused_sessions");
 
         // PTY activity in s2 (the sibling pane) happens while it is visible.
-        manager.handle_event(&s2, SessionEvent::pty(b"active output")).await;
-        
+        manager
+            .handle_event(&s2, SessionEvent::pty(b"active output"))
+            .await;
+
         // Quiescence sweep flips s2 back to AwaitingInput.
         manager
             .handle_event(
@@ -4520,10 +4545,22 @@ mod tests {
         mgr.delete("parent").await.expect("delete parent");
 
         let ids: Vec<String> = mgr.list().await.into_iter().map(|s| s.id).collect();
-        assert!(!ids.contains(&"parent".to_string()), "parent must be deleted");
-        assert!(!ids.contains(&"subA".to_string()), "direct subagent must be deleted");
-        assert!(!ids.contains(&"subB".to_string()), "direct subagent must be deleted");
-        assert!(!ids.contains(&"subA1".to_string()), "nested subagent must be deleted");
+        assert!(
+            !ids.contains(&"parent".to_string()),
+            "parent must be deleted"
+        );
+        assert!(
+            !ids.contains(&"subA".to_string()),
+            "direct subagent must be deleted"
+        );
+        assert!(
+            !ids.contains(&"subB".to_string()),
+            "direct subagent must be deleted"
+        );
+        assert!(
+            !ids.contains(&"subA1".to_string()),
+            "nested subagent must be deleted"
+        );
         assert!(
             ids.contains(&"other".to_string()),
             "unrelated session must survive the cascade",
@@ -4601,7 +4638,10 @@ mod tests {
         // No adapter attached → fast path only.
         mgr.archive(id).await.expect("archive fast");
         let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_millis(500), "archive must return quickly (was {elapsed:?})");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "archive must return quickly (was {elapsed:?})"
+        );
 
         // Re-insert for delete test (previous archive removed it from map in some paths).
         let id2 = "s-fast-delete";
@@ -4612,7 +4652,10 @@ mod tests {
         let start2 = std::time::Instant::now();
         mgr.delete(id2).await.expect("delete fast");
         let elapsed2 = start2.elapsed();
-        assert!(elapsed2 < Duration::from_millis(500), "delete must return quickly (was {elapsed2:?})");
+        assert!(
+            elapsed2 < Duration::from_millis(500),
+            "delete must return quickly (was {elapsed2:?})"
+        );
     }
 
     #[tokio::test]
@@ -4668,7 +4711,8 @@ mod tests {
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
-        let storage = Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
         let config = Arc::new(crate::config::Config::default());
         let (mgr, _remote_rx, _restart_rx) =
             SessionManager::new(storage.clone(), config, tmp.path().join("run"))
@@ -4681,7 +4725,9 @@ mod tests {
 
         // Start a program run
         let body = "# Todo\n- a\n";
-        let run = mgr.start_program_run(id, body, false, None).expect("start_program_run");
+        let run = mgr
+            .start_program_run(id, body, false, None)
+            .expect("start_program_run");
         assert!(!run.seen_running);
         assert!(!run.first_output_seen);
 
@@ -5001,7 +5047,12 @@ mod tests {
         mgr.start_program_run(&id, md, false, None).expect("start");
         let get = mgr.program_get(&id).await.expect("get");
         let id_of = |n: &str| {
-            get.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone()
+            get.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .id
+                .clone()
         };
         // Planning pass: only the task is pending (heading settled).
         declare(
@@ -5009,8 +5060,16 @@ mod tests {
             &id,
             "# Tasks",
             vec![
-                agentd_protocol::ProgramShimmerDecl { id: id_of("# Tasks"), shimmer: false, tooltip: None },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("do the thing"), shimmer: true, tooltip: Some("Doing the thing".into()) },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("# Tasks"),
+                    shimmer: false,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("do the thing"),
+                    shimmer: true,
+                    tooltip: Some("Doing the thing".into()),
+                },
             ],
         )
         .await;
@@ -5058,7 +5117,11 @@ mod tests {
         )
         .await;
         assert!(
-            res.blocks.iter().find(|b| b.text.contains("do the thing")).unwrap().shimmer,
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains("do the thing"))
+                .unwrap()
+                .shimmer,
             "the run survived the transient empty and the re-declaration re-lit the block"
         );
     }
@@ -5073,7 +5136,12 @@ mod tests {
         mgr.start_program_run(&id, md, false, None).expect("start");
         let get = mgr.program_get(&id).await.expect("get");
         let id_of = |n: &str| {
-            get.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone()
+            get.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .id
+                .clone()
         };
         // Planning pass: heading settled, task pending.
         declare(
@@ -5081,8 +5149,16 @@ mod tests {
             &id,
             "# Tasks",
             vec![
-                agentd_protocol::ProgramShimmerDecl { id: id_of("# Tasks"), shimmer: false, tooltip: None },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("do the thing"), shimmer: true, tooltip: Some("Doing the thing".into()) },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("# Tasks"),
+                    shimmer: false,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("do the thing"),
+                    shimmer: true,
+                    tooltip: Some("Doing the thing".into()),
+                },
             ],
         )
         .await;
@@ -5104,13 +5180,26 @@ mod tests {
             })
             .await
             .expect("move keep_pending");
-        let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
-        assert!(shim("do the thing"), "keep_pending kept the moved block pending");
+        let shim = |n: &str| {
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .shimmer
+        };
+        assert!(
+            shim("do the thing"),
+            "keep_pending kept the moved block pending"
+        );
         // keep_pending re-adds the block under its NEW id with no carried-over
         // tooltip (spec 0057): the projection reports none, so a renderer falls
         // back to the hardcoded label until the agent re-declares with a tooltip.
         assert_eq!(
-            res.blocks.iter().find(|b| b.text.contains("do the thing")).unwrap().tooltip,
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains("do the thing"))
+                .unwrap()
+                .tooltip,
             None,
             "moved block has no stored tooltip; renderer falls back"
         );
@@ -5128,7 +5217,14 @@ mod tests {
         let (mgr, _storage, id) = program_test_mgr(md).await;
         mgr.start_program_run(&id, md, false, None).expect("start");
         let g = mgr.program_get(&id).await.expect("get");
-        let id_of = |n: &str| g.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone();
+        let id_of = |n: &str| {
+            g.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .id
+                .clone()
+        };
         // Planning pass: settle headings, keep the todo task pending.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
@@ -5191,7 +5287,13 @@ mod tests {
             })
             .await
             .expect("insert under heading");
-        let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
+        let shim = |n: &str| {
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .shimmer
+        };
         assert!(
             shim("ship X — @{session:s9}"),
             "keep_pending lights the inserted item even though it isn't new_string's first block"
@@ -5204,7 +5306,7 @@ mod tests {
 
     // Smart clip instance ids are UI identity metadata. The TUI can normalize a
     // missing clip_id after an agent moved a pending task into In progress; that
-    // should not settle the task's shimmer by changing only the block id input.
+    // should not settle the task's shimmer by changing only clip instance metadata.
     #[tokio::test]
     async fn program_update_adding_smart_clip_id_preserves_pending_block() {
         let md = "# In progress\n\n* task — @{session:s1}\n";
@@ -5212,6 +5314,12 @@ mod tests {
         let (mgr, _storage, id) = program_test_mgr(md).await;
         mgr.start_program_run(&id, md, false, None).expect("start");
         let g = mgr.program_get(&id).await.expect("get");
+        let before_task = g
+            .blocks
+            .iter()
+            .find(|b| b.text.contains("task"))
+            .unwrap()
+            .clone();
         let id_of = |n: &str| {
             g.blocks
                 .iter()
@@ -5260,16 +5368,184 @@ mod tests {
             .await
             .expect("normalize clip id");
 
-        let task = res
-            .blocks
-            .iter()
-            .find(|b| b.text.contains("task"))
-            .unwrap();
+        let task = res.blocks.iter().find(|b| b.text.contains("task")).unwrap();
         assert!(
             task.shimmer,
             "adding only clip_id metadata must not settle pending work"
         );
+        assert_eq!(
+            task.id, before_task.id,
+            "smart-clip ids do not change the stable ref"
+        );
+        assert_eq!(task.block_id, before_task.block_id);
+        assert_eq!(task.content_epoch, before_task.content_epoch);
+        assert_eq!(task.content_id, before_task.content_id);
         assert_eq!(task.tooltip.as_deref(), Some("Still working"));
+    }
+
+    // Duplicate blocks have the same legacy content id, so stable shimmer must
+    // address block instances by daemon-owned refs. Settling one duplicate must
+    // not settle or re-light its twin.
+    #[tokio::test]
+    async fn program_shimmer_stable_refs_distinguish_duplicate_blocks() {
+        let md = "* duplicate\n* duplicate\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let g = mgr.program_get(&id).await.expect("get");
+        assert_eq!(g.blocks.len(), 2);
+        assert_eq!(g.blocks[0].content_id, g.blocks[1].content_id);
+        assert_ne!(g.blocks[0].id, g.blocks[1].id);
+        assert!(g.blocks.iter().all(|b| b.shimmer));
+
+        let first_ref = g.blocks[0].id.clone();
+        let second_ref = g.blocks[1].id.clone();
+        let res = mgr
+            .program_edit(ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: md.into(),
+                    new_string: md.into(),
+                    replace_all: false,
+                    keep_pending: false,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                note: None,
+                shimmer: vec![agentd_protocol::ProgramShimmerDecl {
+                    id: first_ref,
+                    shimmer: false,
+                    tooltip: None,
+                }],
+            })
+            .await
+            .expect("settle first duplicate");
+
+        assert!(!res.blocks[0].shimmer, "first duplicate settled by ref");
+        assert!(res.blocks[1].shimmer, "second duplicate keeps shimmering");
+        assert_eq!(
+            res.blocks[1].id, second_ref,
+            "unchanged duplicate keeps its ref"
+        );
+    }
+
+    // A human semantic edit changes the block's content epoch. The old pending
+    // ref no longer matches the new meaning, so stale shimmer drops fail-closed.
+    #[tokio::test]
+    async fn program_shimmer_semantic_edit_changes_epoch_and_drops_pending() {
+        let md = "* task\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let before = mgr.program_get(&id).await.expect("get").blocks[0].clone();
+
+        let res = mgr
+            .program_update(ProgramUpdateParams {
+                session_id: id.clone(),
+                markdown: "* task changed\n".into(),
+                base_version: None,
+                actor: agentd_protocol::ProgramUpdateActor::Human,
+                template_id: None,
+                note: None,
+                shimmer: None,
+                shimmer_tooltips: None,
+            })
+            .await
+            .expect("human edit");
+
+        let after = &res.blocks[0];
+        assert_eq!(
+            after.block_id, before.block_id,
+            "same indexed block keeps instance id"
+        );
+        assert_eq!(after.content_epoch, before.content_epoch + 1);
+        assert_ne!(after.id, before.id);
+        assert_ne!(after.content_id, before.content_id);
+        assert!(
+            !after.shimmer,
+            "stale pending ref does not attach to changed text"
+        );
+    }
+
+    // keep_pending is the explicit opt-in for semantic edits that should remain
+    // in flight: the edit creates a new epoch and atomically re-adds that new ref.
+    #[tokio::test]
+    async fn program_edit_keep_pending_relights_new_epoch() {
+        let md = "* task\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let before = mgr.program_get(&id).await.expect("get").blocks[0].clone();
+
+        let res = mgr
+            .program_edit(ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: "* task".into(),
+                    new_string: "* task @{session:s1}".into(),
+                    replace_all: false,
+                    keep_pending: true,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                note: None,
+                shimmer: vec![],
+            })
+            .await
+            .expect("agent edit");
+
+        let after = res.blocks.iter().find(|b| b.text.contains("task")).unwrap();
+        assert_eq!(after.block_id, before.block_id);
+        assert_eq!(after.content_epoch, before.content_epoch + 1);
+        assert_ne!(after.id, before.id);
+        assert!(after.shimmer, "keep_pending re-adds the new ref atomically");
+    }
+
+    // Moving unchanged text is not a semantic change: the block ref follows the
+    // block to its new location and keeps shimmer without keep_pending.
+    #[tokio::test]
+    async fn program_shimmer_ref_follows_unchanged_moved_block() {
+        let md = "# Todo\n\n* task\n\n# Doing\n";
+        let moved = "# Todo\n\n# Doing\n\n* task\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None).expect("start");
+        let before = mgr
+            .program_get(&id)
+            .await
+            .expect("get")
+            .blocks
+            .into_iter()
+            .find(|b| b.text.contains("task"))
+            .unwrap();
+
+        let res = mgr
+            .program_edit(ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![
+                    agentd_protocol::ProgramEdit {
+                        old_string: "* task\n\n".into(),
+                        new_string: "".into(),
+                        replace_all: false,
+                        keep_pending: false,
+                    },
+                    agentd_protocol::ProgramEdit {
+                        old_string: "# Doing\n".into(),
+                        new_string: "# Doing\n\n* task\n".into(),
+                        replace_all: false,
+                        keep_pending: false,
+                    },
+                ],
+                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                note: None,
+                shimmer: vec![],
+            })
+            .await
+            .expect("move unchanged block");
+
+        assert_eq!(res.program.markdown, moved);
+        let after = res.blocks.iter().find(|b| b.text.contains("task")).unwrap();
+        assert_eq!(
+            after.id, before.id,
+            "same content keeps the same ref across moves"
+        );
+        assert_eq!(after.content_epoch, before.content_epoch);
+        assert!(after.shimmer, "pending shimmer follows the moved block");
+        assert_eq!(after.start_line, 4);
     }
 
     // Finer block granularity: a section of consecutive list items (no blank
@@ -5283,7 +5559,14 @@ mod tests {
         let g = mgr.program_get(&id).await.expect("get");
         // Each line is its own block: heading + three items.
         assert_eq!(g.blocks.len(), 4, "section splits into heading + 3 items");
-        let id_of = |n: &str| g.blocks.iter().find(|b| b.text.contains(n)).unwrap().id.clone();
+        let id_of = |n: &str| {
+            g.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .id
+                .clone()
+        };
         // Planning pass: settle the heading, keep all three items pending.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
@@ -5296,10 +5579,26 @@ mod tests {
             actor: agentd_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![
-                agentd_protocol::ProgramShimmerDecl { id: id_of("# In progress"), shimmer: false, tooltip: None },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("task A"), shimmer: true, tooltip: None },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("task B"), shimmer: true, tooltip: None },
-                agentd_protocol::ProgramShimmerDecl { id: id_of("task C"), shimmer: true, tooltip: None },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("# In progress"),
+                    shimmer: false,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("task A"),
+                    shimmer: true,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("task B"),
+                    shimmer: true,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("task C"),
+                    shimmer: true,
+                    tooltip: None,
+                },
             ],
         })
         .await
@@ -5316,11 +5615,21 @@ mod tests {
                 }],
                 actor: agentd_protocol::ProgramUpdateActor::Agent,
                 note: None,
-                shimmer: vec![agentd_protocol::ProgramShimmerDecl { id: id_of("task B"), shimmer: false, tooltip: None }],
+                shimmer: vec![agentd_protocol::ProgramShimmerDecl {
+                    id: id_of("task B"),
+                    shimmer: false,
+                    tooltip: None,
+                }],
             })
             .await
             .expect("settle B");
-        let shim = |n: &str| res.blocks.iter().find(|b| b.text.contains(n)).unwrap().shimmer;
+        let shim = |n: &str| {
+            res.blocks
+                .iter()
+                .find(|b| b.text.contains(n))
+                .unwrap()
+                .shimmer
+        };
         assert!(!shim("# In progress"), "heading is its own settled block");
         assert!(shim("task A"), "task A keeps shimmering");
         assert!(!shim("task B"), "only task B settled");
@@ -5343,15 +5652,34 @@ mod tests {
             &id,
             md,
             &[
-                agentd_protocol::ProgramShimmerDecl { id: agentd_protocol::program_block_id("# A"), shimmer: false, tooltip: None },
-                agentd_protocol::ProgramShimmerDecl { id: b.clone(), shimmer: false, tooltip: None },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: agentd_protocol::program_block_id("# A"),
+                    shimmer: false,
+                    tooltip: None,
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: b.clone(),
+                    shimmer: false,
+                    tooltip: None,
+                },
             ],
         );
-        assert!(mgr.program_run_snapshot(&id).is_none(), "empty pending shows no shimmer");
+        assert!(
+            mgr.program_run_snapshot(&id).is_none(),
+            "empty pending shows no shimmer"
+        );
         // Owning session goes idle with nothing pending → the empty run is reaped.
         mgr.note_session_state_for_program_run(&id, SessionState::AwaitingInput);
         // A re-declaration can no longer revive it: the record is gone.
-        mgr.narrow_program_run(&id, md, &[agentd_protocol::ProgramShimmerDecl { id: b, shimmer: true, tooltip: None }]);
+        mgr.narrow_program_run(
+            &id,
+            md,
+            &[agentd_protocol::ProgramShimmerDecl {
+                id: b,
+                shimmer: true,
+                tooltip: None,
+            }],
+        );
         assert!(
             mgr.program_run_snapshot(&id).is_none(),
             "reaped on idle; a re-declaration does not revive a cleared run"
@@ -5365,47 +5693,36 @@ mod tests {
     #[tokio::test]
     async fn program_run_managed_survives_idle_and_clears_on_settle() {
         use agentd_protocol::SessionState;
-        use tempfile::tempdir;
-
-        let tmp = tempdir().expect("tempdir");
-        let storage =
-            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
-        let config = Arc::new(crate::config::Config::default());
-        let (mgr, _remote_rx, _restart_rx) =
-            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
-                .await
-                .expect("session manager");
-
-        let id = "smanagedrun";
         let body = "# Alpha\n\n# Beta\n";
+        let (mgr, _storage, id) = program_test_mgr(body).await;
 
         // Fresh run: unmanaged, both blocks pending.
         let run = mgr
-            .start_program_run(id, body, false, None)
+            .start_program_run(&id, body, false, None)
             .expect("start_program_run");
         assert!(!run.agent_managed, "a fresh run is unmanaged");
-        assert_eq!(run.pending_block_ids.len(), 2);
+        assert_eq!(run.pending_block_refs.len(), 2);
 
         // Owning session is seen running.
-        mgr.note_session_state_for_program_run(id, SessionState::Running);
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
         assert!(
-            mgr.program_run_snapshot(id)
+            mgr.program_run_snapshot(&id)
                 .expect("run present")
                 .seen_running
         );
 
         // Planning-pass-style declaration narrows the run (text unchanged, so
         // both blocks stay pending) and marks it agent-managed.
-        mgr.narrow_program_run(id, body, &[]);
-        let run = mgr.program_run_snapshot(id).expect("managed run present");
+        mgr.narrow_program_run(&id, body, &[]);
+        let run = mgr.program_run_snapshot(&id).expect("managed run present");
         assert!(run.agent_managed, "an in-run declaration marks it managed");
         assert_eq!(run.pending_block_ids.len(), 2);
 
         // The agent delegates and its own turn ends → AwaitingInput. The
         // managed run must NOT clear: delegated work is still pending.
-        mgr.note_session_state_for_program_run(id, SessionState::AwaitingInput);
+        mgr.note_session_state_for_program_run(&id, SessionState::AwaitingInput);
         assert_eq!(
-            mgr.program_run_snapshot(id)
+            mgr.program_run_snapshot(&id)
                 .expect("managed run survives the owning session going idle")
                 .pending_block_ids
                 .len(),
@@ -5413,24 +5730,46 @@ mod tests {
         );
 
         // Repeated wake/idle cycles (e.g. a /loop monitor) keep it alive.
-        mgr.note_session_state_for_program_run(id, SessionState::Running);
-        mgr.note_session_state_for_program_run(id, SessionState::AwaitingInput);
-        assert!(mgr.program_run_snapshot(id).is_some(), "still pending");
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        mgr.note_session_state_for_program_run(&id, SessionState::AwaitingInput);
+        assert!(mgr.program_run_snapshot(&id).is_some(), "still pending");
 
         // Settle one block (its text changes, dropping its signature); the
         // other stays pending and the run lives on.
-        mgr.narrow_program_run(id, "# Alpha done\n\n# Beta\n", &[]);
+        mgr.program_update(ProgramUpdateParams {
+            session_id: id.clone(),
+            markdown: "# Alpha done\n\n# Beta\n".into(),
+            base_version: None,
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            template_id: None,
+            note: None,
+            shimmer: None,
+            shimmer_tooltips: None,
+        })
+        .await
+        .expect("settle alpha");
         assert_eq!(
-            mgr.program_run_snapshot(id)
+            mgr.program_run_snapshot(&id)
                 .expect("one block still pending")
                 .pending_block_ids,
             vec![agentd_protocol::program_block_id("# Beta")]
         );
 
         // Settling the last block empties the pending set → the run clears.
-        mgr.narrow_program_run(id, "# Alpha done\n\n# Beta done\n", &[]);
+        mgr.program_update(ProgramUpdateParams {
+            session_id: id.clone(),
+            markdown: "# Alpha done\n\n# Beta done\n".into(),
+            base_version: None,
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            template_id: None,
+            note: None,
+            shimmer: None,
+            shimmer_tooltips: None,
+        })
+        .await
+        .expect("settle beta");
         assert!(
-            mgr.program_run_snapshot(id).is_none(),
+            mgr.program_run_snapshot(&id).is_none(),
             "an empty pending set clears the run"
         );
     }
@@ -5440,31 +5779,23 @@ mod tests {
     #[tokio::test]
     async fn program_run_managed_clears_on_terminal_state() {
         use agentd_protocol::SessionState;
-        use tempfile::tempdir;
-
-        let tmp = tempdir().expect("tempdir");
-        let storage =
-            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
-        let config = Arc::new(crate::config::Config::default());
-        let (mgr, _remote_rx, _restart_rx) =
-            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
-                .await
-                .expect("session manager");
-
-        let id = "sterminalrun";
         let body = "# Alpha\n\n# Beta\n";
-        mgr.start_program_run(id, body, false, None).expect("start");
-        mgr.note_session_state_for_program_run(id, SessionState::Running);
-        mgr.narrow_program_run(id, body, &[]);
+        let (mgr, _storage, id) = program_test_mgr(body).await;
+        mgr.start_program_run(&id, body, false, None)
+            .expect("start");
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        mgr.narrow_program_run(&id, body, &[]);
         assert!(
-            mgr.program_run_snapshot(id).expect("managed").agent_managed,
+            mgr.program_run_snapshot(&id)
+                .expect("managed")
+                .agent_managed,
             "run is managed with pending blocks"
         );
 
         // Errored is terminal → clear despite still-pending blocks.
-        mgr.note_session_state_for_program_run(id, SessionState::Errored);
+        mgr.note_session_state_for_program_run(&id, SessionState::Errored);
         assert!(
-            mgr.program_run_snapshot(id).is_none(),
+            mgr.program_run_snapshot(&id).is_none(),
             "a terminal state clears a managed run"
         );
     }

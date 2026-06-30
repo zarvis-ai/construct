@@ -3588,7 +3588,10 @@ function programDiff3(ours, base, theirs) {
 function programRunFromProgress(progress) {
   if (!progress) return null;
   const nowMs = Date.now();
-  const ids = progress.pending_block_ids || [];
+  const ids = [
+    ...(progress.pending_block_refs || []),
+    ...(progress.pending_block_ids || []),
+  ];
   if (progress.expires_at_ms <= nowMs || ids.length === 0) return null;
   const perf = performance.now();
   const startPerf = progress.started_at_ms <= nowMs ? perf - (nowMs - progress.started_at_ms) : perf;
@@ -3601,12 +3604,17 @@ function programRunFromProgress(progress) {
   };
 }
 
-function programActiveLines(buffer, pendingSet) {
+function programActiveLines(buffer, pendingSet, blocks) {
   const n = programLines(buffer).length;
   const active = new Array(n).fill(false);
   let any = false;
-  for (const b of programBlockSpans(buffer)) {
-    if (pendingSet.has(b.id)) {
+  const spans = blocks && blocks.length ? blocks : programBlockSpans(buffer);
+  const hasStableMatch = !!(blocks && blocks.length && spans.some((b) => pendingSet.has(b.id) || pendingSet.has(b.block_ref)));
+  for (const b of spans) {
+    const pending = hasStableMatch
+      ? (pendingSet.has(b.id) || pendingSet.has(b.block_ref))
+      : (pendingSet.has(b.id) || pendingSet.has(b.block_ref) || pendingSet.has(b.content_id));
+    if (pending) {
       for (let i = b.start_line; i < b.end_line && i < n; i++) { active[i] = true; any = true; }
     }
   }
@@ -3765,7 +3773,9 @@ function programApplyShimmer() {
   const run = id && state.program.runById.get(id);
   let active = null;
   if (run && performance.now() < run.deadlinePerf) {
-    active = programActiveLines(programSerialize(), run.pendingIds);
+    const doc = state.program.docById.get(id);
+    const cleanBlocks = doc && programNormalizeClipIds(programSerialize()) === doc.saved ? (doc.blocks || []) : null;
+    active = programActiveLines(programSerialize(), run.pendingIds, cleanBlocks);
   }
   lineEls.forEach((el, i) => { el.classList.toggle("is-running", !!(active && active[i])); });
 }
@@ -3889,6 +3899,7 @@ async function programMountSession(id) {
     version: p.version,
     templateId: p.template_id || null,
     saved: programNormalizeClipIds(p.markdown),
+    blocks: result.blocks || [],
   });
   const run = programRunFromProgress(result.active_run);
   if (run) state.program.runById.set(id, run); else state.program.runById.delete(id);
@@ -3943,6 +3954,7 @@ function handleProgramState(params) {
     version: program.version,
     templateId: program.template_id || null,
     saved: programNormalizeClipIds(program.markdown),
+    blocks: params.blocks || [],
   });
   if (isMounted) {
     programRenderDoc(program.markdown);
@@ -3995,6 +4007,7 @@ async function programSave() {
       version: p.version,
       templateId: p.template_id || null,
       saved: programNormalizeClipIds(p.markdown),
+      blocks: result.blocks || [],
     });
     const runP = programRunFromProgress(result.active_run);
     if (runP) state.program.runById.set(id, runP); else state.program.runById.delete(id);
@@ -4142,7 +4155,7 @@ async function programApplyTemplate(tmplId) {
   try {
     const result = await rpc("program.update", { session_id: id, markdown: t.markdown, base_version: doc.version, template_id: t.id });
     const p = result.program;
-    state.program.docById.set(id, { version: p.version, templateId: p.template_id || null, saved: programNormalizeClipIds(p.markdown) });
+    state.program.docById.set(id, { version: p.version, templateId: p.template_id || null, saved: programNormalizeClipIds(p.markdown), blocks: result.blocks || [] });
     if (state.program.mountedId === id) {
       programRenderDoc(p.markdown);
       programVersionEl.textContent = "v" + p.version;

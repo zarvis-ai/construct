@@ -1,60 +1,63 @@
 # 0053-program-shimmer-block-addressing
 
 Status: accepted
-Date: 2026-06-28
+Date: 2026-06-30
 Area: protocol
 Scope: How a program block's shimmer state is addressed and declared across program read, edit, update, and execute.
 
 ## Decision
 
-Program-block shimmer is a **declared per-block state addressed by a stable, content-derived block id** — not a state inferred from whether a block's text changed between reads.
+Program-block shimmer is a declared per-block state addressed by a daemon-owned stable block reference, not by position and not by inferred text changes.
 
 Definitions:
 
-- A **block** is a run of non-blank Markdown lines split at heading and list-item boundaries: each heading line, each list item (with its wrapped continuation lines), and each plain paragraph is its own block. A section of consecutive task items is therefore many blocks, not one — so an individual item can be declared pending or settled without disturbing its siblings, even when the items are written with no blank lines between them. (The same unit as `0042-program-run-progress-affordance`.)
-- A block's **id** is derived deterministically from its normalized semantic content (its trimmed lines joined by newline, with smart-clip `clip_id` instance metadata ignored). The id is **stable against position** — reordering, insertion or removal of other blocks, structural shifts, and concurrent edits elsewhere in the document all leave it unchanged. It is **not stable against editing the block's own semantic content** (changing the text or smart-clip target changes the id), and **two blocks with identical normalized semantic content share one id** and therefore one shimmer state.
+- A **block** is a run of non-blank Markdown lines split at heading and list-item boundaries: each heading line, each list item (with its wrapped continuation lines), and each plain paragraph is its own block.
+- A **block id** identifies one block instance across moves and concurrent edits.
+- A **content epoch** increments when that block instance's semantic content changes.
+- A **block ref** is `block_id:content_epoch`. It is the authoritative shimmer address returned as each block's `id`/`block_ref` in program projections.
+- A **content id** is the legacy normalized-content hash. It ignores smart-clip `clip_id` metadata and remains available as `content_id` for compatibility, but it is ambiguous for duplicate text and must not be preferred when block refs are available.
 
-Shimmer is carried across the four program surfaces as follows:
+The daemon stores block identity in program metadata and reconciles it whenever the Markdown changes. Unchanged content keeps its ref across moves. Metadata-only smart-clip instance-id changes keep the same ref. Semantic edits keep the block id but advance the epoch, producing a new ref so stale shimmer declarations do not attach to changed meaning. New blocks receive new block ids.
 
-- **Read** returns an ordered, derived projection of the document: each block with its id, its text (or source line range), and its current `shimmer` boolean. The projection is computed at read time from the live Markdown overlaid with the active run's shimmer set. It is never written into the Markdown, never versioned, and recomputed on every read.
-- **Edit** accepts, alongside its content edits, an **optional and partial** list of `{id, shimmer}` declarations that may address **any** block — including blocks the edit does not change. Declarations resolve against the document the call produces; a declaration whose id matches no block is dropped (the block changed underneath the caller).
-- **Update** (whole-document replace) requires a **complete** shimmer declaration over the blocks of the new Markdown — every block's pending/settled state. Because the caller supplies the entire text, the block set and its order are unambiguous.
-- **Execute** lights the whole executed region (the full document, or the selection) shimmering optimistically the instant it is invoked, and accepts an optional initial pending set.
+Shimmer is carried across the program surfaces as follows:
 
-Because shimmer is keyed by id, **a block's prior shimmer does not carry across a change to its own semantic content**: once a block's meaningful text changes its id changes, and the new content is settled unless the same call re-declares its new id pending. This one rule produces both required behaviors — a human (or agent) editing a block's text settles it by default, while an agent that edits a block but means to keep working on it re-declares its new id pending in the same call. Smart-clip `clip_id` changes are excluded from identity because they are client-assigned instance metadata; adding, repairing, or renumbering `clip_id` must not settle otherwise unchanged pending work.
+- **Read** returns an ordered projection of the document: each block with its stable ref (`id`/`block_ref`), legacy `content_id`, text or source line range, and current `shimmer` boolean.
+- **Edit** accepts an optional and partial list of `{id, shimmer}` declarations. The id may be a stable ref or a legacy content id. Declarations resolve against the document the call produces; a declaration whose id matches no block is dropped.
+- **Update** accepts a complete shimmer declaration over the blocks of the new Markdown. The daemon maps that ordered declaration to the new stable refs.
+- **Execute** lights the executed region optimistically immediately. The daemon then publishes stable refs for the active run so clients can replace the optimistic projection as soon as possible.
 
-Every write returns the fresh per-block projection in its response. A caller therefore reads once, then rides the echo from each write, and rarely acts on a stale read.
+Because shimmer is keyed by block ref, a block's prior shimmer does not carry across a semantic edit by default. Agents that edit a still-in-flight block must set `keep_pending: true` on that edit, or explicitly declare the resulting block's new ref pending in the same call. `keep_pending` is preferred because it re-adds the produced ref atomically, before any intermediate empty pending set can make the UI go dark.
+
+Every write returns the fresh per-block projection. Agents should read once, then use the echoed blocks from each write.
 
 ## Reason
 
-The earlier mechanism inferred shimmer from block-content changes: a block shimmered from Run start until its text changed. That cannot express "this block is settled but its text is unchanged," so blocks that need no work — which by definition never change — stayed shimmering for the whole turn, while the blocks with real work settled as the agent rewrote them. The observed result was the exact inverse of intent: inert sections (headings, untouched rules) shimmered while the actively-worked items went calm. Making shimmer a declared per-block state removes the inference entirely: a block shimmers because it is declared pending, full stop.
+Users can edit Program at any time and run again while an older run is still active. A robust shimmer model must therefore provide both immediate affordance and precise visibility without trusting positions or stale text.
 
-Addressing by a content-derived id rather than a positional index is a deliberate safety choice. A positional index silently retargets the **wrong** block whenever blocks are inserted, removed, reordered, or edited concurrently — it fails open, corrupting a block the caller never named. A content-derived id instead matches **nothing** when its block changed underneath the caller — it fails closed: the intended update is dropped, but no other block is touched. This is the same concurrency behavior the anchored content edit already has (its find anchor is content-matched and simply fails when the targeted text changed), so shimmer addressing and content addressing behave identically under a race, and the caller's existing "re-read and retry" path covers both.
+Content-derived ids were better than indexes because they failed closed under many races, but they had two serious gaps: identical blocks shared one shimmer state, and semantic edits had no stable object to attach an explicit "same task, new text" transition to. A daemon-owned block id plus epoch solves both. Duplicate blocks get distinct refs. Moves preserve refs. Semantic edits intentionally advance the ref, so old shimmer cannot accidentally stick to new meaning. Smart-clip `clip_id` repair is treated as metadata and does not advance the epoch, so UI normalization does not settle real work.
 
-A truly stable id — one that survives editing a block's own content — is intentionally out of scope. It would require either hidden identity markers embedded in the Markdown or a reconciliation side-table mapping blocks to persistent ids across every save. Both contradict the plain-Markdown, co-editable, no-fragile-bookkeeping stance of `0042-program-run-progress-affordance`, and both are far too heavy for a transient animation that is already best-effort and cleared at turn end.
-
-Partial declarations on edit and a complete declaration on update reflect how each surface is used. Edit is targeted and frequent; forcing every edit to restate the shimmer state of every block would invite the opposite failure — quietly settling a still-pending block the caller forgot to re-list. A partial list lets a call touch only what it means to. Update already carries the whole document, so a complete declaration is both natural and unambiguous, and being required there means a wholesale rewrite can never silently inherit a stale shimmer set.
+The model remains plain-Markdown friendly: identity lives in program metadata, not hidden Markdown markers, and content ids remain as a compatibility fallback for older clients and transient dirty-buffer projections.
 
 ## Consequences
 
-- Program get and state payloads publish the per-block projection (block ids plus shimmer state) rather than an opaque list of pending block signatures. Clients animate the time-based shimmer wave locally over the blocks the daemon marks pending; they do not re-derive the block-to-shimmer join themselves.
-- The optimistic client-side start in `0042` is unchanged: a Run lights its whole region immediately, before the first projection arrives; the projection then narrows it.
-- Stale-id drops and identical-content collisions are accepted imprecision, bounded by the best-effort narrowing and the authoritative turn-end stop signal in `0042`. A dropped declaration self-heals on the next read or write echo, or clears at turn end.
-- No write ever changes the shimmer of a block it did not name by id. A concurrent human edit to a targeted block drops that one declaration (and, for a content edit on the same block, fails the find-anchor match); the caller re-reads via the echoed projection and retries.
-- Shimmer is declared two ways, by purpose. The call-level per-block **id list** declares the pending state of blocks that already exist — settling no-work blocks, marking others pending — and is the planning-pass mechanism. A per-edit **`keep_pending`** flag instead keeps the block(s) an edit *produces* pending, addressing them by the edit rather than by a not-yet-known id; it exists because a text-changing edit (move, annotate, append a clip) re-ids its block, and requiring the post-edit id would force a two-step declare-after-edit whose intermediate state empties the pending set. `keep_pending` adds the id of **every** block its `new_string` introduces in the same narrowing call that drops the old one — so a heading-anchored insert whose `new_string` spans a heading plus a moved item keeps the inserted item, not merely the first block. A block the `new_string` merely restates unchanged (the anchor heading) is not re-lit.
-- A run is not destroyed by a *transient* empty pending set mid-turn. A text-changing edit drops the old id before any new id is added, so without `keep_pending` the set momentarily empties; reaping the run there would make a follow-up re-declaration a silent no-op. The run is kept alive across the gap (nothing shimmers in it) and reaped only on a terminal/idle owning-session state or the inactivity backstop — see the stop lifecycle in `0042`.
-- Smart-clip instance-id normalization is shimmer-neutral. A client may add a missing `clip_id` or repair duplicate `clip_id` values during save; those metadata-only changes leave block ids unchanged, so an in-flight task does not go dark merely because the rendered clip instance gained a stable UI id.
+- Program get, edit, update, execute, and state payloads publish the per-block projection so clients do not independently invent block identity.
+- Clients should use stable refs whenever the local buffer matches the saved daemon document. They may fall back to content ids only for legacy payloads or dirty optimistic buffers.
+- A stale stable-ref declaration fails closed: it matches no block if the target's semantic content changed and the caller did not use `keep_pending`.
+- Identical-content blocks are distinct when addressed by stable ref. Legacy content-id declarations may still affect all matching duplicates and should be treated as compatibility behavior.
+- No write changes the shimmer of a stable-ref-addressed block it did not name, except `keep_pending`, which names blocks by the edit output instead of by a ref the caller cannot know yet.
+- A run is not destroyed by a transient empty pending set mid-turn. Text-changing edits can drop old refs before new refs are added; the run survives that gap and is reaped by the lifecycle defined in `0042`.
+- Smart-clip `clip_id` normalization is shimmer-neutral. Changing only instance metadata leaves block refs unchanged.
 
 ## Non-Goals
 
-- This does not introduce persistent or sticky block identity, a per-block lock, or a per-task status; shimmer remains the transient pending/settled signal defined in `0042` and `0048`.
-- It does not change the start / stop lifecycle, the optimistic start, or the stop signals of `0042-program-run-progress-affordance`; it only defines how the pending set is addressed and declared.
-- It does not attempt to keep a block's id stable across edits to its own semantic content, nor to disambiguate two blocks with identical content. Accepted consequences of content-derived ids: two blocks with identical text (e.g. repeated `## Done` / `## Notes` headings) share one id and shimmer/settle together; and renumbering an ordered list (`2.` → `1.` after a removal) changes the surviving items' text and therefore their ids, dropping their shimmer. Unordered bullets and stable headings avoid both.
-- It does not parse fenced regions: lines inside a code fence or a `:::clip` block that look like headings or list items are split as blocks like any other line. Shimmer granularity inside such regions is therefore cosmetic-only and not meaningful.
+- This does not introduce task status, locks, or permanent task tracking. Shimmer remains the transient pending/settled signal defined in `0042`.
+- This does not change the optimistic start or stop lifecycle of `0042`; it only defines the addressing model for the pending set.
+- This does not require identity markers in Markdown.
+- This does not make legacy content ids precise for duplicates. They are compatibility fallback only.
 
 ## Examples
 
-- **The inverse, fixed.** A program has a Rule heading, an empty TODO heading, two in-progress items, and a Done heading. The agent reads the projection, then makes one edit that declares the two item ids `shimmer: true` and the Rule, TODO, and Done ids `shimmer: false` — changing no block's text. The two items keep shimmering; the inert headings go calm at once, instead of shimmering for the rest of the turn.
-- **Editing a block but keeping it pending.** The agent rewrites an item to record a hand-off. The rewrite changes the block's text, so its id changes; the same edit declares the new id `shimmer: true`, and the item keeps shimmering. When the result lands, a later edit rewrites it again and declares it settled, and it settles.
-- **Concurrent human edit.** Between the agent's read and its edit, a human rewrites one block. The agent's shimmer declaration for that block's old id matches nothing and is dropped; its declarations for the other blocks still apply. The agent re-reads the echoed projection and re-declares the human-changed block if it still intends to work on it.
-- **Identical blocks.** Two list items have identical text. They share one id, so they shimmer and settle together; distinguishing them would require giving them distinct text.
+- **Duplicate blocks.** Two identical list items have the same content id but different stable refs. Settling one by ref leaves the other shimmering.
+- **Smart-clip metadata.** `@{session:s1}` becoming `@{session:s1 clip_id=clip_4}` keeps the same block ref and shimmer.
+- **Semantic edit.** `* build` becoming `* build and test` advances the epoch and drops old shimmer unless the edit uses `keep_pending`.
+- **Move.** Moving `* build` from Todo to In progress without changing its text keeps the same ref and its shimmer follows the block.

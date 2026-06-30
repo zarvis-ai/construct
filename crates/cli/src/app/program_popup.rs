@@ -17,14 +17,15 @@ impl App {
                 let now = Instant::now();
                 match result.active_run.and_then(ProgramRun::from_progress) {
                     Some(run) => {
-                        self.program_runs.insert(result.program.session_id.clone(), run);
+                        self.program_runs
+                            .insert(result.program.session_id.clone(), run);
                     }
                     None => {
                         self.program_runs.remove(&result.program.session_id);
                     }
                 }
                 self.program_popups.remove(&result.program.session_id);
-                let mut popup = program_popup_from_document(result.program, now);
+                let mut popup = program_popup_from_document(result.program, result.blocks, now);
                 // Restore the caret + scroll the user left when this program was
                 // last hidden, so hide→show is position-preserving rather than
                 // jumping back to the top.
@@ -88,13 +89,14 @@ impl App {
                 Ok(result) => {
                     match result.active_run.and_then(ProgramRun::from_progress) {
                         Some(run) => {
-                            self.program_runs.insert(result.program.session_id.clone(), run);
+                            self.program_runs
+                                .insert(result.program.session_id.clone(), run);
                         }
                         None => {
                             self.program_runs.remove(&result.program.session_id);
                         }
                     }
-                    let popup = program_popup_from_document(result.program, now);
+                    let popup = program_popup_from_document(result.program, result.blocks, now);
                     if selected_id.as_deref() == Some(session_id.as_str()) {
                         self.program_popup = Some(popup);
                     } else {
@@ -206,6 +208,7 @@ impl App {
                 Ok(result) => {
                     return Ok(Some(ProgramSaveOutcome {
                         program: result.program,
+                        blocks: result.blocks,
                         merged,
                         conflicted,
                     }));
@@ -246,6 +249,7 @@ impl App {
                     if let Some(active) = self.program_popup.as_mut() {
                         active.buffer = outcome.program.markdown.clone();
                         active.saved_markdown = outcome.program.markdown.clone();
+                        active.blocks = outcome.blocks.clone();
                         active.program = outcome.program;
                         active.cursor = active.cursor.min(active.buffer.chars().count());
                         active.preferred_col = None;
@@ -267,6 +271,7 @@ impl App {
                     if let Some(cached) = self.program_popups.get_mut(&session_id) {
                         cached.buffer = outcome.program.markdown.clone();
                         cached.saved_markdown = outcome.program.markdown.clone();
+                        cached.blocks = outcome.blocks.clone();
                         cached.program = outcome.program;
                         cached.cursor = cached.cursor.min(cached.buffer.chars().count());
                         cached.preferred_col = None;
@@ -289,6 +294,7 @@ impl App {
                 if let Some(popup) = self.program_popup.as_mut() {
                     popup.buffer = outcome.program.markdown.clone();
                     popup.saved_markdown = outcome.program.markdown.clone();
+                    popup.blocks = outcome.blocks.clone();
                     popup.program = outcome.program;
                     popup.cursor = popup.cursor.min(popup.buffer.chars().count());
                     popup.preferred_col = None;
@@ -298,15 +304,15 @@ impl App {
                         "program merged with conflicts to resolve (version {version})"
                     ));
                 } else if merged {
-                    self.set_status(format!("program merged with agent edits (version {version})"));
+                    self.set_status(format!(
+                        "program merged with agent edits (version {version})"
+                    ));
                 } else {
                     self.set_status(format!("program saved version {version}"));
                 }
                 true
             }
-            Ok(None) => {
-                true
-            }
+            Ok(None) => true,
             Err(e) => {
                 self.set_status(format!("program save failed: {e}"));
                 false
@@ -337,12 +343,9 @@ impl App {
             .map(|popup| popup.saved_markdown.clone())
             .unwrap_or_default();
 
-        let dirty = self
-            .program_popup
-            .as_ref()
-            .is_some_and(|popup| {
-                program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
-            });
+        let dirty = self.program_popup.as_ref().is_some_and(|popup| {
+            program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
+        });
         if dirty && !self.save_program_popup().await {
             return false;
         }
@@ -351,9 +354,8 @@ impl App {
             .program_popup
             .as_ref()
             .map(|popup| popup.program.version);
-        let selection = selection.map(|selection| {
-            program_normalize_smart_clip_instance_ids(&selection)
-        });
+        let selection =
+            selection.map(|selection| program_normalize_smart_clip_instance_ids(&selection));
         let is_selection = selection.is_some();
         // Optimistic feedback (spec 0042): start the Run shimmer the instant
         // Run is pressed, before the execute round trip, so the affordance

@@ -29,14 +29,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
-mod matrix_clicks;
-mod session_title_menu;
-mod minibuffer;
 mod dynamic_ui;
-mod program_popup;
 mod editor;
+mod matrix_clicks;
+mod minibuffer;
 mod mouse;
+mod program_popup;
 mod session_picker;
+mod session_title_menu;
 pub use session_picker::{
     session_picker_scroll, SessionPickerDialog, SessionPickerPurpose, SessionPickerRow,
 };
@@ -132,9 +132,7 @@ fn selection_is_valid_for_sessions(
                 .iter()
                 .any(|s| is_user_list_session(s) && s.archived && s.group_id.is_none()),
             ArchiveSection::Group(id) => sessions.iter().any(|s| {
-                is_user_list_session(s)
-                    && s.archived
-                    && s.group_id.as_deref() == Some(id.as_str())
+                is_user_list_session(s) && s.archived && s.group_id.as_deref() == Some(id.as_str())
             }),
             ArchiveSection::Subagents(parent_id) => sessions.iter().any(|s| {
                 is_subagent_session(s)
@@ -369,7 +367,10 @@ impl MainWindowTree {
 
     fn collect_session_ids_into<'a>(&'a self, out: &mut Vec<&'a str>) {
         match self {
-            Self::Leaf { selection: Selection::Session(id), .. } => out.push(id.as_str()),
+            Self::Leaf {
+                selection: Selection::Session(id),
+                ..
+            } => out.push(id.as_str()),
             Self::Leaf { .. } => {}
             Self::Split { first, second, .. } => {
                 first.collect_session_ids_into(out);
@@ -640,10 +641,7 @@ pub struct ProgramTemplateHit {
 
 impl ProgramTemplateHit {
     pub fn contains(&self, col: u16, row: u16) -> bool {
-        row >= self.row_start
-            && row <= self.row_end
-            && col >= self.col_start
-            && col < self.col_end
+        row >= self.row_start && row <= self.row_end && col >= self.col_start && col < self.col_end
     }
 }
 
@@ -718,9 +716,19 @@ pub struct SessionTitleMenu {
 impl SessionTitleMenu {
     pub fn item_at(&self, col: u16, row: u16) -> Option<SessionTitleMenuAction> {
         if col <= self.area.x
-            || col >= self.area.x.saturating_add(self.area.width).saturating_sub(1)
+            || col
+                >= self
+                    .area
+                    .x
+                    .saturating_add(self.area.width)
+                    .saturating_sub(1)
             || row <= self.area.y
-            || row >= self.area.y.saturating_add(self.area.height).saturating_sub(1)
+            || row
+                >= self
+                    .area
+                    .y
+                    .saturating_add(self.area.height)
+                    .saturating_sub(1)
         {
             return None;
         }
@@ -1333,7 +1341,13 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
             let pre_render = h.replay(cols.max(1), rows.max(1), 0);
             let is_alt_screen = pre_render.screen.alternate_screen();
             drop(pre_render);
-            (Some(h), editor_state, agent_status, ui_panels, is_alt_screen)
+            (
+                Some(h),
+                editor_state,
+                agent_status,
+                ui_panels,
+                is_alt_screen,
+            )
         } else {
             let mut ui_panels: HashMap<String, agentd_protocol::UiPanel> = detail
                 .ui_panels
@@ -1489,6 +1503,7 @@ pub struct ProgramPopup {
     pub program: agentd_protocol::ProgramDocument,
     pub buffer: String,
     pub saved_markdown: String,
+    pub blocks: Vec<agentd_protocol::ProgramBlockView>,
     pub undo_stack: Vec<ProgramUndoState>,
     pub cursor: usize,
     pub preferred_col: Option<usize>,
@@ -1529,12 +1544,12 @@ pub struct ProgramViewMemory {
 pub struct ProgramRun {
     /// When Run was pressed. The shimmer wave is a function of elapsed time.
     pub started_at: Instant,
-    /// Stable content-derived ids of blocks still pending (shimmering), per
-    /// spec 0053. A block shimmers while its id is in this set; the daemon
-    /// owns the set and publishes it, and clients map it back onto source lines
-    /// via the shared block parser.
+    /// Stable block refs (plus legacy fallback content ids) of blocks still
+    /// pending, per spec 0053. The daemon owns the set and publishes it; clients
+    /// map it back onto source lines through the daemon block projection when
+    /// the buffer is clean and through content ids only for dirty fallback.
     pub pending: HashSet<String>,
-    /// Per-block run-status tooltips keyed by stable block id (spec 0057). Missing
+    /// Per-block run-status tooltips keyed by stable block ref (spec 0057). Missing
     /// entries render the hardcoded fallback label on hover.
     pub pending_tooltips: HashMap<String, String>,
     /// Absolute backstop: clear no later than this regardless of signals.
@@ -1550,7 +1565,9 @@ impl ProgramRun {
             .duration_since(UNIX_EPOCH)
             .ok()?
             .as_millis() as i64;
-        if progress.expires_at_ms <= now_ms || progress.pending_block_ids.is_empty() {
+        if progress.expires_at_ms <= now_ms
+            || (progress.pending_block_refs.is_empty() && progress.pending_block_ids.is_empty())
+        {
             return None;
         }
         let started_at = if progress.started_at_ms <= now_ms {
@@ -1559,9 +1576,11 @@ impl ProgramRun {
             now
         };
         let deadline = now + Duration::from_millis((progress.expires_at_ms - now_ms) as u64);
+        let mut pending: HashSet<String> = progress.pending_block_refs.into_iter().collect();
+        pending.extend(progress.pending_block_ids);
         Some(Self {
             started_at,
-            pending: progress.pending_block_ids.into_iter().collect(),
+            pending,
             pending_tooltips: progress.pending_block_tooltips,
             deadline,
             first_output_seen: progress.first_output_seen,
@@ -1570,13 +1589,13 @@ impl ProgramRun {
 }
 
 /// A program "block": a maximal run of consecutive non-blank Markdown lines,
-/// identified by its stable content-derived id. The unit of Run shimmer — a
-/// block shimmers as a whole and settles as a whole (specs 0042, 0053).
+/// identified by its legacy content id for dirty-buffer fallback. The daemon
+/// projection supplies authoritative stable refs for synced documents.
 pub(crate) struct ProgramBlock {
     /// Source-line index range `[start_line, end_line)` into `markdown.lines()`.
     pub start_line: usize,
     pub end_line: usize,
-    /// Stable content-derived block id (spec 0053) — what the shimmer set keys on.
+    /// Legacy content-derived block id (spec 0053).
     pub id: String,
 }
 
@@ -1623,9 +1642,8 @@ pub(crate) fn program_referenced_session_ids(markdown: &str) -> Vec<String> {
     ids
 }
 
-/// Stable block ids of the blocks contained in `body` — the set of blocks that
-/// a Run over `body` should shimmer. For a full-program run `body` is the whole
-/// document; for a selection run it is the selected text.
+/// Legacy content ids of the blocks contained in `body` — used for local
+/// optimistic/selection shimmer before the daemon returns stable refs.
 pub(crate) fn program_run_pending_ids(body: &str) -> HashSet<String> {
     agentd_protocol::program_block_spans(body)
         .into_iter()
@@ -1638,6 +1656,8 @@ struct ProgramSaveOutcome {
     /// The document as it now lives on the daemon (our content, possibly
     /// merged with concurrent edits).
     program: agentd_protocol::ProgramDocument,
+    /// Echoed per-block projection for stable shimmer refs.
+    blocks: Vec<agentd_protocol::ProgramBlockView>,
     /// A 3-way merge ran because the document advanced underneath us.
     merged: bool,
     /// The merge could not reconcile overlapping edits, so the saved content
@@ -2020,8 +2040,7 @@ pub struct LayoutSnapshot {
     /// session-picker dialog reads this to render its `@`→session variant in
     /// place of the inline context menu instead of center-screen. `Some` only
     /// while a program's `@` smart-clip search is live.
-    pub program_smart_clip_anchor:
-        Option<(ratatui::layout::Position, ratatui::layout::Rect)>,
+    pub program_smart_clip_anchor: Option<(ratatui::layout::Position, ratatui::layout::Rect)>,
     /// Session smart-clip hitboxes in the active program body from the last
     /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
     pub program_clip_hits: Vec<ProgramClipHit>,
@@ -3809,7 +3828,11 @@ impl App {
 
     /// Set whether a section's archived sessions are revealed. Returns whether
     /// the state actually changed.
-    pub fn set_archive_section_revealed(&mut self, section: &ArchiveSection, revealed: bool) -> bool {
+    pub fn set_archive_section_revealed(
+        &mut self,
+        section: &ArchiveSection,
+        revealed: bool,
+    ) -> bool {
         match section {
             ArchiveSection::Ungrouped => {
                 let changed = self.show_archived_ungrouped != revealed;
@@ -4559,12 +4582,12 @@ impl App {
         if Self::is_collapsed_ungrouped_archive_row(&items[next]) {
             let direction = delta.signum();
             let primary_beyond_archive = if direction > 0 {
-                items[next + 1..].iter().position(Self::is_primary_list_target)
+                items[next + 1..]
+                    .iter()
+                    .position(Self::is_primary_list_target)
                     .map(|offset| next + 1 + offset)
             } else {
-                items[..next]
-                    .iter()
-                    .rposition(Self::is_primary_list_target)
+                items[..next].iter().rposition(Self::is_primary_list_target)
             };
             if let Some(index) = primary_beyond_archive {
                 next = index;
@@ -4688,7 +4711,12 @@ impl App {
     /// drops a needed redraw; the cost of an occasional extra paint is
     /// far cheaper than missing one.
     fn session_visible_on_screen(&self, id: &str) -> bool {
-        if self.main_windows.visible_session_ids().iter().any(|s| *s == id) {
+        if self
+            .main_windows
+            .visible_session_ids()
+            .iter()
+            .any(|s| *s == id)
+        {
             return true;
         }
         if self.orchestrator_id.as_deref() == Some(id) {
@@ -5212,7 +5240,7 @@ impl App {
                         agentd_protocol::ProgramStateNotificationPayload,
                     >(p)
                     {
-                        self.on_program_state(payload.program, payload.active_run);
+                        self.on_program_state(payload.program, payload.active_run, payload.blocks);
                     }
                 }
             }
@@ -5230,6 +5258,7 @@ impl App {
         &mut self,
         program: agentd_protocol::ProgramDocument,
         active_run: Option<agentd_protocol::ProgramRunProgress>,
+        blocks: Vec<agentd_protocol::ProgramBlockView>,
     ) {
         match active_run.and_then(ProgramRun::from_progress) {
             Some(run) => {
@@ -5264,6 +5293,7 @@ impl App {
         }
         popup.buffer = program.markdown.clone();
         popup.saved_markdown = program.markdown.clone();
+        popup.blocks = blocks;
         popup.program = program;
         let buffer_len = popup.buffer.chars().count();
         popup.cursor = popup.cursor.min(buffer_len);
@@ -7507,7 +7537,6 @@ impl App {
             Err(e) => self.set_status(format!("remote-control stop failed: {e}")),
         }
     }
-
 }
 
 /// Best-effort one-line summary of a tool call's args JSON for the
@@ -8309,7 +8338,11 @@ fn program_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
     let Some(body) = clip.strip_prefix("@{").and_then(|s| s.strip_suffix('}')) else {
         return clip.to_string();
     };
-    format!("@{{{} clip_id={}}}", body, program_next_smart_clip_id(buffer))
+    format!(
+        "@{{{} clip_id={}}}",
+        body,
+        program_next_smart_clip_id(buffer)
+    )
 }
 
 fn program_normalize_smart_clip_instance_ids(markdown: &str) -> String {
@@ -8323,7 +8356,10 @@ fn program_normalize_smart_clip_instance_ids(markdown: &str) -> String {
         let start_b = byte_pos(markdown, range.start + 2);
         let end_b = byte_pos(markdown, range.end.saturating_sub(1));
         if let Some(id) = program_smart_clip_instance_id(&markdown[start_b..end_b]) {
-            if let Some(num) = id.strip_prefix("clip_").and_then(|s| s.parse::<usize>().ok()) {
+            if let Some(num) = id
+                .strip_prefix("clip_")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
                 max = max.max(num);
             }
         }
@@ -8374,7 +8410,10 @@ fn program_next_smart_clip_id(buffer: &str) -> String {
         let start_b = byte_pos(buffer, range.start + 2);
         let end_b = byte_pos(buffer, range.end.saturating_sub(1));
         if let Some(id) = program_smart_clip_instance_id(&buffer[start_b..end_b]) {
-            if let Some(num) = id.strip_prefix("clip_").and_then(|s| s.parse::<usize>().ok()) {
+            if let Some(num) = id
+                .strip_prefix("clip_")
+                .and_then(|s| s.parse::<usize>().ok())
+            {
                 max = max.max(num);
             }
         }
@@ -8475,6 +8514,7 @@ fn program_smart_clip_ranges(buffer: &str) -> Vec<ProgramSmartClipRange> {
 
 fn program_popup_from_document(
     program: agentd_protocol::ProgramDocument,
+    blocks: Vec<agentd_protocol::ProgramBlockView>,
     now: Instant,
 ) -> ProgramPopup {
     let markdown = program.markdown.clone();
@@ -8482,6 +8522,7 @@ fn program_popup_from_document(
         program,
         buffer: markdown.clone(),
         saved_markdown: markdown,
+        blocks,
         undo_stack: Vec::new(),
         cursor: 0,
         preferred_col: None,
@@ -8508,7 +8549,10 @@ fn program_offset_to_line_col(lines: &[String], offset: usize) -> (usize, usize)
         consumed += len + 1; // + the trailing newline
     }
     let last = lines.len().saturating_sub(1);
-    (last, lines.get(last).map(|l| l.chars().count()).unwrap_or(0))
+    (
+        last,
+        lines.get(last).map(|l| l.chars().count()).unwrap_or(0),
+    )
 }
 
 /// Inverse of [`program_offset_to_line_col`]: the char offset of `(line, col)`.
@@ -8984,18 +9028,19 @@ mod tests {
 
     fn program_popup_for_test(session_id: &str, markdown: &str, cursor: usize) -> ProgramPopup {
         let now = Instant::now();
-    ProgramPopup {
-        program: agentd_protocol::ProgramDocument {
-            session_id: session_id.to_string(),
-            markdown: markdown.to_string(),
-            version: 1,
-            updated_at_ms: 0,
-            template_id: None,
-        },
-        buffer: markdown.to_string(),
-        saved_markdown: markdown.to_string(),
-        undo_stack: Vec::new(),
-        cursor,
+        ProgramPopup {
+            program: agentd_protocol::ProgramDocument {
+                session_id: session_id.to_string(),
+                markdown: markdown.to_string(),
+                version: 1,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            buffer: markdown.to_string(),
+            saved_markdown: markdown.to_string(),
+            blocks: Vec::new(),
+            undo_stack: Vec::new(),
+            cursor,
             preferred_col: None,
             selection: None,
             smart_clip: None,
@@ -9011,7 +9056,10 @@ mod tests {
     async fn program_scroll_offset_follows_cursor_down_and_back() {
         let (mut app, _dir, _server) = empty_app().await;
         // Twenty short, non-wrapping lines rendered into a 5-row-tall viewport.
-        let markdown = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let markdown = (0..20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.program_popup = Some(program_popup_for_test("s1", &markdown, 0));
         app.layout.program_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 5));
 
@@ -9024,7 +9072,10 @@ mod tests {
         app.program_popup.as_mut().unwrap().cursor = markdown.chars().count();
         app.follow_program_scroll();
         let offset = app.program_popup.as_ref().unwrap().scroll_offset;
-        assert!(offset > 0, "offset should advance below the fold, got {offset}");
+        assert!(
+            offset > 0,
+            "offset should advance below the fold, got {offset}"
+        );
         assert!(
             (offset..offset + 5).contains(&19),
             "cursor row 19 must be visible within [{offset}, {})",
@@ -9040,7 +9091,10 @@ mod tests {
     #[tokio::test]
     async fn program_hide_then_show_restores_cursor_and_scroll() {
         let (mut app, _dir, server) = empty_app().await;
-        let markdown = (0..20).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let markdown = (0..20)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         // Active program with the user parked partway down: a non-zero caret,
         // a remembered preferred column, and a freely-scrolled viewport.
@@ -9193,8 +9247,7 @@ mod tests {
         app.program_popup = Some(program_popup_for_test("s1", "see @{session:sub1}", 0));
         // The subagent isn't reachable through the list at all.
         assert!(
-            !app
-                .list_items()
+            !app.list_items()
                 .iter()
                 .any(|it| it.matches(&Selection::Session("sub1".into()))),
             "subagent must not have a navigable list row"
@@ -9219,7 +9272,10 @@ mod tests {
                 modifiers: crossterm::event::KeyModifiers::empty(),
             })
             .await;
-        assert!(consumed, "clip click is handled by the program mouse router");
+        assert!(
+            consumed,
+            "clip click is handled by the program mouse router"
+        );
         assert_eq!(app.selection.session_id(), Some("sub1"));
         // The active window pane drives the main view; it must point at the
         // target, or the click wouldn't actually reveal the session.
@@ -9244,26 +9300,28 @@ mod tests {
     async fn program_c_l_centers_cursor_row_in_viewport() {
         let (mut app, _dir, _server) = empty_app().await;
         // 30 short lines into a 7-row viewport.
-        let markdown = (0..30).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let markdown = (0..30)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.program_popup = Some(program_popup_for_test("s1", &markdown, 0));
         app.layout.program_inner_area = Some(ratatui::layout::Rect::new(0, 0, 40, 7));
 
         // Start near top: center should be near 0 (clamped).
         app.center_program_cursor();
         let off0 = app.program_popup.as_ref().unwrap().scroll_offset;
-        assert!(off0 <= 3, "near-top center should keep offset small, got {off0}");
+        assert!(
+            off0 <= 3,
+            "near-top center should keep offset small, got {off0}"
+        );
 
         // Move cursor far down (visual row ~29).
         let total_chars = markdown.chars().count();
         app.program_popup.as_mut().unwrap().cursor = total_chars;
         app.center_program_cursor();
         let off = app.program_popup.as_ref().unwrap().scroll_offset;
-        let cursor_row = crate::ui::program_cursor_visual_row(
-            Some(&app),
-            &markdown,
-            total_chars,
-            40,
-        );
+        let cursor_row =
+            crate::ui::program_cursor_visual_row(Some(&app), &markdown, total_chars, 40);
         // Cursor row should be roughly centered in the 7-row window.
         // With half=3, we expect offset ~ cursor_row - 3, cursor visible in middle.
         assert!(
@@ -9272,7 +9330,10 @@ mod tests {
             off + 7
         );
         // And not at the very top or bottom of the window for a mid-buffer cursor.
-        assert!(off > 5, "offset should have advanced for deep cursor, got {off}");
+        assert!(
+            off > 5,
+            "offset should have advanced for deep cursor, got {off}"
+        );
     }
 
     #[tokio::test]
@@ -9360,7 +9421,10 @@ mod tests {
             .await;
 
         assert!(!app.program_smart_clip_active(), "C-g dismisses the picker");
-        assert!(app.program_popup.is_some(), "C-g must not close the program");
+        assert!(
+            app.program_popup.is_some(),
+            "C-g must not close the program"
+        );
         server.abort();
     }
 
@@ -9546,8 +9610,14 @@ mod tests {
             .await;
 
         // Esc dismisses just the picker; the program surface remains open.
-        assert!(!app.program_smart_clip_active(), "Esc should cancel the picker");
-        assert!(app.program_popup.is_some(), "Esc must not close the program");
+        assert!(
+            !app.program_smart_clip_active(),
+            "Esc should cancel the picker"
+        );
+        assert!(
+            app.program_popup.is_some(),
+            "Esc must not close the program"
+        );
         server.abort();
     }
 
@@ -9891,7 +9961,11 @@ mod tests {
         app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE))
             .await;
 
-        assert_eq!(app.program_popup.as_ref().unwrap().cursor, 6, "during search the first match >= anchor is selected (cursor moves)");
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().cursor,
+            6,
+            "during search the first match >= anchor is selected (cursor moves)"
+        );
         app.handle_program_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
             .await;
         let popup = app.program_popup.as_ref().unwrap();
@@ -9916,7 +9990,11 @@ mod tests {
         session.harness = "shell".into();
         session.state = agentd_protocol::SessionState::Done;
         app.sessions = vec![session];
-        app.program_popup = Some(program_popup_for_test("s1", "hello @{session:stest} world", 0));
+        app.program_popup = Some(program_popup_for_test(
+            "s1",
+            "hello @{session:stest} world",
+            0,
+        ));
 
         app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
@@ -9949,7 +10027,11 @@ mod tests {
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
         session.id = "stest".into();
         app.sessions = vec![session];
-        app.program_popup = Some(program_popup_for_test("s1", "hello @{session:stest} world", 0));
+        app.program_popup = Some(program_popup_for_test(
+            "s1",
+            "hello @{session:stest} world",
+            0,
+        ));
 
         app.handle_program_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
             .await;
@@ -10034,8 +10116,14 @@ mod tests {
             .await;
 
         let popup = app.program_popup.as_ref().unwrap();
-        assert_eq!(popup.buffer, "- item", "outdent at column 0 clamps to a no-op");
-        assert_eq!(popup.cursor, 3, "cursor is undisturbed by a clamped outdent");
+        assert_eq!(
+            popup.buffer, "- item",
+            "outdent at column 0 clamps to a no-op"
+        );
+        assert_eq!(
+            popup.cursor, 3,
+            "cursor is undisturbed by a clamped outdent"
+        );
         server.abort();
     }
 
@@ -10116,12 +10204,18 @@ mod tests {
         let text = rendered_text(term.backend().buffer());
 
         assert!(text.contains("▶"), "title run icon should render: {text:?}");
-        assert!(text.contains("▣"), "program mode toggle should render: {text:?}");
+        assert!(
+            text.contains("▣"),
+            "program mode toggle should render: {text:?}"
+        );
         assert!(
             !text.contains("<program>"),
             "title should no longer render a literal program label: {text:?}"
         );
-        assert!(text.contains("Run"), "selection run menu should render: {text:?}");
+        assert!(
+            text.contains("Run"),
+            "selection run menu should render: {text:?}"
+        );
         assert!(app.layout.program_title_run_hit.is_some());
         assert!(app.layout.program_title_toggle_hit.is_some());
         assert!(app.layout.program_selection_run_hit.is_some());
@@ -11072,7 +11166,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_run_for_orchestrator_does_not_panic_and_submit_does_not_clear_other_shimmers() {
+    async fn program_run_for_orchestrator_does_not_panic_and_submit_does_not_clear_other_shimmers()
+    {
         // TDD for the reported panic (screenshot 2026-06-27 9.43.19),
         // "Program click 'run' on smith session does type the prompt, but not submit",
         // and "On smith session program, when submit the prompt, all shimmer animation clears".
@@ -11173,14 +11268,20 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut app = test_app(client, vec![summary_with_kind(agentd_protocol::SessionKind::User)]);
+        let mut app = test_app(
+            client,
+            vec![summary_with_kind(agentd_protocol::SessionKind::User)],
+        );
 
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app))
             .expect("session title should render");
         let text = rendered_text(term.backend().buffer());
-        assert!(text.contains("●"), "chat mode should keep the status glyph: {text:?}");
+        assert!(
+            text.contains("●"),
+            "chat mode should keep the status glyph: {text:?}"
+        );
         let view = app.layout.view_area.expect("view area");
         let (x_start, _x_end, y) = crate::ui::view_program_toggle_button_range(view);
 
@@ -11198,7 +11299,10 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::empty(),
         })
         .await;
-        assert!(app.program_popup.is_some(), "clicking the title toggle should open program");
+        assert!(
+            app.program_popup.is_some(),
+            "clicking the title toggle should open program"
+        );
         server.abort();
     }
 
@@ -11345,7 +11449,10 @@ mod tests {
         })
         .await;
 
-        assert_eq!(app.active_window_id, 2, "clicking the bottom pane focuses it");
+        assert_eq!(
+            app.active_window_id, 2,
+            "clicking the bottom pane focuses it"
+        );
         let popup = app
             .program_popup
             .as_ref()
@@ -11429,7 +11536,10 @@ mod tests {
         app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
         app.program_popup.as_mut().unwrap().buffer = "alpha beta changed".to_string();
 
-        assert!(app.execute_program_popup(Some("beta".to_string()), None).await);
+        assert!(
+            app.execute_program_popup(Some("beta".to_string()), None)
+                .await
+        );
 
         let (first_method, first_params) = seen_rx.recv().await.expect("program update request");
         let (second_method, second_params) = seen_rx.recv().await.expect("program execute request");
@@ -11455,13 +11565,17 @@ mod tests {
         let (mut app, _dir, server) = empty_app().await;
         app.program_popup = Some(program_popup_for_test("s1", "# Todo\n- a\n", 0));
         // The owning agent edited the program on the daemon.
-        app.on_program_state(agentd_protocol::ProgramDocument {
-            session_id: "s1".into(),
-            markdown: "# Todo\n- a\n- agent added\n".into(),
-            version: 2,
-            updated_at_ms: 0,
-            template_id: None,
-        }, None);
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "# Todo\n- a\n- agent added\n".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.program.version, 2);
         assert_eq!(popup.buffer, "# Todo\n- a\n- agent added\n");
@@ -11481,17 +11595,27 @@ mod tests {
                 .await;
         }
         assert_eq!(
-            app.program_popup.as_ref().unwrap().search.as_ref().unwrap().matches,
+            app.program_popup
+                .as_ref()
+                .unwrap()
+                .search
+                .as_ref()
+                .unwrap()
+                .matches,
             vec![(0, 5)]
         );
 
-        app.on_program_state(agentd_protocol::ProgramDocument {
-            session_id: "s1".into(),
-            markdown: "zero alpha".into(),
-            version: 2,
-            updated_at_ms: 0,
-            template_id: None,
-        }, None);
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "zero alpha".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
 
         let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search remains active");
@@ -11512,13 +11636,17 @@ mod tests {
         app.handle_program_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
             .await;
 
-        app.on_program_state(agentd_protocol::ProgramDocument {
-            session_id: "s1".into(),
-            markdown: "tiny".into(),
-            version: 2,
-            updated_at_ms: 0,
-            template_id: None,
-        }, None);
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "tiny".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
 
         let popup = app.program_popup.as_ref().unwrap();
         let search = popup.search.as_ref().expect("search remains active");
@@ -11628,6 +11756,7 @@ mod tests {
                         template_id: None,
                     },
                     active_run: None,
+                    blocks: Vec::new(),
                 })
                 .unwrap(),
             ),
@@ -11703,13 +11832,17 @@ mod tests {
         app.program_popup = Some(program_popup_for_test("s1", "# Todo\n- a\n", 0));
         // The user is mid-edit (buffer diverges from the saved content).
         app.program_popup.as_mut().unwrap().buffer = "# Todo\n- a\n- human typing\n".into();
-        app.on_program_state(agentd_protocol::ProgramDocument {
-            session_id: "s1".into(),
-            markdown: "# Todo\n- a\n- agent added\n".into(),
-            version: 2,
-            updated_at_ms: 0,
-            template_id: None,
-        }, None);
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "# Todo\n- a\n- agent added\n".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
         let popup = app.program_popup.as_ref().unwrap();
         // Unsaved edits are untouched and the base version stays stale, so the
         // save path detects the conflict and merges both sides.
@@ -12158,7 +12291,10 @@ mod tests {
             SessionPickerPurpose::InsertProgramClip
         );
         // Empty `@` query: both sessions are bright.
-        assert_eq!(picker_bright(&app.session_picker_rows()), vec!["alpha", "beta"]);
+        assert_eq!(
+            picker_bright(&app.session_picker_rows()),
+            vec!["alpha", "beta"]
+        );
 
         // Typing routes into the buffer's `@<typeahead>` token — not a separate
         // dialog search line — and the dialog re-filters from it.
@@ -12176,7 +12312,10 @@ mod tests {
         }
         assert_eq!(app.program_popup.as_ref().unwrap().buffer, "@");
         assert!(app.session_picker_active(), "still open at the bare `@`");
-        assert_eq!(picker_bright(&app.session_picker_rows()), vec!["alpha", "beta"]);
+        assert_eq!(
+            picker_bright(&app.session_picker_rows()),
+            vec!["alpha", "beta"]
+        );
 
         // Backspacing over the `@` itself removes it and dismisses the picker.
         app.handle_session_picker_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
@@ -12231,7 +12370,10 @@ mod tests {
         match &rows[2] {
             ProgramSmartClipRow::Clip { candidate, dimmed } => {
                 assert_eq!(candidate.label, "beta");
-                assert!(dimmed, "query 'al' does not match beta — dimmed, not hidden");
+                assert!(
+                    dimmed,
+                    "query 'al' does not match beta — dimmed, not hidden"
+                );
             }
             other => panic!("expected beta clip, got {other:?}"),
         }
@@ -12948,7 +13090,8 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
-        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
 
         let pane = app
             .layout
@@ -12987,10 +13130,18 @@ mod tests {
             menu.item_at(item_col, item_row),
             Some(SessionTitleMenuAction::SplitHorizontal)
         );
-        app.on_mouse(click(MouseEventKind::Down(MouseButton::Left), item_col, item_row))
-            .await;
-        app.on_mouse(click(MouseEventKind::Up(MouseButton::Left), item_col, item_row))
-            .await;
+        app.on_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            item_col,
+            item_row,
+        ))
+        .await;
+        app.on_mouse(click(
+            MouseEventKind::Up(MouseButton::Left),
+            item_col,
+            item_row,
+        ))
+        .await;
 
         assert!(
             app.is_split_layout(),
@@ -13331,7 +13482,10 @@ mod tests {
             .program_popup
             .as_ref()
             .expect("program stays open after a list click");
-        assert!(!popup.closing, "list click must not start closing the program");
+        assert!(
+            !popup.closing,
+            "list click must not start closing the program"
+        );
         assert_eq!(popup.buffer, "draft");
         server.abort();
     }
@@ -13363,7 +13517,10 @@ mod tests {
             .program_popups
             .get("s1")
             .expect("the prior session's program is stashed, not closed");
-        assert!(!stashed.closing, "a list click must never close the program");
+        assert!(
+            !stashed.closing,
+            "a list click must never close the program"
+        );
         assert_eq!(stashed.buffer, "draft");
         server.abort();
     }
@@ -13397,7 +13554,8 @@ mod tests {
         // live geometry the mouse handler will see.
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
-        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
 
         let items_area = app.layout.list_items_area.expect("list items area");
         // s2 is the second session row (s1 at +0, s2 at +1). Click past the
@@ -13848,7 +14006,10 @@ mod tests {
         app.active_window_id = 1;
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT))
             .await;
-        assert_eq!(app.active_window_id, 2, "Shift+Right: top-left -> top-right");
+        assert_eq!(
+            app.active_window_id, 2,
+            "Shift+Right: top-left -> top-right"
+        );
 
         app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
             .await;
@@ -14211,7 +14372,10 @@ mod tests {
         let archive_open = rows
             .iter()
             .any(|r| matches!(r, SessionPickerRow::ArchiveHeader { expanded: true, .. }));
-        assert!(archive_open, "archive section should reveal the matching session");
+        assert!(
+            archive_open,
+            "archive section should reveal the matching session"
+        );
         assert_eq!(picker_bright(&rows), vec!["delta"]);
         server.abort();
     }
@@ -14258,7 +14422,10 @@ mod tests {
         // The `C-x b` switcher has no parent menu to return to, so Left does
         // nothing — neither closing the dialog nor moving the selection.
         app.handle_session_picker_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-        assert!(app.session_picker_active(), "Left is a no-op for the switcher");
+        assert!(
+            app.session_picker_active(),
+            "Left is a no-op for the switcher"
+        );
         assert_eq!(app.session_picker.as_ref().unwrap().selected, before);
         server.abort();
     }
@@ -14634,10 +14801,15 @@ mod tests {
             })
             .await;
         }
-        let pty = || SessionEvent::Pty { data: String::new() };
+        let pty = || SessionEvent::Pty {
+            data: String::new(),
+        };
 
         feed(&mut app, "vis", pty()).await;
-        assert!(app.notification_dirtied_view, "visible session PTY must repaint");
+        assert!(
+            app.notification_dirtied_view,
+            "visible session PTY must repaint"
+        );
 
         feed(&mut app, "bg", pty()).await;
         assert!(
@@ -15882,7 +16054,10 @@ mod tests {
             .first()
             .expect("rendered session pane")
             .inner_area;
-        assert!(inner.width > 0 && inner.height > 0, "pane has a content area");
+        assert!(
+            inner.width > 0 && inner.height > 0,
+            "pane has a content area"
+        );
 
         // Focus the list, then click in the middle of the pane's content area.
         app.focus = PaneFocus::List;
@@ -17739,7 +17914,6 @@ mod widget_action_tests {
     }
 }
 
-
 /// Translate a crossterm `KeyEvent` into the raw byte sequence a PTY would
 /// receive from a real terminal. Returns `None` for keys we don't have a
 /// canonical encoding for (e.g. function keys we don't ship a mapping for).
@@ -18220,7 +18394,9 @@ mod session_end_prompt_tests {
 
     #[test]
     fn d_or_y_or_delete_deletes() {
-        for s in ["d", "D", "  d  ", "y", "Y", "  y  ", "delete", "DELETE", " Delete "] {
+        for s in [
+            "d", "D", "  d  ", "y", "Y", "  y  ", "delete", "DELETE", " Delete ",
+        ] {
             assert_eq!(
                 parse_session_end_choice(s),
                 SessionEndChoice::Delete,
