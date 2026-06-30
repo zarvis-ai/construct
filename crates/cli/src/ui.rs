@@ -7823,7 +7823,7 @@ fn render_program_clip_hover(
     else {
         return;
     };
-    render_session_hover_card(f, app, modal, &session_id, mx, my);
+    render_session_hover_card(f, app, modal, &session_id, mx, my, None);
 }
 
 /// Lay out the floating session hover card so it reads as a landscape tile: its
@@ -7873,7 +7873,12 @@ fn session_hover_card_rect(
 /// output — anchored just below `(anchor_col, anchor_row)` (or above it when
 /// there's no room) and kept inside `modal`. Clears its own area so it overlays
 /// the program body without disturbing it. Shared by the clip-chip hover and the
-/// shimmer-text hover; always laid out wider than it is tall.
+/// shimmer-text hover; always laid out wider than it is tall. When `title` is
+/// `Some`, it captions the card's top border (truncated to fit) — the shimmer
+/// hover passes the block's status tooltip so the live preview keeps the
+/// spec-0057 label. Returns `true` when the card actually painted, `false` when
+/// there was nothing to show (unknown session, no captured output yet, or no
+/// room) so a caller can fall back to a plain text tooltip.
 fn render_session_hover_card(
     f: &mut Frame,
     app: &mut App,
@@ -7881,9 +7886,10 @@ fn render_session_hover_card(
     session_id: &str,
     anchor_col: u16,
     anchor_row: u16,
-) {
+    title: Option<&str>,
+) -> bool {
     let Some(_s) = app.sessions.iter().find(|s| s.id == session_id) else {
-        return;
+        return false;
     };
 
     let max_w = modal
@@ -7895,26 +7901,33 @@ fn render_session_hover_card(
         .get_mut(session_id)
         .map(|history| history.replay(max_w.max(1), PROGRAM_CLIP_HOVER_PREVIEW_ROWS, 0));
     let Some(out) = preview_output else {
-        return;
+        return false;
     };
     if non_empty_row_span(out.screen) == 0 {
-        return;
+        return false;
     }
 
     let content_w = max_w;
     let content_h = PROGRAM_CLIP_HOVER_PREVIEW_ROWS;
     let (width, height) = session_hover_card_size(content_w, content_h, max_w);
     let Some(area) = session_hover_card_rect(modal, width, height, anchor_col, anchor_row) else {
-        return;
+        return false;
     };
 
     f.render_widget(Clear, area);
-    f.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.accent_alt)),
-        area,
-    );
+    let mut card = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent_alt));
+    if let Some(label) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        let label = format!(" {label} ");
+        card = card.title(Span::styled(
+            truncate_to_width(&label, area.width.saturating_sub(2) as usize),
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(card, area);
     let inner = Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(1),
@@ -7932,18 +7945,23 @@ fn render_session_hover_card(
         out.screen,
         &app.theme,
     );
+    true
 }
 
 /// Session-preview popover shown while the mouse hovers *shimmering* program text
-/// — a block still running under a program Run. Resolves the session clip inside
-/// the shimmering block under the cursor and paints the shared session card with
-/// that session's live output. Unlike the clip-chip hover, it self-dismisses
-/// once the pointer has been still for [`PROGRAM_SHIMMER_HOVER_IDLE`].
+/// — a block still running under a program Run. Resolves the shimmering block
+/// under the cursor and, when that block names a session (its first
+/// `@{session:…}` clip), paints the shared session card with that session's live
+/// output — a cropped terminal view of the work in flight — captioned with the
+/// block's status tooltip (spec 0057). When the block names no session, or that
+/// session has produced no output yet, it degrades to the bare text tooltip.
+/// Unlike the clip-chip hover, it self-dismisses once the pointer has been still
+/// for [`PROGRAM_SHIMMER_HOVER_IDLE`].
 fn render_program_shimmer_hover(
     f: &mut Frame,
     app: &mut App,
     popup: &crate::app::ProgramPopup,
-    _modal: Rect,
+    modal: Rect,
     scroll_offset: usize,
     body: Rect,
     now: Instant,
@@ -7983,12 +8001,37 @@ fn render_program_shimmer_hover(
     ) else {
         return;
     };
+    // The concise status tooltip travels with the shimmer (spec 0057); own it so
+    // the immutable `app` borrow is released before the session card needs `&mut`.
     let tooltip = app
         .program_runs
         .get(&popup.program.session_id)
         .and_then(|run| run.pending_tooltips.get(&block_id))
-        .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| t.as_str());
-    render_tooltip_at(f, &app.theme, tooltip, mx, my, 2, -1);
+        .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| t.as_str())
+        .to_string();
+    // Prefer a cropped live terminal view of the session this block is working,
+    // captioned with the status tooltip. The resolver helpers mirror the same
+    // wrap/scroll math as the shimmer band, so the hovered cell maps to the same
+    // block the highlight is sweeping.
+    let line_sessions =
+        program_shimmer_line_sessions(Some(app), &popup.buffer, &shimmer.active_lines);
+    let session_id = program_shimmer_session_at(
+        Some(app),
+        &popup.buffer,
+        &line_sessions,
+        scroll_offset,
+        body,
+        mx,
+        my,
+    );
+    if let Some(session_id) = session_id {
+        if render_session_hover_card(f, app, modal, &session_id, mx, my, Some(&tooltip)) {
+            return;
+        }
+    }
+    // No session reference, or it has nothing to show yet: keep the spec-0057
+    // text tooltip as the affordance.
+    render_tooltip_at(f, &app.theme, &tooltip, mx, my, 2, -1);
 }
 
 /// For each source line of `markdown`, the session id of the shimmering block it

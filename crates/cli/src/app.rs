@@ -10497,6 +10497,98 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn program_shimmer_hover_shows_session_terminal_preview() {
+        use crate::pty_render::ItemHistory;
+
+        // A shimmering block that names a worker session (its first
+        // `@{session:…}` clip) shows that session's live terminal tail — a
+        // cropped preview of the work in flight — captioned with the block's
+        // status tooltip, instead of the bare text tooltip.
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s3 = summary_with_kind(agentd_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s2.id = "s2".into();
+        s3.id = "s3".into();
+        app.sessions = vec![s1, s2, s3];
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 2;
+        app.selection = Selection::Session("s2".into());
+
+        let markdown = "Building the PR @{session:s3}";
+        let mut inactive_program = program_popup_for_test("s1", markdown, 0);
+        inactive_program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.program_popups.insert("s1".into(), inactive_program);
+
+        // The worker session's PTY tail is what the cropped preview should paint.
+        let mut history = ItemHistory::new();
+        history.feed_pty(b"SHIMMER_TERMINAL_PREVIEW\nsecond line");
+        app.histories.insert("s3".into(), history);
+
+        let block_id = agentd_protocol::program_block_spans(markdown)
+            .into_iter()
+            .next()
+            .expect("one block")
+            .id;
+        app.program_runs.insert(
+            "s1".into(),
+            ProgramRun {
+                started_at: Instant::now(),
+                pending: HashSet::from([block_id.clone()]),
+                pending_tooltips: HashMap::from([(block_id, "Building PR".into())]),
+                deadline: Instant::now() + Duration::from_secs(60),
+                first_output_seen: true,
+            },
+        );
+
+        let backend = ratatui::backend::TestBackend::new(160, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let pane = app
+            .layout
+            .main_window_areas
+            .iter()
+            .find(|hit| hit.id == 1)
+            .expect("inactive split pane")
+            .area;
+        let inner = pane.inner(ratatui::layout::Margin {
+            horizontal: 1 + PROGRAM_CONTENT_PADDING_X,
+            vertical: 1 + PROGRAM_CONTENT_PADDING_Y,
+        });
+        // Hover the block's leading text cell — away from the trailing clip chip —
+        // so the shimmer hover (not the clip hover) owns the preview.
+        app.mouse_pos = Some((inner.x, inner.y));
+        app.last_mouse_move = Some(Instant::now());
+
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("shimmer hover preview should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("SHIMMER_TERMINAL_PREVIEW"),
+            "hovering a shimmering block that names a session should show its terminal tail"
+        );
+        assert!(
+            text.contains("Building PR"),
+            "the cropped preview should keep the status tooltip as its caption"
+        );
+        server.abort();
+    }
+
     /// Seed `app` with one selected session that owns a single sticky widget,
     /// plus a fully-revealed program popup over it. Returns the keep-alive dir
     /// and mock-daemon handle.
