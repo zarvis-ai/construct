@@ -6252,35 +6252,100 @@ fn chat_lines(theme: &Theme, events: &[TimestampedEvent]) -> Vec<Line<'static>> 
         if !lines.is_empty() && chat_event_needs_gap(previous_kind, kind) {
             lines.push(Line::raw(""));
         }
-        lines.push(format_chat_event(theme, ev));
+        push_chat_event(theme, &mut lines, ev);
         previous_kind = kind;
     }
 
     lines
 }
 
-fn append_chat_text_chunk(lines: &mut [Line<'static>], event: &SessionEvent) {
-    let Some(last) = lines.last_mut() else {
-        return;
-    };
+fn append_chat_text_chunk(lines: &mut Vec<Line<'static>>, event: &SessionEvent) {
     match event {
-        SessionEvent::Message { text, .. } => last.spans.push(Span::raw(text.clone())),
+        SessionEvent::Message { text, .. } => push_chat_text(lines, text, Style::default()),
         SessionEvent::Reasoning { text } => {
-            let style = last.spans.last().map(|span| span.style).unwrap_or_default();
-            last.spans.push(Span::styled(text.clone(), style));
+            // Continue the style of the run this delta belongs to.
+            let style = lines
+                .last()
+                .and_then(|line| line.spans.last())
+                .map(|span| span.style)
+                .unwrap_or_default();
+            push_chat_text(lines, text, style);
         }
         _ => {}
     }
 }
 
-fn format_chat_event(theme: &Theme, ev: &TimestampedEvent) -> Line<'static> {
+fn push_chat_event(theme: &Theme, lines: &mut Vec<Line<'static>>, ev: &TimestampedEvent) {
     let ts = ev.at.format("%H:%M:%S").to_string();
-    let mut spans = vec![Span::styled(
+    // Each event opens on a fresh line carrying its timestamp prefix; the body
+    // (and any newline-split continuation lines) flow from there.
+    lines.push(Line::from(Span::styled(
         format!("[{ts}] "),
         Style::default().fg(theme.dim),
-    )];
-    spans.extend(format_chat_event_body(theme, &ev.event));
-    Line::from(spans)
+    )));
+    push_chat_event_body(theme, lines, &ev.event);
+}
+
+/// Append an event's body to the trailing chat line. Prose bodies (assistant /
+/// user messages, reasoning) are split on `\n` so multi-line model output keeps
+/// its paragraph breaks; ratatui's word-wrapper treats a bare `\n` as ordinary
+/// whitespace, so without this every newline collapses onto a single wrapped
+/// line (the "jam-packed" headless transcript). All other event kinds are
+/// single-line by construction.
+fn push_chat_event_body(theme: &Theme, lines: &mut Vec<Line<'static>>, ev: &SessionEvent) {
+    match ev {
+        SessionEvent::Message { role, text } => {
+            let role_label = match role {
+                MessageRole::User => "user",
+                MessageRole::Assistant => "agent",
+                MessageRole::System => "system",
+                MessageRole::Tool => "tool",
+            };
+            push_chat_span(
+                lines,
+                Span::styled(format!("{role_label:>7}: "), role_style(theme, *role)),
+            );
+            push_chat_text(lines, text, Style::default());
+        }
+        SessionEvent::Reasoning { text } => {
+            // Model's private thinking — dim + italic so the user can tell it
+            // apart from the actual response.
+            let style = Style::default()
+                .fg(theme.dim)
+                .add_modifier(Modifier::ITALIC);
+            push_chat_span(lines, Span::styled("thinking: ".to_string(), style));
+            push_chat_text(lines, text, style);
+        }
+        other => {
+            let spans = format_chat_event_body(theme, other);
+            if let Some(last) = lines.last_mut() {
+                last.spans.extend(spans);
+            }
+        }
+    }
+}
+
+/// Append `text` to the in-progress chat lines, starting a new `Line` at each
+/// `\n`. The first segment continues the trailing line (so a role label or a
+/// prior streaming delta stays on the same row); width-wrapping is still left
+/// to the `Paragraph` widget — this only restores the hard newlines it would
+/// otherwise swallow.
+fn push_chat_text(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+    let mut segments = text.split('\n');
+    if let Some(first) = segments.next() {
+        push_chat_span(lines, Span::styled(first.to_string(), style));
+    }
+    for seg in segments {
+        lines.push(Line::from(Span::styled(seg.to_string(), style)));
+    }
+}
+
+fn push_chat_span(lines: &mut Vec<Line<'static>>, span: Span<'static>) {
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(span);
+    } else {
+        lines.push(Line::from(span));
+    }
 }
 
 fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>> {
@@ -11409,6 +11474,70 @@ mod tests {
         let lines = chat_lines(&Theme::default(), &events);
         assert_eq!(lines.len(), 1);
         assert!(line_text(&lines[0]).contains("thinking: thinking"));
+    }
+
+    #[test]
+    fn chat_mode_splits_multiline_assistant_message() {
+        // A headless / non-PTY session renders its conversation through the
+        // structured-event chat view. Multi-line model output must keep its
+        // newlines: ratatui's word-wrapper treats a bare `\n` as whitespace,
+        // so a message crammed into one `Line` collapses onto a single wrapped
+        // row (the reported "jam-packed" transcript). Each newline must open a
+        // fresh `Line`.
+        let at = chrono::Utc::now();
+        let events = vec![TimestampedEvent {
+            seq: 1,
+            at,
+            event: SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: "first line\nsecond line\n\nfourth line".into(),
+            },
+        }];
+        let lines = chat_lines(&Theme::default(), &events);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(lines.len(), 4, "expected 4 visual lines, got {rendered:?}");
+        assert!(
+            rendered[0].contains("agent: first line"),
+            "{rendered:?}"
+        );
+        assert_eq!(rendered[1], "second line");
+        assert_eq!(rendered[2], "");
+        assert_eq!(rendered[3], "fourth line");
+        // No rendered line may still carry an embedded newline.
+        for line in &rendered {
+            assert!(!line.contains('\n'), "line kept a raw newline: {line:?}");
+        }
+    }
+
+    #[test]
+    fn chat_mode_splits_newline_inside_streaming_delta() {
+        // Streaming deltas are folded onto the in-progress block; a newline
+        // arriving mid-stream must still break to a new line rather than run
+        // the next paragraph into the previous one.
+        let at = chrono::Utc::now();
+        let events = vec![
+            TimestampedEvent {
+                seq: 1,
+                at,
+                event: SessionEvent::Message {
+                    role: MessageRole::Assistant,
+                    text: "intro ".into(),
+                },
+            },
+            TimestampedEvent {
+                seq: 2,
+                at,
+                event: SessionEvent::Message {
+                    role: MessageRole::Assistant,
+                    text: "tail\nnext para".into(),
+                },
+            },
+        ];
+        let lines = chat_lines(&Theme::default(), &events);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(lines.len(), 2, "{rendered:?}");
+        assert!(rendered[0].contains("agent: intro tail"), "{rendered:?}");
+        assert_eq!(rendered[1], "next para");
     }
 
     #[test]
