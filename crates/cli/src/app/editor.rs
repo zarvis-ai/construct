@@ -736,6 +736,16 @@ impl App {
             return;
         };
         match row {
+            // The session category opens the richer session-picker dialog
+            // (spec 0063) instead of the inline submenu — it adds archive
+            // groups and query-driven auto-expand. The program's smart-clip
+            // search stays live so confirming can replace the `@…` token.
+            ProgramSmartClipRow::Category {
+                group: ProgramSmartClipGroup::Session,
+                ..
+            } => {
+                self.open_session_picker_for_program_clip();
+            }
             ProgramSmartClipRow::Category { group, .. } => {
                 self.enter_program_smart_clip_submenu(group);
             }
@@ -757,8 +767,13 @@ impl App {
                 _ => None,
             }
         });
-        if let Some(group) = group {
-            self.enter_program_smart_clip_submenu(group);
+        match group {
+            // Mirror `accept`: the session category drills into the dialog.
+            Some(ProgramSmartClipGroup::Session) => {
+                self.open_session_picker_for_program_clip();
+            }
+            Some(group) => self.enter_program_smart_clip_submenu(group),
+            None => {}
         }
     }
 
@@ -800,7 +815,10 @@ impl App {
         }
     }
 
-    fn insert_program_smart_clip_candidate(&mut self, candidate: &ProgramSmartClipCandidate) {
+    pub(super) fn insert_program_smart_clip_candidate(
+        &mut self,
+        candidate: &ProgramSmartClipCandidate,
+    ) {
         let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
@@ -1034,7 +1052,9 @@ impl App {
             .collect()
     }
 
-    fn session_smart_clip_candidate(session: &SessionSummary) -> ProgramSmartClipCandidate {
+    pub(super) fn session_smart_clip_candidate(
+        session: &SessionSummary,
+    ) -> ProgramSmartClipCandidate {
         let title = session
             .title
             .clone()

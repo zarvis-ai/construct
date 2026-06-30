@@ -36,6 +36,7 @@ A flat, truncated list forced a single ordering to serve two jobs at once — "s
 - New clip types become new category rows (and submenus) and join the relevance pool; they should not be bolted on as a third flat section.
 - The relevance section can legitimately repeat an item that also appears under its category — that redundancy is accepted in exchange for a fast top-of-menu path.
 - Ranking is heuristic, not stable across query edits; selection is clamped, not preserved by identity, as the query changes.
+- In the **TUI**, activating the `session` category opens the reusable session-picker dialog (see `0063-session-picker-dialog`) instead of the inline session submenu; that dialog additionally surfaces archived sessions and auto-expands matching groups. The inserted clip and the relevance section are unchanged, so the lockstep requirement above still binds the clip result, ordering, and dimming — it does not require the web UI to mirror the dialog's modal presentation. The web UI keeps the inline session submenu.
 
 ## Non-Goals
 

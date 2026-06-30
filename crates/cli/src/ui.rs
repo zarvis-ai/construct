@@ -275,6 +275,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn finish_frame(f: &mut Frame, app: &mut App) {
+    // The session-picker dialog is the topmost modal — drawn last so it sits
+    // over every base view (including zoomed layouts, which return through
+    // here) and before `capture_frame_text` so it lands in the frame snapshot.
+    render_session_picker(f, app);
     capture_frame_text(f, app);
     render_hovered_url(f, app);
     render_text_selection(f, app);
@@ -5921,7 +5925,10 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         let mut spans = vec![Span::raw(mb.prompt.clone()), Span::raw(mb.input.clone())];
         if let Some(err) = &mb.error {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(err.clone(), minibuffer_hint_style(app, mb)));
+            spans.push(Span::styled(
+                err.clone(),
+                Style::default().fg(app.theme.danger),
+            ));
         }
         let para = Paragraph::new(Line::from(spans));
         f.render_widget(para, area);
@@ -6008,13 +6015,6 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
-fn minibuffer_hint_style(app: &App, mb: &Minibuffer) -> Style {
-    if matches!(mb.intent, MinibufferIntent::SwitchSession) {
-        Style::default().fg(app.theme.muted)
-    } else {
-        Style::default().fg(app.theme.danger)
-    }
-}
 
 fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
     // Target a comfortable reading width — long enough to keep each
@@ -6089,7 +6089,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   session actions
     C-x C-f         new session
-    C-x b           switch focused window to an existing session
+    C-x b           switch session (picker dialog: type to filter, ↑↓ move)
     C-x i           send input to selected session
     C-x k           delete selected session (confirms; kills if running)
     C-x Space       open selected session's program
@@ -8537,6 +8537,11 @@ fn render_program_smart_clip_picker(
     let Some(search) = popup.smart_clip.as_ref() else {
         return;
     };
+    // When the session-picker dialog is open over the `@`→session path, it
+    // owns the screen; don't also paint the inline picker behind it.
+    if app.session_picker.is_some() {
+        return;
+    }
     if program_area.width == 0 || program_area.height < 3 {
         return;
     }
@@ -8700,6 +8705,230 @@ fn render_program_smart_clip_row(
                 spans.push(Span::styled(candidate.detail.clone(), detail_style));
             }
             Line::from(spans)
+        }
+    }
+}
+
+/// The reusable session-picker dialog (spec 0063): a centered modal listing
+/// every session grouped like the list view, with a typeahead search that dims
+/// non-matches and auto-expands the groups that contain one. Drawn topmost.
+fn render_session_picker(f: &mut Frame, app: &mut App) {
+    let Some(dialog) = app.session_picker.as_ref() else {
+        return;
+    };
+    let title = dialog.title().to_string();
+    let query = dialog.query.clone();
+    let selected = dialog.selected;
+    let rows = app.session_picker_rows();
+
+    let area = f.area();
+    if area.width < 28 || area.height < 8 {
+        return;
+    }
+
+    // Centered modal: ~⅗ of the width (clamped) and ~⅔ of the height.
+    let width = (area.width * 3 / 5)
+        .clamp(40, 76)
+        .min(area.width.saturating_sub(4));
+    let max_height = (area.height * 2 / 3).max(8).min(area.height.saturating_sub(2));
+    // inner rows = search (1) + separator (1) + body + footer (1); borders add 2.
+    let fixed = 5u16; // 2 borders + search + separator + footer
+    let body_avail = max_height.saturating_sub(fixed).max(1);
+    let body_rows = (rows.len() as u16).min(body_avail).max(1);
+    let height = (body_rows + fixed).min(max_height).max(fixed + 1);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    // Raw indices of the selectable (visible, non-dimmed) session rows, and the
+    // raw index currently highlighted.
+    let selectable_raw: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.is_selectable())
+        .map(|(i, _)| i)
+        .collect();
+    let sel_raw = if selectable_raw.is_empty() {
+        None
+    } else {
+        Some(selectable_raw[selected.min(selectable_raw.len() - 1)])
+    };
+
+    // Clamp the persisted scroll so the highlighted row stays on screen.
+    let visible = body_rows as usize;
+    let total = rows.len();
+    let mut scroll = app.session_picker.as_ref().map(|d| d.scroll).unwrap_or(0);
+    if let Some(sr) = sel_raw {
+        if sr < scroll {
+            scroll = sr;
+        } else if sr >= scroll + visible {
+            scroll = sr + 1 - visible;
+        }
+    }
+    scroll = scroll.min(total.saturating_sub(visible));
+    if let Some(d) = app.session_picker.as_mut() {
+        d.scroll = scroll;
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent_alt))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(app.theme.accent_alt)
+                .add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(rect);
+    f.render_widget(Clear, rect);
+    f.render_widget(block, rect);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let (search_area, sep_area, body_area, footer_area) =
+        (chunks[0], chunks[1], chunks[2], chunks[3]);
+
+    // Search line with a block caret.
+    let search_line = Line::from(vec![
+        Span::styled("Search: ", Style::default().fg(app.theme.muted)),
+        Span::styled(query.clone(), Style::default().fg(app.theme.text)),
+        Span::styled("▏", Style::default().fg(app.theme.accent)),
+    ]);
+    f.render_widget(Paragraph::new(search_line), search_area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(sep_area.width as usize),
+            Style::default().fg(app.theme.border),
+        ))),
+        sep_area,
+    );
+
+    // Body rows (scrolled).
+    let inner_w = body_area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    if rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no sessions",
+            Style::default().fg(app.theme.dim),
+        )));
+    } else {
+        for (raw_idx, row) in rows.iter().enumerate().skip(scroll).take(visible) {
+            let row_selected = sel_raw == Some(raw_idx);
+            lines.push(render_session_picker_row(app, row, row_selected, inner_w));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), body_area);
+
+    // Footer hint, with a match tally while searching.
+    let footer = if query.trim().is_empty() {
+        "↑↓ / C-n C-p move · Enter switch · Esc cancel".to_string()
+    } else {
+        format!(
+            "{} match{} · ↑↓ move · Enter select · Esc cancel",
+            selectable_raw.len(),
+            if selectable_raw.len() == 1 { "" } else { "es" },
+        )
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(app.theme.dim),
+        ))),
+        footer_area,
+    );
+}
+
+/// One row of the session-picker dialog: a project header, an "N archived"
+/// disclosure, or a session (highlighted when selected, dimmed when it fails
+/// the query).
+fn render_session_picker_row(
+    app: &App,
+    row: &crate::app::SessionPickerRow,
+    selected: bool,
+    width: usize,
+) -> Line<'static> {
+    use crate::app::SessionPickerRow;
+    match row {
+        SessionPickerRow::GroupHeader {
+            name,
+            expanded,
+            matches,
+        } => {
+            let glyph = if *expanded { "▾" } else { "▸" };
+            // A collapsed header means the group held no match — show it muted.
+            let style = if *expanded {
+                Style::default()
+                    .fg(app.theme.group)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            let count = if *matches > 0 {
+                format!("  ({matches})")
+            } else {
+                String::new()
+            };
+            Line::from(Span::styled(format!("{glyph} {name}{count}"), style))
+        }
+        SessionPickerRow::ArchiveHeader {
+            count,
+            expanded,
+            indented,
+        } => {
+            let indent = if *indented { "  " } else { "" };
+            let glyph = if *expanded { "▾" } else { "▸" };
+            Line::from(Span::styled(
+                format!("{indent}{glyph} {count} archived"),
+                Style::default().fg(app.theme.muted),
+            ))
+        }
+        SessionPickerRow::Session {
+            summary,
+            indented,
+            dimmed,
+        } => {
+            let indent = if *indented { "  " } else { "" };
+            let glyph = session_status_glyph(app, summary);
+            let label = primary_label(summary);
+            let harness = harness_label(summary);
+            let (text_style, harness_style) = if selected {
+                let s = Style::default()
+                    .fg(app.theme.highlight_fg)
+                    .bg(app.theme.highlight_bg)
+                    .add_modifier(Modifier::BOLD);
+                (s, s)
+            } else if *dimmed {
+                let s = Style::default().fg(app.theme.dim);
+                (s, s)
+            } else {
+                (
+                    Style::default().fg(app.theme.text),
+                    Style::default().fg(app.theme.muted),
+                )
+            };
+            let prefix = if selected { ">" } else { " " };
+            let left = format!("{prefix} {indent}{glyph} {label}");
+            let pad = width
+                .saturating_sub(left.chars().count() + harness.chars().count() + 1)
+                .max(1);
+            Line::from(vec![
+                Span::styled(left, text_style),
+                Span::styled(" ".repeat(pad), text_style),
+                Span::styled(harness, harness_style),
+            ])
         }
     }
 }

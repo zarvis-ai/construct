@@ -15,15 +15,6 @@ impl App {
         // Fork shares the new-session harness picker (completion + Enter
         // validation), but offers only real harnesses — no `project`/`group`.
         let is_harness_picker = is_new_harness || is_fork_harness;
-        let is_switch_session = matches!(
-            self.minibuffer.as_ref().map(|m| &m.intent),
-            Some(MinibufferIntent::SwitchSession)
-        );
-        let switch_sessions: Vec<SessionSummary> = if is_switch_session {
-            self.user_sessions().into_iter().cloned().collect()
-        } else {
-            Vec::new()
-        };
         let available_harnesses: Vec<String> = if is_new_harness {
             let mut v: Vec<String> = self
                 .harnesses
@@ -153,16 +144,6 @@ impl App {
             KeyCode::Tab => {
                 if is_harness_picker {
                     apply_harness_completion(mb, &available_harnesses);
-                } else if matches!(mb.intent, MinibufferIntent::SwitchSession) {
-                    let input = mb.input.clone();
-                    let matches = match_switch_sessions_from(&switch_sessions, &input);
-                    if let Some(s) = matches.first() {
-                        mb.input = session_switch_label(s);
-                        mb.cursor = mb.input.chars().count();
-                        mb.error = Some(switch_session_hint_from(&switch_sessions, &mb.input));
-                    } else {
-                        mb.error = Some(format!("no match for {input}"));
-                    }
                 }
                 return;
             }
@@ -235,9 +216,6 @@ impl App {
             // the input.
             KeyCode::Char(c) if !ctrl && !alt => {
                 insert_minibuffer_text(mb, &c.to_string());
-                if matches!(mb.intent, MinibufferIntent::SwitchSession) {
-                    mb.error = Some(switch_session_hint_from(&switch_sessions, &mb.input));
-                }
             }
             _ => {}
         }
@@ -253,19 +231,6 @@ impl App {
                     Ok(()) => self.set_status("input sent".to_string()),
                     Err(e) => self.set_status(format!("send failed: {e}")),
                 }
-            }
-            MinibufferIntent::SwitchSession => {
-                let matches = self.match_switch_sessions(&input);
-                let Some(session) = matches.first() else {
-                    self.set_status(format!("no session matches {}", input.trim()));
-                    return;
-                };
-                let session_id = session.id.clone();
-                let label = session_switch_label(session);
-                self.select_session(session_id);
-                self.sync_active_window_selection();
-                self.focus = PaneFocus::View;
-                self.set_status(format!("window → {label}"));
             }
             MinibufferIntent::NewSessionHarness => {
                 let harness = input.trim().to_string();
@@ -613,30 +578,6 @@ impl App {
     /// keybind (`M-x` / `C-x x` / click on the prompt). Prefers the
     /// orchestrator panel when an orchestrator session is available;
     /// falls back to the static command palette.
-    fn match_switch_sessions(&self, query: &str) -> Vec<&SessionSummary> {
-        let sessions = self.user_sessions();
-        match_switch_sessions_refs(sessions, query)
-    }
-
-    fn switch_session_hint(&self, query: &str) -> String {
-        let sessions: Vec<SessionSummary> = self.user_sessions().into_iter().cloned().collect();
-        switch_session_hint_from(&sessions, query)
-    }
-
-    pub fn open_minibuffer_for_switch_session(&mut self) {
-        if self.user_sessions().is_empty() {
-            self.set_status("no sessions".to_string());
-            return;
-        }
-        self.minibuffer = Some(Minibuffer {
-            prompt: "Switch session: ".to_string(),
-            input: String::new(),
-            cursor: 0,
-            intent: MinibufferIntent::SwitchSession,
-            error: Some(self.switch_session_hint("")),
-        });
-    }
-
     pub fn open_minibuffer_for_command(&mut self) {
         if self.orchestrator_id.is_some() {
             self.orchestrator_scrollback = 0;

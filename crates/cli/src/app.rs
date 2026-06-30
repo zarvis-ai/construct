@@ -36,6 +36,8 @@ mod dynamic_ui;
 mod program_popup;
 mod editor;
 mod mouse;
+mod session_picker;
+pub use session_picker::{SessionPickerDialog, SessionPickerPurpose, SessionPickerRow};
 
 pub const TERMINAL_SCROLLBAR_TTL: Duration = Duration::from_millis(1200);
 pub(crate) const DYNAMIC_UI_AUTOHIDE_SECS: u64 = 15;
@@ -516,7 +518,6 @@ pub enum MinibufferIntent {
     RestartConfirm {
         session_id: String,
     },
-    SwitchSession,
     Rename {
         session_id: String,
     },
@@ -967,6 +968,10 @@ pub struct App {
     /// /tasks popup state: `None` = closed, `Some(...)` = open with
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
+    /// Reusable session-picker dialog (spec 0063): `None` = closed. Opened by
+    /// `C-x b` (switch the active window's session) and by the program view's
+    /// `@`→session path (insert a session clip). Captures all input while open.
+    pub session_picker: Option<SessionPickerDialog>,
     /// Selected session's program, rendered in an in-TUI modal.
     pub program_popup: Option<ProgramPopup>,
     /// Open program popups for sessions that are not currently selected.
@@ -2276,6 +2281,7 @@ async fn run_with_socket_initial_selection(
         matrix_reveal_hits: Vec::new(),
         orchestrator_desired_size: None,
         tasks_popup: None,
+        session_picker: None,
         program_popup: None,
         program_popups: HashMap::new(),
         program_view_memory: HashMap::new(),
@@ -6277,6 +6283,14 @@ impl App {
             }
             return;
         }
+        // The session-picker dialog is the topmost modal: while open it owns
+        // every keystroke. This must sit above the program-popup gate below so
+        // that a dialog opened from the program view's `@`→session path
+        // captures input instead of leaking it into the program buffer.
+        if self.session_picker_active() {
+            self.handle_session_picker_key(key);
+            return;
+        }
         if self.tasks_popup.is_some() {
             if matches!(key.code, KeyCode::Esc) {
                 self.tasks_popup = None;
@@ -6778,7 +6792,7 @@ impl App {
                 self.open_minibuffer_for_command();
             }
             OpenSwitchSession => {
-                self.open_minibuffer_for_switch_session();
+                self.open_session_picker(SessionPickerPurpose::Switch);
             }
             FocusView => {
                 // Enter on an "N archived" disclosure row expands/collapses it
@@ -7619,43 +7633,6 @@ fn switch_session_match_score(s: &SessionSummary, query: &str) -> Option<i32> {
     } else {
         None
     }
-}
-
-fn match_switch_sessions_from<'a>(
-    sessions: &'a [SessionSummary],
-    query: &str,
-) -> Vec<&'a SessionSummary> {
-    let mut scored: Vec<(i32, chrono::DateTime<chrono::Utc>, &SessionSummary)> = sessions
-        .iter()
-        .filter_map(|s| switch_session_match_score(s, query).map(|score| (score, s.created_at, s)))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    scored.into_iter().map(|(_, _, s)| s).collect()
-}
-
-fn match_switch_sessions_refs<'a>(
-    sessions: Vec<&'a SessionSummary>,
-    query: &str,
-) -> Vec<&'a SessionSummary> {
-    let mut scored: Vec<(i32, chrono::DateTime<chrono::Utc>, &SessionSummary)> = sessions
-        .into_iter()
-        .filter_map(|s| switch_session_match_score(s, query).map(|score| (score, s.created_at, s)))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    scored.into_iter().map(|(_, _, s)| s).collect()
-}
-
-fn switch_session_hint_from(sessions: &[SessionSummary], query: &str) -> String {
-    let matches = match_switch_sessions_from(sessions, query);
-    if matches.is_empty() {
-        return "no matches".to_string();
-    }
-    let labels: Vec<String> = matches
-        .into_iter()
-        .take(5)
-        .map(session_switch_label)
-        .collect();
-    format!("matches: {}", labels.join(", "))
 }
 
 fn normalized_points(a: ScreenPoint, b: ScreenPoint) -> (ScreenPoint, ScreenPoint) {
@@ -8827,6 +8804,7 @@ mod tests {
             resizing_main_window: None,
             list_collapsed: false,
             tasks_popup: None,
+            session_picker: None,
             program_popup: None,
             program_popups: HashMap::new(),
             program_view_memory: HashMap::new(),
@@ -11948,7 +11926,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_smart_clip_category_expands_into_session_submenu() {
+    async fn program_smart_clip_session_category_opens_picker_dialog() {
         let (mut app, _dir, server) = empty_app().await;
         let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
         alpha.id = "a".into();
@@ -11972,22 +11950,32 @@ mod tests {
             .selected = 2;
         app.accept_program_smart_clip();
 
+        // The session category now opens the richer picker dialog (spec 0063)
+        // rather than the inline submenu. The underlying `@` smart-clip search
+        // stays live so confirming can replace the `@` token, and the buffer is
+        // untouched until then.
+        assert!(app.session_picker_active());
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().purpose,
+            SessionPickerPurpose::InsertProgramClip
+        );
+        assert!(app.program_popup.as_ref().unwrap().smart_clip.is_some());
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "@");
+
+        // Confirming the highlighted session (alpha) replaces the `@` token with
+        // its clip and dismisses both the dialog and the smart-clip search.
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.session_picker.is_none());
         let popup = app.program_popup.as_ref().unwrap();
-        assert!(matches!(
-            popup.smart_clip.as_ref().unwrap().view,
-            ProgramSmartClipView::Submenu(ProgramSmartClipGroup::Session)
-        ));
-        // Buffer is untouched — expanding a category inserts nothing.
-        assert_eq!(popup.buffer, "@");
-        let rows = app.program_smart_clip_rows(popup);
-        let clips: Vec<&str> = rows
-            .iter()
-            .filter_map(|r| match r {
-                ProgramSmartClipRow::Clip { candidate, .. } => Some(candidate.label.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(clips, vec!["alpha", "beta"]);
+        assert!(
+            popup.buffer.starts_with("@{session:a"),
+            "inserted alpha's clip, got {:?}",
+            popup.buffer
+        );
+        assert!(
+            popup.smart_clip.is_none(),
+            "smart-clip search closes once the clip is inserted"
+        );
         server.abort();
     }
 
@@ -13804,6 +13792,11 @@ mod tests {
 
     #[test]
     fn switch_session_matches_title_id_harness_and_fuzzy() {
+        // `switch_session_match_score` is the shared match notion that drives
+        // both the old switcher and the session-picker dialog's dimming: a
+        // `Some` score means "matches" (rendered bright / selectable), `None`
+        // means "no match" (dimmed). Covers title, id, harness, and a loose
+        // fuzzy subsequence — and confirms non-matches return `None`.
         let mut shell = summary_with_kind(agentd_protocol::SessionKind::User);
         shell.id = "shell-session-abcdef".into();
         shell.harness = "shell".into();
@@ -13812,24 +13805,203 @@ mod tests {
         codex.id = "codex-session-abcdef".into();
         codex.harness = "codex".into();
         codex.title = Some("Review PR".into());
-        let sessions = vec![shell, codex];
 
-        assert_eq!(
-            match_switch_sessions_from(&sessions, "Build")[0].id,
-            "shell-session-abcdef"
-        );
-        assert_eq!(
-            match_switch_sessions_from(&sessions, "codex-session")[0].id,
-            "codex-session-abcdef"
-        );
-        assert_eq!(
-            match_switch_sessions_from(&sessions, "codex")[0].id,
-            "codex-session-abcdef"
-        );
-        assert_eq!(
-            match_switch_sessions_from(&sessions, "rvpr")[0].id,
-            "codex-session-abcdef"
-        );
+        // Title substring.
+        assert!(switch_session_match_score(&shell, "Build").is_some());
+        assert!(switch_session_match_score(&codex, "Build").is_none());
+        // Id substring.
+        assert!(switch_session_match_score(&codex, "codex-session").is_some());
+        assert!(switch_session_match_score(&shell, "codex-session").is_none());
+        // Harness name.
+        assert!(switch_session_match_score(&codex, "codex").is_some());
+        assert!(switch_session_match_score(&shell, "codex").is_none());
+        // Fuzzy subsequence over "Review PR".
+        assert!(switch_session_match_score(&codex, "rvpr").is_some());
+        assert!(switch_session_match_score(&shell, "rvpr").is_none());
+        // An empty query matches everything (nothing is dimmed).
+        assert!(switch_session_match_score(&shell, "").is_some());
+        assert!(switch_session_match_score(&codex, "").is_some());
+    }
+
+    /// Fixture for the session-picker dialog: two ungrouped sessions (`alpha`,
+    /// `beta`), a project `Proj` holding an active `gamma` and an archived
+    /// `delta`.
+    async fn session_picker_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+        let (mut app, dir, server) = empty_app().await;
+        let mk = |id: &str, title: &str, harness: &str, pos: i64| {
+            let mut s = summary_with_kind(agentd_protocol::SessionKind::User);
+            s.id = id.into();
+            s.title = Some(title.into());
+            s.harness = harness.into();
+            s.position = pos;
+            s
+        };
+        let mut alpha = mk("s1", "alpha", "shell", 0);
+        let mut beta = mk("s2", "beta", "codex", 1);
+        let mut gamma = mk("s3", "gamma", "shell", 0);
+        gamma.group_id = Some("g1".into());
+        let mut delta = mk("s4", "delta", "shell", 1);
+        delta.group_id = Some("g1".into());
+        delta.archived = true;
+        alpha.group_id = None;
+        beta.group_id = None;
+        app.sessions = vec![alpha, beta, gamma, delta];
+        app.groups = vec![GroupSummary {
+            id: "g1".into(),
+            name: "Proj".into(),
+            created_at: chrono::Utc::now(),
+            position: 0,
+            collapsed: false,
+        }];
+        (app, dir, server)
+    }
+
+    /// Titles of the non-dimmed (selectable) session rows, top to bottom.
+    fn picker_bright(rows: &[SessionPickerRow]) -> Vec<String> {
+        rows.iter()
+            .filter_map(|r| match r {
+                SessionPickerRow::Session {
+                    summary,
+                    dimmed: false,
+                    ..
+                } => summary.title.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn picker_group(rows: &[SessionPickerRow], name: &str) -> Option<bool> {
+        rows.iter().find_map(|r| match r {
+            SessionPickerRow::GroupHeader {
+                name: n, expanded, ..
+            } if n == name => Some(*expanded),
+            _ => None,
+        })
+    }
+
+    fn picker_type(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.handle_session_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+    }
+
+    #[tokio::test]
+    async fn session_picker_empty_query_lists_active_and_hides_archived() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        assert!(app.session_picker_active());
+        let rows = app.session_picker_rows();
+        // Ungrouped actives + group's active member are bright; archived delta
+        // stays hidden behind a collapsed "1 archived" row.
+        assert_eq!(picker_bright(&rows), vec!["alpha", "beta", "gamma"]);
+        assert_eq!(picker_group(&rows, "Proj"), Some(true));
+        let archive_open = rows
+            .iter()
+            .any(|r| matches!(r, SessionPickerRow::ArchiveHeader { expanded: true, .. }));
+        assert!(!archive_open, "archive section should start collapsed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_query_dims_nonmatches_and_collapses_empty_groups() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        picker_type(&mut app, "alpha");
+        let rows = app.session_picker_rows();
+        // Only `alpha` matches; `beta` is dimmed (still present), and `Proj`
+        // collapses because none of its sessions match.
+        assert_eq!(picker_bright(&rows), vec!["alpha"]);
+        assert_eq!(picker_group(&rows, "Proj"), Some(false));
+        let beta_dimmed = rows.iter().any(|r| matches!(
+            r,
+            SessionPickerRow::Session { summary, dimmed: true, .. } if summary.title.as_deref() == Some("beta")
+        ));
+        assert!(beta_dimmed, "non-matching beta stays visible but dimmed");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_query_autoexpands_group_with_match() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        picker_type(&mut app, "gamma");
+        let rows = app.session_picker_rows();
+        assert_eq!(picker_group(&rows, "Proj"), Some(true));
+        assert_eq!(picker_bright(&rows), vec!["gamma"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_query_reveals_matching_archived_session() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        picker_type(&mut app, "delta");
+        let rows = app.session_picker_rows();
+        // The group opens (its archived member matches) and the archive section
+        // expands to surface `delta`.
+        assert_eq!(picker_group(&rows, "Proj"), Some(true));
+        let archive_open = rows
+            .iter()
+            .any(|r| matches!(r, SessionPickerRow::ArchiveHeader { expanded: true, .. }));
+        assert!(archive_open, "archive section should reveal the matching session");
+        assert_eq!(picker_bright(&rows), vec!["delta"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_navigation_wraps_and_confirms() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        // Three selectable rows: alpha(0), beta(1), gamma(2). Down twice lands
+        // on gamma; once more wraps to alpha.
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, 2);
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, 0);
+        // C-p wraps backwards to the last match.
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, 2);
+        // Back to beta and confirm: switches focus to s2.
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_picker.as_ref().unwrap().selected, 1);
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.session_picker.is_none(), "confirm closes the dialog");
+        assert_eq!(app.selection.session_id(), Some("s2"));
+        assert_eq!(app.focus, PaneFocus::View);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_escape_cancels() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.session_picker_active());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_open_with_no_sessions_is_noop() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        assert!(!app.session_picker_active());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_renders_title_and_sessions() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("session picker should render");
+        let text = app.frame_text.join("\n");
+        assert!(text.contains("switch session"), "dialog title is shown");
+        assert!(text.contains("alpha"), "sessions are listed");
+        assert!(text.contains("Proj"), "project headers are shown");
+        server.abort();
     }
 
     #[tokio::test]
