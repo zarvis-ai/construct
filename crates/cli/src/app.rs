@@ -1592,6 +1592,35 @@ pub(crate) fn program_blocks(markdown: &str) -> Vec<ProgramBlock> {
         .collect()
 }
 
+/// Session ids referenced by `@{session:…}` smart clips anywhere in `markdown`,
+/// in first-seen order and deduplicated. Used to keep the referenced worker
+/// sessions' PTY history warm so the program hover preview (spec 0060) can paint
+/// a live terminal tail the instant the pointer lands. `@{harness:…}` and other
+/// clip kinds are ignored — only sessions have a terminal to preview.
+pub(crate) fn program_referenced_session_ids(markdown: &str) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut rest = markdown;
+    // `@`, `{`, `}` are ASCII so byte-`find` lands on char boundaries.
+    while let Some(open) = rest.find("@{") {
+        let after = &rest[open + 2..];
+        let Some(close) = after.find('}') else {
+            break;
+        };
+        let body = &after[..close];
+        // Body looks like `session:abc` or `session:abc clip_id=3`; the kind/id
+        // pair is the first whitespace-delimited token (mirrors the clip target
+        // parse used for rendering).
+        let token = body.split_whitespace().next().unwrap_or(body);
+        if let Some(("session", id)) = token.split_once(':') {
+            if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+                ids.push(id.to_string());
+            }
+        }
+        rest = &after[close + 1..];
+    }
+    ids
+}
+
 /// Stable block ids of the blocks contained in `body` — the set of blocks that
 /// a Run over `body` should shimmer. For a full-program run `body` is the whole
 /// document; for a selection run it is the selected text.
@@ -2627,6 +2656,7 @@ async fn run_loop(
                 .into_iter()
                 .chain(app.pinned_sessions_needing_hydration())
                 .chain(app.orchestrator_session_needing_hydration())
+                .chain(app.program_referenced_sessions_needing_hydration())
             {
                 if selected_hydrating.contains(&id)
                     || pinned_hydration_session.as_deref() == Some(id.as_str())
@@ -3493,6 +3523,59 @@ impl App {
             .any(|s| s.id == *id && s.has_pty && !self.histories.contains_key(&s.id));
         let needs_ui_panels = !self.ui_panels.contains_key(id);
         (needs_history || needs_ui_panels).then(|| id.clone())
+    }
+
+    /// Worker sessions referenced by a `@{session:…}` smart clip in a program
+    /// that is currently on screen — a program restored in a main-window leaf,
+    /// or the active program popup. Their PTY history must be warm so the
+    /// program hover preview (spec 0060) — both the shimmer-text card and the
+    /// clip-chip card — can paint a cropped live terminal tail the instant the
+    /// pointer lands. These workers are usually neither selected, pinned, nor
+    /// the orchestrator, so without this nothing else hydrates them and the
+    /// preview silently degrades to the bare text tooltip.
+    fn program_referenced_sessions_needing_hydration(&self) -> Vec<String> {
+        fn collect_leaf_sessions(node: &MainWindowTree, out: &mut Vec<String>) {
+            match node {
+                MainWindowTree::Leaf { selection, .. } => {
+                    if let Some(id) = selection.session_id() {
+                        if !out.iter().any(|existing| existing == id) {
+                            out.push(id.to_string());
+                        }
+                    }
+                }
+                MainWindowTree::Split { first, second, .. } => {
+                    collect_leaf_sessions(first, out);
+                    collect_leaf_sessions(second, out);
+                }
+            }
+        }
+        let mut visible_program_owners = Vec::new();
+        collect_leaf_sessions(&self.main_windows, &mut visible_program_owners);
+
+        let mut referenced: Vec<String> = Vec::new();
+        let add_refs = |markdown: &str, referenced: &mut Vec<String>| {
+            for id in program_referenced_session_ids(markdown) {
+                if !referenced.iter().any(|existing| existing == &id) {
+                    referenced.push(id);
+                }
+            }
+        };
+        for owner in &visible_program_owners {
+            if let Some(popup) = self.program_popups.get(owner) {
+                add_refs(&popup.buffer, &mut referenced);
+            }
+        }
+        if let Some(popup) = self.program_popup.as_ref() {
+            add_refs(&popup.buffer, &mut referenced);
+        }
+
+        referenced
+            .into_iter()
+            .filter(|id| {
+                self.sessions.iter().any(|s| &s.id == id && s.has_pty)
+                    && !self.histories.contains_key(id)
+            })
+            .collect()
     }
 
     async fn apply_session_hydration(&mut self, hydration: SessionHydration) {
@@ -12673,6 +12756,67 @@ mod tests {
             .insert("s1".into(), crate::pty_render::ItemHistory::new());
 
         assert_eq!(app.main_window_sessions_needing_hydration(), vec!["s2"]);
+        server.abort();
+    }
+
+    #[test]
+    fn program_referenced_session_ids_extracts_session_clips_only() {
+        // Session clips are collected (deduped, in order); harness clips and
+        // other kinds are ignored, and a `clip_id=` suffix does not split the id.
+        let md = "Build @{session:s3} then @{harness:codex} and @{session:s3 clip_id=4} \
+                  finally @{session:s7}";
+        assert_eq!(
+            program_referenced_session_ids(md),
+            vec!["s3".to_string(), "s7".to_string()]
+        );
+        assert!(program_referenced_session_ids("no clips here").is_empty());
+    }
+
+    #[tokio::test]
+    async fn program_referenced_sessions_need_hydration_for_hover_preview() {
+        // A program shown in a main-window leaf references a worker session that
+        // is neither selected, pinned, nor the orchestrator. Its PTY history
+        // must be hydrated so the program hover preview (spec 0060) can paint a
+        // live terminal tail instead of degrading to the bare text tooltip.
+        let (mut app, _dir, server) = empty_app().await;
+        let mut owner = summary_with_kind(agentd_protocol::SessionKind::User);
+        owner.id = "s1".into();
+        owner.has_pty = true;
+        let mut worker = summary_with_kind(agentd_protocol::SessionKind::User);
+        worker.id = "s3".into();
+        worker.has_pty = true;
+        // A second referenced session with no PTY can't be previewed, so it must
+        // not be queued for hydration.
+        let mut no_pty = summary_with_kind(agentd_protocol::SessionKind::User);
+        no_pty.id = "s4".into();
+        no_pty.has_pty = false;
+        app.sessions = vec![owner, worker, no_pty];
+        app.main_windows = MainWindowTree::Leaf {
+            id: 1,
+            selection: Selection::Session("s1".into()),
+        };
+        app.program_popups.insert(
+            "s1".into(),
+            program_popup_for_test(
+                "s1",
+                "Build the PR @{session:s3}\nDocs @{session:s4}\nUnknown @{session:s9}",
+                0,
+            ),
+        );
+
+        // s3 has a previewable PTY and no warm history yet → queue it. s4 has no
+        // PTY and s9 is unknown → skip both.
+        assert_eq!(
+            app.program_referenced_sessions_needing_hydration(),
+            vec!["s3".to_string()]
+        );
+
+        // Once its history is warm, it drops out of the queue (idempotent).
+        app.histories
+            .insert("s3".into(), crate::pty_render::ItemHistory::new());
+        assert!(app
+            .program_referenced_sessions_needing_hydration()
+            .is_empty());
         server.abort();
     }
 

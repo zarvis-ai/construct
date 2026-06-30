@@ -25,6 +25,7 @@ Captioning the preview with the tooltip preserves the concise agent-authored sta
 - The shimmer hover and the session-clip hover share one preview card, so their look, sizing, and placement must stay unified; a change to one is a change to both.
 - A shimmering block that names no session, or whose session has no captured output, must still show the text tooltip — the preview is an upgrade, never a replacement that can blank the affordance.
 - A surface that cannot render a live terminal preview (or cannot support hover) remains free to show only the text tooltip and still satisfies `0057`.
+- A referenced worker session is usually not the one being viewed — it is neither selected, pinned, nor the orchestrator. For the preview to be ready the instant the pointer lands, a surface that renders a visible program must keep the terminal history of the sessions that program references warm, not only the history of the sessions it is currently displaying. A surface that hydrates session history lazily must extend that hydration to program-referenced sessions, or the preview silently degrades to the bare text tooltip.
 
 ## Non-Goals
 
