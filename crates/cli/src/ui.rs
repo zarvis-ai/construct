@@ -7283,6 +7283,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_title_close_hit = None;
     app.layout.program_selection_run_hit = None;
     app.layout.program_inner_area = None;
+    app.layout.program_smart_clip_anchor = None;
     app.layout.program_clip_hits.clear();
     if app
         .program_popup
@@ -7788,6 +7789,13 @@ fn render_program_popup_at(
             program_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, inner)
         {
             render_editor_cursor(f, pos, &app.theme);
+            // Publish the `@`-anchor so the session-picker dialog can hang its
+            // `@`→session variant exactly where the inline context menu would
+            // sit. Captured before `render_program_smart_clip_picker`, which
+            // early-returns once the dialog is open.
+            if popup.smart_clip.is_some() {
+                app.layout.program_smart_clip_anchor = Some((pos, inner));
+            }
             render_program_smart_clip_picker(f, app, popup, pos, inner);
         }
     }
@@ -8709,15 +8717,24 @@ fn render_program_smart_clip_row(
     }
 }
 
-/// The reusable session-picker dialog (spec 0063): a centered modal listing
-/// every session grouped like the list view, with a typeahead search that dims
-/// non-matches and auto-expands the groups that contain one. Drawn topmost.
+/// The reusable session-picker dialog (spec 0063). Two layouts share one body:
+///
+/// * `C-x b` switcher — a centered modal with a typeahead search line and a
+///   **fixed** height (derived from the full, unfiltered list) so the search
+///   line never jumps as the query narrows the results; the body scrolls within
+///   the constant frame.
+/// * program `@`→session — a search-less list **anchored where the inline `@`
+///   context menu sat**, sized to its content. The live `@<typeahead>` token in
+///   the program buffer (visible just above the dialog) is the query, so no
+///   in-dialog search line is needed.
+///
+/// Drawn topmost.
 fn render_session_picker(f: &mut Frame, app: &mut App) {
     let Some(dialog) = app.session_picker.as_ref() else {
         return;
     };
     let title = dialog.title().to_string();
-    let query = dialog.query.clone();
+    let query = app.session_picker_effective_query();
     let selected = dialog.selected;
     let rows = app.session_picker_rows();
 
@@ -8726,24 +8743,13 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Centered modal: ~⅗ of the width (clamped) and ~⅔ of the height.
-    let width = (area.width * 3 / 5)
-        .clamp(40, 76)
-        .min(area.width.saturating_sub(4));
-    let max_height = (area.height * 2 / 3).max(8).min(area.height.saturating_sub(2));
-    // inner rows = search (1) + separator (1) + body + footer (1); borders add 2.
-    let fixed = 5u16; // 2 borders + search + separator + footer
-    let body_avail = max_height.saturating_sub(fixed).max(1);
-    let body_rows = (rows.len() as u16).min(body_avail).max(1);
-    let height = (body_rows + fixed).min(max_height).max(fixed + 1);
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+    // The switcher owns a search line; the `@`→session variant does not (its
+    // query is the buffer's `@<typeahead>`), and it anchors to the inline
+    // context menu's position when that anchor was captured this frame.
+    let show_search = matches!(dialog.purpose, crate::app::SessionPickerPurpose::Switch);
+    let anchor = (!show_search)
+        .then(|| app.layout.program_smart_clip_anchor)
+        .flatten();
 
     // Raw indices of the selectable (visible, non-dimmed) session rows, and the
     // raw index currently highlighted.
@@ -8757,6 +8763,56 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         None
     } else {
         Some(selectable_raw[selected.min(selectable_raw.len() - 1)])
+    };
+
+    // Resolve the outer rect and how many body rows fit inside it.
+    let (rect, body_rows) = if let Some((cursor_pos, prog)) = anchor {
+        // Anchored, search-less list: same width/placement rules as the inline
+        // `@` picker it replaces, content-sized, no footer.
+        let width = 46u16.min(prog.width.max(1));
+        let max_rows = prog.height.saturating_sub(2).min(14);
+        let body_rows = (rows.len() as u16).min(max_rows).max(1);
+        let height = body_rows + 2; // borders only
+        let x = cursor_pos
+            .x
+            .min(prog.x.saturating_add(prog.width.saturating_sub(width)));
+        let below_y = cursor_pos.y.saturating_add(1);
+        let above_y = cursor_pos.y.saturating_sub(height);
+        let y = if below_y.saturating_add(height) <= prog.y.saturating_add(prog.height) {
+            below_y
+        } else {
+            above_y.max(prog.y)
+        };
+        (Rect { x, y, width, height }, body_rows)
+    } else if show_search {
+        // Centered switcher with a FIXED height: size the body to the full,
+        // unfiltered list (clamped) so the frame stays put while the live query
+        // collapses groups and shrinks the visible rows.
+        let width = (area.width * 3 / 5)
+            .clamp(40, 76)
+            .min(area.width.saturating_sub(4));
+        let max_height = (area.height * 2 / 3).max(8).min(area.height.saturating_sub(2));
+        let fixed = 5u16; // 2 borders + search + separator + footer
+        let body_avail = max_height.saturating_sub(fixed).max(1);
+        let stable_rows = app.session_picker_rows_for_query("").len() as u16;
+        let body_rows = stable_rows.clamp(1, body_avail);
+        let height = body_rows + fixed;
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        (Rect { x, y, width, height }, body_rows)
+    } else {
+        // Search-less but no anchor captured (defensive fallback): a centered,
+        // content-sized, borders-only list.
+        let width = (area.width * 3 / 5)
+            .clamp(40, 76)
+            .min(area.width.saturating_sub(4));
+        let max_height = (area.height * 2 / 3).max(8).min(area.height.saturating_sub(2));
+        let body_avail = max_height.saturating_sub(2).max(1);
+        let body_rows = (rows.len() as u16).clamp(1, body_avail);
+        let height = body_rows + 2;
+        let x = area.x + area.width.saturating_sub(width) / 2;
+        let y = area.y + area.height.saturating_sub(height) / 2;
+        (Rect { x, y, width, height }, body_rows)
     };
 
     // Clamp the persisted scroll so the highlighted row stays on screen.
@@ -8788,33 +8844,58 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
     f.render_widget(Clear, rect);
     f.render_widget(block, rect);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-    let (search_area, sep_area, body_area, footer_area) =
-        (chunks[0], chunks[1], chunks[2], chunks[3]);
+    // The switcher splits its inner area into search / separator / body / footer;
+    // the anchored variant is body-only.
+    let body_area = if show_search {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+        let (search_area, sep_area, body_area, footer_area) =
+            (chunks[0], chunks[1], chunks[2], chunks[3]);
 
-    // Search line with a block caret.
-    let search_line = Line::from(vec![
-        Span::styled("Search: ", Style::default().fg(app.theme.muted)),
-        Span::styled(query.clone(), Style::default().fg(app.theme.text)),
-        Span::styled("▏", Style::default().fg(app.theme.accent)),
-    ]);
-    f.render_widget(Paragraph::new(search_line), search_area);
+        // Search line with a block caret.
+        let search_line = Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(app.theme.muted)),
+            Span::styled(query.clone(), Style::default().fg(app.theme.text)),
+            Span::styled("▏", Style::default().fg(app.theme.accent)),
+        ]);
+        f.render_widget(Paragraph::new(search_line), search_area);
 
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "─".repeat(sep_area.width as usize),
-            Style::default().fg(app.theme.border),
-        ))),
-        sep_area,
-    );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(sep_area.width as usize),
+                Style::default().fg(app.theme.border),
+            ))),
+            sep_area,
+        );
+
+        // Footer hint, with a match tally while searching.
+        let footer = if query.trim().is_empty() {
+            "↑↓ / C-n C-p move · Enter switch · Esc cancel".to_string()
+        } else {
+            format!(
+                "{} match{} · ↑↓ move · Enter select · Esc cancel",
+                selectable_raw.len(),
+                if selectable_raw.len() == 1 { "" } else { "es" },
+            )
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                footer,
+                Style::default().fg(app.theme.dim),
+            ))),
+            footer_area,
+        );
+        body_area
+    } else {
+        inner
+    };
 
     // Body rows (scrolled).
     let inner_w = body_area.width as usize;
@@ -8831,24 +8912,6 @@ fn render_session_picker(f: &mut Frame, app: &mut App) {
         }
     }
     f.render_widget(Paragraph::new(lines), body_area);
-
-    // Footer hint, with a match tally while searching.
-    let footer = if query.trim().is_empty() {
-        "↑↓ / C-n C-p move · Enter switch · Esc cancel".to_string()
-    } else {
-        format!(
-            "{} match{} · ↑↓ move · Enter select · Esc cancel",
-            selectable_raw.len(),
-            if selectable_raw.len() == 1 { "" } else { "es" },
-        )
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            footer,
-            Style::default().fg(app.theme.dim),
-        ))),
-        footer_area,
-    );
 }
 
 /// One row of the session-picker dialog: a project header, an "N archived"

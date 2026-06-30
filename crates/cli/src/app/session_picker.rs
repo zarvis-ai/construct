@@ -115,17 +115,46 @@ impl App {
         self.open_session_picker(SessionPickerPurpose::InsertProgramClip);
     }
 
-    /// Materialize the dialog's rows for the current query. Mirrors the
+    /// The query that drives dimming/auto-expand. For the `C-x b` switcher this
+    /// is the dialog's own typeahead line. For the program `@`→session variant
+    /// there is no search line in the dialog — the live `@<typeahead>` token in
+    /// the program buffer is the query, so it stays in lock-step with what the
+    /// user sees behind the anchored dialog.
+    pub(crate) fn session_picker_effective_query(&self) -> String {
+        let Some(dialog) = self.session_picker.as_ref() else {
+            return String::new();
+        };
+        match dialog.purpose {
+            SessionPickerPurpose::Switch => dialog.query.clone(),
+            SessionPickerPurpose::InsertProgramClip => self
+                .program_popup
+                .as_ref()
+                .and_then(|popup| {
+                    let trigger_start = popup.smart_clip.as_ref()?.trigger_start;
+                    program_smart_clip_query(popup, trigger_start)
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Materialize the dialog's rows for its effective query (see
+    /// [`Self::session_picker_effective_query`]).
+    pub(crate) fn session_picker_rows(&self) -> Vec<SessionPickerRow> {
+        self.session_picker_rows_for_query(&self.session_picker_effective_query())
+    }
+
+    /// Materialize the dialog's rows for an explicit `query`. Mirrors the
     /// session-list ordering (ungrouped, then groups by position, members by
     /// position) but expands/collapses each group and archive section by
-    /// whether it contains a query match.
-    pub(crate) fn session_picker_rows(&self) -> Vec<SessionPickerRow> {
-        let Some(dialog) = self.session_picker.as_ref() else {
+    /// whether it contains a query match. Rendering passes an empty query here
+    /// to size the switcher to its full (unfiltered) list so the frame height
+    /// stays stable as the live query narrows the results.
+    pub(crate) fn session_picker_rows_for_query(&self, query: &str) -> Vec<SessionPickerRow> {
+        if self.session_picker.is_none() {
             return Vec::new();
-        };
-        let query = dialog.query.clone();
+        }
         let has_query = !query.trim().is_empty();
-        let matched = |s: &SessionSummary| switch_session_match_score(s, &query).is_some();
+        let matched = |s: &SessionSummary| switch_session_match_score(s, query).is_some();
 
         let mut out: Vec<SessionPickerRow> = Vec::new();
         let orch_id = self.orchestrator_id.as_deref();
@@ -236,6 +265,42 @@ impl App {
         }
     }
 
+    /// Snap the highlight back to the top match. Called after the effective
+    /// query changes (typing/backspace) so navigation resumes from the best hit.
+    fn session_picker_reset_selection(&mut self) {
+        if let Some(dialog) = self.session_picker.as_mut() {
+            dialog.selected = 0;
+            dialog.scroll = 0;
+        }
+    }
+
+    /// `@`→session variant: there is no dialog search line, so a typed character
+    /// extends the live `@<typeahead>` token in the program buffer. That token
+    /// *is* the query, so the dialog re-filters as the visible text grows. A
+    /// character that ends the token (e.g. whitespace) tears the `@` search down,
+    /// which dismisses the picker just as the inline `@` menu would.
+    fn session_picker_program_push_char(&mut self, c: char) {
+        self.insert_program_text(&c.to_string());
+        if self.program_smart_clip_active() {
+            self.session_picker_reset_selection();
+        } else {
+            self.cancel_session_picker();
+        }
+    }
+
+    /// `@`→session variant of backspace: delete the last character of the live
+    /// `@<typeahead>` token. Backspacing over the `@` itself removes it and
+    /// closes the whole picker (mirroring the inline `@` menu).
+    fn session_picker_program_backspace(&mut self) {
+        if self.program_smart_clip_backspace() {
+            self.session_picker_reset_selection();
+        } else {
+            // The `@` trigger is gone (or there is no live search); nothing left
+            // to pick against, so dismiss the dialog too.
+            self.cancel_session_picker();
+        }
+    }
+
     /// Close the dialog without acting. When it was driving a program-clip
     /// insertion, also dismiss the underlying `@` smart-clip menu so it doesn't
     /// reappear behind the closed dialog.
@@ -296,11 +361,17 @@ impl App {
 
     /// Route a key while the dialog owns input. Captures everything: typing
     /// edits the query, arrows / `C-n` / `C-p` move the selection, Enter
-    /// confirms, Esc / `C-g` cancels.
+    /// confirms, Esc / `C-g` cancels. Typing/backspace route to whichever query
+    /// backs the dialog — the switcher's own line, or the program's live
+    /// `@<typeahead>` token for the `@`→session variant.
     pub(super) fn handle_session_picker_key(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let super_mod = key.modifiers.contains(KeyModifiers::SUPER);
+        let to_program = matches!(
+            self.session_picker.as_ref().map(|d| &d.purpose),
+            Some(SessionPickerPurpose::InsertProgramClip)
+        );
         match key.code {
             KeyCode::Esc => self.cancel_session_picker(),
             KeyCode::Char('g') if ctrl => self.cancel_session_picker(),
@@ -309,7 +380,11 @@ impl App {
             KeyCode::Down => self.move_session_picker_selection(1),
             KeyCode::Char('p') if ctrl => self.move_session_picker_selection(-1),
             KeyCode::Char('n') if ctrl => self.move_session_picker_selection(1),
+            KeyCode::Backspace if to_program => self.session_picker_program_backspace(),
             KeyCode::Backspace => self.session_picker_backspace(),
+            KeyCode::Char(c) if !ctrl && !alt && !super_mod && to_program => {
+                self.session_picker_program_push_char(c)
+            }
             KeyCode::Char(c) if !ctrl && !alt && !super_mod => self.session_picker_push_char(c),
             _ => {}
         }

@@ -856,6 +856,46 @@ impl App {
         }
     }
 
+    /// Delete one character from the live `@<typeahead>` token while *keeping*
+    /// the smart-clip search alive (unlike [`Self::delete_program_back`], which
+    /// always tears the search down). Used by the anchored `@`→session picker so
+    /// backspacing narrows the query in place. Returns `true` while the `@`
+    /// trigger survives; `false` once the `@` itself is removed (or there is no
+    /// live search), signaling the caller to dismiss the picker.
+    pub(super) fn program_smart_clip_backspace(&mut self) -> bool {
+        let Some(popup) = self.program_popup.as_ref() else {
+            return false;
+        };
+        let Some(search) = popup.smart_clip.as_ref() else {
+            return false;
+        };
+        let trigger_start = search.trigger_start;
+        if popup.cursor <= trigger_start {
+            return false;
+        }
+        // An empty query means the cursor sits just past the `@`; backspacing
+        // here deletes the `@` and ends the search.
+        let drop_trigger = program_smart_clip_query(popup, trigger_start)
+            .map(|q| q.is_empty())
+            .unwrap_or(true);
+        let del_start = popup.cursor - 1;
+        let start_b = byte_pos(&popup.buffer, del_start);
+        let end_b = byte_pos(&popup.buffer, popup.cursor);
+        self.push_program_undo_state();
+        let Some(popup) = self.program_popup.as_mut() else {
+            return false;
+        };
+        popup.buffer.replace_range(start_b..end_b, "");
+        popup.cursor = del_start;
+        popup.preferred_col = None;
+        popup.selection = None;
+        if drop_trigger {
+            popup.smart_clip = None;
+            return false;
+        }
+        true
+    }
+
     fn program_smart_clip_selectable_count(rows: &[ProgramSmartClipRow]) -> usize {
         rows.iter().filter(|r| r.is_selectable()).count()
     }

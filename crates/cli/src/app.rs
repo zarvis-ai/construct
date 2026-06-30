@@ -1984,6 +1984,13 @@ pub struct LayoutSnapshot {
     /// Cursor-move handlers and the mouse wheel read its width/height to keep
     /// the caret on-screen and to bound scrolling; `None` when no program is open.
     pub program_inner_area: Option<ratatui::layout::Rect>,
+    /// `@`-smart-clip anchor from the last frame: the editor cursor `Position`
+    /// the inline picker hangs from, plus the program's inner `Rect`. The
+    /// session-picker dialog reads this to render its `@`→session variant in
+    /// place of the inline context menu instead of center-screen. `Some` only
+    /// while a program's `@` smart-clip search is live.
+    pub program_smart_clip_anchor:
+        Option<(ratatui::layout::Position, ratatui::layout::Rect)>,
     /// Session smart-clip hitboxes in the active program body from the last
     /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
     pub program_clip_hits: Vec<ProgramClipHit>,
@@ -8712,6 +8719,7 @@ mod tests {
             program_title_close_hit: None,
             program_selection_run_hit: None,
             program_inner_area: None,
+            program_smart_clip_anchor: None,
             program_clip_hits: Vec::new(),
             program_template_hits: Vec::new(),
             browser_preview_area: None,
@@ -11976,6 +11984,63 @@ mod tests {
             popup.smart_clip.is_none(),
             "smart-clip search closes once the clip is inserted"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_picker_clip_variant_filters_from_buffer_typeahead() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        alpha.id = "a".into();
+        alpha.title = Some("alpha".into());
+        alpha.position = 0;
+        let mut beta = summary_with_kind(agentd_protocol::SessionKind::User);
+        beta.id = "b".into();
+        beta.title = Some("beta".into());
+        beta.position = 1;
+        app.sessions = vec![alpha, beta];
+        app.program_popup = Some(program_popup_for_test("s1", "", 0));
+        app.insert_program_text("@");
+
+        // Open the `@`→session dialog (session category sits at root position 2).
+        app.program_popup
+            .as_mut()
+            .unwrap()
+            .smart_clip
+            .as_mut()
+            .unwrap()
+            .selected = 2;
+        app.accept_program_smart_clip();
+        assert_eq!(
+            app.session_picker.as_ref().unwrap().purpose,
+            SessionPickerPurpose::InsertProgramClip
+        );
+        // Empty `@` query: both sessions are bright.
+        assert_eq!(picker_bright(&app.session_picker_rows()), vec!["alpha", "beta"]);
+
+        // Typing routes into the buffer's `@<typeahead>` token — not a separate
+        // dialog search line — and the dialog re-filters from it.
+        picker_type(&mut app, "alph");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "@alph");
+        assert!(
+            app.session_picker.as_ref().unwrap().query.is_empty(),
+            "the dialog keeps no search line of its own for the `@` variant"
+        );
+        assert_eq!(picker_bright(&app.session_picker_rows()), vec!["alpha"]);
+
+        // Backspacing edits the same token in place while the `@` survives.
+        for _ in 0..4 {
+            app.handle_session_picker_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "@");
+        assert!(app.session_picker_active(), "still open at the bare `@`");
+        assert_eq!(picker_bright(&app.session_picker_rows()), vec!["alpha", "beta"]);
+
+        // Backspacing over the `@` itself removes it and dismisses the picker.
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(!app.session_picker_active());
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "");
+        assert!(app.program_popup.as_ref().unwrap().smart_clip.is_none());
         server.abort();
     }
 
