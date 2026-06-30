@@ -79,7 +79,7 @@ pub fn catalog() -> Vec<Value> {
         // ----- Write -----
         tool(
             "construct_program_edit",
-            "PREFERRED for changing a session's program: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST program content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_program_get and retry. Agent edits need no user confirmation. Shimmer (the program-run progress animation) is declared per block by stable id: pass a `shimmer` array of `{id, shimmer}` entries to mark blocks pending (true) or settled (false). The list is PARTIAL and may target ANY block — not only the ones these edits change — so a planning pass can settle no-work blocks without touching their text; blocks you omit keep their current shimmer. Get block ids from construct_program_get or the `blocks` echoed by this call. Editing a block's text changes its id, so to keep an edited block shimmering set `keep_pending: true` on that edit (preferred — it re-adds the resulting block's new id atomically, so you need not know the new id and the block never goes dark; use this when moving an in-flight task into an In progress section or appending a @{session} clip). Ids that no longer match a block are ignored (that block changed underneath you). Every entry that sets `shimmer: true` MUST include a `tooltip`: a concise (≤10-word) description of that block's run status (e.g. \"Building PR\", \"Waiting on CI\"); it is shown when a user hovers the shimmering block. Tooltips are ignored for `shimmer: false`.",
+            "PREFERRED for changing a session's program: apply one or more anchored find/replace edits (like the code Edit tool). Each edit replaces `old_string` with `new_string`; set `replace_all` to replace every occurrence, or include enough surrounding context to make `old_string` unique. An empty `old_string` appends `new_string` to the document. Edits apply to the LATEST program content, so a human editing a different region at the same time merges cleanly — no version to pass and no conflict. The call fails (writing nothing) only if an `old_string` is missing or ambiguous, which means that exact text changed underneath you: re-read with construct_program_get and retry. Agent edits need no user confirmation. For moving or reclassifying text between headings, use ONE construct_program_edit call with multiple `edits` entries — one entry removes the text from its old location and another inserts it at the new location. Do not make a separate remove call followed by a separate add call; the Program view can otherwise show a transient missing block. Shimmer (the program-run progress animation) is declared per block by stable id: pass a `shimmer` array of `{id, shimmer}` entries to mark blocks pending (true) or settled (false). The list is PARTIAL and may target ANY block — not only the ones these edits change — so a planning pass can settle no-work blocks without touching their text; blocks you omit keep their current shimmer. Get block ids from construct_program_get or the `blocks` echoed by this call. Editing a block's text changes its id, so to keep an edited block shimmering set `keep_pending: true` on that edit (preferred — it re-adds the resulting block's new id atomically, so you need not know the new id and the block never goes dark; use this when moving an in-flight task into an In progress section or appending a @{session} clip). Ids that no longer match a block are ignored (that block changed underneath you). Every entry that sets `shimmer: true` MUST include a `tooltip`: a concise (≤10-word) description of that block's run status (e.g. \"Building PR\", \"Waiting on CI\"); it is shown when a user hovers the shimmering block. Tooltips are ignored for `shimmer: false`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -87,6 +87,7 @@ pub fn catalog() -> Vec<Value> {
                     "edits": {
                         "type": "array",
                         "minItems": 1,
+                        "description": "All targeted replacements to apply atomically in order. For moves, put the removal and insertion edits in this same array so the block never disappears between tool calls.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -996,6 +997,31 @@ mod tests {
         ] {
             assert!(names.contains(expected), "missing {expected}");
         }
+    }
+
+    #[test]
+    fn program_edit_tool_guides_moves_into_one_call() {
+        let tool = catalog()
+            .into_iter()
+            .find(|tool| tool.get("name").and_then(|name| name.as_str()) == Some("construct_program_edit"))
+            .expect("program edit tool");
+        let description = tool
+            .get("description")
+            .and_then(|description| description.as_str())
+            .expect("description");
+        let edits_description = tool
+            .pointer("/inputSchema/properties/edits/description")
+            .and_then(|description| description.as_str())
+            .expect("edits description");
+
+        assert!(
+            description.contains("ONE construct_program_edit call with multiple `edits` entries"),
+            "tool description should tell agents to move blocks in one call"
+        );
+        assert!(
+            edits_description.contains("For moves"),
+            "edits schema description should reinforce atomic move edits"
+        );
     }
 
     #[test]

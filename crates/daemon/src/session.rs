@@ -479,6 +479,7 @@ fn program_run_instructions() -> Vec<String> {
         "Infer the user's intended objective from the document structure and prose, then keep taking useful next actions while there is actionable work you can do.".to_string(),
         "Do not ask the user to run the program again; if the document still implies useful work you can perform, continue in this turn.".to_string(),
         "Record meaningful state changes or results on the program with construct_program_edit (anchored find/replace edits that merge with concurrent human edits; use construct_program_update only for a wholesale rewrite).".to_string(),
+        "When moving or reclassifying existing text between headings or sections, do it with one construct_program_edit call containing multiple `edits` entries: one replacement removes the text from the old location and another replacement inserts it in the new location. Do not remove in one tool call and add in a later tool call, because viewers can briefly see the block disappear.".to_string(),
         "Keep the program clean: do not add new sections, notes, bullet points, or execution details unless the program content or the user's instructions explicitly request them. Only update what the program already implies needs updating. The program should be at least as concise and readable after a run as it was before.".to_string(),
         "If blocked, write the blocker and next required external action on the program before ending.".to_string(),
         "Smart clips are Markdown-native typed references. The clip_id attribute identifies a specific clip instance, not the target itself; preserve clip_id values when editing existing clips. You may insert smart clips into the program at your discretion even without an explicit user request.".to_string(),
@@ -3484,6 +3485,20 @@ mod tests {
         let bytes = std::fs::read(mgr.program_run_context_path("s123")).unwrap();
         let parsed: agent_context::ProgramRunContext = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, context);
+    }
+
+    #[test]
+    fn program_run_instructions_require_atomic_move_edits() {
+        let instructions = program_run_instructions().join("\n");
+
+        assert!(
+            instructions.contains("one construct_program_edit call containing multiple `edits` entries"),
+            "program runs should tell agents to move blocks in one edit call"
+        );
+        assert!(
+            instructions.contains("viewers can briefly see the block disappear"),
+            "instruction should explain the transient Program-view failure mode"
+        );
     }
 
     #[tokio::test]
