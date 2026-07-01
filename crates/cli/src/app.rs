@@ -5385,9 +5385,7 @@ impl App {
         let Some(popup) = popup else {
             return;
         };
-        let dirty =
-            program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown;
-        if dirty {
+        if program_popup_has_unsaved_edits(popup) {
             return;
         }
         let buffer_len = popup.buffer.chars().count();
@@ -5444,9 +5442,7 @@ impl App {
         if program.version <= popup.program.version {
             return;
         }
-        let dirty =
-            program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown;
-        if dirty {
+        if program_popup_has_unsaved_edits(popup) {
             // Don't clobber unsaved edits. Keep the stale base version so the
             // next save detects the conflict and 3-way merges both sides.
             return;
@@ -8523,6 +8519,20 @@ fn program_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
         body,
         program_next_smart_clip_id(buffer)
     )
+}
+
+/// Whether the popup holds edits the user actually made, as opposed to
+/// differing from the last daemon sync only by smart-clip instance-id
+/// normalization. Agent-written documents can carry clips without a
+/// `clip_id=` (or with duplicate ids), so the normalized form of an untouched
+/// buffer never equals the raw `saved_markdown`; comparing normalized to raw
+/// would misread such a popup as dirty and silently skip every live agent
+/// update until the program was hidden and reopened. Normalize both sides so
+/// only real edits count (the web UI does the same — it stores and compares
+/// normalized content).
+fn program_popup_has_unsaved_edits(popup: &ProgramPopup) -> bool {
+    program_normalize_smart_clip_instance_ids(&popup.buffer)
+        != program_normalize_smart_clip_instance_ids(&popup.saved_markdown)
 }
 
 fn program_normalize_smart_clip_instance_ids(markdown: &str) -> String {
@@ -12916,6 +12926,68 @@ mod tests {
         assert_eq!(popup.program.version, 2);
         assert_eq!(popup.buffer, "# Todo\n- a\n- agent added\n");
         assert_eq!(popup.saved_markdown, "# Todo\n- a\n- agent added\n");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_adopts_update_when_untouched_clip_lacks_id() {
+        // Regression: an agent-written document can carry a smart clip without
+        // a clip_id (the daemon stores it as-is). The popup's buffer and
+        // saved_markdown are both that raw content, but its *normalized* form
+        // differs — an untouched popup must not read as dirty, or every live
+        // agent update is skipped until the program is hidden and reopened.
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test(
+            "s1",
+            "# In progress\n- task @{session:sub1}\n",
+            0,
+        ));
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "# In progress\n\n# Done\n- task @{session:sub1}\n".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.program.version, 2);
+        assert_eq!(popup.buffer, "# In progress\n\n# Done\n- task @{session:sub1}\n");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_preserves_real_edits_when_clip_lacks_id() {
+        // Real unsaved edits must still be preserved even when the last synced
+        // content is not in normalized form.
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test(
+            "s1",
+            "# In progress\n- task @{session:sub1}\n",
+            0,
+        ));
+        app.program_popup.as_mut().unwrap().buffer =
+            "# In progress\n- task @{session:sub1}\n- human typing\n".into();
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "# Done\n- task @{session:sub1}\n".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.buffer,
+            "# In progress\n- task @{session:sub1}\n- human typing\n"
+        );
+        assert_eq!(popup.program.version, 1);
         server.abort();
     }
 
