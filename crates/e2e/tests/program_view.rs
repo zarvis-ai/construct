@@ -666,6 +666,49 @@ async fn web_program_view_full_parity() {
     );
     assert_eq!(collab["remoteLabel"], "TUI", "{collab:?}");
 
+    // --- 12. Live collaboration: own rebased cursor notification moves caret.
+    let own_cursor: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.get": () => ({ program: { session_id: "s-own-cursor", markdown: "123456789\n", version: 1, template_id: null }, active_run: null, blocks: [], revisions: [], collaborators: [] }),
+              "program.list_templates": () => ({ templates: [] }),
+              "program.cursor": (p) => {
+                return { cursor: { session_id: p.session_id, client_id: "web-self", label: "Web", kind: "web", cursor: p.cursor, color_index: 1, updated_at_ms: Date.now(), active: !p.clear } };
+              },
+            }, async () => {
+              setSession("s-own-cursor", "shell");
+              await switchCurrentViewMode("program");
+              state.program.ownClientId = "web-self";
+              const before = programRangeForOffset(6);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(before);
+              handleProgramState({ program: { session_id: "s-own-cursor", markdown: "12356789\n", version: 2, template_id: null }, active_run: null, blocks: [] });
+              handleProgramCursor({ cursor: { session_id: "s-own-cursor", client_id: "web-self", label: "Web 1", kind: "web", cursor: 5, color_index: 1, updated_at_ms: Date.now(), active: true } });
+              const offsets = programSelectionOffsets();
+              return {
+                text: programSerialize(),
+                head: offsets ? offsets.head : null,
+                remoteCursorCount: programCursorLayerEl.querySelectorAll(".program-remote-cursor").length,
+              };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate own cursor")
+        .into_value()
+        .expect("json");
+    assert_eq!(own_cursor["text"], "12356789\n", "{own_cursor:?}");
+    assert_eq!(
+        own_cursor["head"], 5,
+        "own caret should adopt daemon-rebased cursor offset: {own_cursor:?}"
+    );
+    assert_eq!(
+        own_cursor["remoteCursorCount"], 0,
+        "own cursor should not render as a remote overlay: {own_cursor:?}"
+    );
+
     // --- Visual artifacts: drive the REAL session's program (it has a smart
     //     clip from step 1) and leave it mounted so the screenshots show the
     //     genuine rendered surface, chip, and run shimmer. ------------------

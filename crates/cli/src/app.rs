@@ -5312,17 +5312,62 @@ impl App {
                         agentd_protocol::ProgramCursorNotificationPayload,
                     >(p)
                     {
-                        if payload.cursor.active {
-                            self.program_collaborators
-                                .insert(payload.cursor.client_id.clone(), payload.cursor);
-                        } else {
-                            self.program_collaborators.remove(&payload.cursor.client_id);
-                        }
+                        self.on_program_cursor(payload.cursor);
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    fn on_program_cursor(&mut self, cursor: agentd_protocol::ProgramCursor) {
+        let is_own = self.own_program_client_id.as_deref() == Some(cursor.client_id.as_str());
+        if cursor.active {
+            self.program_collaborators
+                .insert(cursor.client_id.clone(), cursor.clone());
+            if is_own {
+                self.apply_own_program_cursor(&cursor);
+            }
+        } else {
+            self.program_collaborators.remove(&cursor.client_id);
+        }
+    }
+
+    fn apply_own_program_cursor(&mut self, cursor: &agentd_protocol::ProgramCursor) {
+        let updating_session_id = cursor.session_id.clone();
+        let popup = if self
+            .program_popup
+            .as_ref()
+            .is_some_and(|p| p.program.session_id == updating_session_id)
+        {
+            self.program_popup.as_mut()
+        } else {
+            self.program_popups.get_mut(&updating_session_id)
+        };
+        let Some(popup) = popup else {
+            return;
+        };
+        let dirty =
+            program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown;
+        if dirty {
+            return;
+        }
+        let buffer_len = popup.buffer.chars().count();
+        popup.cursor = cursor.cursor.min(buffer_len);
+        match (cursor.selection_anchor, cursor.selection_head) {
+            (Some(anchor), Some(head)) if anchor != head => {
+                popup.selection = Some(ProgramSelection {
+                    anchor: anchor.min(buffer_len),
+                    head: head.min(buffer_len),
+                    dragged: false,
+                });
+            }
+            _ => {
+                popup.selection = None;
+            }
+        }
+        popup.preferred_col = None;
+        Self::update_program_smart_clip_after_cursor_move(popup);
     }
 
     /// A program changed on the daemon (most often the owning agent edited it).

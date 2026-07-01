@@ -4275,7 +4275,25 @@ function handleProgramCursor(params) {
   if (!cursor || !cursor.client_id) return;
   if (cursor.active === false) state.program.collaboratorById.delete(cursor.client_id);
   else state.program.collaboratorById.set(cursor.client_id, cursor);
+  programApplyOwnCursor(cursor);
   programRenderCursors();
+}
+
+function programApplyOwnCursor(cursor) {
+  if (!cursor || cursor.client_id !== state.program.ownClientId || cursor.active === false) return;
+  const id = state.program.mountedId;
+  if (!id || state.mode !== "program" || cursor.session_id !== id) return;
+  const doc = state.program.docById.get(id);
+  if (!doc || (doc.pendingLive || 0) > 0) return;
+  const current = programNormalizeClipIds(programSerialize());
+  const cleanBase = doc.live != null ? doc.live : doc.saved;
+  if (current !== cleanBase) return;
+  const offset = Math.min(cursor.cursor || 0, programCharCount(current));
+  const sel = window.getSelection();
+  if (!sel) return;
+  const range = programRangeForOffset(offset);
+  sel.removeAllRanges();
+  sel.addRange(range);
 }
 
 // --- save (optimistic version + 3-way merge) ---

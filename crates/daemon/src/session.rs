@@ -543,6 +543,171 @@ fn program_edit_keep_ids(
         .collect()
 }
 
+fn program_default_cursor_label(kind: &str) -> String {
+    match kind {
+        "web" => "Web".to_string(),
+        "tui" => "TUI".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn program_unique_cursor_label(
+    cursors: &HashMap<u64, agentd_protocol::ProgramCursor>,
+    conn_id: u64,
+    requested: &str,
+    kind: &str,
+) -> String {
+    let fallback = program_default_cursor_label(kind);
+    let base = requested.trim();
+    let base = if base.is_empty() {
+        fallback.as_str()
+    } else {
+        base
+    };
+    let used: std::collections::HashSet<&str> = cursors
+        .iter()
+        .filter(|(id, cursor)| **id != conn_id && cursor.active)
+        .map(|(_, cursor)| cursor.label.as_str())
+        .collect();
+    let generic = matches!(base, "TUI" | "Web" | "tui" | "web");
+    if !generic && !used.contains(base) {
+        return base.to_string();
+    }
+    for n in 1.. {
+        let candidate = format!("{base} {n}");
+        if !used.contains(candidate.as_str()) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgramCursorReplacement {
+    start: usize,
+    old_len: usize,
+    new_len: usize,
+}
+
+fn program_cursor_replacements(
+    base: &str,
+    edits: &[agentd_protocol::ProgramEdit],
+) -> Result<Vec<ProgramCursorReplacement>> {
+    let mut working = base.to_string();
+    let mut replacements = Vec::new();
+    for (i, edit) in edits.iter().enumerate() {
+        if edit.old_string.is_empty() {
+            let prefix_len = usize::from(!working.is_empty() && !working.ends_with('\n'));
+            let inserted = prefix_len + edit.new_string.chars().count();
+            replacements.push(ProgramCursorReplacement {
+                start: working.chars().count(),
+                old_len: 0,
+                new_len: inserted,
+            });
+            if working.is_empty() {
+                working = edit.new_string.clone();
+            } else {
+                if !working.ends_with('\n') {
+                    working.push('\n');
+                }
+                working.push_str(&edit.new_string);
+            }
+            continue;
+        }
+
+        let match_byte_offsets: Vec<usize> = working
+            .match_indices(&edit.old_string)
+            .map(|(offset, _)| offset)
+            .collect();
+        match match_byte_offsets.len() {
+            0 => anyhow::bail!(
+                "program edit {}: old_string not found in the current program:\n{}",
+                i + 1,
+                edit.old_string
+            ),
+            n if n > 1 && !edit.replace_all => anyhow::bail!(
+                "program edit {}: old_string is not unique ({} matches); add surrounding context or set replace_all",
+                i + 1,
+                n
+            ),
+            _ => {}
+        }
+
+        let old_chars: Vec<char> = edit.old_string.chars().collect();
+        let new_chars: Vec<char> = edit.new_string.chars().collect();
+        let mut prefix = 0usize;
+        while prefix < old_chars.len()
+            && prefix < new_chars.len()
+            && old_chars[prefix] == new_chars[prefix]
+        {
+            prefix += 1;
+        }
+        let mut old_suffix = old_chars.len();
+        let mut new_suffix = new_chars.len();
+        while old_suffix > prefix
+            && new_suffix > prefix
+            && old_chars[old_suffix - 1] == new_chars[new_suffix - 1]
+        {
+            old_suffix -= 1;
+            new_suffix -= 1;
+        }
+        let old_len = old_suffix.saturating_sub(prefix);
+        let new_len = new_suffix.saturating_sub(prefix);
+        let selected_offsets = if edit.replace_all {
+            match_byte_offsets
+        } else {
+            vec![match_byte_offsets[0]]
+        };
+        let mut cumulative_delta = 0isize;
+        for byte_offset in selected_offsets {
+            let anchor_start = working[..byte_offset]
+                .chars()
+                .count()
+                .saturating_add_signed(cumulative_delta);
+            replacements.push(ProgramCursorReplacement {
+                start: anchor_start + prefix,
+                old_len,
+                new_len,
+            });
+            cumulative_delta += new_chars.len() as isize - old_chars.len() as isize;
+        }
+        working = if edit.replace_all {
+            working.replace(&edit.old_string, &edit.new_string)
+        } else {
+            working.replacen(&edit.old_string, &edit.new_string, 1)
+        };
+    }
+    Ok(replacements)
+}
+
+fn program_rebase_offset(offset: usize, replacements: &[ProgramCursorReplacement]) -> usize {
+    let mut pos = offset;
+    for replacement in replacements {
+        let start = replacement.start;
+        let end = start + replacement.old_len;
+        if replacement.old_len == 0 {
+            if pos > start {
+                pos = pos.saturating_add(replacement.new_len);
+            }
+            continue;
+        }
+        if pos < start {
+            continue;
+        }
+        if pos >= end {
+            if replacement.new_len >= replacement.old_len {
+                pos = pos.saturating_add(replacement.new_len - replacement.old_len);
+            } else {
+                pos = pos.saturating_sub(replacement.old_len - replacement.new_len);
+            }
+        } else {
+            let inner = pos - start;
+            pos = start + inner.min(replacement.new_len);
+        }
+    }
+    pos
+}
+
 impl SessionEntry {
     pub fn is_deleted(&self) -> bool {
         self.deleted.load(Ordering::SeqCst)
@@ -947,15 +1112,13 @@ impl SessionManager {
         self.get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
-        let label = params.label.unwrap_or_else(|| match kind {
-            "web" => "Web".to_string(),
-            "tui" => "TUI".to_string(),
-            other => other.to_string(),
-        });
+        let requested_label = params
+            .label
+            .unwrap_or_else(|| program_default_cursor_label(kind));
         let mut cursor = agentd_protocol::ProgramCursor {
             session_id: params.session_id,
             client_id: format!("c{conn_id}"),
-            label,
+            label: requested_label.clone(),
             kind: kind.to_string(),
             cursor: params.cursor,
             selection_anchor: params.selection_anchor,
@@ -967,6 +1130,12 @@ impl SessionManager {
         };
         if let Ok(mut cursors) = self.program_cursors.lock() {
             if cursor.active {
+                cursor.label = cursors
+                    .get(&conn_id)
+                    .map(|existing| existing.label.clone())
+                    .unwrap_or_else(|| {
+                        program_unique_cursor_label(&cursors, conn_id, &requested_label, kind)
+                    });
                 cursors.insert(conn_id, cursor.clone());
             } else if let Some(existing) = cursors.remove(&conn_id) {
                 cursor = existing;
@@ -1471,16 +1640,25 @@ impl SessionManager {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn program_edit(&self, params: ProgramEditParams) -> Result<ProgramUpdateResult> {
+        self.program_edit_from_conn(params, None).await
+    }
+
+    pub async fn program_edit_from_conn(
+        &self,
+        params: ProgramEditParams,
+        source_conn_id: Option<u64>,
+    ) -> Result<ProgramUpdateResult> {
         self.get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
         // Block ids of the pre-edit document, to tell which keep_pending blocks
         // are genuinely new (so a re-stated, unchanged heading is not re-lit).
-        let before_blocks = self
+        let (before_program, before_blocks) = self
             .storage
             .read_program_with_blocks(&params.session_id)
-            .map(|(_, blocks)| blocks)
+            .map(|(program, blocks)| (Some(program), blocks))
             .unwrap_or_default();
         let before_refs: std::collections::HashSet<String> =
             before_blocks.iter().map(|block| block.id.clone()).collect();
@@ -1490,6 +1668,18 @@ impl SessionManager {
             params.actor,
             params.note,
         )?;
+        let cursor_updates = before_program
+            .as_ref()
+            .map(|before| {
+                self.rebase_program_cursors_after_edit(
+                    &params.session_id,
+                    &before.markdown,
+                    &params.edits,
+                    program.version,
+                    source_conn_id,
+                )
+            })
+            .unwrap_or_default();
         // Apply the partial shimmer declaration against the post-edit document
         // (spec 0053): changed blocks drop their prior shimmer; declared ids set
         // pending/settled; ids that no longer exist are ignored (fail closed).
@@ -1521,6 +1711,11 @@ impl SessionManager {
         let blocks = self.program_blocks_projection(&params.session_id, &program.markdown);
         let active_run = self.program_run_snapshot(&params.session_id);
         self.broadcast_program_state(program.clone());
+        for cursor in cursor_updates {
+            let _ = self.broadcast.send(BroadcastMsg::ProgramCursor(
+                agentd_protocol::ProgramCursorNotificationPayload { cursor },
+            ));
+        }
         Ok(ProgramUpdateResult {
             program,
             blocks,
@@ -1619,6 +1814,53 @@ impl SessionManager {
                 blocks,
             },
         ));
+    }
+
+    fn rebase_program_cursors_after_edit(
+        &self,
+        session_id: &str,
+        before_markdown: &str,
+        edits: &[agentd_protocol::ProgramEdit],
+        version: u64,
+        source_conn_id: Option<u64>,
+    ) -> Vec<agentd_protocol::ProgramCursor> {
+        let Ok(replacements) = program_cursor_replacements(before_markdown, edits) else {
+            return Vec::new();
+        };
+        if replacements.is_empty() {
+            return Vec::new();
+        }
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut updates = Vec::new();
+        if let Ok(mut cursors) = self.program_cursors.lock() {
+            for (conn_id, cursor) in cursors.iter_mut() {
+                if Some(*conn_id) == source_conn_id
+                    || !cursor.active
+                    || cursor.session_id != session_id
+                {
+                    continue;
+                }
+                let old_cursor = cursor.cursor;
+                let old_anchor = cursor.selection_anchor;
+                let old_head = cursor.selection_head;
+                cursor.cursor = program_rebase_offset(cursor.cursor, &replacements);
+                cursor.selection_anchor = cursor
+                    .selection_anchor
+                    .map(|p| program_rebase_offset(p, &replacements));
+                cursor.selection_head = cursor
+                    .selection_head
+                    .map(|p| program_rebase_offset(p, &replacements));
+                cursor.version = Some(version);
+                if cursor.cursor != old_cursor
+                    || cursor.selection_anchor != old_anchor
+                    || cursor.selection_head != old_head
+                {
+                    cursor.updated_at_ms = now;
+                    updates.push(cursor.clone());
+                }
+            }
+        }
+        updates
     }
 
     fn program_run_context_path(&self, session_id: &str) -> PathBuf {
@@ -4927,6 +5169,227 @@ mod tests {
             }
             other => panic!("unexpected broadcast: {other:?}"),
         }
+    }
+
+    async fn put_program_cursor(
+        mgr: &SessionManager,
+        session_id: &str,
+        conn_id: u64,
+        kind: &str,
+        cursor: usize,
+    ) -> agentd_protocol::ProgramCursor {
+        mgr.program_cursor(
+            conn_id,
+            kind,
+            agentd_protocol::ProgramCursorParams {
+                session_id: session_id.to_string(),
+                cursor,
+                selection_anchor: None,
+                selection_head: None,
+                version: Some(1),
+                label: Some(match kind {
+                    "web" => "Web".to_string(),
+                    "tui" => "TUI".to_string(),
+                    other => other.to_string(),
+                }),
+                clear: false,
+            },
+        )
+        .await
+        .expect("cursor")
+        .cursor
+    }
+
+    fn collaborator(
+        mgr: &SessionManager,
+        session_id: &str,
+        client_id: &str,
+    ) -> agentd_protocol::ProgramCursor {
+        mgr.program_collaborators(session_id)
+            .into_iter()
+            .find(|cursor| cursor.client_id == client_id)
+            .expect("collaborator")
+    }
+
+    #[tokio::test]
+    async fn program_cursor_labels_are_unique_per_connected_client() {
+        let (mgr, _storage, id) = program_test_mgr("abc\n").await;
+
+        let a = put_program_cursor(&mgr, &id, 1, "tui", 0).await;
+        let b = put_program_cursor(&mgr, &id, 2, "tui", 1).await;
+        let c = put_program_cursor(&mgr, &id, 3, "web", 2).await;
+        let d = mgr
+            .program_cursor(
+                4,
+                "tui",
+                agentd_protocol::ProgramCursorParams {
+                    session_id: id.clone(),
+                    cursor: 3,
+                    selection_anchor: None,
+                    selection_head: None,
+                    version: Some(1),
+                    label: Some("moon".to_string()),
+                    clear: false,
+                },
+            )
+            .await
+            .expect("custom cursor")
+            .cursor;
+        let e = mgr
+            .program_cursor(
+                5,
+                "tui",
+                agentd_protocol::ProgramCursorParams {
+                    session_id: id.clone(),
+                    cursor: 4,
+                    selection_anchor: None,
+                    selection_head: None,
+                    version: Some(1),
+                    label: Some("moon".to_string()),
+                    clear: false,
+                },
+            )
+            .await
+            .expect("duplicate custom cursor")
+            .cursor;
+
+        assert_eq!(a.label, "TUI 1");
+        assert_eq!(b.label, "TUI 2");
+        assert_eq!(c.label, "Web 1");
+        assert_eq!(d.label, "moon");
+        assert_eq!(e.label, "moon 1");
+    }
+
+    #[tokio::test]
+    async fn program_edit_rebases_peer_cursor_after_source_insert() {
+        let (mgr, _storage, id) = program_test_mgr("123456789\n").await;
+        put_program_cursor(&mgr, &id, 1, "tui", 4).await;
+        put_program_cursor(&mgr, &id, 2, "web", 6).await;
+
+        let result = mgr
+            .program_edit_from_conn(
+                agentd_protocol::ProgramEditParams {
+                    session_id: id.clone(),
+                    edits: vec![agentd_protocol::ProgramEdit {
+                        old_string: "123456".to_string(),
+                        new_string: "123X456".to_string(),
+                        replace_all: false,
+                        keep_pending: false,
+                    }],
+                    actor: agentd_protocol::ProgramUpdateActor::Human,
+                    note: None,
+                    shimmer: Vec::new(),
+                },
+                Some(1),
+            )
+            .await
+            .expect("edit");
+
+        assert_eq!(result.program.markdown, "123X456789\n");
+        assert_eq!(
+            collaborator(&mgr, &id, "c1").cursor,
+            4,
+            "source cursor is already in post-edit coordinates"
+        );
+        let peer = collaborator(&mgr, &id, "c2");
+        assert_eq!(peer.cursor, 7);
+        assert_eq!(peer.version, Some(result.program.version));
+    }
+
+    #[tokio::test]
+    async fn program_edit_rebases_peer_cursor_and_selection_after_delete() {
+        let (mgr, _storage, id) = program_test_mgr("123456789\n").await;
+        mgr.program_cursor(
+            2,
+            "web",
+            agentd_protocol::ProgramCursorParams {
+                session_id: id.clone(),
+                cursor: 6,
+                selection_anchor: Some(4),
+                selection_head: Some(6),
+                version: Some(1),
+                label: Some("Web".to_string()),
+                clear: false,
+            },
+        )
+        .await
+        .expect("peer cursor");
+
+        mgr.program_edit_from_conn(
+            agentd_protocol::ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: "123456".to_string(),
+                    new_string: "12356".to_string(),
+                    replace_all: false,
+                    keep_pending: false,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Human,
+                note: None,
+                shimmer: Vec::new(),
+            },
+            Some(1),
+        )
+        .await
+        .expect("edit");
+
+        let peer = collaborator(&mgr, &id, "c2");
+        assert_eq!(peer.cursor, 5);
+        assert_eq!(peer.selection_anchor, Some(3));
+        assert_eq!(peer.selection_head, Some(5));
+    }
+
+    #[tokio::test]
+    async fn program_edit_clamps_peer_cursor_inside_deleted_text() {
+        let (mgr, _storage, id) = program_test_mgr("123456789\n").await;
+        put_program_cursor(&mgr, &id, 2, "web", 4).await;
+
+        mgr.program_edit_from_conn(
+            agentd_protocol::ProgramEditParams {
+                session_id: id.clone(),
+                edits: vec![agentd_protocol::ProgramEdit {
+                    old_string: "3456".to_string(),
+                    new_string: "".to_string(),
+                    replace_all: false,
+                    keep_pending: false,
+                }],
+                actor: agentd_protocol::ProgramUpdateActor::Human,
+                note: None,
+                shimmer: Vec::new(),
+            },
+            Some(1),
+        )
+        .await
+        .expect("delete range");
+
+        assert_eq!(collaborator(&mgr, &id, "c2").cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn program_edit_rebases_replacements_after_multiple_replace_all_matches() {
+        let (mgr, _storage, id) = program_test_mgr("aXaXa\n").await;
+        put_program_cursor(&mgr, &id, 2, "web", 2).await; // before second `a`
+        put_program_cursor(&mgr, &id, 3, "web", 3).await; // after second `a`
+        put_program_cursor(&mgr, &id, 4, "web", 5).await; // after third `a`
+
+        mgr.program_edit(agentd_protocol::ProgramEditParams {
+            session_id: id.clone(),
+            edits: vec![agentd_protocol::ProgramEdit {
+                old_string: "a".to_string(),
+                new_string: "ab".to_string(),
+                replace_all: true,
+                keep_pending: false,
+            }],
+            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            note: None,
+            shimmer: Vec::new(),
+        })
+        .await
+        .expect("replace all");
+
+        assert_eq!(collaborator(&mgr, &id, "c2").cursor, 3);
+        assert_eq!(collaborator(&mgr, &id, "c3").cursor, 4);
+        assert_eq!(collaborator(&mgr, &id, "c4").cursor, 7);
     }
 
     // The bug that motivated spec 0053: a planning pass must clear shimmer on

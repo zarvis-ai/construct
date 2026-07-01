@@ -8,15 +8,15 @@ use agentd_protocol::{
     ipc_method, ipc_notif, transport, ChatViewerActiveResult, CreateSessionParams, ErrorObject,
     GroupCreateParams, GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, Notification, PingResult, ProgramCursorParams, ProgramEditParams,
-    ProgramExecuteParams, ProgramGetParams, ProgramUpdateParams, ProjectCreateParams,
-    ProjectCreateResult, ProjectDeleteParams, ProjectDeletedNotificationPayload, ProjectMoveParams,
-    ProjectRenameParams, ProjectSetCollapsedParams, ProjectStateNotificationPayload,
-    PtyReplayParams, Request, Response, SessionAttachClipboardParams, SessionIdParams,
-    SessionInputParams, SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams,
-    SessionSetApprovalModeParams, SessionSetFocusedParams, SessionSetGroupParams,
-    SessionSetPinnedParams, SessionSetProjectParams, SessionSetTitleParams, SessionSetViewParams,
-    SessionToolActionParams, SessionToolDecisionParams, SubscribeParams, TranscriptParams,
-    IPC_VERSION,
+    ProgramExecuteParams, ProgramGetParams, ProgramUpdateActor, ProgramUpdateParams,
+    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
+    ProjectSetCollapsedParams, ProjectStateNotificationPayload, PtyReplayParams, Request, Response,
+    SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
+    SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
+    SessionSetFocusedParams, SessionSetGroupParams, SessionSetPinnedParams,
+    SessionSetProjectParams, SessionSetTitleParams, SessionSetViewParams, SessionToolActionParams,
+    SessionToolDecisionParams, SubscribeParams, TranscriptParams, IPC_VERSION,
 };
 use anyhow::{Context, Result};
 use futures::{SinkExt as _, StreamExt as _};
@@ -1084,7 +1084,12 @@ async fn dispatch(
     });
     dispatch_entry!(ipc_method::PROGRAM_EDIT, {
         let p = params!(req, ProgramEditParams);
-        match manager.program_edit(p).await {
+        let source_conn_id = if p.actor == ProgramUpdateActor::Human {
+            Some(conn_id)
+        } else {
+            None
+        };
+        match manager.program_edit_from_conn(p, source_conn_id).await {
             Ok(result) => ok!(req, &result),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
