@@ -8043,7 +8043,12 @@ fn render_program_popup_at(
     }
     render_program_title_tooltip(f, app, popup, summary_ref, rect);
     if !popup.closing {
-        render_program_clip_hover(f, app, rect, &clip_hits);
+        render_program_clip_hover(
+            f,
+            app,
+            program_clip_hover_bounds(app.layout.view_area, base_rect),
+            &clip_hits,
+        );
     }
     if !popup.closing {
         render_program_shimmer_hover(f, app, popup, scroll_offset, inner, now);
@@ -8134,6 +8139,10 @@ fn render_program_clip_hover(
         return;
     };
     render_session_hover_card(f, app, modal, &session_id, mx, my, None);
+}
+
+fn program_clip_hover_bounds(view_area: Option<Rect>, base_rect: Rect) -> Rect {
+    view_area.unwrap_or(base_rect)
 }
 
 /// Lay out the floating session hover card so it reads as a landscape tile: its
@@ -10576,6 +10585,23 @@ mod tests {
         assert_eq!(
             rect.y, 28,
             "card should flip above the mouse near the bottom"
+        );
+    }
+
+    #[test]
+    fn program_clip_hover_uses_view_bounds_not_program_rect() {
+        let view_area = Rect::new(10, 0, 140, 40);
+        let program_rect = Rect::new(10, 0, 140, 16);
+
+        assert_eq!(
+            program_clip_hover_bounds(Some(view_area), program_rect),
+            view_area,
+            "session preview cards should be allowed to extend outside the rolled-down Program"
+        );
+        assert_eq!(
+            program_clip_hover_bounds(None, program_rect),
+            program_rect,
+            "fallback to the Program pane when no broader view geometry is known"
         );
     }
 
