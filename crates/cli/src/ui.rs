@@ -7577,15 +7577,16 @@ fn apply_program_shimmer(lines: &mut [Line], shimmer: &ProgramShimmer, theme: &T
 }
 
 /// Build the empty-program onboarding placeholder: a one-line description of what
-/// the program is, every non-blank template as a row in a single grouped list
-/// (hovering a row highlights it so it reads as clickable), a divider, and a
-/// smart-clip syntax reference. Returns the lines to render plus the row
-/// hitboxes. Coordinates are absolute screen cells — safe because an empty
-/// program never scrolls (offset is always 0) and every line is kept within
-/// `inner.width`, so no wrapping shifts the rows. Templates that don't fit the
-/// available height collapse into a trailing "+N more" row. Falls back to a
-/// plain description+syntax when the program is too narrow/short for any row
-/// or no templates are available.
+/// the program is, a "Templates" header followed by every non-blank template as
+/// a plain (borderless) list row — hovering a row highlights it so it reads as
+/// clickable — a tip about adding custom templates when none are configured, a
+/// divider, and a smart-clip syntax reference. Returns the lines to render plus
+/// the row hitboxes. Coordinates are absolute screen cells — safe because an
+/// empty program never scrolls (offset is always 0) and every line is kept
+/// within `inner.width`, so no wrapping shifts the rows. Templates that don't
+/// fit the available height collapse into a trailing "+N more" row. Falls back
+/// to a plain description+syntax when the program is too narrow/short for any
+/// row or no templates are available.
 fn program_empty_placeholder(
     theme: &crate::theme::Theme,
     templates: &[agentd_protocol::ProgramTemplate],
@@ -7601,9 +7602,15 @@ fn program_empty_placeholder(
     // fences group output.
     const SYNTAX: &str =
         "Syntax: @{session:id} embeds a session · @{harness:name} delegates · select + Run dispatches · :::clip … ::: groups output.";
+    const HEADER: &str = "Templates";
+    // Default location custom templates are read from (see `[program]` in the
+    // daemon config); a short nudge for when no custom templates are configured.
+    const CUSTOM_TIP: &str =
+        "Tip: drop a .md file in ~/.local/share/construct/program/templates to add a custom template.";
 
     let desc_line = Line::from(Span::styled(truncate_to_width(DESC, width), dim));
     let syntax_line = Line::from(Span::styled(truncate_to_width(SYNTAX, width), dim));
+    let tip_line = Line::from(Span::styled(truncate_to_width(CUSTOM_TIP, width), dim));
     let divider = Line::from(Span::styled("─".repeat(width), dim));
 
     let plain = || {
@@ -7618,6 +7625,7 @@ fn program_empty_placeholder(
     };
 
     const INDENT: u16 = 2;
+    const BULLET: &str = "* ";
     const MAX_LABEL: usize = 40;
 
     // Every non-blank template becomes a list row — "blank" *is* the empty state,
@@ -7629,12 +7637,10 @@ fn program_empty_placeholder(
     if total == 0 {
         return plain();
     }
-
-    // The list box is one column wide, sized to the longest visible name (padded
-    // one cell either side) and capped so it always fits inside the pane. Too
-    // narrow for even a single-character row falls back to plain prose.
+    // Rows are indented and bulleted, no box. Too narrow for even a
+    // single-character row falls back to plain prose.
     let label_budget = width
-        .saturating_sub(INDENT as usize + 4) // 2 side borders + 2 cells of padding
+        .saturating_sub(INDENT as usize + BULLET.len())
         .min(MAX_LABEL);
     if label_budget == 0 {
         return plain();
@@ -7649,16 +7655,27 @@ fn program_empty_placeholder(
         .max()
         .unwrap_or(0);
 
-    // Height budget. Header = desc + blank (2). Footer = blank + divider + blank +
-    // syntax (4). The box spends 2 rows on its own top/bottom border; every
-    // remaining row holds one template, or a trailing "+N more" indicator.
-    let header = 2usize;
+    // Height budget. Header = desc + blank + "Templates" + blank (4). Footer =
+    // blank + divider + blank + syntax (4). Tip = blank + tip line (2), only
+    // reserved when there's room; it's dropped before the list itself would be.
+    let header = 4usize;
     let footer = 4usize;
-    let avail = (inner.height as usize).saturating_sub(header + footer);
-    if avail < 3 {
+    let tip_extra = 2usize;
+    // Show the custom-template tip only when every offered template is built
+    // in — as soon as one custom template shows up, the user already knows
+    // how — and only when there's room; it's dropped before the list itself
+    // would be.
+    let mut show_tip = ordered.iter().all(|t| t.built_in);
+    let mut avail =
+        (inner.height as usize).saturating_sub(header + footer + if show_tip { tip_extra } else { 0 });
+    if show_tip && avail < 1 {
+        show_tip = false;
+        avail = (inner.height as usize).saturating_sub(header + footer);
+    }
+    if avail < 1 {
         return plain();
     }
-    let max_item_rows = avail - 2;
+    let max_item_rows = avail;
     let fits_all = total <= max_item_rows;
     let (shown, reserve_overflow) = if fits_all {
         (total, false)
@@ -7666,7 +7683,7 @@ fn program_empty_placeholder(
         (max_item_rows.saturating_sub(1), true)
     };
 
-    // Widen the box to fit the overflow indicator too (truncated to
+    // Widen the row to fit the overflow indicator too (truncated to
     // `label_budget` like any other row if the pane is too narrow for it), so
     // "+N more" doesn't get clipped down to unreadable ellipsis.
     let overflow_text = reserve_overflow
@@ -7674,29 +7691,32 @@ fn program_empty_placeholder(
     let content_w = overflow_text.as_ref().map_or(max_name_w, |t| {
         max_name_w.max(UnicodeWidthStr::width(t.as_str()))
     });
-    let inner_w = content_w + 2; // 1 cell of padding either side
-    let box_w = inner_w as u16 + 2; // + left/right border
+    let row_w = content_w as u16 + BULLET.len() as u16;
 
-    let border = Style::default().fg(theme.accent);
+    let bullet_style = Style::default().fg(theme.dim);
     let indent = || Span::styled(" ".repeat(INDENT as usize), Style::default());
     let pad_to_width = |s: &str, w: usize| {
         let w = w.saturating_sub(UnicodeWidthStr::width(s));
         format!("{s}{}", " ".repeat(w))
     };
 
-    let box_left = inner.x + INDENT;
-    let box_top = inner.y + 2;
-    let mut lines = vec![desc_line, Line::from("")];
-    lines.push(Line::from(vec![
-        indent(),
-        Span::styled(format!("┌{}┐", "─".repeat(inner_w)), border),
-    ]));
+    let row_left = inner.x + INDENT;
+    let item_start_row = inner.y + header as u16;
+    let mut lines = vec![
+        desc_line,
+        Line::from(""),
+        Line::from(Span::styled(
+            HEADER,
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
 
     let mut hits = Vec::new();
     for (i, (t, name)) in ordered.iter().zip(names.iter()).take(shown).enumerate() {
-        let row = box_top + 1 + i as u16;
+        let row = item_start_row + i as u16;
         let hovered =
-            mouse_pos.is_some_and(|(mx, my)| my == row && mx >= box_left && mx < box_left + box_w);
+            mouse_pos.is_some_and(|(mx, my)| my == row && mx >= row_left && mx < row_left + row_w);
         let label_style = if hovered {
             Style::default()
                 .fg(theme.text)
@@ -7705,16 +7725,15 @@ fn program_empty_placeholder(
         } else {
             Style::default().fg(theme.text)
         };
-        let label = pad_to_width(&format!(" {name} "), inner_w);
+        let label = pad_to_width(name, content_w);
         lines.push(Line::from(vec![
             indent(),
-            Span::styled("│".to_string(), border),
+            Span::styled(BULLET, if hovered { label_style } else { bullet_style }),
             Span::styled(label, label_style),
-            Span::styled("│".to_string(), border),
         ]));
         hits.push(crate::app::ProgramTemplateHit {
-            col_start: box_left,
-            col_end: box_left + box_w,
+            col_start: row_left,
+            col_end: row_left + row_w,
             row_start: row,
             row_end: row,
             template_id: t.id.clone(),
@@ -7722,19 +7741,18 @@ fn program_empty_placeholder(
         });
     }
     if let Some(overflow_text) = &overflow_text {
-        let label = pad_to_width(&format!(" {overflow_text} "), inner_w);
+        let label = pad_to_width(overflow_text, content_w);
         lines.push(Line::from(vec![
             indent(),
-            Span::styled("│".to_string(), border),
+            Span::styled(" ".repeat(BULLET.len()), dim),
             Span::styled(label, dim),
-            Span::styled("│".to_string(), border),
         ]));
     }
-    lines.push(Line::from(vec![
-        indent(),
-        Span::styled(format!("└{}┘", "─".repeat(inner_w)), border),
-    ]));
 
+    if show_tip {
+        lines.push(Line::from(""));
+        lines.push(tip_line);
+    }
     lines.push(Line::from(""));
     lines.push(divider);
     lines.push(Line::from(""));
@@ -10751,9 +10769,28 @@ mod tests {
         assert_eq!(hits[1].template_id, "tasks");
         assert_eq!(hits[0].markdown, "# Investigation\n");
 
-        // Rows stack vertically inside a single grouped list box that starts
-        // right after the description + blank line (inner rect row 1+2).
-        assert_eq!(hits[0].row_start, inner.y + 3);
+        // A "Templates" header line precedes the list, right after the
+        // description + blank line (inner rect row 1+2).
+        let rendered: String = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Templates"), "expected a Templates header: {rendered}");
+        // No borders — plain bulleted rows.
+        for ch in ['┌', '┐', '└', '┘', '│'] {
+            assert!(!rendered.contains(ch), "expected no button borders: {rendered}");
+        }
+        // Both templates are built in, so the custom-template tip should show.
+        // (The tip itself can be truncated on a narrow pane, so check its lead-in
+        // rather than the full sentence.)
+        assert!(
+            rendered.contains("Tip:"),
+            "expected a custom-template tip: {rendered}"
+        );
+
+        // Rows stack vertically starting right after the header + blank line.
+        assert_eq!(hits[0].row_start, inner.y + 4);
         assert_eq!(hits[0].row_end, hits[0].row_start);
         assert_eq!(hits[1].row_start, hits[0].row_start + 1);
         assert!(hits[0].col_start >= inner.x);
@@ -10766,6 +10803,24 @@ mod tests {
         for line in &lines {
             assert!(line.width() <= inner.width as usize);
         }
+    }
+
+    #[test]
+    fn program_empty_placeholder_hides_tip_when_custom_template_exists() {
+        let theme = crate::theme::Theme::default();
+        let mut custom = placeholder_template("mine", "Mine");
+        custom.built_in = false;
+        let templates = vec![placeholder_template("tasks", "Tasks"), custom];
+        let (lines, _) = program_empty_placeholder(&theme, &templates, None, Rect::new(2, 1, 76, 20));
+        let rendered: String = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !rendered.contains("Tip:"),
+            "tip should be hidden once a custom template exists: {rendered}"
+        );
     }
 
     #[test]
@@ -10837,7 +10892,7 @@ mod tests {
         let rows: std::collections::BTreeSet<u16> = hits.iter().map(|h| h.row_start).collect();
         assert_eq!(rows.len(), 5, "expected one row per template");
         for (i, h) in hits.iter().enumerate() {
-            assert_eq!(h.row_start, inner.y + 3 + i as u16);
+            assert_eq!(h.row_start, inner.y + 4 + i as u16);
             assert_eq!(h.row_end, h.row_start);
             assert!(h.contains(h.col_start, h.row_start));
         }
@@ -10889,8 +10944,8 @@ mod tests {
     fn program_empty_placeholder_falls_back_when_narrow() {
         let theme = crate::theme::Theme::default();
         let templates = vec![placeholder_template("tasks", "Tasks")];
-        // Too narrow for an indented bordered list row: plain description + syntax only.
-        let (_, hits) = program_empty_placeholder(&theme, &templates, None, Rect::new(0, 0, 6, 20));
+        // Too narrow to fit even the indent + bullet: plain description + syntax only.
+        let (_, hits) = program_empty_placeholder(&theme, &templates, None, Rect::new(0, 0, 4, 20));
         assert!(hits.is_empty());
     }
 
