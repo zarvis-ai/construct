@@ -1689,14 +1689,16 @@
     line-height: 1.6;
   }
   .program-empty .pe-desc { color: var(--fg-dim); margin-bottom: 14px; max-width: 70ch; }
+  .program-empty .pe-templates-header {
+    font-weight: 600;
+    color: var(--fg);
+    margin-bottom: 6px;
+  }
   .program-empty .pe-templates {
     display: flex;
     flex-direction: column;
     max-width: 46ch;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    overflow: hidden;
-    margin-bottom: 18px;
+    margin-bottom: 10px;
   }
   .program-empty .pe-tmpl {
     display: block;
@@ -1704,18 +1706,17 @@
     background: transparent;
     color: var(--fg);
     border: none;
-    border-bottom: 1px solid var(--border-faint);
-    border-left: 2px solid transparent;
-    padding: 8px 14px;
+    padding: 4px 2px;
     font: inherit;
     font-weight: 600;
     cursor: pointer;
     text-align: left;
   }
-  .program-empty .pe-templates .pe-tmpl:last-child { border-bottom: none; }
-  .program-empty .pe-tmpl:hover { background: var(--bg-elev-2); border-left-color: var(--accent); }
+  .program-empty .pe-tmpl:hover { background: var(--bg-elev-2); }
+  .program-empty .pe-tmpl-bullet { color: var(--fg-faint); margin-right: 4px; }
   .program-empty .pe-tmpl .pe-tmpl-desc { display: block; font-weight: 400;
-    color: var(--fg-faint); font-size: 12px; margin-top: 3px; }
+    color: var(--fg-faint); font-size: 12px; margin-top: 3px; margin-left: 16px; }
+  .program-empty .pe-templates-tip { color: var(--fg-faint); font-size: 12.5px; max-width: 70ch; margin-bottom: 18px; }
   .program-empty .pe-divider { border-top: 1px solid var(--border-faint); margin: 14px 0; }
   .program-empty .pe-syntax { color: var(--fg-faint); font-size: 12.5px; max-width: 78ch; }
   .program-empty .pe-syntax code { color: var(--accent-alt); }
@@ -4475,13 +4476,17 @@ function programRenderEmpty() {
     .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
   let html = '<div class="pe-desc">Program — a shared Markdown space you and your agents edit and run together.</div>';
   if (tmpls.length) {
+    html += '<div class="pe-templates-header">Templates</div>';
     html += '<div class="pe-templates">';
     for (const t of tmpls) {
-      html += `<button type="button" class="pe-tmpl" data-tmpl="${escape(t.id)}">${escape(t.name)}`;
+      html += `<button type="button" class="pe-tmpl" data-tmpl="${escape(t.id)}"><span class="pe-tmpl-bullet">*</span>${escape(t.name)}`;
       if (t.description) html += `<span class="pe-tmpl-desc">${escape(t.description)}</span>`;
       html += "</button>";
     }
     html += "</div>";
+    if (tmpls.every((t) => t.built_in)) {
+      html += '<div class="pe-templates-tip">Tip: drop a .md file in ~/.local/share/construct/program/templates to add a custom template.</div>';
+    }
   }
   html += '<div class="pe-divider"></div>';
   html += '<div class="pe-syntax">Syntax: <code>@{session:id}</code> embeds a session · <code>@{harness:name}</code> delegates · select text + Run dispatches · <code>:::clip … :::</code> groups output.</div>';
