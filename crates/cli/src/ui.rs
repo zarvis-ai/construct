@@ -3039,7 +3039,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .is_some_and(|s| app.open_program_session_ids().iter().any(|id| id == &s.id));
     let mode_glyph = summary.as_ref().map(|s| {
         if program_open {
-            program_mode_glyph()
+            session_mode_glyph(app, s, program_mode_glyph())
         } else {
             session_status_glyph(app, s)
         }
@@ -3053,14 +3053,20 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .saturating_sub(harness_w)
         .saturating_sub(close_w)
         .saturating_sub(3 + glyph_w);
-    let title = match (summary.as_ref(), group.as_ref()) {
-        (Some(s), _) => format!(
-            " {} {} ",
-            mode_glyph.unwrap_or(""),
-            truncate_to_width(&primary_label(s), label_budget),
-        ),
-        (None, Some(g)) => format!(" project: {} ", g.name),
-        (None, None) => " no session ".to_string(),
+    let title: Line<'static> = match (summary.as_ref(), group.as_ref()) {
+        (Some(s), _) => {
+            let glyph_style = session_title_glyph_style(&app.theme, program_open, focused);
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(mode_glyph.unwrap_or(""), glyph_style),
+                Span::raw(format!(
+                    " {} ",
+                    truncate_to_width(&primary_label(s), label_budget)
+                )),
+            ])
+        }
+        (None, Some(g)) => Line::from(format!(" project: {} ", g.name)),
+        (None, None) => Line::from(" no session "),
     };
     // Right-side cluster (widget indicators, harness label, close button) is
     // shared with the program popup so the two title bars can't drift. Close is
@@ -6982,6 +6988,14 @@ fn vt100_color(c: vt100::Color) -> Option<Color> {
 /// bytes within the quiescence window, otherwise the session's static
 /// lifecycle glyph.
 fn session_status_glyph(app: &App, s: &SessionSummary) -> &'static str {
+    session_mode_glyph(app, s, s.state.glyph())
+}
+
+/// Same animation gate as `session_status_glyph`, but with a caller-supplied
+/// static fallback glyph instead of the lifecycle glyph. Lets the Program-open
+/// indicator (a static `▣` otherwise) animate exactly like the normal status
+/// dot while the session is actively working.
+fn session_mode_glyph(app: &App, s: &SessionSummary, static_glyph: &'static str) -> &'static str {
     // `agent_statuses` only holds entries while a turn is active (the live
     // handler removes them on the `active=false` turn-end event), so a
     // present, active entry means smith is working right now.
@@ -6993,7 +7007,7 @@ fn session_status_glyph(app: &App, s: &SessionSummary) -> &'static str {
     if session_should_animate_status(s, app.pty_active(&s.id), agent_active) {
         app.spinner_frame()
     } else {
-        s.state.glyph()
+        static_glyph
     }
 }
 
@@ -7023,6 +7037,19 @@ fn session_should_animate_status(s: &SessionSummary, pty_active: bool, agent_act
         true
     } else {
         pty_active
+    }
+}
+
+/// Style for the session pane title's mode glyph. When the Program view is
+/// open for this session, the glyph takes the program border color instead
+/// of the title's default (uncolored) text, so it reads as part of the
+/// Program frame it toggles into (spec 0045) rather than the plain session
+/// status dot.
+fn session_title_glyph_style(theme: &Theme, program_open: bool, focused: bool) -> Style {
+    if program_open {
+        program_border_style(theme, focused)
+    } else {
+        Style::default()
     }
 }
 
@@ -12626,6 +12653,47 @@ mod tests {
         s.state = SessionState::AwaitingInput;
         // Not Running → never animates, regardless of activity signals.
         assert!(!session_should_animate_status(&s, true, true));
+    }
+
+    #[test]
+    fn program_open_title_glyph_takes_program_border_color() {
+        // When the Program view is open for the selected session, the title
+        // bar's mode glyph (▣ or the animated spinner in its place) must read
+        // as part of the Program frame it toggles into — the program border
+        // color, focus-dimmed the same way `program_border_style` dims the
+        // actual Program pane's border.
+        let theme = Theme::default();
+        let focused = session_title_glyph_style(&theme, true, true);
+        let unfocused = session_title_glyph_style(&theme, true, false);
+        assert_eq!(focused.fg, Some(theme.accent_alt));
+        assert_eq!(unfocused.fg, Some(theme.accent_alt));
+        assert!(!focused.add_modifier.contains(Modifier::DIM));
+        assert!(unfocused.add_modifier.contains(Modifier::DIM));
+    }
+
+    #[test]
+    fn closed_title_glyph_is_unstyled() {
+        // No Program open → the glyph keeps the title's plain default style,
+        // unchanged from before this indicator existed.
+        let theme = Theme::default();
+        assert_eq!(
+            session_title_glyph_style(&theme, false, true),
+            Style::default()
+        );
+        assert_eq!(
+            session_title_glyph_style(&theme, false, false),
+            Style::default()
+        );
+    }
+
+    #[test]
+    fn program_mode_glyph_differs_from_every_spinner_frame() {
+        // `session_mode_glyph` swaps in a spinner frame in place of `▣`
+        // whenever `session_should_animate_status` is true, falling back to
+        // the static `▣` otherwise. If the static glyph ever collided with a
+        // spinner frame, the Program-open indicator would silently stop
+        // appearing to animate.
+        assert!(!crate::app::SPINNER_FRAMES.contains(&program_mode_glyph()));
     }
 
     fn widget(markdown: &str) -> agentd_protocol::UiPanel {
