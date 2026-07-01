@@ -7978,7 +7978,7 @@ fn render_program_popup_at(
         render_program_clip_hover(f, app, rect, &clip_hits);
     }
     if !popup.closing {
-        render_program_shimmer_hover(f, app, popup, rect, scroll_offset, inner, now);
+        render_program_shimmer_hover(f, app, popup, scroll_offset, inner, now);
     }
 }
 
@@ -8114,13 +8114,12 @@ fn session_hover_card_rect(
 /// Render the floating session hover card — a live tail of the session's PTY
 /// output — anchored just below `(anchor_col, anchor_row)` (or above it when
 /// there's no room) and kept inside `modal`. Clears its own area so it overlays
-/// the program body without disturbing it. Shared by the clip-chip hover and the
-/// shimmer-text hover; always laid out wider than it is tall. When `title` is
-/// `Some`, it captions the card's top border (truncated to fit) — the shimmer
-/// hover passes the block's status tooltip so the live preview keeps the
-/// spec-0057 label. Returns `true` when the card actually painted, `false` when
-/// there was nothing to show (unknown session, no captured output yet, or no
-/// room) so a caller can fall back to a plain text tooltip.
+/// the program body without disturbing it. Used by the clip-chip hover, which
+/// previews the referenced session's terminal; always laid out wider than it
+/// is tall. When `title` is `Some`, it captions the card's top border
+/// (truncated to fit). Returns `true` when the card actually painted, `false`
+/// when there was nothing to show (unknown session, no captured output yet, or
+/// no room) so a caller can fall back to a plain text tooltip.
 fn render_session_hover_card(
     f: &mut Frame,
     app: &mut App,
@@ -8190,23 +8189,17 @@ fn render_session_hover_card(
     true
 }
 
-/// Session-preview popover shown while the mouse hovers *shimmering* program text
-/// — a block still running under a program Run. Resolves the shimmering block
-/// under the cursor and paints the shared session card with the *dispatching*
-/// session's live output — the orchestrator running this program, i.e.
-/// `popup.program.session_id` — a cropped terminal view of the work in flight,
-/// captioned with the block's status tooltip (spec 0057). This is the session's
-/// own terminal, never a worker a block happens to name; hovering the
-/// `@{session:…}` clip chip itself is the distinct affordance for previewing a
-/// referenced worker (see `render_program_clip_hover`). When the dispatching
-/// session has produced no output yet, this degrades to the bare text tooltip.
-/// Like the clip-chip hover, it persists for as long as the pointer stays over
-/// the shimmering block.
+/// Status-text tooltip shown while the mouse hovers *shimmering* program text —
+/// a block still running under a program Run. Resolves the shimmering block
+/// under the cursor and paints its concise run-status tooltip (spec 0057), e.g.
+/// "Building PR". Never a session preview: the roll-down Program view already
+/// puts the terminal a scroll away, so shimmer hover stays a plain label.
+/// Hovering the `@{session:…}` clip chip itself is the distinct affordance for
+/// previewing a referenced worker's live output (see `render_program_clip_hover`).
 fn render_program_shimmer_hover(
     f: &mut Frame,
-    app: &mut App,
+    app: &App,
     popup: &crate::app::ProgramPopup,
-    modal: Rect,
     scroll_offset: usize,
     body: Rect,
     now: Instant,
@@ -8215,7 +8208,7 @@ fn render_program_shimmer_hover(
         return;
     };
     // A clip chip under the cursor is owned by `render_program_clip_hover`; don't
-    // double-render the card on top of it.
+    // double-render the tooltip on top of it.
     if app
         .layout
         .program_clip_hits
@@ -8239,27 +8232,15 @@ fn render_program_shimmer_hover(
     ) else {
         return;
     };
-    // The concise status tooltip travels with the shimmer (spec 0057); own it so
-    // the immutable `app` borrow is released before the session card needs `&mut`.
+    // The concise status tooltip travels with the shimmer (spec 0057).
     let tooltip = app
         .program_runs
         .get(&popup.program.session_id)
         .and_then(|run| run.pending_tooltips.get(&block_id))
         .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| {
             t.as_str()
-        })
-        .to_string();
-    // Prefer a cropped live terminal view of the dispatching session — the
-    // orchestrator running this program — captioned with the status tooltip.
-    // Never the session a block happens to name; that's the clip-chip hover's
-    // job.
-    let dispatcher_id = popup.program.session_id.clone();
-    if render_session_hover_card(f, app, modal, &dispatcher_id, mx, my, Some(&tooltip)) {
-        return;
-    }
-    // Nothing captured yet for the dispatcher: keep the spec-0057 text tooltip
-    // as the affordance.
-    render_tooltip_at(f, &app.theme, &tooltip, mx, my, 2, -1);
+        });
+    render_tooltip_at(f, &app.theme, tooltip, mx, my, 2, -1);
 }
 
 fn program_shimmer_block_at(

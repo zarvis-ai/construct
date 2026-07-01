@@ -9269,6 +9269,7 @@ mod tests {
                 cursor: 3,
                 preferred_col: None,
                 scroll_offset: 0,
+                cover_percent: PROGRAM_COVER_PERCENT_DEFAULT,
             },
         );
         app.program_collaborators.insert(
@@ -11508,14 +11509,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_shimmer_hover_shows_dispatching_session_terminal_preview() {
+    async fn program_shimmer_hover_shows_status_text_not_session_preview() {
         use crate::pty_render::ItemHistory;
 
         // Hovering a shimmering block's prose (away from its clip chip) shows
-        // the *dispatching* session's live terminal tail — the orchestrator
-        // running the program — captioned with the block's status tooltip,
-        // instead of the bare text tooltip, and instead of a worker the block
-        // happens to name.
+        // only the block's concise status tooltip. The rolled-down Program view
+        // can expose the terminal directly; session previews remain exclusive
+        // to explicit session clip chips.
         let (mut app, _dir, server) = empty_app().await;
         let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
         let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -11544,8 +11544,6 @@ mod tests {
         inactive_program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         app.program_popups.insert("s1".into(), inactive_program);
 
-        // The dispatching session (s1, the program's own owner) is what the
-        // cropped preview should paint — not the worker (s3) the block names.
         let mut dispatcher_history = ItemHistory::new();
         dispatcher_history.feed_pty(b"SHIMMER_TERMINAL_PREVIEW\nsecond line");
         app.histories.insert("s1".into(), dispatcher_history);
@@ -11586,32 +11584,30 @@ mod tests {
             vertical: 1 + PROGRAM_CONTENT_PADDING_Y,
         });
         // Hover the block's leading text cell — away from the trailing clip chip —
-        // so the shimmer hover (not the clip hover) owns the preview.
+        // so the shimmer hover, not the clip hover, owns the tooltip.
         app.mouse_pos = Some((inner.x, inner.y));
 
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("shimmer hover preview should render");
+            .expect("shimmer hover tooltip should render");
         let text = rendered_text(term.backend().buffer());
         assert!(
-            text.contains("SHIMMER_TERMINAL_PREVIEW"),
-            "hovering shimmering prose should show the dispatching session's terminal tail"
+            text.contains("Building PR"),
+            "hovering shimmering prose should show the block status tooltip"
+        );
+        assert!(
+            !text.contains("SHIMMER_TERMINAL_PREVIEW"),
+            "shimmer hover must not show the dispatching session terminal tail"
         );
         assert!(
             !text.contains("WORKER_TERMINAL_OUTPUT"),
-            "hovering shimmering prose must not show the worker session it names"
-        );
-        assert!(
-            text.contains("Building PR"),
-            "the cropped preview should keep the status tooltip as its caption"
+            "shimmer hover must not show the worker session it names"
         );
         server.abort();
     }
 
     #[tokio::test]
-    async fn program_shimmer_hover_persists_while_pointer_stays_still() {
-        use crate::pty_render::ItemHistory;
-
-        // The shimmer-text hover must persist for as long as the pointer stays
+    async fn program_shimmer_status_tooltip_persists_while_pointer_stays_still() {
+        // The shimmer-text tooltip must persist for as long as the pointer stays
         // over the shimmering block — matching the clip-chip hover — rather than
         // self-dismissing once the pointer has been briefly still.
         let (mut app, _dir, server) = empty_app().await;
@@ -11626,10 +11622,6 @@ mod tests {
         let mut program = program_popup_for_test("s1", markdown, 0);
         program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         app.program_popup = Some(program);
-
-        let mut history = ItemHistory::new();
-        history.feed_pty(b"STILL_HOVERED_PREVIEW\nsecond line");
-        app.histories.insert("s1".into(), history);
 
         let block_id = agentd_protocol::program_block_spans(markdown)
             .into_iter()
@@ -11660,22 +11652,22 @@ mod tests {
         app.mouse_pos = Some((inner.x, inner.y));
 
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("shimmer hover preview should render");
+            .expect("shimmer hover tooltip should render");
         assert!(
-            rendered_text(term.backend().buffer()).contains("STILL_HOVERED_PREVIEW"),
-            "hovering a shimmering block should show its dispatcher preview"
+            rendered_text(term.backend().buffer()).contains("Building PR"),
+            "hovering a shimmering block should show its status tooltip"
         );
 
         // The pointer hasn't moved since the last render, but it also hasn't
         // left the block — real wall-clock time passing alone must not hide
-        // the preview.
+        // the tooltip.
         tokio::time::sleep(Duration::from_millis(1_200)).await;
 
         term.draw(|f| crate::ui::render(f, &mut app))
-            .expect("shimmer hover preview should still render");
+            .expect("shimmer hover tooltip should still render");
         assert!(
-            rendered_text(term.backend().buffer()).contains("STILL_HOVERED_PREVIEW"),
-            "the preview must persist for as long as the pointer stays over the block, \
+            rendered_text(term.backend().buffer()).contains("Building PR"),
+            "the tooltip must persist for as long as the pointer stays over the block, \
              not self-dismiss once it has been briefly still"
         );
         server.abort();
