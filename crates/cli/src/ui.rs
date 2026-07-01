@@ -7452,19 +7452,56 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
         }
     }
     if let Some(popup) = app.program_popup.as_ref() {
-        let base_rect = app
-            .layout
-            .main_window_areas
-            .iter()
-            .find(|hit| hit.id == app.active_window_id)
-            .map(|hit| hit.area)
-            .or(app.layout.view_area)
-            .unwrap_or_else(|| f.area());
+        let base_rect = program_popup_base_rect(
+            &app.layout.main_window_areas,
+            app.active_window_id,
+            app.layout.view_area,
+            &popup.program.session_id,
+            |id| app.selection_for_window(id),
+            f.area(),
+        );
         popups.push((popup.clone(), base_rect, true));
     }
     for (popup, base_rect, active) in popups {
         render_program_popup_at(f, app, &popup, base_rect, active, now);
     }
+}
+
+fn program_popup_base_rect(
+    main_window_areas: &[crate::app::WindowPaneHit],
+    active_window_id: u64,
+    view_area: Option<Rect>,
+    popup_session_id: &str,
+    mut selection_for_window: impl FnMut(u64) -> Option<crate::app::Selection>,
+    fallback: Rect,
+) -> Rect {
+    let active_area = main_window_areas
+        .iter()
+        .find(|hit| hit.id == active_window_id)
+        .map(|hit| hit.area);
+
+    if main_window_areas.iter().any(|hit| {
+        hit.id == active_window_id
+            && matches!(
+                selection_for_window(hit.id),
+                Some(crate::app::Selection::Session(session_id))
+                    if session_id == popup_session_id
+            )
+    }) {
+        return active_area.unwrap_or(fallback);
+    }
+
+    main_window_areas
+        .iter()
+        .find_map(|hit| match selection_for_window(hit.id) {
+            Some(crate::app::Selection::Session(session_id)) if session_id == popup_session_id => {
+                Some(hit.area)
+            }
+            _ => None,
+        })
+        .or(active_area)
+        .or(view_area)
+        .unwrap_or(fallback)
 }
 
 /// Temporal speed of the program Run shimmer wave, in radians/sec.
@@ -11307,6 +11344,90 @@ mod tests {
             style.fg,
             Some(theme.dim),
             "terminal-focused Program frame should not use the dim color"
+        );
+    }
+
+    #[test]
+    fn active_program_popup_uses_owning_split_rect_before_active_window() {
+        let left = Rect::new(0, 0, 50, 30);
+        let right = Rect::new(50, 0, 50, 30);
+        let hits = vec![
+            crate::app::WindowPaneHit {
+                id: 1,
+                area: left,
+                inner_area: left.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                }),
+            },
+            crate::app::WindowPaneHit {
+                id: 2,
+                area: right,
+                inner_area: right.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                }),
+            },
+        ];
+
+        let rect = program_popup_base_rect(
+            &hits,
+            2,
+            None,
+            "s-left",
+            |id| match id {
+                1 => Some(crate::app::Selection::Session("s-left".into())),
+                2 => Some(crate::app::Selection::Session("s-right".into())),
+                _ => None,
+            },
+            Rect::new(0, 0, 100, 30),
+        );
+
+        assert_eq!(
+            rect, left,
+            "a rolled-down Program must stay anchored to its session pane, \
+             even when terminal focus moves to another split"
+        );
+    }
+
+    #[test]
+    fn active_program_popup_keeps_active_rect_when_active_window_owns_session() {
+        let left = Rect::new(0, 0, 50, 30);
+        let right = Rect::new(50, 0, 50, 30);
+        let hits = vec![
+            crate::app::WindowPaneHit {
+                id: 1,
+                area: left,
+                inner_area: left.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                }),
+            },
+            crate::app::WindowPaneHit {
+                id: 2,
+                area: right,
+                inner_area: right.inner(Margin {
+                    horizontal: 1,
+                    vertical: 1,
+                }),
+            },
+        ];
+
+        let rect = program_popup_base_rect(
+            &hits,
+            2,
+            None,
+            "s-shared",
+            |id| match id {
+                1 | 2 => Some(crate::app::Selection::Session("s-shared".into())),
+                _ => None,
+            },
+            Rect::new(0, 0, 100, 30),
+        );
+
+        assert_eq!(
+            rect, right,
+            "when the focused split also owns the Program session, use that split"
         );
     }
 
