@@ -3567,11 +3567,13 @@ impl App {
     /// Worker sessions referenced by a `@{session:…}` smart clip in a program
     /// that is currently on screen — a program restored in a main-window leaf,
     /// or the active program popup. Their PTY history must be warm so the
-    /// program hover preview (spec 0060) — both the shimmer-text card and the
-    /// clip-chip card — can paint a cropped live terminal tail the instant the
-    /// pointer lands. These workers are usually neither selected, pinned, nor
-    /// the orchestrator, so without this nothing else hydrates them and the
-    /// preview silently degrades to the bare text tooltip.
+    /// clip-chip hover preview (spec 0060) can paint a cropped live terminal
+    /// tail the instant the pointer lands on the clip. (The shimmer-text hover
+    /// always targets the program's own dispatching session, which is already
+    /// warm, so it doesn't need this.) These workers are usually neither
+    /// selected, pinned, nor the orchestrator, so without this nothing else
+    /// hydrates them and the clip-chip preview silently degrades to the bare
+    /// text tooltip.
     fn program_referenced_sessions_needing_hydration(&self) -> Vec<String> {
         fn collect_leaf_sessions(node: &MainWindowTree, out: &mut Vec<String>) {
             match node {
@@ -11169,13 +11171,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_shimmer_hover_shows_session_terminal_preview() {
+    async fn program_shimmer_hover_shows_dispatching_session_terminal_preview() {
         use crate::pty_render::ItemHistory;
 
-        // A shimmering block that names a worker session (its first
-        // `@{session:…}` clip) shows that session's live terminal tail — a
-        // cropped preview of the work in flight — captioned with the block's
-        // status tooltip, instead of the bare text tooltip.
+        // Hovering a shimmering block's prose (away from its clip chip) shows
+        // the *dispatching* session's live terminal tail — the orchestrator
+        // running the program — captioned with the block's status tooltip,
+        // instead of the bare text tooltip, and instead of a worker the block
+        // happens to name.
         let (mut app, _dir, server) = empty_app().await;
         let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
         let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -11204,10 +11207,14 @@ mod tests {
         inactive_program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         app.program_popups.insert("s1".into(), inactive_program);
 
-        // The worker session's PTY tail is what the cropped preview should paint.
-        let mut history = ItemHistory::new();
-        history.feed_pty(b"SHIMMER_TERMINAL_PREVIEW\nsecond line");
-        app.histories.insert("s3".into(), history);
+        // The dispatching session (s1, the program's own owner) is what the
+        // cropped preview should paint — not the worker (s3) the block names.
+        let mut dispatcher_history = ItemHistory::new();
+        dispatcher_history.feed_pty(b"SHIMMER_TERMINAL_PREVIEW\nsecond line");
+        app.histories.insert("s1".into(), dispatcher_history);
+        let mut worker_history = ItemHistory::new();
+        worker_history.feed_pty(b"WORKER_TERMINAL_OUTPUT\nsecond line");
+        app.histories.insert("s3".into(), worker_history);
 
         let block_id = agentd_protocol::program_block_spans(markdown)
             .into_iter()
@@ -11251,7 +11258,11 @@ mod tests {
         let text = rendered_text(term.backend().buffer());
         assert!(
             text.contains("SHIMMER_TERMINAL_PREVIEW"),
-            "hovering a shimmering block that names a session should show its terminal tail"
+            "hovering shimmering prose should show the dispatching session's terminal tail"
+        );
+        assert!(
+            !text.contains("WORKER_TERMINAL_OUTPUT"),
+            "hovering shimmering prose must not show the worker session it names"
         );
         assert!(
             text.contains("Building PR"),

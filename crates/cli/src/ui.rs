@@ -8178,11 +8178,14 @@ fn render_session_hover_card(
 
 /// Session-preview popover shown while the mouse hovers *shimmering* program text
 /// — a block still running under a program Run. Resolves the shimmering block
-/// under the cursor and, when that block names a session (its first
-/// `@{session:…}` clip), paints the shared session card with that session's live
-/// output — a cropped terminal view of the work in flight — captioned with the
-/// block's status tooltip (spec 0057). When the block names no session, or that
-/// session has produced no output yet, it degrades to the bare text tooltip.
+/// under the cursor and paints the shared session card with the *dispatching*
+/// session's live output — the orchestrator running this program, i.e.
+/// `popup.program.session_id` — a cropped terminal view of the work in flight,
+/// captioned with the block's status tooltip (spec 0057). This is the session's
+/// own terminal, never a worker a block happens to name; hovering the
+/// `@{session:…}` clip chip itself is the distinct affordance for previewing a
+/// referenced worker (see `render_program_clip_hover`). When the dispatching
+/// session has produced no output yet, this degrades to the bare text tooltip.
 /// Unlike the clip-chip hover, it self-dismisses once the pointer has been still
 /// for [`PROGRAM_SHIMMER_HOVER_IDLE`].
 fn render_program_shimmer_hover(
@@ -8240,103 +8243,17 @@ fn render_program_shimmer_hover(
             t.as_str()
         })
         .to_string();
-    // Prefer a cropped live terminal view of the session this block is working,
-    // captioned with the status tooltip. The resolver helpers mirror the same
-    // wrap/scroll math as the shimmer band, so the hovered cell maps to the same
-    // block the highlight is sweeping.
-    let line_sessions =
-        program_shimmer_line_sessions(Some(app), &popup.buffer, &shimmer.active_lines);
-    let session_id = program_shimmer_session_at(
-        Some(app),
-        &popup.buffer,
-        &line_sessions,
-        scroll_offset,
-        body,
-        mx,
-        my,
-    );
-    if let Some(session_id) = session_id {
-        if render_session_hover_card(f, app, modal, &session_id, mx, my, Some(&tooltip)) {
-            return;
-        }
+    // Prefer a cropped live terminal view of the dispatching session — the
+    // orchestrator running this program — captioned with the status tooltip.
+    // Never the session a block happens to name; that's the clip-chip hover's
+    // job.
+    let dispatcher_id = popup.program.session_id.clone();
+    if render_session_hover_card(f, app, modal, &dispatcher_id, mx, my, Some(&tooltip)) {
+        return;
     }
-    // No session reference, or it has nothing to show yet: keep the spec-0057
-    // text tooltip as the affordance.
+    // Nothing captured yet for the dispatcher: keep the spec-0057 text tooltip
+    // as the affordance.
     render_tooltip_at(f, &app.theme, &tooltip, mx, my, 2, -1);
-}
-
-/// For each source line of `markdown`, the session id of the shimmering block it
-/// belongs to (resolved from the first `@{session:…}` clip in that block), or
-/// `None` for lines outside a shimmering block and shimmering blocks with no
-/// session clip. A block "shimmers" when any of its lines is set in
-/// `active_lines` (the per-source-line mask from [`program_run_shimmer`]).
-fn program_shimmer_line_sessions(
-    app: Option<&App>,
-    markdown: &str,
-    active_lines: &[bool],
-) -> Vec<Option<String>> {
-    let lines: Vec<&str> = markdown.lines().collect();
-    let mut out = vec![None; lines.len()];
-    for block in crate::app::program_blocks(markdown) {
-        let shimmering = (block.start_line..block.end_line)
-            .any(|li| active_lines.get(li).copied().unwrap_or(false));
-        if !shimmering {
-            continue;
-        }
-        let sid = (block.start_line..block.end_line).find_map(|li| {
-            let raw = lines.get(li)?;
-            let (_rendered, clips) = program_rendered_line_with_clips(app, raw);
-            clips.iter().find_map(|clip| {
-                let (kind, id) = program_smart_clip_target(&clip.raw_clip);
-                (kind == "session").then(|| id.to_string())
-            })
-        });
-        if let Some(id) = sid {
-            for li in block.start_line..block.end_line {
-                if let Some(slot) = out.get_mut(li) {
-                    *slot = Some(id.clone());
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Resolve a screen cell over the program body to the session id of the
-/// shimmering block under it, or `None` when the cell isn't on a shimmering
-/// block that references a session. Mirrors the wrap/scroll math of
-/// [`program_session_clip_hits`] so hover targets line up with what's painted.
-fn program_shimmer_session_at(
-    app: Option<&App>,
-    markdown: &str,
-    line_sessions: &[Option<String>],
-    scroll_offset: usize,
-    area: Rect,
-    col: u16,
-    row: u16,
-) -> Option<String> {
-    if area.width == 0 || area.height == 0 {
-        return None;
-    }
-    if col < area.x || col >= area.x.saturating_add(area.width) {
-        return None;
-    }
-    if row < area.y || row >= area.y.saturating_add(area.height) {
-        return None;
-    }
-    let target_abs_row = scroll_offset.saturating_add((row - area.y) as usize);
-    let width = area.width as usize;
-    let mut visual_row_base = 0usize;
-    for (i, raw) in markdown.lines().enumerate() {
-        let (rendered, _clips) = program_rendered_line_with_clips(app, raw);
-        let rows = program_wrap_row_starts(&rendered, width).len();
-        let next_base = visual_row_base.saturating_add(rows);
-        if target_abs_row >= visual_row_base && target_abs_row < next_base {
-            return line_sessions.get(i).cloned().flatten();
-        }
-        visual_row_base = next_base;
-    }
-    None
 }
 
 fn program_shimmer_block_at(
@@ -10596,73 +10513,6 @@ mod tests {
         assert_eq!(
             rect.y, 28,
             "card should flip above the mouse near the bottom"
-        );
-    }
-
-    #[test]
-    fn program_shimmer_line_sessions_maps_block_to_its_session() {
-        // An item with a wrapped continuation line is one block; only it
-        // shimmers. Every line of the shimmering block resolves to the session
-        // its clip references; the settled item and the blank separator resolve
-        // to nothing.
-        let md = "- working @{session:s1}\n  detail line\n\n- idle @{session:s2}";
-        let active = [true, true, false, false];
-        let got = program_shimmer_line_sessions(None, md, &active);
-        assert_eq!(
-            got,
-            vec![Some("s1".to_string()), Some("s1".to_string()), None, None]
-        );
-    }
-
-    #[test]
-    fn program_shimmer_line_sessions_ignores_blocks_without_a_session_clip() {
-        // A shimmering block with no session clip yields no hover target.
-        let md = "just running prose\nmore prose";
-        let active = [true, true];
-        assert_eq!(
-            program_shimmer_line_sessions(None, md, &active),
-            vec![None, None]
-        );
-    }
-
-    #[test]
-    fn program_shimmer_session_at_resolves_cursor_to_block_session() {
-        let area = Rect::new(0, 0, 80, 6);
-        let md = "- working @{session:s1}\n  detail line\n\n- idle @{session:s2}";
-        let line_sessions = vec![Some("s1".to_string()), Some("s1".to_string()), None, None];
-        // Both lines of the shimmering block resolve to s1.
-        assert_eq!(
-            program_shimmer_session_at(None, md, &line_sessions, 0, area, 5, 0),
-            Some("s1".to_string())
-        );
-        assert_eq!(
-            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 1),
-            Some("s1".to_string())
-        );
-        // The settled block and out-of-body cells resolve to nothing.
-        assert_eq!(
-            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 3),
-            None
-        );
-        assert_eq!(
-            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 99),
-            None
-        );
-    }
-
-    #[test]
-    fn program_shimmer_session_at_tracks_scroll_offset() {
-        // A target on the third logical row follows the viewport when scrolled.
-        let area = Rect::new(0, 0, 80, 6);
-        let md = "l0\nl1\n@{session:s2}";
-        let line_sessions = vec![None, None, Some("s2".to_string())];
-        assert_eq!(
-            program_shimmer_session_at(None, md, &line_sessions, 0, area, 0, 2),
-            Some("s2".to_string())
-        );
-        assert_eq!(
-            program_shimmer_session_at(None, md, &line_sessions, 2, area, 0, 0),
-            Some("s2".to_string())
         );
     }
 
