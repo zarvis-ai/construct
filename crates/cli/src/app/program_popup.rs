@@ -40,6 +40,7 @@ impl App {
                 // back to the list for navigation while the program stays
                 // visible (see the focus gate in `on_key`).
                 self.focus = PaneFocus::View;
+                self.program_terminal_focus = false;
                 self.set_status(format!("program opened at version {version}"));
                 // Live reload: the daemon re-reads the templates dir on every
                 // call, but the client caches the list. Kick off a non-blocking
@@ -527,6 +528,7 @@ impl App {
         // session's program restores them (the popup itself is dropped once the
         // close animation lapses — see `render_program_popup`).
         self.remember_program_view_state();
+        self.program_terminal_focus = false;
         if let Some(popup) = self.program_popup.as_mut() {
             self.program_popups.remove(&popup.program.session_id);
             let now = Instant::now();
@@ -546,6 +548,7 @@ impl App {
                     cursor: popup.cursor,
                     preferred_col: popup.preferred_col,
                     scroll_offset: popup.scroll_offset,
+                    cover_percent: popup.cover_percent,
                 },
             );
         }
@@ -561,6 +564,10 @@ impl App {
             popup.cursor = memory.cursor.min(popup.buffer.chars().count());
             popup.preferred_col = memory.preferred_col;
             popup.scroll_offset = memory.scroll_offset;
+            popup.cover_percent = memory.cover_percent.clamp(
+                crate::app::PROGRAM_COVER_PERCENT_MIN,
+                crate::app::PROGRAM_COVER_PERCENT_MAX,
+            );
         }
     }
 }

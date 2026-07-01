@@ -7405,6 +7405,8 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_title_close_hit = None;
     app.layout.program_selection_run_hit = None;
     app.layout.program_inner_area = None;
+    app.layout.program_base_area = None;
+    app.layout.program_resize_hit = None;
     app.layout.program_smart_clip_anchor = None;
     app.layout.program_clip_hits.clear();
     if app
@@ -7441,7 +7443,6 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
             .map(|hit| hit.area)
             .or(app.layout.view_area)
             .unwrap_or_else(|| f.area());
-        app.layout.modal_area = Some(base_rect);
         popups.push((popup.clone(), base_rect, true));
     }
     for (popup, base_rect, active) in popups {
@@ -7455,6 +7456,16 @@ const PROGRAM_SHIMMER_SPEED: f32 = 4.2;
 /// band spans roughly `2π / DENSITY` characters, so ~0.18 gives a highlight
 /// band ~35 chars wide travelling through the running region.
 const PROGRAM_SHIMMER_DENSITY: f32 = 0.18;
+
+fn program_roll_down_height(base_height: u16, cover_percent: u16) -> u16 {
+    let percent = cover_percent.clamp(
+        crate::app::PROGRAM_COVER_PERCENT_MIN,
+        crate::app::PROGRAM_COVER_PERCENT_MAX,
+    );
+    let wanted = ((base_height as u32 * percent as u32) + 50) / 100;
+    let min_height = base_height.min(8).max(1) as u32;
+    wanted.clamp(min_height, base_height.max(1) as u32) as u16
+}
 
 /// Which source lines of a program are shimmering, plus the wave phase (spec
 /// 0042). Derived from the session's `ProgramRun` at render time.
@@ -7758,7 +7769,8 @@ fn render_program_popup_at(
     if progress <= 0.0 {
         return;
     }
-    let visible_h = ((base_rect.height as f32 * progress).ceil() as u16).clamp(1, base_rect.height);
+    let target_h = program_roll_down_height(base_rect.height, popup.cover_percent);
+    let visible_h = ((target_h as f32 * progress).ceil() as u16).clamp(1, target_h);
     if visible_h == 0 {
         return;
     }
@@ -7792,7 +7804,11 @@ fn render_program_popup_at(
     let title = program_title_line(app, popup, active, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
 
-    let border_style = program_border_style(&app.theme, active);
+    let border_style = if active && app.program_terminal_focus {
+        Style::default().fg(app.theme.dim)
+    } else {
+        program_border_style(&app.theme, active)
+    };
     // The session-actions ☰ icon should read as part of the program frame, so its
     // base hue tracks the program border color (accent_alt) rather than the
     // default session-view close color. Focus dimming + hover still compose via
@@ -7815,6 +7831,14 @@ fn render_program_popup_at(
         block,
     );
     if active {
+        app.layout.modal_area = Some(rect);
+        app.layout.program_base_area = Some(base_rect);
+        app.layout.program_resize_hit = Some(Rect {
+            x: rect.x,
+            y: rect.y + rect.height.saturating_sub(1),
+            width: rect.width,
+            height: 1,
+        });
         // Run lives in the left cluster; the close button and widget icons reuse
         // the shared session-view geometry (`view_close_button_range` and
         // `dynamic_ui_widget_hits` from `render_session_widget_title`) so the
@@ -8428,7 +8452,11 @@ fn program_title_line<'a>(
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
     let toggle_glyph = program_mode_glyph();
-    let border_style = program_border_style(&app.theme, active);
+    let border_style = if active && app.program_terminal_focus {
+        Style::default().fg(app.theme.dim)
+    } else {
+        program_border_style(&app.theme, active)
+    };
     let program_style = program_toggle_style(app, popup, active);
     let modified_style = Style::default()
         .fg(app.theme.warning)

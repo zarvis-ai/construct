@@ -34,12 +34,26 @@ impl App {
 
     pub(super) async fn handle_program_mouse(&mut self, ev: &MouseEvent) -> bool {
         use crossterm::event::MouseButton;
-        let Some(modal) = self.layout.modal_area else {
-            return false;
-        };
         if self.program_popup.is_none() {
             return false;
         }
+        if self.resizing_program_popup.is_some() {
+            match ev.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.resize_program_popup_to_row(ev.row);
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.resize_program_popup_to_row(ev.row);
+                    self.resizing_program_popup = None;
+                    return true;
+                }
+                _ => return true,
+            }
+        }
+        let Some(modal) = self.layout.modal_area else {
+            return false;
+        };
         if let Some(menu) = self.session_title_menu.clone() {
             if let Some(action) = menu.item_at(ev.column, ev.row) {
                 if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -60,6 +74,15 @@ impl App {
             && ev.row >= modal.y
             && ev.row < modal.y.saturating_add(modal.height);
         if !contains {
+            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+                && self
+                    .layout
+                    .program_base_area
+                    .is_some_and(|base| Self::rect_contains(base, ev.column, ev.row))
+            {
+                self.focus = PaneFocus::View;
+                self.program_terminal_focus = true;
+            }
             return false;
         }
         // A left click anywhere inside the program modal reclaims keyboard focus
@@ -73,6 +96,16 @@ impl App {
         // click switches sessions, so that case still behaves correctly.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.focus = PaneFocus::View;
+            self.program_terminal_focus = false;
+        }
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
+            && self
+                .layout
+                .program_resize_hit
+                .is_some_and(|hit| Self::rect_contains(hit, ev.column, ev.row))
+        {
+            self.resizing_program_popup = Some(());
+            return true;
         }
         let title_run_hit = self.layout.program_title_run_hit;
         let title_toggle_hit = self.layout.program_title_toggle_hit;
@@ -255,6 +288,25 @@ impl App {
             }
             _ => true,
         }
+    }
+
+    fn resize_program_popup_to_row(&mut self, row: u16) {
+        let Some(base) = self.layout.program_base_area else {
+            return;
+        };
+        let Some(popup) = self.program_popup.as_mut() else {
+            return;
+        };
+        let max_h = base.height.max(1);
+        let raw_h = row.saturating_sub(base.y).saturating_add(1).clamp(1, max_h);
+        let min_h = max_h.min(8).max(1);
+        let height = raw_h.clamp(min_h, max_h);
+        let percent = ((height as u32 * 100) + (max_h as u32 / 2)) / max_h as u32;
+        popup.cover_percent = (percent as u16).clamp(
+            crate::app::PROGRAM_COVER_PERCENT_MIN,
+            crate::app::PROGRAM_COVER_PERCENT_MAX,
+        );
+        self.program_terminal_focus = false;
     }
 
     pub(super) async fn handle_program_key(&mut self, key: KeyEvent) {

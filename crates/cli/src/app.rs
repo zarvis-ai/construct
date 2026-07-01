@@ -973,6 +973,11 @@ pub struct App {
     /// Split-window divider drag: parent split id, direction, drag-start
     /// coordinate, drag-start ratio, and parent split area.
     pub resizing_main_window: Option<(u64, WindowSplitDirection, u16, u16, ratatui::layout::Rect)>,
+    pub resizing_program_popup: Option<()>,
+    /// True when the active Program is rolled down but the exposed terminal has
+    /// keyboard focus. The Program remains visible, but keys flow to the
+    /// underlying session instead of editing Program Markdown.
+    pub program_terminal_focus: bool,
     /// User has collapsed the session list pane via the `−` button
     /// on its title bar. Effective only when the list pane doesn't
     /// have focus — when focus is on the list (e.g. via `C-x o`),
@@ -1525,6 +1530,10 @@ pub struct ProgramPopup {
     /// rows skipped off the top so the body can scroll when it overflows the
     /// viewport. Cursor moves follow the caret; the mouse wheel scrolls freely.
     pub scroll_offset: usize,
+    /// Percent of the owning pane height covered by the roll-down Program
+    /// surface. Defaults to roughly two thirds so the bottom third of the
+    /// session terminal remains visible.
+    pub cover_percent: u16,
 }
 
 /// Caret + scroll of a program view, remembered across a hide→show cycle. When
@@ -1543,7 +1552,12 @@ pub struct ProgramViewMemory {
     /// Vertical scroll offset in wrapped rows. An out-of-range value is clamped
     /// by the renderer, so a shrunk document can't scroll past its end.
     pub scroll_offset: usize,
+    pub cover_percent: u16,
 }
+
+pub(crate) const PROGRAM_COVER_PERCENT_DEFAULT: u16 = 67;
+pub(crate) const PROGRAM_COVER_PERCENT_MIN: u16 = 30;
+pub(crate) const PROGRAM_COVER_PERCENT_MAX: u16 = 100;
 
 /// In-flight program Run animation state for one session (spec 0042). Present
 /// while a program Run this client issued is believed to still be executing in
@@ -2043,6 +2057,10 @@ pub struct LayoutSnapshot {
     /// Cursor-move handlers and the mouse wheel read its width/height to keep
     /// the caret on-screen and to bound scrolling; `None` when no program is open.
     pub program_inner_area: Option<ratatui::layout::Rect>,
+    /// Full pane rect the active Program is rolled down inside.
+    pub program_base_area: Option<ratatui::layout::Rect>,
+    /// Bottom border row of the active Program; dragging it resizes coverage.
+    pub program_resize_hit: Option<ratatui::layout::Rect>,
     /// `@`-smart-clip anchor from the last frame: the editor cursor `Position`
     /// the inline picker hangs from, plus the program's inner `Rect`. The
     /// session-picker dialog reads this to render its `@`→session variant in
@@ -2387,6 +2405,8 @@ async fn run_with_socket_initial_selection(
         matrix_rain_h: persisted.matrix_rain_h,
         resizing_matrix_rain: None,
         resizing_main_window: None,
+        resizing_program_popup: None,
+        program_terminal_focus: false,
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
@@ -6556,6 +6576,7 @@ impl App {
         if self.program_popup.is_some()
             && self.minibuffer.is_none()
             && self.focus == PaneFocus::View
+            && !self.program_terminal_focus
         {
             if self.handle_program_global_key(key).await {
                 return;
@@ -8655,6 +8676,7 @@ fn program_popup_from_document(
         hide_after: now + Duration::from_secs(365 * 24 * 60 * 60),
         closing: false,
         scroll_offset: 0,
+        cover_percent: PROGRAM_COVER_PERCENT_DEFAULT,
     }
 }
 
@@ -8970,6 +8992,8 @@ mod tests {
             program_title_close_hit: None,
             program_selection_run_hit: None,
             program_inner_area: None,
+            program_base_area: None,
+            program_resize_hit: None,
             program_smart_clip_anchor: None,
             program_clip_hits: Vec::new(),
             program_template_hits: Vec::new(),
@@ -9061,6 +9085,8 @@ mod tests {
             matrix_rain_h: None,
             resizing_matrix_rain: None,
             resizing_main_window: None,
+            resizing_program_popup: None,
+            program_terminal_focus: false,
             list_collapsed: false,
             tasks_popup: None,
             session_picker: None,
@@ -9173,6 +9199,7 @@ mod tests {
             hide_after: now + Duration::from_secs(60),
             closing: false,
             scroll_offset: 0,
+            cover_percent: PROGRAM_COVER_PERCENT_DEFAULT,
         }
     }
 
@@ -10895,6 +10922,125 @@ mod tests {
         assert!(
             text.contains("ZZWIDGET"),
             "pinned widget body should render on top of the program: {text:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_defaults_to_roll_down_with_terminal_visible() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "# program\n\nbody", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 45);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let base = app.layout.program_base_area.expect("program base area");
+        let modal = app.layout.modal_area.expect("program modal area");
+        assert_eq!(modal.y, base.y);
+        assert_eq!(modal.width, base.width);
+        assert!(
+            modal.height < base.height,
+            "default Program should leave terminal visible: modal={modal:?} base={base:?}"
+        );
+        assert_eq!(
+            app.layout.program_resize_hit,
+            Some(Rect::new(
+                modal.x,
+                modal.y + modal.height - 1,
+                modal.width,
+                1
+            )),
+            "Program bottom border should be the resize hit row"
+        );
+        assert!(
+            (modal.height as i32 - ((base.height as i32 * 67 + 50) / 100)).abs() <= 1,
+            "default Program coverage should be about two thirds: modal={modal:?} base={base:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_bottom_border_drag_resizes_coverage() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        app.layout.program_base_area = Some(Rect::new(20, 0, 80, 30));
+        app.layout.modal_area = Some(Rect::new(20, 0, 80, 20));
+        app.layout.program_resize_hit = Some(Rect::new(20, 19, 80, 1));
+
+        assert!(
+            app.handle_program_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 40,
+                row: 19,
+                modifiers: KeyModifiers::NONE,
+            })
+            .await,
+            "resize border should consume mouse down"
+        );
+        assert!(app.resizing_program_popup.is_some());
+
+        app.handle_program_mouse(&MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 40,
+            row: 28,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert_eq!(app.program_popup.as_ref().unwrap().cover_percent, 97);
+
+        app.handle_program_mouse(&MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 40,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert!(app.resizing_program_popup.is_none());
+        assert_eq!(app.program_popup.as_ref().unwrap().cover_percent, 30);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clicking_exposed_terminal_focuses_terminal_without_hiding_program() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        app.focus = PaneFocus::View;
+        app.layout.program_base_area = Some(Rect::new(20, 0, 80, 30));
+        app.layout.modal_area = Some(Rect::new(20, 0, 80, 20));
+
+        let consumed = app
+            .handle_program_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 40,
+                row: 24,
+                modifiers: KeyModifiers::NONE,
+            })
+            .await;
+
+        assert!(!consumed, "exposed terminal click should fall through");
+        assert!(app.program_terminal_focus);
+        assert!(app.program_popup.is_some(), "Program remains visible");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().buffer,
+            "draft",
+            "terminal-focused keys must not edit Program Markdown"
         );
         server.abort();
     }
