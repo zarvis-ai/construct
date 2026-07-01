@@ -7804,14 +7804,10 @@ fn render_program_popup_at(
     let title = program_title_line(app, popup, active, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
 
-    let border_style = if active && app.program_terminal_focus {
-        Style::default().fg(app.theme.dim)
-    } else {
-        program_border_style(&app.theme, active)
-    };
-    // The session-actions ☰ icon should read as part of the program frame, so its
-    // base hue tracks the program border color (accent_alt) rather than the
-    // default session-view close color. Focus dimming + hover still compose via
+    let border_style = program_frame_style(&app.theme, active, app.program_terminal_focus);
+    // The session-actions ☰ icon should read as part of the visible frame, so its
+    // base hue tracks the current frame color rather than the default
+    // session-view close color. Focus dimming + hover still compose via
     // `session_menu_icon_style` (focused → border hue, unfocused → dimmed, hover
     // wins).
     let menu_icon_color = border_style.fg.unwrap_or(app.theme.accent_alt);
@@ -8366,6 +8362,14 @@ fn program_border_style(theme: &Theme, active: bool) -> Style {
     }
 }
 
+fn program_frame_style(theme: &Theme, active: bool, terminal_focus: bool) -> Style {
+    if active && terminal_focus {
+        pane_border_style(theme, true)
+    } else {
+        program_border_style(theme, active)
+    }
+}
+
 /// Column geometry for the program title bar's LEFT cluster — the truncated
 /// session label, the Run button (now wedged between the name and the dirty
 /// marker), and the `modified` marker. Both the title renderer and the tooltip
@@ -8452,11 +8456,7 @@ fn program_title_line<'a>(
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
     let toggle_glyph = program_mode_glyph();
-    let border_style = if active && app.program_terminal_focus {
-        Style::default().fg(app.theme.dim)
-    } else {
-        program_border_style(&app.theme, active)
-    };
+    let border_style = program_frame_style(&app.theme, active, app.program_terminal_focus);
     let program_style = program_toggle_style(app, popup, active);
     let modified_style = Style::default()
         .fg(app.theme.warning)
@@ -11234,6 +11234,27 @@ mod tests {
             "inactive program border should dim without switching hue"
         );
         assert_ne!(active_program.fg, pane_border_style(&theme, true).fg);
+    }
+
+    #[test]
+    fn terminal_focused_program_frame_uses_focused_session_border() {
+        let theme = Theme::default();
+        let style = program_frame_style(&theme, true, true);
+
+        assert_eq!(
+            style.fg,
+            pane_border_style(&theme, true).fg,
+            "terminal-focused rolled-down Program should read as a focused session pane"
+        );
+        assert!(
+            !style.add_modifier.contains(Modifier::DIM),
+            "terminal-focused Program frame must not look unfocused"
+        );
+        assert_ne!(
+            style.fg,
+            Some(theme.dim),
+            "terminal-focused Program frame should not use the dim color"
+        );
     }
 
     #[test]

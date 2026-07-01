@@ -9269,6 +9269,7 @@ mod tests {
                 cursor: 3,
                 preferred_col: None,
                 scroll_offset: 0,
+                cover_percent: PROGRAM_COVER_PERCENT_DEFAULT,
             },
         );
         app.program_collaborators.insert(
