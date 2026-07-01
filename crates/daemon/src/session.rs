@@ -69,6 +69,7 @@ const RESPAWN_REDRAW_MAX_WAIT: Duration = Duration::from_secs(6);
 /// settle lets its render/state update land so the trailing `\r` is read as
 /// a clean submit keypress rather than being coalesced into the paste.
 const PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY: Duration = Duration::from_millis(120);
+const PROGRAM_CURSOR_TTL_MS: i64 = 60 * 1000;
 /// How long an interactive full-screen TUI harness's PTY may be silent before
 /// the daemon treats it as awaiting input. Line-oriented shells use
 /// foreground-process-group detection in the adapter and are exempt.
@@ -1091,12 +1092,13 @@ impl SessionManager {
     }
 
     pub fn program_collaborators(&self, session_id: &str) -> Vec<agentd_protocol::ProgramCursor> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
         self.program_cursors
             .lock()
             .map(|cursors| {
                 cursors
                     .values()
-                    .filter(|cursor| cursor.active && cursor.session_id == session_id)
+                    .filter(|cursor| program_cursor_is_visible(cursor, session_id, now_ms))
                     .cloned()
                     .collect()
             })
@@ -2836,6 +2838,16 @@ impl SessionManager {
             }));
         Ok(())
     }
+}
+
+fn program_cursor_is_visible(
+    cursor: &agentd_protocol::ProgramCursor,
+    session_id: &str,
+    now_ms: i64,
+) -> bool {
+    cursor.active
+        && cursor.session_id == session_id
+        && now_ms.saturating_sub(cursor.updated_at_ms) <= PROGRAM_CURSOR_TTL_MS
 }
 
 /// Shell out to `construct-adapter-smith --title-mode "<prompt>"`, capture
@@ -5169,6 +5181,28 @@ mod tests {
             }
             other => panic!("unexpected broadcast: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn program_cursor_presence_expires_from_snapshots_after_inactivity() {
+        let (mgr, _storage, id) = program_test_mgr("- one\n").await;
+        let cursor = put_program_cursor(&mgr, &id, 7, "tui", 3).await;
+        assert_eq!(cursor.client_id, "c7");
+        assert_eq!(mgr.program_collaborators(&id).len(), 1);
+
+        if let Ok(mut cursors) = mgr.program_cursors.lock() {
+            let cursor = cursors.get_mut(&7).expect("stored cursor");
+            cursor.updated_at_ms = chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_sub(PROGRAM_CURSOR_TTL_MS + 1);
+        }
+
+        assert!(mgr.program_collaborators(&id).is_empty());
+        let get = mgr.program_get(&id).await.expect("program get");
+        assert!(
+            get.collaborators.is_empty(),
+            "program.get should not return stale collaborators"
+        );
     }
 
     async fn put_program_cursor(

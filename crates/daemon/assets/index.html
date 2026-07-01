@@ -3914,7 +3914,7 @@ function programRenderCursors() {
   for (const cursor of state.program.collaboratorById.values()) {
     if (!cursor.active || cursor.session_id !== id) continue;
     if (cursor.client_id && cursor.client_id === state.program.ownClientId) continue;
-    if (now - (cursor.updated_at_ms || 0) > 30000) continue;
+    if (now - (cursor.updated_at_ms || 0) > 60000) continue;
     const rect = programCursorRectForOffset(cursor.cursor || 0);
     if (!rect) continue;
     const el = document.createElement("div");

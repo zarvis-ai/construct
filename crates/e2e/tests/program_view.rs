@@ -631,6 +631,10 @@ async fn web_program_view_full_parity() {
               document.execCommand("insertText", false, "X");
               await new Promise((r) => setTimeout(r, 120));
               handleProgramCursor({ cursor: { session_id: "s-collab", client_id: "peer-1", label: "TUI", kind: "tui", cursor: 1, color_index: 2, updated_at_ms: Date.now(), active: true } });
+              // A peer that stopped publishing over a minute ago must not
+              // render, even though the daemon never sent an explicit
+              // tombstone for it (e.g. the peer's connection is just idle).
+              handleProgramCursor({ cursor: { session_id: "s-collab", client_id: "peer-2", label: "Stale", kind: "tui", cursor: 2, color_index: 3, updated_at_ms: Date.now() - 61000, active: true } });
               return {
                 text: programSerialize(),
                 editCount: window.__programEdits.length,
@@ -662,7 +666,7 @@ async fn web_program_view_full_parity() {
     );
     assert_eq!(
         collab["remoteCursorCount"], 1,
-        "remote cursor overlay should render: {collab:?}"
+        "remote cursor overlay should render only the live peer, not the stale one: {collab:?}"
     );
     assert_eq!(collab["remoteLabel"], "TUI", "{collab:?}");
 

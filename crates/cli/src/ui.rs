@@ -4,7 +4,8 @@ use crate::app::{
     App, HarnessHit, HintZone, ListItem as AppListItem, MainWindowTree, Minibuffer,
     MinibufferIntent, PaneFocus, ScreenPoint, Selection, SessionTitleMenuAction,
     TextSelectionRange, ViewMode, WindowDividerHit, WindowPaneHit, WindowSplitDirection, ZoomMode,
-    PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y, PROGRAM_REVEAL_MS,
+    PROGRAM_COLLAB_CURSOR_TTL_MS, PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y,
+    PROGRAM_REVEAL_MS,
 };
 use crate::keymap::KeyAction;
 use crate::text_util::wrap_to_width;
@@ -7975,8 +7976,12 @@ fn render_program_collab_cursors(
     inner: Rect,
 ) {
     let max_cursor = popup.buffer.chars().count();
+    let now_ms = chrono::Utc::now().timestamp_millis();
     for cursor in app.program_collaborators.values() {
         if !cursor.active || cursor.session_id != popup.program.session_id {
+            continue;
+        }
+        if now_ms.saturating_sub(cursor.updated_at_ms) > PROGRAM_COLLAB_CURSOR_TTL_MS {
             continue;
         }
         if app.own_program_client_id.as_deref() == Some(cursor.client_id.as_str()) {
