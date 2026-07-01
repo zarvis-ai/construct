@@ -1000,6 +1000,22 @@ pub struct App {
     /// re-render in a split), yet its caret/scroll must still survive a
     /// hide→show cycle. Keyed by session id; consumed on the next open.
     pub program_view_memory: HashMap<String, ProgramViewMemory>,
+    /// User-preferred height (in cells) the active program covers of its pane.
+    /// `None` = default to rolling down so about ⅓ of the pane's height stays
+    /// revealed underneath. Adjustable by dragging the program's bottom
+    /// border; clamped to the pane's current height at render time. Persisted
+    /// across launches, mirroring `pin_strip_h`.
+    pub program_view_h: Option<u16>,
+    /// `Some((anchor_row, anchor_height))` while the user drags the active
+    /// program's bottom border to resize how much of the pane it covers.
+    pub resizing_program_view: Option<(u16, u16)>,
+    /// While `true`, a click landed in the session view revealed below a
+    /// rolled-down program rather than on the program body itself: keystrokes
+    /// route to the session's PTY instead of the program editor even though
+    /// `focus == View` and the program stays visible. Cleared whenever the
+    /// user clicks back into the program, or whenever the active program
+    /// changes (open, close, or selection switch).
+    pub program_terminal_focus: bool,
     /// In-flight program Run animations, keyed by session id (spec 0042). An
     /// entry means a program Run is believed to still be executing for that
     /// session; it drives the shimmer over the executed Markdown.
@@ -1833,6 +1849,28 @@ pub const LIST_PANEL_W_COLLAPSED: u16 = 0;
 pub const PIN_STRIP_H_MIN: u16 = 3;
 pub const PIN_STRIP_H_MAX: u16 = 40;
 
+/// Bounds for the active program's user-adjustable cover height. The minimum
+/// keeps the border + title + one content row visible; the maximum always
+/// leaves at least `PROGRAM_VIEW_REVEAL_MIN` rows of the session view exposed
+/// underneath, so dragging the program's bottom border can never fully
+/// re-cover the session — that's what the hide/show toggle is for.
+pub const PROGRAM_VIEW_H_MIN: u16 = 4;
+pub const PROGRAM_VIEW_REVEAL_MIN: u16 = 2;
+
+/// How much of `total_h` the active program covers at rest: `override_h` if
+/// the user has dragged its bottom border, otherwise a default that leaves
+/// about a third of the pane revealed underneath (spec: roll down on open so
+/// the underlying session stays reachable). Re-clamped every frame against
+/// the pane's *current* height, so a stale drag from a since-resized terminal
+/// never starves the revealed strip or the program itself.
+pub(crate) fn program_view_target_height(total_h: u16, override_h: Option<u16>) -> u16 {
+    let max_h = total_h.saturating_sub(PROGRAM_VIEW_REVEAL_MIN);
+    let default_h = total_h.saturating_sub((total_h / 3).max(PROGRAM_VIEW_REVEAL_MIN));
+    override_h
+        .unwrap_or(default_h)
+        .clamp(PROGRAM_VIEW_H_MIN, max_h.max(PROGRAM_VIEW_H_MIN))
+}
+
 /// Matrix-rain panel height in terminal rows. The product request was
 /// "about 200px"; terminal UIs do not know pixel height, so the default is
 /// a compact 12-row panel and render-time clamping shrinks it on short panes.
@@ -2039,6 +2077,12 @@ pub struct LayoutSnapshot {
     pub program_title_close_hit: Option<(u16, u16, u16)>,
     /// Program selected-text context Run button bounds: `(x_start, x_end, y)`.
     pub program_selection_run_hit: Option<(u16, u16, u16)>,
+    /// The active program popup's own rendered bounds from the last frame —
+    /// its border rect, which may cover only part of its pane while rolled
+    /// down. Mouse hit-testing uses this (not `modal_area`, the full pane) to
+    /// tell a click on the program body apart from a click in the session
+    /// view revealed below it.
+    pub program_view_area: Option<ratatui::layout::Rect>,
     /// Inner content rect of the active program popup from the last frame.
     /// Cursor-move handlers and the mouse wheel read its width/height to keep
     /// the caret on-screen and to bound scrolling; `None` when no program is open.
@@ -2350,6 +2394,9 @@ async fn run_with_socket_initial_selection(
         program_popup: None,
         program_popups: HashMap::new(),
         program_view_memory: HashMap::new(),
+        program_view_h: persisted.program_view_h,
+        resizing_program_view: None,
+        program_terminal_focus: false,
         program_runs: HashMap::new(),
         program_collaborators: HashMap::new(),
         own_program_client_id: None,
@@ -2528,6 +2575,7 @@ async fn run_with_socket_initial_selection(
         pin_strip_h: app.pin_strip_h,
         orchestrator_panel_h: app.orchestrator_panel_h,
         matrix_rain_h: app.matrix_rain_h,
+        program_view_h: app.program_view_h,
         list_collapsed: app.list_collapsed,
         matrix_rain_hidden: app.matrix_rain_hidden,
         hide_pane_side_borders: app.hide_pane_side_borders,
@@ -3149,6 +3197,7 @@ impl App {
         if self.program_popup.is_some()
             && self.minibuffer.is_none()
             && self.focus == PaneFocus::View
+            && !self.program_terminal_focus
         {
             self.insert_program_text(&text);
             return;
@@ -6041,19 +6090,26 @@ impl App {
         if self.handle_dynamic_ui_overlay_click(col, row).await {
             return;
         }
-        if let Some(modal) = self.layout.modal_area {
-            if self.program_popup.is_some() {
-                if contains(modal, col, row) {
-                    self.place_program_cursor(modal, col, row);
+        if self.program_popup.is_some() {
+            // In real usage `handle_program_mouse` runs first for every mouse
+            // event while a program is open and already claims any click
+            // inside the program's own rendered rect (not `modal_area`, the
+            // whole pane) — mirrored here as a defensive fallback for a click
+            // that reaches this path directly.
+            if let Some(view) = self.layout.program_view_area {
+                if contains(view, col, row) {
+                    self.place_program_cursor(view, col, row);
                     return;
                 }
-                // A click outside the program never closes it. The program is a
-                // per-session surface dismissed only via its title-glyph
-                // toggle or C-x Space. Fall through so the click still selects
-                // a session / focuses a pane; the program then follows the new
-                // selection (the prior program is stashed, not destroyed) via
-                // sync_program_popup_with_selection.
-            } else if !contains(modal, col, row) {
+            }
+            // A click outside the program never closes it. The program is a
+            // per-session surface dismissed only via its title-glyph
+            // toggle or C-x Space. Fall through so the click still selects
+            // a session / focuses a pane; the program then follows the new
+            // selection (the prior program is stashed, not destroyed) via
+            // sync_program_popup_with_selection.
+        } else if let Some(modal) = self.layout.modal_area {
+            if !contains(modal, col, row) {
                 self.dismiss_modal();
                 return;
             } else {
@@ -6157,9 +6213,19 @@ impl App {
             .copied()
         {
             let view = hit.area;
+            let was_active_window = hit.id == self.active_window_id;
             self.focus_main_window(hit.id);
             if contains(view, col, row) {
                 self.dynamic_ui_focused = None;
+                if was_active_window && self.program_popup.is_some() {
+                    // A program is open over this pane but didn't claim the
+                    // click (that already happens earlier, in
+                    // `handle_program_mouse`) — it landed in the session view
+                    // revealed below a rolled-down program. Route keystrokes
+                    // to the session's PTY until the user clicks back into
+                    // the program.
+                    self.program_terminal_focus = true;
+                }
                 if let Some((x_start, x_end, y)) = self.layout.browser_preview_close {
                     if row == y && col >= x_start && col < x_end {
                         if let Some(id) = self.selected_id() {
@@ -6553,9 +6619,15 @@ impl App {
         // keymap and move the list selection instead of the program cursor.
         // Opening a program focuses the view (see `open_program_popup`), so the
         // common open-then-type flow is unchanged.
+        //
+        // `program_terminal_focus` is the same idea for a rolled-down program:
+        // a click into the session view revealed below it hands typing to that
+        // session's PTY instead, even though the program stays visible and
+        // `focus` is still `View`. Clicking back into the program clears it.
         if self.program_popup.is_some()
             && self.minibuffer.is_none()
             && self.focus == PaneFocus::View
+            && !self.program_terminal_focus
         {
             if self.handle_program_global_key(key).await {
                 return;
@@ -8969,6 +9041,7 @@ mod tests {
             program_title_toggle_hit: None,
             program_title_close_hit: None,
             program_selection_run_hit: None,
+            program_view_area: None,
             program_inner_area: None,
             program_smart_clip_anchor: None,
             program_clip_hits: Vec::new(),
@@ -9067,6 +9140,9 @@ mod tests {
             program_popup: None,
             program_popups: HashMap::new(),
             program_view_memory: HashMap::new(),
+            program_view_h: None,
+            resizing_program_view: None,
+            program_terminal_focus: false,
             program_runs: HashMap::new(),
             program_collaborators: HashMap::new(),
             own_program_client_id: None,
@@ -9380,6 +9456,7 @@ mod tests {
         // Geometry the last program render would have captured: a modal area
         // and a clip hit for the subagent.
         app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_view_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
         app.layout.program_clip_hits = vec![ProgramClipHit {
             col_start: 4,
             col_end: 16,
@@ -10076,6 +10153,7 @@ mod tests {
         let (mut app, _dir, server) = two_session_app().await;
         app.program_popup = Some(program_popup_for_test("s1", "ab\ncd\nef", 0));
         app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_view_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
         // Precondition the bug hit: the session list had grabbed keyboard focus
         // while the program stayed visible in the view pane.
         app.focus = PaneFocus::List;
@@ -10116,6 +10194,233 @@ mod tests {
             "typing into the reclaimed program must not move the list selection"
         );
 
+        server.abort();
+    }
+
+    #[test]
+    fn program_view_target_height_defaults_to_roughly_a_third_revealed() {
+        // No drag yet (`override_h: None`): the default should leave about a
+        // third of the pane revealed underneath.
+        assert_eq!(program_view_target_height(30, None), 20);
+        assert_eq!(program_view_target_height(9, None), 6);
+        // On a very short pane the program's own minimum height wins over the
+        // revealed-third default, so the program stays usable.
+        assert_eq!(program_view_target_height(5, None), PROGRAM_VIEW_H_MIN);
+    }
+
+    #[test]
+    fn program_view_target_height_clamps_drag_to_leave_a_sliver_revealed() {
+        // Dragging past the pane's height must not fully re-cover the session.
+        assert_eq!(program_view_target_height(30, Some(1000)), 28);
+        // Dragging below the minimum still leaves the program usable.
+        assert_eq!(program_view_target_height(30, Some(0)), PROGRAM_VIEW_H_MIN);
+        // A reasonable in-range drag passes through unchanged.
+        assert_eq!(program_view_target_height(30, Some(12)), 12);
+    }
+
+    #[tokio::test]
+    async fn program_rolls_down_to_reveal_session_by_default() {
+        let (mut app, _dir, server) = two_session_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "alpha\nbeta\ngamma", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let base = app
+            .layout
+            .main_window_areas
+            .first()
+            .expect("main window area")
+            .area;
+        let program_rect = app.layout.program_view_area.expect("program rendered");
+        assert_eq!(
+            program_rect.y, base.y,
+            "program is anchored to the pane's top"
+        );
+        assert_eq!(
+            program_rect.height,
+            crate::app::program_view_target_height(base.height, None),
+            "at rest (no drag yet) the program covers the default ⅔-of-pane height"
+        );
+        assert!(
+            program_rect.height < base.height,
+            "the program must not cover the whole pane by default: {} vs {}",
+            program_rect.height,
+            base.height
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn dragging_program_bottom_border_resizes_cover_height() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = two_session_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "alpha\nbeta\ngamma", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let rect = app.layout.program_view_area.expect("program rendered");
+        let border_row = rect.y + rect.height - 1;
+
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 2,
+            row: border_row,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(
+            app.handle_program_mouse(&down).await,
+            "grabbing the program's bottom border starts a resize"
+        );
+        assert_eq!(app.resizing_program_view, Some((border_row, rect.height)));
+
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: rect.x + 2,
+            row: border_row + 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.handle_program_mouse(&drag).await);
+        assert_eq!(
+            app.program_view_h,
+            Some(rect.height + 3),
+            "dragging the border down grows the program's cover height by the row delta"
+        );
+
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: rect.x + 2,
+            row: border_row + 3,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(app.handle_program_mouse(&up).await);
+        assert!(app.resizing_program_view.is_none(), "Up ends the drag");
+
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let new_rect = app.layout.program_view_area.expect("program rendered");
+        assert_eq!(
+            new_rect.height,
+            rect.height + 3,
+            "the new cover height persists across the next render"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn click_in_revealed_session_strip_hands_focus_to_terminal_without_closing_program() {
+        let (mut app, _dir, server) = two_session_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "alpha\nbeta\ngamma", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.focus = PaneFocus::View;
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let base = app
+            .layout
+            .main_window_areas
+            .first()
+            .expect("main window area")
+            .area;
+        let rect = app.layout.program_view_area.expect("program rendered");
+        assert!(
+            rect.height < base.height,
+            "precondition: the program is rolled down, leaving a revealed strip"
+        );
+        let revealed_row = rect.y + rect.height; // inside the pane, below the program
+
+        app.handle_left_click(base.x + 2, revealed_row).await;
+
+        assert!(
+            app.program_terminal_focus,
+            "a click below the program (still inside its pane) hands focus to the session terminal"
+        );
+        assert_eq!(app.focus, PaneFocus::View);
+        assert!(
+            app.program_popup.is_some(),
+            "the program must stay open, just no longer focused"
+        );
+
+        let cursor_before = app.program_popup.as_ref().unwrap().cursor;
+        let buffer_before = app.program_popup.as_ref().unwrap().buffer.clone();
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().cursor,
+            cursor_before,
+            "while the terminal has focus, keystrokes must not move the program cursor"
+        );
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().buffer,
+            buffer_before,
+            "while the terminal has focus, keystrokes must not edit the program buffer"
+        );
+
+        // Clicking back into the program body reclaims its focus.
+        let click_body = ratatui::layout::Rect {
+            height: rect.height.saturating_sub(1).max(1),
+            ..rect
+        };
+        app.handle_left_click(click_body.x + 1, click_body.y + 1)
+            .await;
+        assert!(
+            !app.program_terminal_focus,
+            "clicking back into the program body reclaims its focus from the terminal"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_border_dims_while_session_terminal_has_focus() {
+        let (mut app, _dir, server) = two_session_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "alpha", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let rect = app.layout.program_view_area.expect("program rendered");
+        let focused_style = term
+            .backend()
+            .buffer()
+            .cell((rect.x, rect.y))
+            .map(|c| c.style());
+
+        app.program_terminal_focus = true;
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let unfocused_style = term
+            .backend()
+            .buffer()
+            .cell((rect.x, rect.y))
+            .map(|c| c.style());
+
+        assert_ne!(
+            focused_style, unfocused_style,
+            "the program's border must change style once the session terminal takes focus"
+        );
         server.abort();
     }
 

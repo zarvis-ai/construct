@@ -7404,6 +7404,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_title_toggle_hit = None;
     app.layout.program_title_close_hit = None;
     app.layout.program_selection_run_hit = None;
+    app.layout.program_view_area = None;
     app.layout.program_inner_area = None;
     app.layout.program_smart_clip_anchor = None;
     app.layout.program_clip_hits.clear();
@@ -7764,7 +7765,17 @@ fn render_program_popup_at(
     if progress <= 0.0 {
         return;
     }
-    let visible_h = ((base_rect.height as f32 * progress).ceil() as u16).clamp(1, base_rect.height);
+    // The active program rolls down to rest at a fraction of the pane (default
+    // ⅓ revealed, user-adjustable by dragging its bottom border) rather than
+    // covering it entirely, so the underlying session stays reachable.
+    // Background split-window programs (not `active`) keep covering their
+    // whole pane — they're a passive preview, not something the user drags.
+    let target_h = if active {
+        crate::app::program_view_target_height(base_rect.height, app.program_view_h)
+    } else {
+        base_rect.height
+    };
+    let visible_h = ((target_h as f32 * progress).ceil() as u16).clamp(1, base_rect.height);
     if visible_h == 0 {
         return;
     }
@@ -7798,7 +7809,13 @@ fn render_program_popup_at(
     let title = program_title_line(app, popup, active, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
 
-    let border_style = program_border_style(&app.theme, active);
+    // While the session terminal holds focus (the user clicked into the strip
+    // revealed below a rolled-down program), the program's frame dims exactly
+    // like an unfocused split pane — the visual cue that keystrokes are going
+    // to the session below, not the program body, even though the program is
+    // still visible and still `active`.
+    let focused = active && !app.program_terminal_focus;
+    let border_style = program_border_style(&app.theme, focused);
     // The session-actions ☰ icon should read as part of the program frame, so its
     // base hue tracks the program border color (accent_alt) rather than the
     // default session-view close color. Focus dimming + hover still compose via
@@ -7816,7 +7833,7 @@ fn render_program_popup_at(
         border_style,
         show_close,
         true,
-        active,
+        focused,
         menu_icon_color,
         block,
     );
@@ -7828,6 +7845,10 @@ fn render_program_popup_at(
         app.layout.program_title_run_hit = left.run;
         app.layout.program_title_toggle_hit = title_toggle_hit;
         app.layout.program_title_close_hit = show_close.then(|| view_close_button_range(rect));
+        // Real (possibly rolled-down) bounds of this frame, so mouse
+        // hit-testing can tell a click on the program apart from a click in
+        // the session view revealed below it.
+        app.layout.program_view_area = Some(rect);
     }
     // Area inside the program's border (title bar excluded), mirroring the
     // session view's `block.inner(area)`. The content body adds extra padding on

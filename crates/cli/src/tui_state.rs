@@ -38,6 +38,8 @@ pub struct TuiState {
     #[serde(default)]
     pub matrix_rain_h: Option<u16>,
     #[serde(default)]
+    pub program_view_h: Option<u16>,
+    #[serde(default)]
     pub list_collapsed: bool,
     #[serde(default)]
     pub matrix_rain_hidden: bool,
@@ -62,6 +64,7 @@ impl Default for TuiState {
             pin_strip_h: None,
             orchestrator_panel_h: None,
             matrix_rain_h: None,
+            program_view_h: None,
             list_collapsed: false,
             matrix_rain_hidden: false,
             hide_pane_side_borders: default_hide_pane_side_borders(),
@@ -124,5 +127,26 @@ mod tests {
         let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(restored.open_program_session_ids, vec!["s1", "s2"]);
+    }
+
+    #[test]
+    fn legacy_state_defaults_program_view_h() {
+        let state: TuiState = serde_json::from_str(r#"{"last_selected_session_id": "s1"}"#)
+            .expect("legacy state should deserialize");
+
+        assert_eq!(state.program_view_h, None);
+    }
+
+    #[test]
+    fn state_round_trips_program_view_h() {
+        let state = TuiState {
+            program_view_h: Some(14),
+            ..TuiState::default()
+        };
+
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.program_view_h, Some(14));
     }
 }

@@ -40,6 +40,7 @@ impl App {
                 // back to the list for navigation while the program stays
                 // visible (see the focus gate in `on_key`).
                 self.focus = PaneFocus::View;
+                self.program_terminal_focus = false;
                 self.set_status(format!("program opened at version {version}"));
                 // Live reload: the daemon re-reads the templates dir on every
                 // call, but the client caches the list. Kick off a non-blocking
@@ -107,6 +108,7 @@ impl App {
                     let popup = program_popup_from_document(result.program, result.blocks, now);
                     if selected_id.as_deref() == Some(session_id.as_str()) {
                         self.program_popup = Some(popup);
+                        self.program_terminal_focus = false;
                     } else {
                         self.program_popups.insert(session_id.clone(), popup);
                     }
@@ -159,6 +161,10 @@ impl App {
             return;
         }
         self.stash_active_program_popup();
+        // The active program identity is changing (or disappearing); whatever
+        // the prior session's rolled-down/terminal-focus state was doesn't
+        // carry over to a different session's program.
+        self.program_terminal_focus = false;
         if let Some(selected_id) = selected_id {
             if let Some(mut popup) = self.program_popups.remove(&selected_id) {
                 popup.closing = false;

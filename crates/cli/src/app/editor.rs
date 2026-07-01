@@ -30,11 +30,40 @@ impl App {
         popup.preferred_col = None;
         popup.selection = None;
         popup.smart_clip = None;
+        // Placing the cursor is the program claiming the click, so it also
+        // reclaims typing focus from the session terminal (mirrors the reset
+        // in `handle_program_mouse`'s own click-inside handling).
+        self.program_terminal_focus = false;
     }
 
     pub(super) async fn handle_program_mouse(&mut self, ev: &MouseEvent) -> bool {
         use crossterm::event::MouseButton;
-        let Some(modal) = self.layout.modal_area else {
+        // The program's bottom-border resize-drag continues to apply even if
+        // the cursor strays outside the program's rect mid-gesture (dragged
+        // above the border into the body, or off the pane entirely), so it's
+        // checked first, ahead of every position-gated hit-test below.
+        if self.resizing_program_view.is_some() {
+            match ev.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let (anchor_row, anchor_h) = self
+                        .resizing_program_view
+                        .expect("checked by outer is_some");
+                    let delta = ev.row as i32 - anchor_row as i32;
+                    let want = (anchor_h as i32 + delta).max(PROGRAM_VIEW_H_MIN as i32) as u16;
+                    self.program_view_h = Some(want);
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.resizing_program_view = None;
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        // The active program's own rendered bounds (which may cover only part
+        // of its pane while rolled down), not `modal_area` (the whole pane) —
+        // clicks below this rect are in the session view revealed underneath.
+        let Some(modal) = self.layout.program_view_area else {
             return false;
         };
         if self.program_popup.is_none() {
@@ -55,6 +84,20 @@ impl App {
                 self.session_title_menu = None;
             }
         }
+        // The program's bottom border doubles as a height handle, mirroring
+        // the pin-strip / matrix-rain drag handles: grabbing it starts a
+        // resize instead of placing the cursor or hitting a title/body
+        // control underneath.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let border_row = modal.y.saturating_add(modal.height).saturating_sub(1);
+            if ev.row == border_row
+                && ev.column >= modal.x
+                && ev.column < modal.x.saturating_add(modal.width)
+            {
+                self.resizing_program_view = Some((ev.row, modal.height));
+                return true;
+            }
+        }
         let contains = ev.column >= modal.x
             && ev.column < modal.x.saturating_add(modal.width)
             && ev.row >= modal.y
@@ -71,8 +114,12 @@ impl App {
         // `open_program_popup`), which is why those workarounds restored typing.
         // The session-clip handler below re-points focus at the list when the
         // click switches sessions, so that case still behaves correctly.
+        // It also reclaims the program's own keyboard/typing focus away from
+        // the session terminal, if a prior click into the revealed strip
+        // below had handed focus there.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.focus = PaneFocus::View;
+            self.program_terminal_focus = false;
         }
         let title_run_hit = self.layout.program_title_run_hit;
         let title_toggle_hit = self.layout.program_title_toggle_hit;
