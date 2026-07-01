@@ -66,6 +66,9 @@ pub(crate) const PROGRAM_CONTENT_PADDING_Y: u16 = 1;
 /// output signal. A missed first-output transition must never strand the
 /// animation; a timeout backstop is mandatory (spec 0042).
 pub(crate) const PROGRAM_RUN_MAX_MS: u64 = 10 * 60 * 1000;
+/// Remote Program collaborator cursors are presence hints. Hide them when the
+/// peer has not published activity recently.
+pub(crate) const PROGRAM_COLLAB_CURSOR_TTL_MS: i64 = 60 * 1000;
 /// Wrapped rows the program body scrolls per mouse-wheel notch.
 pub(crate) const PROGRAM_WHEEL_SCROLL_ROWS: usize = 3;
 const PROGRAM_UNDO_STACK_LIMIT: usize = 100;
@@ -10523,7 +10526,7 @@ mod tests {
                 selection_head: None,
                 version: Some(1),
                 color_index: 2,
-                updated_at_ms: 0,
+                updated_at_ms: chrono::Utc::now().timestamp_millis(),
                 active: true,
             },
         );
@@ -10584,6 +10587,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_remote_cursor_hides_after_inactivity_timeout() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        let cursor = "\n".chars().count() + "alp".chars().count();
+        app.program_popup = Some(program_popup_for_test("s1", "\nalpha beta", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.program_collaborators.insert(
+            "peer-1".to_string(),
+            agentd_protocol::ProgramCursor {
+                session_id: "s1".to_string(),
+                client_id: "peer-1".to_string(),
+                label: "Peer".to_string(),
+                kind: "tui".to_string(),
+                cursor,
+                selection_anchor: None,
+                selection_head: None,
+                version: Some(1),
+                color_index: 2,
+                updated_at_ms: chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(PROGRAM_COLLAB_CURSOR_TTL_MS + 1),
+                active: true,
+            },
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let inner = app.layout.program_inner_area.expect("program inner area");
+        let popup = app.program_popup.as_ref().expect("program popup");
+        let (visual_row, col) = crate::ui::program_cursor_visual_pos(
+            Some(&app),
+            &popup.buffer,
+            cursor,
+            inner.width as usize,
+        );
+        let x = inner.x + col as u16;
+        let y = inner.y + visual_row as u16;
+        let buffer = term.backend().buffer();
+        let cursor_cell = buffer.cell((x, y)).expect("remote cursor cell");
+        assert_eq!(
+            cursor_cell.symbol(),
+            "h",
+            "stale remote cursor should leave the target glyph plain"
+        );
+        assert!(
+            !cursor_cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "stale remote cursor should not underline the target cell"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_remote_cursor_label_truncates_to_capped_highlight_width() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
@@ -10608,7 +10675,7 @@ mod tests {
                 selection_head: None,
                 version: Some(1),
                 color_index: 2,
-                updated_at_ms: 0,
+                updated_at_ms: chrono::Utc::now().timestamp_millis(),
                 active: true,
             },
         );

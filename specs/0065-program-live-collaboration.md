@@ -25,7 +25,7 @@ Multiple TUI and web clients can edit the same Program at the same time. Local-o
 
 Clients should prefer live anchored edits for normal typing, paste, delete, and small replacements. Whole-document update remains available for template application, explicit save fallback, and large rewrites. When a remote Program state or rebased own-cursor notification arrives, a clean or live-synced editor should adopt it immediately and remap the local caret. If a client still has unsynced local edits, it may temporarily preserve them and fall back to the existing merge-on-save path.
 
-Future clients must filter their own cursor from remote-cursor rendering and must expire stale cursor presence defensively.
+Future clients must filter their own cursor from remote-cursor rendering and must expire stale cursor presence defensively. A remote cursor that has published no update for over one minute must stop rendering, whether or not an explicit tombstone was received for it — a client that goes idle or drops without a clean disconnect must not leave a permanent ghost cursor. The daemon applies the same one-minute cutoff when answering a Program snapshot request, so a freshly-opened client never adopts an already-stale cursor.
 
 ## Non-Goals
 
