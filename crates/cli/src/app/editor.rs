@@ -266,6 +266,7 @@ impl App {
             .as_ref()
             .map(|popup| popup.buffer.clone());
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl_char = Self::normalized_ctrl_char(key);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let super_mod = key.modifiers.contains(KeyModifiers::SUPER);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -279,23 +280,18 @@ impl App {
                     | KeyCode::Home
                     | KeyCode::End
             )
-            && self
-                .program_popup
-                .as_ref()
-                .is_some_and(|popup| {
-                    popup.selection.is_none()
-                        && popup.smart_clip.is_none()
-                        && popup.search.is_none()
-                })
+            && self.program_popup.as_ref().is_some_and(|popup| {
+                popup.selection.is_none() && popup.smart_clip.is_none() && popup.search.is_none()
+            })
         {
             self.begin_program_selection();
         }
         if self.program_search_active() {
             match key.code {
                 KeyCode::Esc => self.cancel_program_search(),
-                KeyCode::Char('g') if ctrl => self.cancel_program_search(),
-                KeyCode::Char('s') if ctrl => self.move_program_search_match(1),
-                KeyCode::Char('r') if ctrl => self.move_program_search_match(-1),
+                _ if ctrl_char == Some('g') => self.cancel_program_search(),
+                _ if ctrl_char == Some('s') => self.move_program_search_match(1),
+                _ if ctrl_char == Some('r') => self.move_program_search_match(-1),
                 KeyCode::Enter => self.accept_program_search(),
                 KeyCode::Backspace => self.delete_program_search_query_char(),
                 KeyCode::Char(c) if !ctrl && !alt && !super_mod => {
@@ -326,8 +322,8 @@ impl App {
             // Right drills into the highlighted category's submenu; Left backs out.
             KeyCode::Right if self.program_smart_clip_active() => self.program_smart_clip_expand(),
             KeyCode::Left if self.program_smart_clip_active() => self.program_smart_clip_collapse(),
-            KeyCode::Char(' ' | '@' | '\0') if ctrl => self.begin_program_selection(),
-            KeyCode::Char('g') if ctrl => {
+            _ if matches!(ctrl_char, Some(' ' | '@' | '\0')) => self.begin_program_selection(),
+            _ if ctrl_char == Some('g') => {
                 // C-g cancels: dismiss the transient smart-clip picker and
                 // clear any active C-Space selection mark. No-op when neither
                 // is active. Like Esc, it is deliberately NOT a program-hide
@@ -336,8 +332,9 @@ impl App {
                 if let Some(popup) = self.program_popup.as_mut() {
                     popup.selection = None;
                 }
+                self.set_status("program selection canceled".to_string());
             }
-            KeyCode::Char('a') if ctrl => {
+            _ if ctrl_char == Some('a') => {
                 if let Some(popup) = self.program_popup.as_mut() {
                     popup.cursor = program_line_start(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
@@ -345,8 +342,8 @@ impl App {
                     Self::update_program_smart_clip_after_cursor_move(popup);
                 }
             }
-            KeyCode::Char('s') if ctrl => self.begin_program_search(),
-            KeyCode::Char('e') if ctrl => {
+            _ if ctrl_char == Some('s') => self.begin_program_search(),
+            _ if ctrl_char == Some('e') => {
                 if let Some(popup) = self.program_popup.as_mut() {
                     popup.cursor = program_line_end(&popup.buffer, popup.cursor);
                     popup.preferred_col = None;
@@ -354,19 +351,19 @@ impl App {
                     Self::update_program_smart_clip_after_cursor_move(popup);
                 }
             }
-            KeyCode::Char('b') if ctrl => self.move_program_cursor(-1),
-            KeyCode::Char('f') if ctrl => self.move_program_cursor(1),
-            KeyCode::Char('p') if ctrl && self.program_smart_clip_active() => {
+            _ if ctrl_char == Some('b') => self.move_program_cursor(-1),
+            _ if ctrl_char == Some('f') => self.move_program_cursor(1),
+            _ if ctrl_char == Some('p') && self.program_smart_clip_active() => {
                 self.move_program_smart_clip_selection(-1)
             }
-            KeyCode::Char('n') if ctrl && self.program_smart_clip_active() => {
+            _ if ctrl_char == Some('n') && self.program_smart_clip_active() => {
                 self.move_program_smart_clip_selection(1)
             }
-            KeyCode::Char('p') if ctrl => self.move_program_cursor_vertical(-1),
-            KeyCode::Char('n') if ctrl => self.move_program_cursor_vertical(1),
-            KeyCode::Char('v') if ctrl => self.paste_program_clipboard(),
-            KeyCode::Char('y') if ctrl => self.paste_program_clipboard(),
-            KeyCode::Char('w') if ctrl => self.cut_program_selection(),
+            _ if ctrl_char == Some('p') => self.move_program_cursor_vertical(-1),
+            _ if ctrl_char == Some('n') => self.move_program_cursor_vertical(1),
+            _ if ctrl_char == Some('v') => self.paste_program_clipboard(),
+            _ if ctrl_char == Some('y') => self.paste_program_clipboard(),
+            _ if ctrl_char == Some('w') => self.cut_program_selection(),
             // M-w is emacs kill-ring-save: copy the selection, never delete.
             KeyCode::Char('w') if alt => self.copy_program_selection_and_deactivate(),
             KeyCode::Char('/') if ctrl => self.undo_program_edit(),
@@ -375,7 +372,7 @@ impl App {
             // no-op here; the C-x C-c quit chord is consumed earlier in
             // handle_program_global_key, and bare Cmd-C still self-inserts 'c').
             KeyCode::Char('c')
-                if (ctrl || super_mod)
+                if (ctrl_char == Some('c') || super_mod)
                     && self
                         .program_popup
                         .as_ref()
@@ -384,9 +381,9 @@ impl App {
             {
                 self.copy_program_selection_and_deactivate()
             }
-            KeyCode::Char('d') if ctrl => self.delete_program_forward(),
-            KeyCode::Char('h') if ctrl => self.delete_program_back(),
-            KeyCode::Char('k') if ctrl => self.cut_program_line(),
+            _ if ctrl_char == Some('d') => self.delete_program_forward(),
+            _ if ctrl_char == Some('h') => self.delete_program_back(),
+            _ if ctrl_char == Some('k') => self.cut_program_line(),
             KeyCode::Enter => self.insert_program_text("\n"),
             KeyCode::Backspace => self.delete_program_back(),
             KeyCode::Delete => self.delete_program_forward(),
@@ -394,7 +391,7 @@ impl App {
             KeyCode::Right => self.move_program_cursor(1),
             KeyCode::Up => self.move_program_cursor_vertical(-1),
             KeyCode::Down => self.move_program_cursor_vertical(1),
-            KeyCode::Char('l') if ctrl => {
+            _ if ctrl_char == Some('l') => {
                 // C-l: center the current cursor row in the program viewport (emacs-like).
                 self.center_program_cursor();
             }
@@ -419,7 +416,9 @@ impl App {
             // just the cursor's line when there is no selection.
             KeyCode::Tab if !ctrl && !alt => self.shift_program_indent(false),
             KeyCode::BackTab if !ctrl && !alt => self.shift_program_indent(true),
-            KeyCode::Char(c) if !ctrl && !alt => self.insert_program_text(&c.to_string()),
+            KeyCode::Char(c) if ctrl_char.is_none() && !ctrl && !alt => {
+                self.insert_program_text(&c.to_string())
+            }
             _ => {}
         }
         // Any cursor move or edit above may have pushed the caret out of the
@@ -428,6 +427,24 @@ impl App {
         self.publish_program_cursor().await;
         if let Some(before) = before {
             self.flush_program_live_edit(before).await;
+        }
+    }
+
+    fn normalized_ctrl_char(key: KeyEvent) -> Option<char> {
+        let KeyCode::Char(c) = key.code else {
+            return None;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Some(match c {
+                '\0' => '\0',
+                ' ' | '@' => ' ',
+                c => c.to_ascii_lowercase(),
+            });
+        }
+        match c as u32 {
+            0 => Some('\0'),
+            1..=26 => char::from_u32((c as u32) - 1 + ('a' as u32)),
+            _ => None,
         }
     }
 

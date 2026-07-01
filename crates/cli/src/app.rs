@@ -9529,6 +9529,11 @@ mod tests {
         assert!(popup.selection.is_none(), "C-g should clear the selection");
         // Cancelling the mark must not mutate the buffer or move text around.
         assert_eq!(popup.buffer, "abcdef");
+        assert_eq!(
+            app.status.as_ref().map(|(status, _)| status.as_str()),
+            Some("program selection canceled"),
+            "C-g should replace the stale selection-started status"
+        );
         assert_eq!(app.program_clipboard, None);
         server.abort();
     }
@@ -9563,51 +9568,97 @@ mod tests {
         app.program_popup = Some(program_popup_for_test("s1", "abc\ndef", 1));
         app.layout.program_inner_area = Some(Rect::new(0, 0, 20, 5));
 
-        app.handle_program_key(KeyEvent::new(
-            KeyCode::Char(' '),
-            KeyModifiers::CONTROL,
-        ))
-        .await;
-        app.handle_program_key(KeyEvent::new(
-            KeyCode::Char('f'),
-            KeyModifiers::CONTROL,
-        ))
-        .await;
+        app.handle_program_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
 
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.cursor, 2);
         assert_eq!(App::program_selection_range(popup), Some((1, 2)));
         assert_eq!(App::selected_program_text(popup).as_deref(), Some("b"));
 
-        app.handle_program_key(KeyEvent::new(
-            KeyCode::Char('b'),
-            KeyModifiers::CONTROL,
-        ))
-        .await;
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .await;
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.cursor, 1);
         assert!(popup.selection.is_some());
         assert_eq!(App::program_selection_range(popup), None);
 
-        app.handle_program_key(KeyEvent::new(
-            KeyCode::Char('n'),
-            KeyModifiers::CONTROL,
-        ))
-        .await;
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await;
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.cursor, 5);
         assert_eq!(App::program_selection_range(popup), Some((1, 5)));
         assert_eq!(App::selected_program_text(popup).as_deref(), Some("bc\nd"));
 
-        app.handle_program_key(KeyEvent::new(
-            KeyCode::Char('p'),
-            KeyModifiers::CONTROL,
-        ))
-        .await;
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await;
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.cursor, 1);
         assert!(popup.selection.is_some());
         assert_eq!(App::program_selection_range(popup), None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_ctrl_space_extends_selection_with_raw_control_bytes() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "abc\ndef", 1));
+        app.layout.program_inner_area = Some(Rect::new(0, 0, 20, 5));
+
+        // Some terminal paths deliver Emacs control keys as raw ASCII control
+        // bytes with no CONTROL modifier. Program selection must handle those
+        // the same way as normalized Ctrl+letter events.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\0'), KeyModifiers::NONE))
+            .await;
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x06'), KeyModifiers::NONE))
+            .await; // C-f
+
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 2);
+        assert_eq!(App::program_selection_range(popup), Some((1, 2)));
+        assert_eq!(App::selected_program_text(popup).as_deref(), Some("b"));
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x05'), KeyModifiers::NONE))
+            .await; // C-e
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 3);
+        assert_eq!(App::program_selection_range(popup), Some((1, 3)));
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x01'), KeyModifiers::NONE))
+            .await; // C-a
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 0);
+        assert_eq!(App::program_selection_range(popup), Some((0, 1)));
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x0e'), KeyModifiers::NONE))
+            .await; // C-n
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 4);
+        assert_eq!(App::program_selection_range(popup), Some((1, 4)));
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x10'), KeyModifiers::NONE))
+            .await; // C-p
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 0);
+        assert_eq!(App::program_selection_range(popup), Some((0, 1)));
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x02'), KeyModifiers::NONE))
+            .await; // C-b at start stays put and keeps the mark alive.
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 0);
+        assert!(popup.selection.is_some());
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('\x07'), KeyModifiers::NONE))
+            .await; // C-g
+        let popup = app.program_popup.as_ref().unwrap();
+        assert!(popup.selection.is_none(), "raw C-g should cancel selection");
+        assert_eq!(popup.buffer, "abc\ndef");
+        assert_eq!(
+            app.status.as_ref().map(|(status, _)| status.as_str()),
+            Some("program selection canceled")
+        );
         server.abort();
     }
 
