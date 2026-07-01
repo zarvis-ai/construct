@@ -7013,6 +7013,14 @@ fn session_should_animate_status(s: &SessionSummary, pty_active: bool, agent_act
     // in `Running` while idle, so they keep the short PTY-activity gate.
     if is_smith_like_harness(&s.harness) {
         agent_active
+    } else if is_headless(s) {
+        // Headless adapters (e.g. `claude -p` streaming JSON) never emit
+        // PTY bytes, so `pty_active` is permanently false and the spinner
+        // could never show. But they also don't sit `Running` at an idle
+        // prompt the way interactive PTY sessions do — the adapter flips
+        // explicitly back to `AwaitingInput` between turns — so `Running`
+        // alone is already a reliable "working right now" signal here.
+        true
     } else {
         pty_active
     }
@@ -12598,6 +12606,18 @@ mod tests {
         // (agent_active is irrelevant for non-smith harnesses).
         assert!(!session_should_animate_status(&s, false, false));
         assert!(session_should_animate_status(&s, true, false));
+    }
+
+    #[test]
+    fn headless_running_status_animates_without_pty_activity() {
+        // Headless adapters (e.g. `claude -p`) never emit PTY bytes, so
+        // `pty_active` is permanently false for them. They also flip
+        // explicitly back to AwaitingInput between turns, so `Running`
+        // alone is a reliable "working" signal — animate regardless of
+        // the (always-false) PTY-activity gate.
+        let mut s = summary_with_mode("claude", Some("headless"));
+        s.state = SessionState::Running;
+        assert!(session_should_animate_status(&s, false, false));
     }
 
     #[test]
