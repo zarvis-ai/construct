@@ -10824,6 +10824,8 @@ fn program_smart_clip_span<'a>(
                     // A dead reference reads as struck-through, not just
                     // recolored, so it's unmistakable at a glance.
                     modifier |= Modifier::CROSSED_OUT;
+                } else if program_session_chip_is_dimmed(status) {
+                    modifier |= Modifier::DIM;
                 }
                 program_session_chip_bg(&app.theme, status)
             }
@@ -10857,7 +10859,11 @@ fn program_session_clip_status(app: &App, raw_clip: &str) -> Option<SessionState
 /// color (the two slots are the same color in both palettes) so a settled
 /// reference looks the same as before this badge existed; every other status
 /// gets its own color so a state change — especially a worker dying — is
-/// visible at a glance without reading the label text.
+/// visible at a glance without reading the label text. `Done` is additionally
+/// rendered with [`Modifier::DIM`] (see `program_smart_clip_span`) so a
+/// settled clip visually recedes next to an in-progress one at full
+/// brightness, rather than the two competing for attention with equally
+/// vivid colors.
 fn program_session_chip_bg(theme: &Theme, status: Option<SessionState>) -> ratatui::style::Color {
     match status {
         Some(SessionState::Pending) => theme.muted,
@@ -10867,6 +10873,14 @@ fn program_session_chip_bg(theme: &Theme, status: Option<SessionState>) -> ratat
         Some(SessionState::Errored) => theme.danger,
         None => theme.muted,
     }
+}
+
+/// Whether a session smart-clip chip should render dimmed: only a settled
+/// (`Done`) target — an in-progress, queued, paused, errored, or unresolved
+/// reference stays at normal brightness so it doesn't compete for attention
+/// with (or get mistaken for) a completed one.
+fn program_session_chip_is_dimmed(status: Option<SessionState>) -> bool {
+    matches!(status, Some(SessionState::Done))
 }
 
 /// Plain-language hover tooltip for a session smart-clip's live status.
@@ -11457,6 +11471,19 @@ mod tests {
         // the same theme color today), so this change is invisible for the
         // common "everything's fine" case.
         assert_eq!(theme.info, theme.accent_alt);
+    }
+
+    #[test]
+    fn program_session_chip_is_dimmed_only_for_done() {
+        assert!(!program_session_chip_is_dimmed(Some(SessionState::Pending)));
+        assert!(!program_session_chip_is_dimmed(Some(SessionState::Running)));
+        assert!(!program_session_chip_is_dimmed(Some(
+            SessionState::AwaitingInput
+        )));
+        assert!(!program_session_chip_is_dimmed(Some(SessionState::Paused)));
+        assert!(program_session_chip_is_dimmed(Some(SessionState::Done)));
+        assert!(!program_session_chip_is_dimmed(Some(SessionState::Errored)));
+        assert!(!program_session_chip_is_dimmed(None));
     }
 
     #[test]

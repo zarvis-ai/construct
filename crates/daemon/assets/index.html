@@ -1633,8 +1633,10 @@
   }
   /* Session smart-clip status badge: subtle status-tinted color, driven by
      `data-status` (kept live by programUpdateChipStatuses). "done" has no
-     rule — it keeps the chip's default accent-alt look, unchanged from
-     before this badge existed. A missing/deleted target reads as
+     color rule of its own — it keeps the chip's default accent-alt look —
+     but it does get an opacity cut below, so a settled clip visually
+     recedes next to an in-progress one instead of the two competing for
+     attention with equally vivid colors. A missing/deleted target reads as
      struck-through so it's unmistakable at a glance, not just recolored. */
   .program-clip[data-status="pending"] {
     background: color-mix(in srgb, var(--fg-faint) 20%, transparent);
@@ -1646,6 +1648,9 @@
     background: color-mix(in srgb, var(--ok) 20%, transparent);
     color: var(--ok);
     border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  }
+  .program-clip[data-status="done"] {
+    opacity: 0.6;
   }
   .program-clip[data-status="paused"] {
     background: color-mix(in srgb, var(--warn) 20%, transparent);
