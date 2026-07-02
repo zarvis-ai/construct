@@ -18,6 +18,21 @@ fn program_block_ids(
         .collect()
 }
 
+fn program_run_system_status(run: &ProgramRunProgress) -> &'static str {
+    if run.queued_behind_current_turn && !run.seen_running {
+        agentd_protocol::PROGRAM_SHIMMER_STATUS_QUEUED
+    } else if run.first_output_seen {
+        agentd_protocol::PROGRAM_SHIMMER_STATUS_AGENT_WORKING
+    } else {
+        agentd_protocol::PROGRAM_SHIMMER_STATUS_DELIVERED
+    }
+}
+
+fn project_program_run_status(mut run: ProgramRunProgress) -> ProgramRunProgress {
+    run.system_status = Some(program_run_system_status(&run).to_string());
+    run
+}
+
 impl SessionManager {
     pub(super) fn program_run_snapshot(&self, session_id: &str) -> Option<ProgramRunProgress> {
         let now_ms = Utc::now().timestamp_millis();
@@ -57,7 +72,7 @@ impl SessionManager {
                         out.pending_block_ids = out.pending_block_refs.clone();
                     }
                 }
-                Some(out)
+                Some(project_program_run_status(out.with_refreshed_stage()))
             }
             _ => None,
         }
@@ -127,12 +142,24 @@ impl SessionManager {
             .collect()
     }
 
+    #[cfg(test)]
     pub(super) fn start_program_run(
         &self,
         session_id: &str,
         body: &str,
         is_selection: bool,
         initial: Option<&[bool]>,
+    ) -> Option<ProgramRunProgress> {
+        self.start_program_run_with_dispatch_state(session_id, body, is_selection, initial, false)
+    }
+
+    pub(super) fn start_program_run_with_dispatch_state(
+        &self,
+        session_id: &str,
+        body: &str,
+        is_selection: bool,
+        initial: Option<&[bool]>,
+        queued_behind_current_turn: bool,
     ) -> Option<ProgramRunProgress> {
         let blocks = match self.storage.read_program_with_blocks(session_id) {
             Ok((program, blocks)) if program.markdown.trim() == body.trim() => blocks,
@@ -202,24 +229,31 @@ impl SessionManager {
             }
             return None;
         }
+        let total_block_count = pending.len();
         let run = ProgramRunProgress {
             run_id: format!("{session_id}:{now_ms}"),
             started_at_ms: now_ms,
             expires_at_ms: now_ms + PROGRAM_RUN_MAX_MS,
+            system_status: None,
             pending_block_ids: Vec::new(),
             pending_block_refs: pending.into_iter().collect(),
             pending_block_tooltips: std::collections::HashMap::new(),
             seen_running: false,
             first_output_seen: false,
+            queued_behind_current_turn,
             // Unmanaged until the agent narrows it with a declaration/edit.
             // Until then it is the optimistic full-program shimmer and stays
             // subject to the owning-session idle stop signal.
             agent_managed: false,
-        };
+            stage: agentd_protocol::ProgramRunStage::Delivered,
+            settled_block_count: 0,
+            total_block_count,
+        }
+        .with_refreshed_stage();
         if let Ok(mut runs) = self.program_runs.lock() {
             runs.insert(session_id.to_string(), run.clone());
         }
-        Some(run)
+        Some(project_program_run_status(run))
     }
 
     /// Apply a partial shimmer declaration after an edit (spec 0053): drop

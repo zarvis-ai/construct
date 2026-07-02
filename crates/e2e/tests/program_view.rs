@@ -269,7 +269,7 @@ async fn web_program_view_full_parity() {
               programTestClearSel();
               await programRun();
               const r = state.program.runById.get("s-run");
-              return { execs: window.__execs, runPending: r ? r.pendingIds.size : 0, shimmerActive: !!programInputEl.querySelector(".program-line.is-running"), msg: programMsgEl.textContent };
+              return { execs: window.__execs, runPending: r ? r.pendingIds.size : 0, shimmerActive: !!programInputEl.querySelector(".program-line.is-running"), stage: programRunStageEl.textContent, msg: programMsgEl.textContent };
             })
             "###,
         )
@@ -287,6 +287,7 @@ async fn web_program_view_full_parity() {
         run["shimmerActive"], true,
         "running lines should get the shimmer class: {run:?}"
     );
+    assert_eq!(run["stage"], "delivered", "{run:?}");
     assert!(
         run["msg"]
             .as_str()
@@ -326,6 +327,7 @@ async fn web_program_view_full_parity() {
                 runPending: state.program.runById.get("s-run-immediate")?.pendingIds.size || 0,
                 shimmerActive: !!programInputEl.querySelector(".program-line.is-running"),
                 button: programRunBtn.dataset.running,
+                stage: programRunStageEl.textContent,
                 msg: programMsgEl.textContent,
               };
               resolveExecute();
@@ -334,6 +336,7 @@ async fn web_program_view_full_parity() {
                 runPending: state.program.runById.get("s-run-immediate")?.pendingIds.size || 0,
                 shimmerActive: !!programInputEl.querySelector(".program-line.is-running"),
                 button: programRunBtn.dataset.running,
+                stage: programRunStageEl.textContent,
                 msg: programMsgEl.textContent,
               };
               return { before, after };
@@ -356,6 +359,14 @@ async fn web_program_view_full_parity() {
     assert_eq!(
         immediate_run["before"]["button"], "true",
         "Run button should pulse before execute resolves: {immediate_run:?}"
+    );
+    assert_eq!(
+        immediate_run["before"]["stage"], "pressed",
+        "{immediate_run:?}"
+    );
+    assert_eq!(
+        immediate_run["after"]["stage"], "delivered",
+        "{immediate_run:?}"
     );
     assert!(
         immediate_run["before"]["msg"]
@@ -821,6 +832,245 @@ async fn web_program_view_full_parity() {
     screenshot(&page, "program_view_clip_menu.png").await;
 
     page.evaluate("enterChatMode(); true").await.ok();
+}
+
+/// Instant-dispatch fast path (spec 0066): a selection-Run over a single list
+/// item naming exactly one `@{harness:<name>}` clip is executed by the daemon
+/// mechanically — no browser needed, this drives the real daemon IPC surface
+/// directly like the other e2e helpers in this crate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_instant_dispatch_fast_path() {
+    let d = Daemon::spawn().await.expect("daemon");
+    let cwd = d.dir.path().to_string_lossy().to_string();
+
+    let owner = d
+        .client
+        .create(shell_session_params(&cwd, "owner"))
+        .await
+        .expect("create owner session");
+
+    let md = "# Todo\n\n- Print hello @{harness:shell}\n";
+    let updated = d
+        .client
+        .program_update(agentd_protocol::ProgramUpdateParams {
+            session_id: owner.clone(),
+            markdown: md.to_string(),
+            base_version: None,
+            actor: agentd_protocol::ProgramUpdateActor::Human,
+            template_id: None,
+            note: None,
+            shimmer: None,
+            shimmer_tooltips: None,
+        })
+        .await
+        .expect("program.update");
+
+    let item_text = "- Print hello @{harness:shell}";
+    let result = d
+        .client
+        .program_execute(agentd_protocol::ProgramExecuteParams {
+            session_id: owner.clone(),
+            selection: Some(item_text.to_string()),
+            base_version: Some(updated.program.version),
+            shimmer: None,
+        })
+        .await
+        .expect("program.execute");
+
+    // No LLM round trip: the fast path never delivers a prompt to the owner.
+    assert_eq!(result.prompt, "", "fast path must not deliver a prompt");
+
+    // Exactly one subagent was spawned, parented to the owner and backed by
+    // the named harness.
+    let sessions = d.client.list().await.expect("list");
+    let subagents: Vec<_> = sessions
+        .iter()
+        .filter(|s| {
+            s.kind == agentd_protocol::SessionKind::Subagent
+                && s.parent_session_id.as_deref() == Some(owner.as_str())
+        })
+        .collect();
+    assert_eq!(
+        subagents.len(),
+        1,
+        "expected exactly one dispatched subagent: {sessions:?}"
+    );
+    let subagent = subagents[0];
+    assert_eq!(subagent.harness, "shell");
+
+    // The program was annotated with the new subagent's session clip,
+    // alongside (not replacing) the original harness clip.
+    let expected_clip = format!("@{{session:{}}}", subagent.id);
+    assert!(
+        result.program.markdown.contains(&expected_clip),
+        "program should carry the new subagent's session clip: {}",
+        result.program.markdown
+    );
+    assert!(
+        result.program.markdown.contains("@{harness:shell}"),
+        "the original harness clip should stay: {}",
+        result.program.markdown
+    );
+
+    // The dispatched item shimmers with the "Dispatched" tooltip, and the
+    // active_run projection reflects the started run for shimmer rendering.
+    let dispatched_block = result
+        .blocks
+        .iter()
+        .find(|b| b.text.contains("Print hello"))
+        .expect("dispatched block present in projection");
+    assert!(dispatched_block.shimmer, "dispatched item should shimmer");
+    assert_eq!(
+        dispatched_block.tooltip.as_deref(),
+        Some("Dispatched"),
+        "dispatched item should carry the 'Dispatched' tooltip"
+    );
+    let active_run = result.active_run.expect("active run started");
+    assert!(
+        active_run.agent_managed,
+        "a fast-pathed run is actively managed via its shimmer declaration"
+    );
+
+    // Re-reading the program from a clean call agrees with the execute
+    // response — the run state is daemon-owned shared state, not a
+    // client-local optimistic artifact.
+    let refetched = d.client.program_get(&owner).await.expect("program.get");
+    assert!(refetched
+        .active_run
+        .is_some_and(|run| run.agent_managed && !run.pending_block_refs.is_empty()));
+}
+
+/// A selection where only *some* items name a harness clip falls through to
+/// the normal (LLM-mediated) execute path in its entirety — no subagent is
+/// created for the matching item either (spec 0066: mixed selections are
+/// all-or-nothing, never partially fast-pathed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_instant_dispatch_mixed_selection_falls_through() {
+    let d = Daemon::spawn().await.expect("daemon");
+    let cwd = d.dir.path().to_string_lossy().to_string();
+
+    let owner = d
+        .client
+        .create(shell_session_params(&cwd, "owner"))
+        .await
+        .expect("create owner session");
+
+    let md = "- Fix the bug @{harness:shell}\n- Investigate the timeout\n";
+    d.client
+        .program_update(agentd_protocol::ProgramUpdateParams {
+            session_id: owner.clone(),
+            markdown: md.to_string(),
+            base_version: None,
+            actor: agentd_protocol::ProgramUpdateActor::Human,
+            template_id: None,
+            note: None,
+            shimmer: None,
+            shimmer_tooltips: None,
+        })
+        .await
+        .expect("program.update");
+
+    let selection = "- Fix the bug @{harness:shell}\n- Investigate the timeout";
+    let result = d
+        .client
+        .program_execute(agentd_protocol::ProgramExecuteParams {
+            session_id: owner.clone(),
+            selection: Some(selection.to_string()),
+            base_version: None,
+            shimmer: None,
+        })
+        .await
+        .expect("program.execute");
+
+    // Normal path: a real prompt is delivered, and the document is untouched
+    // by the execute call itself (the agent would edit it in its own turn).
+    assert!(!result.prompt.is_empty(), "normal path delivers a prompt");
+    assert_eq!(result.program.markdown, md);
+
+    // No subagent was spawned even though one item named a harness clip.
+    let sessions = d.client.list().await.expect("list");
+    let subagents = sessions
+        .iter()
+        .filter(|s| s.kind == agentd_protocol::SessionKind::Subagent)
+        .count();
+    assert_eq!(
+        subagents, 0,
+        "a mixed selection must not partially fast-path: {sessions:?}"
+    );
+}
+
+/// A nested (indented) list item's leading whitespace must survive into the
+/// anchored edit the fast path applies (spec 0066) — using the whole
+/// selection's *trimmed* text as the edit anchor would strip that
+/// indentation from the first line and the anchor would never match the
+/// stored document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn program_instant_dispatch_preserves_nested_indentation() {
+    let d = Daemon::spawn().await.expect("daemon");
+    let cwd = d.dir.path().to_string_lossy().to_string();
+
+    let owner = d
+        .client
+        .create(shell_session_params(&cwd, "owner"))
+        .await
+        .expect("create owner session");
+
+    let md = "- Parent\n  - Fix nested bug @{harness:shell}\n";
+    d.client
+        .program_update(agentd_protocol::ProgramUpdateParams {
+            session_id: owner.clone(),
+            markdown: md.to_string(),
+            base_version: None,
+            actor: agentd_protocol::ProgramUpdateActor::Human,
+            template_id: None,
+            note: None,
+            shimmer: None,
+            shimmer_tooltips: None,
+        })
+        .await
+        .expect("program.update");
+
+    // Selected exactly as it appears in the document, indentation included.
+    let selection = "  - Fix nested bug @{harness:shell}";
+    let result = d
+        .client
+        .program_execute(agentd_protocol::ProgramExecuteParams {
+            session_id: owner.clone(),
+            selection: Some(selection.to_string()),
+            base_version: None,
+            shimmer: None,
+        })
+        .await
+        .expect("program.execute");
+
+    assert_eq!(result.prompt, "", "fast path must not deliver a prompt");
+    assert!(
+        result
+            .program
+            .markdown
+            .contains("  - Fix nested bug @{harness:shell} @{session:"),
+        "the nested item's original indentation must be preserved: {}",
+        result.program.markdown
+    );
+}
+
+fn shell_session_params(cwd: &str, title: &str) -> agentd_protocol::CreateSessionParams {
+    agentd_protocol::CreateSessionParams {
+        harness: "shell".to_string(),
+        cwd: cwd.to_string(),
+        prompt: None,
+        model: None,
+        title: Some(title.to_string()),
+        mode: None,
+        pty_size: None,
+        worktree: false,
+        env: std::collections::HashMap::new(),
+        args: Vec::new(),
+        kind: Default::default(),
+        parent_session_id: None,
+        group_id: None,
+        position_after_session_id: None,
+    }
 }
 
 async fn wait_conn_open(page: &Page) {

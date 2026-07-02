@@ -1030,6 +1030,10 @@ pub struct ProgramShimmerDecl {
 /// legacy run state, or a block kept pending across an edit (spec 0057).
 pub const PROGRAM_SHIMMER_FALLBACK_TOOLTIP: &str = "Working…";
 
+pub const PROGRAM_SHIMMER_STATUS_QUEUED: &str = "Queued behind current turn";
+pub const PROGRAM_SHIMMER_STATUS_DELIVERED: &str = "Delivered, waiting for agent";
+pub const PROGRAM_SHIMMER_STATUS_AGENT_WORKING: &str = "Agent working, no status yet";
+
 /// Maximum word count for a program-shimmer tooltip (spec 0057). Longer
 /// tooltips are gracefully truncated rather than rejected.
 pub const PROGRAM_SHIMMER_TOOLTIP_MAX_WORDS: usize = 10;
@@ -1102,29 +1106,90 @@ fn program_smart_clip_body_without_instance_id(raw_clip: &str) -> String {
         .join(" ")
 }
 
+/// One inline `@{type:target ...}` smart-clip occurrence found while scanning
+/// program text, with the byte span (`start` is the index of `@`, `end` is
+/// one past the closing `}`) so a caller can remove or replace it in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramSmartClipOccurrence {
+    pub type_name: String,
+    pub target: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Scan `text` for every inline `@{type:target ...}` smart-clip occurrence, in
+/// source order. A clip body with no `:` is reported with `type_name` `"clip"`
+/// and `target` set to the whole body. Does not descend into fenced
+/// `:::clip ... :::` blocks. Used by the daemon's instant-dispatch fast path
+/// (spec 0066) to find and strip a list item's harness clip without a full
+/// Markdown parser.
+pub fn program_scan_smart_clips(text: &str) -> Vec<ProgramSmartClipOccurrence> {
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while let Some(rel_start) = text[idx..].find("@{") {
+        let start = idx + rel_start;
+        let after = start + 2;
+        let Some(rel_end) = text[after..].find('}') else {
+            break;
+        };
+        let end = after + rel_end + 1;
+        let body = &text[after..after + rel_end];
+        let first = body.split_whitespace().next().unwrap_or(body);
+        let (type_name, target) = first.split_once(':').unwrap_or(("clip", first));
+        out.push(ProgramSmartClipOccurrence {
+            type_name: type_name.to_string(),
+            target: target.to_string(),
+            start,
+            end,
+        });
+        idx = end;
+    }
+    out
+}
+
 /// True if a trimmed line is a Markdown ATX heading (`#`..`######` then a space).
 fn program_is_heading(trimmed: &str) -> bool {
     let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
     (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ')
 }
 
-/// True if a trimmed line begins a Markdown list item: a `-`/`*`/`+` bullet
-/// (with content or as a bare empty bullet) or an ordered `N.`/`N)` marker.
-fn program_is_list_item(trimmed: &str) -> bool {
-    if trimmed == "-" || trimmed == "*" || trimmed == "+" {
-        return true;
-    }
+/// Byte length of the list-item marker at the start of `trimmed` — the bullet
+/// or ordered prefix plus its single separating space (e.g. 2 for `"- "`, 4
+/// for `"12. "`). `None` for a bare/empty bullet (`"-"` alone) or a line that
+/// is not a list item.
+fn program_list_item_marker_len(trimmed: &str) -> Option<usize> {
     if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
-        return true;
+        return Some(2);
     }
     let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
     if digits > 0 {
         let rest = &trimmed[digits..];
-        if rest.starts_with(". ") || rest.starts_with(") ") || rest == "." || rest == ")" {
-            return true;
+        if rest.starts_with(". ") || rest.starts_with(") ") {
+            return Some(digits + 2);
         }
     }
-    false
+    None
+}
+
+/// True if a trimmed line begins a Markdown list item: a `-`/`*`/`+` bullet
+/// (with content or as a bare empty bullet) or an ordered `N.`/`N)` marker.
+pub fn program_is_list_item(trimmed: &str) -> bool {
+    if trimmed == "-" || trimmed == "*" || trimmed == "+" {
+        return true;
+    }
+    if program_list_item_marker_len(trimmed).is_some() {
+        return true;
+    }
+    let digits = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    digits > 0 && matches!(&trimmed[digits..], "." | ")")
+}
+
+/// The text following a list item's marker — e.g. `"task"` for both `"- task"`
+/// and `"12. task"` — or `None` if `trimmed` is not a list item with content
+/// (including a bare empty bullet). Used by the daemon's instant-dispatch
+/// fast path (spec 0066) to derive a subagent prompt from a program list item.
+pub fn program_list_item_text(trimmed: &str) -> Option<&str> {
+    program_list_item_marker_len(trimmed).map(|len| &trimmed[len..])
 }
 
 /// Split Markdown into ordered blocks, finer than paragraphs: a run of non-blank
@@ -1192,11 +1257,34 @@ pub fn program_block_spans(markdown: &str) -> Vec<ProgramBlockSpan> {
     blocks
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramRunStage {
+    /// Client-local optimistic stage immediately after Run is pressed, before
+    /// the execute call returns. Daemon snapshots normally advance to Delivered
+    /// because shared run state is published after delivery succeeds.
+    Pressed,
+    Delivered,
+    FirstOutput,
+    PlanningPassDone,
+    Settling,
+}
+
+impl Default for ProgramRunStage {
+    fn default() -> Self {
+        Self::Pressed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramRunProgress {
     pub run_id: String,
     pub started_at_ms: i64,
     pub expires_at_ms: i64,
+    /// Daemon-derived run-level fallback status for shimmering blocks whose
+    /// agent-authored tooltip is missing (optimistic/legacy/keep_pending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_status: Option<String>,
     /// Legacy content-derived ids of the blocks still pending in this run.
     /// New payloads prefer `pending_block_refs`; this is kept for older clients
     /// and dirty-buffer fallback rendering.
@@ -1218,6 +1306,11 @@ pub struct ProgramRunProgress {
     pub seen_running: bool,
     #[serde(default)]
     pub first_output_seen: bool,
+    /// Internal daemon fact: true when Run was dispatched while the owning
+    /// session was already in a turn. This is used to derive `system_status`;
+    /// the projected status string is the client-facing contract.
+    #[serde(default, skip_serializing)]
+    pub queued_behind_current_turn: bool,
     /// True once an in-run program declaration/edit has narrowed this run —
     /// i.e. the run is actively managed via per-block declarations rather than
     /// riding the untouched optimistic full-program shimmer. A managed run is
@@ -1229,6 +1322,52 @@ pub struct ProgramRunProgress {
     /// after being seen running. See `specs/0042-program-run-progress-affordance.md`.
     #[serde(default)]
     pub agent_managed: bool,
+    /// Derived compact stage for clients to render next to the Run control.
+    /// It is computed from the run lifecycle facts above; clients should not
+    /// use it as a stop signal.
+    #[serde(default)]
+    pub stage: ProgramRunStage,
+    /// Number of blocks from this run's initial pending set that have settled.
+    #[serde(default)]
+    pub settled_block_count: usize,
+    /// Number of blocks in this run's initial pending set.
+    #[serde(default)]
+    pub total_block_count: usize,
+}
+
+impl ProgramRunProgress {
+    pub fn pending_block_count(&self) -> usize {
+        if !self.pending_block_refs.is_empty() {
+            self.pending_block_refs.len()
+        } else {
+            self.pending_block_ids.len()
+        }
+    }
+
+    pub fn refresh_stage(&mut self) {
+        let pending = self.pending_block_count();
+        if self.total_block_count == 0 {
+            self.total_block_count = pending;
+        }
+        self.total_block_count = self.total_block_count.max(pending);
+        self.settled_block_count = self.total_block_count.saturating_sub(pending);
+        self.stage = if self.agent_managed {
+            if self.settled_block_count > 0 {
+                ProgramRunStage::Settling
+            } else {
+                ProgramRunStage::PlanningPassDone
+            }
+        } else if self.first_output_seen {
+            ProgramRunStage::FirstOutput
+        } else {
+            ProgramRunStage::Delivered
+        };
+    }
+
+    pub fn with_refreshed_stage(mut self) -> Self {
+        self.refresh_stage();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2335,6 +2474,39 @@ mod program_block_tests {
     }
 
     #[test]
+    fn scan_smart_clips_finds_type_target_and_span() {
+        let text = "- do X @{harness:codex} and @{session:s1 clip_id=clip_2}";
+        let clips = program_scan_smart_clips(text);
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].type_name, "harness");
+        assert_eq!(clips[0].target, "codex");
+        assert_eq!(&text[clips[0].start..clips[0].end], "@{harness:codex}");
+        assert_eq!(clips[1].type_name, "session");
+        assert_eq!(clips[1].target, "s1");
+        assert_eq!(
+            &text[clips[1].start..clips[1].end],
+            "@{session:s1 clip_id=clip_2}"
+        );
+    }
+
+    #[test]
+    fn scan_smart_clips_empty_for_no_clips() {
+        assert!(program_scan_smart_clips("- plain item, no clips here").is_empty());
+    }
+
+    #[test]
+    fn list_item_text_strips_bullet_and_ordered_markers() {
+        assert_eq!(program_list_item_text("- task"), Some("task"));
+        assert_eq!(program_list_item_text("* task"), Some("task"));
+        assert_eq!(program_list_item_text("+ task"), Some("task"));
+        assert_eq!(program_list_item_text("12. task"), Some("task"));
+        assert_eq!(program_list_item_text("3) task"), Some("task"));
+        // Bare/empty bullets and non-list-item lines have no item text.
+        assert_eq!(program_list_item_text("-"), None);
+        assert_eq!(program_list_item_text("plain paragraph"), None);
+    }
+
+    #[test]
     fn normalize_tooltip_trims_collapses_and_truncates() {
         // Empty / whitespace-only → None (never stored as an empty label).
         assert_eq!(normalize_program_tooltip("   "), None);
@@ -2353,6 +2525,56 @@ mod program_block_tests {
             normalize_program_tooltip(eleven),
             Some("one two three four five six seven eight nine ten…".to_string())
         );
+    }
+
+    fn run_progress_with_pending(pending: &[&str]) -> ProgramRunProgress {
+        ProgramRunProgress {
+            run_id: "r1".into(),
+            started_at_ms: 10,
+            expires_at_ms: 20,
+            pending_block_ids: Vec::new(),
+            pending_block_refs: pending.iter().map(|id| (*id).to_string()).collect(),
+            pending_block_tooltips: HashMap::new(),
+            seen_running: false,
+            first_output_seen: false,
+            agent_managed: false,
+            stage: ProgramRunStage::Pressed,
+            settled_block_count: 0,
+            total_block_count: pending.len(),
+        }
+    }
+
+    #[test]
+    fn program_run_stage_derives_pipeline_progress() {
+        let mut run = run_progress_with_pending(&["a", "b", "c"]);
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::Delivered);
+        assert_eq!(run.settled_block_count, 0);
+        assert_eq!(run.total_block_count, 3);
+
+        run.first_output_seen = true;
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::FirstOutput);
+
+        run.agent_managed = true;
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::PlanningPassDone);
+
+        run.pending_block_refs = vec!["b".into(), "c".into()];
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::Settling);
+        assert_eq!(run.settled_block_count, 1);
+        assert_eq!(run.total_block_count, 3);
+    }
+
+    #[test]
+    fn program_run_stage_defaults_total_for_legacy_payloads() {
+        let mut run = run_progress_with_pending(&["a", "b"]);
+        run.total_block_count = 0;
+        run.refresh_stage();
+        assert_eq!(run.total_block_count, 2);
+        assert_eq!(run.settled_block_count, 0);
+        assert_eq!(run.stage, ProgramRunStage::Delivered);
     }
 }
 

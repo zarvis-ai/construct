@@ -523,6 +523,66 @@ fn program_run_context(
     }
 }
 
+/// One selected program block matching the instant-dispatch fast-path shape
+/// (spec 0066): a list item whose text contains exactly one smart clip, and
+/// that clip is `@{harness:<name>}`.
+struct ProgramDispatchItem {
+    /// The block's raw source text (list marker included), pre-edit — the
+    /// anchor for the append edit that adds the `@{session:<id>}` clip.
+    text: String,
+    /// The harness clip's target, e.g. "codex".
+    harness: String,
+    /// The item's prose with its list marker and clip syntax stripped — the
+    /// dispatched subagent's initial prompt.
+    prompt: String,
+}
+
+/// If every block in `blocks` is a list item containing exactly one smart
+/// clip and that clip is `@{harness:<name>}`, returns one
+/// [`ProgramDispatchItem`] per block in document order. Otherwise — a
+/// heading/paragraph block, a missing/non-harness/ambiguous clip, or a
+/// harness name that resolves to nothing — returns `None` so the caller falls
+/// the *whole* selection through to the normal execute path rather than
+/// fast-pathing part of a mixed selection (spec 0066).
+fn program_dispatch_plan(
+    blocks: &[agentd_protocol::ProgramBlockSpan],
+) -> Option<Vec<ProgramDispatchItem>> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let first_line = block.text.lines().next().unwrap_or("").trim();
+        if !agentd_protocol::program_is_list_item(first_line) {
+            return None;
+        }
+        let clips = agentd_protocol::program_scan_smart_clips(&block.text);
+        if clips.len() != 1 {
+            return None;
+        }
+        let clip = &clips[0];
+        let harness = clip.target.trim();
+        if clip.type_name != "harness" || harness.is_empty() {
+            return None;
+        }
+        let mut without_clip = String::with_capacity(block.text.len());
+        without_clip.push_str(&block.text[..clip.start]);
+        without_clip.push_str(&block.text[clip.end..]);
+        let trimmed = without_clip.trim();
+        let body = agentd_protocol::program_list_item_text(trimmed).unwrap_or(trimmed);
+        let prompt = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if prompt.is_empty() {
+            return None;
+        }
+        items.push(ProgramDispatchItem {
+            text: block.text.clone(),
+            harness: harness.to_string(),
+            prompt,
+        });
+    }
+    Some(items)
+}
+
 /// Legacy content ids of every block an edit flagged `keep_pending` introduces:
 /// the blocks whose work the edit keeps in flight. These ids are content-
 /// derived, so each block parsed from a keep_pending edit's `new_string` in
@@ -1726,7 +1786,7 @@ impl SessionManager {
     }
 
     pub async fn program_execute(
-        &self,
+        self: &Arc<Self>,
         params: ProgramExecuteParams,
     ) -> Result<ProgramExecuteResult> {
         let entry = self
@@ -1760,6 +1820,37 @@ impl SessionManager {
         }
         let run_body = body.to_string();
         let is_selection = params.selection.is_some();
+
+        // Instant-dispatch fast path (spec 0066): before the normal
+        // prompt-delivery path below, check whether this is a selection run
+        // whose every block is a list item naming exactly one
+        // `@{harness:<name>}` clip. If so, the daemon executes the dispatch
+        // mechanically — spawn a subagent per item, annotate the program,
+        // declare each item pending — without paying an LLM round trip
+        // through the owning session. Any block that doesn't match falls the
+        // *whole* selection through to the normal path unchanged.
+        //
+        // Uses the *raw* selection (not `run_body`, which trims the whole
+        // string) so a nested/indented item's leading whitespace survives
+        // into the anchored edit's `old_string` below — trimming the whole
+        // selection would strip that indentation from the first line only,
+        // making the anchor fail to match the stored document verbatim.
+        if let Some(raw_selection) = params.selection.as_deref().filter(|s| !s.trim().is_empty())
+        {
+            let selection_blocks = agentd_protocol::program_block_spans(raw_selection);
+            if let Some(items) = program_dispatch_plan(&selection_blocks) {
+                let owner_cwd = entry.summary.read().await.cwd.clone();
+                return self
+                    .program_dispatch_execute(
+                        &params.session_id,
+                        &owner_cwd,
+                        raw_selection,
+                        items,
+                    )
+                    .await;
+            }
+        }
+
         let scope = if selected.is_some() {
             "selection"
         } else {
@@ -1768,9 +1859,12 @@ impl SessionManager {
         let run_context = program_run_context(&result.program, scope, body);
         self.write_program_run_context(&params.session_id, &run_context)?;
         let prompt = program_execution_prompt();
-        let delivery = {
+        let (delivery, queued_behind_current_turn) = {
             let summary = entry.summary.read().await;
-            program_execution_delivery(&*summary)
+            (
+                program_execution_delivery(&*summary),
+                summary.state == agentd_protocol::SessionState::Running,
+            )
         };
         match delivery {
             ProgramExecutionDelivery::ExternalPtyTypedSubmit => {
@@ -1785,11 +1879,12 @@ impl SessionManager {
                 self.send_input(&params.session_id, prompt.clone()).await?;
             }
         }
-        let active_run = self.start_program_run(
+        let active_run = self.start_program_run_with_dispatch_state(
             &params.session_id,
             &run_body,
             is_selection,
             params.shimmer.as_deref(),
+            queued_behind_current_turn,
         );
         let blocks = self.program_blocks_projection(&params.session_id, &result.program.markdown);
         Ok(ProgramExecuteResult {
@@ -1797,6 +1892,93 @@ impl SessionManager {
             prompt,
             active_run,
             blocks,
+        })
+    }
+
+    /// Instant-dispatch fast path (spec 0066): spawn one subagent per
+    /// `items` entry, then in a single anchored edit append each subagent's
+    /// `@{session:<id>}` clip to its item and declare the item pending with
+    /// tooltip "Dispatched". No prompt is delivered to `session_id` — the
+    /// daemon executes this dispatch mechanically instead of routing it
+    /// through the owning session's agent.
+    async fn program_dispatch_execute(
+        self: &Arc<Self>,
+        session_id: &str,
+        owner_cwd: &str,
+        body: &str,
+        items: Vec<ProgramDispatchItem>,
+    ) -> Result<ProgramExecuteResult> {
+        let mut edits = Vec::with_capacity(items.len());
+        let mut shimmer = Vec::with_capacity(items.len());
+        for item in &items {
+            let mut env = HashMap::new();
+            env.insert(
+                "CONSTRUCT_PARENT_SESSION_ID".to_string(),
+                session_id.to_string(),
+            );
+            let subagent_id = self
+                .create(CreateSessionParams {
+                    harness: item.harness.clone(),
+                    cwd: owner_cwd.to_string(),
+                    prompt: Some(item.prompt.clone()),
+                    model: None,
+                    title: Some(format!("subagent:{}", item.harness)),
+                    mode: Some("headless".to_string()),
+                    pty_size: Some(PtySize {
+                        cols: 100,
+                        rows: 30,
+                    }),
+                    worktree: false,
+                    env,
+                    args: Vec::new(),
+                    kind: agentd_protocol::SessionKind::Subagent,
+                    parent_session_id: Some(session_id.to_string()),
+                    group_id: None,
+                    position_after_session_id: None,
+                })
+                .await?;
+            let new_string = format!("{} @{{session:{}}}", item.text, subagent_id);
+            let content_id = agentd_protocol::program_block_spans(&new_string)
+                .into_iter()
+                .next()
+                .map(|span| span.id)
+                .unwrap_or_default();
+            edits.push(agentd_protocol::ProgramEdit {
+                old_string: item.text.clone(),
+                new_string,
+                replace_all: false,
+                keep_pending: true,
+            });
+            shimmer.push(agentd_protocol::ProgramShimmerDecl {
+                id: content_id,
+                shimmer: true,
+                tooltip: Some("Dispatched".to_string()),
+            });
+        }
+
+        // Seed the run's pending set over every dispatched item now that every
+        // subagent exists, so the response/active_run projection reflects the
+        // started run (spec 0042) even before the edit below lands.
+        self.start_program_run(session_id, body, true, Some(&vec![true; items.len()]));
+
+        let edit_result = self
+            .program_edit_from_conn(
+                ProgramEditParams {
+                    session_id: session_id.to_string(),
+                    edits,
+                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    note: Some("instant dispatch".to_string()),
+                    shimmer,
+                },
+                None,
+            )
+            .await?;
+
+        Ok(ProgramExecuteResult {
+            program: edit_result.program,
+            prompt: String::new(),
+            active_run: edit_result.active_run,
+            blocks: edit_result.blocks,
         })
     }
 
@@ -3209,6 +3391,55 @@ mod tests {
             program_execution_delivery(&summary),
             ProgramExecutionDelivery::AdapterInput
         );
+    }
+
+    fn dispatch_plan(markdown: &str) -> Option<Vec<ProgramDispatchItem>> {
+        program_dispatch_plan(&agentd_protocol::program_block_spans(markdown))
+    }
+
+    #[test]
+    fn program_dispatch_plan_matches_single_item_with_harness_clip() {
+        let items = dispatch_plan("- Fix bug @{harness:codex}\n").expect("plan");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].harness, "codex");
+        assert_eq!(items[0].prompt, "Fix bug");
+        assert_eq!(items[0].text, "- Fix bug @{harness:codex}");
+    }
+
+    #[test]
+    fn program_dispatch_plan_strips_ordered_marker_and_collapses_wrapped_lines() {
+        let items =
+            dispatch_plan("1. Investigate\n   the flaky test @{harness:claude}\n").expect("plan");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].harness, "claude");
+        assert_eq!(items[0].prompt, "Investigate the flaky test");
+    }
+
+    #[test]
+    fn program_dispatch_plan_none_for_heading() {
+        assert!(dispatch_plan("# Title @{harness:codex}\n").is_none());
+    }
+
+    #[test]
+    fn program_dispatch_plan_none_for_missing_clip() {
+        assert!(dispatch_plan("- just a task\n").is_none());
+    }
+
+    #[test]
+    fn program_dispatch_plan_none_for_multiple_clips() {
+        assert!(dispatch_plan("- do X @{harness:codex} and @{session:s1}\n").is_none());
+    }
+
+    #[test]
+    fn program_dispatch_plan_none_for_non_harness_clip() {
+        assert!(dispatch_plan("- do X @{session:s1}\n").is_none());
+    }
+
+    #[test]
+    fn program_dispatch_plan_none_for_mixed_selection() {
+        // Whole selection falls through to the normal path when any block
+        // doesn't match the fast-path shape, even if another block does.
+        assert!(dispatch_plan("- item one @{harness:codex}\n- item two\n").is_none());
     }
 
     #[test]
@@ -6527,6 +6758,51 @@ mod tests {
         assert!(
             mgr.program_run_snapshot(&id).is_none(),
             "an empty pending set clears the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn program_run_system_status_tracks_dispatch_and_output_state() {
+        use agentd_protocol::{
+            SessionState, PROGRAM_SHIMMER_STATUS_AGENT_WORKING, PROGRAM_SHIMMER_STATUS_DELIVERED,
+            PROGRAM_SHIMMER_STATUS_QUEUED,
+        };
+        let body = "# Alpha\n\n# Beta\n";
+        let (mgr, _storage, id) = program_test_mgr(body).await;
+
+        let run = mgr
+            .start_program_run(&id, body, false, None)
+            .expect("start idle-dispatched run");
+        assert_eq!(
+            run.system_status.as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_DELIVERED)
+        );
+
+        let run = mgr
+            .start_program_run_with_dispatch_state(&id, body, false, None, true)
+            .expect("start queued run");
+        assert_eq!(
+            run.system_status.as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_QUEUED)
+        );
+
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        assert_eq!(
+            mgr.program_run_snapshot(&id)
+                .expect("running snapshot")
+                .system_status
+                .as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_DELIVERED),
+            "once this program turn starts it is no longer queued"
+        );
+
+        mgr.mark_program_run_output_seen(&id);
+        assert_eq!(
+            mgr.program_run_snapshot(&id)
+                .expect("output snapshot")
+                .system_status
+                .as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_AGENT_WORKING)
         );
     }
 

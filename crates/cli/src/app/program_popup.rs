@@ -510,10 +510,14 @@ impl App {
             session_id.to_string(),
             ProgramRun {
                 started_at: now,
+                total_block_count: pending.len(),
                 pending,
                 pending_tooltips: HashMap::new(),
+                system_status: None,
                 deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,
+                stage: agentd_protocol::ProgramRunStage::Pressed,
+                settled_block_count: 0,
             },
         );
     }
@@ -522,6 +526,35 @@ impl App {
     /// missed first-output signal can never strand the animation (spec 0042).
     pub(super) fn expire_program_runs(&mut self, now: Instant) {
         self.program_runs.retain(|_, run| now < run.deadline);
+        self.expire_program_settle_flourishes(now);
+    }
+
+    pub(super) fn record_program_settle_flourishes(
+        &mut self,
+        session_id: &str,
+        previous_pending: &HashSet<String>,
+        next_pending: &HashSet<String>,
+        now: Instant,
+    ) {
+        let settled: Vec<String> = previous_pending.difference(next_pending).cloned().collect();
+        if settled.is_empty() {
+            return;
+        }
+        let flourishes = self
+            .program_settle_flourishes
+            .entry(session_id.to_string())
+            .or_default();
+        for block_ref in settled {
+            flourishes.insert(block_ref, now);
+        }
+    }
+
+    fn expire_program_settle_flourishes(&mut self, now: Instant) {
+        let ttl = Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS);
+        self.program_settle_flourishes.retain(|_, flourishes| {
+            flourishes.retain(|_, started_at| now.saturating_duration_since(*started_at) < ttl);
+            !flourishes.is_empty()
+        });
     }
 
     pub(super) async fn close_program_popup(&mut self) {

@@ -7565,6 +7565,34 @@ struct ProgramShimmer {
     phase: f32,
 }
 
+fn format_program_run_elapsed(started_at: Instant, now: Instant) -> String {
+    let secs = now.saturating_duration_since(started_at).as_secs();
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn program_system_status_tooltip(run: &crate::app::ProgramRun, now: Instant) -> Option<String> {
+    let status = run.system_status.as_deref().map(str::trim)?;
+    if status.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{status} — {}",
+        format_program_run_elapsed(run.started_at, now)
+    ))
+}
+
+/// One-shot settle flourish lines. `started_at` is per source line so multiple
+/// blocks can settle in separate notifications and animate independently.
+struct ProgramSettleFlourish {
+    started_at_by_line: Vec<Option<Instant>>,
+}
+
 /// Build the shimmer overlay for a popup from its session's `ProgramRun`, or
 /// `None` if no run is active, it has lapsed, or every block has settled. A
 /// block shimmers while its stable ref is in the run's pending set (spec 0053);
@@ -7628,6 +7656,54 @@ fn program_run_shimmer(
     })
 }
 
+fn program_settle_flourish(
+    app: &App,
+    popup: &crate::app::ProgramPopup,
+    now: Instant,
+) -> Option<ProgramSettleFlourish> {
+    let flourishes = app
+        .program_settle_flourishes
+        .get(&popup.program.session_id)?;
+    if flourishes.is_empty() {
+        return None;
+    }
+    let clean = popup.buffer == popup.saved_markdown && !popup.blocks.is_empty();
+    if !clean {
+        return None;
+    }
+    let ttl = Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS);
+    let mut started_at_by_line = vec![None; popup.buffer.lines().count()];
+    let mut any = false;
+    let has_stable_match = popup
+        .blocks
+        .iter()
+        .any(|block| flourishes.contains_key(&block.id));
+    for block in &popup.blocks {
+        let started_at = if has_stable_match {
+            flourishes.get(&block.id)
+        } else {
+            flourishes
+                .get(&block.id)
+                .or_else(|| flourishes.get(&block.content_id))
+        };
+        let Some(started_at) = started_at.copied() else {
+            continue;
+        };
+        if now.saturating_duration_since(started_at) >= ttl {
+            continue;
+        }
+        for slot in started_at_by_line
+            .iter_mut()
+            .take(block.end_line)
+            .skip(block.start_line)
+        {
+            *slot = Some(started_at);
+            any = true;
+        }
+    }
+    any.then_some(ProgramSettleFlourish { started_at_by_line })
+}
+
 /// Overlay the Run shimmer onto already-rendered program lines: for each active
 /// line, re-emit its text character-by-character with a brightness drawn from a
 /// travelling wave, so a highlight band sweeps through the running region. The
@@ -7659,6 +7735,57 @@ fn apply_program_shimmer(lines: &mut [Line], shimmer: &ProgramShimmer, theme: &T
                 }
                 new_spans.push(Span::styled(ch.to_string(), st));
                 gidx += 1;
+            }
+        }
+        line.spans = new_spans;
+    }
+}
+
+fn apply_program_settle_flourish(
+    lines: &mut [Line],
+    flourish: &ProgramSettleFlourish,
+    theme: &Theme,
+    now: Instant,
+) {
+    let ttl = Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS).as_secs_f32();
+    for (i, line) in lines.iter_mut().enumerate() {
+        let Some(started_at) = flourish
+            .started_at_by_line
+            .get(i)
+            .and_then(|started_at| *started_at)
+        else {
+            continue;
+        };
+        let progress =
+            (now.saturating_duration_since(started_at).as_secs_f32() / ttl).clamp(0.0, 1.0);
+        let total_chars = line
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum::<usize>()
+            .max(1);
+        let sweep_center = progress * 1.35 - 0.18;
+        let mut line_idx = 0usize;
+        let mut new_spans = Vec::new();
+        for span in std::mem::take(&mut line.spans) {
+            if span.style.bg.is_some() {
+                line_idx += span.content.chars().count();
+                new_spans.push(span);
+                continue;
+            }
+            let style = span.style;
+            let base_fg = style.fg.unwrap_or(theme.text);
+            for ch in span.content.chars() {
+                let x = line_idx as f32 / total_chars as f32;
+                let distance = (x - sweep_center).abs();
+                let intensity = (1.0 - distance / 0.20).clamp(0.0, 1.0);
+                let eased = intensity * intensity * (3.0 - 2.0 * intensity);
+                let mut st = style.fg(blend_color(base_fg, theme.accent, eased * 0.85));
+                if eased > 0.70 {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                new_spans.push(Span::styled(ch.to_string(), st));
+                line_idx += 1;
             }
         }
         line.spans = new_spans;
@@ -7901,12 +8028,14 @@ fn render_program_popup_at(
     // always offers a close button.
     let show_close = true;
     let dirty = popup.buffer != popup.saved_markdown;
+    let stage_label = program_run_stage_label(app, popup, now);
     let left = program_title_left_layout(
         summary_ref,
         short_id(&popup.program.session_id),
         rect,
         dirty,
         show_close,
+        stage_label.as_deref(),
     );
     let title = program_title_line(app, popup, active, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
@@ -7981,6 +8110,9 @@ fn render_program_popup_at(
     // sweep a highlight through the blocks that have not settled yet.
     if let Some(shimmer) = program_run_shimmer(app, popup, now) {
         apply_program_shimmer(&mut lines, &shimmer, &app.theme);
+    }
+    if let Some(flourish) = program_settle_flourish(app, popup, now) {
+        apply_program_settle_flourish(&mut lines, &flourish, &app.theme, now);
     }
     // Empty program: replace the bare body with a richer onboarding placeholder —
     // a one-line description, a grouped list of clickable templates, a divider,
@@ -8356,14 +8488,21 @@ fn render_program_shimmer_hover(
     ) else {
         return;
     };
-    // The concise status tooltip travels with the shimmer (spec 0057).
-    let tooltip = app
-        .program_runs
-        .get(&popup.program.session_id)
-        .and_then(|run| run.pending_tooltips.get(&block_id))
-        .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| {
-            t.as_str()
-        });
+    // Agent-authored block tooltip wins; otherwise show the daemon-derived
+    // run-level status before falling back to the optimistic legacy label.
+    let system_tooltip;
+    let tooltip = match app.program_runs.get(&popup.program.session_id) {
+        Some(run) => match run.pending_tooltips.get(&block_id) {
+            Some(t) if !t.trim().is_empty() => t.as_str(),
+            _ => {
+                system_tooltip = program_system_status_tooltip(run, now);
+                system_tooltip
+                    .as_deref()
+                    .unwrap_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP)
+            }
+        },
+        None => agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP,
+    };
     render_tooltip_at(f, &app.theme, tooltip, mx, my, 2, -1);
 }
 
@@ -8489,6 +8628,8 @@ struct ProgramTitleLeft {
     /// Run-button hit range `(x_start, x_end_exclusive, y)`, or `None` when the
     /// pane is too narrow to fit it.
     run: Option<(u16, u16, u16)>,
+    /// Bounded run-stage label that fits between Run and the dirty marker.
+    stage_label: Option<String>,
     /// `modified` word hit range `(x_start, x_end_exclusive)` on row `rect.y`,
     /// or `None` when the program is not dirty.
     modified: Option<(u16, u16)>,
@@ -8500,6 +8641,7 @@ fn program_title_left_layout(
     rect: Rect,
     dirty: bool,
     show_close: bool,
+    stage_label: Option<&str>,
 ) -> ProgramTitleLeft {
     let glyph_w = UnicodeWidthStr::width(program_mode_glyph());
     let run_w = UnicodeWidthStr::width(PROGRAM_RUN_BUTTON);
@@ -8512,6 +8654,26 @@ fn program_title_left_layout(
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
     let close_w = if show_close { 3 } else { 0 };
+    let right_cluster_left = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_sub(harness_w as u16)
+        .saturating_sub(close_w as u16);
+    let stage_w_candidate = stage_label
+        .map(|label| UnicodeWidthStr::width(label).saturating_add(1))
+        .unwrap_or(0);
+    let min_left_with_stage = rect
+        .x
+        .saturating_add(3 + glyph_w as u16)
+        .saturating_add(run_w as u16)
+        .saturating_add(stage_w_candidate as u16)
+        .saturating_add(marker_w as u16);
+    let stage_label = (stage_w_candidate > 0 && min_left_with_stage <= right_cluster_left)
+        .then(|| stage_label.unwrap_or_default().to_string());
+    let stage_w = stage_label
+        .as_deref()
+        .map(|label| UnicodeWidthStr::width(label).saturating_add(1))
+        .unwrap_or(0);
     // Mirror the session view's title-label budget (corners + harness + close +
     // ` <glyph> <label> ` scaffolding), and additionally reserve the
     // program-only left-cluster extras: the Run button and the dirty marker.
@@ -8521,6 +8683,7 @@ fn program_title_left_layout(
         .saturating_sub(close_w)
         .saturating_sub(3 + glyph_w)
         .saturating_sub(run_w)
+        .saturating_sub(stage_w)
         .saturating_sub(marker_w);
     let label = match summary {
         Some(s) => truncate_to_width(&primary_label(s), label_budget),
@@ -8541,7 +8704,11 @@ fn program_title_left_layout(
     let run = (run_x_end < pane_right).then_some((run_x_start, run_x_end, rect.y));
     // The dirty marker trails the Run button (or a one-cell gap when Run didn't
     // fit): ` <run>* modified` / ` <label> * modified`.
-    let gap_after_label = if run.is_some() { run_w as u16 } else { 1 };
+    let gap_after_label = if run.is_some() {
+        run_w.saturating_add(stage_w) as u16
+    } else {
+        1
+    };
     let modified = dirty.then(|| {
         let start = run_x_start
             .saturating_add(gap_after_label)
@@ -8552,8 +8719,35 @@ fn program_title_left_layout(
     ProgramTitleLeft {
         label,
         run,
+        stage_label,
         modified,
     }
+}
+
+const PROGRAM_RUN_STAGE_MAX_WIDTH: usize = 18;
+
+fn program_run_stage_label(
+    app: &App,
+    popup: &crate::app::ProgramPopup,
+    now: Instant,
+) -> Option<String> {
+    let run = app
+        .program_runs
+        .get(&popup.program.session_id)
+        .filter(|run| now < run.deadline)?;
+    let label = match run.stage {
+        agentd_protocol::ProgramRunStage::Pressed => "pressed".to_string(),
+        agentd_protocol::ProgramRunStage::Delivered => "delivered".to_string(),
+        agentd_protocol::ProgramRunStage::FirstOutput => "first output".to_string(),
+        agentd_protocol::ProgramRunStage::PlanningPassDone => "planning pass done".to_string(),
+        agentd_protocol::ProgramRunStage::Settling => {
+            format!(
+                "{}/{} settled",
+                run.settled_block_count, run.total_block_count
+            )
+        }
+    };
+    Some(truncate_to_width(&label, PROGRAM_RUN_STAGE_MAX_WIDTH))
 }
 
 fn program_title_line<'a>(
@@ -8616,6 +8810,13 @@ fn program_title_line<'a>(
             PROGRAM_RUN_BUTTON.to_string()
         };
         spans.push(Span::styled(run_button, run_style));
+        if let Some(label) = left.stage_label.as_deref() {
+            spans.push(Span::styled(" ", border_style));
+            spans.push(Span::styled(
+                label.to_string(),
+                Style::default().fg(app.theme.muted),
+            ));
+        }
     } else {
         spans.push(Span::styled(" ", border_style));
     }
@@ -8721,6 +8922,7 @@ fn render_program_title_tooltip(
         rect,
         dirty,
         true,
+        program_run_stage_label(app, popup, Instant::now()).as_deref(),
     );
     if let Some((start, end)) = left.modified {
         if mx >= start && mx < end {
@@ -11738,7 +11940,7 @@ mod tests {
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true);
+        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true, None);
         let run = layout.run.expect("run button fits at this width");
         let modified = layout.modified.expect("dirty marker present");
 
@@ -11778,7 +11980,14 @@ mod tests {
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true);
+        let layout = program_title_left_layout(
+            summary_ref,
+            "sess",
+            rect,
+            true,
+            true,
+            Some("planning pass done"),
+        );
         let run = layout.run.expect("run fits");
         let modified = layout.modified.expect("dirty marker present");
         let left_extent = modified.1.max(run.1);
