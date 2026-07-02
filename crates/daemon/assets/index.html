@@ -1975,7 +1975,7 @@
           <span class="program-version" id="programVersion"></span>
           <span class="program-flex"></span>
           <span class="program-msg" id="programMsg" aria-live="polite"></span>
-          <button type="button" id="programFindBtn" title="Find (Ctrl+F)">Find</button>
+          <button type="button" id="programFindBtn" title="Find">Find</button>
           <button type="button" id="programRunBtn" title="Run program (Ctrl+Enter) — runs the selection if text is selected">Run</button>
           <span class="program-run-stage" id="programRunStage" aria-live="polite"></span>
           <button type="button" id="programSaveBtn" title="Save (Ctrl+S)">Save</button>
@@ -5378,7 +5378,14 @@ function programOnKeyDown(e) {
   }
   if (mod && (e.key === "s" || e.key === "S")) { e.preventDefault(); programSave(); return; }
   if (mod && e.key === "Enter") { e.preventDefault(); programRun(); return; }
-  if (mod && (e.key === "f" || e.key === "F")) { e.preventDefault(); programOpenFind(); return; }
+  // Emacs C-f: move the caret forward one character, matching the TUI's
+  // Program binding. Must preventDefault or the browser opens its Find bar.
+  if (mod && (e.key === "f" || e.key === "F")) {
+    e.preventDefault();
+    const sel = window.getSelection();
+    if (sel) sel.modify("move", "forward", "character");
+    return;
+  }
   if (e.key === "Escape" && state.program.find) { e.preventDefault(); programCloseFind(); programInputEl.focus(); return; }
   if (e.key === "Tab" && !mod) {
     e.preventDefault();

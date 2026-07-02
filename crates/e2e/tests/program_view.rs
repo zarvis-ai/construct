@@ -584,6 +584,48 @@ async fn web_program_view_full_parity() {
     assert_eq!(find["count"], "1/3", "{find:?}");
     assert_eq!(find["countAfterNext"], "2/3", "{find:?}");
 
+    // --- 9b. Ctrl+F is Emacs cursor-forward, not the browser/app Find. -------
+    let ctrl_f: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.get": () => ({ program: { session_id: "s-ctrlf", markdown: "abcdef\n", version: 1, template_id: null }, active_run: null, blocks: [], revisions: [] }),
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              setSession("s-ctrlf", "shell");
+              await switchCurrentViewMode("program");
+              const before = programRangeForOffset(2);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(before);
+              const ev = new KeyboardEvent("keydown", { key: "f", ctrlKey: true, bubbles: true, cancelable: true });
+              const defaultPrevented = !programInputEl.dispatchEvent(ev);
+              const offsets = programSelectionOffsets();
+              return {
+                defaultPrevented,
+                head: offsets ? offsets.head : null,
+                findVisible: !programFindEl.hidden,
+              };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate ctrl+f cursor forward")
+        .into_value()
+        .expect("json");
+    assert_eq!(
+        ctrl_f["defaultPrevented"], true,
+        "Ctrl+F must be prevented so the browser never opens its Find bar: {ctrl_f:?}"
+    );
+    assert_eq!(
+        ctrl_f["head"], 3,
+        "Ctrl+F should move the caret forward one character: {ctrl_f:?}"
+    );
+    assert_eq!(
+        ctrl_f["findVisible"], false,
+        "Ctrl+F must not open the Program Find bar either: {ctrl_f:?}"
+    );
+
     // --- 10. Live program/state: adopt when clean, keep when dirty. ----------
     let live: serde_json::Value = page
         .evaluate(

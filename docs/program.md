@@ -53,7 +53,8 @@ agent edits merge automatically (see [Collaboration](#collaboration)).
 | `@` | Open the smart-clip picker |
 
 The web client uses native browser editing (caret, selection, clipboard, undo,
-IME) with the same capabilities, plus `Ctrl+S` to save, `Ctrl+F` to find, and
+IME) with the same capabilities, plus `Ctrl+S` to save, `Ctrl+F` for
+Emacs-style cursor-forward (click the Find button to search), and
 `Ctrl+Enter` to run.
 
 ## Smart clips
