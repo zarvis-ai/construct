@@ -5467,14 +5467,17 @@ impl App {
             (Some(anchor), Some(head)) => Some((anchor.min(buffer_len), head.min(buffer_len))),
             _ => None,
         };
-        // The daemon broadcasts every cursor publish back to its publisher, so
-        // most own-cursor notifications are plain echoes of state we already
-        // hold. Applying an echo is not a no-op: it resets `preferred_col`
-        // (losing C-n/C-p column stickiness) and used to collapse a zero-width
-        // C-Space mark to "no selection" before the first motion key could
-        // extend it. Only a daemon-side rebase — our offsets shifted by another
-        // client's edit — carries values that differ from local state, and that
-        // is the case this method exists for.
+        // The daemon no longer re-broadcasts a plain cursor publish back to
+        // its own source connection, so most notifications reaching here are
+        // genuine daemon-side rebases — our offsets shifted by another
+        // client's edit — which is the case this method exists for. The
+        // equality check below still matters: with adopt-side rebasing in
+        // `on_program_state`, our own rebase of a just-adopted edit often
+        // lands on the exact same offsets the daemon's rebase broadcast
+        // carries, and applying that redundant "update" is not a no-op — it
+        // resets `preferred_col` (losing C-n/C-p column stickiness) and used
+        // to collapse a zero-width C-Space mark to "no selection" before the
+        // first motion key could extend it.
         let local_selection = popup.selection.as_ref().map(|s| (s.anchor, s.head));
         if incoming_cursor == popup.cursor && incoming_selection == local_selection {
             return;
@@ -5548,14 +5551,32 @@ impl App {
             // next save detects the conflict and 3-way merges both sides.
             return;
         }
+        // Rebase the caret, selection, and search anchor through the old→new
+        // content diff instead of merely clamping them to the new length
+        // (spec 0065). A clamp alone leaves them pointing at whatever text
+        // now occupies their old offset — usually garbage — whenever the
+        // adopted change inserted or removed text before them; a rebase
+        // keeps them pinned to the same logical position in the document.
+        let diff_span = program_document_diff_span(&popup.buffer, &program.markdown);
         popup.buffer = program.markdown.clone();
         popup.saved_markdown = program.markdown.clone();
         popup.blocks = blocks;
         popup.program = program;
         let buffer_len = popup.buffer.chars().count();
-        popup.cursor = popup.cursor.min(buffer_len);
+        let rebase = |pos: usize| -> usize {
+            match diff_span {
+                Some(span) => program_rebase_position(pos, span),
+                None => pos,
+            }
+            .min(buffer_len)
+        };
+        popup.cursor = rebase(popup.cursor);
+        if let Some(selection) = popup.selection.as_mut() {
+            selection.anchor = rebase(selection.anchor);
+            selection.head = rebase(selection.head);
+        }
         if let Some(search) = popup.search.as_mut() {
-            search.anchor_cursor = search.anchor_cursor.min(buffer_len);
+            search.anchor_cursor = rebase(search.anchor_cursor);
         }
         popup.preferred_col = None;
         popup.undo_stack.clear();
@@ -8637,6 +8658,54 @@ fn program_smart_clip_with_instance_id(clip: &str, buffer: &str) -> String {
 fn program_popup_has_unsaved_edits(popup: &ProgramPopup) -> bool {
     program_normalize_smart_clip_instance_ids(&popup.buffer)
         != program_normalize_smart_clip_instance_ids(&popup.saved_markdown)
+}
+
+/// The char-offset span (in `old`/`new` coordinates respectively) where `old`
+/// and `new` differ, via common-prefix/suffix trim — mirrors
+/// `program_edit_overall_span` in crates/daemon/src/session.rs. Returns
+/// `(prefix, old_end, new_end)`: chars before `prefix` are shared, chars from
+/// `prefix` to `old_end` in `old` were replaced by chars from `prefix` to
+/// `new_end` in `new`. `None` when `old == new` (no rebase needed).
+fn program_document_diff_span(old: &str, new: &str) -> Option<(usize, usize, usize)> {
+    if old == new {
+        return None;
+    }
+    let old_chars: Vec<char> = old.chars().collect();
+    let new_chars: Vec<char> = new.chars().collect();
+    let mut prefix = 0usize;
+    while prefix < old_chars.len()
+        && prefix < new_chars.len()
+        && old_chars[prefix] == new_chars[prefix]
+    {
+        prefix += 1;
+    }
+    let mut old_end = old_chars.len();
+    let mut new_end = new_chars.len();
+    while old_end > prefix
+        && new_end > prefix
+        && old_chars[old_end - 1] == new_chars[new_end - 1]
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+    Some((prefix, old_end, new_end))
+}
+
+/// Rebase a char offset in the old document through to the new document,
+/// given the diff span from [`program_document_diff_span`]. Positions at or
+/// before the changed span's start are unchanged; positions at or after the
+/// old span's end shift by the length delta; positions inside the changed
+/// span clamp to the new span's end.
+fn program_rebase_position(pos: usize, span: (usize, usize, usize)) -> usize {
+    let (prefix, old_end, new_end) = span;
+    if pos <= prefix {
+        pos
+    } else if pos >= old_end {
+        let delta = new_end as isize - old_end as isize;
+        (pos as isize + delta).max(prefix as isize) as usize
+    } else {
+        new_end
+    }
 }
 
 fn program_normalize_smart_clip_instance_ids(markdown: &str) -> String {
@@ -13636,6 +13705,181 @@ mod tests {
             "# In progress\n- task @{session:sub1}\n- human typing\n"
         );
         assert_eq!(popup.program.version, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_rebases_caret_past_insertion_before_it() {
+        // Spec 0065: adopt must remap the local caret through the content
+        // change, not merely clamp it. Insertion lands before the caret
+        // (after "alpha "), so the caret must shift by the insertion length
+        // rather than stay pinned mid-text.
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 10));
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "alpha INSERTED beta".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 19, "caret should shift by the 9-char insertion");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_leaves_caret_unchanged_for_change_after_it() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 5));
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "alpha zzz".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 5, "change is entirely after the caret");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_shifts_caret_for_change_before_it() {
+        let (mut app, _dir, server) = empty_app().await;
+        // Caret at 8 sits after "alpha be" (inside "beta"). Replacing "alpha"
+        // (5 chars) with "A" (1 char) shifts everything after it by -4.
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 8));
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "A beta".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 4, "caret shifts by the -4 length delta");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_clamps_caret_inside_replaced_span() {
+        let (mut app, _dir, server) = empty_app().await;
+        // Caret at 2 sits inside "alpha" (the replaced span itself).
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 2));
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "X beta".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.cursor, 1,
+            "caret inside the replaced span clamps to the new span's end"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_rebases_selection_anchor_and_head() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut popup = program_popup_for_test("s1", "alpha beta", 0);
+        popup.selection = Some(ProgramSelection {
+            anchor: 7,
+            head: 9,
+            dragged: false,
+        });
+        app.program_popup = Some(popup);
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "A beta".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        let selection = popup.selection.as_ref().expect("selection survives adopt");
+        assert_eq!((selection.anchor, selection.head), (3, 5));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_rebases_search_anchor() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut popup = program_popup_for_test("s1", "alpha beta", 0);
+        popup.search = Some(ProgramSearch {
+            anchor_cursor: 6,
+            query: "beta".into(),
+            matches: Vec::new(),
+            selected: 0,
+        });
+        app.program_popup = Some(popup);
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "A beta".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        let search = popup.search.as_ref().expect("search survives adopt");
+        assert_eq!(search.anchor_cursor, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_notification_rebases_caret_across_clip_id_renormalization() {
+        // The amplifier defect: a broadcast whose only difference is a
+        // re-minted `clip_id=` value still adopts (clean check normalizes
+        // instance ids), but the ids have different lengths (clip_9 vs
+        // clip_10) so every offset after the clip must shift by the delta.
+        let (mut app, _dir, server) = empty_app().await;
+        let old_markdown = "before @{session:sub1 clip_id=9} after";
+        let cursor = old_markdown.chars().count();
+        app.program_popup = Some(program_popup_for_test("s1", old_markdown, cursor));
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "before @{session:sub1 clip_id=10} after".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            None,
+            Vec::new(),
+        );
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.cursor,
+            cursor + 1,
+            "caret after the clip shifts by the 1-char id-length delta"
+        );
         server.abort();
     }
 

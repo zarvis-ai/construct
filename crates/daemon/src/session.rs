@@ -227,7 +227,20 @@ pub enum BroadcastMsg {
     GroupState(GroupStateNotificationPayload),
     GroupDeleted(GroupDeletedNotificationPayload),
     ProgramState(ProgramStateNotificationPayload),
-    ProgramCursor(agentd_protocol::ProgramCursorNotificationPayload),
+    ProgramCursor {
+        payload: agentd_protocol::ProgramCursorNotificationPayload,
+        /// The connection whose own plain cursor publish produced this
+        /// broadcast, if any. The per-connection forwarder skips delivering
+        /// it back to that connection: a plain publish is an echo of state
+        /// the publisher already applied locally, and re-delivering it can
+        /// race a later local move — the receiver has no way to tell a
+        /// stale echo from a genuine daemon-side rebase, so it must never
+        /// see the echo at all. `None` for disconnect tombstones and
+        /// rebase-driven updates (`rebase_program_cursors_after_edit`),
+        /// which every connection — including the cursor's own owner —
+        /// needs to receive.
+        skip_conn_id: Option<u64>,
+    },
     /// Aggregate state for the remote WS transport. Emitted by
     /// `server::handle_ws_connection` on every accept/drop so the
     /// local TUI can show a "remote attached" badge.
@@ -1187,9 +1200,10 @@ impl SessionManager {
             if let Some(mut cursor) = cursors.remove(&conn_id) {
                 cursor.active = false;
                 cursor.updated_at_ms = chrono::Utc::now().timestamp_millis();
-                let _ = self.broadcast.send(BroadcastMsg::ProgramCursor(
-                    agentd_protocol::ProgramCursorNotificationPayload { cursor },
-                ));
+                let _ = self.broadcast.send(BroadcastMsg::ProgramCursor {
+                    payload: agentd_protocol::ProgramCursorNotificationPayload { cursor },
+                    skip_conn_id: None,
+                });
             }
         }
     }
@@ -1248,11 +1262,18 @@ impl SessionManager {
                 cursor.updated_at_ms = chrono::Utc::now().timestamp_millis();
             }
         }
-        let _ = self.broadcast.send(BroadcastMsg::ProgramCursor(
-            agentd_protocol::ProgramCursorNotificationPayload {
+        // Skip delivering this broadcast back to its own publisher: it's a
+        // plain-publish echo of state `conn_id` already applied locally
+        // before calling in, and letting it round-trip back opens a window
+        // where a later local move races the echo and gets clobbered by it
+        // (the receiver can't tell "stale echo" from "real daemon rebase").
+        // Every other connection still needs it to render this cursor.
+        let _ = self.broadcast.send(BroadcastMsg::ProgramCursor {
+            payload: agentd_protocol::ProgramCursorNotificationPayload {
                 cursor: cursor.clone(),
             },
-        ));
+            skip_conn_id: Some(conn_id),
+        });
         Ok(agentd_protocol::ProgramCursorResult { cursor })
     }
 
@@ -1840,9 +1861,13 @@ impl SessionManager {
         let active_run = self.program_run_snapshot(&params.session_id);
         self.broadcast_program_state(program.clone());
         for cursor in cursor_updates {
-            let _ = self.broadcast.send(BroadcastMsg::ProgramCursor(
-                agentd_protocol::ProgramCursorNotificationPayload { cursor },
-            ));
+            // A genuine rebase, not a plain-publish echo — the cursor's own
+            // owner needs this broadcast just as much as every peer does, so
+            // nothing is excluded.
+            let _ = self.broadcast.send(BroadcastMsg::ProgramCursor {
+                payload: agentd_protocol::ProgramCursorNotificationPayload { cursor },
+                skip_conn_id: None,
+            });
         }
         // Publish the agent's presence cursor over the edit's real span so
         // connected clients see where the agent just wrote (spec 0065 agent
@@ -5555,9 +5580,17 @@ mod tests {
 
         let broadcast = rx.recv().await.expect("broadcast");
         match broadcast {
-            BroadcastMsg::ProgramCursor(payload) => {
+            BroadcastMsg::ProgramCursor {
+                payload,
+                skip_conn_id,
+            } => {
                 assert_eq!(payload.cursor.client_id, "c7");
                 assert!(payload.cursor.active);
+                assert_eq!(
+                    skip_conn_id,
+                    Some(7),
+                    "a plain publish must be skipped for its own publisher"
+                );
             }
             other => panic!("unexpected broadcast: {other:?}"),
         }
@@ -5566,9 +5599,13 @@ mod tests {
         assert!(mgr.program_collaborators(&id).is_empty());
         let broadcast = rx.recv().await.expect("clear broadcast");
         match broadcast {
-            BroadcastMsg::ProgramCursor(payload) => {
+            BroadcastMsg::ProgramCursor {
+                payload,
+                skip_conn_id,
+            } => {
                 assert_eq!(payload.cursor.client_id, "c7");
                 assert!(!payload.cursor.active);
+                assert_eq!(skip_conn_id, None, "a disconnect tombstone excludes no one");
             }
             other => panic!("unexpected broadcast: {other:?}"),
         }
@@ -6074,7 +6111,7 @@ mod tests {
         let agent_client_id = agent_collaborator(&mgr, &id).client_id.clone();
         let mut agent_cursor_broadcasts = Vec::new();
         while let Ok(msg) = rx.try_recv() {
-            if let BroadcastMsg::ProgramCursor(payload) = msg {
+            if let BroadcastMsg::ProgramCursor { payload, .. } = msg {
                 if payload.cursor.client_id == agent_client_id {
                     agent_cursor_broadcasts.push(payload.cursor);
                 }

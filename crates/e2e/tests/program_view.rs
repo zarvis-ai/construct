@@ -724,6 +724,42 @@ async fn web_program_view_full_parity() {
         "own cursor should not render as a remote overlay: {own_cursor:?}"
     );
 
+    // --- 12b. Live program/state adopt rebases the caret through the content
+    //          diff instead of merely clamping it (spec 0065). An insertion
+    //          lands before the caret, with no own-cursor echo to correct it
+    //          afterward — the adopt path itself must shift the caret.
+    let adopt_caret: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.get": () => ({ program: { session_id: "s-adopt-caret", markdown: "alpha beta\n", version: 1, template_id: null }, active_run: null, blocks: [], revisions: [] }),
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              setSession("s-adopt-caret", "shell");
+              await switchCurrentViewMode("program");
+              const before = programRangeForOffset(10);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(before);
+              handleProgramState({ program: { session_id: "s-adopt-caret", markdown: "alpha INSERTED beta\n", version: 2, template_id: null }, active_run: null, blocks: [] });
+              const offsets = programSelectionOffsets();
+              return { text: programSerialize(), head: offsets ? offsets.head : null };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate adopt caret")
+        .into_value()
+        .expect("json");
+    assert_eq!(
+        adopt_caret["text"], "alpha INSERTED beta\n",
+        "{adopt_caret:?}"
+    );
+    assert_eq!(
+        adopt_caret["head"], 19,
+        "caret should shift by the 9-char insertion, not clamp in place: {adopt_caret:?}"
+    );
+
     // --- 13. Session-status chip badges: initial missing state, live update
     //         on session/state, and flip to missing on session/deleted. Also
     //         covers the running-activity pulse (`.is-active`), which mirrors
