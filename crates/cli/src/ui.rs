@@ -6188,6 +6188,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x i           send input to selected session
     C-x k           delete selected session (confirms; kills if running)
     C-x Space       open selected session's program
+    C-x C-o         focus session terminal / refocus Program
     C-x d           show diff
     C-x r           rename selected session (clears title on empty submit)
     C-x f           fork selected session into a new harness (seeded w/ history)

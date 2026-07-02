@@ -16,6 +16,21 @@ impl App {
         }
     }
 
+    pub(crate) fn toggle_program_terminal_focus(&mut self) {
+        let Some(popup) = self.program_popup.as_ref() else {
+            self.set_status("program focus: no program open".to_string());
+            return;
+        };
+        let terminal_focus = !popup.terminal_focus;
+        self.focus = PaneFocus::View;
+        self.set_program_terminal_focus(terminal_focus);
+        if terminal_focus {
+            self.set_status("focus: session terminal".to_string());
+        } else {
+            self.set_status("focus: program".to_string());
+        }
+    }
+
     pub(super) async fn open_program_popup(&mut self) {
         let Some(session_id) = self.selected_id() else {
             self.set_status("program: no session selected".to_string());

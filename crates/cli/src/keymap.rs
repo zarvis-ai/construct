@@ -37,6 +37,11 @@ pub enum KeyAction {
     /// when text is selected). Bound to `C-x C-r` — the keyboard equivalent of
     /// the title-bar ▶ button and the selection ▶ Run button.
     RunProgram,
+    /// Toggle keyboard focus between an open Program surface and the
+    /// underlying session terminal in the same split. Bound to `C-x C-o`:
+    /// Program focus slides the Program right to expose the terminal; terminal
+    /// focus slides it back and resumes Program editing.
+    ToggleProgramTerminalFocus,
     OpenDiff,
     Interrupt,
     OpenCommandPalette,
@@ -258,6 +263,10 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ctrl('s')]), SaveProgram),
         (Chord(vec![ctrl('x'), ch('u')]), UndoProgram),
         (Chord(vec![ctrl('x'), ctrl('r')]), RunProgram),
+        (
+            Chord(vec![ctrl('x'), ctrl('o')]),
+            ToggleProgramTerminalFocus,
+        ),
         (Chord(vec![ctrl('x'), ch('d')]), OpenDiff),
         (Chord(vec![ctrl('x'), ch('i')]), OpenSendInput),
         // `C-x r` opens the rename minibuffer (with current title pre-filled).
@@ -322,6 +331,10 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('x'), ctrl('s')]), SaveProgram),
         (Chord(vec![ctrl('x'), ch('u')]), UndoProgram),
         (Chord(vec![ctrl('x'), ctrl('r')]), RunProgram),
+        (
+            Chord(vec![ctrl('x'), ctrl('o')]),
+            ToggleProgramTerminalFocus,
+        ),
         (Chord(vec![ch('d')]), OpenDiff),
         (Chord(vec![ctrl('c')]), Interrupt),
         // `r` opens the rename minibuffer; refresh moved to M-x refresh.
@@ -608,6 +621,20 @@ mod tests {
                     KeymapResult::Action(KeyAction::RunProgram)
                 ),
                 "C-x C-r should trigger RunProgram in {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn c_x_ctrl_o_toggles_program_terminal_focus() {
+        for profile in [Profile::Emacs, Profile::Vim] {
+            let km = default_for(profile);
+            assert!(
+                matches!(
+                    resolve(&km, vec![ctrl('x'), ctrl('o')]),
+                    KeymapResult::Action(KeyAction::ToggleProgramTerminalFocus)
+                ),
+                "C-x C-o should toggle Program/session focus in {profile:?}"
             );
         }
     }
