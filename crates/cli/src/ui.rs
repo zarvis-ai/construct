@@ -7565,6 +7565,12 @@ struct ProgramShimmer {
     phase: f32,
 }
 
+/// One-shot settle flourish lines. `started_at` is per source line so multiple
+/// blocks can settle in separate notifications and animate independently.
+struct ProgramSettleFlourish {
+    started_at_by_line: Vec<Option<Instant>>,
+}
+
 /// Build the shimmer overlay for a popup from its session's `ProgramRun`, or
 /// `None` if no run is active, it has lapsed, or every block has settled. A
 /// block shimmers while its stable ref is in the run's pending set (spec 0053);
@@ -7628,6 +7634,54 @@ fn program_run_shimmer(
     })
 }
 
+fn program_settle_flourish(
+    app: &App,
+    popup: &crate::app::ProgramPopup,
+    now: Instant,
+) -> Option<ProgramSettleFlourish> {
+    let flourishes = app
+        .program_settle_flourishes
+        .get(&popup.program.session_id)?;
+    if flourishes.is_empty() {
+        return None;
+    }
+    let clean = popup.buffer == popup.saved_markdown && !popup.blocks.is_empty();
+    if !clean {
+        return None;
+    }
+    let ttl = Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS);
+    let mut started_at_by_line = vec![None; popup.buffer.lines().count()];
+    let mut any = false;
+    let has_stable_match = popup
+        .blocks
+        .iter()
+        .any(|block| flourishes.contains_key(&block.id));
+    for block in &popup.blocks {
+        let started_at = if has_stable_match {
+            flourishes.get(&block.id)
+        } else {
+            flourishes
+                .get(&block.id)
+                .or_else(|| flourishes.get(&block.content_id))
+        };
+        let Some(started_at) = started_at.copied() else {
+            continue;
+        };
+        if now.saturating_duration_since(started_at) >= ttl {
+            continue;
+        }
+        for slot in started_at_by_line
+            .iter_mut()
+            .take(block.end_line)
+            .skip(block.start_line)
+        {
+            *slot = Some(started_at);
+            any = true;
+        }
+    }
+    any.then_some(ProgramSettleFlourish { started_at_by_line })
+}
+
 /// Overlay the Run shimmer onto already-rendered program lines: for each active
 /// line, re-emit its text character-by-character with a brightness drawn from a
 /// travelling wave, so a highlight band sweeps through the running region. The
@@ -7659,6 +7713,57 @@ fn apply_program_shimmer(lines: &mut [Line], shimmer: &ProgramShimmer, theme: &T
                 }
                 new_spans.push(Span::styled(ch.to_string(), st));
                 gidx += 1;
+            }
+        }
+        line.spans = new_spans;
+    }
+}
+
+fn apply_program_settle_flourish(
+    lines: &mut [Line],
+    flourish: &ProgramSettleFlourish,
+    theme: &Theme,
+    now: Instant,
+) {
+    let ttl = Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS).as_secs_f32();
+    for (i, line) in lines.iter_mut().enumerate() {
+        let Some(started_at) = flourish
+            .started_at_by_line
+            .get(i)
+            .and_then(|started_at| *started_at)
+        else {
+            continue;
+        };
+        let progress =
+            (now.saturating_duration_since(started_at).as_secs_f32() / ttl).clamp(0.0, 1.0);
+        let total_chars = line
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum::<usize>()
+            .max(1);
+        let sweep_center = progress * 1.35 - 0.18;
+        let mut line_idx = 0usize;
+        let mut new_spans = Vec::new();
+        for span in std::mem::take(&mut line.spans) {
+            if span.style.bg.is_some() {
+                line_idx += span.content.chars().count();
+                new_spans.push(span);
+                continue;
+            }
+            let style = span.style;
+            let base_fg = style.fg.unwrap_or(theme.text);
+            for ch in span.content.chars() {
+                let x = line_idx as f32 / total_chars as f32;
+                let distance = (x - sweep_center).abs();
+                let intensity = (1.0 - distance / 0.20).clamp(0.0, 1.0);
+                let eased = intensity * intensity * (3.0 - 2.0 * intensity);
+                let mut st = style.fg(blend_color(base_fg, theme.accent, eased * 0.85));
+                if eased > 0.70 {
+                    st = st.add_modifier(Modifier::BOLD);
+                }
+                new_spans.push(Span::styled(ch.to_string(), st));
+                line_idx += 1;
             }
         }
         line.spans = new_spans;
@@ -7983,6 +8088,9 @@ fn render_program_popup_at(
     // sweep a highlight through the blocks that have not settled yet.
     if let Some(shimmer) = program_run_shimmer(app, popup, now) {
         apply_program_shimmer(&mut lines, &shimmer, &app.theme);
+    }
+    if let Some(flourish) = program_settle_flourish(app, popup, now) {
+        apply_program_settle_flourish(&mut lines, &flourish, &app.theme, now);
     }
     // Empty program: replace the bare body with a richer onboarding placeholder —
     // a one-line description, a grouped list of clickable templates, a divider,

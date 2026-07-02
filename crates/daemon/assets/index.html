@@ -1644,9 +1644,25 @@
     border-radius: 3px;
     animation: program-shimmer 1.6s linear infinite;
   }
+  .program-line.is-settling:not(.is-running) {
+    background-image: linear-gradient(100deg,
+      transparent 28%,
+      color-mix(in srgb, var(--accent) 38%, transparent) 46%,
+      color-mix(in srgb, var(--fg) 18%, transparent) 52%,
+      transparent 70%);
+    background-size: 240% 100%;
+    background-repeat: no-repeat;
+    border-radius: 3px;
+    animation: program-settle 300ms ease-out 1 both;
+  }
   @keyframes program-shimmer {
     from { background-position: 140% 0; }
     to { background-position: -40% 0; }
+  }
+  @keyframes program-settle {
+    0% { background-position: 145% 0; }
+    88% { background-position: -35% 0; }
+    100% { background-position: -45% 0; background-image: none; }
   }
   .program-cursor-layer {
     position: absolute;
@@ -2316,6 +2332,9 @@ const state = {
     // In-flight run shimmer per session id:
     // { pendingIds:Set, tooltips:Map, startPerf, deadlinePerf }.
     runById: new Map(),
+    // Recently-settled block refs per session id: Map<id, Map<ref,startPerf>>.
+    settleById: new Map(),
+    settleTimer: 0,
     // Client-local title Run button pulse per session id. This is intentionally
     // separate from block shimmer: a re-Run can happen while an older shimmer is
     // already narrowed and has already seen output.
@@ -3435,6 +3454,7 @@ async function selectSession(id, { replaceUrl = false } = {}) {
 // the SAME shared rules as the daemon/TUI so block ids agree across clients.
 
 const PROGRAM_RUN_MAX_MS = 10 * 60 * 1000;
+const PROGRAM_SETTLE_FLASH_MS = 300;
 const PROGRAM_TEXT_ENCODER = new TextEncoder();
 
 // --- shared block-identity rules (ports of agentd_protocol) ---
@@ -3650,14 +3670,19 @@ function programDiff3(ours, base, theirs) {
 
 // --- run shimmer ---
 
+function programPendingIdsFromProgress(progress) {
+  if (!progress) return null;
+  return new Set([
+    ...(progress.pending_block_refs || []),
+    ...(progress.pending_block_ids || []),
+  ]);
+}
+
 function programRunFromProgress(progress) {
   if (!progress) return null;
   const nowMs = Date.now();
-  const ids = [
-    ...(progress.pending_block_refs || []),
-    ...(progress.pending_block_ids || []),
-  ];
-  if (progress.expires_at_ms <= nowMs || ids.length === 0) return null;
+  const ids = programPendingIdsFromProgress(progress);
+  if (progress.expires_at_ms <= nowMs || !ids || ids.size === 0) return null;
   const perf = performance.now();
   const startPerf = progress.started_at_ms <= nowMs ? perf - (nowMs - progress.started_at_ms) : perf;
   const pendingCount = (progress.pending_block_refs && progress.pending_block_refs.length)
@@ -3672,7 +3697,7 @@ function programRunFromProgress(progress) {
     else stage = "delivered";
   }
   return {
-    pendingIds: new Set(ids),
+    pendingIds: ids,
     tooltips: new Map(Object.entries(progress.pending_block_tooltips || {})),
     startPerf,
     deadlinePerf: perf + (progress.expires_at_ms - nowMs),
@@ -3695,6 +3720,47 @@ function programRunStageLabel(run) {
   }
 }
 
+function programRecordSettleFlourishes(id, previousPending, nextPending) {
+  if (!id || !previousPending || !nextPending) return;
+  const settled = [];
+  for (const ref of previousPending) if (!nextPending.has(ref)) settled.push(ref);
+  if (!settled.length) return;
+  const now = performance.now();
+  let byRef = state.program.settleById.get(id);
+  if (!byRef) { byRef = new Map(); state.program.settleById.set(id, byRef); }
+  for (const ref of settled) byRef.set(ref, now);
+  programScheduleSettlePrune();
+}
+
+function programPruneSettleFlourishes() {
+  const now = performance.now();
+  for (const [id, byRef] of state.program.settleById) {
+    for (const [ref, started] of byRef) {
+      if (now - started >= PROGRAM_SETTLE_FLASH_MS) byRef.delete(ref);
+    }
+    if (!byRef.size) state.program.settleById.delete(id);
+  }
+}
+
+function programScheduleSettlePrune() {
+  if (state.program.settleTimer) clearTimeout(state.program.settleTimer);
+  programPruneSettleFlourishes();
+  let nextMs = Infinity;
+  const now = performance.now();
+  for (const byRef of state.program.settleById.values()) {
+    for (const started of byRef.values()) {
+      nextMs = Math.min(nextMs, PROGRAM_SETTLE_FLASH_MS - (now - started));
+    }
+  }
+  if (!Number.isFinite(nextMs)) { state.program.settleTimer = 0; return; }
+  state.program.settleTimer = setTimeout(() => {
+    state.program.settleTimer = 0;
+    programPruneSettleFlourishes();
+    if (state.mode === "program") programApplyShimmer();
+    programScheduleSettlePrune();
+  }, Math.max(0, nextMs));
+}
+
 function programActiveLines(buffer, pendingSet, blocks) {
   const n = programLines(buffer).length;
   const active = new Array(n).fill(false);
@@ -3706,6 +3772,23 @@ function programActiveLines(buffer, pendingSet, blocks) {
       ? (pendingSet.has(b.id) || pendingSet.has(b.block_ref))
       : (pendingSet.has(b.id) || pendingSet.has(b.block_ref) || pendingSet.has(b.content_id));
     if (pending) {
+      for (let i = b.start_line; i < b.end_line && i < n; i++) { active[i] = true; any = true; }
+    }
+  }
+  return any ? active : null;
+}
+
+function programSettleLines(buffer, settledSet, blocks) {
+  if (!settledSet || !settledSet.size || !blocks || !blocks.length) return null;
+  const n = programLines(buffer).length;
+  const active = new Array(n).fill(false);
+  let any = false;
+  const hasStableMatch = blocks.some((b) => settledSet.has(b.id) || settledSet.has(b.block_ref));
+  for (const b of blocks) {
+    const settling = hasStableMatch
+      ? (settledSet.has(b.id) || settledSet.has(b.block_ref))
+      : (settledSet.has(b.id) || settledSet.has(b.block_ref) || settledSet.has(b.content_id));
+    if (settling) {
       for (let i = b.start_line; i < b.end_line && i < n; i++) { active[i] = true; any = true; }
     }
   }
@@ -4018,12 +4101,24 @@ function programApplyShimmer() {
   const lineEls = programInputEl.querySelectorAll(":scope > div");
   const run = id && state.program.runById.get(id);
   let active = null;
+  let settling = null;
   if (run && performance.now() < run.deadlinePerf) {
     const doc = state.program.docById.get(id);
     const cleanBlocks = doc && programNormalizeClipIds(programSerialize()) === doc.saved ? (doc.blocks || []) : null;
     active = programActiveLines(programSerialize(), run.pendingIds, cleanBlocks);
   }
-  lineEls.forEach((el, i) => { el.classList.toggle("is-running", !!(active && active[i])); });
+  const settledRefs = id && state.program.settleById.get(id);
+  if (settledRefs && settledRefs.size) {
+    programPruneSettleFlourishes();
+    const doc = state.program.docById.get(id);
+    const cleanBlocks = doc && programNormalizeClipIds(programSerialize()) === doc.saved ? (doc.blocks || []) : null;
+    settling = cleanBlocks ? programSettleLines(programSerialize(), settledRefs, cleanBlocks) : null;
+  }
+  lineEls.forEach((el, i) => {
+    const running = !!(active && active[i]);
+    el.classList.toggle("is-running", running);
+    el.classList.toggle("is-settling", !running && !!(settling && settling[i]));
+  });
 }
 
 function programRunButtonActive(id) {
@@ -4278,6 +4373,9 @@ function handleProgramState(params) {
   const program = params.program;
   if (!program) return;
   const id = program.session_id;
+  const previousRun = state.program.runById.get(id);
+  const nextPending = params.active_run ? programPendingIdsFromProgress(params.active_run) : null;
+  if (previousRun && nextPending) programRecordSettleFlourishes(id, previousRun.pendingIds, nextPending);
   const run = programRunFromProgress(params.active_run);
   if (run) state.program.runById.set(id, run); else state.program.runById.delete(id);
   if (!run || run.firstOutputSeen) programClearRunButton(id);
@@ -6775,6 +6873,7 @@ function handleNotification(method, params) {
     state.widgetsById.delete(params.session_id);
     state.program.docById.delete(params.session_id);
     state.program.runById.delete(params.session_id);
+    state.program.settleById.delete(params.session_id);
     if (state.viewModeById.delete(params.session_id)) saveViewModePrefs();
     clearBrowserPreview(params.session_id);
     if (params.session_id === state.currentId) {
