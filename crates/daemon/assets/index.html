@@ -1631,6 +1631,39 @@
     user-select: all;
     cursor: default;
   }
+  /* Session smart-clip status badge: subtle status-tinted color, driven by
+     `data-status` (kept live by programUpdateChipStatuses). "done" has no
+     rule — it keeps the chip's default accent-alt look, unchanged from
+     before this badge existed. A missing/deleted target reads as
+     struck-through so it's unmistakable at a glance, not just recolored. */
+  .program-clip[data-status="pending"] {
+    background: color-mix(in srgb, var(--fg-faint) 20%, transparent);
+    color: var(--fg-faint);
+    border-color: color-mix(in srgb, var(--fg-faint) 40%, transparent);
+  }
+  .program-clip[data-status="running"],
+  .program-clip[data-status="awaiting_input"] {
+    background: color-mix(in srgb, var(--ok) 20%, transparent);
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  }
+  .program-clip[data-status="paused"] {
+    background: color-mix(in srgb, var(--warn) 20%, transparent);
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+  }
+  .program-clip[data-status="errored"] {
+    background: color-mix(in srgb, var(--err) 22%, transparent);
+    color: var(--err);
+    border-color: color-mix(in srgb, var(--err) 45%, transparent);
+  }
+  .program-clip[data-status="missing"] {
+    background: color-mix(in srgb, var(--fg-faint) 14%, transparent);
+    color: var(--fg-faint);
+    border-color: color-mix(in srgb, var(--fg-faint) 30%, transparent);
+    text-decoration: line-through;
+    opacity: 0.78;
+  }
   /* Run shimmer: a travelling highlight band sweeps the running lines. Pure CSS
      (no per-char DOM rebuild) so it never disturbs the caret while editing. */
   .program-line.is-running {
@@ -3839,21 +3872,29 @@ function programLineClipRanges(line) {
   return ranges;
 }
 
-// The friendly chip label the overlay paints in place of a raw `@{…}` clip
-// body — mirrors the TUI: `<glyph> <title> · <harness>` for a session, `✓ name`
-// for a harness, dropping the `clip_id=…` noise (spec 0059).
-function programClipLabel(body) {
+// Split a clip body (`session:abc`, `harness:codex`, or `session:abc
+// clip_id=3`) into its `(kind, id)`, mirroring the TUI's
+// `program_smart_clip_target`.
+function programClipTarget(body) {
   const first = (body.trim().split(/\s+/)[0]) || body;
   const colon = first.indexOf(":");
   const kind = colon === -1 ? "clip" : first.slice(0, colon);
   const id = colon === -1 ? first : first.slice(colon + 1);
+  return [kind, id];
+}
+
+// The friendly chip label the overlay paints in place of a raw `@{…}` clip
+// body — mirrors the TUI: `<glyph> <title> · <harness>` for a session, `✓ name`
+// for a harness, dropping the `clip_id=…` noise (spec 0059).
+function programClipLabel(body) {
+  const [kind, id] = programClipTarget(body);
   if (kind === "session") {
     const s = state.sessions.find((x) => x.id === id);
     if (s) {
       const title = (s.title && s.title.trim()) ? s.title : id.slice(0, 6);
       return `${sessionStatusGlyph(s)} ${title} · ${s.harness || "session"}`;
     }
-    return `session ${id}`;
+    return `⊘ ${id.slice(0, 6)} · missing`;
   }
   if (kind === "harness") {
     const h = state.harnesses.find((x) => x.name === id);
@@ -3864,16 +3905,69 @@ function programClipLabel(body) {
   return `${kind} ${id}`;
 }
 
+// Live session status backing a session smart-clip's badge, mirroring the
+// TUI: the session's own `state` word, or "missing" when the target id no
+// longer resolves against the fleet (deleted, archived, or never existed).
+function programSessionChipStatus(id) {
+  const s = state.sessions.find((x) => x.id === id);
+  return s ? sessionStatusLabel(s) : "missing";
+}
+
+// Plain-language hover tooltip for a session smart-clip's live status
+// (spec: program smart-clip status badges). Distinct wording from the raw
+// status word for the two cases a viewer actually reads on hover.
+function programSessionChipStatusTooltip(status) {
+  switch (status) {
+    case "pending": return "pending";
+    case "running": return "running";
+    case "awaiting_input": return "awaiting input";
+    case "paused": return "paused";
+    case "done": return "done";
+    case "errored": return "exited with error";
+    case "missing": return "session deleted";
+    default: return "";
+  }
+}
+
 // Build an atomic, content-fit chip widget for a raw `@{…}` clip. It is
 // contenteditable=false, so the browser treats it as one character: a single
 // cursor stop, and Backspace deletes the whole clip (the TUI's model, spec 0059).
+// A session-kind clip also carries a live status badge (`data-status` +
+// hover tooltip) driven by `state.sessions`, kept fresh by
+// `programUpdateChipStatuses` on every `session/state` push.
 function programChipEl(rawClip) {
   const span = document.createElement("span");
   span.className = "program-clip";
   span.setAttribute("contenteditable", "false");
   span.dataset.raw = rawClip;
-  span.textContent = programClipLabel(rawClip.slice(2, -1));
+  const body = rawClip.slice(2, -1);
+  span.textContent = programClipLabel(body);
+  const [kind, id] = programClipTarget(body);
+  if (kind === "session") {
+    const status = programSessionChipStatus(id);
+    span.dataset.status = status;
+    span.title = programSessionChipStatusTooltip(status);
+  }
   return span;
+}
+
+// Repaint every mounted session smart-clip chip referencing `sessionId` with
+// its current label/status/tooltip. Called on live `session/state` and
+// `session/deleted` pushes so a worker dying (or getting deleted) turns its
+// chip red — or struck-through — instantly without a full document
+// re-render (which would clobber the caret/selection mid-edit).
+function programUpdateChipStatuses(sessionId) {
+  if (!programInputEl) return;
+  const chips = programInputEl.querySelectorAll(".program-clip[data-raw]");
+  for (const chip of chips) {
+    const body = chip.dataset.raw.slice(2, -1);
+    const [kind, id] = programClipTarget(body);
+    if (kind !== "session" || id !== sessionId) continue;
+    const status = programSessionChipStatus(id);
+    chip.textContent = programClipLabel(body);
+    chip.dataset.status = status;
+    chip.title = programSessionChipStatusTooltip(status);
+  }
 }
 
 // Fill a line element with text nodes + atomic chip widgets for one source line.
@@ -6878,6 +6972,10 @@ function handleNotification(method, params) {
     const i = state.sessions.findIndex((s) => s.id === session.id);
     if (i >= 0) state.sessions[i] = session;
     else state.sessions.push(session);
+    // Repaint any mounted Program smart-clip chips referencing this session
+    // in place — a worker dying should turn its chip red instantly, without
+    // waiting for (or forcing) a full document re-render.
+    programUpdateChipStatuses(session.id);
     const status = sessionStatusLabel(session);
     if (status !== "running" && status !== "pending") {
       state.chatWorkingById.delete(session.id);
@@ -6904,6 +7002,8 @@ function handleNotification(method, params) {
       }
     }
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
+    // Any chip referencing the now-gone session flips to "missing".
+    programUpdateChipStatuses(params.session_id);
     scheduleRenderSessions();
     state.editorById.delete(params.session_id);
     state.agentStatusById.delete(params.session_id);

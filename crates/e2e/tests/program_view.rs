@@ -724,6 +724,65 @@ async fn web_program_view_full_parity() {
         "own cursor should not render as a remote overlay: {own_cursor:?}"
     );
 
+    // --- 13. Session-status chip badges: initial missing state, live update
+    //         on session/state, and flip to missing on session/deleted. ------
+    let badges: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.get": () => ({ program: { session_id: "s-badges", markdown: "@{session:sBadge1} @{session:sGone}\n", version: 1, template_id: null }, active_run: null, blocks: [], revisions: [] }),
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              state.sessions = [
+                { id: "s-badges", harness: "shell", kind: "user" },
+                { id: "sBadge1", title: "Worker", harness: "claude", state: "running", kind: "user" },
+              ];
+              state.currentId = "s-badges";
+              await switchCurrentViewMode("program");
+              const chipInfo = () => Array.from(programInputEl.querySelectorAll(".program-clip[data-raw]"))
+                .map((c) => ({ status: c.dataset.status, title: c.title }));
+              const before = chipInfo();
+              handleNotification("session/state", { session: { id: "sBadge1", title: "Worker", harness: "claude", state: "errored", kind: "user" } });
+              const afterError = chipInfo();
+              handleNotification("session/deleted", { session_id: "sBadge1" });
+              const afterDelete = chipInfo();
+              return { before, afterError, afterDelete };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate badges")
+        .into_value()
+        .expect("json");
+    assert_eq!(
+        badges["before"][0]["status"], "running",
+        "a resolved session clip should badge its live status: {badges:?}"
+    );
+    assert_eq!(
+        badges["before"][1]["status"], "missing",
+        "a clip whose target isn't in state.sessions should badge missing: {badges:?}"
+    );
+    assert_eq!(
+        badges["before"][1]["title"], "session deleted",
+        "{badges:?}"
+    );
+    assert_eq!(
+        badges["afterError"][0]["status"], "errored",
+        "a live session/state push should repaint the mounted chip in place: {badges:?}"
+    );
+    assert_eq!(
+        badges["afterError"][0]["title"], "exited with error",
+        "{badges:?}"
+    );
+    assert_eq!(
+        badges["afterDelete"][0]["status"], "missing",
+        "session/deleted should flip the now-dead chip to missing: {badges:?}"
+    );
+    assert_eq!(
+        badges["afterDelete"][0]["title"], "session deleted",
+        "{badges:?}"
+    );
+
     // --- Visual artifacts: drive the REAL session's program (it has a smart
     //     clip from step 1) and leave it mounted so the screenshots show the
     //     genuine rendered surface, chip, and run shimmer. ------------------

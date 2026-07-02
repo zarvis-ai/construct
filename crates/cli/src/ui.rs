@@ -8305,7 +8305,19 @@ fn render_program_clip_hover(
     else {
         return;
     };
-    render_session_hover_card(f, app, modal, &session_id, mx, my, None);
+    if render_session_hover_card(f, app, modal, &session_id, mx, my, None) {
+        return;
+    }
+    // No live preview (unknown session, or no captured output yet, per spec
+    // 0060) — degrade to the plain-language status badge tooltip instead of
+    // showing nothing.
+    let status = app
+        .sessions
+        .iter()
+        .find(|s| s.id == session_id)
+        .map(|s| s.state);
+    let tooltip = program_session_clip_status_tooltip(status);
+    render_tooltip_at(f, &app.theme, tooltip, mx, my, 2, -1);
 }
 
 fn program_clip_hover_bounds(view_area: Option<Rect>, base_rect: Rect) -> Rect {
@@ -10434,13 +10446,22 @@ fn program_smart_clip_span<'a>(
     is_active_match: bool,
 ) -> Span<'a> {
     let (kind, label) = program_smart_clip_label(Some(app), raw_clip);
+    let mut modifier = Modifier::BOLD;
     let bg = if is_active_match {
         app.theme.highlight_bg
     } else if in_match {
         app.theme.highlight_bg
     } else {
         match kind {
-            "session" => app.theme.accent_alt,
+            "session" => {
+                let status = program_session_clip_status(app, raw_clip);
+                if status.is_none() {
+                    // A dead reference reads as struck-through, not just
+                    // recolored, so it's unmistakable at a glance.
+                    modifier |= Modifier::CROSSED_OUT;
+                }
+                program_session_chip_bg(&app.theme, status)
+            }
             "harness" => app.theme.harness,
             "session-response" => app.theme.info,
             _ => app.theme.inactive_highlight_bg,
@@ -10449,11 +10470,55 @@ fn program_smart_clip_span<'a>(
     let mut style = Style::default()
         .fg(app.theme.highlight_fg)
         .bg(bg)
-        .add_modifier(Modifier::BOLD);
+        .add_modifier(modifier);
     if is_active_match {
         style = style.fg(app.theme.highlight_fg);
     }
     Span::styled(format!(" {} ", label), style)
+}
+
+/// The live daemon status backing a `@{session:…}` smart-clip's chip badge.
+/// `None` means the referenced session id no longer resolves against the
+/// fleet (deleted, archived, or never existed) — the chip renders that as
+/// "missing" rather than silently keeping whatever color it last had.
+fn program_session_clip_status(app: &App, raw_clip: &str) -> Option<SessionState> {
+    let (_, id) = program_smart_clip_target(raw_clip);
+    app.sessions.iter().find(|s| s.id == id).map(|s| s.state)
+}
+
+/// Chip background for a session smart-clip, driven by the target session's
+/// live `SessionState` (spec 0027 theme slots, so it stays readable in both
+/// palettes). `Done` intentionally matches the old fixed `accent_alt` chip
+/// color (the two slots are the same color in both palettes) so a settled
+/// reference looks the same as before this badge existed; every other status
+/// gets its own color so a state change — especially a worker dying — is
+/// visible at a glance without reading the label text.
+fn program_session_chip_bg(theme: &Theme, status: Option<SessionState>) -> ratatui::style::Color {
+    match status {
+        Some(SessionState::Pending) => theme.muted,
+        Some(SessionState::Running) | Some(SessionState::AwaitingInput) => theme.success,
+        Some(SessionState::Paused) => theme.warning,
+        Some(SessionState::Done) => theme.info,
+        Some(SessionState::Errored) => theme.danger,
+        None => theme.muted,
+    }
+}
+
+/// Plain-language hover tooltip for a session smart-clip's live status.
+/// Distinct wording from `SessionState::label()` for the cases a viewer
+/// actually reads on hover: an errored worker reads as "exited with error"
+/// (not the internal word "errored"), and an unresolved session id reads as
+/// "session deleted" rather than "missing".
+fn program_session_clip_status_tooltip(status: Option<SessionState>) -> &'static str {
+    match status {
+        Some(SessionState::Pending) => "pending",
+        Some(SessionState::Running) => "running",
+        Some(SessionState::AwaitingInput) => "awaiting input",
+        Some(SessionState::Paused) => "paused",
+        Some(SessionState::Done) => "done",
+        Some(SessionState::Errored) => "exited with error",
+        None => "session deleted",
+    }
 }
 
 fn program_smart_clip_visual_width(app: Option<&App>, raw_clip: &str) -> usize {
@@ -10482,6 +10547,14 @@ fn program_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
     )
 }
 
+/// The chip label for a session smart-clip whose target id doesn't resolve
+/// against the live fleet. Carries its own glyph (distinct from any
+/// `SessionState::glyph()`) so a dead reference is visually distinct from a
+/// resolved one, not just a plain fallback string.
+fn program_missing_session_clip_label(id: &str) -> String {
+    format!("⊘ {} · missing", short_id(id))
+}
+
 fn program_harness_clip_label(h: &agentd_protocol::HarnessInfo) -> String {
     let status_icon = if h.available { "✓" } else { "✗" };
     format!("{status_icon} {}", h.name)
@@ -10493,14 +10566,18 @@ pub(crate) fn program_smart_clip_label<'a>(
 ) -> (&'a str, String) {
     let (kind, id) = program_smart_clip_target(raw_clip);
     let label = match kind {
-        "session" => app
-            .and_then(|app| {
-                app.sessions
-                    .iter()
-                    .find(|s| s.id == id)
-                    .map(program_session_clip_label)
-            })
-            .unwrap_or_else(|| format!("session {id}")),
+        "session" => match app {
+            // A live App can distinguish "resolves to a session" from
+            // "doesn't" — the latter gets its own glyph so a dead reference
+            // reads differently from a merely-not-yet-loaded one.
+            Some(app) => app
+                .sessions
+                .iter()
+                .find(|s| s.id == id)
+                .map(program_session_clip_label)
+                .unwrap_or_else(|| program_missing_session_clip_label(id)),
+            None => format!("session {id}"),
+        },
         "harness" => app
             .and_then(|app| {
                 app.harnesses
@@ -10959,6 +11036,84 @@ mod tests {
 
         assert_eq!(program_harness_clip_label(&available), "✓ codex");
         assert_eq!(program_harness_clip_label(&missing), "✗ claude");
+    }
+
+    #[test]
+    fn program_session_chip_bg_maps_status_to_theme_colors() {
+        let theme = crate::theme::Theme::default();
+        assert_eq!(
+            program_session_chip_bg(&theme, Some(SessionState::Pending)),
+            theme.muted
+        );
+        assert_eq!(
+            program_session_chip_bg(&theme, Some(SessionState::Running)),
+            theme.success
+        );
+        assert_eq!(
+            program_session_chip_bg(&theme, Some(SessionState::AwaitingInput)),
+            theme.success
+        );
+        assert_eq!(
+            program_session_chip_bg(&theme, Some(SessionState::Paused)),
+            theme.warning
+        );
+        assert_eq!(
+            program_session_chip_bg(&theme, Some(SessionState::Done)),
+            theme.info
+        );
+        assert_eq!(
+            program_session_chip_bg(&theme, Some(SessionState::Errored)),
+            theme.danger
+        );
+        assert_eq!(program_session_chip_bg(&theme, None), theme.muted);
+        // A settled reference keeps exactly the pre-badge chip color (both are
+        // the same theme color today), so this change is invisible for the
+        // common "everything's fine" case.
+        assert_eq!(theme.info, theme.accent_alt);
+    }
+
+    #[test]
+    fn program_session_clip_status_tooltip_uses_plain_language() {
+        assert_eq!(
+            program_session_clip_status_tooltip(Some(SessionState::Pending)),
+            "pending"
+        );
+        assert_eq!(
+            program_session_clip_status_tooltip(Some(SessionState::Running)),
+            "running"
+        );
+        assert_eq!(
+            program_session_clip_status_tooltip(Some(SessionState::AwaitingInput)),
+            "awaiting input"
+        );
+        assert_eq!(
+            program_session_clip_status_tooltip(Some(SessionState::Done)),
+            "done"
+        );
+        assert_eq!(
+            program_session_clip_status_tooltip(Some(SessionState::Errored)),
+            "exited with error"
+        );
+        assert_eq!(program_session_clip_status_tooltip(None), "session deleted");
+    }
+
+    #[test]
+    fn program_missing_session_clip_label_has_distinct_glyph() {
+        let label = program_missing_session_clip_label("abcdefghijklmnop");
+        assert_eq!(label, "⊘ abcdefghij · missing");
+        assert_ne!(
+            label, "session abcdefghijklmnop",
+            "a missing session must not render as the plain no-App fallback"
+        );
+    }
+
+    #[test]
+    fn program_smart_clip_label_missing_session_keeps_legacy_text_without_app() {
+        // Without a live App there's no way to distinguish "not found" from
+        // "not loaded yet", so the plain fallback stays — this is the width
+        // math cursor positioning and hit-testing use before an App exists.
+        let (_, label) = program_smart_clip_label(None, "session:ghost");
+        assert_eq!(label, "session ghost");
     }
 
     #[test]

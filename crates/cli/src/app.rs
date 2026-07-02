@@ -11877,6 +11877,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_clip_chip_color_reflects_live_session_status() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut running = summary_with_kind(agentd_protocol::SessionKind::User);
+        running.id = "s-run".into();
+        running.state = agentd_protocol::SessionState::Running;
+        let mut errored = summary_with_kind(agentd_protocol::SessionKind::User);
+        errored.id = "s-err".into();
+        errored.state = agentd_protocol::SessionState::Errored;
+        app.sessions = vec![running, errored];
+        app.selection = Selection::Session("s-run".into());
+        app.program_popup = Some(program_popup_for_test(
+            "s-run",
+            "@{session:s-run} @{session:s-err} @{session:s-ghost}",
+            0,
+        ));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let hits = app.layout.program_clip_hits.clone();
+        assert_eq!(hits.len(), 3, "expected three session clip hits: {hits:?}");
+        let buf = term.backend().buffer();
+        // Sample a couple of cells into the chip rather than `col_start`
+        // itself: the buffer's text cursor sits at offset 0 (the popup's
+        // `cursor` field), which paints its own block-cursor cell over the
+        // chip's leading padding space and isn't what this test covers.
+        let style_of = |id: &str| {
+            let hit = hits
+                .iter()
+                .find(|h| h.session_id == id)
+                .unwrap_or_else(|| panic!("no clip hit for {id}"));
+            buf.cell((hit.col_start + 2, hit.row)).expect("cell").style()
+        };
+
+        let running_style = style_of("s-run");
+        let errored_style = style_of("s-err");
+        let ghost_style = style_of("s-ghost");
+        assert_eq!(
+            running_style.bg,
+            Some(app.theme.success),
+            "a running worker's chip should read as success-colored"
+        );
+        assert_eq!(
+            errored_style.bg,
+            Some(app.theme.danger),
+            "a dying worker's chip should turn danger-colored"
+        );
+        assert_eq!(
+            ghost_style.bg,
+            Some(app.theme.muted),
+            "an unresolved session id should render muted, not the old fixed accent color"
+        );
+        assert!(
+            ghost_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT),
+            "a missing session's chip should render struck-through"
+        );
+        assert!(
+            !errored_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::CROSSED_OUT),
+            "a known-but-errored session is not struck through, only recolored"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_clip_hover_shows_missing_session_tooltip() {
+        let (mut app, _dir, server) = empty_app().await;
+        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        app.sessions = vec![s1];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "talk @{session:ghost}", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let hit = app
+            .layout
+            .program_clip_hits
+            .first()
+            .cloned()
+            .expect("clip hit for ghost session");
+        app.mouse_pos = Some((hit.col_start, hit.row));
+
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("hover tooltip should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("session deleted"),
+            "hovering a dead session clip with no preview should degrade to the \
+             plain-language status instead of showing nothing: {text}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_session_hover_card_shows_session_output() {
         use crate::pty_render::ItemHistory;
 
