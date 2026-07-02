@@ -2285,6 +2285,7 @@ const state = {
   subagentCollapsed: new Set(),
   showArchivedUngrouped: false,
   showArchivedGroups: new Set(),
+  showArchivedSubagents: new Set(),
   currentId: null,
   // Per-session transcript items (the rows we've rendered). Keyed by
   // session_id so switching sessions is just a re-render of cached
@@ -2940,8 +2941,25 @@ function orderedItems() {
       childrenExpanded: expanded,
     });
     if (expanded) {
-      for (const child of children) {
+      const activeChildren = children.filter((c) => !c.archived);
+      const archivedChildren = children.filter((c) => c.archived);
+      for (const child of activeChildren) {
         items.push({ kind: "session", session: child, indented: true, isSubagent: true });
+      }
+      if (archivedChildren.length > 0) {
+        const archivedExpanded = state.showArchivedSubagents.has(session.id);
+        items.push({
+          kind: "archived-row",
+          section: "subagent:" + session.id,
+          count: archivedChildren.length,
+          expanded: archivedExpanded,
+          indented: true,
+        });
+        if (archivedExpanded) {
+          for (const child of archivedChildren) {
+            items.push({ kind: "session", session: child, indented: true, isSubagent: true });
+          }
+        }
       }
     }
   }
@@ -3305,6 +3323,10 @@ function toggleArchivedSection(section) {
   if (!section) return;
   if (section === "ungrouped") {
     state.showArchivedUngrouped = !state.showArchivedUngrouped;
+  } else if (section.startsWith("subagent:")) {
+    const parentId = section.slice("subagent:".length);
+    if (state.showArchivedSubagents.has(parentId)) state.showArchivedSubagents.delete(parentId);
+    else state.showArchivedSubagents.add(parentId);
   } else {
     if (state.showArchivedGroups.has(section)) state.showArchivedGroups.delete(section);
     else state.showArchivedGroups.add(section);
