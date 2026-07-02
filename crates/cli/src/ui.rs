@@ -15,7 +15,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -7651,6 +7651,24 @@ fn program_popup_paint_rect(popup_rect: Rect, buffer_area: Rect) -> Option<Rect>
     (rect.width > 0 && rect.height > 0).then_some(rect)
 }
 
+/// Copy the visible cells from a logical popup-sized buffer into the real frame
+/// buffer. The source buffer may extend past the terminal edge; only `region`
+/// is copied, preserving the popup's full layout width while letting the
+/// terminal edge crop pixels.
+fn copy_buffer_region(src: &Buffer, dst: &mut Buffer, region: Rect) {
+    for y in region.top()..region.bottom() {
+        for x in region.left()..region.right() {
+            let Some(src_cell) = src.cell(Position { x, y }) else {
+                continue;
+            };
+            let Some(dst_cell) = dst.cell_mut(Position { x, y }) else {
+                continue;
+            };
+            *dst_cell = src_cell.clone();
+        }
+    }
+}
+
 /// Snapshot the cells of `region` so painting over them can be undone.
 fn snapshot_buffer_region(buf: &Buffer, region: Rect) -> Vec<ratatui::buffer::Cell> {
     let mut cells = Vec::with_capacity(region.width as usize * region.height as usize);
@@ -8013,8 +8031,8 @@ fn program_empty_placeholder(
     // how — and only when there's room; it's dropped before the list itself
     // would be.
     let mut show_tip = ordered.iter().all(|t| t.built_in);
-    let mut avail =
-        (inner.height as usize).saturating_sub(header + footer + if show_tip { tip_extra } else { 0 });
+    let mut avail = (inner.height as usize)
+        .saturating_sub(header + footer + if show_tip { tip_extra } else { 0 });
     if show_tip && avail < 1 {
         show_tip = false;
         avail = (inner.height as usize).saturating_sub(header + footer);
@@ -8148,6 +8166,7 @@ fn render_program_popup_at(
     let Some(paint_rect) = program_popup_paint_rect(rect, buffer_area) else {
         return None;
     };
+    let clipped_by_frame_edge = paint_rect != rect;
     // Crop the slide overhang: snapshot the strip right of the owning pane
     // before painting anything, and restore it once the popup (border, title
     // bar, contents, tooltips) has been drawn — the popup must never bleed
@@ -8244,8 +8263,7 @@ fn render_program_popup_at(
         // `dynamic_ui_widget_hits` from `render_session_widget_title`) so the
         // program click handlers in `app.rs` line up with what's painted.
         app.layout.program_title_run_hit = clamp_title_hit_to_pane(left.run, pane_right);
-        app.layout.program_title_toggle_hit =
-            clamp_title_hit_to_pane(title_toggle_hit, pane_right);
+        app.layout.program_title_toggle_hit = clamp_title_hit_to_pane(title_toggle_hit, pane_right);
         app.layout.program_title_close_hit = clamp_title_hit_to_pane(
             show_close.then(|| view_close_button_range(rect)),
             pane_right,
@@ -8256,15 +8274,21 @@ fn render_program_popup_at(
     // top of this, but the sticky-widget popover must use the un-padded border
     // inner so its top sits exactly one row below the title bar — the same
     // y-position as the normal session view (see the widget reveal below).
-    let block_inner = block.inner(paint_rect);
-    let inner = block_inner
-        .inner(Margin {
-            horizontal: PROGRAM_CONTENT_PADDING_X,
-            vertical: PROGRAM_CONTENT_PADDING_Y,
-        })
-        .intersection(buffer_area);
-    f.render_widget(Clear, paint_rect);
-    f.render_widget(block, paint_rect);
+    let block_inner = block.inner(rect);
+    let inner = block_inner.inner(Margin {
+        horizontal: PROGRAM_CONTENT_PADDING_X,
+        vertical: PROGRAM_CONTENT_PADDING_Y,
+    });
+    // `block_inner`/`inner` now carry the popup's full, un-clipped width (see
+    // above) so content lays out without reflowing — but a few popovers
+    // (sticky widgets, smart-clip picker, selection context menu) clamp their
+    // own paint rect to whatever `program_area` they're handed instead of to
+    // the real buffer, the same way `Clear` does. Handing them the full
+    // width would let their `Clear` land past the frame edge and panic —
+    // exactly what clipping to `paint_rect` used to prevent. Pass this
+    // frame-bounded rect to those instead.
+    let safe_inner = inner.intersection(buffer_area);
+    let safe_block_inner = block_inner.intersection(buffer_area);
 
     let selection = program_selection_range(popup);
     let search = popup
@@ -8323,16 +8347,40 @@ fn render_program_popup_at(
     let para = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll_offset.min(u16::MAX as usize) as u16, 0));
-    f.render_widget(para, inner);
-    render_program_scroll_indicator(
-        f,
-        &app.theme,
-        rect,
-        inner,
-        scroll_offset,
-        total_rows,
-        viewport_rows,
-    );
+    if clipped_by_frame_edge {
+        // When the slid Program reaches the terminal's right edge, rendering
+        // directly into the clipped frame intersection would make Ratatui lay
+        // out the block/title/body at the narrower visible width. Render into
+        // a popup-sized offscreen buffer instead, then copy only the terminal-
+        // visible cells back. This preserves crop semantics without reflow.
+        let mut popup_buffer = Buffer::empty(rect);
+        Clear.render(rect, &mut popup_buffer);
+        block.render(rect, &mut popup_buffer);
+        para.render(inner, &mut popup_buffer);
+        render_program_scroll_indicator_to_buffer(
+            &mut popup_buffer,
+            &app.theme,
+            rect,
+            inner,
+            scroll_offset,
+            total_rows,
+            viewport_rows,
+        );
+        copy_buffer_region(&popup_buffer, f.buffer_mut(), paint_rect);
+    } else {
+        f.render_widget(Clear, paint_rect);
+        f.render_widget(block, paint_rect);
+        f.render_widget(para, inner);
+        render_program_scroll_indicator(
+            f,
+            &app.theme,
+            rect,
+            inner,
+            scroll_offset,
+            total_rows,
+            viewport_rows,
+        );
+    }
     // Reveal the session's hovered/pinned sticky widgets on top of the program,
     // mirroring the normal session view. The title-bar squares are painted by
     // `apply_pane_title_right_cluster` above (which arms `dynamic_ui_hover` on
@@ -8346,10 +8394,12 @@ fn render_program_popup_at(
             // Pass the border-stripped inner rect (not the full `rect`) so the
             // popover starts below the title bar, matching the session view. Using
             // the full `rect` here put the widget's top on the title row, hiding the
-            // □/■ squares and the other title-bar controls.
+            // □/■ squares and the other title-bar controls. `safe_block_inner`
+            // (not `block_inner`) because this popover's own `Clear` isn't
+            // bounds-checked against the buffer, only against the area it's given.
             render_visible_dynamic_ui_panels(
                 f,
-                block_inner,
+                safe_block_inner,
                 app,
                 &popup.program.session_id,
                 &panels,
@@ -8373,14 +8423,17 @@ fn render_program_popup_at(
             // sit. Captured before `render_program_smart_clip_picker`, which
             // early-returns once the dialog is open.
             if popup.smart_clip.is_some() {
-                app.layout.program_smart_clip_anchor = Some((pos, inner));
+                app.layout.program_smart_clip_anchor = Some((pos, safe_inner));
             }
-            render_program_smart_clip_picker(f, app, popup, pos, inner);
+            // Both this and the selection context menu below clamp their own
+            // paint rect to `program_area` rather than to the real buffer, so
+            // they get `safe_inner`, not the popup's full-width `inner`.
+            render_program_smart_clip_picker(f, app, popup, pos, safe_inner);
         }
         render_program_collab_cursors(f, app, popup, scroll_offset, inner);
     }
     if active && !popup.closing {
-        render_program_selection_context_menu(f, app, popup, scroll_offset, inner);
+        render_program_selection_context_menu(f, app, popup, scroll_offset, safe_inner);
     }
     render_program_title_tooltip(f, app, popup, summary_ref, paint_rect);
     // Undo everything painted right of the owning pane: this is what crops the
@@ -8842,8 +8895,8 @@ fn program_shimmer_block_at(
 /// the body overflows its viewport. Like the terminal scrollback bar, it tints
 /// only the cell background so the border glyph underneath stays intact, and it
 /// sits on the border column so it never clobbers body text.
-fn render_program_scroll_indicator(
-    f: &mut Frame,
+fn render_program_scroll_indicator_to_buffer(
+    buf: &mut Buffer,
     theme: &Theme,
     rect: Rect,
     inner: Rect,
@@ -8873,10 +8926,30 @@ fn render_program_scroll_indicator(
         } else {
             track_color
         };
-        if let Some(cell) = f.buffer_mut().cell_mut(Position { x, y }) {
+        if let Some(cell) = buf.cell_mut(Position { x, y }) {
             cell.set_bg(color);
         }
     }
+}
+
+fn render_program_scroll_indicator(
+    f: &mut Frame,
+    theme: &Theme,
+    rect: Rect,
+    inner: Rect,
+    scroll_offset: usize,
+    total_rows: usize,
+    viewport_rows: usize,
+) {
+    render_program_scroll_indicator_to_buffer(
+        f.buffer_mut(),
+        theme,
+        rect,
+        inner,
+        scroll_offset,
+        total_rows,
+        viewport_rows,
+    );
 }
 
 fn program_border_style(theme: &Theme, active: bool) -> Style {
@@ -11521,13 +11594,24 @@ mod tests {
         // description + blank line (inner rect row 1+2).
         let rendered: String = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("Templates"), "expected a Templates header: {rendered}");
+        assert!(
+            rendered.contains("Templates"),
+            "expected a Templates header: {rendered}"
+        );
         // No borders — plain bulleted rows.
         for ch in ['┌', '┐', '└', '┘', '│'] {
-            assert!(!rendered.contains(ch), "expected no button borders: {rendered}");
+            assert!(
+                !rendered.contains(ch),
+                "expected no button borders: {rendered}"
+            );
         }
         // Both templates are built in, so the custom-template tip should show.
         // (The tip itself can be truncated on a narrow pane, so check its lead-in
@@ -11559,10 +11643,16 @@ mod tests {
         let mut custom = placeholder_template("mine", "Mine");
         custom.built_in = false;
         let templates = vec![placeholder_template("tasks", "Tasks"), custom];
-        let (lines, _) = program_empty_placeholder(&theme, &templates, None, Rect::new(2, 1, 76, 20));
+        let (lines, _) =
+            program_empty_placeholder(&theme, &templates, None, Rect::new(2, 1, 76, 20));
         let rendered: String = lines
             .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
@@ -12080,7 +12170,10 @@ mod tests {
         // Out-of-range fractions clamp to the endpoints rather than
         // overshooting past the pane or sliding left.
         assert_eq!(program_popup_visible_rect(base, 20, -0.5).x, base.x);
-        assert_eq!(program_popup_visible_rect(base, 20, 1.5).x, base.x + full_offset);
+        assert_eq!(
+            program_popup_visible_rect(base, 20, 1.5).x,
+            base.x + full_offset
+        );
     }
 
     #[test]
@@ -12124,6 +12217,35 @@ mod tests {
             Some(Rect::new(30, 4, 80, 20)),
             "painting must be clipped to the frame buffer before widgets render"
         );
+    }
+
+    #[test]
+    fn terminal_edge_copy_preserves_logical_popup_width() {
+        let frame_area = Rect::new(0, 0, 20, 4);
+        let logical = Rect::new(8, 0, 20, 4);
+        let visible = program_popup_paint_rect(logical, frame_area).expect("visible strip");
+
+        let mut popup = Buffer::empty(logical);
+        let text = "abcdefghijklmnop";
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .render(logical, &mut popup);
+
+        let mut frame = Buffer::empty(frame_area);
+        copy_buffer_region(&popup, &mut frame, visible);
+
+        let first_visible_row: String = (8..20).map(|x| frame[(x, 0)].symbol()).collect();
+        assert_eq!(
+            first_visible_row, "abcdefghijkl",
+            "visible cells should be copied from the full-width layout"
+        );
+        for x in 8..20 {
+            assert_eq!(
+                frame[(x, 1)].symbol(),
+                " ",
+                "full-width rendering should not wrap into visible row 1 at x={x}"
+            );
+        }
     }
 
     #[test]
