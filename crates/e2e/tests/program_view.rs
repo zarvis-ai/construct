@@ -660,6 +660,59 @@ async fn web_program_view_full_parity() {
     );
     assert_eq!(live["dirty"], "true", "{live:?}");
 
+    let run_state: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.get": () => ({ program: { session_id: "s-run-state", markdown: "- pending\n", version: 1, template_id: null }, active_run: null, blocks: [], revisions: [] }),
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              const md = "- pending\n";
+              setSession("s-run-state", "shell");
+              await switchCurrentViewMode("program");
+              const id = programBlockSpans(md)[0].id;
+              programStartOptimisticRun("s-run-state", md, false, null, "");
+              handleProgramState({ program: { session_id: "s-run-state", markdown: md, version: 2, template_id: null }, active_run: null, blocks: [] });
+              const kept = state.program.runById.get("s-run-state");
+              const settleAfterKept = state.program.settleById.get("s-run-state")?.size || 0;
+              const now = Date.now();
+              handleProgramState({
+                program: { session_id: "s-run-state", markdown: md, version: 2, template_id: null },
+                active_run: { run_id: "r1", started_at_ms: now - 1000, expires_at_ms: now + 60000, pending_block_ids: [id], pending_block_tooltips: {}, seen_running: true, first_output_seen: false, agent_managed: false },
+                blocks: [],
+              });
+              const confirmed = state.program.runById.get("s-run-state");
+              handleProgramState({ program: { session_id: "s-run-state", markdown: md, version: 2, template_id: null }, active_run: null, blocks: [] });
+              return {
+                keptPending: kept ? kept.pendingIds.size : 0,
+                settleAfterKept,
+                confirmedPending: confirmed ? confirmed.pendingIds.size : 0,
+                cleared: !state.program.runById.has("s-run-state"),
+              };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate program run state")
+        .into_value()
+        .expect("json");
+    assert_eq!(
+        run_state["keptPending"], 1,
+        "empty state must not clear an optimistic web run: {run_state:?}"
+    );
+    assert_eq!(
+        run_state["settleAfterKept"], 0,
+        "skipped optimistic clear must not record settle flourishes: {run_state:?}"
+    );
+    assert_eq!(
+        run_state["confirmedPending"], 1,
+        "daemon progress should be adopted before later clear: {run_state:?}"
+    );
+    assert_eq!(
+        run_state["cleared"], true,
+        "empty state must still clear daemon-confirmed web runs: {run_state:?}"
+    );
+
     // --- 11. Live collaboration: local edit RPC + remote cursor overlay. ----
     let collab: serde_json::Value = page
         .evaluate(

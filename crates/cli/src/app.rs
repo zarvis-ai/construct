@@ -1661,6 +1661,10 @@ pub struct ProgramRun {
     /// Compact run-pipeline stage derived by the daemon, or Pressed for this
     /// client's optimistic pre-response state.
     pub stage: agentd_protocol::ProgramRunStage,
+    /// True once this run has been observed in a daemon payload. Local
+    /// optimistic starts stay false until program.execute or program/state
+    /// confirms them.
+    pub daemon_confirmed: bool,
     /// Blocks settled from the run's initial pending set.
     pub settled_block_count: usize,
     /// Blocks in the run's initial pending set.
@@ -1696,6 +1700,7 @@ impl ProgramRun {
             deadline,
             first_output_seen: progress.first_output_seen,
             stage: progress.stage,
+            daemon_confirmed: true,
             settled_block_count: progress.settled_block_count,
             total_block_count: progress.total_block_count,
         })
@@ -5555,6 +5560,42 @@ impl App {
         Self::update_program_smart_clip_after_cursor_move(popup);
     }
 
+    fn adopt_daemon_program_run(
+        &mut self,
+        session_id: &str,
+        active_run: Option<agentd_protocol::ProgramRunProgress>,
+    ) {
+        match active_run.and_then(ProgramRun::from_progress) {
+            Some(run) => {
+                self.program_runs.insert(session_id.to_string(), run);
+            }
+            None => {
+                self.program_runs.remove(session_id);
+            }
+        }
+    }
+
+    fn adopt_program_state_run(
+        &mut self,
+        session_id: &str,
+        active_run: Option<agentd_protocol::ProgramRunProgress>,
+    ) {
+        match active_run.and_then(ProgramRun::from_progress) {
+            Some(run) => {
+                self.program_runs.insert(session_id.to_string(), run);
+            }
+            None => {
+                if self
+                    .program_runs
+                    .get(session_id)
+                    .is_some_and(|run| run.daemon_confirmed)
+                {
+                    self.program_runs.remove(session_id);
+                }
+            }
+        }
+    }
+
     /// A program changed on the daemon (most often the owning agent edited it).
     /// Keep any open popup for that session in sync: when the user has no
     /// unsaved edits, adopt the new content live so they see the agent's
@@ -5582,14 +5623,7 @@ impl App {
                 Instant::now(),
             );
         }
-        match active_run.and_then(ProgramRun::from_progress) {
-            Some(run) => {
-                self.program_runs.insert(program.session_id.clone(), run);
-            }
-            None => {
-                self.program_runs.remove(&program.session_id);
-            }
-        }
+        self.adopt_program_state_run(&program.session_id, active_run);
         let updating_session_id = program.session_id.clone();
         let popup = if self
             .program_popup
@@ -9750,6 +9784,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(30),
                 first_output_seen: false,
                 stage: agentd_protocol::ProgramRunStage::Delivered,
+                daemon_confirmed: true,
                 settled_block_count: 0,
                 total_block_count: 1,
             },
@@ -12755,6 +12790,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
                 stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                daemon_confirmed: true,
                 settled_block_count: 0,
                 total_block_count: 0,
             },
@@ -13037,6 +13073,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
                 stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                daemon_confirmed: true,
                 settled_block_count: 0,
                 total_block_count: 1,
             },
@@ -13128,6 +13165,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
                 stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                daemon_confirmed: true,
                 settled_block_count: 0,
                 total_block_count: 1,
             },
@@ -13204,6 +13242,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
                 stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                daemon_confirmed: true,
                 settled_block_count: 0,
                 total_block_count: 1,
             },
@@ -14487,6 +14526,46 @@ mod tests {
         assert!(program_run_pending_ids("   \n").is_empty());
     }
 
+    fn program_doc_for_test(
+        session_id: &str,
+        markdown: &str,
+        version: u64,
+    ) -> agentd_protocol::ProgramDocument {
+        agentd_protocol::ProgramDocument {
+            session_id: session_id.into(),
+            markdown: markdown.into(),
+            version,
+            updated_at_ms: 0,
+            template_id: None,
+        }
+    }
+
+    fn program_progress_for_test(
+        run_id: &str,
+        pending: Vec<String>,
+    ) -> agentd_protocol::ProgramRunProgress {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        agentd_protocol::ProgramRunProgress {
+            run_id: run_id.into(),
+            started_at_ms: now_ms - 1000,
+            expires_at_ms: now_ms + 60_000,
+            pending_block_ids: pending,
+            pending_block_refs: Vec::new(),
+            pending_block_tooltips: HashMap::new(),
+            system_status: None,
+            seen_running: true,
+            first_output_seen: false,
+            queued_behind_current_turn: false,
+            agent_managed: false,
+            stage: agentd_protocol::ProgramRunStage::Delivered,
+            settled_block_count: 0,
+            total_block_count: 1,
+        }
+    }
+
     #[tokio::test]
     async fn program_optimistic_run_lights_every_block_immediately() {
         let (mut app, _dir, server) = empty_app().await;
@@ -14502,6 +14581,70 @@ mod tests {
         assert!(run.pending_tooltips.is_empty());
         assert!(!run.first_output_seen);
         assert!(run.deadline > Instant::now());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_empty_run_keeps_unconfirmed_optimistic_run_then_clears_confirmed_run() {
+        let (mut app, _dir, server) = empty_app().await;
+        let id = agentd_protocol::program_block_id;
+        let body = "# Todo\n\n- alpha\n";
+
+        app.start_program_run("s1", body, false, "");
+        let optimistic_pending = app.program_runs["s1"].pending.clone();
+        app.on_program_state(program_doc_for_test("s1", body, 2), None, Vec::new());
+
+        let run = app
+            .program_runs
+            .get("s1")
+            .expect("empty daemon state must not clear an unconfirmed optimistic run");
+        assert_eq!(run.pending, optimistic_pending);
+        assert!(
+            app.program_settle_flourishes.get("s1").is_none(),
+            "keeping the optimistic run must not flash blocks as settled"
+        );
+
+        app.on_program_state(
+            program_doc_for_test("s1", body, 2),
+            Some(program_progress_for_test("run-1", vec![id("- alpha")])),
+            Vec::new(),
+        );
+        let run = app
+            .program_runs
+            .get("s1")
+            .expect("daemon progress should be adopted");
+        assert!(run.pending.contains(&id("- alpha")));
+
+        app.on_program_state(program_doc_for_test("s1", body, 2), None, Vec::new());
+        assert!(
+            !app.program_runs.contains_key("s1"),
+            "empty daemon state must still clear a daemon-confirmed run"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_empty_run_does_not_record_settle_flourish_for_kept_optimistic_run() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.start_program_run("s1", "- pending\n", false, "");
+        assert!(app.program_runs["s1"]
+            .pending
+            .contains(&agentd_protocol::program_block_id("- pending")));
+
+        app.on_program_state(
+            program_doc_for_test("s1", "- pending\n", 42),
+            None,
+            Vec::new(),
+        );
+
+        assert!(
+            app.program_runs.contains_key("s1"),
+            "the optimistic run should survive the empty broadcast"
+        );
+        assert!(
+            app.program_settle_flourishes.get("s1").is_none(),
+            "a skipped optimistic removal must not look like a settled block"
+        );
         server.abort();
     }
 
@@ -14721,6 +14864,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_dirty_run_survives_empty_save_broadcast_before_execute_response() {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let Ok(n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let req: Value = serde_json::from_str(&line).expect("json request");
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let method = req
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        let params = req.get("params").cloned().unwrap_or(Value::Null);
+                        let markdown = params
+                            .get("markdown")
+                            .and_then(Value::as_str)
+                            .unwrap_or("# Todo\n\n- settled\n\n- pending\n\n- user changed\n");
+                        let pending_id = agentd_protocol::program_block_id("- user changed");
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64;
+                        let result = match method {
+                            ipc_method::PROGRAM_UPDATE => serde_json::json!({
+                                "program": {
+                                    "session_id": "s1",
+                                    "markdown": markdown,
+                                    "version": 2,
+                                    "updated_at_ms": 0,
+                                    "template_id": null
+                                },
+                                "blocks": [],
+                                "active_run": null
+                            }),
+                            ipc_method::PROGRAM_EXECUTE => serde_json::json!({
+                                "program": {
+                                    "session_id": "s1",
+                                    "markdown": "# Todo\n\n- settled\n\n- pending\n\n- user changed\n",
+                                    "version": 2,
+                                    "updated_at_ms": 0,
+                                    "template_id": null
+                                },
+                                "prompt": "run",
+                                "active_run": {
+                                    "run_id": "run-1",
+                                    "started_at_ms": now_ms - 1000,
+                                    "expires_at_ms": now_ms + 60000,
+                                    "pending_block_ids": [pending_id],
+                                    "pending_block_refs": [],
+                                    "pending_block_tooltips": {},
+                                    "system_status": null,
+                                    "seen_running": true,
+                                    "first_output_seen": false,
+                                    "queued_behind_current_turn": false,
+                                    "agent_managed": false,
+                                    "stage": "delivered",
+                                    "settled_block_count": 0,
+                                    "total_block_count": 1
+                                },
+                                "blocks": []
+                            }),
+                            _ => Value::Null,
+                        };
+                        let resp =
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                        if writer
+                            .write_all((resp.to_string() + "\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        summary.id = "s1".into();
+        let mut app = test_app(client, vec![summary]);
+        let saved = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
+        let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
+        app.program_popup = Some(program_popup_for_test("s1", saved, 0));
+        app.program_popup.as_mut().unwrap().buffer = edited.to_string();
+        app.start_program_run("s1", edited, false, saved);
+        assert!(
+            !app.program_runs["s1"].pending.is_empty(),
+            "dirty run should start with optimistic pending blocks"
+        );
+
+        assert!(app.save_program_popup().await);
+        app.on_program_state(program_doc_for_test("s1", edited, 2), None, Vec::new());
+        assert!(
+            app.program_runs
+                .get("s1")
+                .is_some_and(|run| !run.pending.is_empty()),
+            "the save's stale empty broadcast must not kill the optimistic run"
+        );
+
+        let result = app
+            .client
+            .program_execute(agentd_protocol::ProgramExecuteParams {
+                session_id: "s1".into(),
+                selection: None,
+                base_version: Some(2),
+                shimmer: None,
+            })
+            .await
+            .expect("execute response");
+        app.adopt_daemon_program_run("s1", result.active_run);
+        let run = app.program_runs.get("s1").expect("execute confirms run");
+        assert!(run.daemon_confirmed);
+        assert!(!run.pending.is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_optimistic_selection_run_adds_to_existing_shimmer_scope() {
         // A selection run must not clear shimmer another in-flight run
         // already declared elsewhere in the program — it optimistically adds
@@ -14758,6 +15039,10 @@ mod tests {
     async fn program_run_waits_for_daemon_clear_state() {
         let (mut app, _dir, server) = empty_app().await;
         app.start_program_run("s1", "# Todo\n- a\n", false, "");
+        app.program_runs
+            .get_mut("s1")
+            .expect("run")
+            .daemon_confirmed = true;
         assert!(app.program_runs.contains_key("s1"));
 
         async fn feed(app: &mut App, session: &str, event: SessionEvent) {
@@ -14889,6 +15174,7 @@ mod tests {
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
                 stage: agentd_protocol::ProgramRunStage::default(),
+                daemon_confirmed: true,
                 settled_block_count: 0,
                 total_block_count: 2,
             },

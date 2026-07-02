@@ -41,15 +41,7 @@ impl App {
             Ok(result) => {
                 let version = result.program.version;
                 let now = Instant::now();
-                match result.active_run.and_then(ProgramRun::from_progress) {
-                    Some(run) => {
-                        self.program_runs
-                            .insert(result.program.session_id.clone(), run);
-                    }
-                    None => {
-                        self.program_runs.remove(&result.program.session_id);
-                    }
-                }
+                self.adopt_daemon_program_run(&result.program.session_id, result.active_run);
                 for cursor in result.collaborators {
                     self.program_collaborators
                         .insert(cursor.client_id.clone(), cursor);
@@ -118,15 +110,7 @@ impl App {
             }
             match self.client.program_get(session_id).await {
                 Ok(result) => {
-                    match result.active_run.and_then(ProgramRun::from_progress) {
-                        Some(run) => {
-                            self.program_runs
-                                .insert(result.program.session_id.clone(), run);
-                        }
-                        None => {
-                            self.program_runs.remove(&result.program.session_id);
-                        }
-                    }
+                    self.adopt_daemon_program_run(&result.program.session_id, result.active_run);
                     for cursor in result.collaborators {
                         self.program_collaborators
                             .insert(cursor.client_id.clone(), cursor);
@@ -466,14 +450,7 @@ impl App {
         };
         match self.client.program_execute(params).await {
             Ok(result) => {
-                match result.active_run.and_then(ProgramRun::from_progress) {
-                    Some(run) => {
-                        self.program_runs.insert(session_id.clone(), run);
-                    }
-                    None => {
-                        self.program_runs.remove(&session_id);
-                    }
-                }
+                self.adopt_daemon_program_run(&session_id, result.active_run);
                 let scope = if is_selection { "selection" } else { "program" };
                 self.set_status(format!(
                     "program run sent ({scope}, version {})",
@@ -593,6 +570,7 @@ impl App {
                 deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,
                 stage: agentd_protocol::ProgramRunStage::Pressed,
+                daemon_confirmed: false,
                 settled_block_count: 0,
             },
         );

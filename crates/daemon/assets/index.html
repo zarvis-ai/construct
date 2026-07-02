@@ -3802,6 +3802,7 @@ function programRunFromProgress(progress) {
     deadlinePerf: perf + (progress.expires_at_ms - nowMs),
     firstOutputSeen: !!progress.first_output_seen,
     stage,
+    daemonConfirmed: true,
     settledBlockCount: progress.settled_block_count != null ? progress.settled_block_count : settled,
     totalBlockCount: total,
   };
@@ -4731,13 +4732,20 @@ function handleProgramState(params) {
   const nextPending = params.active_run ? programPendingIdsFromProgress(params.active_run) : null;
   if (previousRun && nextPending) programRecordSettleFlourishes(id, previousRun.pendingIds, nextPending);
   const run = programRunFromProgress(params.active_run);
-  if (run) state.program.runById.set(id, run); else state.program.runById.delete(id);
-  if (!run || run.firstOutputSeen) programClearRunButton(id);
+  let effectiveRun = run || null;
+  if (run) {
+    state.program.runById.set(id, run);
+  } else if (!params.active_run && previousRun && !previousRun.daemonConfirmed) {
+    effectiveRun = previousRun;
+  } else {
+    state.program.runById.delete(id);
+  }
+  if (!effectiveRun || effectiveRun.firstOutputSeen) programClearRunButton(id);
   const isMounted = state.program.mountedId === id && state.mode === "program";
   const doc = state.program.docById.get(id);
   const refreshShimmer = () => {
     if (!isMounted) return;
-    if (run) programStartShimmer(id);
+    if (effectiveRun) programStartShimmer(id);
     else { programStopShimmer(); programApplyShimmer(); }
   };
   if (doc && program.version <= doc.version) { refreshShimmer(); return; }
@@ -4915,6 +4923,7 @@ function programStartOptimisticRun(id, body, isSelection, selectedBlockIds, prev
     deadlinePerf: perf + PROGRAM_RUN_MAX_MS,
     firstOutputSeen: false,
     stage: "pressed",
+    daemonConfirmed: false,
     settledBlockCount: 0,
     totalBlockCount: pending.size,
   });
