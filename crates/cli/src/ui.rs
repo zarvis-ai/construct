@@ -7606,7 +7606,7 @@ fn program_roll_down_height(base_height: u16, cover_percent: u16) -> u16 {
     wanted.clamp(min_height, base_height.max(1) as u32) as u16
 }
 
-fn program_terminal_focus_slide_offset(width: u16) -> u16 {
+pub(crate) fn program_terminal_focus_slide_offset(width: u16) -> u16 {
     if width <= 1 {
         return 0;
     }
@@ -8139,11 +8139,10 @@ fn render_program_popup_at(
     if visible_h == 0 {
         return None;
     }
-    let slide = if active {
-        app.program_slide_fraction(now)
-    } else {
-        0.0
-    };
+    // Each popup carries its own slide state, so a Program left slid aside in
+    // an unfocused split pane stays slid there — focusing another window must
+    // not snap it back to the pane's left edge.
+    let slide = popup.slide_fraction(now);
     let rect = program_popup_visible_rect(base_rect, visible_h, slide);
     let buffer_area = f.buffer_mut().area;
     let Some(paint_rect) = program_popup_paint_rect(rect, buffer_area) else {

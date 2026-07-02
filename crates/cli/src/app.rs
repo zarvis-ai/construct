@@ -994,18 +994,6 @@ pub struct App {
     /// coordinate, drag-start ratio, and parent split area.
     pub resizing_main_window: Option<(u64, WindowSplitDirection, u16, u16, ratatui::layout::Rect)>,
     pub resizing_program_popup: Option<()>,
-    /// True when the active Program is rolled down but the exposed terminal has
-    /// keyboard focus. The Program remains visible, but keys flow to the
-    /// underlying session instead of editing Program Markdown.
-    pub program_terminal_focus: bool,
-    /// Terminal-focus slide animation: the slide fraction the rolled-down
-    /// Program had when `program_terminal_focus` last flipped (0.0 anchored,
-    /// 1.0 fully slid), and when the flip happened. The renderer eases from
-    /// this fraction toward the focus target over `PROGRAM_REVEAL_MS`, so
-    /// reversing focus mid-slide resumes from the popup's current position
-    /// instead of snapping. Flip focus via `set_program_terminal_focus`.
-    pub program_slide_from: f32,
-    pub program_slide_changed_at: Option<Instant>,
     /// User has collapsed the session list pane via the `−` button
     /// on its title bar. Effective only when the list pane doesn't
     /// have focus — when focus is on the list (e.g. via `C-x o`),
@@ -1566,6 +1554,53 @@ pub struct ProgramPopup {
     /// surface. Defaults to roughly two thirds so the bottom third of the
     /// session terminal remains visible.
     pub cover_percent: u16,
+    /// True while this rolled-down Program is slid aside because the terminal
+    /// it exposes holds keyboard focus. Keys flow to the underlying session
+    /// instead of editing Program Markdown. Per-popup (not on `App`) so that
+    /// focusing a different split window leaves this popup's slide untouched:
+    /// the popup stays slid in its own pane and is still slid when its window
+    /// regains focus.
+    pub terminal_focus: bool,
+    /// Terminal-focus slide animation: the slide fraction this popup had when
+    /// `terminal_focus` last flipped (0.0 anchored, 1.0 fully slid), and when
+    /// the flip happened. The renderer eases from this fraction toward the
+    /// focus target over `PROGRAM_REVEAL_MS`, so reversing focus mid-slide
+    /// resumes from the popup's current position instead of snapping. Flip
+    /// focus via [`ProgramPopup::set_terminal_focus`].
+    pub slide_from: f32,
+    pub slide_changed_at: Option<Instant>,
+}
+
+impl ProgramPopup {
+    /// Flip keyboard focus between this rolled-down Program and the terminal
+    /// it exposes. Every flip goes through here so the popup's terminal-focus
+    /// slide animates instead of snapping: the current in-flight fraction is
+    /// captured as the new starting point, so reversing focus mid-slide
+    /// resumes from wherever the popup is rather than jumping to an endpoint.
+    pub(crate) fn set_terminal_focus(&mut self, focused: bool) {
+        if self.terminal_focus == focused {
+            return;
+        }
+        let now = Instant::now();
+        self.slide_from = self.slide_fraction(now);
+        self.terminal_focus = focused;
+        self.slide_changed_at = Some(now);
+    }
+
+    /// Current terminal-focus slide fraction: 0.0 = anchored at the pane's
+    /// left edge, 1.0 = fully slid right. Eases linearly from `slide_from`
+    /// toward the focus target over `PROGRAM_REVEAL_MS` (the same duration as
+    /// the roll-down reveal).
+    pub(crate) fn slide_fraction(&self, now: Instant) -> f32 {
+        let target = if self.terminal_focus { 1.0 } else { 0.0 };
+        let Some(changed_at) = self.slide_changed_at else {
+            return target;
+        };
+        let progress = (now.saturating_duration_since(changed_at).as_secs_f32()
+            / (PROGRAM_REVEAL_MS as f32 / 1000.0))
+            .clamp(0.0, 1.0);
+        self.slide_from + (target - self.slide_from) * progress
+    }
 }
 
 /// Caret + scroll of a program view, remembered across a hide→show cycle. When
@@ -2463,9 +2498,6 @@ async fn run_with_socket_initial_selection(
         resizing_matrix_rain: None,
         resizing_main_window: None,
         resizing_program_popup: None,
-        program_terminal_focus: false,
-        program_slide_from: 0.0,
-        program_slide_changed_at: None,
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
@@ -6676,10 +6708,12 @@ impl App {
         // keymap and move the list selection instead of the program cursor.
         // Opening a program focuses the view (see `open_program_popup`), so the
         // common open-then-type flow is unchanged.
-        if self.program_popup.is_some()
+        if self
+            .program_popup
+            .as_ref()
+            .is_some_and(|popup| !popup.terminal_focus)
             && self.minibuffer.is_none()
             && self.focus == PaneFocus::View
-            && !self.program_terminal_focus
         {
             if self.handle_program_global_key(key).await {
                 return;
@@ -8794,6 +8828,9 @@ fn program_popup_from_document(
         closing: false,
         scroll_offset: 0,
         cover_percent: PROGRAM_COVER_PERCENT_DEFAULT,
+        terminal_focus: false,
+        slide_from: 0.0,
+        slide_changed_at: None,
     }
 }
 
@@ -9204,9 +9241,6 @@ mod tests {
             resizing_matrix_rain: None,
             resizing_main_window: None,
             resizing_program_popup: None,
-            program_terminal_focus: false,
-            program_slide_from: 0.0,
-            program_slide_changed_at: None,
             list_collapsed: false,
             tasks_popup: None,
             session_picker: None,
@@ -9321,6 +9355,9 @@ mod tests {
             closing: false,
             scroll_offset: 0,
             cover_percent: PROGRAM_COVER_PERCENT_DEFAULT,
+            terminal_focus: false,
+            slide_from: 0.0,
+            slide_changed_at: None,
         }
     }
 
@@ -11903,12 +11940,12 @@ mod tests {
             .await;
 
         assert!(!consumed, "exposed terminal click should fall through");
-        assert!(app.program_terminal_focus);
+        let popup = app.program_popup.as_ref().expect("Program remains visible");
+        assert!(popup.terminal_focus);
         assert!(
-            app.program_slide_changed_at.is_some(),
+            popup.slide_changed_at.is_some(),
             "focus flip should start the slide animation"
         );
-        assert!(app.program_popup.is_some(), "Program remains visible");
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
             .await;
@@ -11923,50 +11960,78 @@ mod tests {
     #[tokio::test]
     async fn program_terminal_focus_slide_animates_and_reverses_mid_flight() {
         let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
 
         // Before any focus flip, the fraction sits at the anchored endpoint.
-        assert_eq!(app.program_slide_fraction(Instant::now()), 0.0);
+        assert_eq!(
+            app.program_popup
+                .as_ref()
+                .unwrap()
+                .slide_fraction(Instant::now()),
+            0.0
+        );
 
         app.set_program_terminal_focus(true);
         let changed_at = app
-            .program_slide_changed_at
+            .program_popup
+            .as_ref()
+            .unwrap()
+            .slide_changed_at
             .expect("focus flip records its instant");
         assert!(
-            app.program_slide_fraction(changed_at) < 0.01,
+            app.program_popup
+                .as_ref()
+                .unwrap()
+                .slide_fraction(changed_at)
+                < 0.01,
             "the slide starts anchored, not snapped right"
         );
-        let half =
-            app.program_slide_fraction(changed_at + Duration::from_millis(PROGRAM_REVEAL_MS / 2));
+        let half = app.program_popup.as_ref().unwrap().slide_fraction(
+            changed_at + Duration::from_millis(PROGRAM_REVEAL_MS / 2),
+        );
         assert!(
             (half - 0.5).abs() < 0.05,
             "halfway through the popup is mid-slide, got {half}"
         );
         assert_eq!(
-            app.program_slide_fraction(changed_at + Duration::from_millis(PROGRAM_REVEAL_MS)),
+            app.program_popup.as_ref().unwrap().slide_fraction(
+                changed_at + Duration::from_millis(PROGRAM_REVEAL_MS),
+            ),
             1.0,
             "the slide settles fully slid"
         );
 
         // A redundant flip must not restart the animation.
         app.set_program_terminal_focus(true);
-        assert_eq!(app.program_slide_changed_at, Some(changed_at));
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().slide_changed_at,
+            Some(changed_at)
+        );
 
         // Reversing mid-flight resumes from the in-flight fraction instead of
         // snapping to an endpoint: simulate a slide-right that started half a
         // reveal ago, then hand focus back to the Program.
-        app.program_slide_from = 0.0;
-        app.program_slide_changed_at =
-            Some(Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS / 2));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.slide_from = 0.0;
+            popup.slide_changed_at =
+                Some(Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS / 2));
+        }
         app.set_program_terminal_focus(false);
         assert!(
-            (app.program_slide_from - 0.5).abs() < 0.1,
+            (app.program_popup.as_ref().unwrap().slide_from - 0.5).abs() < 0.1,
             "reversal should start near the mid-flight position, got {}",
-            app.program_slide_from
+            app.program_popup.as_ref().unwrap().slide_from
         );
-        let done = app.program_slide_changed_at.expect("reversal records instant")
+        let done = app
+            .program_popup
+            .as_ref()
+            .unwrap()
+            .slide_changed_at
+            .expect("reversal records instant")
             + Duration::from_millis(PROGRAM_REVEAL_MS);
         assert_eq!(
-            app.program_slide_fraction(done),
+            app.program_popup.as_ref().unwrap().slide_fraction(done),
             0.0,
             "the reversed slide settles back at the pane's left edge"
         );
@@ -15654,6 +15719,14 @@ mod tests {
         ];
         app.layout.modal_area = Some(Rect::new(20, 0, 40, 20));
         app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
+        app.set_program_terminal_focus(true);
+        {
+            let popup = app.program_popup.as_mut().expect("active s1 program");
+            popup.slide_from = 1.0;
+            popup.slide_changed_at = Some(
+                Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS),
+            );
+        }
 
         app.handle_left_click(65, 5).await;
 
@@ -15664,11 +15737,25 @@ mod tests {
             app.program_popups.contains_key("s1"),
             "clicking another split should stash, not close, the open program"
         );
+        let stashed = app.program_popups.get("s1").expect("stashed s1 program");
+        assert!(
+            stashed.terminal_focus,
+            "focusing another split must not unslide split 1's Program"
+        );
+        assert_eq!(
+            stashed.slide_fraction(Instant::now()),
+            1.0,
+            "stashed Program should keep its slid position"
+        );
 
         app.active_window_id = 1;
         app.selection = Selection::Session("s1".into());
         app.sync_program_popup_with_selection();
-        assert!(app.program_popup.is_some());
+        let restored = app.program_popup.as_ref().expect("restored s1 program");
+        assert!(
+            restored.terminal_focus,
+            "returning to split 1 should restore the slid Program state"
+        );
 
         app.run_action(KeyAction::SwitchFocus).await;
         app.sync_program_popup_with_selection();
@@ -15679,6 +15766,11 @@ mod tests {
         assert!(
             app.program_popups.contains_key("s1"),
             "C-x o should keep split 1's program attached to split 1's session"
+        );
+        let stashed = app.program_popups.get("s1").expect("stashed s1 program");
+        assert!(
+            stashed.terminal_focus,
+            "C-x o to another split must not reset split 1's slide state"
         );
         server.abort();
     }
