@@ -725,7 +725,10 @@ async fn web_program_view_full_parity() {
     );
 
     // --- 13. Session-status chip badges: initial missing state, live update
-    //         on session/state, and flip to missing on session/deleted. ------
+    //         on session/state, and flip to missing on session/deleted. Also
+    //         covers the running-activity pulse (`.is-active`), which mirrors
+    //         the session list's own gate (state "running" + recent PTY
+    //         bytes) rather than repainting per spinner frame. ---------------
     let badges: serde_json::Value = page
         .evaluate(
             r###"
@@ -735,12 +738,12 @@ async fn web_program_view_full_parity() {
             }, async () => {
               state.sessions = [
                 { id: "s-badges", harness: "shell", kind: "user" },
-                { id: "sBadge1", title: "Worker", harness: "claude", state: "running", kind: "user" },
+                { id: "sBadge1", title: "Worker", harness: "claude", state: "running", last_pty_at_ms: Date.now(), kind: "user" },
               ];
               state.currentId = "s-badges";
               await switchCurrentViewMode("program");
               const chipInfo = () => Array.from(programInputEl.querySelectorAll(".program-clip[data-raw]"))
-                .map((c) => ({ status: c.dataset.status, title: c.title }));
+                .map((c) => ({ status: c.dataset.status, title: c.title, active: c.classList.contains("is-active") }));
               const before = chipInfo();
               handleNotification("session/state", { session: { id: "sBadge1", title: "Worker", harness: "claude", state: "errored", kind: "user" } });
               const afterError = chipInfo();
@@ -759,6 +762,11 @@ async fn web_program_view_full_parity() {
         "a resolved session clip should badge its live status: {badges:?}"
     );
     assert_eq!(
+        badges["before"][0]["active"], true,
+        "a running session with recent PTY bytes should pulse its chip, mirroring \
+         the session list's own activity indicator: {badges:?}"
+    );
+    assert_eq!(
         badges["before"][1]["status"], "missing",
         "a clip whose target isn't in state.sessions should badge missing: {badges:?}"
     );
@@ -773,6 +781,10 @@ async fn web_program_view_full_parity() {
     assert_eq!(
         badges["afterError"][0]["title"], "exited with error",
         "{badges:?}"
+    );
+    assert_eq!(
+        badges["afterError"][0]["active"], false,
+        "an errored session should stop pulsing its chip: {badges:?}"
     );
     assert_eq!(
         badges["afterDelete"][0]["status"], "missing",

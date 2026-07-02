@@ -1664,6 +1664,14 @@
     text-decoration: line-through;
     opacity: 0.78;
   }
+  /* Mirrors the session list's own running-activity indicator: `.is-active`
+     is set (programChipEl / programUpdateChipStatuses) with the same gate
+     the list uses (state "running" + recent PTY bytes, `sessionPtyActive`),
+     and reuses the list's own `statusPulse` keyframe so a chip whose target
+     session is actively working breathes exactly like the list's status dot. */
+  .program-clip[data-status="running"].is-active {
+    animation: statusPulse 900ms ease-in-out infinite;
+  }
   /* Run shimmer: a travelling highlight band sweeps the running lines. Pure CSS
      (no per-char DOM rebuild) so it never disturbs the caret while editing. */
   .program-line.is-running {
@@ -3937,6 +3945,13 @@ function programSessionChipStatus(id) {
   return s ? sessionStatusLabel(s) : "missing";
 }
 
+// Whether a session smart-clip's chip should pulse, mirroring the session
+// list's own `.state.is-active` gate exactly: "running" and recent PTY bytes.
+function programSessionChipActive(id) {
+  const s = state.sessions.find((x) => x.id === id);
+  return !!s && sessionStatusLabel(s) === "running" && sessionPtyActive(s);
+}
+
 // Plain-language hover tooltip for a session smart-clip's live status
 // (spec: program smart-clip status badges). Distinct wording from the raw
 // status word for the two cases a viewer actually reads on hover.
@@ -3971,6 +3986,7 @@ function programChipEl(rawClip) {
     const status = programSessionChipStatus(id);
     span.dataset.status = status;
     span.title = programSessionChipStatusTooltip(status);
+    span.classList.toggle("is-active", programSessionChipActive(id));
   }
   return span;
 }
@@ -3991,6 +4007,7 @@ function programUpdateChipStatuses(sessionId) {
     chip.textContent = programClipLabel(body);
     chip.dataset.status = status;
     chip.title = programSessionChipStatusTooltip(status);
+    chip.classList.toggle("is-active", programSessionChipActive(id));
   }
 }
 

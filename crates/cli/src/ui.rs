@@ -10810,14 +10810,12 @@ fn program_smart_clip_target(raw_clip: &str) -> (&str, &str) {
 /// The chip label for a session smart-clip: `<glyph> <name> · <harness>`.
 /// Mirrors the session list's leading lifecycle glyph and name; shows the
 /// harness (not the model) and drops the redundant "session" prefix and the
-/// status word.
-fn program_session_clip_label(s: &agentd_protocol::SessionSummary) -> String {
-    format!(
-        "{} {} · {}",
-        s.state.glyph(),
-        primary_label(s),
-        harness_label(s)
-    )
+/// status word. `glyph` is the caller's already-resolved status glyph — the
+/// caller decides static vs. animated (via `session_status_glyph`'s shared
+/// `session_should_animate_status` gate) so this formatter can't fork that
+/// logic.
+fn program_session_clip_label(glyph: &str, s: &agentd_protocol::SessionSummary) -> String {
+    format!("{} {} · {}", glyph, primary_label(s), harness_label(s))
 }
 
 /// The chip label for a session smart-clip whose target id doesn't resolve
@@ -10847,7 +10845,7 @@ pub(crate) fn program_smart_clip_label<'a>(
                 .sessions
                 .iter()
                 .find(|s| s.id == id)
-                .map(program_session_clip_label)
+                .map(|s| program_session_clip_label(session_status_glyph(app, s), s))
                 .unwrap_or_else(|| program_missing_session_clip_label(id)),
             None => format!("session {id}"),
         },
@@ -11271,8 +11269,11 @@ mod tests {
     fn program_session_clip_label_shows_glyph_name_and_harness() {
         let s = clip_test_session("abc123", Some("My Task"), "codex", SessionState::Running);
         // `<glyph> <name> · <harness>` — no "session" prefix, no model, no status word.
-        assert_eq!(program_session_clip_label(&s), "● My Task · codex");
-        let label = program_session_clip_label(&s);
+        assert_eq!(
+            program_session_clip_label(s.state.glyph(), &s),
+            "● My Task · codex"
+        );
+        let label = program_session_clip_label(s.state.glyph(), &s);
         assert!(
             !label.contains("session"),
             "dropped the session prefix: {label}"
@@ -11284,13 +11285,28 @@ mod tests {
     }
 
     #[test]
+    fn program_session_clip_label_uses_caller_supplied_glyph() {
+        // The glyph is the caller's decision, not this formatter's — the
+        // chip's animation swap (spinner frame in place of the static
+        // lifecycle glyph, gated by the shared `session_should_animate_status`
+        // via `session_status_glyph`) works simply by passing a different
+        // glyph in, with no forked animation logic in the label formatter.
+        let s = clip_test_session("abc123", Some("My Task"), "codex", SessionState::Running);
+        let spinner = crate::app::SPINNER_FRAMES[2];
+        assert_eq!(
+            program_session_clip_label(spinner, &s),
+            format!("{spinner} My Task · codex")
+        );
+    }
+
+    #[test]
     fn program_session_clip_label_used_by_smart_clip_label() {
         // The chip label routes through the shared session-label helper when the
         // session resolves against the app.
         let s = clip_test_session("s9", Some("Build"), "claude", SessionState::Done);
         let (kind, label) = (
             program_smart_clip_target("session:s9").0,
-            program_session_clip_label(&s),
+            program_session_clip_label(s.state.glyph(), &s),
         );
         assert_eq!(kind, "session");
         assert_eq!(label, "✓ Build · claude");
