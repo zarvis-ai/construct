@@ -18,6 +18,45 @@ fn program_block_ids(
         .collect()
 }
 
+fn program_run_blocks_from_spans(
+    body: &str,
+    saved_blocks: &[agentd_protocol::ProgramBlockView],
+) -> Vec<agentd_protocol::ProgramBlockView> {
+    let mut by_content: std::collections::HashMap<String, Vec<&agentd_protocol::ProgramBlockView>> =
+        std::collections::HashMap::new();
+    for block in saved_blocks {
+        if !block.content_id.is_empty() {
+            by_content
+                .entry(block.content_id.clone())
+                .or_default()
+                .push(block);
+        }
+    }
+
+    agentd_protocol::program_block_spans(body)
+        .into_iter()
+        .map(|span| {
+            if let Some(matches) = by_content.get(&span.id) {
+                if let [block] = matches.as_slice() {
+                    return (*block).clone();
+                }
+            }
+            agentd_protocol::ProgramBlockView {
+                id: span.id.clone(),
+                block_id: String::new(),
+                content_epoch: 0,
+                block_ref: String::new(),
+                content_id: span.id,
+                start_line: span.start_line,
+                end_line: span.end_line,
+                text: span.text,
+                shimmer: false,
+                tooltip: None,
+            }
+        })
+        .collect()
+}
+
 fn program_run_system_status(run: &ProgramRunProgress) -> &'static str {
     if run.queued_behind_current_turn && !run.seen_running {
         agentd_protocol::PROGRAM_SHIMMER_STATUS_QUEUED
@@ -161,24 +200,16 @@ impl SessionManager {
         initial: Option<&[bool]>,
         queued_behind_current_turn: bool,
     ) -> Option<ProgramRunProgress> {
-        let blocks = match self.storage.read_program_with_blocks(session_id) {
-            Ok((program, blocks)) if program.markdown.trim() == body.trim() => blocks,
-            _ => agentd_protocol::program_block_spans(body)
-                .into_iter()
-                .map(|span| agentd_protocol::ProgramBlockView {
-                    id: span.id.clone(),
-                    block_id: String::new(),
-                    content_epoch: 0,
-                    block_ref: String::new(),
-                    content_id: span.id,
-                    start_line: span.start_line,
-                    end_line: span.end_line,
-                    text: span.text,
-                    shimmer: false,
-                    tooltip: None,
-                })
-                .collect(),
-        };
+        let (blocks, is_full_document_body) =
+            match self.storage.read_program_with_blocks(session_id) {
+                Ok((program, saved_blocks)) if program.markdown.trim() == body.trim() => {
+                    (saved_blocks, true)
+                }
+                Ok((_program, saved_blocks)) => {
+                    (program_run_blocks_from_spans(body, &saved_blocks), false)
+                }
+                Err(_) => (program_run_blocks_from_spans(body, &[]), false),
+            };
         if blocks.is_empty() {
             if let Ok(mut runs) = self.program_runs.lock() {
                 runs.remove(session_id);
@@ -188,6 +219,7 @@ impl SessionManager {
         let body_ids: std::collections::HashSet<String> =
             blocks.iter().map(block_ref_or_id).collect();
         let now_ms = Utc::now().timestamp_millis();
+        let adds_to_existing = is_selection || (initial.is_some() && !is_full_document_body);
         let pending: std::collections::HashSet<String> =
             if let Some(decl) = initial.filter(|d| d.len() == blocks.len()) {
                 // Explicit initial pending set, in document order (spec 0053).
@@ -222,6 +254,34 @@ impl SessionManager {
             } else {
                 body_ids
             };
+        if adds_to_existing {
+            if let Ok(mut runs) = self.program_runs.lock() {
+                if let Some(run) = runs.get_mut(session_id) {
+                    let previous_pending: std::collections::HashSet<String> = run
+                        .pending_block_refs
+                        .iter()
+                        .chain(run.pending_block_ids.iter())
+                        .cloned()
+                        .collect();
+                    let mut added = 0usize;
+                    for id in pending {
+                        if previous_pending.contains(&id) {
+                            continue;
+                        }
+                        if !run.pending_block_refs.contains(&id)
+                            && !run.pending_block_ids.contains(&id)
+                        {
+                            run.pending_block_refs.push(id);
+                            added += 1;
+                        }
+                    }
+                    run.total_block_count = run.total_block_count.saturating_add(added);
+                    run.expires_at_ms = now_ms + PROGRAM_RUN_MAX_MS;
+                    run.refresh_stage();
+                    return Some(project_program_run_status(run.clone()));
+                }
+            }
+        }
         if pending.is_empty() {
             // An explicit all-settled initial set leaves nothing to shimmer.
             if let Ok(mut runs) = self.program_runs.lock() {
