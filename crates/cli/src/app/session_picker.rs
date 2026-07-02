@@ -381,6 +381,17 @@ impl App {
         }
     }
 
+    /// `C-k`: kill from the cursor to the end of the query. The cursor itself
+    /// doesn't move — it's already at the (now shorter) end of the query.
+    fn session_picker_kill_to_end(&mut self) {
+        if let Some(dialog) = self.session_picker.as_mut() {
+            let pos = byte_pos(&dialog.query, dialog.cursor);
+            dialog.query.truncate(pos);
+            dialog.cursor = dialog.cursor.min(dialog.query.chars().count());
+        }
+        self.session_picker_reset_selection();
+    }
+
     /// Snap the highlight back to the top match. Called after the effective
     /// query changes (typing/backspace) so navigation resumes from the best hit.
     fn session_picker_reset_selection(&mut self) {
@@ -593,6 +604,7 @@ impl App {
             KeyCode::Char('b') if ctrl && !to_program => self.session_picker_move_cursor(-1),
             KeyCode::Char('a') if ctrl && !to_program => self.session_picker_cursor_to_edge(false),
             KeyCode::Char('e') if ctrl && !to_program => self.session_picker_cursor_to_edge(true),
+            KeyCode::Char('k') if ctrl && !to_program => self.session_picker_kill_to_end(),
             KeyCode::Backspace if to_program => self.session_picker_program_backspace(),
             KeyCode::Backspace => self.session_picker_backspace(),
             KeyCode::Char(c) if !ctrl && !alt && !super_mod && to_program => {

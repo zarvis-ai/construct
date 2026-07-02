@@ -17985,6 +17985,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_picker_ctrl_k_kills_to_end_of_line() {
+        let (mut app, _dir, server) = session_picker_app().await;
+        app.open_session_picker(SessionPickerPurpose::Switch);
+        picker_type(&mut app, "abcdef"); // cursor at 6, query "abcdef"
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_picker.as_ref().unwrap().cursor, 2);
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_picker.as_ref().unwrap().query, "ab");
+        // The cursor was already at (the new) end; it doesn't move.
+        assert_eq!(app.session_picker.as_ref().unwrap().cursor, 2);
+        // Killing again at the end of the line is a no-op.
+        app.handle_session_picker_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.session_picker.as_ref().unwrap().query, "ab");
+        assert_eq!(app.session_picker.as_ref().unwrap().cursor, 2);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn session_picker_open_with_no_sessions_is_noop() {
         let (mut app, _dir, server) = empty_app().await;
         app.open_session_picker(SessionPickerPurpose::Switch);
