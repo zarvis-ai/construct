@@ -378,10 +378,42 @@ impl App {
             .map(|popup| popup.saved_markdown.clone())
             .unwrap_or_default();
 
+        let selection =
+            selection.map(|selection| program_normalize_smart_clip_instance_ids(&selection));
+        let is_selection = selection.is_some();
+        let pre_save_run_body = match selection.as_deref() {
+            Some(sel) => sel.to_string(),
+            None => self
+                .program_popup
+                .as_ref()
+                .map(|popup| program_normalize_smart_clip_instance_ids(&popup.buffer))
+                .unwrap_or_default(),
+        };
+        let selected_block_ids = selected_block_ids.or_else(|| {
+            is_selection
+                .then(|| {
+                    self.program_popup
+                        .as_ref()
+                        .and_then(Self::selected_program_block_ids)
+                })
+                .flatten()
+        });
+        let pending = match selected_block_ids {
+            Some(ids) if is_selection => self.program_run_pending_with_existing(&session_id, ids),
+            _ => self.program_run_pending_for_body(
+                &session_id,
+                &pre_save_run_body,
+                is_selection,
+                &prev_saved,
+            ),
+        };
+        self.start_program_run_with_pending(&session_id, pending);
+
         let dirty = self.program_popup.as_ref().is_some_and(|popup| {
             program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
         });
         if dirty && !self.save_program_popup().await {
+            self.program_runs.remove(&session_id);
             return false;
         }
 
@@ -389,9 +421,6 @@ impl App {
             .program_popup
             .as_ref()
             .map(|popup| popup.program.version);
-        let selection =
-            selection.map(|selection| program_normalize_smart_clip_instance_ids(&selection));
-        let is_selection = selection.is_some();
         // Optimistic feedback (spec 0042): start the Run shimmer the instant
         // Run is pressed, before the execute round trip, so the affordance
         // covers the agent's latency rather than the request's. The executed
@@ -404,24 +433,36 @@ impl App {
                 .map(|popup| popup.buffer.clone())
                 .unwrap_or_default(),
         };
-        let selected_block_ids = selected_block_ids.or_else(|| {
-            self.program_popup
-                .as_ref()
-                .and_then(Self::selected_program_block_ids)
-        });
-        match selected_block_ids {
-            Some(pending) if is_selection => {
-                let pending = self.program_run_pending_with_existing(&session_id, pending);
-                self.start_program_run_with_pending(&session_id, pending)
-            }
-            _ => self.start_program_run(&session_id, &run_body, is_selection, &prev_saved),
-        }
+        let selected_block_ids = is_selection
+            .then(|| {
+                self.program_popup
+                    .as_ref()
+                    .and_then(Self::selected_program_block_ids)
+            })
+            .flatten();
+        let pending = match selected_block_ids {
+            Some(ids) if is_selection => self.program_run_pending_with_existing(&session_id, ids),
+            _ => self.program_run_pending_for_body(
+                &session_id,
+                &run_body,
+                is_selection,
+                &prev_saved,
+            ),
+        };
+        self.start_program_run_with_pending(&session_id, pending.clone());
+        let shimmer = if is_selection {
+            Self::program_run_all_shimmer_for_body(&run_body)
+        } else {
+            Self::program_run_shimmer_for_body(&run_body, &pending)
+        };
         let params = agentd_protocol::ProgramExecuteParams {
             session_id: session_id.clone(),
             selection,
             base_version,
-            // Optimistic full-region shimmer; the run's planning pass narrows it.
-            shimmer: None,
+            // Echo the TUI's optimistic pending set so a mid-flight full re-Run
+            // cannot be narrowed back to old pending refs before the planning
+            // pass sees user-edited blocks.
+            shimmer,
         };
         match self.client.program_execute(params).await {
             Ok(result) => {
@@ -462,6 +503,7 @@ impl App {
     /// running one snippet must not dim blocks another in-flight run is still
     /// working on; a fresh run with nothing in flight shimmers just the
     /// selected region.
+    #[cfg(test)]
     pub(super) fn start_program_run(
         &mut self,
         session_id: &str,
@@ -469,18 +511,22 @@ impl App {
         is_selection: bool,
         prev_saved: &str,
     ) {
+        let pending = self.program_run_pending_for_body(session_id, body, is_selection, prev_saved);
+        self.start_program_run_with_pending(session_id, pending);
+    }
+
+    pub(super) fn program_run_pending_for_body(
+        &self,
+        session_id: &str,
+        body: &str,
+        is_selection: bool,
+        prev_saved: &str,
+    ) -> HashSet<String> {
         let body_ids = program_run_pending_ids(body);
         if body_ids.is_empty() {
-            // Empty body has nothing to shimmer; drop any stale run.
-            self.program_runs.remove(session_id);
-            return;
+            return HashSet::new();
         }
-        let pending: HashSet<String> = match self.program_runs.get(session_id) {
-            // Re-Run mid-flight: union of the user's fresh edits (blocks present
-            // now but not in the last synced content) and blocks that never
-            // settled under the prior run. Agent-settled blocks are in
-            // `prev_saved` and absent from `old.pending`, so both terms skip
-            // them and they stop re-shimmering.
+        match self.program_runs.get(session_id) {
             Some(old) if !is_selection => {
                 let prev_ids = program_run_pending_ids(prev_saved);
                 let narrowed: HashSet<String> = body_ids
@@ -488,27 +534,31 @@ impl App {
                     .chain(body_ids.intersection(&old.pending))
                     .cloned()
                     .collect();
-                // A run can already exist over this session with nothing left
-                // that overlaps the fresh press — e.g. the prior run was
-                // scoped to a selection, or its pending set had transiently
-                // emptied mid-turn (spec 0042) without being cleared yet.
-                // Pressing Run again must still give immediate feedback for
-                // this new request rather than silently going dark, so an
-                // empty narrowing falls back to the whole executed body —
-                // mirroring the daemon's own mid-flight fallback.
                 if narrowed.is_empty() {
                     body_ids
                 } else {
                     narrowed
                 }
             }
-            // A selection run keeps any shimmer already in flight and adds
-            // its own scope on top of it (see `program_run_pending_with_existing`).
             Some(old) => old.pending.union(&body_ids).cloned().collect(),
-            // Fresh run, nothing in flight: shimmer just the executed body.
             None => body_ids,
-        };
-        self.start_program_run_with_pending(session_id, pending);
+        }
+    }
+
+    pub(super) fn program_run_shimmer_for_body(
+        body: &str,
+        pending: &HashSet<String>,
+    ) -> Option<Vec<bool>> {
+        let shimmer: Vec<bool> = agentd_protocol::program_block_spans(body)
+            .into_iter()
+            .map(|span| pending.contains(&span.id))
+            .collect();
+        (!shimmer.is_empty()).then_some(shimmer)
+    }
+
+    fn program_run_all_shimmer_for_body(body: &str) -> Option<Vec<bool>> {
+        let len = agentd_protocol::program_block_spans(body).len();
+        (len > 0).then(|| vec![true; len])
     }
 
     /// Union `ids` with the pending set of any Run already in flight for

@@ -6648,6 +6648,87 @@ mod tests {
         assert!(!run.agent_managed);
     }
 
+    #[tokio::test]
+    async fn program_full_rerun_with_explicit_shimmer_includes_user_edited_block() {
+        use agentd_protocol::SessionState;
+
+        let md = "# A\n\n# B\n";
+        let edited = "# A\n\n# B edited\n";
+        let (mgr, storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None)
+            .expect("start full run");
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        let get = mgr.program_get(&id).await.expect("get");
+        let block_ref = |needle: &str| {
+            get.blocks
+                .iter()
+                .find(|b| b.text.contains(needle))
+                .unwrap_or_else(|| panic!("missing block {needle:?}"))
+                .id
+                .clone()
+        };
+        let a_ref = block_ref("# A");
+        let b_ref = block_ref("# B");
+
+        declare(
+            &mgr,
+            &id,
+            "# A",
+            vec![
+                agentd_protocol::ProgramShimmerDecl {
+                    id: a_ref.clone(),
+                    shimmer: true,
+                    tooltip: Some("Working A".into()),
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: b_ref,
+                    shimmer: false,
+                    tooltip: None,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(
+            mgr.program_run_snapshot(&id)
+                .expect("narrowed run")
+                .pending_block_refs,
+            vec![a_ref.clone()]
+        );
+
+        storage
+            .update_program(
+                &id,
+                edited.to_string(),
+                agentd_protocol::ProgramUpdateActor::Human,
+                None,
+                None,
+                None,
+            )
+            .expect("save edited program");
+        let edited_get = mgr.program_get(&id).await.expect("edited get");
+        let edited_b_ref = edited_get
+            .blocks
+            .iter()
+            .find(|b| b.text.contains("# B edited"))
+            .expect("edited B block")
+            .id
+            .clone();
+
+        let run = mgr
+            .start_program_run_with_dispatch_state(&id, edited, false, Some(&[true, true]), true)
+            .expect("explicit full re-run");
+
+        assert!(
+            run.pending_block_refs.contains(&a_ref),
+            "still-pending block A remains pending"
+        );
+        assert!(
+            run.pending_block_refs.contains(&edited_b_ref),
+            "user-edited block B is seeded pending by explicit shimmer"
+        );
+        assert_eq!(run.pending_block_refs.len(), 2);
+    }
+
     // An edit's shimmer declaration for an id that no longer exists is dropped
     // (fail closed), and other blocks are untouched.
     #[tokio::test]

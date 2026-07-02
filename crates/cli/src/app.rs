@@ -14135,6 +14135,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_dirty_run_seeds_optimistic_pending_before_save_response() {
+        let (mut app, _dir, server) = empty_app().await;
+        let id = agentd_protocol::program_block_id;
+        let saved = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
+        let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
+
+        app.program_popup = Some(program_popup_for_test("s1", saved, 0));
+        app.program_popup.as_mut().unwrap().buffer = edited.to_string();
+        app.start_program_run("s1", saved, false, "");
+        app.program_runs.get_mut("s1").expect("run").pending = HashSet::from([id("- pending")]);
+        app.start_program_run("s1", edited, false, saved);
+
+        let pending = &app.program_runs["s1"].pending;
+        assert_eq!(pending.len(), 2);
+        assert!(pending.contains(&id("- pending")));
+        assert!(
+            pending.contains(&id("- user changed")),
+            "dirty user edits must shimmer before any save RPC response"
+        );
+        assert!(!pending.contains(&id("- settled")));
+        assert!(!pending.contains(&id("- untouched")));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_execute_sends_explicit_shimmer_for_edited_and_pending_blocks() {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+        use tokio::sync::mpsc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (tx, mut rx) = mpsc::unbounded_channel::<(String, Value)>();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let Ok(n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let req: Value = serde_json::from_str(&line).expect("json request");
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let method = req
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let params = req.get("params").cloned().unwrap_or(Value::Null);
+                        let _ = tx.send((method.clone(), params.clone()));
+                        let session_id = params
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("s1");
+                        let markdown = params
+                            .get("markdown")
+                            .and_then(Value::as_str)
+                            .unwrap_or("# Todo\n\n- settled\n\n- pending\n\n- user changed\n");
+                        let result = match method.as_str() {
+                            ipc_method::PROGRAM_UPDATE => serde_json::json!({
+                                "program": {
+                                    "session_id": session_id,
+                                    "markdown": markdown,
+                                    "version": 2,
+                                    "updated_at_ms": 0,
+                                    "template_id": null
+                                },
+                                "blocks": []
+                            }),
+                            ipc_method::PROGRAM_EXECUTE => serde_json::json!({
+                                "program": {
+                                    "session_id": session_id,
+                                    "markdown": "# Todo\n\n- settled\n\n- pending\n\n- user changed\n",
+                                    "version": 2,
+                                    "updated_at_ms": 0,
+                                    "template_id": null
+                                },
+                                "prompt": "run",
+                                "active_run": null,
+                                "blocks": []
+                            }),
+                            _ => Value::Null,
+                        };
+                        let resp =
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                        if writer
+                            .write_all((resp.to_string() + "\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        summary.id = "s1".into();
+        let mut app = test_app(client, vec![summary]);
+        let id = agentd_protocol::program_block_id;
+        let saved = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
+        let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
+        app.program_popup = Some(program_popup_for_test("s1", saved, 0));
+        app.program_popup.as_mut().unwrap().buffer = edited.to_string();
+        app.start_program_run("s1", saved, false, "");
+        app.program_runs.get_mut("s1").expect("run").pending = HashSet::from([id("- pending")]);
+
+        assert!(app.execute_program_popup(None, None).await);
+
+        let mut execute_params = None;
+        while let Some((method, params)) = rx.recv().await {
+            if method == ipc_method::PROGRAM_EXECUTE {
+                execute_params = Some(params);
+                break;
+            }
+        }
+        let params = execute_params.expect("program.execute params");
+        assert_eq!(params.get("base_version").and_then(Value::as_u64), Some(2));
+        assert_eq!(
+            params.get("shimmer").cloned(),
+            Some(serde_json::json!([false, false, true, true])),
+            "explicit shimmer must preserve still-pending and user-edited blocks"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_optimistic_selection_run_adds_to_existing_shimmer_scope() {
         // A selection run must not clear shimmer another in-flight run
         // already declared elsewhere in the program — it optimistically adds
