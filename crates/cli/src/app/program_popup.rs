@@ -510,10 +510,13 @@ impl App {
             session_id.to_string(),
             ProgramRun {
                 started_at: now,
+                total_block_count: pending.len(),
                 pending,
                 pending_tooltips: HashMap::new(),
                 deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,
+                stage: agentd_protocol::ProgramRunStage::Pressed,
+                settled_block_count: 0,
             },
         );
     }

@@ -1523,6 +1523,14 @@
   .program-msg { color: var(--fg-dim); font-size: 12px; max-width: 42ch;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .program-msg.is-error { color: var(--err); }
+  .program-run-stage {
+    color: var(--fg-dim);
+    font-size: 12px;
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .program-bar button {
     background: var(--bg-elev-2);
     color: var(--fg);
@@ -1904,6 +1912,7 @@
           <span class="program-msg" id="programMsg" aria-live="polite"></span>
           <button type="button" id="programFindBtn" title="Find (Ctrl+F)">Find</button>
           <button type="button" id="programRunBtn" title="Run program (Ctrl+Enter) — runs the selection if text is selected">Run</button>
+          <span class="program-run-stage" id="programRunStage" aria-live="polite"></span>
           <button type="button" id="programSaveBtn" title="Save (Ctrl+S)">Save</button>
         </div>
         <div class="program-find" id="programFind" hidden>
@@ -2128,6 +2137,7 @@ const programVersionEl = $("programVersion");
 const programMsgEl = $("programMsg");
 const programSaveBtn = $("programSaveBtn");
 const programRunBtn = $("programRunBtn");
+const programRunStageEl = $("programRunStage");
 const programFindBtn = $("programFindBtn");
 const programFindEl = $("programFind");
 const programFindInputEl = $("programFindInput");
@@ -3675,13 +3685,39 @@ function programRunFromProgress(progress) {
   if (progress.expires_at_ms <= nowMs || !ids || ids.size === 0) return null;
   const perf = performance.now();
   const startPerf = progress.started_at_ms <= nowMs ? perf - (nowMs - progress.started_at_ms) : perf;
+  const pendingCount = (progress.pending_block_refs && progress.pending_block_refs.length)
+    ? progress.pending_block_refs.length
+    : (progress.pending_block_ids || []).length;
+  const total = Math.max(progress.total_block_count || 0, pendingCount);
+  const settled = Math.max(0, total - pendingCount);
+  let stage = progress.stage || null;
+  if (!stage) {
+    if (progress.agent_managed) stage = settled > 0 ? "settling" : "planning_pass_done";
+    else if (progress.first_output_seen) stage = "first_output";
+    else stage = "delivered";
+  }
   return {
     pendingIds: ids,
     tooltips: new Map(Object.entries(progress.pending_block_tooltips || {})),
     startPerf,
     deadlinePerf: perf + (progress.expires_at_ms - nowMs),
     firstOutputSeen: !!progress.first_output_seen,
+    stage,
+    settledBlockCount: progress.settled_block_count != null ? progress.settled_block_count : settled,
+    totalBlockCount: total,
   };
+}
+
+function programRunStageLabel(run) {
+  if (!run || performance.now() >= run.deadlinePerf) return "";
+  switch (run.stage) {
+    case "pressed": return "pressed";
+    case "delivered": return "delivered";
+    case "first_output": return "first output";
+    case "planning_pass_done": return "planning pass done";
+    case "settling": return `${run.settledBlockCount}/${run.totalBlockCount} settled`;
+    default: return "";
+  }
 }
 
 function programRecordSettleFlourishes(id, previousPending, nextPending) {
@@ -4099,13 +4135,15 @@ function programRefreshRunButton() {
   const id = state.program.mountedId;
   const active = !!(id && programRunButtonActive(id));
   programRunBtn.dataset.running = active ? "true" : "false";
+  const run = id && state.program.runById.get(id);
+  programRunStageEl.textContent = run ? programRunStageLabel(run) : "";
   if (state.program.runButtonTimer) {
     clearTimeout(state.program.runButtonTimer);
     state.program.runButtonTimer = 0;
   }
   if (!active || !id) return;
-  const run = state.program.runButtonById.get(id);
-  const ms = Math.max(0, run.deadlinePerf - performance.now());
+  const buttonRun = state.program.runButtonById.get(id);
+  const ms = Math.max(0, buttonRun.deadlinePerf - performance.now());
   state.program.runButtonTimer = setTimeout(() => {
     state.program.runButtonTimer = 0;
     state.program.runButtonById.delete(id);
@@ -4140,6 +4178,7 @@ function programEventClearsRunButton(event) {
 function programStartShimmer(id) {
   programStopShimmer();
   programApplyShimmer();
+  if (state.program.mountedId === id) programRefreshRunButton();
   const run = state.program.runById.get(id);
   if (!run) return;
   // Clear the highlight when the run's backstop deadline passes.
@@ -4147,7 +4186,7 @@ function programStartShimmer(id) {
   state.program.raf = setTimeout(() => {
     state.program.raf = 0;
     state.program.runById.delete(id);
-    if (state.program.mountedId === id) programApplyShimmer();
+    if (state.program.mountedId === id) { programApplyShimmer(); programRefreshRunButton(); }
   }, ms);
 }
 
@@ -4164,6 +4203,7 @@ function leaveProgramView() {
   programStopShimmer();
   if (state.program.runButtonTimer) { clearTimeout(state.program.runButtonTimer); state.program.runButtonTimer = 0; }
   programRunBtn.dataset.running = "false";
+  programRunStageEl.textContent = "";
   programCloseClipMenu();
   programCloseFind();
   programWrapEl.hidden = true;
@@ -4496,11 +4536,20 @@ function programStartOptimisticRun(id, body, isSelection, selectedBlockIds, prev
   }
   if (!pending.size) {
     state.program.runById.delete(id);
-    if (state.program.mountedId === id) { programStopShimmer(); programApplyShimmer(); }
+    if (state.program.mountedId === id) { programStopShimmer(); programApplyShimmer(); programRefreshRunButton(); }
     return { pendingIds: pending, shimmer: spans.map(() => false) };
   }
   const perf = performance.now();
-  state.program.runById.set(id, { pendingIds: pending, tooltips: new Map(), startPerf: perf, deadlinePerf: perf + PROGRAM_RUN_MAX_MS });
+  state.program.runById.set(id, {
+    pendingIds: pending,
+    tooltips: new Map(),
+    startPerf: perf,
+    deadlinePerf: perf + PROGRAM_RUN_MAX_MS,
+    firstOutputSeen: false,
+    stage: "pressed",
+    settledBlockCount: 0,
+    totalBlockCount: pending.size,
+  });
   if (state.program.mountedId === id) programStartShimmer(id);
   return { pendingIds: pending, shimmer: spans.map((b) => pending.has(b.id)) };
 }

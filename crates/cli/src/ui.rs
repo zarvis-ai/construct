@@ -8006,12 +8006,14 @@ fn render_program_popup_at(
     // always offers a close button.
     let show_close = true;
     let dirty = popup.buffer != popup.saved_markdown;
+    let stage_label = program_run_stage_label(app, popup, now);
     let left = program_title_left_layout(
         summary_ref,
         short_id(&popup.program.session_id),
         rect,
         dirty,
         show_close,
+        stage_label.as_deref(),
     );
     let title = program_title_line(app, popup, active, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
@@ -8585,6 +8587,8 @@ struct ProgramTitleLeft {
     /// Run-button hit range `(x_start, x_end_exclusive, y)`, or `None` when the
     /// pane is too narrow to fit it.
     run: Option<(u16, u16, u16)>,
+    /// Bounded run-stage label that fits between Run and the dirty marker.
+    stage_label: Option<String>,
     /// `modified` word hit range `(x_start, x_end_exclusive)` on row `rect.y`,
     /// or `None` when the program is not dirty.
     modified: Option<(u16, u16)>,
@@ -8596,6 +8600,7 @@ fn program_title_left_layout(
     rect: Rect,
     dirty: bool,
     show_close: bool,
+    stage_label: Option<&str>,
 ) -> ProgramTitleLeft {
     let glyph_w = UnicodeWidthStr::width(program_mode_glyph());
     let run_w = UnicodeWidthStr::width(PROGRAM_RUN_BUTTON);
@@ -8608,6 +8613,26 @@ fn program_title_left_layout(
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
     let close_w = if show_close { 3 } else { 0 };
+    let right_cluster_left = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_sub(harness_w as u16)
+        .saturating_sub(close_w as u16);
+    let stage_w_candidate = stage_label
+        .map(|label| UnicodeWidthStr::width(label).saturating_add(1))
+        .unwrap_or(0);
+    let min_left_with_stage = rect
+        .x
+        .saturating_add(3 + glyph_w as u16)
+        .saturating_add(run_w as u16)
+        .saturating_add(stage_w_candidate as u16)
+        .saturating_add(marker_w as u16);
+    let stage_label = (stage_w_candidate > 0 && min_left_with_stage <= right_cluster_left)
+        .then(|| stage_label.unwrap_or_default().to_string());
+    let stage_w = stage_label
+        .as_deref()
+        .map(|label| UnicodeWidthStr::width(label).saturating_add(1))
+        .unwrap_or(0);
     // Mirror the session view's title-label budget (corners + harness + close +
     // ` <glyph> <label> ` scaffolding), and additionally reserve the
     // program-only left-cluster extras: the Run button and the dirty marker.
@@ -8617,6 +8642,7 @@ fn program_title_left_layout(
         .saturating_sub(close_w)
         .saturating_sub(3 + glyph_w)
         .saturating_sub(run_w)
+        .saturating_sub(stage_w)
         .saturating_sub(marker_w);
     let label = match summary {
         Some(s) => truncate_to_width(&primary_label(s), label_budget),
@@ -8637,7 +8663,11 @@ fn program_title_left_layout(
     let run = (run_x_end < pane_right).then_some((run_x_start, run_x_end, rect.y));
     // The dirty marker trails the Run button (or a one-cell gap when Run didn't
     // fit): ` <run>* modified` / ` <label> * modified`.
-    let gap_after_label = if run.is_some() { run_w as u16 } else { 1 };
+    let gap_after_label = if run.is_some() {
+        run_w.saturating_add(stage_w) as u16
+    } else {
+        1
+    };
     let modified = dirty.then(|| {
         let start = run_x_start
             .saturating_add(gap_after_label)
@@ -8648,8 +8678,35 @@ fn program_title_left_layout(
     ProgramTitleLeft {
         label,
         run,
+        stage_label,
         modified,
     }
+}
+
+const PROGRAM_RUN_STAGE_MAX_WIDTH: usize = 18;
+
+fn program_run_stage_label(
+    app: &App,
+    popup: &crate::app::ProgramPopup,
+    now: Instant,
+) -> Option<String> {
+    let run = app
+        .program_runs
+        .get(&popup.program.session_id)
+        .filter(|run| now < run.deadline)?;
+    let label = match run.stage {
+        agentd_protocol::ProgramRunStage::Pressed => "pressed".to_string(),
+        agentd_protocol::ProgramRunStage::Delivered => "delivered".to_string(),
+        agentd_protocol::ProgramRunStage::FirstOutput => "first output".to_string(),
+        agentd_protocol::ProgramRunStage::PlanningPassDone => "planning pass done".to_string(),
+        agentd_protocol::ProgramRunStage::Settling => {
+            format!(
+                "{}/{} settled",
+                run.settled_block_count, run.total_block_count
+            )
+        }
+    };
+    Some(truncate_to_width(&label, PROGRAM_RUN_STAGE_MAX_WIDTH))
 }
 
 fn program_title_line<'a>(
@@ -8712,6 +8769,13 @@ fn program_title_line<'a>(
             PROGRAM_RUN_BUTTON.to_string()
         };
         spans.push(Span::styled(run_button, run_style));
+        if let Some(label) = left.stage_label.as_deref() {
+            spans.push(Span::styled(" ", border_style));
+            spans.push(Span::styled(
+                label.to_string(),
+                Style::default().fg(app.theme.muted),
+            ));
+        }
     } else {
         spans.push(Span::styled(" ", border_style));
     }
@@ -8817,6 +8881,7 @@ fn render_program_title_tooltip(
         rect,
         dirty,
         true,
+        program_run_stage_label(app, popup, Instant::now()).as_deref(),
     );
     if let Some((start, end)) = left.modified {
         if mx >= start && mx < end {
@@ -11691,7 +11756,7 @@ mod tests {
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true);
+        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true, None);
         let run = layout.run.expect("run button fits at this width");
         let modified = layout.modified.expect("dirty marker present");
 
@@ -11731,7 +11796,14 @@ mod tests {
         let summary = summary_with_mode("smith", Some("interactive"));
         let summary_ref = Some(&summary);
 
-        let layout = program_title_left_layout(summary_ref, "sess", rect, true, true);
+        let layout = program_title_left_layout(
+            summary_ref,
+            "sess",
+            rect,
+            true,
+            true,
+            Some("planning pass done"),
+        );
         let run = layout.run.expect("run fits");
         let modified = layout.modified.expect("dirty marker present");
         let left_extent = modified.1.max(run.1);

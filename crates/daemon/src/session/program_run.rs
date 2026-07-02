@@ -57,7 +57,7 @@ impl SessionManager {
                         out.pending_block_ids = out.pending_block_refs.clone();
                     }
                 }
-                Some(out)
+                Some(out.with_refreshed_stage())
             }
             _ => None,
         }
@@ -202,6 +202,7 @@ impl SessionManager {
             }
             return None;
         }
+        let total_block_count = pending.len();
         let run = ProgramRunProgress {
             run_id: format!("{session_id}:{now_ms}"),
             started_at_ms: now_ms,
@@ -215,7 +216,11 @@ impl SessionManager {
             // Until then it is the optimistic full-program shimmer and stays
             // subject to the owning-session idle stop signal.
             agent_managed: false,
-        };
+            stage: agentd_protocol::ProgramRunStage::Delivered,
+            settled_block_count: 0,
+            total_block_count,
+        }
+        .with_refreshed_stage();
         if let Ok(mut runs) = self.program_runs.lock() {
             runs.insert(session_id.to_string(), run.clone());
         }

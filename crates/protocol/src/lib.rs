@@ -1192,6 +1192,25 @@ pub fn program_block_spans(markdown: &str) -> Vec<ProgramBlockSpan> {
     blocks
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramRunStage {
+    /// Client-local optimistic stage immediately after Run is pressed, before
+    /// the execute call returns. Daemon snapshots normally advance to Delivered
+    /// because shared run state is published after delivery succeeds.
+    Pressed,
+    Delivered,
+    FirstOutput,
+    PlanningPassDone,
+    Settling,
+}
+
+impl Default for ProgramRunStage {
+    fn default() -> Self {
+        Self::Pressed
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramRunProgress {
     pub run_id: String,
@@ -1229,6 +1248,52 @@ pub struct ProgramRunProgress {
     /// after being seen running. See `specs/0042-program-run-progress-affordance.md`.
     #[serde(default)]
     pub agent_managed: bool,
+    /// Derived compact stage for clients to render next to the Run control.
+    /// It is computed from the run lifecycle facts above; clients should not
+    /// use it as a stop signal.
+    #[serde(default)]
+    pub stage: ProgramRunStage,
+    /// Number of blocks from this run's initial pending set that have settled.
+    #[serde(default)]
+    pub settled_block_count: usize,
+    /// Number of blocks in this run's initial pending set.
+    #[serde(default)]
+    pub total_block_count: usize,
+}
+
+impl ProgramRunProgress {
+    pub fn pending_block_count(&self) -> usize {
+        if !self.pending_block_refs.is_empty() {
+            self.pending_block_refs.len()
+        } else {
+            self.pending_block_ids.len()
+        }
+    }
+
+    pub fn refresh_stage(&mut self) {
+        let pending = self.pending_block_count();
+        if self.total_block_count == 0 {
+            self.total_block_count = pending;
+        }
+        self.total_block_count = self.total_block_count.max(pending);
+        self.settled_block_count = self.total_block_count.saturating_sub(pending);
+        self.stage = if self.agent_managed {
+            if self.settled_block_count > 0 {
+                ProgramRunStage::Settling
+            } else {
+                ProgramRunStage::PlanningPassDone
+            }
+        } else if self.first_output_seen {
+            ProgramRunStage::FirstOutput
+        } else {
+            ProgramRunStage::Delivered
+        };
+    }
+
+    pub fn with_refreshed_stage(mut self) -> Self {
+        self.refresh_stage();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2353,6 +2418,56 @@ mod program_block_tests {
             normalize_program_tooltip(eleven),
             Some("one two three four five six seven eight nine ten…".to_string())
         );
+    }
+
+    fn run_progress_with_pending(pending: &[&str]) -> ProgramRunProgress {
+        ProgramRunProgress {
+            run_id: "r1".into(),
+            started_at_ms: 10,
+            expires_at_ms: 20,
+            pending_block_ids: Vec::new(),
+            pending_block_refs: pending.iter().map(|id| (*id).to_string()).collect(),
+            pending_block_tooltips: HashMap::new(),
+            seen_running: false,
+            first_output_seen: false,
+            agent_managed: false,
+            stage: ProgramRunStage::Pressed,
+            settled_block_count: 0,
+            total_block_count: pending.len(),
+        }
+    }
+
+    #[test]
+    fn program_run_stage_derives_pipeline_progress() {
+        let mut run = run_progress_with_pending(&["a", "b", "c"]);
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::Delivered);
+        assert_eq!(run.settled_block_count, 0);
+        assert_eq!(run.total_block_count, 3);
+
+        run.first_output_seen = true;
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::FirstOutput);
+
+        run.agent_managed = true;
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::PlanningPassDone);
+
+        run.pending_block_refs = vec!["b".into(), "c".into()];
+        run.refresh_stage();
+        assert_eq!(run.stage, ProgramRunStage::Settling);
+        assert_eq!(run.settled_block_count, 1);
+        assert_eq!(run.total_block_count, 3);
+    }
+
+    #[test]
+    fn program_run_stage_defaults_total_for_legacy_payloads() {
+        let mut run = run_progress_with_pending(&["a", "b"]);
+        run.total_block_count = 0;
+        run.refresh_stage();
+        assert_eq!(run.total_block_count, 2);
+        assert_eq!(run.settled_block_count, 0);
+        assert_eq!(run.stage, ProgramRunStage::Delivered);
     }
 }
 

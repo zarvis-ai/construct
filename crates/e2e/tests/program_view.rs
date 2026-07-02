@@ -269,7 +269,7 @@ async fn web_program_view_full_parity() {
               programTestClearSel();
               await programRun();
               const r = state.program.runById.get("s-run");
-              return { execs: window.__execs, runPending: r ? r.pendingIds.size : 0, shimmerActive: !!programInputEl.querySelector(".program-line.is-running"), msg: programMsgEl.textContent };
+              return { execs: window.__execs, runPending: r ? r.pendingIds.size : 0, shimmerActive: !!programInputEl.querySelector(".program-line.is-running"), stage: programRunStageEl.textContent, msg: programMsgEl.textContent };
             })
             "###,
         )
@@ -287,6 +287,7 @@ async fn web_program_view_full_parity() {
         run["shimmerActive"], true,
         "running lines should get the shimmer class: {run:?}"
     );
+    assert_eq!(run["stage"], "delivered", "{run:?}");
     assert!(
         run["msg"]
             .as_str()
@@ -326,6 +327,7 @@ async fn web_program_view_full_parity() {
                 runPending: state.program.runById.get("s-run-immediate")?.pendingIds.size || 0,
                 shimmerActive: !!programInputEl.querySelector(".program-line.is-running"),
                 button: programRunBtn.dataset.running,
+                stage: programRunStageEl.textContent,
                 msg: programMsgEl.textContent,
               };
               resolveExecute();
@@ -334,6 +336,7 @@ async fn web_program_view_full_parity() {
                 runPending: state.program.runById.get("s-run-immediate")?.pendingIds.size || 0,
                 shimmerActive: !!programInputEl.querySelector(".program-line.is-running"),
                 button: programRunBtn.dataset.running,
+                stage: programRunStageEl.textContent,
                 msg: programMsgEl.textContent,
               };
               return { before, after };
@@ -356,6 +359,14 @@ async fn web_program_view_full_parity() {
     assert_eq!(
         immediate_run["before"]["button"], "true",
         "Run button should pulse before execute resolves: {immediate_run:?}"
+    );
+    assert_eq!(
+        immediate_run["before"]["stage"], "pressed",
+        "{immediate_run:?}"
+    );
+    assert_eq!(
+        immediate_run["after"]["stage"], "delivered",
+        "{immediate_run:?}"
     );
     assert!(
         immediate_run["before"]["msg"]
