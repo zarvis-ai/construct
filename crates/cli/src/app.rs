@@ -998,6 +998,14 @@ pub struct App {
     /// keyboard focus. The Program remains visible, but keys flow to the
     /// underlying session instead of editing Program Markdown.
     pub program_terminal_focus: bool,
+    /// Terminal-focus slide animation: the slide fraction the rolled-down
+    /// Program had when `program_terminal_focus` last flipped (0.0 anchored,
+    /// 1.0 fully slid), and when the flip happened. The renderer eases from
+    /// this fraction toward the focus target over `PROGRAM_REVEAL_MS`, so
+    /// reversing focus mid-slide resumes from the popup's current position
+    /// instead of snapping. Flip focus via `set_program_terminal_focus`.
+    pub program_slide_from: f32,
+    pub program_slide_changed_at: Option<Instant>,
     /// User has collapsed the session list pane via the `−` button
     /// on its title bar. Effective only when the list pane doesn't
     /// have focus — when focus is on the list (e.g. via `C-x o`),
@@ -2456,6 +2464,8 @@ async fn run_with_socket_initial_selection(
         resizing_main_window: None,
         resizing_program_popup: None,
         program_terminal_focus: false,
+        program_slide_from: 0.0,
+        program_slide_changed_at: None,
         list_collapsed: persisted.list_collapsed,
         editor_states: HashMap::new(),
         agent_statuses: HashMap::new(),
@@ -9195,6 +9205,8 @@ mod tests {
             resizing_main_window: None,
             resizing_program_popup: None,
             program_terminal_focus: false,
+            program_slide_from: 0.0,
+            program_slide_changed_at: None,
             list_collapsed: false,
             tasks_popup: None,
             session_picker: None,
@@ -11892,6 +11904,10 @@ mod tests {
 
         assert!(!consumed, "exposed terminal click should fall through");
         assert!(app.program_terminal_focus);
+        assert!(
+            app.program_slide_changed_at.is_some(),
+            "focus flip should start the slide animation"
+        );
         assert!(app.program_popup.is_some(), "Program remains visible");
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
@@ -11900,6 +11916,59 @@ mod tests {
             app.program_popup.as_ref().unwrap().buffer,
             "draft",
             "terminal-focused keys must not edit Program Markdown"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_terminal_focus_slide_animates_and_reverses_mid_flight() {
+        let (mut app, _dir, server) = empty_app().await;
+
+        // Before any focus flip, the fraction sits at the anchored endpoint.
+        assert_eq!(app.program_slide_fraction(Instant::now()), 0.0);
+
+        app.set_program_terminal_focus(true);
+        let changed_at = app
+            .program_slide_changed_at
+            .expect("focus flip records its instant");
+        assert!(
+            app.program_slide_fraction(changed_at) < 0.01,
+            "the slide starts anchored, not snapped right"
+        );
+        let half =
+            app.program_slide_fraction(changed_at + Duration::from_millis(PROGRAM_REVEAL_MS / 2));
+        assert!(
+            (half - 0.5).abs() < 0.05,
+            "halfway through the popup is mid-slide, got {half}"
+        );
+        assert_eq!(
+            app.program_slide_fraction(changed_at + Duration::from_millis(PROGRAM_REVEAL_MS)),
+            1.0,
+            "the slide settles fully slid"
+        );
+
+        // A redundant flip must not restart the animation.
+        app.set_program_terminal_focus(true);
+        assert_eq!(app.program_slide_changed_at, Some(changed_at));
+
+        // Reversing mid-flight resumes from the in-flight fraction instead of
+        // snapping to an endpoint: simulate a slide-right that started half a
+        // reveal ago, then hand focus back to the Program.
+        app.program_slide_from = 0.0;
+        app.program_slide_changed_at =
+            Some(Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS / 2));
+        app.set_program_terminal_focus(false);
+        assert!(
+            (app.program_slide_from - 0.5).abs() < 0.1,
+            "reversal should start near the mid-flight position, got {}",
+            app.program_slide_from
+        );
+        let done = app.program_slide_changed_at.expect("reversal records instant")
+            + Duration::from_millis(PROGRAM_REVEAL_MS);
+        assert_eq!(
+            app.program_slide_fraction(done),
+            0.0,
+            "the reversed slide settles back at the pane's left edge"
         );
         server.abort();
     }

@@ -7614,17 +7614,72 @@ fn program_terminal_focus_slide_offset(width: u16) -> u16 {
     (offset as u16).clamp(1, width.saturating_sub(1))
 }
 
-fn program_popup_visible_rect(base_rect: Rect, visible_h: u16, slide_right: bool) -> Rect {
+fn program_popup_visible_rect(base_rect: Rect, visible_h: u16, slide: f32) -> Rect {
     let mut rect = Rect {
         height: visible_h,
         ..base_rect
     };
-    if slide_right {
-        rect.x = rect
-            .x
-            .saturating_add(program_terminal_focus_slide_offset(base_rect.width));
-    }
+    let max_offset = program_terminal_focus_slide_offset(base_rect.width);
+    let offset = ((max_offset as f32) * slide.clamp(0.0, 1.0)).round() as u16;
+    rect.x = rect.x.saturating_add(offset.min(max_offset));
     rect
+}
+
+/// Strip of the frame buffer a slid Program popup may bleed into, right of its
+/// owning pane. The popup keeps its full layout width while slid so the
+/// content doesn't reflow, which pushes its right side past the pane edge;
+/// everything painted there gets cropped by restoring the pre-paint cells.
+/// Spans the pane's full row range (not just the popup's) so title tooltips
+/// and popovers hanging below the popup are cropped too. `None` when the
+/// popup stays inside the pane.
+fn program_popup_crop_region(base_rect: Rect, popup_rect: Rect, buffer_area: Rect) -> Option<Rect> {
+    if popup_rect.right() <= base_rect.right() {
+        return None;
+    }
+    let region = Rect {
+        x: base_rect.right(),
+        y: base_rect.y,
+        width: popup_rect.right().saturating_sub(base_rect.right()),
+        height: base_rect.height,
+    }
+    .intersection(buffer_area);
+    (region.width > 0 && region.height > 0).then_some(region)
+}
+
+/// Snapshot the cells of `region` so painting over them can be undone.
+fn snapshot_buffer_region(buf: &Buffer, region: Rect) -> Vec<ratatui::buffer::Cell> {
+    let mut cells = Vec::with_capacity(region.width as usize * region.height as usize);
+    for y in region.top()..region.bottom() {
+        for x in region.left()..region.right() {
+            cells.push(buf[(x, y)].clone());
+        }
+    }
+    cells
+}
+
+/// Put a `snapshot_buffer_region` snapshot back, cropping whatever was painted
+/// over `region` in between.
+fn restore_buffer_region(buf: &mut Buffer, region: Rect, cells: Vec<ratatui::buffer::Cell>) {
+    let mut cells = cells.into_iter();
+    for y in region.top()..region.bottom() {
+        for x in region.left()..region.right() {
+            let Some(cell) = cells.next() else {
+                return;
+            };
+            buf[(x, y)] = cell;
+        }
+    }
+}
+
+/// Clamp a title-bar hit range `(x_start, x_end_exclusive, y)` to the owning
+/// pane's right edge; a control cropped away entirely loses its hitbox.
+fn clamp_title_hit_to_pane(
+    hit: Option<(u16, u16, u16)>,
+    pane_right: u16,
+) -> Option<(u16, u16, u16)> {
+    let (xs, xe, y) = hit?;
+    let xe = xe.min(pane_right);
+    (xs < xe).then_some((xs, xe, y))
 }
 
 /// Which source lines of a program are shimmering, plus the wave phase (spec
@@ -8079,8 +8134,18 @@ fn render_program_popup_at(
     if visible_h == 0 {
         return None;
     }
-    let rect =
-        program_popup_visible_rect(base_rect, visible_h, active && app.program_terminal_focus);
+    let slide = if active {
+        app.program_slide_fraction(now)
+    } else {
+        0.0
+    };
+    let rect = program_popup_visible_rect(base_rect, visible_h, slide);
+    // Crop the slide overhang: snapshot the strip right of the owning pane
+    // before painting anything, and restore it once the popup (border, title
+    // bar, contents, tooltips) has been drawn — the popup must never bleed
+    // into a neighboring pane.
+    let crop = program_popup_crop_region(base_rect, rect, f.buffer_mut().area);
+    let crop_snapshot = crop.map(|region| snapshot_buffer_region(f.buffer_mut(), region));
 
     let summary = app
         .sessions
@@ -8109,7 +8174,10 @@ fn render_program_popup_at(
     let title = program_title_line(app, popup, active, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
 
-    let border_style = program_frame_style(&app.theme, active, app.program_terminal_focus);
+    // The frame keeps the program's own border color even while the popup is
+    // slid aside because the exposed terminal holds keyboard focus — the slide
+    // itself is the focus cue, not a hue change.
+    let border_style = program_border_style(&app.theme, active);
     // The session-actions ☰ icon should read as part of the visible frame, so its
     // base hue tracks the current frame color rather than the default
     // session-view close color. Focus dimming + hover still compose via
@@ -8120,6 +8188,7 @@ fn render_program_popup_at(
         .borders(Borders::ALL)
         .border_style(border_style)
         .title(title);
+    let cluster_hits_start = app.layout.dynamic_ui_widget_hits.len();
     let block = apply_pane_title_right_cluster(
         app,
         rect,
@@ -8131,22 +8200,47 @@ fn render_program_popup_at(
         menu_icon_color,
         block,
     );
+    // Title-bar widget squares can sit in the slid popup's cropped overhang;
+    // clamp the hitboxes the call above registered to the pane edge so an
+    // invisible square can't react to hovers/clicks over a neighboring pane.
+    for hit in app
+        .layout
+        .dynamic_ui_widget_hits
+        .iter_mut()
+        .skip(cluster_hits_start)
+    {
+        hit.end_col = hit.end_col.min(base_rect.right());
+    }
+    app.layout
+        .dynamic_ui_widget_hits
+        .retain(|hit| hit.start_col < hit.end_col);
     if active {
-        app.layout.modal_area = Some(rect);
+        // Hitboxes stop at the pane edge like the pixels do: a slid popup's
+        // cropped-away right side must not swallow clicks meant for whatever
+        // is visible there (a neighboring split, the exposed terminal).
+        let pane_right = base_rect.right();
+        app.layout.modal_area = Some(rect.intersection(base_rect));
         app.layout.program_base_area = Some(base_rect);
-        app.layout.program_resize_hit = Some(Rect {
-            x: rect.x,
-            y: rect.y + rect.height.saturating_sub(1),
-            width: rect.width,
-            height: 1,
-        });
+        app.layout.program_resize_hit = Some(
+            Rect {
+                x: rect.x,
+                y: rect.y + rect.height.saturating_sub(1),
+                width: rect.width,
+                height: 1,
+            }
+            .intersection(base_rect),
+        );
         // Run lives in the left cluster; the close button and widget icons reuse
         // the shared session-view geometry (`view_close_button_range` and
         // `dynamic_ui_widget_hits` from `render_session_widget_title`) so the
         // program click handlers in `app.rs` line up with what's painted.
-        app.layout.program_title_run_hit = left.run;
-        app.layout.program_title_toggle_hit = title_toggle_hit;
-        app.layout.program_title_close_hit = show_close.then(|| view_close_button_range(rect));
+        app.layout.program_title_run_hit = clamp_title_hit_to_pane(left.run, pane_right);
+        app.layout.program_title_toggle_hit =
+            clamp_title_hit_to_pane(title_toggle_hit, pane_right);
+        app.layout.program_title_close_hit = clamp_title_hit_to_pane(
+            show_close.then(|| view_close_button_range(rect)),
+            pane_right,
+        );
     }
     // Area inside the program's border (title bar excluded), mirroring the
     // session view's `block.inner(area)`. The content body adds extra padding on
@@ -8278,6 +8372,11 @@ fn render_program_popup_at(
         render_program_selection_context_menu(f, app, popup, scroll_offset, inner);
     }
     render_program_title_tooltip(f, app, popup, summary_ref, rect);
+    // Undo everything painted right of the owning pane: this is what crops the
+    // slid popup's border/title/contents at the pane edge.
+    if let (Some(region), Some(saved)) = (crop, crop_snapshot) {
+        restore_buffer_region(f.buffer_mut(), region, saved);
+    }
     (!popup.closing).then(|| ProgramPopupHoverOverlay {
         popup: popup.clone(),
         clip_bounds: program_clip_hover_bounds(app.layout.view_area, base_rect),
@@ -8781,14 +8880,6 @@ fn program_border_style(theme: &Theme, active: bool) -> Style {
     }
 }
 
-fn program_frame_style(theme: &Theme, active: bool, terminal_focus: bool) -> Style {
-    if active && terminal_focus {
-        pane_border_style(theme, true)
-    } else {
-        program_border_style(theme, active)
-    }
-}
-
 /// Column geometry for the program title bar's LEFT cluster — the truncated
 /// session label, the Run button (now wedged between the name and the dirty
 /// marker), and the `modified` marker. Both the title renderer and the tooltip
@@ -8930,7 +9021,7 @@ fn program_title_line<'a>(
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
     let toggle_glyph = program_mode_glyph();
-    let border_style = program_frame_style(&app.theme, active, app.program_terminal_focus);
+    let border_style = program_border_style(&app.theme, active);
     let program_style = program_toggle_style(app, popup, active);
     let modified_style = Style::default()
         .fg(app.theme.warning)
@@ -11922,30 +12013,9 @@ mod tests {
     }
 
     #[test]
-    fn terminal_focused_program_frame_uses_focused_session_border() {
-        let theme = Theme::default();
-        let style = program_frame_style(&theme, true, true);
-
-        assert_eq!(
-            style.fg,
-            pane_border_style(&theme, true).fg,
-            "terminal-focused rolled-down Program should read as a focused session pane"
-        );
-        assert!(
-            !style.add_modifier.contains(Modifier::DIM),
-            "terminal-focused Program frame must not look unfocused"
-        );
-        assert_ne!(
-            style.fg,
-            Some(theme.dim),
-            "terminal-focused Program frame should not use the dim color"
-        );
-    }
-
-    #[test]
     fn terminal_focused_program_popup_slides_right_without_resizing() {
         let base = Rect::new(10, 4, 100, 30);
-        let rect = program_popup_visible_rect(base, 20, true);
+        let rect = program_popup_visible_rect(base, 20, 1.0);
 
         assert_eq!(rect.x, 30, "20% of the pane should be revealed at left");
         assert_eq!(rect.y, base.y);
@@ -11960,10 +12030,104 @@ mod tests {
         );
 
         assert_eq!(
-            program_popup_visible_rect(base, 20, false),
+            program_popup_visible_rect(base, 20, 0.0),
             Rect::new(10, 4, 100, 20),
             "normal Program rendering stays anchored"
         );
+    }
+
+    #[test]
+    fn program_popup_slide_animates_between_anchored_and_slid() {
+        let base = Rect::new(10, 4, 100, 30);
+        let full_offset = program_terminal_focus_slide_offset(base.width);
+
+        let halfway = program_popup_visible_rect(base, 20, 0.5);
+        assert_eq!(
+            halfway.x,
+            base.x + full_offset / 2,
+            "a mid-flight slide fraction lands the popup between the endpoints"
+        );
+        assert!(halfway.x > base.x);
+        assert!(halfway.x < base.x + full_offset);
+
+        // Out-of-range fractions clamp to the endpoints rather than
+        // overshooting past the pane or sliding left.
+        assert_eq!(program_popup_visible_rect(base, 20, -0.5).x, base.x);
+        assert_eq!(program_popup_visible_rect(base, 20, 1.5).x, base.x + full_offset);
+    }
+
+    #[test]
+    fn program_popup_crop_region_covers_only_the_slide_overhang() {
+        let buffer_area = Rect::new(0, 0, 200, 50);
+        let base = Rect::new(10, 4, 100, 30);
+
+        // Anchored popup: nothing to crop.
+        assert_eq!(
+            program_popup_crop_region(base, Rect::new(10, 4, 100, 20), buffer_area),
+            None
+        );
+
+        // Slid popup: the strip right of the pane, spanning the pane's rows.
+        let slid = program_popup_visible_rect(base, 20, 1.0);
+        assert_eq!(
+            program_popup_crop_region(base, slid, buffer_area),
+            Some(Rect::new(110, 4, 20, 30))
+        );
+
+        // Pane flush against the terminal edge: the overhang is off-screen and
+        // ratatui already clips it, so there is nothing to restore.
+        let narrow_buffer = Rect::new(0, 0, 110, 50);
+        assert_eq!(program_popup_crop_region(base, slid, narrow_buffer), None);
+    }
+
+    #[test]
+    fn restoring_the_crop_region_undoes_popup_overhang_paint() {
+        let buffer_area = Rect::new(0, 0, 60, 10);
+        let base = Rect::new(0, 0, 40, 10);
+        let slid = Rect::new(8, 0, 40, 6);
+        let mut buf = Buffer::empty(buffer_area);
+        for y in 0..10 {
+            for x in 0..60 {
+                buf[(x, y)].set_symbol("N"); // neighboring-pane content
+            }
+        }
+
+        let region = program_popup_crop_region(base, slid, buffer_area).expect("overhang");
+        let saved = snapshot_buffer_region(&buf, region);
+        for y in slid.top()..slid.bottom() {
+            for x in slid.left()..slid.right() {
+                buf[(x, y)].set_symbol("P"); // popup paint, bleeding right of base
+            }
+        }
+        restore_buffer_region(&mut buf, region, saved);
+
+        for y in slid.top()..slid.bottom() {
+            for x in slid.left()..slid.right() {
+                let expected = if x < base.right() { "P" } else { "N" };
+                assert_eq!(
+                    buf[(x, y)].symbol(),
+                    expected,
+                    "cell ({x},{y}) should be {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cropped_title_hits_clamp_to_the_pane_edge() {
+        // Fully visible: untouched.
+        assert_eq!(
+            clamp_title_hit_to_pane(Some((5, 9, 0)), 40),
+            Some((5, 9, 0))
+        );
+        // Straddling the pane edge: the hidden tail is unclickable.
+        assert_eq!(
+            clamp_title_hit_to_pane(Some((38, 44, 0)), 40),
+            Some((38, 40, 0))
+        );
+        // Fully cropped away: no hitbox at all.
+        assert_eq!(clamp_title_hit_to_pane(Some((40, 44, 0)), 40), None);
+        assert_eq!(clamp_title_hit_to_pane(None, 40), None);
     }
 
     #[test]

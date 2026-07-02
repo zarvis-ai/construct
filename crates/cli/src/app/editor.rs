@@ -81,7 +81,7 @@ impl App {
                     .is_some_and(|base| Self::rect_contains(base, ev.column, ev.row))
             {
                 self.focus = PaneFocus::View;
-                self.program_terminal_focus = true;
+                self.set_program_terminal_focus(true);
             }
             return false;
         }
@@ -96,7 +96,7 @@ impl App {
         // click switches sessions, so that case still behaves correctly.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.focus = PaneFocus::View;
-            self.program_terminal_focus = false;
+            self.set_program_terminal_focus(false);
         }
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
             && self
@@ -328,7 +328,7 @@ impl App {
             crate::app::PROGRAM_COVER_PERCENT_MIN,
             crate::app::PROGRAM_COVER_PERCENT_MAX,
         );
-        self.program_terminal_focus = false;
+        self.set_program_terminal_focus(false);
     }
 
     pub(super) async fn handle_program_key(&mut self, key: KeyEvent) {

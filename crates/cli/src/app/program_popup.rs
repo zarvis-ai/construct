@@ -5,6 +5,36 @@ use std::time::{Duration, Instant};
 use super::*;
 
 impl App {
+    /// Flip keyboard focus between the rolled-down Program and the terminal it
+    /// exposes. Every flip goes through here so the popup's terminal-focus
+    /// slide animates instead of snapping: the current in-flight fraction is
+    /// captured as the new starting point, so reversing focus mid-slide
+    /// resumes from wherever the popup is rather than jumping to an endpoint.
+    pub(crate) fn set_program_terminal_focus(&mut self, focused: bool) {
+        if self.program_terminal_focus == focused {
+            return;
+        }
+        let now = Instant::now();
+        self.program_slide_from = self.program_slide_fraction(now);
+        self.program_terminal_focus = focused;
+        self.program_slide_changed_at = Some(now);
+    }
+
+    /// Current terminal-focus slide fraction: 0.0 = anchored at the pane's
+    /// left edge, 1.0 = fully slid right. Eases linearly from
+    /// `program_slide_from` toward the focus target over `PROGRAM_REVEAL_MS`
+    /// (the same duration as the roll-down reveal).
+    pub(crate) fn program_slide_fraction(&self, now: Instant) -> f32 {
+        let target = if self.program_terminal_focus { 1.0 } else { 0.0 };
+        let Some(changed_at) = self.program_slide_changed_at else {
+            return target;
+        };
+        let progress = (now.saturating_duration_since(changed_at).as_secs_f32()
+            / (PROGRAM_REVEAL_MS as f32 / 1000.0))
+            .clamp(0.0, 1.0);
+        self.program_slide_from + (target - self.program_slide_from) * progress
+    }
+
     pub(super) async fn open_program_popup(&mut self) {
         let Some(session_id) = self.selected_id() else {
             self.set_status("program: no session selected".to_string());
@@ -40,7 +70,7 @@ impl App {
                 // back to the list for navigation while the program stays
                 // visible (see the focus gate in `on_key`).
                 self.focus = PaneFocus::View;
-                self.program_terminal_focus = false;
+                self.set_program_terminal_focus(false);
                 self.set_status(format!("program opened at version {version}"));
                 // Live reload: the daemon re-reads the templates dir on every
                 // call, but the client caches the list. Kick off a non-blocking
@@ -583,7 +613,7 @@ impl App {
         // session's program restores them (the popup itself is dropped once the
         // close animation lapses — see `render_program_popup`).
         self.remember_program_view_state();
-        self.program_terminal_focus = false;
+        self.set_program_terminal_focus(false);
         if let Some(popup) = self.program_popup.as_mut() {
             self.program_popups.remove(&popup.program.session_id);
             let now = Instant::now();
