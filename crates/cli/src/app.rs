@@ -66,6 +66,9 @@ pub(crate) const PROGRAM_CONTENT_PADDING_Y: u16 = 1;
 /// output signal. A missed first-output transition must never strand the
 /// animation; a timeout backstop is mandatory (spec 0042).
 pub(crate) const PROGRAM_RUN_MAX_MS: u64 = 10 * 60 * 1000;
+/// One-shot flourish shown when an authoritative program Run pending block
+/// settles. Presentation-only and client-local.
+pub(crate) const PROGRAM_SETTLE_FLASH_MS: u64 = 300;
 /// Remote Program collaborator cursors are presence hints. Hide them when the
 /// peer has not published activity recently.
 pub(crate) const PROGRAM_COLLAB_CURSOR_TTL_MS: i64 = 60 * 1000;
@@ -1026,6 +1029,10 @@ pub struct App {
     /// entry means a program Run is believed to still be executing for that
     /// session; it drives the shimmer over the executed Markdown.
     pub program_runs: HashMap<String, ProgramRun>,
+    /// Recently-settled program block refs, keyed by session id then block ref.
+    /// Renderers turn these into a short one-shot flourish and prune them after
+    /// `PROGRAM_SETTLE_FLASH_MS`.
+    pub program_settle_flourishes: HashMap<String, HashMap<String, Instant>>,
     /// Ephemeral Program collaboration cursors, keyed by daemon client id.
     pub program_collaborators: HashMap<String, agentd_protocol::ProgramCursor>,
     pub own_program_client_id: Option<String>,
@@ -1598,10 +1605,18 @@ pub struct ProgramRun {
     pub deadline: Instant,
     /// Whether the first output has been observed.
     pub first_output_seen: bool,
+    /// Compact run-pipeline stage derived by the daemon, or Pressed for this
+    /// client's optimistic pre-response state.
+    pub stage: agentd_protocol::ProgramRunStage,
+    /// Blocks settled from the run's initial pending set.
+    pub settled_block_count: usize,
+    /// Blocks in the run's initial pending set.
+    pub total_block_count: usize,
 }
 
 impl ProgramRun {
-    fn from_progress(progress: agentd_protocol::ProgramRunProgress) -> Option<Self> {
+    fn from_progress(mut progress: agentd_protocol::ProgramRunProgress) -> Option<Self> {
+        progress.refresh_stage();
         let now = Instant::now();
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1627,6 +1642,9 @@ impl ProgramRun {
             system_status: progress.system_status,
             deadline,
             first_output_seen: progress.first_output_seen,
+            stage: progress.stage,
+            settled_block_count: progress.settled_block_count,
+            total_block_count: progress.total_block_count,
         })
     }
 }
@@ -1692,6 +1710,14 @@ pub(crate) fn program_run_pending_ids(body: &str) -> HashSet<String> {
         .into_iter()
         .map(|span| span.id)
         .collect()
+}
+
+fn program_run_progress_pending_ids(
+    progress: &agentd_protocol::ProgramRunProgress,
+) -> HashSet<String> {
+    let mut pending: HashSet<String> = progress.pending_block_refs.iter().cloned().collect();
+    pending.extend(progress.pending_block_ids.iter().cloned());
+    pending
 }
 
 /// Result of flushing a program popup's buffer to the daemon.
@@ -2391,6 +2417,7 @@ async fn run_with_socket_initial_selection(
         program_popups: HashMap::new(),
         program_view_memory: HashMap::new(),
         program_runs: HashMap::new(),
+        program_settle_flourishes: HashMap::new(),
         program_collaborators: HashMap::new(),
         own_program_client_id: None,
         program_clipboard: None,
@@ -5393,19 +5420,32 @@ impl App {
             return;
         }
         let buffer_len = popup.buffer.chars().count();
-        popup.cursor = cursor.cursor.min(buffer_len);
-        match (cursor.selection_anchor, cursor.selection_head) {
-            (Some(anchor), Some(head)) if anchor != head => {
-                popup.selection = Some(ProgramSelection {
-                    anchor: anchor.min(buffer_len),
-                    head: head.min(buffer_len),
-                    dragged: false,
-                });
-            }
-            _ => {
-                popup.selection = None;
-            }
+        let incoming_cursor = cursor.cursor.min(buffer_len);
+        let incoming_selection = match (cursor.selection_anchor, cursor.selection_head) {
+            (Some(anchor), Some(head)) => Some((anchor.min(buffer_len), head.min(buffer_len))),
+            _ => None,
+        };
+        // The daemon broadcasts every cursor publish back to its publisher, so
+        // most own-cursor notifications are plain echoes of state we already
+        // hold. Applying an echo is not a no-op: it resets `preferred_col`
+        // (losing C-n/C-p column stickiness) and used to collapse a zero-width
+        // C-Space mark to "no selection" before the first motion key could
+        // extend it. Only a daemon-side rebase — our offsets shifted by another
+        // client's edit — carries values that differ from local state, and that
+        // is the case this method exists for.
+        let local_selection = popup.selection.as_ref().map(|s| (s.anchor, s.head));
+        if incoming_cursor == popup.cursor && incoming_selection == local_selection {
+            return;
         }
+        popup.cursor = incoming_cursor;
+        // A zero-width pair is a C-Space mark awaiting its first motion, not
+        // "no selection" — keep it alive across the rebase so the next motion
+        // key extends from the rebased mark instead of merely moving.
+        popup.selection = incoming_selection.map(|(anchor, head)| ProgramSelection {
+            anchor,
+            head,
+            dragged: false,
+        });
         popup.preferred_col = None;
         Self::update_program_smart_clip_after_cursor_move(popup);
     }
@@ -5422,6 +5462,21 @@ impl App {
         active_run: Option<agentd_protocol::ProgramRunProgress>,
         blocks: Vec<agentd_protocol::ProgramBlockView>,
     ) {
+        let previous_pending = self
+            .program_runs
+            .get(&program.session_id)
+            .map(|run| run.pending.clone());
+        let next_pending = active_run.as_ref().map(program_run_progress_pending_ids);
+        if let (Some(previous_pending), Some(next_pending)) =
+            (previous_pending.as_ref(), next_pending.as_ref())
+        {
+            self.record_program_settle_flourishes(
+                &program.session_id,
+                previous_pending,
+                next_pending,
+                Instant::now(),
+            );
+        }
         match active_run.and_then(ProgramRun::from_progress) {
             Some(run) => {
                 self.program_runs.insert(program.session_id.clone(), run);
@@ -5650,6 +5705,7 @@ impl App {
         }
         self.program_popups.remove(id);
         self.program_runs.remove(id);
+        self.program_settle_flourishes.remove(id);
         self.program_view_memory.remove(id);
         self.program_collaborators
             .retain(|_, cursor| cursor.session_id != id);
@@ -9146,6 +9202,7 @@ mod tests {
             program_popups: HashMap::new(),
             program_view_memory: HashMap::new(),
             program_runs: HashMap::new(),
+            program_settle_flourishes: HashMap::new(),
             program_collaborators: HashMap::new(),
             own_program_client_id: None,
             program_clipboard: None,
@@ -9479,6 +9536,9 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(30),
                 first_output_seen: false,
+                stage: agentd_protocol::ProgramRunStage::Delivered,
+                settled_block_count: 0,
+                total_block_count: 1,
             },
         );
         app.program_view_memory.insert(
@@ -10178,6 +10238,125 @@ mod tests {
             assert_eq!(selection.head, 2);
             server.abort();
         }
+    }
+
+    /// The daemon broadcast that echoes our own cursor publish back at us,
+    /// exactly as a live session sees after every keystroke.
+    fn own_program_cursor_echo(app: &App) -> agentd_protocol::ProgramCursor {
+        let popup = app.program_popup.as_ref().unwrap();
+        agentd_protocol::ProgramCursor {
+            session_id: popup.program.session_id.clone(),
+            client_id: "c7".into(),
+            label: "TUI".into(),
+            kind: "tui".into(),
+            cursor: popup.cursor,
+            selection_anchor: popup.selection.as_ref().map(|s| s.anchor),
+            selection_head: popup.selection.as_ref().map(|s| s.head),
+            version: Some(popup.program.version),
+            color_index: 0,
+            updated_at_ms: 0,
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn program_ctrl_space_mark_survives_own_cursor_echo() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "abc\ndef", 1));
+        app.layout.program_inner_area = Some(Rect::new(0, 0, 20, 5));
+        app.own_program_client_id = Some("c7".to_string());
+
+        // C-Space publishes the fresh zero-width mark and the daemon
+        // broadcasts it straight back. That echo used to fall into the
+        // "no selection" arm (anchor == head) and drop the mark, so in a
+        // live session C-f/C-b/C-p/C-n/C-a/C-e after C-Space only moved
+        // the cursor — even though handler-only tests passed.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        let selection = popup.selection.as_ref().expect("mark survives own echo");
+        assert_eq!((selection.anchor, selection.head), (1, 1));
+
+        // C-f extends by one char; the echo after it must keep the range.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 2)));
+
+        // C-e extends to end of line.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 3)));
+
+        // C-n extends a line down and must keep the sticky visual column
+        // across the echo (the echo used to reset `preferred_col`).
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 7)));
+        assert!(
+            popup.preferred_col.is_some(),
+            "own echo must not reset the C-n/C-p sticky column"
+        );
+
+        // C-p extends back up.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 3)));
+
+        // C-a extends to start of line.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((0, 1)));
+
+        // C-b at buffer start stays put and keeps the mark alive.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 0);
+        assert_eq!(App::program_selection_range(popup), Some((0, 1)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_own_cursor_rebase_keeps_zero_width_mark() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "abc\ndef", 1));
+        app.layout.program_inner_area = Some(Rect::new(0, 0, 20, 5));
+        app.own_program_client_id = Some("c7".to_string());
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+
+        // Another client's edit rebased our cursor daemon-side: same
+        // zero-width mark shape, shifted offsets. The rebase must land and
+        // the mark must stay alive at the new position.
+        let mut rebased = own_program_cursor_echo(&app);
+        rebased.cursor = 5;
+        rebased.selection_anchor = Some(5);
+        rebased.selection_head = Some(5);
+        app.on_program_cursor(rebased);
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 5);
+        let selection = popup.selection.as_ref().expect("rebased mark stays alive");
+        assert_eq!((selection.anchor, selection.head), (5, 5));
+
+        // The next motion extends from the rebased mark.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((5, 6)));
+        server.abort();
     }
 
     #[tokio::test]
@@ -11671,6 +11850,9 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
+                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                settled_block_count: 0,
+                total_block_count: 0,
             },
         );
 
@@ -11845,6 +12027,9 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
+                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                settled_block_count: 0,
+                total_block_count: 1,
             },
         );
 
@@ -11933,6 +12118,9 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
+                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                settled_block_count: 0,
+                total_block_count: 1,
             },
         );
 
@@ -12006,6 +12194,9 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
+                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                settled_block_count: 0,
+                total_block_count: 1,
             },
         );
 
@@ -13320,6 +13511,85 @@ mod tests {
             Instant::now() - Duration::from_millis(1);
         app.expire_program_runs(Instant::now());
         assert!(!app.program_runs.contains_key("s1"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_settle_flourish_tracks_pending_diff_and_expires() {
+        let (mut app, _dir, server) = empty_app().await;
+        let now = Instant::now();
+        let previous = HashSet::from([
+            "block-a:1".to_string(),
+            "block-b:1".to_string(),
+            "block-c:1".to_string(),
+        ]);
+        let next = HashSet::from(["block-b:1".to_string()]);
+
+        app.record_program_settle_flourishes("s1", &previous, &next, now);
+
+        let flourishes = app.program_settle_flourishes.get("s1").unwrap();
+        assert_eq!(flourishes.len(), 2);
+        assert_eq!(flourishes.get("block-a:1"), Some(&now));
+        assert_eq!(flourishes.get("block-c:1"), Some(&now));
+        assert!(!flourishes.contains_key("block-b:1"));
+
+        app.expire_program_runs(
+            now + Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS - 1),
+        );
+        assert!(app
+            .program_settle_flourishes
+            .get("s1")
+            .is_some_and(|flourishes| flourishes.contains_key("block-a:1")));
+
+        app.expire_program_runs(now + Duration::from_millis(crate::app::PROGRAM_SETTLE_FLASH_MS));
+        assert!(!app.program_settle_flourishes.contains_key("s1"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_state_empty_pending_progress_flashes_final_settled_refs() {
+        let (mut app, _dir, server) = empty_app().await;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        app.program_runs.insert(
+            "s1".into(),
+            ProgramRun {
+                started_at: Instant::now(),
+                pending: HashSet::from(["block-a:1".into(), "block-b:1".into()]),
+                pending_tooltips: HashMap::new(),
+                deadline: Instant::now() + Duration::from_secs(60),
+                first_output_seen: true,
+            },
+        );
+
+        app.on_program_state(
+            agentd_protocol::ProgramDocument {
+                session_id: "s1".into(),
+                markdown: "- a\n- b\n".into(),
+                version: 2,
+                updated_at_ms: 0,
+                template_id: None,
+            },
+            Some(agentd_protocol::ProgramRunProgress {
+                run_id: "run-1".into(),
+                started_at_ms: now_ms - 1000,
+                expires_at_ms: now_ms + 60_000,
+                pending_block_ids: Vec::new(),
+                pending_block_refs: Vec::new(),
+                pending_block_tooltips: HashMap::new(),
+                seen_running: true,
+                first_output_seen: true,
+                agent_managed: true,
+            }),
+            Vec::new(),
+        );
+
+        assert!(!app.program_runs.contains_key("s1"));
+        let flourishes = app.program_settle_flourishes.get("s1").unwrap();
+        assert!(flourishes.contains_key("block-a:1"));
+        assert!(flourishes.contains_key("block-b:1"));
         server.abort();
     }
 

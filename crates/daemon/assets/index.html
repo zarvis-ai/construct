@@ -1523,6 +1523,14 @@
   .program-msg { color: var(--fg-dim); font-size: 12px; max-width: 42ch;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .program-msg.is-error { color: var(--err); }
+  .program-run-stage {
+    color: var(--fg-dim);
+    font-size: 12px;
+    max-width: 18ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .program-bar button {
     background: var(--bg-elev-2);
     color: var(--fg);
@@ -1636,9 +1644,25 @@
     border-radius: 3px;
     animation: program-shimmer 1.6s linear infinite;
   }
+  .program-line.is-settling:not(.is-running) {
+    background-image: linear-gradient(100deg,
+      transparent 28%,
+      color-mix(in srgb, var(--accent) 38%, transparent) 46%,
+      color-mix(in srgb, var(--fg) 18%, transparent) 52%,
+      transparent 70%);
+    background-size: 240% 100%;
+    background-repeat: no-repeat;
+    border-radius: 3px;
+    animation: program-settle 300ms ease-out 1 both;
+  }
   @keyframes program-shimmer {
     from { background-position: 140% 0; }
     to { background-position: -40% 0; }
+  }
+  @keyframes program-settle {
+    0% { background-position: 145% 0; }
+    88% { background-position: -35% 0; }
+    100% { background-position: -45% 0; background-image: none; }
   }
   .program-cursor-layer {
     position: absolute;
@@ -1888,6 +1912,7 @@
           <span class="program-msg" id="programMsg" aria-live="polite"></span>
           <button type="button" id="programFindBtn" title="Find (Ctrl+F)">Find</button>
           <button type="button" id="programRunBtn" title="Run program (Ctrl+Enter) — runs the selection if text is selected">Run</button>
+          <span class="program-run-stage" id="programRunStage" aria-live="polite"></span>
           <button type="button" id="programSaveBtn" title="Save (Ctrl+S)">Save</button>
         </div>
         <div class="program-find" id="programFind" hidden>
@@ -2112,6 +2137,7 @@ const programVersionEl = $("programVersion");
 const programMsgEl = $("programMsg");
 const programSaveBtn = $("programSaveBtn");
 const programRunBtn = $("programRunBtn");
+const programRunStageEl = $("programRunStage");
 const programFindBtn = $("programFindBtn");
 const programFindEl = $("programFind");
 const programFindInputEl = $("programFindInput");
@@ -2306,6 +2332,9 @@ const state = {
     // In-flight run shimmer per session id:
     // { pendingIds:Set, tooltips:Map, startPerf, deadlinePerf }.
     runById: new Map(),
+    // Recently-settled block refs per session id: Map<id, Map<ref,startPerf>>.
+    settleById: new Map(),
+    settleTimer: 0,
     // Client-local title Run button pulse per session id. This is intentionally
     // separate from block shimmer: a re-Run can happen while an older shimmer is
     // already narrowed and has already seen output.
@@ -3426,6 +3455,7 @@ async function selectSession(id, { replaceUrl = false } = {}) {
 
 const PROGRAM_RUN_MAX_MS = 10 * 60 * 1000;
 const PROGRAM_SHIMMER_FALLBACK_TOOLTIP = "Working…";
+const PROGRAM_SETTLE_FLASH_MS = 300;
 const PROGRAM_TEXT_ENCODER = new TextEncoder();
 
 // --- shared block-identity rules (ports of agentd_protocol) ---
@@ -3641,23 +3671,42 @@ function programDiff3(ours, base, theirs) {
 
 // --- run shimmer ---
 
+function programPendingIdsFromProgress(progress) {
+  if (!progress) return null;
+  return new Set([
+    ...(progress.pending_block_refs || []),
+    ...(progress.pending_block_ids || []),
+  ]);
+}
+
 function programRunFromProgress(progress) {
   if (!progress) return null;
   const nowMs = Date.now();
-  const ids = [
-    ...(progress.pending_block_refs || []),
-    ...(progress.pending_block_ids || []),
-  ];
-  if (progress.expires_at_ms <= nowMs || ids.length === 0) return null;
+  const ids = programPendingIdsFromProgress(progress);
+  if (progress.expires_at_ms <= nowMs || !ids || ids.size === 0) return null;
   const perf = performance.now();
   const startPerf = progress.started_at_ms <= nowMs ? perf - (nowMs - progress.started_at_ms) : perf;
+  const pendingCount = (progress.pending_block_refs && progress.pending_block_refs.length)
+    ? progress.pending_block_refs.length
+    : (progress.pending_block_ids || []).length;
+  const total = Math.max(progress.total_block_count || 0, pendingCount);
+  const settled = Math.max(0, total - pendingCount);
+  let stage = progress.stage || null;
+  if (!stage) {
+    if (progress.agent_managed) stage = settled > 0 ? "settling" : "planning_pass_done";
+    else if (progress.first_output_seen) stage = "first_output";
+    else stage = "delivered";
+  }
   return {
-    pendingIds: new Set(ids),
+    pendingIds: ids,
     tooltips: new Map(Object.entries(progress.pending_block_tooltips || {})),
     systemStatus: String(progress.system_status || "").trim(),
     startPerf,
     deadlinePerf: perf + (progress.expires_at_ms - nowMs),
     firstOutputSeen: !!progress.first_output_seen,
+    stage,
+    settledBlockCount: progress.settled_block_count != null ? progress.settled_block_count : settled,
+    totalBlockCount: total,
   };
 }
 
@@ -3673,6 +3722,61 @@ function programRunSystemTooltip(run) {
   if (!status) return "";
   return `${status} — ${programRunElapsedLabel(run)}`;
 }
+
+
+function programRunStageLabel(run) {
+  if (!run || performance.now() >= run.deadlinePerf) return "";
+  switch (run.stage) {
+    case "pressed": return "pressed";
+    case "delivered": return "delivered";
+    case "first_output": return "first output";
+    case "planning_pass_done": return "planning pass done";
+    case "settling": return `${run.settledBlockCount}/${run.totalBlockCount} settled`;
+    default: return "";
+  }
+}
+
+function programRecordSettleFlourishes(id, previousPending, nextPending) {
+  if (!id || !previousPending || !nextPending) return;
+  const settled = [];
+  for (const ref of previousPending) if (!nextPending.has(ref)) settled.push(ref);
+  if (!settled.length) return;
+  const now = performance.now();
+  let byRef = state.program.settleById.get(id);
+  if (!byRef) { byRef = new Map(); state.program.settleById.set(id, byRef); }
+  for (const ref of settled) byRef.set(ref, now);
+  programScheduleSettlePrune();
+}
+
+function programPruneSettleFlourishes() {
+  const now = performance.now();
+  for (const [id, byRef] of state.program.settleById) {
+    for (const [ref, started] of byRef) {
+      if (now - started >= PROGRAM_SETTLE_FLASH_MS) byRef.delete(ref);
+    }
+    if (!byRef.size) state.program.settleById.delete(id);
+  }
+}
+
+function programScheduleSettlePrune() {
+  if (state.program.settleTimer) clearTimeout(state.program.settleTimer);
+  programPruneSettleFlourishes();
+  let nextMs = Infinity;
+  const now = performance.now();
+  for (const byRef of state.program.settleById.values()) {
+    for (const started of byRef.values()) {
+      nextMs = Math.min(nextMs, PROGRAM_SETTLE_FLASH_MS - (now - started));
+    }
+  }
+  if (!Number.isFinite(nextMs)) { state.program.settleTimer = 0; return; }
+  state.program.settleTimer = setTimeout(() => {
+    state.program.settleTimer = 0;
+    programPruneSettleFlourishes();
+    if (state.mode === "program") programApplyShimmer();
+    programScheduleSettlePrune();
+  }, Math.max(0, nextMs));
+}
+
 
 function programActiveLines(buffer, run, blocks) {
   const n = programLines(buffer).length;
@@ -3702,6 +3806,23 @@ function programActiveLines(buffer, run, blocks) {
     }
   }
   return any ? { active, tooltips } : null;
+}
+
+function programSettleLines(buffer, settledSet, blocks) {
+  if (!settledSet || !settledSet.size || !blocks || !blocks.length) return null;
+  const n = programLines(buffer).length;
+  const active = new Array(n).fill(false);
+  let any = false;
+  const hasStableMatch = blocks.some((b) => settledSet.has(b.id) || settledSet.has(b.block_ref));
+  for (const b of blocks) {
+    const settling = hasStableMatch
+      ? (settledSet.has(b.id) || settledSet.has(b.block_ref))
+      : (settledSet.has(b.id) || settledSet.has(b.block_ref) || settledSet.has(b.content_id));
+    if (settling) {
+      for (let i = b.start_line; i < b.end_line && i < n; i++) { active[i] = true; any = true; }
+    }
+  }
+  return any ? active : null;
 }
 
 function programLineClipRanges(line) {
@@ -4010,14 +4131,23 @@ function programApplyShimmer() {
   const lineEls = programInputEl.querySelectorAll(":scope > div");
   const run = id && state.program.runById.get(id);
   let shimmer = null;
+  let settling = null;
   if (run && performance.now() < run.deadlinePerf) {
     const doc = state.program.docById.get(id);
     const cleanBlocks = doc && programNormalizeClipIds(programSerialize()) === doc.saved ? (doc.blocks || []) : null;
     shimmer = programActiveLines(programSerialize(), run, cleanBlocks);
   }
+  const settledRefs = id && state.program.settleById.get(id);
+  if (settledRefs && settledRefs.size) {
+    programPruneSettleFlourishes();
+    const doc = state.program.docById.get(id);
+    const cleanBlocks = doc && programNormalizeClipIds(programSerialize()) === doc.saved ? (doc.blocks || []) : null;
+    settling = cleanBlocks ? programSettleLines(programSerialize(), settledRefs, cleanBlocks) : null;
+  }
   lineEls.forEach((el, i) => {
     const running = !!(shimmer && shimmer.active[i]);
     el.classList.toggle("is-running", running);
+    el.classList.toggle("is-settling", !running && !!(settling && settling[i]));
     if (running) {
       const label = shimmer.tooltips[i] || PROGRAM_SHIMMER_FALLBACK_TOOLTIP;
       el.setAttribute("title", label);
@@ -4043,13 +4173,15 @@ function programRefreshRunButton() {
   const id = state.program.mountedId;
   const active = !!(id && programRunButtonActive(id));
   programRunBtn.dataset.running = active ? "true" : "false";
+  const run = id && state.program.runById.get(id);
+  programRunStageEl.textContent = run ? programRunStageLabel(run) : "";
   if (state.program.runButtonTimer) {
     clearTimeout(state.program.runButtonTimer);
     state.program.runButtonTimer = 0;
   }
   if (!active || !id) return;
-  const run = state.program.runButtonById.get(id);
-  const ms = Math.max(0, run.deadlinePerf - performance.now());
+  const buttonRun = state.program.runButtonById.get(id);
+  const ms = Math.max(0, buttonRun.deadlinePerf - performance.now());
   state.program.runButtonTimer = setTimeout(() => {
     state.program.runButtonTimer = 0;
     state.program.runButtonById.delete(id);
@@ -4084,6 +4216,7 @@ function programEventClearsRunButton(event) {
 function programStartShimmer(id) {
   programStopShimmer();
   programApplyShimmer();
+  if (state.program.mountedId === id) programRefreshRunButton();
   const run = state.program.runById.get(id);
   if (!run) return;
   // Clear the highlight when the run's backstop deadline passes.
@@ -4091,7 +4224,7 @@ function programStartShimmer(id) {
   state.program.raf = setTimeout(() => {
     state.program.raf = 0;
     state.program.runById.delete(id);
-    if (state.program.mountedId === id) programApplyShimmer();
+    if (state.program.mountedId === id) { programApplyShimmer(); programRefreshRunButton(); }
   }, ms);
 }
 
@@ -4108,6 +4241,7 @@ function leaveProgramView() {
   programStopShimmer();
   if (state.program.runButtonTimer) { clearTimeout(state.program.runButtonTimer); state.program.runButtonTimer = 0; }
   programRunBtn.dataset.running = "false";
+  programRunStageEl.textContent = "";
   programCloseClipMenu();
   programCloseFind();
   programWrapEl.hidden = true;
@@ -4277,6 +4411,9 @@ function handleProgramState(params) {
   const program = params.program;
   if (!program) return;
   const id = program.session_id;
+  const previousRun = state.program.runById.get(id);
+  const nextPending = params.active_run ? programPendingIdsFromProgress(params.active_run) : null;
+  if (previousRun && nextPending) programRecordSettleFlourishes(id, previousRun.pendingIds, nextPending);
   const run = programRunFromProgress(params.active_run);
   if (run) state.program.runById.set(id, run); else state.program.runById.delete(id);
   if (!run || run.firstOutputSeen) programClearRunButton(id);
@@ -4437,11 +4574,21 @@ function programStartOptimisticRun(id, body, isSelection, selectedBlockIds, prev
   }
   if (!pending.size) {
     state.program.runById.delete(id);
-    if (state.program.mountedId === id) { programStopShimmer(); programApplyShimmer(); }
+    if (state.program.mountedId === id) { programStopShimmer(); programApplyShimmer(); programRefreshRunButton(); }
     return { pendingIds: pending, shimmer: spans.map(() => false) };
   }
   const perf = performance.now();
-  state.program.runById.set(id, { pendingIds: pending, tooltips: new Map(), systemStatus: "", startPerf: perf, deadlinePerf: perf + PROGRAM_RUN_MAX_MS });
+  state.program.runById.set(id, {
+    pendingIds: pending,
+    tooltips: new Map(),
+    systemStatus: "",
+    startPerf: perf,
+    deadlinePerf: perf + PROGRAM_RUN_MAX_MS,
+    firstOutputSeen: false,
+    stage: "pressed",
+    settledBlockCount: 0,
+    totalBlockCount: pending.size,
+  });
   if (state.program.mountedId === id) programStartShimmer(id);
   return { pendingIds: pending, shimmer: spans.map((b) => pending.has(b.id)) };
 }
@@ -6765,6 +6912,7 @@ function handleNotification(method, params) {
     state.widgetsById.delete(params.session_id);
     state.program.docById.delete(params.session_id);
     state.program.runById.delete(params.session_id);
+    state.program.settleById.delete(params.session_id);
     if (state.viewModeById.delete(params.session_id)) saveViewModePrefs();
     clearBrowserPreview(params.session_id);
     if (params.session_id === state.currentId) {
