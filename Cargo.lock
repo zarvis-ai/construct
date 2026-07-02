@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agentd"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-cli"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd",
  "agentd-client",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-client"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -92,7 +92,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-e2e"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-client",
  "agentd-protocol",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "agentd-protocol"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "base64",
@@ -509,7 +509,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-antigravity"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-claude"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -535,7 +535,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-codex"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -547,7 +547,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-common"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "tokio",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-grok"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-shell"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-protocol",
  "anyhow",
@@ -579,7 +579,7 @@ dependencies = [
 
 [[package]]
 name = "construct-adapter-smith"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-client",
  "agentd-protocol",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "construct-mcp"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "agentd-client",
  "agentd-protocol",
