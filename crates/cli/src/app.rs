@@ -6954,6 +6954,7 @@ impl App {
                 | KeyAction::ToggleZoom
                 | KeyAction::ToggleHelp
                 | KeyAction::OpenProgram
+                | KeyAction::ToggleProgramTerminalFocus
                 | KeyAction::OpenCommandPalette
                 | KeyAction::OpenSwitchSession
                 | KeyAction::OpenNewSession
@@ -7183,6 +7184,9 @@ impl App {
                     .as_ref()
                     .and_then(Self::selected_program_text);
                 self.execute_program_popup(selection, None).await;
+            }
+            ToggleProgramTerminalFocus => {
+                self.toggle_program_terminal_focus();
             }
             OpenDiff => {
                 if let Some(id) = self.selected_id() {
@@ -12022,6 +12026,50 @@ mod tests {
             app.program_popup.as_ref().unwrap().buffer,
             "draft",
             "terminal-focused keys must not edit Program Markdown"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn c_x_ctrl_o_toggles_between_program_and_terminal_focus() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        app.focus = PaneFocus::View;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await;
+
+        let popup = app.program_popup.as_ref().expect("program remains open");
+        assert!(
+            popup.terminal_focus,
+            "C-x C-o from Program focus should focus the terminal"
+        );
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(
+            app.status.as_ref().map(|(message, _)| message.as_str()),
+            Some("focus: session terminal")
+        );
+        assert!(
+            popup.slide_changed_at.is_some(),
+            "terminal focus should start the slide animation"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL))
+            .await;
+
+        let popup = app.program_popup.as_ref().expect("program remains open");
+        assert!(
+            !popup.terminal_focus,
+            "C-x C-o from terminal focus should refocus Program"
+        );
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(
+            app.status.as_ref().map(|(message, _)| message.as_str()),
+            Some("focus: program")
         );
         server.abort();
     }
