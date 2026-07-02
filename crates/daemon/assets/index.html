@@ -1632,15 +1632,25 @@
     cursor: default;
   }
   /* Session smart-clip status badge: subtle status-tinted color, driven by
-     `data-status` (kept live by programUpdateChipStatuses). "running" and
-     "awaiting_input" have no rule, same as "done" — all three keep the
-     chip's default accent-alt look, so a clip's color doesn't change as its
-     target session finishes. A missing/deleted target reads as
+     `data-status` (kept live by programUpdateChipStatuses). "done" has no
+     color rule of its own — it keeps the chip's default accent-alt look —
+     but it does get an opacity cut below, so a settled clip visually
+     recedes next to an in-progress one instead of the two competing for
+     attention with equally vivid colors. A missing/deleted target reads as
      struck-through so it's unmistakable at a glance, not just recolored. */
   .program-clip[data-status="pending"] {
     background: color-mix(in srgb, var(--fg-faint) 20%, transparent);
     color: var(--fg-faint);
     border-color: color-mix(in srgb, var(--fg-faint) 40%, transparent);
+  }
+  .program-clip[data-status="running"],
+  .program-clip[data-status="awaiting_input"] {
+    background: color-mix(in srgb, var(--ok) 20%, transparent);
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  }
+  .program-clip[data-status="done"] {
+    opacity: 0.6;
   }
   .program-clip[data-status="paused"] {
     background: color-mix(in srgb, var(--warn) 20%, transparent);
