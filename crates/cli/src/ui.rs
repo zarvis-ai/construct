@@ -7468,6 +7468,14 @@ fn render_tasks_popup(f: &mut Frame, app: &mut App) {
     f.render_widget(para, inner);
 }
 
+struct ProgramPopupHoverOverlay {
+    popup: crate::app::ProgramPopup,
+    clip_bounds: Rect,
+    clip_hits: Vec<crate::app::ProgramClipHit>,
+    scroll_offset: usize,
+    inner: Rect,
+}
+
 fn render_program_popup(f: &mut Frame, app: &mut App) {
     let now = Instant::now();
     app.layout.program_title_run_hit = None;
@@ -7515,8 +7523,32 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
         );
         popups.push((popup.clone(), base_rect, true));
     }
+    let mut hover_overlays = Vec::new();
     for (popup, base_rect, active) in popups {
-        render_program_popup_at(f, app, &popup, base_rect, active, now);
+        if let Some(overlay) = render_program_popup_at(f, app, &popup, base_rect, active, now) {
+            hover_overlays.push(overlay);
+        }
+    }
+    render_program_hover_overlays(f, app, &hover_overlays, now);
+}
+
+fn render_program_hover_overlays(
+    f: &mut Frame,
+    app: &mut App,
+    hover_overlays: &[ProgramPopupHoverOverlay],
+    now: Instant,
+) {
+    for overlay in hover_overlays {
+        render_program_clip_hover(f, app, overlay.clip_bounds, &overlay.clip_hits);
+        render_program_shimmer_hover(
+            f,
+            app,
+            &overlay.popup,
+            overlay.scroll_offset,
+            overlay.inner,
+            &overlay.clip_hits,
+            now,
+        );
     }
 }
 
@@ -8022,9 +8054,9 @@ fn render_program_popup_at(
     base_rect: Rect,
     active: bool,
     now: Instant,
-) {
+) -> Option<ProgramPopupHoverOverlay> {
     if base_rect.width < 40 || base_rect.height < 8 {
-        return;
+        return None;
     }
 
     let progress = if popup.closing {
@@ -8040,12 +8072,12 @@ fn render_program_popup_at(
     }
     .clamp(0.0, 1.0);
     if progress <= 0.0 {
-        return;
+        return None;
     }
     let target_h = program_roll_down_height(base_rect.height, popup.cover_percent);
     let visible_h = ((target_h as f32 * progress).ceil() as u16).clamp(1, target_h);
     if visible_h == 0 {
-        return;
+        return None;
     }
     let rect =
         program_popup_visible_rect(base_rect, visible_h, active && app.program_terminal_focus);
@@ -8246,17 +8278,13 @@ fn render_program_popup_at(
         render_program_selection_context_menu(f, app, popup, scroll_offset, inner);
     }
     render_program_title_tooltip(f, app, popup, summary_ref, rect);
-    if !popup.closing {
-        render_program_clip_hover(
-            f,
-            app,
-            program_clip_hover_bounds(app.layout.view_area, base_rect),
-            &clip_hits,
-        );
-    }
-    if !popup.closing {
-        render_program_shimmer_hover(f, app, popup, scroll_offset, inner, now);
-    }
+    (!popup.closing).then(|| ProgramPopupHoverOverlay {
+        popup: popup.clone(),
+        clip_bounds: program_clip_hover_bounds(app.layout.view_area, base_rect),
+        clip_hits,
+        scroll_offset,
+        inner,
+    })
 }
 
 fn render_program_collab_cursors(
@@ -8605,6 +8633,7 @@ fn render_program_shimmer_hover(
     popup: &crate::app::ProgramPopup,
     scroll_offset: usize,
     body: Rect,
+    clip_hits: &[crate::app::ProgramClipHit],
     now: Instant,
 ) {
     let Some((mx, my)) = app.mouse_pos else {
@@ -8612,12 +8641,7 @@ fn render_program_shimmer_hover(
     };
     // A clip chip under the cursor is owned by `render_program_clip_hover`; don't
     // double-render the tooltip on top of it.
-    if app
-        .layout
-        .program_clip_hits
-        .iter()
-        .any(|hit| hit.contains(mx, my))
-    {
+    if clip_hits.iter().any(|hit| hit.contains(mx, my)) {
         return;
     }
     let Some(shimmer) = program_run_shimmer(app, popup, now) else {
