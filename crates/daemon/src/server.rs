@@ -107,7 +107,7 @@ async fn run_session<I: Inbound>(
     let sub_out_tx = out_tx.clone();
     let sub_manager = manager.clone();
     let sub_task = tokio::spawn(async move {
-        run_subscription_loop(sub_manager, sub_out_tx, sub_cmd_rx).await;
+        run_subscription_loop(sub_manager, sub_out_tx, sub_cmd_rx, conn_id).await;
     });
 
     loop {
@@ -865,6 +865,7 @@ async fn run_subscription_loop(
     manager: Arc<SessionManager>,
     out_tx: mpsc::UnboundedSender<serde_json::Value>,
     mut cmd_rx: mpsc::Receiver<SubCmd>,
+    conn_id: u64,
 ) {
     let mut sub_rx: Option<broadcast::Receiver<BroadcastMsg>> = None;
     let mut filter: Option<String> = None;
@@ -888,7 +889,7 @@ async fn run_subscription_loop(
                 msg = rx.recv() => {
                     match msg {
                         Ok(m) => {
-                            forward_broadcast(&out_tx, &filter, m);
+                            forward_broadcast(&out_tx, &filter, m, conn_id);
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             tracing::warn!(skipped = n, "subscriber lagged");
@@ -916,14 +917,27 @@ fn forward_broadcast(
     out_tx: &mpsc::UnboundedSender<serde_json::Value>,
     filter: &Option<String>,
     msg: BroadcastMsg,
+    conn_id: u64,
 ) {
+    // A plain cursor publish is skipped for its own source connection — see
+    // `BroadcastMsg::ProgramCursor`'s doc comment. Every other message kind
+    // (and every other connection) forwards as usual.
+    if let BroadcastMsg::ProgramCursor {
+        skip_conn_id: Some(skip),
+        ..
+    } = &msg
+    {
+        if *skip == conn_id {
+            return;
+        }
+    }
     if let Some(f) = filter {
         let matches = match &msg {
             BroadcastMsg::Event(e) => e.session_id == *f,
             BroadcastMsg::State(s) => s.session.id == *f,
             BroadcastMsg::Deleted(d) => d.session_id == *f,
             BroadcastMsg::ProgramState(c) => c.program.session_id == *f,
-            BroadcastMsg::ProgramCursor(c) => c.cursor.session_id == *f,
+            BroadcastMsg::ProgramCursor { payload, .. } => payload.cursor.session_id == *f,
             // Group + remote-state notifications aren't session-
             // specific; always forward even when a session filter
             // is set so the local TUI's remote badge stays accurate
@@ -966,8 +980,8 @@ fn forward_broadcast(
             };
             Notification::new(ipc_notif::PROGRAM_STATE, Some(p))
         }
-        BroadcastMsg::ProgramCursor(c) => {
-            let p = match serde_json::to_value(&c) {
+        BroadcastMsg::ProgramCursor { payload, .. } => {
+            let p = match serde_json::to_value(&payload) {
                 Ok(v) => v,
                 Err(_) => return,
             };
@@ -1560,6 +1574,87 @@ async fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_program_cursor(session_id: &str, client_id: &str) -> agentd_protocol::ProgramCursor {
+        agentd_protocol::ProgramCursor {
+            session_id: session_id.to_string(),
+            client_id: client_id.to_string(),
+            label: "TUI".to_string(),
+            kind: "tui".to_string(),
+            cursor: 0,
+            selection_anchor: None,
+            selection_head: None,
+            version: None,
+            color_index: 0,
+            updated_at_ms: 0,
+            active: true,
+        }
+    }
+
+    #[test]
+    fn forward_broadcast_skips_program_cursor_for_its_own_publisher() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let payload = agentd_protocol::ProgramCursorNotificationPayload {
+            cursor: test_program_cursor("s1", "c7"),
+        };
+        forward_broadcast(
+            &out_tx,
+            &None,
+            BroadcastMsg::ProgramCursor {
+                payload,
+                skip_conn_id: Some(7),
+            },
+            7,
+        );
+        assert!(
+            out_rx.try_recv().is_err(),
+            "the publishing connection must not receive its own plain-publish echo"
+        );
+    }
+
+    #[test]
+    fn forward_broadcast_still_delivers_program_cursor_to_other_connections() {
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let payload = agentd_protocol::ProgramCursorNotificationPayload {
+            cursor: test_program_cursor("s1", "c7"),
+        };
+        forward_broadcast(
+            &out_tx,
+            &None,
+            BroadcastMsg::ProgramCursor {
+                payload,
+                skip_conn_id: Some(7),
+            },
+            42,
+        );
+        assert!(
+            out_rx.try_recv().is_ok(),
+            "peers other than the publisher must still see the cursor move"
+        );
+    }
+
+    #[test]
+    fn forward_broadcast_delivers_program_cursor_rebase_to_its_owner() {
+        // skip_conn_id: None is what genuine rebases (and disconnect
+        // tombstones) use — the cursor's own owner must still receive it.
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+        let payload = agentd_protocol::ProgramCursorNotificationPayload {
+            cursor: test_program_cursor("s1", "c7"),
+        };
+        forward_broadcast(
+            &out_tx,
+            &None,
+            BroadcastMsg::ProgramCursor {
+                payload,
+                skip_conn_id: None,
+            },
+            7,
+        );
+        assert!(
+            out_rx.try_recv().is_ok(),
+            "a rebase-driven update must reach the cursor's own owner"
+        );
+    }
 
     #[test]
     fn web_asset_prefers_dev_dir_then_embedded() {

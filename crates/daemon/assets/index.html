@@ -4130,6 +4130,37 @@ function programAnchoredEdit(prev, next) {
 
 function programCharCount(s) { return Array.from(s || "").length; }
 
+// The char-offset span (in old/new coordinates respectively) where `oldText`
+// and `newText` differ, via common-prefix/suffix trim over codepoints —
+// mirrors program_edit_overall_span in crates/daemon/src/session.rs (and the
+// TUI's program_document_diff_span). Returns null when the two are identical.
+function programDiffSpan(oldText, newText) {
+  if (oldText === newText) return null;
+  const oldChars = Array.from(oldText || "");
+  const newChars = Array.from(newText || "");
+  let prefix = 0;
+  while (prefix < oldChars.length && prefix < newChars.length && oldChars[prefix] === newChars[prefix]) prefix++;
+  let oldEnd = oldChars.length;
+  let newEnd = newChars.length;
+  while (oldEnd > prefix && newEnd > prefix && oldChars[oldEnd - 1] === newChars[newEnd - 1]) {
+    oldEnd--;
+    newEnd--;
+  }
+  return { prefix, oldEnd, newEnd };
+}
+
+// Rebase a char offset in the old document through to the new document,
+// given the diff span from programDiffSpan. Positions at or before the
+// changed span's start are unchanged; positions at or after the old span's
+// end shift by the length delta; positions inside the changed span clamp to
+// the new span's end.
+function programRebaseOffset(pos, span) {
+  if (!span) return pos;
+  if (pos <= span.prefix) return pos;
+  if (pos >= span.oldEnd) return Math.max(span.prefix, pos + (span.newEnd - span.oldEnd));
+  return span.newEnd;
+}
+
 function programSelectionOffsets() {
   const sel = window.getSelection();
   if (!sel || sel.rangeCount === 0) return null;
@@ -4668,9 +4699,16 @@ function handleProgramState(params) {
   });
   if (isMounted) {
     const offsets = programSelectionOffsets();
+    // Rebase the caret through the old→new content diff instead of merely
+    // clamping it to the new length (spec 0065) — a clamp alone leaves it
+    // pointing at whatever text now occupies its old offset whenever the
+    // adopted change inserted or removed text before it.
+    const oldMarkdown = programSerialize();
     programRenderDoc(program.markdown);
     if (offsets) {
-      const range = programRangeForOffset(Math.min(offsets.head, programCharCount(program.markdown)));
+      const span = programDiffSpan(oldMarkdown, program.markdown);
+      const rebasedHead = Math.min(programRebaseOffset(offsets.head, span), programCharCount(program.markdown));
+      const range = programRangeForOffset(rebasedHead);
       const sel = window.getSelection();
       if (sel) { sel.removeAllRanges(); sel.addRange(range); }
     }
