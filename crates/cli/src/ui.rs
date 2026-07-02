@@ -33,8 +33,12 @@ const MATRIX_WALLPAPER_DIM: f32 = 0.22;
 const PREVIEW_REVEAL_SECS: f32 = 1.0;
 const PROGRAM_REVEAL_SECS: f32 = PROGRAM_REVEAL_MS as f32 / 1000.0;
 const PROGRAM_RUN_BUTTON: &str = " ▶ ";
-const PROGRAM_CLIP_HOVER_PREVIEW_COLS: u16 = 102;
-const PROGRAM_CLIP_HOVER_PREVIEW_ROWS: u16 = 12;
+/// Size of the session clip hover terminal preview. COLS caps the card's
+/// outer width and ROWS is the replayed content height, so the tooltip paints
+/// 64x24 cells; terminal cells are roughly twice as tall as they are wide, so
+/// on screen that reads as a 4:3 tile instead of a letterboxed strip.
+const PROGRAM_CLIP_HOVER_PREVIEW_COLS: u16 = 64;
+const PROGRAM_CLIP_HOVER_PREVIEW_ROWS: u16 = 22;
 const PROGRAM_COLLAB_CURSOR_LABEL_MAX_WIDTH: usize = 12;
 /// How long a just-landed agent-authored Program edit keeps its brief reveal
 /// highlight (spec 0065 agent presence) before fading back to plain text.
@@ -11000,14 +11004,20 @@ mod tests {
     }
 
     #[test]
-    fn session_hover_card_uses_narrower_taller_preview_geometry() {
+    fn session_hover_card_preview_geometry_reads_close_to_4_by_3() {
         let (w, h) = session_hover_card_size(
             PROGRAM_CLIP_HOVER_PREVIEW_COLS,
             PROGRAM_CLIP_HOVER_PREVIEW_ROWS,
             PROGRAM_CLIP_HOVER_PREVIEW_COLS,
         );
-        assert_eq!(w, 102, "outer width should be about 20% narrower than 128");
-        assert_eq!(h, 14, "outer height should be about 40% taller than 10");
+        assert_eq!((w, h), (64, 24), "outer card should paint 64x24 cells");
+        // Terminal cells are ~2:1 tall, so the on-screen aspect is w : 2h.
+        let on_screen_aspect = f32::from(w) / (2.0 * f32::from(h));
+        assert!(
+            (on_screen_aspect - 4.0 / 3.0).abs() < 0.05,
+            "expected ~4:3 tooltip, got aspect {on_screen_aspect}"
+        );
+        assert!(w > h, "card must stay landscape in cell terms: {w}x{h}");
     }
 
     #[test]
