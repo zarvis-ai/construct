@@ -5389,19 +5389,32 @@ impl App {
             return;
         }
         let buffer_len = popup.buffer.chars().count();
-        popup.cursor = cursor.cursor.min(buffer_len);
-        match (cursor.selection_anchor, cursor.selection_head) {
-            (Some(anchor), Some(head)) if anchor != head => {
-                popup.selection = Some(ProgramSelection {
-                    anchor: anchor.min(buffer_len),
-                    head: head.min(buffer_len),
-                    dragged: false,
-                });
-            }
-            _ => {
-                popup.selection = None;
-            }
+        let incoming_cursor = cursor.cursor.min(buffer_len);
+        let incoming_selection = match (cursor.selection_anchor, cursor.selection_head) {
+            (Some(anchor), Some(head)) => Some((anchor.min(buffer_len), head.min(buffer_len))),
+            _ => None,
+        };
+        // The daemon broadcasts every cursor publish back to its publisher, so
+        // most own-cursor notifications are plain echoes of state we already
+        // hold. Applying an echo is not a no-op: it resets `preferred_col`
+        // (losing C-n/C-p column stickiness) and used to collapse a zero-width
+        // C-Space mark to "no selection" before the first motion key could
+        // extend it. Only a daemon-side rebase — our offsets shifted by another
+        // client's edit — carries values that differ from local state, and that
+        // is the case this method exists for.
+        let local_selection = popup.selection.as_ref().map(|s| (s.anchor, s.head));
+        if incoming_cursor == popup.cursor && incoming_selection == local_selection {
+            return;
         }
+        popup.cursor = incoming_cursor;
+        // A zero-width pair is a C-Space mark awaiting its first motion, not
+        // "no selection" — keep it alive across the rebase so the next motion
+        // key extends from the rebased mark instead of merely moving.
+        popup.selection = incoming_selection.map(|(anchor, head)| ProgramSelection {
+            anchor,
+            head,
+            dragged: false,
+        });
         popup.preferred_col = None;
         Self::update_program_smart_clip_after_cursor_move(popup);
     }
@@ -10173,6 +10186,125 @@ mod tests {
             assert_eq!(selection.head, 2);
             server.abort();
         }
+    }
+
+    /// The daemon broadcast that echoes our own cursor publish back at us,
+    /// exactly as a live session sees after every keystroke.
+    fn own_program_cursor_echo(app: &App) -> agentd_protocol::ProgramCursor {
+        let popup = app.program_popup.as_ref().unwrap();
+        agentd_protocol::ProgramCursor {
+            session_id: popup.program.session_id.clone(),
+            client_id: "c7".into(),
+            label: "TUI".into(),
+            kind: "tui".into(),
+            cursor: popup.cursor,
+            selection_anchor: popup.selection.as_ref().map(|s| s.anchor),
+            selection_head: popup.selection.as_ref().map(|s| s.head),
+            version: Some(popup.program.version),
+            color_index: 0,
+            updated_at_ms: 0,
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn program_ctrl_space_mark_survives_own_cursor_echo() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "abc\ndef", 1));
+        app.layout.program_inner_area = Some(Rect::new(0, 0, 20, 5));
+        app.own_program_client_id = Some("c7".to_string());
+
+        // C-Space publishes the fresh zero-width mark and the daemon
+        // broadcasts it straight back. That echo used to fall into the
+        // "no selection" arm (anchor == head) and drop the mark, so in a
+        // live session C-f/C-b/C-p/C-n/C-a/C-e after C-Space only moved
+        // the cursor — even though handler-only tests passed.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        let selection = popup.selection.as_ref().expect("mark survives own echo");
+        assert_eq!((selection.anchor, selection.head), (1, 1));
+
+        // C-f extends by one char; the echo after it must keep the range.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 2)));
+
+        // C-e extends to end of line.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 3)));
+
+        // C-n extends a line down and must keep the sticky visual column
+        // across the echo (the echo used to reset `preferred_col`).
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 7)));
+        assert!(
+            popup.preferred_col.is_some(),
+            "own echo must not reset the C-n/C-p sticky column"
+        );
+
+        // C-p extends back up.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((1, 3)));
+
+        // C-a extends to start of line.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((0, 1)));
+
+        // C-b at buffer start stays put and keeps the mark alive.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .await;
+        app.on_program_cursor(own_program_cursor_echo(&app));
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 0);
+        assert_eq!(App::program_selection_range(popup), Some((0, 1)));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_own_cursor_rebase_keeps_zero_width_mark() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "abc\ndef", 1));
+        app.layout.program_inner_area = Some(Rect::new(0, 0, 20, 5));
+        app.own_program_client_id = Some("c7".to_string());
+
+        app.handle_program_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL))
+            .await;
+
+        // Another client's edit rebased our cursor daemon-side: same
+        // zero-width mark shape, shifted offsets. The rebase must land and
+        // the mark must stay alive at the new position.
+        let mut rebased = own_program_cursor_echo(&app);
+        rebased.cursor = 5;
+        rebased.selection_anchor = Some(5);
+        rebased.selection_head = Some(5);
+        app.on_program_cursor(rebased);
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.cursor, 5);
+        let selection = popup.selection.as_ref().expect("rebased mark stays alive");
+        assert_eq!((selection.anchor, selection.head), (5, 5));
+
+        // The next motion extends from the rebased mark.
+        app.handle_program_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(App::program_selection_range(popup), Some((5, 6)));
+        server.abort();
     }
 
     #[tokio::test]
