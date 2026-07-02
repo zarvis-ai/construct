@@ -6505,6 +6505,112 @@ mod tests {
         assert_eq!(tooltip("# A"), None);
     }
 
+    // Spec 0042: starting a selection run while another run is still in flight
+    // adds the selected blocks to the existing pending set. It must not replace
+    // the run record, because that would lose already-pending blocks and the
+    // agent-managed lifecycle bit that keeps delegated work shimmering while
+    // the owning session is idle.
+    #[tokio::test]
+    async fn program_selection_run_unions_with_managed_inflight_run() {
+        use agentd_protocol::SessionState;
+
+        let md = "# A\n\n# B\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        mgr.start_program_run(&id, md, false, None)
+            .expect("start full run");
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        let get = mgr.program_get(&id).await.expect("get");
+        let block_ref = |needle: &str| {
+            get.blocks
+                .iter()
+                .find(|b| b.text.contains(needle))
+                .unwrap_or_else(|| panic!("missing block {needle:?}"))
+                .id
+                .clone()
+        };
+        let a_ref = block_ref("# A");
+        let b_ref = block_ref("# B");
+
+        declare(
+            &mgr,
+            &id,
+            "# A",
+            vec![
+                agentd_protocol::ProgramShimmerDecl {
+                    id: a_ref.clone(),
+                    shimmer: true,
+                    tooltip: Some("Working A".into()),
+                },
+                agentd_protocol::ProgramShimmerDecl {
+                    id: b_ref.clone(),
+                    shimmer: false,
+                    tooltip: None,
+                },
+            ],
+        )
+        .await;
+        let narrowed = mgr.program_run_snapshot(&id).expect("narrowed run");
+        assert!(narrowed.agent_managed);
+        assert_eq!(narrowed.pending_block_refs, vec![a_ref.clone()]);
+
+        let selection_run = mgr
+            .start_program_run_with_dispatch_state(&id, "# B\n", true, Some(&[true]), true)
+            .expect("selection run");
+
+        assert!(
+            selection_run.agent_managed,
+            "selection union preserves the old run's managed lifecycle"
+        );
+        assert_eq!(
+            selection_run.started_at_ms, narrowed.started_at_ms,
+            "selection union refreshes the existing run instead of replacing it"
+        );
+        assert!(
+            selection_run.pending_block_refs.contains(&a_ref),
+            "old in-flight block A keeps shimmering"
+        );
+        assert!(
+            selection_run.pending_block_refs.contains(&b_ref),
+            "selected block B is added under its stable ref"
+        );
+        assert_eq!(
+            selection_run
+                .pending_block_tooltips
+                .get(&a_ref)
+                .map(String::as_str),
+            Some("Working A"),
+            "existing pending tooltips are preserved"
+        );
+
+        mgr.note_session_state_for_program_run(&id, SessionState::AwaitingInput);
+        assert!(
+            mgr.program_run_snapshot(&id).is_some(),
+            "the unioned managed run survives the owning session going idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn program_selection_run_without_active_run_starts_selection_only() {
+        let md = "# A\n\n# B\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        let get = mgr.program_get(&id).await.expect("get");
+        let b_ref = get
+            .blocks
+            .iter()
+            .find(|b| b.text.contains("# B"))
+            .expect("B block")
+            .id
+            .clone();
+
+        let run = mgr
+            .start_program_run_with_dispatch_state(&id, "# B\n", true, Some(&[true]), false)
+            .expect("selection run");
+
+        assert_eq!(run.pending_block_refs, vec![b_ref]);
+        assert_eq!(run.total_block_count, 1);
+        assert!(!run.agent_managed);
+    }
+
     // An edit's shimmer declaration for an id that no longer exists is dropped
     // (fail closed), and other blocks are untouched.
     #[tokio::test]
