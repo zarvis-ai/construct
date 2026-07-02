@@ -1880,11 +1880,21 @@ impl SessionManager {
         if replacements.is_empty() {
             return (Vec::new(), None);
         }
-        // The last replacement's `start` already reflects every earlier
-        // replacement in this batch (the sequential coordinate frame
-        // `program_rebase_offset` walks), and nothing follows it, so
-        // `start + new_len` is already a final-document offset.
-        let last_edit_span = replacements.last().map(|r| (r.start, r.start + r.new_len));
+        // The last *non-degenerate* replacement's `start` already reflects
+        // every earlier replacement in this batch (the sequential
+        // coordinate frame `program_rebase_offset` walks), so `start +
+        // new_len` is already a final-document offset — as long as nothing
+        // after it actually shifts the document. A trailing no-op edit
+        // (`old_string == new_string`, common when an agent restates an
+        // unchanged anchor alongside a real change elsewhere in the same
+        // batch) produces a `(old_len: 0, new_len: 0)` entry that shifts
+        // nothing, so skipping trailing degenerate entries here is safe:
+        // it doesn't change any span computed for a real entry before it.
+        let last_edit_span = replacements
+            .iter()
+            .rev()
+            .find(|r| r.old_len != 0 || r.new_len != 0)
+            .map(|r| (r.start, r.start + r.new_len));
         let now = chrono::Utc::now().timestamp_millis();
         let mut updates = Vec::new();
         if let Ok(mut cursors) = self.program_cursors.lock() {
@@ -5848,6 +5858,52 @@ mod tests {
             "a no-op edit (old_string == new_string) writes nothing, so it must not \
              publish a presence cursor claiming the agent just wrote somewhere"
         );
+    }
+
+    #[tokio::test]
+    async fn program_edit_agent_presence_cursor_ignores_trailing_noop_edit_in_batch() {
+        let (mgr, _storage, id) = program_test_mgr("123456789\n").await;
+
+        // A logical change submitted as two edits in one call (spec 0041):
+        // a real rewrite, plus a no-op restatement of an unrelated anchor
+        // (e.g. an unchanged heading) tacked on afterward. The presence
+        // cursor must land at the real edit, not the degenerate trailing one.
+        let result = mgr
+            .program_edit_from_conn(
+                agentd_protocol::ProgramEditParams {
+                    session_id: id.clone(),
+                    edits: vec![
+                        agentd_protocol::ProgramEdit {
+                            old_string: "456".to_string(),
+                            new_string: "XYZ".to_string(),
+                            replace_all: false,
+                            keep_pending: false,
+                        },
+                        agentd_protocol::ProgramEdit {
+                            old_string: "789".to_string(),
+                            new_string: "789".to_string(),
+                            replace_all: false,
+                            keep_pending: false,
+                        },
+                    ],
+                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    note: None,
+                    shimmer: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .expect("agent edit batch");
+
+        assert_eq!(result.program.markdown, "123XYZ789\n");
+        let cursor = agent_collaborator(&mgr, &id);
+        assert_eq!(
+            cursor.selection_anchor,
+            Some(3),
+            "the real edit's span, not the trailing no-op's zero-width one"
+        );
+        assert_eq!(cursor.selection_head, Some(6));
+        assert_eq!(cursor.cursor, 6);
     }
 
     #[tokio::test]

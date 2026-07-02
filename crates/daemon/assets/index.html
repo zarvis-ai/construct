@@ -3983,7 +3983,16 @@ const PROGRAM_AGENT_REVEAL_MS = 300;
 // its own short-lived elements — not cleared by `programRenderCursors`, which
 // only touches `.program-remote-cursor` — so a cursor update racing in during
 // the ~300ms fade can't cut it short.
+//
+// Only paints while the cursor is still within its brief window: a rebase
+// caused by an *unrelated* edit elsewhere still moves and rebroadcasts an
+// agent cursor (so its position stays correct), but must not re-flash the
+// reveal — the daemon leaves `updated_at_ms` untouched in that case, so
+// checking recency here is what tells "the agent just wrote here" apart
+// from "this cursor merely moved".
 function programRevealAgentEdit(cursor) {
+  if (cursor.kind !== "agent") return;
+  if (Date.now() - (cursor.updated_at_ms || 0) > PROGRAM_AGENT_REVEAL_MS) return;
   const id = state.program.mountedId;
   if (!id || state.mode !== "program" || cursor.session_id !== id) return;
   const anchor = cursor.selection_anchor;
@@ -4204,7 +4213,7 @@ async function programMountSession(id) {
   // watching live would have — checked only now, after `programRenderDoc`
   // has populated the editor DOM the reveal's Range lookups walk.
   for (const cursor of result.collaborators || []) {
-    programRevealAgentEditIfFresh(cursor);
+    programRevealAgentEdit(cursor);
   }
   programVersionEl.textContent = "v" + p.version;
   programRefreshEmptyState();
@@ -4372,23 +4381,12 @@ function handleProgramCursor(params) {
     state.program.collaboratorById.delete(cursor.client_id);
   } else {
     state.program.collaboratorById.set(cursor.client_id, cursor);
-    programRevealAgentEditIfFresh(cursor);
+    programRevealAgentEdit(cursor);
   }
   programApplyOwnCursor(cursor);
   programRenderCursors();
 }
 
-// Only paint the reveal highlight while the cursor is still within its brief
-// window (spec 0065 agent presence): a rebase caused by an *unrelated* edit
-// elsewhere still moves and rebroadcasts an agent cursor (so its position
-// stays correct), but must not re-flash the reveal — the daemon leaves
-// `updated_at_ms` untouched in that case, so checking recency here is what
-// tells "the agent just wrote here" apart from "this cursor merely moved".
-function programRevealAgentEditIfFresh(cursor) {
-  if (cursor.kind !== "agent") return;
-  if (Date.now() - (cursor.updated_at_ms || 0) > PROGRAM_AGENT_REVEAL_MS) return;
-  programRevealAgentEdit(cursor);
-}
 
 function programApplyOwnCursor(cursor) {
   if (!cursor || cursor.client_id !== state.program.ownClientId || cursor.active === false) return;
