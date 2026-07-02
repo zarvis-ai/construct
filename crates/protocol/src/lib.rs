@@ -1030,6 +1030,10 @@ pub struct ProgramShimmerDecl {
 /// legacy run state, or a block kept pending across an edit (spec 0057).
 pub const PROGRAM_SHIMMER_FALLBACK_TOOLTIP: &str = "Working…";
 
+pub const PROGRAM_SHIMMER_STATUS_QUEUED: &str = "Queued behind current turn";
+pub const PROGRAM_SHIMMER_STATUS_DELIVERED: &str = "Delivered, waiting for agent";
+pub const PROGRAM_SHIMMER_STATUS_AGENT_WORKING: &str = "Agent working, no status yet";
+
 /// Maximum word count for a program-shimmer tooltip (spec 0057). Longer
 /// tooltips are gracefully truncated rather than rejected.
 pub const PROGRAM_SHIMMER_TOOLTIP_MAX_WORDS: usize = 10;
@@ -1216,6 +1220,10 @@ pub struct ProgramRunProgress {
     pub run_id: String,
     pub started_at_ms: i64,
     pub expires_at_ms: i64,
+    /// Daemon-derived run-level fallback status for shimmering blocks whose
+    /// agent-authored tooltip is missing (optimistic/legacy/keep_pending).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_status: Option<String>,
     /// Legacy content-derived ids of the blocks still pending in this run.
     /// New payloads prefer `pending_block_refs`; this is kept for older clients
     /// and dirty-buffer fallback rendering.
@@ -1237,6 +1245,11 @@ pub struct ProgramRunProgress {
     pub seen_running: bool,
     #[serde(default)]
     pub first_output_seen: bool,
+    /// Internal daemon fact: true when Run was dispatched while the owning
+    /// session was already in a turn. This is used to derive `system_status`;
+    /// the projected status string is the client-facing contract.
+    #[serde(default, skip_serializing)]
+    pub queued_behind_current_turn: bool,
     /// True once an in-run program declaration/edit has narrowed this run —
     /// i.e. the run is actively managed via per-block declarations rather than
     /// riding the untouched optimistic full-program shimmer. A managed run is

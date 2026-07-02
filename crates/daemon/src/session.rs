@@ -1768,9 +1768,12 @@ impl SessionManager {
         let run_context = program_run_context(&result.program, scope, body);
         self.write_program_run_context(&params.session_id, &run_context)?;
         let prompt = program_execution_prompt();
-        let delivery = {
+        let (delivery, queued_behind_current_turn) = {
             let summary = entry.summary.read().await;
-            program_execution_delivery(&*summary)
+            (
+                program_execution_delivery(&*summary),
+                summary.state == agentd_protocol::SessionState::Running,
+            )
         };
         match delivery {
             ProgramExecutionDelivery::ExternalPtyTypedSubmit => {
@@ -1785,11 +1788,12 @@ impl SessionManager {
                 self.send_input(&params.session_id, prompt.clone()).await?;
             }
         }
-        let active_run = self.start_program_run(
+        let active_run = self.start_program_run_with_dispatch_state(
             &params.session_id,
             &run_body,
             is_selection,
             params.shimmer.as_deref(),
+            queued_behind_current_turn,
         );
         let blocks = self.program_blocks_projection(&params.session_id, &result.program.markdown);
         Ok(ProgramExecuteResult {
@@ -6527,6 +6531,51 @@ mod tests {
         assert!(
             mgr.program_run_snapshot(&id).is_none(),
             "an empty pending set clears the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn program_run_system_status_tracks_dispatch_and_output_state() {
+        use agentd_protocol::{
+            SessionState, PROGRAM_SHIMMER_STATUS_AGENT_WORKING, PROGRAM_SHIMMER_STATUS_DELIVERED,
+            PROGRAM_SHIMMER_STATUS_QUEUED,
+        };
+        let body = "# Alpha\n\n# Beta\n";
+        let (mgr, _storage, id) = program_test_mgr(body).await;
+
+        let run = mgr
+            .start_program_run(&id, body, false, None)
+            .expect("start idle-dispatched run");
+        assert_eq!(
+            run.system_status.as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_DELIVERED)
+        );
+
+        let run = mgr
+            .start_program_run_with_dispatch_state(&id, body, false, None, true)
+            .expect("start queued run");
+        assert_eq!(
+            run.system_status.as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_QUEUED)
+        );
+
+        mgr.note_session_state_for_program_run(&id, SessionState::Running);
+        assert_eq!(
+            mgr.program_run_snapshot(&id)
+                .expect("running snapshot")
+                .system_status
+                .as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_DELIVERED),
+            "once this program turn starts it is no longer queued"
+        );
+
+        mgr.mark_program_run_output_seen(&id);
+        assert_eq!(
+            mgr.program_run_snapshot(&id)
+                .expect("output snapshot")
+                .system_status
+                .as_deref(),
+            Some(PROGRAM_SHIMMER_STATUS_AGENT_WORKING)
         );
     }
 

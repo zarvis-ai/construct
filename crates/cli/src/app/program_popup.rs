@@ -513,6 +513,7 @@ impl App {
                 total_block_count: pending.len(),
                 pending,
                 pending_tooltips: HashMap::new(),
+                system_status: None,
                 deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,
                 stage: agentd_protocol::ProgramRunStage::Pressed,

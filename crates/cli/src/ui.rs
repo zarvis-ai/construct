@@ -7565,6 +7565,28 @@ struct ProgramShimmer {
     phase: f32,
 }
 
+fn format_program_run_elapsed(started_at: Instant, now: Instant) -> String {
+    let secs = now.saturating_duration_since(started_at).as_secs();
+    let minutes = secs / 60;
+    let seconds = secs % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn program_system_status_tooltip(run: &crate::app::ProgramRun, now: Instant) -> Option<String> {
+    let status = run.system_status.as_deref().map(str::trim)?;
+    if status.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{status} — {}",
+        format_program_run_elapsed(run.started_at, now)
+    ))
+}
+
 /// One-shot settle flourish lines. `started_at` is per source line so multiple
 /// blocks can settle in separate notifications and animate independently.
 struct ProgramSettleFlourish {
@@ -8454,14 +8476,21 @@ fn render_program_shimmer_hover(
     ) else {
         return;
     };
-    // The concise status tooltip travels with the shimmer (spec 0057).
-    let tooltip = app
-        .program_runs
-        .get(&popup.program.session_id)
-        .and_then(|run| run.pending_tooltips.get(&block_id))
-        .map_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP, |t| {
-            t.as_str()
-        });
+    // Agent-authored block tooltip wins; otherwise show the daemon-derived
+    // run-level status before falling back to the optimistic legacy label.
+    let system_tooltip;
+    let tooltip = match app.program_runs.get(&popup.program.session_id) {
+        Some(run) => match run.pending_tooltips.get(&block_id) {
+            Some(t) if !t.trim().is_empty() => t.as_str(),
+            _ => {
+                system_tooltip = program_system_status_tooltip(run, now);
+                system_tooltip
+                    .as_deref()
+                    .unwrap_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP)
+            }
+        },
+        None => agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP,
+    };
     render_tooltip_at(f, &app.theme, tooltip, mx, my, 2, -1);
 }
 

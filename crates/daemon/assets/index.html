@@ -3454,6 +3454,7 @@ async function selectSession(id, { replaceUrl = false } = {}) {
 // the SAME shared rules as the daemon/TUI so block ids agree across clients.
 
 const PROGRAM_RUN_MAX_MS = 10 * 60 * 1000;
+const PROGRAM_SHIMMER_FALLBACK_TOOLTIP = "Working…";
 const PROGRAM_SETTLE_FLASH_MS = 300;
 const PROGRAM_TEXT_ENCODER = new TextEncoder();
 
@@ -3699,6 +3700,7 @@ function programRunFromProgress(progress) {
   return {
     pendingIds: ids,
     tooltips: new Map(Object.entries(progress.pending_block_tooltips || {})),
+    systemStatus: String(progress.system_status || "").trim(),
     startPerf,
     deadlinePerf: perf + (progress.expires_at_ms - nowMs),
     firstOutputSeen: !!progress.first_output_seen,
@@ -3707,6 +3709,20 @@ function programRunFromProgress(progress) {
     totalBlockCount: total,
   };
 }
+
+function programRunElapsedLabel(run) {
+  const elapsed = Math.max(0, Math.floor((performance.now() - run.startPerf) / 1000));
+  const mins = Math.floor(elapsed / 60);
+  const secs = elapsed % 60;
+  return mins > 0 ? `${mins}m ${String(secs).padStart(2, "0")}s` : `${secs}s`;
+}
+
+function programRunSystemTooltip(run) {
+  const status = String(run && run.systemStatus || "").trim();
+  if (!status) return "";
+  return `${status} — ${programRunElapsedLabel(run)}`;
+}
+
 
 function programRunStageLabel(run) {
   if (!run || performance.now() >= run.deadlinePerf) return "";
@@ -3761,21 +3777,35 @@ function programScheduleSettlePrune() {
   }, Math.max(0, nextMs));
 }
 
-function programActiveLines(buffer, pendingSet, blocks) {
+
+function programActiveLines(buffer, run, blocks) {
   const n = programLines(buffer).length;
   const active = new Array(n).fill(false);
+  const tooltips = new Array(n).fill("");
   let any = false;
   const spans = blocks && blocks.length ? blocks : programBlockSpans(buffer);
+  const pendingSet = run.pendingIds;
   const hasStableMatch = !!(blocks && blocks.length && spans.some((b) => pendingSet.has(b.id) || pendingSet.has(b.block_ref)));
+  const systemTooltip = programRunSystemTooltip(run);
   for (const b of spans) {
     const pending = hasStableMatch
       ? (pendingSet.has(b.id) || pendingSet.has(b.block_ref))
       : (pendingSet.has(b.id) || pendingSet.has(b.block_ref) || pendingSet.has(b.content_id));
     if (pending) {
-      for (let i = b.start_line; i < b.end_line && i < n; i++) { active[i] = true; any = true; }
+      const tooltip =
+        run.tooltips.get(b.id) ||
+        run.tooltips.get(b.block_ref) ||
+        run.tooltips.get(b.content_id) ||
+        systemTooltip ||
+        PROGRAM_SHIMMER_FALLBACK_TOOLTIP;
+      for (let i = b.start_line; i < b.end_line && i < n; i++) {
+        active[i] = true;
+        tooltips[i] = tooltip;
+        any = true;
+      }
     }
   }
-  return any ? active : null;
+  return any ? { active, tooltips } : null;
 }
 
 function programSettleLines(buffer, settledSet, blocks) {
@@ -4100,12 +4130,12 @@ function programApplyShimmer() {
   const id = state.program.mountedId;
   const lineEls = programInputEl.querySelectorAll(":scope > div");
   const run = id && state.program.runById.get(id);
-  let active = null;
+  let shimmer = null;
   let settling = null;
   if (run && performance.now() < run.deadlinePerf) {
     const doc = state.program.docById.get(id);
     const cleanBlocks = doc && programNormalizeClipIds(programSerialize()) === doc.saved ? (doc.blocks || []) : null;
-    active = programActiveLines(programSerialize(), run.pendingIds, cleanBlocks);
+    shimmer = programActiveLines(programSerialize(), run, cleanBlocks);
   }
   const settledRefs = id && state.program.settleById.get(id);
   if (settledRefs && settledRefs.size) {
@@ -4115,9 +4145,17 @@ function programApplyShimmer() {
     settling = cleanBlocks ? programSettleLines(programSerialize(), settledRefs, cleanBlocks) : null;
   }
   lineEls.forEach((el, i) => {
-    const running = !!(active && active[i]);
+    const running = !!(shimmer && shimmer.active[i]);
     el.classList.toggle("is-running", running);
     el.classList.toggle("is-settling", !running && !!(settling && settling[i]));
+    if (running) {
+      const label = shimmer.tooltips[i] || PROGRAM_SHIMMER_FALLBACK_TOOLTIP;
+      el.setAttribute("title", label);
+      el.setAttribute("aria-label", label);
+    } else {
+      el.removeAttribute("title");
+      el.removeAttribute("aria-label");
+    }
   });
 }
 
@@ -4543,6 +4581,7 @@ function programStartOptimisticRun(id, body, isSelection, selectedBlockIds, prev
   state.program.runById.set(id, {
     pendingIds: pending,
     tooltips: new Map(),
+    systemStatus: "",
     startPerf: perf,
     deadlinePerf: perf + PROGRAM_RUN_MAX_MS,
     firstOutputSeen: false,
