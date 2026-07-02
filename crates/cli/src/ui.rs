@@ -33,6 +33,7 @@ const MATRIX_WALLPAPER_DIM: f32 = 0.22;
 const PREVIEW_REVEAL_SECS: f32 = 1.0;
 const PROGRAM_REVEAL_SECS: f32 = PROGRAM_REVEAL_MS as f32 / 1000.0;
 const PROGRAM_RUN_BUTTON: &str = " ▶ ";
+const PROGRAM_TERMINAL_FOCUS_SLIDE_PERCENT: u16 = 20;
 /// Size of the session clip hover terminal preview. COLS caps the card's
 /// outer width and ROWS is the replayed content height, so the tooltip paints
 /// 64x24 cells; terminal cells are roughly twice as tall as they are wide, so
@@ -7573,6 +7574,27 @@ fn program_roll_down_height(base_height: u16, cover_percent: u16) -> u16 {
     wanted.clamp(min_height, base_height.max(1) as u32) as u16
 }
 
+fn program_terminal_focus_slide_offset(width: u16) -> u16 {
+    if width <= 1 {
+        return 0;
+    }
+    let offset = ((width as u32 * PROGRAM_TERMINAL_FOCUS_SLIDE_PERCENT as u32) + 50) / 100;
+    (offset as u16).clamp(1, width.saturating_sub(1))
+}
+
+fn program_popup_visible_rect(base_rect: Rect, visible_h: u16, slide_right: bool) -> Rect {
+    let mut rect = Rect {
+        height: visible_h,
+        ..base_rect
+    };
+    if slide_right {
+        rect.x = rect
+            .x
+            .saturating_add(program_terminal_focus_slide_offset(base_rect.width));
+    }
+    rect
+}
+
 /// Which source lines of a program are shimmering, plus the wave phase (spec
 /// 0042). Derived from the session's `ProgramRun` at render time.
 struct ProgramShimmer {
@@ -8025,10 +8047,8 @@ fn render_program_popup_at(
     if visible_h == 0 {
         return;
     }
-    let rect = Rect {
-        height: visible_h,
-        ..base_rect
-    };
+    let rect =
+        program_popup_visible_rect(base_rect, visible_h, active && app.program_terminal_focus);
 
     let summary = app
         .sessions
@@ -11895,6 +11915,30 @@ mod tests {
             style.fg,
             Some(theme.dim),
             "terminal-focused Program frame should not use the dim color"
+        );
+    }
+
+    #[test]
+    fn terminal_focused_program_popup_slides_right_without_resizing() {
+        let base = Rect::new(10, 4, 100, 30);
+        let rect = program_popup_visible_rect(base, 20, true);
+
+        assert_eq!(rect.x, 30, "20% of the pane should be revealed at left");
+        assert_eq!(rect.y, base.y);
+        assert_eq!(
+            rect.width, base.width,
+            "Program content must not reflow narrower"
+        );
+        assert_eq!(rect.height, 20);
+        assert!(
+            rect.right() > base.right(),
+            "right edge should move past the owning pane so it visually crops"
+        );
+
+        assert_eq!(
+            program_popup_visible_rect(base, 20, false),
+            Rect::new(10, 4, 100, 20),
+            "normal Program rendering stays anchored"
         );
     }
 
