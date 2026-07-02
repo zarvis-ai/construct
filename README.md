@@ -17,6 +17,10 @@ you. Remote control from your phone when you're in motion.
 - **A delightful way to manage multiple Claude Code and Codex sessions** —
   switch sessions instantly, pin multiple sessions to monitor, or let an agent
   observe all your sessions across different harnesses.
+- **Program: a shared board you and the agent run together** — every session
+  owns a durable Markdown document ([docs/program.md](docs/program.md)) that
+  human and agent co-edit live and execute: select a task, hit Run, and watch
+  per-block progress shimmer as workers report back.
 - **Agent-to-agent orchestration** — MCP tools let an agent list sessions, read
   output, spawn helpers, send input, inspect diffs, and drive Chrome.
 - **ACP (Agent Client Protocol) server** — point Agent Client Protocol clients at
@@ -157,6 +161,9 @@ For an optimized build, use `cargo build --workspace --release` and replace
   Agent Harness Protocol (AHP).
 - [Harnesses and session modes](docs/harnesses.md) — supported adapters,
   interactive vs. headless modes, worktree isolation, and resume behavior.
+- [Program](docs/program.md) — the per-session Markdown document you and the
+  agent co-edit and run: smart clips, run shimmer, templates, and live
+  collaboration.
 - [smith built-in agent](docs/smith.md) — providers, model selection, tools,
   approvals, automode, and hooks.
 - [Unified tool layer](docs/unified-tool-layer.md) — MCP servers and shared tools for
