@@ -1503,7 +1503,8 @@
   .program-wrap[hidden],
   .program-find[hidden],
   .program-empty[hidden],
-  .program-clip-menu[hidden] { display: none; }
+  .program-clip-menu[hidden],
+  .program-hover-card[hidden] { display: none; }
   .program-bar {
     display: flex;
     align-items: center;
@@ -1690,6 +1691,7 @@
     border-radius: 3px;
     animation: program-shimmer 1.6s linear infinite;
   }
+  .program-line.is-running { cursor: help; }
   .program-line.is-settling:not(.is-running) {
     background-image: linear-gradient(100deg,
       transparent 28%,
@@ -1716,6 +1718,45 @@
     z-index: 2;
     pointer-events: none;
     overflow: hidden;
+  }
+  .program-hover-card {
+    position: absolute;
+    z-index: 6;
+    width: min(440px, calc(100% - 24px));
+    max-width: calc(100% - 24px);
+    background: color-mix(in srgb, var(--bg-elev) 94%, black);
+    color: var(--fg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36);
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .program-hover-terminal {
+    height: 154px;
+    background: #020805;
+    border-bottom: 1px solid var(--border-faint);
+  }
+  .program-hover-terminal[hidden],
+  .program-hover-text[hidden] { display: none; }
+  .program-hover-terminal .xterm {
+    padding: 7px 8px;
+    box-sizing: border-box;
+  }
+  .program-hover-text {
+    padding: 8px 10px;
+    color: var(--fg);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .program-hover-caption {
+    padding: 6px 9px;
+    color: var(--fg-dim);
+    font-size: 12px;
+    line-height: 1.25;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .program-remote-cursor {
     position: absolute;
@@ -2005,6 +2046,11 @@
           <div class="program-empty" id="programEmpty" hidden></div>
           <div class="program-clip-menu" id="programClipMenu" hidden role="listbox"
                aria-label="smart-clip suggestions"></div>
+          <div class="program-hover-card" id="programHoverCard" hidden role="tooltip">
+            <div class="program-hover-terminal" id="programHoverTerminal" hidden></div>
+            <div class="program-hover-text" id="programHoverText"></div>
+            <div class="program-hover-caption" id="programHoverCaption"></div>
+          </div>
         </div>
       </div>
       <!--
@@ -2204,6 +2250,10 @@ const programInputEl = $("programInput");
 const programCursorLayerEl = $("programCursorLayer");
 const programEmptyEl = $("programEmpty");
 const programClipMenuEl = $("programClipMenu");
+const programHoverCardEl = $("programHoverCard");
+const programHoverTerminalEl = $("programHoverTerminal");
+const programHoverTextEl = $("programHoverText");
+const programHoverCaptionEl = $("programHoverCaption");
 const programVersionEl = $("programVersion");
 const programMsgEl = $("programMsg");
 const programSaveBtn = $("programSaveBtn");
@@ -2438,6 +2488,10 @@ const state = {
     clip: null,
     // Find state: { query, matches:[{s,e}], idx } | null.
     find: null,
+    // Desktop pointer hover affordance for Program shimmer/session clips.
+    // { kind, sessionId, anchorEl, token, term, clientX, clientY } | null.
+    hover: null,
+    hoverSeq: 0,
   },
 };
 
@@ -2456,6 +2510,7 @@ const WIDGET_AUTOHIDE_MS = 15000;
 const PTY_REPLAY_INITIAL_BYTES = 128 * 1024;
 const PTY_REPLAY_MAX_BYTES = 1024 * 1024;
 const PTY_REPLAY_TOP_THRESHOLD_ROWS = 20;
+const PROGRAM_HOVER_REPLAY_BYTES = 32 * 1024;
 let widgetAutohideTimer = null;
 
 function loadViewModePrefs() {
@@ -4008,6 +4063,14 @@ function programSessionChipStatusTooltip(status) {
   }
 }
 
+function programSessionClipPreviewCaption(id) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s) return "session deleted";
+  const title = (s.title && s.title.trim()) ? s.title.trim() : id.slice(0, 6);
+  const status = programSessionChipStatusTooltip(programSessionChipStatus(id));
+  return status ? `${title} · ${status}` : title;
+}
+
 // Build an atomic, content-fit chip widget for a raw `@{…}` clip. It is
 // contenteditable=false, so the browser treats it as one character: a single
 // cursor stop, and Backspace deletes the whole clip (the TUI's model, spec 0059).
@@ -4026,6 +4089,7 @@ function programChipEl(rawClip) {
     const status = programSessionChipStatus(id);
     span.dataset.status = status;
     span.title = programSessionChipStatusTooltip(status);
+    span.setAttribute("aria-label", programSessionClipPreviewCaption(id));
     span.classList.toggle("is-active", programSessionChipActive(id));
   }
   return span;
@@ -4047,7 +4111,236 @@ function programUpdateChipStatuses(sessionId) {
     chip.textContent = programClipLabel(body);
     chip.dataset.status = status;
     chip.title = programSessionChipStatusTooltip(status);
+    chip.setAttribute("aria-label", programSessionClipPreviewCaption(id));
     chip.classList.toggle("is-active", programSessionChipActive(id));
+  }
+}
+
+function programHoverDisposeTerm() {
+  const hover = state.program.hover;
+  if (hover && hover.term) {
+    try { hover.term.dispose(); } catch (_) {}
+    hover.term = null;
+  }
+  if (programHoverTerminalEl) programHoverTerminalEl.replaceChildren();
+}
+
+function programHideHover() {
+  const hover = state.program.hover;
+  state.program.hoverSeq += 1;
+  if (hover) hover.token = state.program.hoverSeq;
+  programHoverDisposeTerm();
+  state.program.hover = null;
+  programHoverCardEl.hidden = true;
+  programHoverTerminalEl.hidden = true;
+  programHoverTextEl.hidden = false;
+  programHoverTextEl.textContent = "";
+  programHoverCaptionEl.textContent = "";
+}
+
+function programPositionHoverCard(clientX, clientY) {
+  if (!programHoverCardEl || programHoverCardEl.hidden) return;
+  const editor = programEditorEl.getBoundingClientRect();
+  const margin = 10;
+  let left = clientX - editor.left + 14;
+  let top = clientY - editor.top + 14;
+  const width = programHoverCardEl.offsetWidth || 300;
+  const height = programHoverCardEl.offsetHeight || 80;
+  if (left + width > editor.width - margin) left = clientX - editor.left - width - 14;
+  if (top + height > editor.height - margin) top = clientY - editor.top - height - 14;
+  left = Math.max(margin, Math.min(left, Math.max(margin, editor.width - width - margin)));
+  top = Math.max(margin, Math.min(top, Math.max(margin, editor.height - height - margin)));
+  programHoverCardEl.style.left = Math.round(left) + "px";
+  programHoverCardEl.style.top = Math.round(top) + "px";
+}
+
+function programShowTextHover(kind, caption, anchorEl, clientX, clientY) {
+  const token = ++state.program.hoverSeq;
+  programHoverDisposeTerm();
+  state.program.hover = { kind, sessionId: null, anchorEl, token, term: null, clientX, clientY };
+  const label = caption || PROGRAM_SHIMMER_FALLBACK_TOOLTIP;
+  programHoverTextEl.textContent = label;
+  programHoverTextEl.hidden = false;
+  programHoverTerminalEl.hidden = true;
+  programHoverCaptionEl.textContent = label;
+  programHoverCardEl.hidden = false;
+  programPositionHoverCard(clientX, clientY);
+}
+
+function programTargetSessionHasPreviewableTerminal(sessionId) {
+  const s = state.sessions.find((x) => x.id === sessionId);
+  return !!(s && s.has_pty);
+}
+
+function programShowSessionHover(sessionId, caption, anchorEl, clientX, clientY) {
+  const token = ++state.program.hoverSeq;
+  programHoverDisposeTerm();
+  state.program.hover = { kind: "session", sessionId, anchorEl, token, term: null, clientX, clientY };
+  const label = caption || "session";
+  programHoverTextEl.textContent = label;
+  programHoverTextEl.hidden = false;
+  programHoverTerminalEl.hidden = true;
+  programHoverCaptionEl.textContent = label;
+  programHoverCardEl.hidden = false;
+  programPositionHoverCard(clientX, clientY);
+  if (programTargetSessionHasPreviewableTerminal(sessionId)) {
+    programLoadSessionHoverPreview(sessionId, token);
+  }
+}
+
+function programCreateHoverTerm() {
+  const term = new window.Terminal({
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontSize: 11,
+    lineHeight: 1.15,
+    convertEol: false,
+    cursorBlink: false,
+    disableStdin: true,
+    scrollback: 200,
+    cols: 72,
+    rows: 10,
+    theme: {
+      background: "#020805",
+      foreground: "#beffcd",
+      cursor: "#39ff88",
+      cursorAccent: "#06160c",
+      selectionBackground: "#1c4e2a",
+      black: "#020805",
+      red: "#ff5f5a",
+      green: "#7dff73",
+      yellow: "#ffd75c",
+      blue: "#5ce1ff",
+      magenta: "#ff7ad9",
+      cyan: "#5ce1ff",
+      white: "#beffcd",
+      brightBlack: "#20703a",
+      brightRed: "#ff8b86",
+      brightGreen: "#39ff88",
+      brightYellow: "#ffe58a",
+      brightBlue: "#8aeaff",
+      brightMagenta: "#ffa6e4",
+      brightCyan: "#8aeaff",
+      brightWhite: "#e1ffe6",
+    },
+  });
+  programHoverTerminalEl.replaceChildren();
+  term.open(programHoverTerminalEl);
+  term.resize(72, 10);
+  return term;
+}
+
+function filterTerminalAltScreenBytesStateless(data) {
+  if (!data || !data.length) return data;
+  if (typeof data === "string") return data.replace(/\x1b\[\?(?:1049|1047|47)[hl]/g, "");
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  let hasEsc = false;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === 0x1b) { hasEsc = true; break; }
+  }
+  if (!hasEsc) return data;
+  const out = [];
+  let changed = false;
+  for (let i = 0; i < bytes.length;) {
+    let matched = null;
+    for (const seq of TERMINAL_ALT_SCREEN_SEQUENCES) {
+      if (terminalAltSeqMatch(bytes, i, seq)) { matched = seq; break; }
+    }
+    if (matched) {
+      i += matched.length;
+      changed = true;
+      continue;
+    }
+    out.push(bytes[i]);
+    i++;
+  }
+  return changed ? new Uint8Array(out) : data;
+}
+
+async function programLoadSessionHoverPreview(sessionId, token) {
+  const ok = await waitForXterm(1200);
+  let hover = state.program.hover;
+  if (!ok || !hover || hover.token !== token || hover.sessionId !== sessionId) return;
+  let result;
+  try {
+    result = await rpc("session.pty_replay", {
+      session_id: sessionId,
+      max_bytes: PROGRAM_HOVER_REPLAY_BYTES,
+    });
+  } catch (_) {
+    return;
+  }
+  hover = state.program.hover;
+  if (!hover || hover.token !== token || hover.sessionId !== sessionId) return;
+  const bytes = decodeBase64ToBytes(result && result.data || "");
+  if (!bytes.length) return;
+  programHoverTerminalEl.hidden = false;
+  programHoverTextEl.hidden = true;
+  const term = programCreateHoverTerm();
+  hover.term = term;
+  await writeTermData(term, filterTerminalAltScreenBytesStateless(bytes));
+  term.scrollToBottom();
+  hover = state.program.hover;
+  if (hover && hover.token === token) programPositionHoverCard(hover.clientX, hover.clientY);
+}
+
+function programWriteHoverPty(sessionId, bytes) {
+  const hover = state.program.hover;
+  if (!hover || hover.kind !== "session" || hover.sessionId !== sessionId || !hover.term) return;
+  const data = filterTerminalAltScreenBytesStateless(bytes);
+  if (!data || !data.length) return;
+  const term = hover.term;
+  term.write(data, () => {
+    if (state.program.hover && state.program.hover.term === term) term.scrollToBottom();
+  });
+}
+
+function programHoverTargetFromEvent(e) {
+  const clipEl = e.target && e.target.closest ? e.target.closest(".program-clip[data-raw]") : null;
+  if (clipEl && programInputEl.contains(clipEl)) {
+    const body = (clipEl.dataset.raw || "").slice(2, -1);
+    const [kind, id] = programClipTarget(body);
+    if (kind === "session") {
+      return {
+        kind: "session",
+        sessionId: id,
+        caption: programSessionClipPreviewCaption(id),
+        anchorEl: clipEl,
+      };
+    }
+    return null;
+  }
+  const lineEl = e.target && e.target.closest ? e.target.closest(".program-line.is-running") : null;
+  if (lineEl && programInputEl.contains(lineEl)) {
+    return {
+      kind: "shimmer",
+      sessionId: null,
+      caption: lineEl.dataset.tooltip || PROGRAM_SHIMMER_FALLBACK_TOOLTIP,
+      anchorEl: lineEl,
+    };
+  }
+  return null;
+}
+
+function programHandleHoverPointerMove(e) {
+  if (e.pointerType === "touch") return;
+  const target = programHoverTargetFromEvent(e);
+  if (!target) { programHideHover(); return; }
+  const hover = state.program.hover;
+  const same =
+    hover &&
+    hover.kind === target.kind &&
+    hover.sessionId === (target.sessionId || null) &&
+    hover.anchorEl === target.anchorEl;
+  if (same) {
+    hover.clientX = e.clientX;
+    hover.clientY = e.clientY;
+    programPositionHoverCard(e.clientX, e.clientY);
+    return;
+  }
+  if (target.kind === "session") {
+    programShowSessionHover(target.sessionId, target.caption, target.anchorEl, e.clientX, e.clientY);
+  } else {
+    programShowTextHover("shimmer", target.caption, target.anchorEl, e.clientX, e.clientY);
   }
 }
 
@@ -4461,11 +4754,13 @@ function programApplyShimmer() {
     el.classList.toggle("is-settling", !running && !!(settling && settling[i]));
     if (running) {
       const label = shimmer.tooltips[i] || PROGRAM_SHIMMER_FALLBACK_TOOLTIP;
-      el.setAttribute("title", label);
+      el.dataset.tooltip = label;
       el.setAttribute("aria-label", label);
     } else {
-      el.removeAttribute("title");
+      delete el.dataset.tooltip;
       el.removeAttribute("aria-label");
+      const hover = state.program.hover;
+      if (hover && hover.kind === "shimmer" && hover.anchorEl === el) programHideHover();
     }
   });
 }
@@ -4554,6 +4849,7 @@ function leaveProgramView() {
   programRunBtn.dataset.running = "false";
   programRunStageEl.textContent = "";
   programCloseClipMenu();
+  programHideHover();
   programCloseFind();
   programWrapEl.hidden = true;
   state.program.mountedId = null;
@@ -5529,7 +5825,9 @@ function programWireEvents() {
     programRenderCursors();
   });
   programInputEl.addEventListener("click", () => { programUpdateClipMenu(); programPublishCursor(); programRenderCursors(); });
-  programInputEl.addEventListener("scroll", programRenderCursors);
+  programInputEl.addEventListener("pointermove", programHandleHoverPointerMove);
+  programInputEl.addEventListener("pointerleave", programHideHover);
+  programInputEl.addEventListener("scroll", () => { programRenderCursors(); programHideHover(); });
   document.addEventListener("selectionchange", () => {
     if (document.activeElement === programInputEl && state.program.mountedId) {
       programPublishCursor();
@@ -7234,7 +7532,10 @@ function handleNotification(method, params) {
       if (session_id === state.currentId) applyPassiveTerminalWidth();
       return;
     }
-    if (event && event.type === "pty") observeSessionPtyActivity(session_id, params.at);
+    if (event && event.type === "pty") {
+      observeSessionPtyActivity(session_id, params.at);
+      programWriteHoverPty(session_id, decodeBase64ToBytes(event.data || ""));
+    }
     if (event && event.type === "agent_status") {
       if (event.active) state.agentStatusById.set(session_id, event);
       else {
@@ -7306,6 +7607,7 @@ function handleNotification(method, params) {
     state.sessions = state.sessions.filter((s) => s.id !== params.session_id);
     // Any chip referencing the now-gone session flips to "missing".
     programUpdateChipStatuses(params.session_id);
+    if (state.program.hover && state.program.hover.sessionId === params.session_id) programHideHover();
     scheduleRenderSessions();
     state.editorById.delete(params.session_id);
     state.agentStatusById.delete(params.session_id);

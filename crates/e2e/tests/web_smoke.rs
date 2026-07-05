@@ -14,9 +14,9 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use agentd_e2e::{artifact_dir, Daemon};
-use base64::engine::general_purpose::STANDARD as B64;
+use agentd_e2e::{Daemon, artifact_dir};
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::cdp::browser_protocol::page::{
     EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
@@ -741,6 +741,162 @@ async fn web_client_loads_and_websocket_connects() {
     assert!(
         xterm_present,
         "bundled xterm.js never loaded (window.Terminal !== 'function')"
+    );
+
+    let program_hover: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const saved = {
+                sessions: state.sessions,
+                currentId: state.currentId,
+                mode: state.mode,
+                mountedId: state.program.mountedId,
+                docById: state.program.docById,
+                runById: state.program.runById,
+                hover: state.program.hover,
+                ws: state.ws,
+                html: programInputEl.innerHTML,
+                wrapHidden: programWrapEl.hidden,
+              };
+              const calls = [];
+              try {
+                const markdown = 'Build worker @{session:s-worker}';
+                const block = programBlockSpans(markdown)[0];
+                state.sessions = [
+                  { id: 's-owner', title: 'Owner', harness: 'smith', state: 'running', has_pty: true },
+                  { id: 's-worker', title: 'Worker', harness: 'shell', state: 'running', has_pty: true },
+                ];
+                state.currentId = 's-owner';
+                state.mode = 'program';
+                state.program.mountedId = 's-owner';
+                state.program.docById = new Map([['s-owner', {
+                  version: 1,
+                  templateId: null,
+                  saved: programNormalizeClipIds(markdown),
+                  live: programNormalizeClipIds(markdown),
+                  blocks: programBlockSpans(markdown),
+                  pendingLive: 0,
+                }]]);
+                state.program.runById = new Map([['s-owner', {
+                  pendingIds: new Set([block.id]),
+                  tooltips: new Map([[block.id, 'Building worker']]),
+                  systemStatus: '',
+                  startPerf: performance.now(),
+                  deadlinePerf: performance.now() + 60000,
+                }]]);
+                state.ws = {
+                  readyState: 1,
+                  send(raw) {
+                    const msg = JSON.parse(raw);
+                    calls.push(msg);
+                    const pending = state.pending.get(msg.id);
+                    state.pending.delete(msg.id);
+                    if (msg.method === 'session.pty_replay') {
+                      queueMicrotask(() => pending.resolve({
+                        data: btoa('WORKER_PREVIEW_LINE\nsecond line\n'),
+                        start_offset: 0,
+                        end_offset: 32,
+                        total_bytes: 32,
+                        size: { cols: 80, rows: 24 },
+                      }));
+                    } else {
+                      queueMicrotask(() => pending.resolve({}));
+                    }
+                  },
+                };
+
+                programWrapEl.hidden = false;
+                programRenderDoc(markdown);
+                programApplyShimmer();
+                await new Promise((resolve) => requestAnimationFrame(resolve));
+
+                const line = programInputEl.querySelector('.program-line.is-running');
+                const lineRect = line.getBoundingClientRect();
+                line.dispatchEvent(new PointerEvent('pointermove', {
+                  bubbles: true,
+                  pointerType: 'mouse',
+                  clientX: lineRect.left + 6,
+                  clientY: lineRect.top + 6,
+                }));
+                await new Promise((resolve) => requestAnimationFrame(resolve));
+                const shimmerTooltip = programHoverTextEl.textContent;
+                const shimmerTerminalHidden = programHoverTerminalEl.hidden;
+
+                const chip = programInputEl.querySelector('.program-clip[data-raw]');
+                const chipRect = chip.getBoundingClientRect();
+                chip.dispatchEvent(new PointerEvent('pointermove', {
+                  bubbles: true,
+                  pointerType: 'mouse',
+                  clientX: chipRect.left + 4,
+                  clientY: chipRect.top + 4,
+                }));
+                for (let i = 0; i < 20; i++) {
+                  await new Promise((resolve) => requestAnimationFrame(resolve));
+                  if (!programHoverTerminalEl.hidden) break;
+                }
+                const previewCall = calls.find((c) => c.method === 'session.pty_replay');
+                const active = state.program.hover?.term?.buffer?.active;
+                let previewText = '';
+                if (active) {
+                  const rows = [];
+                  for (let i = 0; i < active.length; i++) {
+                    const line = active.getLine(i);
+                    if (line) rows.push(line.translateToString(true));
+                  }
+                  previewText = rows.join('\n');
+                }
+                return {
+                  shimmerTooltip,
+                  shimmerTerminalHidden,
+                  cardVisible: !programHoverCardEl.hidden,
+                  previewCallParams: previewCall && previewCall.params,
+                  previewTerminalVisible: !programHoverTerminalEl.hidden,
+                  previewCaption: programHoverCaptionEl.textContent,
+                  previewText,
+                };
+              } finally {
+                programHideHover();
+                state.sessions = saved.sessions;
+                state.currentId = saved.currentId;
+                state.mode = saved.mode;
+                state.program.mountedId = saved.mountedId;
+                state.program.docById = saved.docById;
+                state.program.runById = saved.runById;
+                state.program.hover = saved.hover;
+                state.ws = saved.ws;
+                programInputEl.innerHTML = saved.html;
+                programWrapEl.hidden = saved.wrapHidden;
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate program hover")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(program_hover["shimmerTooltip"], "Building worker");
+    assert_eq!(program_hover["shimmerTerminalHidden"], true);
+    assert_eq!(program_hover["cardVisible"], true);
+    assert_eq!(
+        program_hover["previewCallParams"]["session_id"], "s-worker",
+        "session clip hover should fetch the referenced session preview: {program_hover:?}"
+    );
+    assert_eq!(
+        program_hover["previewTerminalVisible"], true,
+        "session clip hover should upgrade to a terminal preview: {program_hover:?}"
+    );
+    assert!(
+        program_hover["previewCaption"]
+            .as_str()
+            .is_some_and(|caption| caption.contains("Worker")),
+        "preview caption should identify the referenced session: {program_hover:?}"
+    );
+    assert!(
+        program_hover["previewText"]
+            .as_str()
+            .is_some_and(|text| text.contains("WORKER_PREVIEW_LINE")),
+        "preview terminal should contain replayed PTY output: {program_hover:?}"
     );
 
     // Mobile regression: selecting a PTY-backed session from the list must not

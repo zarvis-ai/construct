@@ -14,6 +14,7 @@ Every session's Program is reachable and fully usable from the web UI, not only 
 - **Save** with optimistic-version conflict handling: a save carries the base version; when the document advanced underneath the editor, the client performs a three-way merge against the common ancestor and writes the result, surfacing standard conflict markers when the merge cannot reconcile overlapping edits.
 - **Run** the whole document, or the current text selection, dispatching the program to the owning session.
 - **Run shimmer**: while a run is in flight, the still-pending blocks shimmer with a travelling-wave highlight, and a per-block run-status tooltip is reachable.
+- **Desktop hover affordances**: on pointer-hover devices, hovering a shimmering block shows its run-status tooltip, and hovering a `@{session:…}` smart-clip shows a compact terminal-tail preview for the referenced session with a status caption. If the target session cannot be previewed, the clip hover degrades to the caption text.
 - **Templates**: an empty Program offers the available non-blank templates as one-click starting points.
 - **Smart-clip autocomplete**: typing the clip trigger offers matching sessions and harnesses and inserts the corresponding clip reference.
 - **Find** within the document.
@@ -38,4 +39,4 @@ Anchoring block identity and merge on the shared rules is what lets shimmer, set
 
 - Pixel-identical rendering or identical keybindings between TUI and web.
 - A rich rendered-Markdown editor: the Program surface is a plain-text Markdown editor with overlays (clips, shimmer, find), matching the TUI's plain-text model, not a WYSIWYG view.
-- Reimplementing the TUI's mouse-hover session-card preview; the web surface may show the lighter per-block run-status tooltip instead.
+- Pixel-identical hover cards between TUI and web. The required parity is semantic: shimmer hover surfaces status text, and session-clip hover previews the referenced session when possible.
