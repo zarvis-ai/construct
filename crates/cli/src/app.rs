@@ -806,6 +806,7 @@ pub struct App {
     /// the cached list until the fresh one lands).
     pub program_templates_tx: mpsc::UnboundedSender<Vec<agentd_protocol::ProgramTemplate>>,
     pub theme: crate::theme::Theme,
+    pub theme_name: crate::theme::ThemeName,
     pub help_visible: bool,
     pub profile: Profile,
     pub keymap: Keymap,
@@ -2271,6 +2272,8 @@ pub struct LayoutSnapshot {
     pub matrix_operator_loop_hit: Option<(u16, u16, u16)>,
     /// Matrix-rain title-bar Operator label bounds: `(x_start, x_end, y)`.
     pub matrix_operator_title_hit: Option<(u16, u16, u16)>,
+    /// Matrix-rain title-bar theme switcher bounds: `(x_start, x_end, y)`.
+    pub matrix_theme_hit: Option<(u16, u16, u16)>,
     /// Matrix-rain title-bar widget viewport affordances for the operator session.
     pub matrix_widget_hits: Vec<MatrixWidgetHit>,
     /// Dynamic UI title-bar affordance bounds: `(x_start, x_end, y, session_id)`.
@@ -2529,6 +2532,7 @@ async fn run_with_socket_initial_selection(
         program_templates,
         program_templates_tx,
         theme,
+        theme_name: theme_config.active_name(None),
         help_visible: false,
         profile,
         keymap,
@@ -2690,7 +2694,8 @@ async fn run_with_socket_initial_selection(
         None
     };
     app.theme = theme_config.resolve(detected_light);
-    tracing::info!(mode = ?theme_config.mode, ?detected_light, "tui theme resolved");
+    app.theme_name = theme_config.active_name(detected_light);
+    tracing::info!(mode = ?theme_config.mode, theme = ?app.theme_name, ?detected_light, "tui theme resolved");
     let mut stdout = std::io::stdout();
     execute!(
         stdout,
@@ -7707,6 +7712,18 @@ impl App {
         }
     }
 
+    pub(super) fn apply_named_theme(&mut self, name: crate::theme::ThemeName) {
+        let mut cfg = crate::theme::ThemeConfig::load();
+        match cfg.select_named(name) {
+            Ok(theme) => {
+                self.theme = theme;
+                self.theme_name = name;
+                self.set_status(format!("theme: {}", name.label()));
+            }
+            Err(e) => self.set_status(format!("theme failed: {e}")),
+        }
+    }
+
     /// Execute a slash-style command (`zoom`, `new`, `quit`, ...) with
     /// no LLM involvement. Used both by the orchestrator panel (when
     /// input starts with `/`) and by the static palette (fallback when
@@ -7748,6 +7765,27 @@ impl App {
                         "expanded"
                     }
                 ));
+            }
+            "theme" => {
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    let names = crate::theme::ThemeName::ALL
+                        .iter()
+                        .map(|name| name.label())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    self.set_status(format!(
+                        "theme: {} (current: {})",
+                        names,
+                        self.theme_name.label()
+                    ));
+                } else if matches!(arg, "next" | "cycle") {
+                    self.apply_named_theme(self.theme_name.next());
+                } else if let Some(name) = crate::theme::ThemeName::parse(arg) {
+                    self.apply_named_theme(name);
+                } else {
+                    self.set_status(format!("theme: unknown '{arg}'; use matrix, dark, or light"));
+                }
             }
             "archived" | "archive" | "archives" => {
                 self.toggle_archived_for_selection();
@@ -9436,6 +9474,7 @@ mod tests {
             dynamic_ui_inline_hit: None,
             matrix_operator_loop_hit: None,
             matrix_operator_title_hit: None,
+            matrix_theme_hit: None,
             matrix_widget_hits: Vec::new(),
             dynamic_ui_trigger: None,
             dynamic_ui_triggers: Vec::new(),
@@ -9467,6 +9506,7 @@ mod tests {
             program_templates: Vec::new(),
             program_templates_tx: mpsc::unbounded_channel().0,
             theme: crate::theme::Theme::default(),
+            theme_name: crate::theme::ThemeName::Matrix,
             help_visible: false,
             profile: Profile::Emacs,
             keymap: keymap::default_for(Profile::Emacs),

@@ -3,6 +3,8 @@
 //! Ships a Matrix-inspired palette in dark and light variants. By default
 //! (`mode = "auto"`) the active variant is chosen at startup by querying the
 //! terminal's background color (OSC 11); `mode = "light"`/`"dark"` force one.
+//! The runtime `/theme` command writes a named `theme = "matrix" | "dark" |
+//! "light"` choice, which takes precedence over legacy `mode`.
 //! Individual slots can be overridden on top of the active variant:
 //!
 //! ```toml
@@ -19,6 +21,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};
 use serde::Deserialize;
+use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -102,10 +105,57 @@ pub enum ThemeMode {
     Dark,
 }
 
+/// User-visible named UI themes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeName {
+    #[default]
+    Matrix,
+    Dark,
+    Light,
+}
+
+impl ThemeName {
+    pub const ALL: [ThemeName; 3] = [ThemeName::Matrix, ThemeName::Dark, ThemeName::Light];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "matrix" | "green" => Some(Self::Matrix),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Matrix => "matrix",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Matrix => "matrix",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Matrix => Self::Dark,
+            Self::Dark => Self::Light,
+            Self::Light => Self::Matrix,
+        }
+    }
+}
+
 /// Parsed `theme.toml` (the `mode` + raw `[colors]` text), kept so the final
 /// palette can be resolved *after* the terminal background is detected.
 pub struct ThemeConfig {
     pub mode: ThemeMode,
+    pub name: Option<ThemeName>,
     /// Raw file contents (empty if no theme.toml), re-applied as `[colors]`
     /// overrides onto whichever base palette is chosen.
     text: String,
@@ -120,6 +170,7 @@ impl ThemeConfig {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Self {
                     mode: ThemeMode::Auto,
+                    name: None,
                     text: String::new(),
                     warning: None,
                 }
@@ -127,6 +178,7 @@ impl ThemeConfig {
             Err(e) => {
                 return Self {
                     mode: ThemeMode::Auto,
+                    name: None,
                     text: String::new(),
                     warning: Some(format!("theme read failed ({}): {e}", path.display())),
                 }
@@ -139,6 +191,7 @@ impl ThemeConfig {
             .map(|e| format!("theme parse failed ({}): {e}", path.display()));
         Self {
             mode: parse_mode(&text),
+            name: parse_theme_name(&text),
             text,
             warning,
         }
@@ -147,21 +200,62 @@ impl ThemeConfig {
     /// Build the final palette. `detected_light` is the OSC 11 result for
     /// `Auto` (ignored for forced modes); `None` falls back to dark.
     pub fn resolve(&self, detected_light: Option<bool>) -> Theme {
-        let light = match self.mode {
-            ThemeMode::Light => true,
-            ThemeMode::Dark => false,
-            ThemeMode::Auto => detected_light.unwrap_or(false),
+        let base = match self.name {
+            Some(name) => Theme::named(name),
+            None => {
+                let light = match self.mode {
+                    ThemeMode::Light => true,
+                    ThemeMode::Dark => false,
+                    ThemeMode::Auto => detected_light.unwrap_or(false),
+                };
+                if light {
+                    Theme::light()
+                } else {
+                    Theme::dark()
+                }
+            }
         };
-        let base = if light { Theme::light() } else { Theme::dark() };
         if self.text.is_empty() {
             return base;
         }
         // Overrides were validated at load; ignore errors here.
         parse_theme_onto(base.clone(), &self.text).unwrap_or(base)
     }
+
+    pub fn active_name(&self, detected_light: Option<bool>) -> ThemeName {
+        if let Some(name) = self.name {
+            return name;
+        }
+        match self.mode {
+            ThemeMode::Light => ThemeName::Light,
+            ThemeMode::Dark => ThemeName::Matrix,
+            ThemeMode::Auto => {
+                if detected_light.unwrap_or(false) {
+                    ThemeName::Light
+                } else {
+                    ThemeName::Matrix
+                }
+            }
+        }
+    }
+
+    pub fn select_named(&mut self, name: ThemeName) -> Result<Theme, String> {
+        persist_named_theme(name)?;
+        self.name = Some(name);
+        self.text = set_theme_line(&self.text, name);
+        Ok(self.resolve(None))
+    }
 }
 
 impl Theme {
+    pub fn named(name: ThemeName) -> Self {
+        match name {
+            ThemeName::Matrix => Self::dark(),
+            ThemeName::Dark => Self::dark_ui(),
+            ThemeName::Light => Self::light_ui(),
+        }
+    }
+
     /// The default Matrix palette, tuned for a dark terminal background.
     pub fn dark() -> Self {
         Self::default()
@@ -202,6 +296,78 @@ impl Theme {
             matrix_flash_good: Color::Rgb(18, 150, 70),
             matrix_flash_warn: Color::Rgb(176, 126, 18),
             matrix_flash_bad: Color::Rgb(190, 50, 44),
+        }
+    }
+
+    /// Neutral dark palette for users who want Construct without the Matrix hue.
+    pub fn dark_ui() -> Self {
+        Self {
+            text: Color::Rgb(232, 236, 243),
+            dim: Color::Rgb(102, 112, 128),
+            muted: Color::Rgb(145, 153, 166),
+            border: Color::Rgb(70, 82, 100),
+            border_focused: Color::Rgb(121, 184, 255),
+            accent: Color::Rgb(121, 184, 255),
+            accent_alt: Color::Rgb(255, 176, 84),
+            highlight_fg: Color::Rgb(12, 18, 28),
+            highlight_bg: Color::Rgb(121, 184, 255),
+            inactive_highlight_bg: Color::Rgb(43, 52, 66),
+            modeline_fg: Color::Rgb(232, 236, 243),
+            modeline_bg: Color::Rgb(29, 38, 52),
+            success: Color::Rgb(99, 201, 127),
+            warning: Color::Rgb(238, 190, 90),
+            danger: Color::Rgb(244, 107, 116),
+            info: Color::Rgb(121, 184, 255),
+            group: Color::Rgb(176, 191, 212),
+            harness: Color::Rgb(176, 191, 212),
+            user: Color::Rgb(245, 247, 250),
+            assistant: Color::Rgb(183, 210, 245),
+            system: Color::Rgb(126, 136, 150),
+            tool: Color::Rgb(99, 201, 127),
+            matrix_dim: Color::Rgb(51, 62, 78),
+            matrix_line: Color::Rgb(76, 92, 112),
+            matrix_close: Color::Rgb(176, 191, 212),
+            matrix_glow: Color::Rgb(91, 112, 138),
+            matrix_flash_work: Color::Rgb(183, 210, 245),
+            matrix_flash_good: Color::Rgb(99, 201, 127),
+            matrix_flash_warn: Color::Rgb(238, 190, 90),
+            matrix_flash_bad: Color::Rgb(244, 107, 116),
+        }
+    }
+
+    /// Neutral light palette with dark text and restrained color accents.
+    pub fn light_ui() -> Self {
+        Self {
+            text: Color::Rgb(34, 40, 49),
+            dim: Color::Rgb(125, 135, 148),
+            muted: Color::Rgb(92, 103, 118),
+            border: Color::Rgb(195, 204, 216),
+            border_focused: Color::Rgb(34, 115, 195),
+            accent: Color::Rgb(34, 115, 195),
+            accent_alt: Color::Rgb(174, 96, 28),
+            highlight_fg: Color::Rgb(255, 255, 255),
+            highlight_bg: Color::Rgb(34, 115, 195),
+            inactive_highlight_bg: Color::Rgb(226, 232, 240),
+            modeline_fg: Color::Rgb(255, 255, 255),
+            modeline_bg: Color::Rgb(52, 86, 128),
+            success: Color::Rgb(37, 135, 72),
+            warning: Color::Rgb(172, 113, 24),
+            danger: Color::Rgb(190, 56, 68),
+            info: Color::Rgb(34, 115, 195),
+            group: Color::Rgb(64, 82, 104),
+            harness: Color::Rgb(64, 82, 104),
+            user: Color::Rgb(20, 24, 32),
+            assistant: Color::Rgb(42, 88, 145),
+            system: Color::Rgb(112, 122, 136),
+            tool: Color::Rgb(37, 135, 72),
+            matrix_dim: Color::Rgb(218, 225, 234),
+            matrix_line: Color::Rgb(184, 196, 210),
+            matrix_close: Color::Rgb(64, 82, 104),
+            matrix_glow: Color::Rgb(146, 164, 184),
+            matrix_flash_work: Color::Rgb(42, 88, 145),
+            matrix_flash_good: Color::Rgb(37, 135, 72),
+            matrix_flash_warn: Color::Rgb(172, 113, 24),
+            matrix_flash_bad: Color::Rgb(190, 56, 68),
         }
     }
 
@@ -247,8 +413,55 @@ fn parse_mode(text: &str) -> ThemeMode {
     }
 }
 
+fn parse_theme_name(text: &str) -> Option<ThemeName> {
+    toml::from_str::<RawTheme>(text)
+        .ok()
+        .and_then(|r| r.theme)
+        .and_then(|name| ThemeName::parse(&name))
+}
+
 pub fn theme_file() -> PathBuf {
     Paths::discover().config_dir.join("theme.toml")
+}
+
+fn persist_named_theme(name: ThemeName) -> Result<(), String> {
+    let path = theme_file();
+    let existing = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("theme read failed ({}): {e}", path.display())),
+    };
+    let updated = set_theme_line(&existing, name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("theme dir create failed ({}): {e}", parent.display()))?;
+    }
+    fs::write(&path, updated).map_err(|e| format!("theme write failed ({}): {e}", path.display()))
+}
+
+fn set_theme_line(text: &str, name: ThemeName) -> String {
+    let mut out = Vec::new();
+    let mut in_top_level = true;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') {
+            in_top_level = false;
+        }
+        if in_top_level
+            && trimmed
+                .strip_prefix("theme")
+                .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            continue;
+        }
+        out.push(line);
+    }
+    let mut updated = format!("theme = \"{}\"\n", name.as_str());
+    if !out.is_empty() {
+        updated.push_str(&out.join("\n"));
+        updated.push('\n');
+    }
+    updated
 }
 
 /// Query the terminal's background color via OSC 11 and return `Some(true)` for
@@ -281,13 +494,7 @@ pub fn detect_terminal_is_light(timeout: std::time::Duration) -> Option<bool> {
             break;
         }
         let mut chunk = [0u8; 64];
-        let n = unsafe {
-            libc::read(
-                fd,
-                chunk.as_mut_ptr() as *mut libc::c_void,
-                chunk.len(),
-            )
-        };
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
         if n <= 0 {
             break;
         }
@@ -440,6 +647,8 @@ fn parse_color(s: &str) -> Result<Color, String> {
 #[derive(Debug, Default, Deserialize)]
 struct RawTheme {
     #[serde(default)]
+    theme: Option<String>,
+    #[serde(default)]
     mode: Option<String>,
     #[serde(default)]
     colors: Option<RawColors>,
@@ -525,12 +734,14 @@ mod tests {
         // Dark mode stays dark even if the terminal reports light, and vice versa.
         let dark = ThemeConfig {
             mode: ThemeMode::Dark,
+            name: None,
             text: String::new(),
             warning: None,
         };
         assert_eq!(dark.resolve(Some(true)).text, Theme::dark().text);
         let light = ThemeConfig {
             mode: ThemeMode::Light,
+            name: None,
             text: String::new(),
             warning: None,
         };
@@ -541,12 +752,40 @@ mod tests {
     fn auto_mode_follows_detection_and_falls_back_dark() {
         let auto = ThemeConfig {
             mode: ThemeMode::Auto,
+            name: None,
             text: String::new(),
             warning: None,
         };
         assert_eq!(auto.resolve(Some(true)).text, Theme::light().text);
         assert_eq!(auto.resolve(Some(false)).text, Theme::dark().text);
         assert_eq!(auto.resolve(None).text, Theme::dark().text); // no answer → dark
+    }
+
+    #[test]
+    fn named_theme_takes_precedence_over_legacy_mode() {
+        let cfg = ThemeConfig {
+            mode: ThemeMode::Light,
+            name: Some(ThemeName::Dark),
+            text: String::new(),
+            warning: None,
+        };
+        assert_eq!(cfg.resolve(Some(true)).text, Theme::dark_ui().text);
+    }
+
+    #[test]
+    fn set_theme_line_replaces_only_top_level_theme() {
+        let updated = set_theme_line(
+            r##"
+theme = "matrix"
+mode = "auto"
+[colors]
+theme = "#ffffff"
+"##,
+            ThemeName::Light,
+        );
+        assert!(updated.starts_with("theme = \"light\""));
+        assert!(updated.contains("mode = \"auto\""));
+        assert!(updated.contains("[colors]\ntheme = \"#ffffff\""));
     }
 
     #[test]
