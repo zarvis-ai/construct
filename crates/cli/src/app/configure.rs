@@ -86,8 +86,8 @@ pub fn smith_method_guidance(id: &str) -> &'static str {
              restart the daemon"
         }
         "claude_subscription" => {
-            "run `claude login` (creates ~/.claude/.credentials.json) as the user the daemon \
-             runs as, then restart the daemon"
+            "run `claude` and log in with your Claude subscription first (creates \
+             ~/.claude/.credentials.json), as the user the daemon runs as, then restart the daemon"
         }
         "codex_subscription" => {
             "run `codex login` (creates ~/.codex/auth.json), then restart the daemon"
@@ -99,7 +99,8 @@ pub fn smith_method_guidance(id: &str) -> &'static str {
             "install Ollama and run `ollama serve` so it's reachable at localhost:11434 (or \
              set OLLAMA_HOST), then restart the daemon"
         }
-        "auto" => "uses the first available method above, in the order listed",
+        "auto" => "uses the first detected API key: Anthropic, then OpenAI, then Gemini; \
+                   subscriptions and Ollama must be picked explicitly",
         _ => "",
     }
 }

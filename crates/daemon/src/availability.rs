@@ -274,6 +274,12 @@ fn env_key_method(
 /// smith-auth tab — unlike `probe_smith` (one pass/fail signal for the
 /// harness picker), this breaks the detection down per method so the dialog
 /// can list all of them and let the user pin one explicitly.
+///
+/// The `auto` entry is the exception: its `available` reflects only the
+/// three direct-API-key methods, because those are the only ones smith's
+/// real auto-detect ladder consults absent a pin (spec 0071) — every other
+/// method here requires an explicit `<prefix>:<model>` pin to be selected
+/// (spec 0069).
 pub async fn smith_auth_methods(cache: &std::sync::Mutex<AvailabilityCache>) -> Vec<SmithAuthMethod> {
     let anthropic = env_key_method(
         "anthropic_api_key",
@@ -355,28 +361,27 @@ pub async fn smith_auth_methods(cache: &std::sync::Mutex<AvailabilityCache>) -> 
             "no Ollama server reachable".to_string()
         },
     };
-    let any_available = [
-        anthropic.available,
-        openai.available,
-        gemini.available,
-        grok_key.available,
-        claude_sub.available,
-        codex_sub.available,
-        grok_sub.available,
-        ollama.available,
-    ]
-    .into_iter()
-    .any(|a| a);
+    // `auto` mirrors `agent::default_auto_detect_spec`'s actual ladder
+    // (spec 0071) — direct API keys only, in this order. It must NOT count
+    // the other five methods here: those all require an explicit
+    // `<prefix>:<model>` pin to be selected (see spec 0069's auto-vs-
+    // explicit distinction), so reporting `auto` as available because e.g.
+    // only a Claude subscription exists would tell the dialog "Auto-detect
+    // is ready" while a session started without a pin still errors with
+    // "no auto-detected smith credential" — the exact promise/behavior
+    // mismatch this dialog exists to prevent.
+    let auto_available = anthropic.available || openai.available || gemini.available;
     let auto = SmithAuthMethod {
         id: "auto",
         label: "Auto-detect",
         model_prefix: "",
         default_model: "",
-        available: any_available,
-        detail: if any_available {
-            "uses the first available method above".to_string()
+        available: auto_available,
+        detail: if auto_available {
+            "auto-detects the first set API key: Anthropic → OpenAI → Gemini".to_string()
         } else {
-            "no method above is available yet".to_string()
+            "no auto-detected API key set (subscriptions and Ollama must be picked explicitly)"
+                .to_string()
         },
     };
     vec![
@@ -453,5 +458,73 @@ mod tests {
         // `sh` is present on every platform this daemon supports.
         let avail = probe_wrapper_cli("CONSTRUCT_TEST_SH_CMD", "CONSTRUCT_TEST_SH_BIN", "sh");
         assert!(avail.available);
+    }
+
+    /// Serializes tests that mutate the direct-API-key / `HOME` env vars
+    /// `smith_auth_methods` reads, so parallel test execution can't race them.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression for the `auto` entry counting subscription/Ollama
+    /// availability: a machine with only a Codex subscription credential
+    /// (no direct API key) must NOT report `auto` as available, since
+    /// `agent::default_auto_detect_spec`'s real ladder (spec 0071) never
+    /// consults subscriptions or Ollama without an explicit pin. Reporting
+    /// `auto` as ready here would tell `/configure` "Auto-detect is ready"
+    /// while a session started without a pin still errors at start — the
+    /// exact mismatch this dialog exists to prevent.
+    #[tokio::test]
+    async fn auto_unavailable_when_only_a_subscription_credential_exists() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let key_vars = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ];
+        let saved_keys: Vec<Option<String>> =
+            key_vars.iter().map(|v| std::env::var(v).ok()).collect();
+        for v in key_vars {
+            std::env::remove_var(v);
+        }
+        let saved_home = std::env::var("HOME").ok();
+        let saved_codex_home = std::env::var("CODEX_HOME").ok();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join(".codex")).expect("mkdir");
+        std::fs::write(tmp.path().join(".codex").join("auth.json"), "{}").expect("write");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("CODEX_HOME");
+
+        let cache = std::sync::Mutex::new(AvailabilityCache::default());
+        let methods = smith_auth_methods(&cache).await;
+
+        for (v, saved) in key_vars.iter().zip(saved_keys) {
+            match saved {
+                Some(val) => std::env::set_var(v, val),
+                None => std::env::remove_var(v),
+            }
+        }
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_codex_home {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+
+        let codex = methods
+            .iter()
+            .find(|m| m.id == "codex_subscription")
+            .expect("codex entry present");
+        assert!(
+            codex.available,
+            "fixture ~/.codex/auth.json should be detected"
+        );
+        let auto = methods.iter().find(|m| m.id == "auto").expect("auto entry present");
+        assert!(
+            !auto.available,
+            "auto must not report available from a subscription-only credential"
+        );
+        assert!(auto.detail.contains("subscriptions and Ollama"));
     }
 }
