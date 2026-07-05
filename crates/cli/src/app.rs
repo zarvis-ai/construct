@@ -29,6 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 
+mod configure;
 mod dynamic_ui;
 mod editor;
 mod matrix_clicks;
@@ -37,6 +38,10 @@ mod mouse;
 mod program_popup;
 mod session_picker;
 mod session_title_menu;
+pub use configure::{
+    harness_guidance, no_agent_harness_available, smith_method_guidance, ConfigurePopup,
+    ConfigureTab, CONFIGURE_TABS,
+};
 pub use session_picker::{
     session_picker_scroll, SessionPickerDialog, SessionPickerPurpose, SessionPickerRow,
 };
@@ -1027,6 +1032,10 @@ pub struct App {
     /// /tasks popup state: `None` = closed, `Some(...)` = open with
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
+    /// `/configure` onboarding dialog (spec 0069): `None` = closed. Opened by
+    /// the command palette, or automatically on first run / when no agent
+    /// harness is available. Captures all input while open.
+    pub configure_popup: Option<ConfigurePopup>,
     /// Reusable session-picker dialog (spec 0063): `None` = closed. Opened by
     /// `C-x b` (switch the active window's session) and by the program view's
     /// `@`→session path (insert a session clip). Captures all input while open.
@@ -2282,6 +2291,9 @@ pub struct LayoutSnapshot {
     pub dynamic_ui_dropdown_area: Option<ratatui::layout::Rect>,
     /// Last rendered dynamic UI stack dimensions: `(session_id, content_rows, viewport_rows)`.
     pub dynamic_ui_scroll_metrics: Option<(String, usize, usize)>,
+    /// Clickable tab-header regions of the `/configure` dialog from the last
+    /// frame (spec 0069) — the only mouse interaction it supports.
+    pub configure_tab_hits: Vec<(ConfigureTab, ratatui::layout::Rect)>,
 }
 
 #[derive(Debug, Clone)]
@@ -2548,6 +2560,7 @@ async fn run_with_socket_initial_selection(
         matrix_reveal_hits: Vec::new(),
         orchestrator_desired_size: None,
         tasks_popup: None,
+        configure_popup: None,
         session_picker: None,
         program_popup: None,
         program_popups: HashMap::new(),
@@ -2678,6 +2691,8 @@ async fn run_with_socket_initial_selection(
         app.hydrating_sessions.insert(id);
     }
 
+    app.maybe_auto_open_configure_popup().await;
+
     // Terminal setup.
     enable_raw_mode().context("enable raw mode")?;
     // Now that the terminal is in raw mode (and before the event loop starts
@@ -2768,10 +2783,10 @@ async fn run_loop(
     // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
     // Re-probe harness availability while the welcome card (no session
-    // selected) is showing, so installing a CLI or exporting an API key
-    // updates the card's live status without a TUI restart. Gated to that
-    // view so a busy fleet doesn't pay an extra IPC round trip every 5s for
-    // no visible benefit.
+    // selected) or the `/configure` dialog is showing, so installing a CLI
+    // or exporting an API key updates the live status without a TUI
+    // restart. Gated to those views so a busy fleet doesn't pay an extra
+    // IPC round trip every 5s for no visible benefit.
     let mut harness_refresh = tokio::time::interval(Duration::from_secs(5));
     harness_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Wall-clock of the last actual `terminal.draw`. The notification arm uses
@@ -3212,8 +3227,11 @@ async fn run_loop(
                 app.update_browser_preview_hover_and_expiry();
                 app.expire_program_runs(Instant::now());
             }
-            _ = harness_refresh.tick(), if app.connected && app.selected_id().is_none() => {
-                if let Ok(list) = app.client.harnesses().await {
+            _ = harness_refresh.tick(), if app.connected
+                && (app.selected_id().is_none() || app.configure_popup.is_some()) => {
+                if app.configure_popup.is_some() {
+                    app.refresh_configure_popup().await;
+                } else if let Ok(list) = app.client.harnesses().await {
                     app.harnesses = list;
                 }
             }
@@ -6022,6 +6040,24 @@ impl App {
         // render against.
         let next_pos = (ev.column, ev.row);
         self.mouse_pos = Some(next_pos);
+        // The `/configure` dialog (spec 0069) is a topmost modal: a
+        // left-click is tested against the tab headers first (dialog stays
+        // open); any other left-click closes it — like clicking away from
+        // an open menu — and the SAME click still takes effect on whatever
+        // is underneath, mirroring `on_key`'s fallthrough for keys. Every
+        // other mouse event kind (hover, scroll, drag, right-click) is
+        // swallowed without closing anything — only an actual click should
+        // dismiss the dialog.
+        if self.configure_popup.is_some() {
+            match ev.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.configure_click_tab(ev.column, ev.row) {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
         // If the cursor is over a pane whose child has grabbed the mouse
         // (e.g. Claude Code in fullscreen), forward the event into that PTY and
         // stop — construct becomes a transparent mouse pipe for the pane, so
@@ -6877,6 +6913,17 @@ impl App {
         // captures input instead of leaking it into the program buffer.
         if self.session_picker_active() {
             self.handle_session_picker_key(key);
+            return;
+        }
+        // The `/configure` dialog (spec 0069) owns the keys it uses for its
+        // own navigation. Anything else closes it and falls through to
+        // ordinary routing below — same keystroke, re-dispatched exactly
+        // once — like clicking away from an open menu: `C-x x` closes the
+        // dialog and opens the command palette, `C-x C-f` closes it and
+        // opens the new-session picker, `C-x C-c` closes it and quits. No
+        // chord is ever a dead end just because this dialog happened to be
+        // on screen (it can auto-open with no prior user action).
+        if self.configure_popup.is_some() && self.handle_configure_key(key).await {
             return;
         }
         if self.tasks_popup.is_some() {
@@ -7816,6 +7863,9 @@ impl App {
                     })
                     .collect();
                 self.set_status(format!("harnesses: {}", names.join(", ")));
+            }
+            "configure" => {
+                self.open_configure_popup().await;
             }
             "construct" => {
                 // Subcommand dispatch:
@@ -9442,6 +9492,7 @@ mod tests {
             dynamic_ui_popover_area: None,
             dynamic_ui_dropdown_area: None,
             dynamic_ui_scroll_metrics: None,
+            configure_tab_hits: Vec::new(),
         }
     }
 
@@ -9519,6 +9570,7 @@ mod tests {
             resizing_program_popup: None,
             list_collapsed: false,
             tasks_popup: None,
+            configure_popup: None,
             session_picker: None,
             program_popup: None,
             program_popups: HashMap::new(),
@@ -9847,6 +9899,417 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
         (client, dir, server)
+    }
+
+    /// Mock daemon for `/configure` dialog tests (spec 0069): answers
+    /// `harness.list`, `smith.auth_status`, and `smith.set_auth_method` from
+    /// fixed fixtures so the dialog's fetch/navigate/confirm flow can be
+    /// driven end-to-end without a real daemon.
+    async fn configure_mock_daemon(
+        harnesses: Vec<serde_json::Value>,
+        smith_methods: Vec<serde_json::Value>,
+        smith_current: Option<&str>,
+    ) -> (Arc<Client>, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let smith_current = smith_current.map(|s| s.to_string());
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let harnesses = harnesses.clone();
+                let smith_methods = smith_methods.clone();
+                let smith_current = smith_current.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let Ok(n) = reader.read_line(&mut line).await else {
+                            break;
+                        };
+                        if n == 0 {
+                            break;
+                        }
+                        let req: Value = serde_json::from_str(&line).expect("json request");
+                        let id = req.get("id").cloned().unwrap_or(Value::Null);
+                        let method = req
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        let params = req.get("params").cloned().unwrap_or(Value::Null);
+                        let result = match method.as_str() {
+                            ipc_method::HARNESS_LIST => Value::Array(harnesses.clone()),
+                            ipc_method::SMITH_AUTH_STATUS => serde_json::json!({
+                                "methods": smith_methods,
+                                "current": smith_current,
+                            }),
+                            ipc_method::SMITH_SET_AUTH_METHOD => {
+                                let method_id = params
+                                    .get("method")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let model_spec = if method_id == "auto" {
+                                    Value::Null
+                                } else {
+                                    Value::String(format!("{method_id}:test-model"))
+                                };
+                                serde_json::json!({
+                                    "model_spec": model_spec,
+                                    "note": "new sessions pick up this default after \
+                                             `construct daemon restart`; already-running \
+                                             sessions keep their current model",
+                                })
+                            }
+                            _ => Value::Null,
+                        };
+                        let resp =
+                            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                        if writer
+                            .write_all((resp.to_string() + "\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        (client, dir, server)
+    }
+
+    fn harness_json(name: &str, available: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "available": available,
+            "detail": if available { "ready" } else { "not found" },
+        })
+    }
+
+    fn smith_method_json(id: &str, label: &str, available: bool) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "label": label,
+            "available": available,
+            "detail": if available { "detected" } else { "not found" },
+        })
+    }
+
+    #[tokio::test]
+    async fn open_configure_popup_fetches_harnesses_and_smith_status() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("claude", false), harness_json("shell", true)],
+            vec![
+                smith_method_json("anthropic_api_key", "Anthropic API key", false),
+                smith_method_json("auto", "Auto-detect", true),
+            ],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+
+        app.open_configure_popup().await;
+
+        assert_eq!(app.harnesses.len(), 2);
+        let popup = app.configure_popup.as_ref().expect("dialog open");
+        assert_eq!(popup.tab, ConfigureTab::Harnesses);
+        assert_eq!(popup.smith_methods.len(), 2);
+        assert_eq!(popup.smith_current.as_deref(), Some("auto"));
+    }
+
+    #[tokio::test]
+    async fn configure_key_navigation_switches_tab_and_wraps_selection() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("claude", false), harness_json("shell", true)],
+            vec![
+                smith_method_json("anthropic_api_key", "Anthropic API key", false),
+                smith_method_json("auto", "Auto-detect", true),
+            ],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
+
+        app.handle_configure_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.configure_popup.as_ref().unwrap().tab,
+            ConfigureTab::SmithAuth
+        );
+
+        app.handle_configure_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.configure_popup.as_ref().unwrap().smith_selected, 1);
+        // Wraps back to the first row rather than going out of bounds.
+        app.handle_configure_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.configure_popup.as_ref().unwrap().smith_selected, 0);
+
+        app.handle_configure_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.configure_popup.as_ref().unwrap().tab,
+            ConfigureTab::Harnesses
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_enter_on_smith_tab_persists_choice_and_shows_note() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("shell", true)],
+            vec![
+                smith_method_json("anthropic_api_key", "Anthropic API key", false),
+                smith_method_json("auto", "Auto-detect", true),
+            ],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
+        app.handle_configure_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await; // → smith-auth tab, row 0 = anthropic_api_key
+
+        app.handle_configure_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        let popup = app.configure_popup.as_ref().expect("dialog still open");
+        assert_eq!(popup.smith_current.as_deref(), Some("anthropic_api_key"));
+        assert!(popup.note.as_deref().unwrap_or("").contains("restart"));
+    }
+
+    #[tokio::test]
+    async fn configure_enter_on_harnesses_tab_is_a_no_op() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("shell", true)],
+            vec![smith_method_json("auto", "Auto-detect", true)],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
+
+        app.handle_configure_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        let popup = app.configure_popup.as_ref().expect("dialog still open");
+        assert_eq!(popup.tab, ConfigureTab::Harnesses);
+        assert!(popup.note.is_none());
+    }
+
+    /// Regression: `on_key`'s configure-popup gate used to swallow every key
+    /// it didn't claim for its own navigation — first with a bare `_ => {}`,
+    /// then with a narrower "let only Quit through" special case — so any
+    /// *other* chord (the command palette's `C-x x`, the new-session
+    /// picker's `C-x C-f`, …) was a dead end while the dialog owned input.
+    /// That's a real first-run bug: this dialog can auto-open with no prior
+    /// user action, and every one of these is documented muscle-memory UX
+    /// (the welcome card advertises `C-x C-c`; the help text advertises
+    /// `C-x x`). The general rule fixes all of them at once: an unclaimed
+    /// key closes the dialog and is re-dispatched through ordinary `on_key`
+    /// routing exactly once — like clicking away from an open menu — so the
+    /// same keystroke that dismissed the dialog still does what it always
+    /// does. Drives the full `on_key` gate chain (not just
+    /// `handle_configure_key` directly) so it also covers the `connected`/
+    /// `session_picker`/`configure_popup` ordering actually deciding who
+    /// owns the keystroke.
+    #[tokio::test]
+    async fn configure_dialog_unclaimed_key_closes_and_reprocesses_through_normal_routing() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("shell", true)],
+            vec![smith_method_json("auto", "Auto-detect", true)],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
+        assert!(app.configure_popup.is_some(), "dialog should be open");
+
+        // `C-x` isn't one of the dialog's own keys (Esc/Left/Right/Tab/
+        // BackTab/Up/Down/Enter), so it closes the dialog immediately and
+        // is fed to the ordinary chord state machine on this same call.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            app.configure_popup.is_none(),
+            "an unclaimed key must close the dialog rather than being swallowed"
+        );
+        // Completing the chord with a plain `x` opens the command palette —
+        // exactly as it would if the dialog had never been open.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+        assert!(
+            matches!(
+                app.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::CommandPalette)
+            ),
+            "C-x x must close the dialog AND open the command palette"
+        );
+    }
+
+    /// The global quit chord is not a special case anymore — it's just one
+    /// instance of the general "unclaimed key closes + reprocesses" rule
+    /// covered above. This test pins that specific, previously-broken case.
+    #[tokio::test]
+    async fn configure_dialog_quit_chord_works_via_the_general_rule() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("shell", true)],
+            vec![smith_method_json("auto", "Auto-detect", true)],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            !app.should_quit,
+            "first half of the C-x C-c chord must not quit yet"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            app.should_quit,
+            "C-x C-c must still quit the TUI even though the configure dialog was open"
+        );
+    }
+
+    /// Serializes tests that mutate `CONSTRUCT_STATE_DIR`.
+    static CONFIGURE_SEEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Regression: the first-run marker used to be written only on Esc/close,
+    /// so a user who quit the TUI (`C-x C-c`) while the dialog was still open
+    /// got re-nagged on the very next launch despite having already seen it.
+    /// Marking on open instead means quitting mid-dialog still counts.
+    #[tokio::test]
+    async fn open_configure_popup_marks_seen_immediately_not_only_on_close() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved_state_dir = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+
+        assert!(
+            !crate::tui_state::configure_dialog_seen(),
+            "fresh state dir starts unseen"
+        );
+
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("shell", true)],
+            vec![smith_method_json("auto", "Auto-detect", true)],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
+
+        let seen_after_open = crate::tui_state::configure_dialog_seen();
+
+        match saved_state_dir {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+
+        assert!(
+            seen_after_open,
+            "opening the dialog must mark it seen even before Esc/close"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_click_tab_switches_and_reports_hit() {
+        let (client, _dir, _server) = configure_mock_daemon(Vec::new(), Vec::new(), None).await;
+        let mut app = test_app(client, Vec::new());
+        app.configure_popup = Some(ConfigurePopup {
+            tab: ConfigureTab::Harnesses,
+            harness_selected: 0,
+            smith_selected: 0,
+            smith_methods: Vec::new(),
+            smith_current: None,
+            note: None,
+        });
+        app.layout.configure_tab_hits = vec![
+            (
+                ConfigureTab::Harnesses,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 10,
+                    height: 1,
+                },
+            ),
+            (
+                ConfigureTab::SmithAuth,
+                Rect {
+                    x: 10,
+                    y: 0,
+                    width: 10,
+                    height: 1,
+                },
+            ),
+        ];
+
+        assert!(app.configure_click_tab(12, 0));
+        assert_eq!(
+            app.configure_popup.as_ref().unwrap().tab,
+            ConfigureTab::SmithAuth
+        );
+        // A click outside any tab header closes the dialog — like clicking
+        // away from an open menu — mirroring the keyboard fallthrough rule.
+        assert!(
+            !app.configure_click_tab(12, 5),
+            "miss outside any tab rect returns false"
+        );
+        assert!(
+            app.configure_popup.is_none(),
+            "a click outside the tab headers must close the dialog"
+        );
+    }
+
+    #[test]
+    fn no_agent_harness_available_ignores_shell() {
+        assert!(no_agent_harness_available(&[]));
+        let shell_only = vec![agentd_protocol::HarnessInfo {
+            name: "shell".to_string(),
+            available: true,
+            detail: None,
+            binary: None,
+            description: None,
+            capabilities: Default::default(),
+        }];
+        assert!(no_agent_harness_available(&shell_only));
+
+        let one_agent_ready = vec![
+            agentd_protocol::HarnessInfo {
+                name: "shell".to_string(),
+                available: true,
+                detail: None,
+                binary: None,
+                description: None,
+                capabilities: Default::default(),
+            },
+            agentd_protocol::HarnessInfo {
+                name: "claude".to_string(),
+                available: true,
+                detail: None,
+                binary: None,
+                description: None,
+                capabilities: Default::default(),
+            },
+        ];
+        assert!(!no_agent_harness_available(&one_agent_ready));
     }
 
     // End-to-end reproduction of the reported repro: open Program on a

@@ -1995,6 +1995,21 @@ mod tests {
             "monitor_model_usable took {elapsed:?}, expected < 8 s (5 s timeout + headroom)"
         );
     }
+
+    /// The orchestrator exception's stand-in provider (spec 0071) must fail
+    /// clearly rather than panic if anything calls it before the main turn
+    /// loop's lazy re-resolve runs — e.g. a background ambient tick firing
+    /// before the user's first message.
+    #[tokio::test]
+    async fn unconfigured_provider_completes_with_a_clear_error() {
+        use provider::LlmProvider as _;
+        let mut sink = DiscardSink;
+        let err = UnconfiguredProvider
+            .complete("stub-model", "sys", &[], &[], &mut sink)
+            .await
+            .expect_err("unconfigured provider must not succeed");
+        assert!(err.to_string().contains("no usable model configured"));
+    }
 }
 
 /// Tri-state interrupt signal used during in-flight turns.
@@ -2011,22 +2026,64 @@ impl Interrupted {
     }
 }
 
+/// Stand-in `provider` for the orchestrator exception (spec 0071): used
+/// while no model has resolved yet, so `provider: Box<dyn LlmProvider>`
+/// never needs to become `Option`-typed through the many helpers that take
+/// it as a plain reference (`compact`, `handle_slash_loop`,
+/// `run_ambient_triage`, auto-review, interval-suggest, …). The main turn
+/// loop checks `model_ready` and lazily re-resolves before ever calling
+/// this; any other path that reaches it anyway (e.g. a background ambient
+/// tick firing before the user's first turn) gets a clean error instead of
+/// a panic — every caller already tolerates a provider error.
+struct UnconfiguredProvider;
+
+#[async_trait::async_trait]
+impl provider::LlmProvider for UnconfiguredProvider {
+    fn name(&self) -> &str {
+        "unconfigured"
+    }
+    async fn complete(
+        &self,
+        _model: &str,
+        _system: &str,
+        _messages: &[Message],
+        _tools: &[provider::ToolSpec],
+        _sink: &mut dyn TextSink,
+    ) -> Result<provider::ProviderTurn> {
+        Err(anyhow::anyhow!("smith has no usable model configured yet"))
+    }
+}
+
 pub async fn run(
     params: SessionStartParams,
     ctx: AdapterContext,
-    spec: ResolvedModel,
+    spec: std::result::Result<ResolvedModel, String>,
 ) -> Result<()> {
     let AdapterContext {
         session_id,
         emit,
         mut inbox,
     } = ctx;
-    let mut provider_name = spec.provider_name();
+    // `spec` is `Err` only for the orchestrator exception (spec 0071): the
+    // caller (`lib.rs::run`) already emitted the curated startup error as a
+    // visible `SessionEvent::Error` and still wants the REPL to come up so
+    // slash commands keep working. `model_ready = false` means `provider`
+    // below is `UnconfiguredProvider` — a stub that fails clearly if
+    // anything calls it — until the main turn loop lazily re-resolves a
+    // real model (see the `model_ready` check just before `push_msg!`).
+    let mut model_ready = spec.is_ok();
+    let mut provider_name: &'static str = "unconfigured";
     // User-facing label (`@profile` when from config, else the wire name).
     // `provider_name` stays the wire name for limit/context/monitor keying.
-    let mut display_name = spec.display_name();
-    let mut model = spec.model.clone();
-    let mut provider = spec.provider;
+    let mut display_name = "(not configured)".to_string();
+    let mut model = String::new();
+    let mut provider: Box<dyn provider::LlmProvider> = Box::new(UnconfiguredProvider);
+    if let Ok(resolved) = spec {
+        provider_name = resolved.provider_name();
+        display_name = resolved.display_name();
+        model = resolved.model.clone();
+        provider = resolved.provider;
+    }
     let cwd = PathBuf::from(&params.cwd);
     let hooks = crate::hooks::Hooks::load(&cwd, &emit);
     let base_hook_payload = crate::hooks::base_payload(&session_id, &cwd, "interactive");
@@ -2633,6 +2690,38 @@ pub async fn run(
         if user_text.trim().is_empty() {
             emit_editor_state(&emit, &editor, &queue);
             continue;
+        }
+
+        // Orchestrator exception (spec 0071): this text is a real turn, not
+        // a slash command (those already `continue`d above without ever
+        // reaching here), so it needs an actual model. If startup couldn't
+        // resolve one, try again now — the user may have exported a key or
+        // picked a method in `/configure` since the session started — and
+        // fail this turn alone (not the whole session) if it still can't.
+        // Ordinary sessions never see `model_ready == false`, since `lib.rs`
+        // only starts this REPL unresolved for the orchestrator.
+        if !model_ready {
+            match crate::agent::resolve_model(&params) {
+                Ok(resolved) => {
+                    provider_name = resolved.provider_name();
+                    display_name = resolved.display_name();
+                    model = resolved.model.clone();
+                    provider = resolved.provider;
+                    model_ready = true;
+                    term.note(&format!("(model configured: {display_name}:{model})"));
+                    emit.emit(SessionEvent::Status {
+                        state: SessionState::Running,
+                        detail: Some(format!("{display_name}:{model}  [interactive]")),
+                    });
+                }
+                Err(e) => {
+                    emit.emit(SessionEvent::Error {
+                        message: crate::model_startup_error_message(&params, &e.to_string()),
+                    });
+                    emit_editor_state(&emit, &editor, &queue);
+                    continue;
+                }
+            }
         }
 
         hooks

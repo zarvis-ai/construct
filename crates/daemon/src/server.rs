@@ -16,7 +16,8 @@ use agentd_protocol::{
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetFocusedParams, SessionSetGroupParams, SessionSetPinnedParams,
     SessionSetProjectParams, SessionSetTitleParams, SessionSetViewParams, SessionToolActionParams,
-    SessionToolDecisionParams, SubscribeParams, TranscriptParams, IPC_VERSION,
+    SessionToolDecisionParams, SmithSetAuthMethodParams, SubscribeParams, TranscriptParams,
+    IPC_VERSION,
 };
 use anyhow::{Context, Result};
 use futures::{SinkExt as _, StreamExt as _};
@@ -1084,6 +1085,16 @@ async fn dispatch(
     });
     dispatch_entry!(ipc_method::HARNESS_LIST, {
         ok!(req, &manager.harnesses().await)
+    });
+    dispatch_entry!(ipc_method::SMITH_AUTH_STATUS, {
+        ok!(req, &manager.smith_auth_status().await)
+    });
+    dispatch_entry!(ipc_method::SMITH_SET_AUTH_METHOD, {
+        let p = params!(req, SmithSetAuthMethodParams);
+        match manager.set_smith_auth_method(&p.method).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
     });
     dispatch_entry!(ipc_method::PROGRAM_GET, {
         let p = params!(req, ProgramGetParams);

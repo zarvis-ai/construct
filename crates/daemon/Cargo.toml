@@ -25,6 +25,7 @@ clap.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 nix.workspace = true
 libc = "0.2"
 which.workspace = true

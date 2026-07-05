@@ -77,6 +77,27 @@ fn state_path() -> PathBuf {
     Paths::discover().tui_state_file()
 }
 
+/// Marker file (spec 0069) recording that the `/configure` dialog has been
+/// dismissed at least once, so it only auto-opens unprompted on a genuinely
+/// fresh install — not every launch. Deliberately a separate file from
+/// `tui-state.json` (rewritten wholesale on every quit) so checking "have we
+/// shown this before" doesn't require parsing the full state blob.
+fn configure_seen_marker_path() -> PathBuf {
+    Paths::discover().state_dir.join("configure-seen")
+}
+
+pub fn configure_dialog_seen() -> bool {
+    configure_seen_marker_path().exists()
+}
+
+pub fn mark_configure_dialog_seen() {
+    let path = configure_seen_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"");
+}
+
 pub fn load() -> TuiState {
     let path = state_path();
     let bytes = match std::fs::read(&path) {

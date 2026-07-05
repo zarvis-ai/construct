@@ -65,7 +65,33 @@ pub async fn run() -> anyhow::Result<()> {
         },
     };
     adapter_run(metadata, |params, ctx| async move {
-        let resolved = match agent::resolve_model(&params) {
+        let mode = resolve_mode(&params);
+        let is_orchestrator =
+            std::env::var("CONSTRUCT_SESSION_KIND").as_deref() == Ok("orchestrator");
+        let resolved = agent::resolve_model(&params);
+
+        // Orchestrator exception (spec 0071): the minibuffer's smith session
+        // must keep serving slash commands — which never touch the provider
+        // (`/construct restart` is the case this exists for) — even when no
+        // model resolves. Hard-exiting here the way an ordinary session does
+        // would take the whole fleet-dispatch surface down on a keyless
+        // machine. `interactive::run` re-attempts resolution lazily on the
+        // first turn that actually needs a model.
+        if is_orchestrator && matches!(mode, Mode::Interactive) {
+            let resolved =
+                resolved.map_err(|e| model_startup_error_message(&params, &e.to_string()));
+            if let Err(message) = &resolved {
+                ctx.emit.emit(SessionEvent::Error {
+                    message: message.clone(),
+                });
+            }
+            if let Err(e) = interactive::run(params, ctx, resolved).await {
+                tracing::warn!(error = ?e, "smith agent loop returned with error");
+            }
+            return;
+        }
+
+        let resolved = match resolved {
             Ok(r) => r,
             Err(e) => {
                 ctx.emit.emit(SessionEvent::Error {
@@ -75,9 +101,8 @@ pub async fn run() -> anyhow::Result<()> {
                 return;
             }
         };
-        let mode = resolve_mode(&params);
         let result = match mode {
-            Mode::Interactive => interactive::run(params, ctx, resolved).await,
+            Mode::Interactive => interactive::run(params, ctx, Ok(resolved)).await,
             Mode::Headless => agent::run(params, ctx, resolved).await,
         };
         if let Err(e) = result {
@@ -96,7 +121,13 @@ fn model_startup_error_message(params: &SessionStartParams, error: &str) -> Stri
     msg.push_str(error);
 
     let lower = error.to_lowercase();
-    if lower.contains("grok auth token") && lower.contains("expired") {
+    if lower.contains("no auto-detected smith credential") {
+        msg.push_str(
+            "\n\nAction: run `/configure` in the construct TUI (or `M-x configure`) to see \
+             every auth method smith supports, its live status, and how to set it up — or set \
+             `CONSTRUCT_SMITH_MODEL` / `--model` explicitly.",
+        );
+    } else if lower.contains("grok auth token") && lower.contains("expired") {
         msg.push_str(
             "\n\nAction: run `grok login`, then restart this session again. \
              Alternatively set `GROK_API_KEY` or `XAI_API_KEY` before restarting.",
@@ -126,7 +157,8 @@ fn model_startup_error_message(params: &SessionStartParams, error: &str) -> Stri
     msg.push_str(
         "\n\nsmith needs one of: `CONSTRUCT_SMITH_MODEL`, `ANTHROPIC_API_KEY`, \
          `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROK_API_KEY`/`XAI_API_KEY`, \
-         a valid Grok OAuth login, or a local Ollama.",
+         a valid Grok OAuth login, or a local Ollama. Run `/configure` in the construct TUI \
+         (or `M-x configure`) to check status and pick one.",
     );
     msg
 }
