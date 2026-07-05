@@ -19105,6 +19105,47 @@ mod tests {
             screen.contains("A harness is the runtime"),
             "missing harness concept:\n{screen}"
         );
+        assert!(
+            screen.contains("emacs keymap"),
+            "default help should show emacs profile:\n{screen}"
+        );
+        assert!(
+            screen.contains("Use C-x C-f to create a session"),
+            "default help should show emacs shortcuts:\n{screen}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn help_modal_uses_vim_shortcuts_in_vim_profile() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.help_visible = true;
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+        let backend = ratatui::backend::TestBackend::new(120, 70);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("vim keymap"),
+            "vim help should show vim profile:\n{screen}"
+        );
+        assert!(
+            screen.contains("Use n to create a session"),
+            "vim help should show vim create shortcut:\n{screen}"
+        );
+        assert!(
+            screen.contains(":               command palette"),
+            "vim help should show vim command palette shortcut:\n{screen}"
+        );
+        assert!(
+            !screen.contains("Use C-x C-f to create a session"),
+            "vim help should not show the emacs create shortcut as primary:\n{screen}"
+        );
         server.abort();
     }
 

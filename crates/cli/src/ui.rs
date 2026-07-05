@@ -7,7 +7,7 @@ use crate::app::{
     PROGRAM_COLLAB_CURSOR_TTL_MS, PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y,
     PROGRAM_REVEAL_MS,
 };
-use crate::keymap::KeyAction;
+use crate::keymap::{KeyAction, Profile};
 use crate::text_util::wrap_to_width;
 use crate::theme::Theme;
 use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
@@ -283,7 +283,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_tasks_popup(f, app);
     render_remote_control_popup(f, app);
     if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme));
+        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
     }
     render_session_title_menu(f, app);
     finish_frame(f, app);
@@ -1249,7 +1249,7 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     }
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme));
+        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
     }
 }
 
@@ -1279,7 +1279,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     render_sessions(f, main_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme));
+        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
     }
 }
 
@@ -6166,7 +6166,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
-fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
+fn render_help(f: &mut Frame, area: Rect, theme: &Theme, profile: Profile) -> Rect {
     // Target a comfortable reading width — long enough to keep each
     // command line on one row without wrapping, capped so it doesn't
     // span an ultra-wide terminal edge-to-edge. The outer rect adds
@@ -6178,8 +6178,9 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
     let target_w = 92u16;
     let width = target_w.min(area.width.saturating_sub(2 * MARGIN + 4));
     // Content height = lines + 2 borders + 2 vertical padding.
+    let help_text = help_text_for_profile(profile);
     let height =
-        (HELP_TEXT.lines().count() as u16 + 4).min(area.height.saturating_sub(2 * MARGIN + 2));
+        (help_text.lines().count() as u16 + 4).min(area.height.saturating_sub(2 * MARGIN + 2));
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect {
@@ -6204,7 +6205,7 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
         .border_style(Style::default().fg(theme.border_focused))
         .padding(ratatui::widgets::Padding::new(2, 2, 1, 1))
         .title(" help (any key to close) ");
-    let para = Paragraph::new(HELP_TEXT)
+    let para = Paragraph::new(help_text)
         .block(block)
         .style(Style::default().fg(theme.text))
         .wrap(Wrap { trim: false });
@@ -6212,7 +6213,14 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme) -> Rect {
     popup
 }
 
-const HELP_TEXT: &str = "
+fn help_text_for_profile(profile: Profile) -> &'static str {
+    match profile {
+        Profile::Emacs => EMACS_HELP_TEXT,
+        Profile::Vim => VIM_HELP_TEXT,
+    }
+}
+
+const EMACS_HELP_TEXT: &str = "
 emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   getting started
@@ -6275,6 +6283,78 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
                                       zoom interrupt refresh harnesses help
     ?               toggle this help
     C-x C-c          quit
+
+When the right pane is showing a PTY-backed session (shell / interactive
+claude / interactive codex) and focus is on the view, keystrokes go to the
+child. `C-x` is the escape prefix — start any `C-x …` chord above to run
+an construct command without changing focus.
+";
+
+const VIM_HELP_TEXT: &str = "
+vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
+
+  getting started
+    A session is one live task or terminal that construct keeps in the list.
+    A harness is the runtime for a session: smith, codex, claude, or shell.
+    The left pane selects sessions; the right pane shows the selected session.
+    Use n to create a session, then choose a harness.
+    Use : for the command palette when you forget a shortcut.
+
+  focus + view
+    C-x o           other window (list → windows → list)
+    C-2 .. C-5      focus split window 1..4 directly (C-2 = first window)
+    Shift+arrow     focus the adjacent split window (in a split layout)
+    C-x arrow       same — reliable alias where the terminal eats Shift+up/down
+    RET (on list)   focus the selected session's view
+    C-x 2 / C-x 3   split current main window below / right
+    C-x 0 / C-x 1   delete current window / delete other windows
+    C-x ^           make current window taller
+    C-x } / C-x {   make current window wider / narrower
+    v / C-x t       toggle chat ↔ terminal view
+    z               zoom: fill the screen with the session view
+    j / down        next session
+    k / up          prev session
+
+  session actions
+    n               new session
+    C-x b           switch session (picker dialog: type to filter, ↑↓ move)
+    i               send input to selected session
+    K               delete selected session (confirms; kills if running)
+    C-x Space       open selected session's program
+    C-x C-o         focus session terminal / refocus Program
+    d               show diff
+    r               rename selected session (clears title on empty submit)
+    f               fork selected session into a new harness (seeded w/ history)
+    C-c             interrupt
+
+  scrollback
+    C-x [ / C-x ]   scroll page up/down
+    C-f / C-b       scroll page down/up
+    g g / G         scroll top / bottom
+    C-x { / C-x }   scroll top / bottom
+
+  pinning (live tile in the pin strip below the main view)
+    Space / p       toggle pin on selected session
+
+  reorder list
+    C-x C-p         move selected session up   (Meta-free, works everywhere)
+    C-x C-n         move selected session down
+    Shift-up/down   same, when the list is focused, in terminals that pass
+                    Shift to arrows (iTerm2/WezTerm/Alacritty yes; macOS
+                    Terminal.app no). In a focused split, Shift+arrow moves
+                    focus between panes instead (see focus + view).
+
+  mouse
+    drag text       select visible TUI text and copy to terminal clipboard
+    C-x m           toggle mouse capture off/on for native selection fallback
+
+  global
+    :               command palette
+                    palette commands: new fork send delete rename program diff border
+                                      zoom interrupt refresh harnesses help
+    A               cycle approval mode
+    ?               toggle this help
+    C-x C-c         quit
 
 When the right pane is showing a PTY-backed session (shell / interactive
 claude / interactive codex) and focus is on the view, keystrokes go to the
