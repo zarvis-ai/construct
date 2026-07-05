@@ -26,6 +26,9 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// Full-frame terminal background. `None` leaves the terminal's own
+    /// background visible, which is intentional for the Matrix theme.
+    pub background: Option<Color>,
     pub text: Color,
     pub dim: Color,
     pub muted: Color,
@@ -61,6 +64,7 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
+            background: None,
             text: Color::Rgb(190, 255, 205),
             dim: Color::Rgb(32, 112, 58),
             muted: Color::Rgb(76, 150, 92),
@@ -266,6 +270,7 @@ impl Theme {
     /// read on white), with pale greens for the fading tails.
     pub fn light() -> Self {
         Self {
+            background: None,
             text: Color::Rgb(20, 52, 32),
             dim: Color::Rgb(96, 140, 108),
             muted: Color::Rgb(108, 128, 114),
@@ -302,6 +307,7 @@ impl Theme {
     /// Neutral dark palette for users who want Construct without the Matrix hue.
     pub fn dark_ui() -> Self {
         Self {
+            background: Some(Color::Rgb(12, 18, 27)),
             text: Color::Rgb(232, 236, 243),
             dim: Color::Rgb(102, 112, 128),
             muted: Color::Rgb(145, 153, 166),
@@ -338,6 +344,7 @@ impl Theme {
     /// Neutral light palette with dark text and restrained color accents.
     pub fn light_ui() -> Self {
         Self {
+            background: Some(Color::Rgb(246, 248, 251)),
             text: Color::Rgb(34, 40, 49),
             dim: Color::Rgb(125, 135, 148),
             muted: Color::Rgb(92, 103, 118),
@@ -538,6 +545,7 @@ fn parse_theme_onto(base: Theme, text: &str) -> Result<Theme, String> {
     let raw: RawTheme = toml::from_str(text).map_err(|e| e.to_string())?;
     let colors = raw.colors.unwrap_or_default();
     let mut theme = base;
+    apply_option(&mut theme.background, colors.background, "background")?;
     apply(&mut theme.text, colors.text, "text")?;
     apply(&mut theme.dim, colors.dim, "dim")?;
     apply(&mut theme.muted, colors.muted, "muted")?;
@@ -602,6 +610,18 @@ fn apply(slot: &mut Color, value: Option<String>, name: &str) -> Result<(), Stri
     Ok(())
 }
 
+fn apply_option(slot: &mut Option<Color>, value: Option<String>, name: &str) -> Result<(), String> {
+    if let Some(value) = value {
+        let trimmed = value.trim();
+        *slot = if trimmed.eq_ignore_ascii_case("none") || trimmed.eq_ignore_ascii_case("reset") {
+            None
+        } else {
+            Some(parse_color(trimmed).map_err(|e| format!("{name}: {e}"))?)
+        };
+    }
+    Ok(())
+}
+
 fn parse_color(s: &str) -> Result<Color, String> {
     let s = s.trim();
     if let Some(hex) = s.strip_prefix('#') {
@@ -656,6 +676,7 @@ struct RawTheme {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawColors {
+    background: Option<String>,
     text: Option<String>,
     dim: Option<String>,
     muted: Option<String>,
@@ -770,6 +791,42 @@ mod tests {
             warning: None,
         };
         assert_eq!(cfg.resolve(Some(true)).text, Theme::dark_ui().text);
+    }
+
+    #[test]
+    fn matrix_is_background_aware_but_named_dark_light_paint_backgrounds() {
+        assert_eq!(Theme::named(ThemeName::Matrix).background, None);
+        assert_eq!(
+            Theme::named(ThemeName::Dark).background,
+            Some(Color::Rgb(12, 18, 27))
+        );
+        assert_eq!(
+            Theme::named(ThemeName::Light).background,
+            Some(Color::Rgb(246, 248, 251))
+        );
+    }
+
+    #[test]
+    fn background_override_can_force_or_clear_frame_paint() {
+        let forced = parse_theme_onto(
+            Theme::dark(),
+            r##"
+            [colors]
+            background = "#101820"
+            "##,
+        )
+        .unwrap();
+        assert_eq!(forced.background, Some(Color::Rgb(16, 24, 32)));
+
+        let cleared = parse_theme_onto(
+            Theme::dark_ui(),
+            r#"
+            [colors]
+            background = "none"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cleared.background, None);
     }
 
     #[test]

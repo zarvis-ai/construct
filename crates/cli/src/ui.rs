@@ -142,6 +142,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_popover_area = None;
     app.layout.dynamic_ui_scroll_metrics = None;
     let area = f.area();
+    if let Some(background) = app.theme.background {
+        f.buffer_mut()
+            .set_style(area, Style::default().bg(background));
+    }
     match app.zoom {
         ZoomMode::View => {
             render_zoomed_view(f, area, app);

@@ -8,8 +8,10 @@ Scope: How Construct clients expose and preserve user-selectable color themes.
 ## Decision
 
 Construct clients expose three named UI themes: `matrix`, `dark`, and `light`.
-Matrix remains the default identity theme. Dark and light are neutral palettes
-for users who want higher contrast or a non-Matrix visual treatment.
+Matrix remains the default identity theme and stays terminal-background-aware in
+the TUI. Dark and light are neutral palettes for users who want higher contrast
+or a non-Matrix visual treatment, and the TUI paints their full frame background
+so they look the same regardless of the host terminal background color.
 
 The TUI must support theme switching from a local slash command and from a
 mouse-clickable affordance in the Operator/minibuffer area. The web UI must
@@ -33,6 +35,8 @@ mixed palette behind.
 
 Matrix-specific visual mechanics, such as the operator rain viewport, may keep
 their behavior across themes, but their colors must adapt to the active palette.
+TUI renderers must not assume the terminal's default background is visible under
+neutral themes; neutral themes own the frame background.
 
 ## Non-Goals
 
