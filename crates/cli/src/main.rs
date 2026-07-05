@@ -339,11 +339,13 @@ async fn main() -> Result<()> {
             let list = c.harnesses().await?;
             for h in list {
                 let status = if h.available { "ok" } else { "missing" };
+                let detail = h.detail.as_deref().unwrap_or("unknown");
                 let bin = h.binary.as_deref().unwrap_or("?");
                 println!(
-                    "{name:<10} [{status}]  {bin}\n           {desc}",
+                    "{name:<10} [{status}]  {detail}\n           {bin}\n           {desc}",
                     name = h.name,
                     status = status,
+                    detail = detail,
                     bin = bin,
                     desc = h.description.unwrap_or_default()
                 );

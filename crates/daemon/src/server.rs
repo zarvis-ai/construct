@@ -1081,7 +1081,9 @@ async fn dispatch(
             }
         )
     });
-    dispatch_entry!(ipc_method::HARNESS_LIST, { ok!(req, &manager.harnesses()) });
+    dispatch_entry!(ipc_method::HARNESS_LIST, {
+        ok!(req, &manager.harnesses().await)
+    });
     dispatch_entry!(ipc_method::PROGRAM_GET, {
         let p = params!(req, ProgramGetParams);
         match manager.program_get(&p.session_id).await {

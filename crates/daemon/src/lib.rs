@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod adapter;
+mod availability;
 mod config;
 mod loops;
 mod remote;

@@ -2275,10 +2275,14 @@ pub struct HarnessHit {
     /// Exclusive end column.
     pub x_end: u16,
     pub y: u16,
-    /// `false` for harnesses whose adapter binary isn't on PATH —
-    /// rendered dimmed + struck-through, click is a no-op + status
-    /// line note, hover shows a "not installed" tooltip.
+    /// `false` for harnesses that failed their real availability probe
+    /// (spec 0068) — rendered dimmed + struck-through, click is a no-op +
+    /// status line note, hover shows a tooltip explaining why.
     pub available: bool,
+    /// Short human-readable reason from the daemon's probe (e.g. "`claude`
+    /// CLI not found on daemon PATH"), shown on hover/click when
+    /// `available` is false.
+    pub detail: Option<String>,
 }
 
 fn selection_bounds_for_layout(
@@ -2745,6 +2749,13 @@ async fn run_loop(
     let mut reconnect: Option<ReconnectState> = None;
     // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
+    // Re-probe harness availability while the welcome card (no session
+    // selected) is showing, so installing a CLI or exporting an API key
+    // updates the card's live status without a TUI restart. Gated to that
+    // view so a busy fleet doesn't pay an extra IPC round trip every 5s for
+    // no visible benefit.
+    let mut harness_refresh = tokio::time::interval(Duration::from_secs(5));
+    harness_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Wall-clock of the last actual `terminal.draw`. The notification arm uses
     // it as a heartbeat: a burst that touched nothing visible skips its repaint
     // only while a draw happened within the last tick, so sustained background
@@ -3182,6 +3193,11 @@ async fn run_loop(
                 }
                 app.update_browser_preview_hover_and_expiry();
                 app.expire_program_runs(Instant::now());
+            }
+            _ = harness_refresh.tick(), if app.connected && app.selected_id().is_none() => {
+                if let Ok(list) = app.client.harnesses().await {
+                    app.harnesses = list;
+                }
             }
         }
     }
@@ -15691,6 +15707,7 @@ mod tests {
         app.harnesses = vec![agentd_protocol::HarnessInfo {
             name: "codex".to_string(),
             available: true,
+            detail: None,
             binary: None,
             description: Some("coding agent".to_string()),
             capabilities: Default::default(),
@@ -15722,6 +15739,7 @@ mod tests {
         app.harnesses = vec![agentd_protocol::HarnessInfo {
             name: "codex".to_string(),
             available: true,
+            detail: None,
             binary: None,
             description: Some("coding agent".to_string()),
             capabilities: Default::default(),
@@ -15753,6 +15771,7 @@ mod tests {
         app.harnesses = vec![agentd_protocol::HarnessInfo {
             name: "codex".to_string(),
             available: true,
+            detail: None,
             binary: None,
             description: Some("coding agent".to_string()),
             capabilities: Default::default(),
@@ -15792,6 +15811,7 @@ mod tests {
         agentd_protocol::HarnessInfo {
             name: name.to_string(),
             available,
+            detail: None,
             binary: None,
             description: None,
             capabilities: Default::default(),
@@ -19011,6 +19031,7 @@ mod tests {
         app.harnesses = vec![agentd_protocol::HarnessInfo {
             name: "shell".to_string(),
             available: true,
+            detail: None,
             binary: None,
             description: None,
             capabilities: Default::default(),

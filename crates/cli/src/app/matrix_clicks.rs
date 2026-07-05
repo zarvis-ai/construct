@@ -67,7 +67,8 @@ impl App {
                 for hit in hits {
                     if hit.y == mb_area.y && col >= hit.x_start && col < hit.x_end {
                         if !hit.available {
-                            self.set_status(format!("{}: adapter binary not installed", hit.name));
+                            let reason = hit.detail.as_deref().unwrap_or("not available");
+                            self.set_status(format!("{}: {reason}", hit.name));
                             return;
                         }
                         let intent = mb.intent.clone();

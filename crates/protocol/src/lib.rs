@@ -1640,6 +1640,12 @@ pub struct ProgramStateNotificationPayload {
 pub struct HarnessInfo {
     pub name: String,
     pub available: bool,
+    /// Short human-readable reason for `available` — e.g. "ready", "ready
+    /// (Claude subscription)", or "`claude` CLI not found on daemon PATH".
+    /// `#[serde(default)]` so older daemons that predate this field still
+    /// deserialize cleanly on newer clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

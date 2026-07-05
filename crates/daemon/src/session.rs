@@ -935,6 +935,12 @@ pub struct SessionManager {
     /// queries. A `std::sync::Mutex` is fine — every critical section is a
     /// tiny insert/remove/scan never held across an `.await`.
     conn_views: std::sync::Mutex<HashMap<u64, (String, ClientView)>>,
+    /// Cache for the expensive bits of harness-availability probing
+    /// (macOS keychain read, Ollama reachability) — see
+    /// `crate::availability`. `std::sync::Mutex` deliberately: every
+    /// critical section is a tiny read/write, never held across an
+    /// `.await`.
+    availability_cache: std::sync::Mutex<crate::availability::AvailabilityCache>,
 }
 
 /// What the main loop should do when it receives a [`RestartCommand`].
@@ -1170,6 +1176,9 @@ impl SessionManager {
                 agent_program_cursor_conn_ids: std::sync::Mutex::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 conn_views: std::sync::Mutex::new(HashMap::new()),
+                availability_cache: std::sync::Mutex::new(
+                    crate::availability::AvailabilityCache::default(),
+                ),
             },
             remote_rx,
             restart_rx,
@@ -1576,22 +1585,51 @@ impl SessionManager {
         anyhow::bail!("{msg}")
     }
 
-    pub fn harnesses(&self) -> Vec<HarnessInfo> {
-        self.config
-            .adapters
-            .iter()
-            .map(|(name, cfg)| {
-                let binary_spec = cfg.binary.clone().unwrap_or_else(|| name.clone());
-                let resolved = locate_binary(&binary_spec);
-                HarnessInfo {
-                    name: name.clone(),
-                    available: resolved.is_some(),
-                    binary: resolved.as_ref().map(|p| p.to_string_lossy().to_string()),
-                    description: cfg.description.clone(),
-                    capabilities: builtin_harness_capabilities(name),
-                }
-            })
-            .collect()
+    pub async fn harnesses(&self) -> Vec<HarnessInfo> {
+        let mut out = Vec::with_capacity(self.config.adapters.len());
+        for (name, cfg) in self.config.adapters.iter() {
+            let binary_spec = cfg.binary.clone().unwrap_or_else(|| name.clone());
+            let resolved = locate_binary(&binary_spec);
+            let availability = self
+                .probe_harness_availability(name, &binary_spec, resolved.as_deref())
+                .await;
+            out.push(HarnessInfo {
+                name: name.clone(),
+                available: availability.available,
+                detail: Some(availability.detail),
+                binary: resolved.as_ref().map(|p| p.to_string_lossy().to_string()),
+                description: cfg.description.clone(),
+                capabilities: builtin_harness_capabilities(name),
+            });
+        }
+        out
+    }
+
+    /// Probe real availability for one configured harness (spec 0068). The
+    /// six built-in adapters get kind-specific probes; anything else (a
+    /// community adapter registered via `[adapters.<name>]`) falls back to
+    /// the original "does its `binary` resolve" check, since there's no
+    /// protocol-level way to ask an arbitrary AHP adapter what it wraps.
+    async fn probe_harness_availability(
+        &self,
+        name: &str,
+        binary_spec: &str,
+        resolved_binary: Option<&std::path::Path>,
+    ) -> crate::availability::Availability {
+        use crate::availability::{probe_generic_adapter, probe_smith, probe_wrapper_cli};
+        match name {
+            "shell" => crate::availability::Availability::ready("ready"),
+            "claude" => probe_wrapper_cli("CONSTRUCT_CLAUDE_CMD", "CONSTRUCT_CLAUDE_BIN", "claude"),
+            "codex" => probe_wrapper_cli("CONSTRUCT_CODEX_CMD", "CONSTRUCT_CODEX_BIN", "codex"),
+            "antigravity" => probe_wrapper_cli(
+                "CONSTRUCT_ANTIGRAVITY_CMD",
+                "CONSTRUCT_ANTIGRAVITY_BIN",
+                "agy",
+            ),
+            "grok" => probe_wrapper_cli("CONSTRUCT_GROK_CMD", "CONSTRUCT_GROK_BIN", "grok"),
+            "smith" => probe_smith(&self.availability_cache).await,
+            _ => probe_generic_adapter(binary_spec, resolved_binary),
+        }
     }
 
     pub async fn list(&self) -> Vec<SessionSummary> {

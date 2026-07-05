@@ -1049,7 +1049,8 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
         .iter()
         .find(|h| h.y == my && mx >= h.x_start && mx < h.x_end && !h.available);
     let Some(hit) = hit else { return };
-    let label = format!(" {} — not installed ", hit.name);
+    let reason = hit.detail.as_deref().unwrap_or("not available");
+    let label = format!(" {}: {} ", hit.name, reason);
     let total = f.area();
     let inner_w = UnicodeWidthStr::width(label.as_str()) as u16;
     let w = inner_w + 2;
@@ -1081,17 +1082,18 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
 fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuffer) {
     // Show every registered harness. For a new session we also surface the
     // synthetic `project` op; forking targets a real harness only.
-    // Unavailable harnesses (binary not on PATH) render dimmed and
-    // strike-through; clicking them no-ops + drops a status note;
-    // hover surfaces a "not installed" tooltip.
+    // Unavailable harnesses (failed their real availability probe, spec
+    // 0068) render dimmed and strike-through; clicking them no-ops + drops
+    // a status note with the daemon's detail string; hover surfaces the
+    // same detail in a tooltip.
     let is_fork = matches!(mb.intent, MinibufferIntent::ForkSessionHarness { .. });
-    let mut entries: Vec<(String, bool)> = app
+    let mut entries: Vec<(String, bool, Option<String>)> = app
         .harnesses
         .iter()
-        .map(|h| (h.name.clone(), h.available))
+        .map(|h| (h.name.clone(), h.available, h.detail.clone()))
         .collect();
     if !is_fork {
-        entries.push(("project".to_string(), true));
+        entries.push(("project".to_string(), true, None));
     }
 
     let (hovered_x, hovered_y) = app.mouse_pos.unwrap_or((u16::MAX, u16::MAX));
@@ -1121,7 +1123,7 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
         &mut col,
         if is_fork { "Fork → [" } else { "New [" },
     );
-    for (i, (name, available)) in entries.iter().enumerate() {
+    for (i, (name, available, detail)) in entries.iter().enumerate() {
         if i > 0 {
             push_raw(&mut spans, &mut col, "|");
         }
@@ -1142,6 +1144,7 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
             x_end,
             y: area.y,
             available: *available,
+            detail: detail.clone(),
         });
         col = x_end;
     }
@@ -3129,7 +3132,17 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
 }
 
 fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
-    let card = centered_rect(area, 72, 10);
+    // Base content (title, blurb, four shortcut lines) is 8 rows; the
+    // harness status section below adds a blank separator + header + one
+    // row per registered harness. Grow the card to fit instead of clipping
+    // — `centered_rect` already clamps to the pane's actual height.
+    let base_rows: u16 = 8;
+    let harness_rows: u16 = if app.harnesses.is_empty() {
+        0
+    } else {
+        2 + app.harnesses.len() as u16
+    };
+    let card = centered_rect(area, 72, (base_rows + harness_rows).max(10));
     let label_style = Style::default().fg(app.theme.accent);
     let hover_style = label_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let mouse = app.mouse_pos;
@@ -3156,7 +3169,7 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
         });
     }
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             "Welcome to construct",
             Style::default()
@@ -3196,6 +3209,40 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
             Span::raw("  exit TUI"),
         ]),
     ];
+    if !app.harnesses.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "Harnesses:",
+            Style::default().fg(app.theme.dim),
+        )));
+        let name_width = app
+            .harnesses
+            .iter()
+            .map(|h| h.name.chars().count())
+            .max()
+            .unwrap_or(0);
+        for h in &app.harnesses {
+            let status = h.detail.as_deref().unwrap_or(if h.available {
+                "ready"
+            } else {
+                "unavailable"
+            });
+            let status_style = Style::default().fg(if h.available {
+                app.theme.text
+            } else {
+                app.theme.dim
+            });
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{:<name_width$}", h.name),
+                    Style::default().fg(app.theme.dim),
+                ),
+                Span::raw("  "),
+                Span::styled(status.to_string(), status_style),
+            ]));
+        }
+    }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, card);
 }
@@ -11661,6 +11708,7 @@ mod tests {
         let available = agentd_protocol::HarnessInfo {
             name: "codex".into(),
             available: true,
+            detail: None,
             binary: None,
             description: None,
             capabilities: Default::default(),
@@ -11668,6 +11716,7 @@ mod tests {
         let missing = agentd_protocol::HarnessInfo {
             name: "claude".into(),
             available: false,
+            detail: None,
             binary: None,
             description: None,
             capabilities: Default::default(),
