@@ -341,13 +341,6 @@
   .session-list .item.active .state.state-awaiting_input { color: #005320; }
   .session-list .item.active .state.state-paused { color: #5a3600; }
   .session-list .item.active .state.state-errored { color: #6d0000; }
-  .session-list .item .state.is-active {
-    animation: statusPulse 900ms ease-in-out infinite;
-  }
-  @keyframes statusPulse {
-    0%, 100% { opacity: 0.62; transform: scale(0.92); }
-    50% { opacity: 1; transform: scale(1); }
-  }
   /* Group header (matches TUI's `▾ name` line above each group).
      Tappable — flips the group's collapsed bit. */
   .session-list .group-header {
@@ -1702,14 +1695,9 @@
     text-decoration: line-through;
     opacity: 0.78;
   }
-  /* Mirrors the session list's own running-activity indicator: `.is-active`
-     is set (programChipEl / programUpdateChipStatuses) with the same gate
-     the list uses (state "running" + recent PTY bytes, `sessionPtyActive`),
-     and reuses the list's own `statusPulse` keyframe so a chip whose target
-     session is actively working breathes exactly like the list's status dot. */
-  .program-clip[data-status="running"].is-active {
-    animation: statusPulse 900ms ease-in-out infinite;
-  }
+  /* Program session clips animate by swapping their leading glyph in JS on
+     the same 120ms cadence as the TUI. Keep the chip body still: no bounce,
+     pulse, or transform while a referenced session is active. */
   /* Run shimmer: a travelling highlight band sweeps the running lines. Pure CSS
      (no per-char DOM rebuild) so it never disturbs the caret while editing. */
   .program-line.is-running {
@@ -2625,6 +2613,7 @@ function updateMiniMatrixIntensity(ts) {
 function observeSessionPtyActivity(sessionId, atMs = Date.now()) {
   if (!sessionId) return;
   state.ptyActivityById.set(sessionId, Number(atMs) || Date.now());
+  refreshSessionActivityGlyphs();
 }
 
 function initMiniMatrix() {
@@ -3136,17 +3125,26 @@ const MATRIX_RAIN_RAMP_UP_SECS = 5;
 const MATRIX_RAIN_DECAY_SECS = 20;
 
 function sessionPtyActive(s, now = Date.now()) {
-  if (!s || !s.last_pty_at_ms) return false;
-  return now - Number(s.last_pty_at_ms) < SESSION_PTY_QUIESCENCE_MS;
+  if (!s) return false;
+  const ptyAt = state.ptyActivityById.get(s.id) || Number(s.last_pty_at_ms || 0);
+  return ptyAt > 0 && now - ptyAt < SESSION_PTY_QUIESCENCE_MS;
 }
 
 function sessionStatusLabel(s) {
   return String((s && s.state) || "pending").toLowerCase();
 }
 
+function sessionShouldAnimateStatus(s, now = Date.now()) {
+  if (sessionStatusLabel(s) !== "running") return false;
+  const activeAgent = state.agentStatusById.get(s.id);
+  if (isStructuredToolSession(s)) return !!(activeAgent && activeAgent.active);
+  if (isHeadlessSession(s)) return true;
+  return sessionPtyActive(s, now);
+}
+
 function sessionStatusGlyph(s, now = Date.now()) {
   const status = sessionStatusLabel(s);
-  if (status === "running" && sessionPtyActive(s, now)) {
+  if (sessionShouldAnimateStatus(s, now)) {
     const idx = Math.floor(now / SESSION_STATUS_FRAME_MS) % SESSION_STATUS_SPINNER.length;
     return SESSION_STATUS_SPINNER[idx];
   }
@@ -3163,9 +3161,39 @@ function sessionStatusGlyph(s, now = Date.now()) {
 
 function sessionStatusHtml(s) {
   const status = sessionStatusLabel(s);
-  const active = status === "running" && sessionPtyActive(s);
+  const active = sessionShouldAnimateStatus(s);
   const classes = `state state-${status}${active ? " is-active" : ""}`;
-  return `<div class="${attr(classes)}" title="${attr(status)}" aria-label="${attr(status)}">${escape(sessionStatusGlyph(s))}</div>`;
+  return `<div class="${attr(classes)}" data-session-id="${attr(s.id)}" title="${attr(status)}" aria-label="${attr(status)}">${escape(sessionStatusGlyph(s))}</div>`;
+}
+
+function refreshSessionStatusEl(el, s, now = Date.now()) {
+  if (!el || !s) return;
+  const status = sessionStatusLabel(s);
+  const active = sessionShouldAnimateStatus(s, now);
+  const classes = `state state-${status}${active ? " is-active" : ""}`;
+  if (el.className !== classes) el.className = classes;
+  if (el.title !== status) el.title = status;
+  if (el.getAttribute("aria-label") !== status) el.setAttribute("aria-label", status);
+  const glyph = sessionStatusGlyph(s, now);
+  if (el.textContent !== glyph) el.textContent = glyph;
+}
+
+function refreshSessionListActivityGlyphs(now = Date.now()) {
+  if (!sessionListEl) return;
+  const byId = new Map(state.sessions.map((s) => [s.id, s]));
+  for (const el of sessionListEl.querySelectorAll(".state[data-session-id]")) {
+    refreshSessionStatusEl(el, byId.get(el.dataset.sessionId), now);
+  }
+}
+
+function refreshSessionActivityGlyphs(now = Date.now()) {
+  refreshSessionListActivityGlyphs(now);
+  refreshProgramSessionClipGlyphs(now);
+}
+
+function initSessionActivitySpinner() {
+  refreshSessionActivityGlyphs();
+  setInterval(refreshSessionActivityGlyphs, SESSION_STATUS_FRAME_MS);
 }
 
 let renderSessionsScheduled = false;
@@ -3211,8 +3239,7 @@ function bindSessionListClicks() {
 
 /** Build a row descriptor: a stable key plus the outer class and inner
  *  HTML. renderSessions() diffs class and inner separately so a pure
- *  selection change (class only) never rebuilds a row's status element
- *  (which would restart its statusPulse animation). */
+ *  selection change (class only) never rebuilds a row's status element. */
 function sessionRowDescriptor(item) {
   if (item.kind === "archived-row") {
     const glyph = item.expanded ? "▾" : "▸";
@@ -3296,8 +3323,8 @@ function renderSessions() {
   }
   // Keyed in-place reconcile. Only rows whose output actually changed are
   // touched, so unchanged rows keep their scroll position, hover/focus,
-  // and CSS animation (statusPulse) state — no more innerHTML blast that
-  // reset scrollTop and restarted every row's animation on each event.
+  // and status-glyph DOM state — no more innerHTML blast that reset
+  // scrollTop and restarted every row's activity indicator on each event.
   const existing = new Map();
   for (const node of Array.from(sessionListEl.children)) {
     if (node.__key) existing.set(node.__key, node);
@@ -4083,11 +4110,11 @@ function programSessionChipStatus(id) {
   return s ? sessionStatusLabel(s) : "missing";
 }
 
-// Whether a session smart-clip's chip should pulse, mirroring the session
-// list's own `.state.is-active` gate exactly: "running" and recent PTY bytes.
+// Whether a session smart-clip's chip should animate, mirroring the session
+// list's own `.state.is-active` gate exactly.
 function programSessionChipActive(id) {
   const s = state.sessions.find((x) => x.id === id);
-  return !!s && sessionStatusLabel(s) === "running" && sessionPtyActive(s);
+  return !!s && sessionShouldAnimateStatus(s);
 }
 
 // Plain-language hover tooltip for a session smart-clip's live status
@@ -4130,6 +4157,7 @@ function programChipEl(rawClip) {
   const [kind, id] = programClipTarget(body);
   if (kind === "session") {
     const status = programSessionChipStatus(id);
+    span.dataset.sessionId = id;
     span.dataset.status = status;
     span.title = programSessionChipStatusTooltip(status);
     span.setAttribute("aria-label", programSessionClipPreviewCaption(id));
@@ -4151,11 +4179,28 @@ function programUpdateChipStatuses(sessionId) {
     const [kind, id] = programClipTarget(body);
     if (kind !== "session" || id !== sessionId) continue;
     const status = programSessionChipStatus(id);
+    chip.dataset.sessionId = id;
     chip.textContent = programClipLabel(body);
     chip.dataset.status = status;
     chip.title = programSessionChipStatusTooltip(status);
     chip.setAttribute("aria-label", programSessionClipPreviewCaption(id));
     chip.classList.toggle("is-active", programSessionChipActive(id));
+  }
+}
+
+function refreshProgramSessionClipGlyphs(now = Date.now()) {
+  if (!programInputEl) return;
+  const chips = programInputEl.querySelectorAll('.program-clip[data-session-id]');
+  for (const chip of chips) {
+    const id = chip.dataset.sessionId;
+    const s = state.sessions.find((x) => x.id === id);
+    if (!s) continue;
+    const active = sessionShouldAnimateStatus(s, now);
+    chip.classList.toggle("is-active", active);
+    if (!active && sessionStatusLabel(s) !== "running") continue;
+    const body = chip.dataset.raw.slice(2, -1);
+    const label = programClipLabel(body);
+    if (chip.textContent !== label) chip.textContent = label;
   }
 }
 
@@ -7670,6 +7715,7 @@ function handleNotification(method, params) {
         state.agentStatusById.delete(session_id);
         state.chatWorkingById.delete(session_id);
       }
+      refreshSessionActivityGlyphs();
     }
     if (programEventClearsRunButton(event)) {
       programClearRunButton(session_id);
@@ -9811,6 +9857,7 @@ window.addEventListener("popstate", () => {
 });
 
 initMiniMatrix();
+initSessionActivitySpinner();
 initPullToRefresh();
 connect();
 </script>
