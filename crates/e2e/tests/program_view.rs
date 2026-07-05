@@ -531,6 +531,66 @@ async fn web_program_view_full_parity() {
         "{run_sel:?}"
     );
 
+    // --- 7a. Drag-style selection exposes the inline Run affordance. --------
+    let run_menu: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              const md = "# Heading\n- alpha\n- beta\n- gamma\n";
+              window.__execs = [];
+              window.__mockProgramHandlers["program.get"] = () => ({ program: { session_id: "s-runmenu", markdown: md, version: 1, template_id: null }, active_run: null, blocks: [], revisions: [] });
+              window.__mockProgramHandlers["program.execute"] = (p) => { window.__execs.push(p); const now = Date.now(); return { program: { session_id: "s-runmenu", markdown: md, version: 1, template_id: null }, blocks: [], active_run: { run_id: "r-menu", started_at_ms: now, expires_at_ms: now + 60000, pending_block_ids: [], pending_block_tooltips: {}, seen_running: false, first_output_seen: false, agent_managed: false } }; };
+              setSession("s-runmenu", "shell");
+              await switchCurrentViewMode("program");
+              programInputEl.focus();
+              programTestSelectLines(1, 2); // "- alpha" + "- beta"
+              const line = programInputEl.querySelectorAll(":scope > div")[2];
+              const rect = line.getBoundingClientRect();
+              programInputEl.dispatchEvent(new PointerEvent("pointerup", {
+                bubbles: true,
+                pointerType: "mouse",
+                clientX: rect.right,
+                clientY: rect.bottom,
+              }));
+              await new Promise((resolve) => requestAnimationFrame(resolve));
+              const shown = !programSelectionMenuEl.hidden;
+              const label = programSelectionRunBtn.textContent.trim();
+              programSelectionRunBtn.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+              for (let i = 0; i < 20 && window.__execs.length === 0; i++) {
+                await new Promise((resolve) => requestAnimationFrame(resolve));
+              }
+              const sel = window.getSelection();
+              return {
+                shown,
+                label,
+                execs: window.__execs,
+                hiddenAfter: programSelectionMenuEl.hidden,
+                selectionCollapsed: !sel || sel.rangeCount === 0 || sel.isCollapsed,
+              };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate selection run menu")
+        .into_value()
+        .expect("json");
+    assert_eq!(run_menu["shown"], true, "{run_menu:?}");
+    assert!(
+        run_menu["label"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Run"),
+        "{run_menu:?}"
+    );
+    assert_eq!(
+        run_menu["execs"][0]["selection"], "- alpha\n- beta",
+        "{run_menu:?}"
+    );
+    assert_eq!(run_menu["hiddenAfter"], true, "{run_menu:?}");
+    assert_eq!(run_menu["selectionCollapsed"], true, "{run_menu:?}");
+
     // --- 8. Smart-clip (@) autocomplete inserts a session clip. --------------
     let clip: serde_json::Value = page
         .evaluate(
