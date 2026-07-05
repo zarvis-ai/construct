@@ -373,6 +373,36 @@ impl App {
                 .map(|popup| program_normalize_smart_clip_instance_ids(&popup.buffer))
                 .unwrap_or_default(),
         };
+
+        // Run overlap/idempotency guard (spec 0042 consequence). A double
+        // `C-x C-r` / double-click a Run button is delivered by the TUI's
+        // serialized event loop as two separate calls into this function —
+        // usually milliseconds *after* the first has already completed its
+        // save/execute round trip, which is why an in-flight flag alone is
+        // not enough: we also debounce an identical repeat for a short
+        // window after a successful dispatch. Keying on session + scope +
+        // executed body means this only ever coalesces a truly identical
+        // repeat gesture: a selection run while a full run is in flight, a
+        // different selection, and a full re-Run whose body changed all
+        // still dispatch (see spec 0042's re-Run and selection-adds-to-
+        // in-flight semantics).
+        let dispatch_key: ProgramRunDispatchKey =
+            (session_id.clone(), is_selection, hash_program_run_body(&pre_save_run_body));
+        if let Some(state) = self.program_run_dispatch.get(&dispatch_key) {
+            let suppress = match state {
+                ProgramRunDispatchState::InFlight => true,
+                ProgramRunDispatchState::Dispatched(at) => {
+                    at.elapsed() < Duration::from_millis(PROGRAM_RUN_DEDUP_WINDOW_MS)
+                }
+            };
+            if suppress {
+                self.set_status("run already dispatched".to_string());
+                return false;
+            }
+        }
+        self.program_run_dispatch
+            .insert(dispatch_key.clone(), ProgramRunDispatchState::InFlight);
+
         let selected_block_ids = selected_block_ids.or_else(|| {
             is_selection
                 .then(|| {
@@ -398,6 +428,7 @@ impl App {
         });
         if dirty && !self.save_program_popup().await {
             self.program_runs.remove(&session_id);
+            self.program_run_dispatch.remove(&dispatch_key);
             return false;
         }
 
@@ -456,11 +487,18 @@ impl App {
                     "program run sent ({scope}, version {})",
                     result.program.version
                 ));
+                // Dispatch landed: start the debounce window rather than
+                // clearing the guard outright, so an identical repeat
+                // gesture arriving right behind it is still coalesced.
+                self.program_run_dispatch
+                    .insert(dispatch_key, ProgramRunDispatchState::Dispatched(Instant::now()));
                 true
             }
             Err(e) => {
-                // The request never landed — retract the optimistic shimmer.
+                // The request never landed — retract the optimistic shimmer
+                // and the guard, so the user can retry immediately.
                 self.program_runs.remove(&session_id);
+                self.program_run_dispatch.remove(&dispatch_key);
                 self.set_status(format!("program run failed: {e}"));
                 false
             }
@@ -581,6 +619,20 @@ impl App {
     pub(super) fn expire_program_runs(&mut self, now: Instant) {
         self.program_runs.retain(|_, run| now < run.deadline);
         self.expire_program_settle_flourishes(now);
+        self.expire_program_run_dispatch_guard(now);
+    }
+
+    /// Prune Run overlap/idempotency guard entries once their dedup window
+    /// has lapsed, so the map does not grow unboundedly as the user edits and
+    /// re-Runs a program over a long session. `InFlight` entries are left
+    /// alone — they are always cleared by `execute_program_popup` itself when
+    /// their dispatch resolves.
+    fn expire_program_run_dispatch_guard(&mut self, now: Instant) {
+        let window = Duration::from_millis(PROGRAM_RUN_DEDUP_WINDOW_MS);
+        self.program_run_dispatch.retain(|_, state| match state {
+            ProgramRunDispatchState::InFlight => true,
+            ProgramRunDispatchState::Dispatched(at) => now.saturating_duration_since(*at) < window,
+        });
     }
 
     pub(super) fn record_program_settle_flourishes(
@@ -679,4 +731,16 @@ impl App {
             );
         }
     }
+}
+
+/// Hash of a program Run's executed body, used only to key the Run
+/// overlap/idempotency guard (`App::program_run_dispatch`, spec 0042
+/// consequence). A collision would at worst suppress a legitimately
+/// different Run for one dedup window — an acceptable, vanishingly unlikely
+/// trade against keying on the whole body text.
+fn hash_program_run_body(body: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    body.hash(&mut hasher);
+    hasher.finish()
 }

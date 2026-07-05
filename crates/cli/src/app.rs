@@ -66,6 +66,13 @@ pub(crate) const PROGRAM_CONTENT_PADDING_Y: u16 = 1;
 /// output signal. A missed first-output transition must never strand the
 /// animation; a timeout backstop is mandatory (spec 0042).
 pub(crate) const PROGRAM_RUN_MAX_MS: u64 = 10 * 60 * 1000;
+/// How long an identical Run (same session, scope, and executed body) is
+/// suppressed after a successful dispatch (spec 0042 consequence): long
+/// enough to absorb a double `C-x C-r` / double-click, which the TUI's
+/// serialized event loop usually delivers as a second call milliseconds
+/// *after* the first has already finished its save/execute round trip, but
+/// short enough that a deliberate re-Run a moment later still goes through.
+pub(crate) const PROGRAM_RUN_DEDUP_WINDOW_MS: u64 = 1500;
 /// One-shot flourish shown when an authoritative program Run pending block
 /// settles. Presentation-only and client-local.
 pub(crate) const PROGRAM_SETTLE_FLASH_MS: u64 = 300;
@@ -1025,6 +1032,16 @@ pub struct App {
     /// entry means a program Run is believed to still be executing for that
     /// session; it drives the shimmer over the executed Markdown.
     pub program_runs: HashMap<String, ProgramRun>,
+    /// Run overlap/idempotency guard (spec 0042 consequence), keyed by
+    /// `(session_id, is_selection, executed-body hash)`. A duplicate Run
+    /// gesture — a double `C-x C-r`, a double-click on a Run button — for the
+    /// exact same session/scope/body is coalesced into whichever dispatch is
+    /// already in flight or just completed, rather than sending a second
+    /// `program.execute`. Keying on the executed body (not just session)
+    /// means a selection Run, a different selection, or a full re-Run whose
+    /// body changed always dispatches — only a truly identical repeat is
+    /// suppressed. See `execute_program_popup`.
+    pub(crate) program_run_dispatch: HashMap<ProgramRunDispatchKey, ProgramRunDispatchState>,
     /// Recently-settled program block refs, keyed by session id then block ref.
     /// Renderers turn these into a short one-shot flourish and prune them after
     /// `PROGRAM_SETTLE_FLASH_MS`.
@@ -1635,6 +1652,24 @@ pub struct ProgramViewMemory {
 pub(crate) const PROGRAM_COVER_PERCENT_DEFAULT: u16 = 67;
 pub(crate) const PROGRAM_COVER_PERCENT_MIN: u16 = 30;
 pub(crate) const PROGRAM_COVER_PERCENT_MAX: u16 = 100;
+
+/// Key for the Run overlap/idempotency guard: the session a Run targets, the
+/// scope (`true` = selection, `false` = whole program), and a hash of the
+/// executed body. See `App::program_run_dispatch`.
+pub(crate) type ProgramRunDispatchKey = (String, bool, u64);
+
+/// State of one `ProgramRunDispatchKey` in `App::program_run_dispatch`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ProgramRunDispatchState {
+    /// The save/execute round trip for this exact Run is still awaited. A
+    /// second identical Run arriving while this is set is suppressed
+    /// outright, regardless of how long ago the first began.
+    InFlight,
+    /// The Run was dispatched (its `program.execute` request was sent) at
+    /// this instant. An identical repeat within `PROGRAM_RUN_DEDUP_WINDOW_MS`
+    /// of this instant is suppressed; after that it dispatches again.
+    Dispatched(Instant),
+}
 
 /// In-flight program Run animation state for one session (spec 0042). Present
 /// while a program Run this client issued is believed to still be executing in
@@ -2497,6 +2532,7 @@ async fn run_with_socket_initial_selection(
         program_popups: HashMap::new(),
         program_view_memory: HashMap::new(),
         program_runs: HashMap::new(),
+        program_run_dispatch: HashMap::new(),
         program_settle_flourishes: HashMap::new(),
         program_collaborators: HashMap::new(),
         program_agent_reveal_receipts: HashMap::new(),
@@ -9445,6 +9481,7 @@ mod tests {
             program_popups: HashMap::new(),
             program_view_memory: HashMap::new(),
             program_runs: HashMap::new(),
+            program_run_dispatch: HashMap::new(),
             program_settle_flourishes: HashMap::new(),
             program_collaborators: HashMap::new(),
             program_agent_reveal_receipts: HashMap::new(),
@@ -14150,6 +14187,234 @@ mod tests {
         assert_eq!(
             second_params.get("base_version").and_then(Value::as_u64),
             Some(2)
+        );
+        server.abort();
+    }
+
+    /// Mock daemon for the Run overlap/idempotency guard tests below: accepts
+    /// a single connection, echoes `program.update`/`program.execute` bodies
+    /// back at an incrementing version, and reports every method name it
+    /// receives on the returned channel so tests can assert exactly how many
+    /// `program.execute` requests actually went out.
+    async fn program_run_dispatch_mock_daemon(
+        session_id: &str,
+    ) -> (
+        Arc<Client>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (methods_tx, methods_rx) = mpsc::unbounded_channel::<String>();
+        let session_id = session_id.to_string();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            let mut version = 1u64;
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let _ = methods_tx.send(method.clone());
+                let result = match method.as_str() {
+                    ipc_method::PROGRAM_UPDATE | ipc_method::PROGRAM_EXECUTE => {
+                        version += 1;
+                        let markdown = params
+                            .get("markdown")
+                            .and_then(Value::as_str)
+                            .or_else(|| params.get("selection").and_then(Value::as_str))
+                            .unwrap_or_default()
+                            .to_string();
+                        let program = serde_json::json!({
+                            "session_id": session_id,
+                            "markdown": markdown,
+                            "version": version,
+                            "updated_at_ms": 0,
+                            "template_id": null,
+                        });
+                        if method == ipc_method::PROGRAM_EXECUTE {
+                            serde_json::json!({ "program": program, "prompt": "run" })
+                        } else {
+                            serde_json::json!({ "program": program })
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        (client, dir, server, methods_rx)
+    }
+
+    /// Drain every method name the mock daemon has recorded so far. Safe to
+    /// call right after an awaited `execute_program_popup` call: its RPCs
+    /// have already completed (and so already reported themselves) by the
+    /// time the call returns.
+    fn drain_methods(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
+        let mut methods = Vec::new();
+        while let Ok(method) = rx.try_recv() {
+            methods.push(method);
+        }
+        methods
+    }
+
+    #[tokio::test]
+    async fn program_run_double_dispatch_is_coalesced_into_one_execute() {
+        // Two immediate identical Run gestures (double `C-x C-r`, a
+        // double-clicked Run button) must not dispatch two execute turns to
+        // the owning agent — the second is coalesced into the first's
+        // dispatch and only sets a status message (spec 0042 consequence).
+        use agentd_protocol::ipc_method;
+
+        let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
+        let mut app = test_app(client, Vec::new());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+
+        assert!(
+            app.execute_program_popup(None, None).await,
+            "first run dispatches"
+        );
+        assert!(
+            !app
+                .execute_program_popup(None, None)
+                .await,
+            "identical immediate re-Run must be suppressed"
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("already dispatched")),
+            "status should explain the suppression, got: {:?}",
+            app.status
+        );
+
+        let methods = drain_methods(&mut methods);
+        assert_eq!(
+            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            1,
+            "exactly one program.execute request, got: {methods:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_run_different_body_dispatches_again() {
+        // A full re-Run whose body changed (the user edited the program
+        // between the two Runs) must not be suppressed by the dedup guard.
+        use agentd_protocol::ipc_method;
+
+        let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
+        let mut app = test_app(client, Vec::new());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+
+        assert!(app.execute_program_popup(None, None).await);
+        app.program_popup.as_mut().unwrap().buffer = "alpha beta changed".to_string();
+        assert!(
+            app.execute_program_popup(None, None).await,
+            "a re-Run with a changed body must dispatch again"
+        );
+
+        let methods = drain_methods(&mut methods);
+        assert_eq!(
+            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            2,
+            "both dispatches should have sent program.execute, got: {methods:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_run_repeat_after_debounce_window_dispatches() {
+        // Once the dedup window has elapsed, an identical Run is a
+        // deliberate re-Run (spec 0042 intentionally supports this) and must
+        // dispatch again.
+        use agentd_protocol::ipc_method;
+
+        let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
+        let mut app = test_app(client, Vec::new());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+
+        assert!(app.execute_program_popup(None, None).await);
+        // Simulate the debounce window having already elapsed by backdating
+        // its recorded instant, matching this file's existing convention for
+        // testing time-based expiry without sleeping (see e.g. `revealed_at`
+        // in the popup-slide tests above).
+        for state in app.program_run_dispatch.values_mut() {
+            if let ProgramRunDispatchState::Dispatched(at) = state {
+                *at = Instant::now() - Duration::from_millis(PROGRAM_RUN_DEDUP_WINDOW_MS + 50);
+            }
+        }
+        assert!(
+            app.execute_program_popup(None, None).await,
+            "an identical re-Run after the debounce window must dispatch"
+        );
+
+        let methods = drain_methods(&mut methods);
+        assert_eq!(
+            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            2,
+            "both dispatches should have sent program.execute, got: {methods:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_run_selection_not_suppressed_by_just_dispatched_full_run() {
+        // Spec 0042 lets a selection Run proceed while a full run is in
+        // flight elsewhere in the program; the dedup guard must not treat
+        // that as a duplicate of the full run that was just dispatched.
+        use agentd_protocol::ipc_method;
+
+        let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
+        let mut app = test_app(client, Vec::new());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+
+        assert!(
+            app.execute_program_popup(None, None).await,
+            "full run dispatches"
+        );
+        assert!(
+            app.execute_program_popup(Some("beta".to_string()), None)
+                .await,
+            "a selection run must not be suppressed by a just-dispatched full run"
+        );
+
+        let methods = drain_methods(&mut methods);
+        assert_eq!(
+            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            2,
+            "both the full run and the selection run should have dispatched, got: {methods:?}"
         );
         server.abort();
     }
