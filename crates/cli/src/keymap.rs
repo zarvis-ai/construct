@@ -10,6 +10,7 @@ pub enum KeyAction {
     NextSession,
     PrevSession,
     Refresh,
+    EnterInsert,
     OpenSendInput,
     OpenNewSession,
     OpenDeleteConfirm,
@@ -325,7 +326,8 @@ fn vim() -> Keymap {
         (Chord(vec![ch('k')]), PrevSession),
         (Chord(vec![key(KeyCode::Down)]), NextSession),
         (Chord(vec![key(KeyCode::Up)]), PrevSession),
-        (Chord(vec![ch('i')]), OpenSendInput),
+        (Chord(vec![ch('i')]), EnterInsert),
+        (Chord(vec![ch('a')]), EnterInsert),
         (Chord(vec![shift('I')]), OpenSendInput),
         (Chord(vec![ch('o')]), OpenNewSession),
         (Chord(vec![ch('n')]), OpenNewSession),
@@ -716,7 +718,8 @@ mod tests {
         assert_action(&km, vec![ch('/')], KeyAction::OpenSwitchSession);
         assert_action(&km, vec![ctrl('x'), ch('b')], KeyAction::OpenSwitchSession);
         assert_action(&km, vec![shift('I')], KeyAction::OpenSendInput);
-        assert_action(&km, vec![ch('i')], KeyAction::OpenSendInput);
+        assert_action(&km, vec![ch('i')], KeyAction::EnterInsert);
+        assert_action(&km, vec![ch('a')], KeyAction::EnterInsert);
         assert_action(&km, vec![shift('Z'), shift('Z')], KeyAction::Quit);
         assert_action(&km, vec![ctrl('d')], KeyAction::ScrollHalfPageDown);
         assert_action(&km, vec![ctrl('u')], KeyAction::ScrollHalfPageUp);

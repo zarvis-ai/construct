@@ -5831,6 +5831,11 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         PaneFocus::List => "list",
         PaneFocus::View => "view",
     };
+    let vim_mode_label = if app.profile == Profile::Vim {
+        format!("{}  ", app.vim_mode.label())
+    } else {
+        String::new()
+    };
     let scrollback_label = if app.view_scrollback > 0 {
         format!("scrollback:{}  ", app.view_scrollback)
     } else {
@@ -5883,7 +5888,8 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         ""
     };
     let modeline_before_approval_mode = format!(
-        " construct  focus:{focus}  {sel}  {model}  {remote}",
+        " construct  {vim_mode}focus:{focus}  {sel}  {model}  {remote}",
+        vim_mode = vim_mode_label,
         focus = focus_label,
         remote = remote_badge,
         sel = match s {
@@ -6302,6 +6308,8 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
   getting started
     Sessions are live tasks; harnesses run them: smith/codex/claude/shell.
     The left pane selects sessions; the right pane shows the selected session.
+    NORMAL runs construct commands. INSERT types into a live terminal session.
+    Unbound NORMAL keys are ignored; they are never sent to the child PTY.
     Use o to create a session, then choose a harness (n also works).
     Use : for the command palette when you forget a shortcut.
 
@@ -6310,7 +6318,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
     C-2 .. C-5      focus split window 1..4 directly (C-2 = first window)
     Shift+arrow     focus adjacent split (C-x arrow is reliable alias)
     C-w h/j/k/l     focus split window left/down/up/right
-    RET (on list)   focus the selected session's view
+    i / a / RET     enter INSERT when the selected view is a live terminal
     C-x 2/3 C-w s/v split current main window below / right
     C-x 0/1 C-w c/o delete current window / delete other windows
     C-x ^ / C-w +   make current window taller
@@ -6322,7 +6330,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
   session actions
     o / n           new session
     / / C-x b       switch session (picker dialog: type to filter, ↑↓ move)
-    i / I           send input to selected session
+    I               send input to selected session
     d d             delete selected session (confirms; kills if running)
     C-x Space       open selected session's program
     C-x C-o         focus session terminal / refocus Program
@@ -6360,11 +6368,11 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
     C-x C-c         quit
     Z Z             quit
 
-When the right pane is showing a PTY-backed session (shell / interactive
-claude / interactive codex) and focus is on the view, keystrokes go to the
-child. `C-x` is the escape prefix — start any `C-x …` chord above to run
-an construct command without changing focus. Other vim chords, including
-`C-w …`, apply when the PTY is not capturing input.
+In NORMAL, construct owns the keyboard. Use i/a/RET to enter INSERT on a live
+terminal session; i/a opens send-input when the selected session has no live
+terminal. In INSERT, keys go to the child PTY except `C-x`, which starts a
+construct escape chord. Use `C-x C-x` to send a literal `C-x`, and `C-\\ C-n`
+to return to NORMAL. Esc always goes to the child PTY.
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

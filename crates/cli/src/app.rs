@@ -777,6 +777,21 @@ pub struct MatrixWidgetHover {
     pub until: Instant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VimMode {
+    Normal,
+    Insert,
+}
+
+impl VimMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            VimMode::Normal => "NORMAL",
+            VimMode::Insert => "INSERT",
+        }
+    }
+}
+
 pub struct App {
     pub client: Arc<Client>,
     /// Last `(session, view)` reported to the daemon via `set_view`, so we only
@@ -809,6 +824,8 @@ pub struct App {
     pub help_visible: bool,
     pub profile: Profile,
     pub keymap: Keymap,
+    pub vim_mode: VimMode,
+    vim_pending_ctrl_backslash: bool,
     pub chord_state: ChordState,
     pub chord_label: String,
     pub status: Option<(String, Instant)>,
@@ -2532,6 +2549,8 @@ async fn run_with_socket_initial_selection(
         help_visible: false,
         profile,
         keymap,
+        vim_mode: VimMode::Normal,
+        vim_pending_ctrl_backslash: false,
         chord_state: ChordState::default(),
         chord_label: String::new(),
         status: None,
@@ -3509,6 +3528,7 @@ impl App {
     }
 
     fn select_session_inner(&mut self, id: String, transition: bool) {
+        self.reset_vim_mode();
         if transition && self.selection.session_id() != Some(id.as_str()) {
             self.start_session_transition();
         }
@@ -3583,6 +3603,7 @@ impl App {
     }
 
     pub fn select_group(&mut self, id: String) {
+        self.reset_vim_mode();
         if self.selection.group_id() != Some(id.as_str()) {
             self.start_session_transition();
         }
@@ -3597,6 +3618,7 @@ impl App {
     /// Select a section's "N archived" disclosure row. Like [`Self::select_group`]
     /// it isn't a session, so the main view shows nothing for it.
     pub fn select_archive_row(&mut self, section: ArchiveSection) {
+        self.reset_vim_mode();
         if self.selection.archive_section() != Some(&section) {
             self.start_session_transition();
         }
@@ -4575,6 +4597,7 @@ impl App {
     fn focus_pane_by_index(&mut self, index: usize) -> bool {
         if index == 0 {
             // Pane 1 is the session list.
+            self.reset_vim_mode();
             self.collapse_orchestrator_panel_on_focus_change();
             if matches!(self.zoom, ZoomMode::View) {
                 self.zoom = ZoomMode::List;
@@ -4587,6 +4610,7 @@ impl App {
         let Some(id) = ids.get(index - 1).copied() else {
             return false;
         };
+        self.reset_vim_mode();
         self.collapse_orchestrator_panel_on_focus_change();
         // Asking for a window implies the view side should be visible.
         if matches!(self.zoom, ZoomMode::List) {
@@ -4633,6 +4657,7 @@ impl App {
         let Some(id) = self.adjacent_window_id(dir) else {
             return false;
         };
+        self.reset_vim_mode();
         self.collapse_orchestrator_panel_on_focus_change();
         self.focus_main_window(id);
         self.set_status(format!("focus: window {id}"));
@@ -6440,6 +6465,7 @@ impl App {
             .cloned()
         {
             if self.sessions.iter().any(|s| s.id == hit.session_id) {
+                self.reset_vim_mode();
                 self.focus = PaneFocus::List;
                 self.select_session(hit.session_id);
             } else {
@@ -6493,6 +6519,7 @@ impl App {
         }
         if let Some(list) = self.layout.list_area {
             if contains(list, col, row) {
+                self.reset_vim_mode();
                 self.click_list(list, col, row).await;
                 return;
             }
@@ -6525,6 +6552,7 @@ impl App {
                 // never falls through to a content click.
                 if crate::ui::is_on_view_uncollapse_handle(self, col, row) {
                     self.list_collapsed = false;
+                    self.reset_vim_mode();
                     self.focus = PaneFocus::List;
                     return;
                 }
@@ -6843,6 +6871,63 @@ impl App {
         }
     }
 
+    fn reset_vim_mode(&mut self) {
+        self.vim_mode = VimMode::Normal;
+        self.vim_pending_ctrl_backslash = false;
+    }
+
+    fn set_vim_insert_if_captured(&mut self) -> bool {
+        if self.profile == Profile::Vim && self.is_pty_captured() {
+            self.vim_mode = VimMode::Insert;
+            self.vim_pending_ctrl_backslash = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn vim_normal_mode(&self) -> bool {
+        self.profile == Profile::Vim && self.vim_mode == VimMode::Normal
+    }
+
+    fn snap_pty_scrollback_to_live(&mut self) -> bool {
+        let active_window = Some(self.active_window_id);
+        let was_scrolled = self.scrollback_for_window(active_window) != 0;
+        self.set_scrollback_for_window(active_window, 0);
+        if was_scrolled {
+            self.show_terminal_scrollbar();
+        }
+        was_scrolled
+    }
+
+    fn queue_selected_pty_input(&mut self, bytes: Vec<u8>) {
+        if let Some(id) = self.selected_id() {
+            self.queue_pty_input(id, bytes, "pty_input");
+        }
+    }
+
+    fn forward_key_to_selected_pty(&mut self, key: KeyEvent) {
+        let was_scrolled = self.snap_pty_scrollback_to_live();
+        if let Some(bytes) = encode_key_to_bytes(key) {
+            self.queue_selected_pty_input(bytes);
+        }
+        if !was_scrolled {
+            self.skip_redraw_after_event = true;
+        }
+    }
+
+    fn forward_ctrl_backslash_pending_to_selected_pty(&mut self, key: KeyEvent) {
+        let was_scrolled = self.snap_pty_scrollback_to_live();
+        let mut bytes = vec![0x1c];
+        if let Some(mut encoded) = encode_key_to_bytes(key) {
+            bytes.append(&mut encoded);
+        }
+        self.queue_selected_pty_input(bytes);
+        if !was_scrolled {
+            self.skip_redraw_after_event = true;
+        }
+    }
+
     async fn on_key(&mut self, key: KeyEvent) {
         self.text_selection = None;
         self.selected_text = None;
@@ -7026,17 +7111,36 @@ impl App {
         // When the PTY is capturing keystrokes (View focus + terminal mode +
         // session has a PTY), keys go straight to the child *unless* the user
         // is starting or continuing a `C-x` chord — those drive the keymap.
-        if self.is_pty_captured() {
+        // Vim NORMAL mode is intentionally command-only: captured PTYs do not
+        // receive unbound keys until the user enters INSERT.
+        if self.is_pty_captured() && !self.vim_normal_mode() {
             let is_ctrl_x = matches!(key.code, KeyCode::Char('x'))
                 && key.modifiers.contains(KeyModifiers::CONTROL);
+            let is_ctrl_backslash = matches!(key.code, KeyCode::Char('\\'))
+                && key.modifiers.contains(KeyModifiers::CONTROL);
+            let is_ctrl_n = matches!(key.code, KeyCode::Char('n'))
+                && key.modifiers.contains(KeyModifiers::CONTROL);
+            if self.vim_pending_ctrl_backslash {
+                self.vim_pending_ctrl_backslash = false;
+                if self.profile == Profile::Vim && is_ctrl_n {
+                    self.reset_vim_mode();
+                } else if is_ctrl_backslash {
+                    self.queue_selected_pty_input(vec![0x1c]);
+                } else {
+                    self.forward_ctrl_backslash_pending_to_selected_pty(key);
+                }
+                return;
+            }
             // Escape hatch: `C-x C-x` sends a literal C-x byte through to the
             // PTY (so vim completion, bash's `C-x C-e`, etc. still work).
             if !self.chord_state.is_empty() && is_ctrl_x {
                 self.chord_state = ChordState::default();
                 self.chord_label.clear();
-                if let Some(id) = self.selected_id() {
-                    self.queue_pty_input(id, vec![0x18], "pty_input");
-                }
+                self.queue_selected_pty_input(vec![0x18]);
+                return;
+            }
+            if self.chord_state.is_empty() && self.profile == Profile::Vim && is_ctrl_backslash {
+                self.vim_pending_ctrl_backslash = true;
                 return;
             }
             // PageUp/PageDown page the TUI scrollback even while the PTY is
@@ -7058,28 +7162,7 @@ impl App {
                 return;
             }
             if self.chord_state.is_empty() && !is_ctrl_x {
-                // Typing snaps the view back to live: it's confusing to
-                // type "into the past" while reading scrollback.
-                let active_window = Some(self.active_window_id);
-                let was_scrolled = self.scrollback_for_window(active_window) != 0;
-                self.set_scrollback_for_window(active_window, 0);
-                if was_scrolled {
-                    self.show_terminal_scrollbar();
-                }
-                if let Some(bytes) = encode_key_to_bytes(key) {
-                    if let Some(id) = self.selected_id() {
-                        self.queue_pty_input(id, bytes, "pty_input");
-                    }
-                }
-                // The keystroke's visible effect arrives later as PTY
-                // output, which triggers its own redraw. Painting now
-                // just renders a stale frame — the dominant wasted
-                // work when a key is held down (one render per repeat).
-                // Skip it, unless we just snapped scrollback back to
-                // live, which is a local display change with no output.
-                if !was_scrolled {
-                    self.skip_redraw_after_event = true;
-                }
+                self.forward_key_to_selected_pty(key);
                 return;
             }
             // fall through to chord dispatch below
@@ -7193,6 +7276,23 @@ impl App {
                 self.refresh_sessions().await;
                 self.transcript_session = None;
                 self.refresh_selected_transcript().await;
+            }
+            EnterInsert => {
+                self.collapse_orchestrator_panel_on_focus_change();
+                self.focus = PaneFocus::View;
+                if !self.set_vim_insert_if_captured() {
+                    if let Some(id) = self.selected_id() {
+                        self.minibuffer = Some(Minibuffer {
+                            prompt: format!("Send to {}: ", short_id(&id)),
+                            input: String::new(),
+                            cursor: 0,
+                            intent: MinibufferIntent::SendInput { session_id: id },
+                            error: None,
+                        });
+                    } else {
+                        self.set_status("no session selected".to_string());
+                    }
+                }
             }
             OpenSendInput => {
                 if let Some(id) = self.selected_id() {
@@ -7439,11 +7539,13 @@ impl App {
                 }
                 self.collapse_orchestrator_panel_on_focus_change();
                 self.focus = PaneFocus::View;
+                self.set_vim_insert_if_captured();
             }
             SwitchFocus => {
                 // In a zoomed layout `C-x o` swaps which pane is
                 // zoomed (and focused). In normal layout it cycles
                 // list plus all visible main windows.
+                self.reset_vim_mode();
                 self.collapse_orchestrator_panel_on_focus_change();
                 match self.zoom {
                     ZoomMode::List => {
@@ -9492,6 +9594,8 @@ mod tests {
             help_visible: false,
             profile: Profile::Emacs,
             keymap: keymap::default_for(Profile::Emacs),
+            vim_mode: VimMode::Normal,
+            vim_pending_ctrl_backslash: false,
             chord_state: ChordState::default(),
             chord_label: String::new(),
             status: None,
@@ -19189,6 +19293,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vim_modeline_shows_mode_and_emacs_modeline_does_not() {
+        let (mut app, _dir, server) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+        app.vim_mode = VimMode::Normal;
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw vim normal");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("NORMAL"),
+            "vim modeline should show NORMAL:\n{screen}"
+        );
+
+        app.vim_mode = VimMode::Insert;
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw vim insert");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("INSERT"),
+            "vim modeline should show INSERT:\n{screen}"
+        );
+
+        app.profile = Profile::Emacs;
+        app.keymap = keymap::default_for(Profile::Emacs);
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw emacs");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            !screen.contains("NORMAL") && !screen.contains("INSERT"),
+            "emacs modeline should not show vim mode:\n{screen}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn empty_state_shortcut_clicks_dispatch_actions() {
         let (mut app, _dir, server) = empty_app().await;
         app.harnesses = vec![agentd_protocol::HarnessInfo {
@@ -19335,6 +19480,120 @@ mod tests {
             app.skip_redraw_after_event,
             "a PTY-passthrough keystroke must skip the immediate stale redraw"
         );
+    }
+
+    #[tokio::test]
+    async fn vim_i_and_enter_enter_insert_for_live_pty_view() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        assert!(app.minibuffer.is_none());
+
+        app.reset_vim_mode();
+        app.focus = PaneFocus::List;
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.focus, PaneFocus::View);
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        assert!(app.minibuffer.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vim_i_opens_send_input_when_selected_session_has_no_live_pty() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        summary.has_pty = false;
+        app.sessions = vec![summary];
+        app.selection = Selection::Session("s1".into());
+        app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+        app.view = ViewMode::Chat;
+        app.focus = PaneFocus::List;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(app.vim_mode, VimMode::Normal);
+        assert!(matches!(
+            app.minibuffer.as_ref().map(|mb| &mb.intent),
+            Some(MinibufferIntent::SendInput { session_id }) if session_id == "s1"
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vim_normal_drops_unbound_letters_but_insert_forwards_them() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "NORMAL mode must not forward unbound letters to the PTY"
+        );
+
+        app.vim_mode = VimMode::Insert;
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        let job = rx.try_recv().expect("INSERT should forward typed keys");
+        assert_eq!(job.bytes, b"q");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vim_ctrl_backslash_ctrl_n_returns_to_normal_without_forwarding() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+        app.vim_mode = VimMode::Insert;
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.vim_mode, VimMode::Insert);
+        assert!(rx.try_recv().is_err(), "C-\\ prefix must not forward yet");
+
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.vim_mode, VimMode::Normal);
+        assert!(
+            rx.try_recv().is_err(),
+            "C-\\ C-n exits INSERT without forwarding either key"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn vim_focus_away_and_session_switch_reset_to_normal() {
+        let (mut app, _dir, server) = two_session_app().await;
+        app.sessions[0].has_pty = true;
+        app.sessions[1].has_pty = true;
+        app.profile = Profile::Vim;
+        app.keymap = keymap::default_for(Profile::Vim);
+        app.focus = PaneFocus::View;
+        app.vim_mode = VimMode::Insert;
+
+        app.run_action(KeyAction::SwitchFocus).await;
+        assert_eq!(app.focus, PaneFocus::List);
+        assert_eq!(app.vim_mode, VimMode::Normal);
+
+        app.vim_mode = VimMode::Insert;
+        app.run_action(KeyAction::NextSession).await;
+        assert_eq!(app.selection, Selection::Session("s2".into()));
+        assert_eq!(app.vim_mode, VimMode::Normal);
+        server.abort();
     }
 
     /// But a keystroke that snaps scrollback back to live IS a local
