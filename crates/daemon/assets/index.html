@@ -1616,6 +1616,38 @@
   .program-input ::selection { background: rgba(57, 255, 136, 0.28); }
   /* One source line. Empty lines keep height via a <br>. */
   .program-line { min-height: 1.6em; }
+  .program-selection-menu {
+    position: absolute;
+    z-index: 8;
+    display: flex;
+    align-items: center;
+    padding: 4px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.36);
+  }
+  .program-selection-menu[hidden] { display: none; }
+  .program-selection-menu button {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 68px;
+    padding: 4px 9px;
+    background: transparent;
+    color: var(--accent);
+    border: 0;
+    border-radius: 4px;
+    font: inherit;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .program-selection-menu button:hover,
+  .program-selection-menu button:focus-visible {
+    background: var(--accent);
+    color: var(--bg);
+    outline: none;
+  }
   /* Smart-clip chip: an atomic, content-fit widget (contenteditable=false). The
      TUI's ` label ` padding is the .35em insets; the whole chip is one cursor
      stop and Backspace deletes it whole. */
@@ -2044,6 +2076,11 @@
                aria-label="program markdown"></div>
           <div class="program-cursor-layer" id="programCursorLayer"></div>
           <div class="program-empty" id="programEmpty" hidden></div>
+          <div class="program-selection-menu" id="programSelectionMenu" hidden>
+            <button type="button" id="programSelectionRunBtn" title="Run selected program text">
+              <span aria-hidden="true">▶</span><span>Run</span>
+            </button>
+          </div>
           <div class="program-clip-menu" id="programClipMenu" hidden role="listbox"
                aria-label="smart-clip suggestions"></div>
           <div class="program-hover-card" id="programHoverCard" hidden role="tooltip">
@@ -2249,6 +2286,8 @@ const programEditorEl = $("programEditor");
 const programInputEl = $("programInput");
 const programCursorLayerEl = $("programCursorLayer");
 const programEmptyEl = $("programEmpty");
+const programSelectionMenuEl = $("programSelectionMenu");
+const programSelectionRunBtn = $("programSelectionRunBtn");
 const programClipMenuEl = $("programClipMenu");
 const programHoverCardEl = $("programHoverCard");
 const programHoverTerminalEl = $("programHoverTerminal");
@@ -4377,6 +4416,7 @@ function programRenderDoc(markdown) {
   for (const line of markdown.split("\n")) programInputEl.appendChild(programLineDiv(line));
   programApplyShimmer();
   programRenderCursors();
+  programHideSelectionMenu();
 }
 
 // Serialize a container's line elements back to Markdown: each top-level line
@@ -4708,6 +4748,69 @@ function programSelectionMarkdown() {
   return programSerializeContainer(tmp);
 }
 
+function programRunnableSelectionRange() {
+  if (!state.program.mountedId || state.mode !== "program") return null;
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return null;
+  const range = sel.getRangeAt(0);
+  if (!programInputEl.contains(range.commonAncestorContainer)) return null;
+  const text = programSelectionMarkdown();
+  if (!text || text.trim() === "") return null;
+  return { sel, range };
+}
+
+function programSelectionFocusRect(sel, fallbackRange) {
+  if (sel && sel.focusNode && programInputEl.contains(sel.focusNode)) {
+    const focusRange = document.createRange();
+    try {
+      focusRange.setStart(sel.focusNode, sel.focusOffset);
+      focusRange.collapse(true);
+      let rect = focusRange.getBoundingClientRect();
+      if (rect && (rect.width || rect.height)) return rect;
+      const rects = focusRange.getClientRects();
+      if (rects && rects.length) return rects[0];
+    } catch (_) {}
+  }
+  const rects = fallbackRange.getClientRects();
+  if (rects && rects.length) return rects[rects.length - 1];
+  return fallbackRange.getBoundingClientRect();
+}
+
+function programHideSelectionMenu() {
+  programSelectionMenuEl.hidden = true;
+}
+
+function programUpdateSelectionMenu() {
+  const runnable = programRunnableSelectionRange();
+  if (!runnable) { programHideSelectionMenu(); return; }
+  const rect = programSelectionFocusRect(runnable.sel, runnable.range);
+  if (!rect || (!rect.width && !rect.height)) { programHideSelectionMenu(); return; }
+  const editor = programEditorEl.getBoundingClientRect();
+  if (rect.bottom < editor.top || rect.top > editor.bottom || rect.right < editor.left || rect.left > editor.right) {
+    programHideSelectionMenu();
+    return;
+  }
+  programSelectionMenuEl.hidden = false;
+  const menuW = programSelectionMenuEl.offsetWidth || 82;
+  const menuH = programSelectionMenuEl.offsetHeight || 32;
+  const pad = 8;
+  let left = rect.left - editor.left + 8;
+  let top = rect.bottom - editor.top + 6;
+  if (top + menuH > editor.height - pad) top = rect.top - editor.top - menuH - 6;
+  left = Math.max(pad, Math.min(left, Math.max(pad, editor.width - menuW - pad)));
+  top = Math.max(pad, Math.min(top, Math.max(pad, editor.height - menuH - pad)));
+  programSelectionMenuEl.style.left = Math.round(left) + "px";
+  programSelectionMenuEl.style.top = Math.round(top) + "px";
+}
+
+function programClearSelection() {
+  const sel = window.getSelection();
+  if (sel) sel.removeAllRanges();
+  programHideSelectionMenu();
+  programPublishCursor();
+  programRenderCursors();
+}
+
 // Keep the editor's direct children as .program-line divs so serialize stays
 // line-accurate after native editing. Best-effort; a no-op when already clean
 // (so it doesn't disturb the caret during normal typing).
@@ -4853,6 +4956,7 @@ function leaveProgramView() {
   programRunBtn.dataset.running = "false";
   programRunStageEl.textContent = "";
   programCloseClipMenu();
+  programHideSelectionMenu();
   programHideHover();
   programCloseFind();
   programWrapEl.hidden = true;
@@ -4881,6 +4985,7 @@ async function programMountSession(id) {
   state.program.mountedId = id;
   programStopShimmer();
   programCloseClipMenu();
+  programHideSelectionMenu();
   programCloseFind();
   programVersionEl.textContent = "";
   programRenderDoc("");
@@ -5777,6 +5882,7 @@ function programOnInput() {
   programApplyShimmer();
   programRenderCursors();
   programUpdateClipMenu();
+  programUpdateSelectionMenu();
   if (state.program.find) programRecomputeFind();
   programOnLocalEdit();
 }
@@ -5829,17 +5935,22 @@ function programWireEvents() {
     // reset the view and highlight.
     if (state.program.clip && ["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) return;
     if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) programUpdateClipMenu();
+    programUpdateSelectionMenu();
     programPublishCursor();
     programRenderCursors();
   });
-  programInputEl.addEventListener("click", () => { programUpdateClipMenu(); programPublishCursor(); programRenderCursors(); });
+  programInputEl.addEventListener("click", () => { programUpdateClipMenu(); programUpdateSelectionMenu(); programPublishCursor(); programRenderCursors(); });
+  programInputEl.addEventListener("pointerup", () => programUpdateSelectionMenu());
   programInputEl.addEventListener("pointermove", programHandleHoverPointerMove);
   programInputEl.addEventListener("pointerleave", programHideHover);
-  programInputEl.addEventListener("scroll", () => { programRenderCursors(); programHideHover(); });
+  programInputEl.addEventListener("scroll", () => { programRenderCursors(); programHideHover(); programHideSelectionMenu(); });
   document.addEventListener("selectionchange", () => {
     if (document.activeElement === programInputEl && state.program.mountedId) {
+      programUpdateSelectionMenu();
       programPublishCursor();
       programRenderCursors();
+    } else {
+      programHideSelectionMenu();
     }
   });
   programInputEl.addEventListener("blur", () => { setTimeout(programCloseClipMenu, 120); });
@@ -5851,6 +5962,13 @@ function programWireEvents() {
   });
   programSaveBtn.addEventListener("click", () => programSave());
   programRunBtn.addEventListener("click", () => programRun());
+  programSelectionRunBtn.addEventListener("mousedown", async (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    await programRun();
+    programClearSelection();
+    try { programInputEl.focus(); } catch (_) {}
+  });
   programFindBtn.addEventListener("click", () => {
     if (state.program.find) { programCloseFind(); programInputEl.focus(); } else programOpenFind();
   });
