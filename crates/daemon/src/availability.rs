@@ -219,6 +219,187 @@ async fn ollama_reachable(cache: &std::sync::Mutex<AvailabilityCache>) -> bool {
     found
 }
 
+/// One auth method the built-in `smith` harness can use (spec 0069's
+/// `/configure` dialog, smith-auth tab). `id` is the stable wire id sent to
+/// clients and echoed back to pin the method; `model_prefix` is the
+/// `CONSTRUCT_SMITH_MODEL` prefix that selects it explicitly (empty for
+/// `"auto"`, which clears the pin instead of setting one).
+pub struct SmithAuthMethod {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub model_prefix: &'static str,
+    pub default_model: &'static str,
+    pub available: bool,
+    pub detail: String,
+}
+
+fn env_key_method(
+    id: &'static str,
+    label: &'static str,
+    model_prefix: &'static str,
+    default_model: &'static str,
+    vars: &[&str],
+) -> SmithAuthMethod {
+    let available = vars.iter().any(|v| env_present(v));
+    let detail = match vars {
+        [one] => {
+            if available {
+                format!("{one} is set")
+            } else {
+                format!("{one} not set")
+            }
+        }
+        [a, b, ..] => {
+            if available {
+                format!("{a} (or {b}) is set")
+            } else {
+                format!("neither {a} nor {b} is set")
+            }
+        }
+        [] => String::new(),
+    };
+    SmithAuthMethod {
+        id,
+        label,
+        model_prefix,
+        default_model,
+        available,
+        detail,
+    }
+}
+
+/// Every auth method smith supports, each with live-detected status, in the
+/// same precedence order `probe_smith` checks (spec 0068). Used by the
+/// `smith.auth_status` IPC method that backs the `/configure` dialog's
+/// smith-auth tab — unlike `probe_smith` (one pass/fail signal for the
+/// harness picker), this breaks the detection down per method so the dialog
+/// can list all of them and let the user pin one explicitly.
+pub async fn smith_auth_methods(cache: &std::sync::Mutex<AvailabilityCache>) -> Vec<SmithAuthMethod> {
+    let anthropic = env_key_method(
+        "anthropic_api_key",
+        "Anthropic API key",
+        "anthropic",
+        "claude-opus-4-8",
+        &["ANTHROPIC_API_KEY"],
+    );
+    let openai = env_key_method(
+        "openai_api_key",
+        "OpenAI API key",
+        "openai",
+        "gpt-5",
+        &["OPENAI_API_KEY"],
+    );
+    let gemini = env_key_method(
+        "gemini_api_key",
+        "Gemini API key",
+        "gemini",
+        "gemini-2.5-pro",
+        &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    );
+    let grok_key = env_key_method(
+        "grok_api_key",
+        "Grok API key",
+        "grok",
+        "grok-2-latest",
+        &["GROK_API_KEY", "XAI_API_KEY"],
+    );
+    let claude_sub_present = claude_oauth_credentials_present(cache).await;
+    let claude_sub = SmithAuthMethod {
+        id: "claude_subscription",
+        label: "Claude subscription",
+        model_prefix: "claude-oauth",
+        default_model: "claude-sonnet-4-6",
+        available: claude_sub_present,
+        detail: if claude_sub_present {
+            "Claude Code credentials found".to_string()
+        } else {
+            "no Claude Code credentials found".to_string()
+        },
+    };
+    let codex_sub_present = codex_auth_file().map(|p| p.exists()).unwrap_or(false);
+    let codex_sub = SmithAuthMethod {
+        id: "codex_subscription",
+        label: "Codex subscription",
+        model_prefix: "codex-oauth",
+        default_model: "gpt-5.5",
+        available: codex_sub_present,
+        detail: if codex_sub_present {
+            "~/.codex/auth.json found".to_string()
+        } else {
+            "no ~/.codex/auth.json found".to_string()
+        },
+    };
+    let grok_sub_present = grok_auth_file().map(|p| p.exists()).unwrap_or(false);
+    let grok_sub = SmithAuthMethod {
+        id: "grok_subscription",
+        label: "Grok subscription",
+        model_prefix: "grok-oauth",
+        default_model: "grok-2-latest",
+        available: grok_sub_present,
+        detail: if grok_sub_present {
+            "~/.grok/auth.json found".to_string()
+        } else {
+            "no ~/.grok/auth.json found".to_string()
+        },
+    };
+    let ollama_present = ollama_reachable(cache).await;
+    let ollama = SmithAuthMethod {
+        id: "ollama",
+        label: "Local Ollama",
+        model_prefix: "ollama",
+        default_model: "llama3.1",
+        available: ollama_present,
+        detail: if ollama_present {
+            "Ollama server reachable".to_string()
+        } else {
+            "no Ollama server reachable".to_string()
+        },
+    };
+    let any_available = [
+        anthropic.available,
+        openai.available,
+        gemini.available,
+        grok_key.available,
+        claude_sub.available,
+        codex_sub.available,
+        grok_sub.available,
+        ollama.available,
+    ]
+    .into_iter()
+    .any(|a| a);
+    let auto = SmithAuthMethod {
+        id: "auto",
+        label: "Auto-detect",
+        model_prefix: "",
+        default_model: "",
+        available: any_available,
+        detail: if any_available {
+            "uses the first available method above".to_string()
+        } else {
+            "no method above is available yet".to_string()
+        },
+    };
+    vec![
+        anthropic, openai, gemini, grok_key, claude_sub, codex_sub, grok_sub, ollama, auto,
+    ]
+}
+
+/// Which `smith_auth_methods` entry a pinned `CONSTRUCT_SMITH_MODEL` spec
+/// currently selects, by matching its `provider:` prefix. `None` pin
+/// (unset/empty) resolves to `"auto"`; a pin whose prefix doesn't match any
+/// known method (an `@profile` or hand-edited spec) resolves to `None` — the
+/// dialog then shows no row as the current pick.
+pub fn current_smith_auth_method(pinned: Option<&str>, methods: &[SmithAuthMethod]) -> Option<String> {
+    let Some(spec) = pinned.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Some("auto".to_string());
+    };
+    let prefix = spec.split(':').next().unwrap_or(spec);
+    methods
+        .iter()
+        .find(|m| !m.model_prefix.is_empty() && m.model_prefix == prefix)
+        .map(|m| m.id.to_string())
+}
+
 /// Strip an optional `scheme://` and path/query suffix, defaulting to port
 /// 11434 (Ollama's default) when the remaining host has no explicit port.
 fn host_port(base_url: &str) -> Option<String> {

@@ -1540,31 +1540,49 @@ impl ResolvedModel {
 ///   3. ANTHROPIC_API_KEY set → `claude-opus-4-8`.
 ///   4. OPENAI_API_KEY set → `gpt-5`.
 ///   5. GEMINI_API_KEY (or GOOGLE_API_KEY) set → `gemini-2.5-pro`.
-///   6. fall through to Ollama with `llama3.1`.
+///   6. none of the above → an error (spec 0069). Earlier versions fell
+///      through to `ollama:llama3.1` here unconditionally, so a zero-config
+///      machine with no Ollama server running got a session that looked
+///      healthy and then died mid-turn with a raw transport error instead
+///      of failing loudly at start. OAuth subscriptions (`claude-oauth:`,
+///      `codex-oauth:`, `grok-oauth:`) and Ollama are still fully supported
+///      — they just require an explicit `<prefix>:<model>` spec (via
+///      `--model`, `CONSTRUCT_SMITH_MODEL`, or picking that method in the
+///      `/configure` dialog's smith-auth tab) rather than being guessed.
 pub fn resolve_model(params: &SessionStartParams) -> Result<ResolvedModel> {
     // `params.model` carries the session's active model. The daemon keeps it
     // current across a `/model` switch (it persists the `ModelChanged` event
     // into the session summary and re-injects it on resume), so a resumed
     // session comes back on the model it was last running, not the default.
-    let spec_str = params
+    let spec_str = match params
         .model
         .clone()
         .filter(|s| !s.trim().is_empty())
         .or_else(|| std::env::var("CONSTRUCT_SMITH_MODEL").ok())
-        .unwrap_or_else(|| {
-            if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-                "anthropic:claude-opus-4-8".to_string()
-            } else if std::env::var("OPENAI_API_KEY").is_ok() {
-                "openai:gpt-5".to_string()
-            } else if std::env::var("GEMINI_API_KEY").is_ok()
-                || std::env::var("GOOGLE_API_KEY").is_ok()
-            {
-                "gemini:gemini-2.5-pro".to_string()
-            } else {
-                "ollama:llama3.1".to_string()
-            }
-        });
+    {
+        Some(s) => s,
+        None => default_auto_detect_spec()?,
+    };
     resolve_model_from_spec(&spec_str)
+}
+
+/// The auto-detect ladder's direct-API-key rungs (steps 3-5 above), used
+/// when neither `--model` nor `CONSTRUCT_SMITH_MODEL` is set. Returns an
+/// error rather than silently picking a provider that isn't configured.
+fn default_auto_detect_spec() -> Result<String> {
+    if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+        return Ok("anthropic:claude-opus-4-8".to_string());
+    }
+    if std::env::var("OPENAI_API_KEY").is_ok() {
+        return Ok("openai:gpt-5".to_string());
+    }
+    if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok() {
+        return Ok("gemini:gemini-2.5-pro".to_string());
+    }
+    anyhow::bail!(
+        "no auto-detected smith credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, or \
+         GEMINI_API_KEY/GOOGLE_API_KEY) and no CONSTRUCT_SMITH_MODEL pin set"
+    )
 }
 
 /// Build a [`ResolvedModel`] from a model spec string. Used by the
@@ -2172,5 +2190,68 @@ mod tests {
 
         assert_eq!(resolved.model, "grok-2-latest");
         assert_eq!(resolved.provider_name(), "grok-oauth");
+    }
+
+    /// Serializes tests that mutate the direct-API-key env vars the
+    /// auto-detect ladder reads, so they don't race each other under the
+    /// test harness's parallel execution.
+    static MODEL_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn default_auto_detect_spec_errors_with_no_credentials_no_implicit_ollama() {
+        let _lock = MODEL_ENV_LOCK.lock().unwrap();
+        let vars = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ];
+        let saved: Vec<Option<String>> = vars.iter().map(|v| env::var(v).ok()).collect();
+        for v in vars {
+            env::remove_var(v);
+        }
+
+        let err = default_auto_detect_spec().unwrap_err().to_string();
+
+        for (v, saved) in vars.iter().zip(saved) {
+            match saved {
+                Some(val) => env::set_var(v, val),
+                None => env::remove_var(v),
+            }
+        }
+        assert!(err.contains("no auto-detected smith credential"), "{err}");
+        assert!(!err.to_lowercase().contains("ollama"), "{err}");
+    }
+
+    #[test]
+    fn default_auto_detect_spec_precedence_anthropic_then_openai_then_gemini() {
+        let _lock = MODEL_ENV_LOCK.lock().unwrap();
+        let vars = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+        ];
+        let saved: Vec<Option<String>> = vars.iter().map(|v| env::var(v).ok()).collect();
+        for v in vars {
+            env::remove_var(v);
+        }
+
+        env::set_var("GEMINI_API_KEY", "x");
+        let gemini_only = default_auto_detect_spec().expect("gemini");
+        env::set_var("OPENAI_API_KEY", "x");
+        let openai_over_gemini = default_auto_detect_spec().expect("openai");
+        env::set_var("ANTHROPIC_API_KEY", "x");
+        let anthropic_over_both = default_auto_detect_spec().expect("anthropic");
+
+        for (v, saved) in vars.iter().zip(saved) {
+            match saved {
+                Some(val) => env::set_var(v, val),
+                None => env::remove_var(v),
+            }
+        }
+        assert_eq!(gemini_only, "gemini:gemini-2.5-pro");
+        assert_eq!(openai_over_gemini, "openai:gpt-5");
+        assert_eq!(anthropic_over_both, "anthropic:claude-opus-4-8");
     }
 }

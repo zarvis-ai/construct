@@ -96,7 +96,13 @@ fn model_startup_error_message(params: &SessionStartParams, error: &str) -> Stri
     msg.push_str(error);
 
     let lower = error.to_lowercase();
-    if lower.contains("grok auth token") && lower.contains("expired") {
+    if lower.contains("no auto-detected smith credential") {
+        msg.push_str(
+            "\n\nAction: run `/configure` in the construct TUI (or `M-x configure`) to see \
+             every auth method smith supports, its live status, and how to set it up — or set \
+             `CONSTRUCT_SMITH_MODEL` / `--model` explicitly.",
+        );
+    } else if lower.contains("grok auth token") && lower.contains("expired") {
         msg.push_str(
             "\n\nAction: run `grok login`, then restart this session again. \
              Alternatively set `GROK_API_KEY` or `XAI_API_KEY` before restarting.",
@@ -126,7 +132,8 @@ fn model_startup_error_message(params: &SessionStartParams, error: &str) -> Stri
     msg.push_str(
         "\n\nsmith needs one of: `CONSTRUCT_SMITH_MODEL`, `ANTHROPIC_API_KEY`, \
          `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROK_API_KEY`/`XAI_API_KEY`, \
-         a valid Grok OAuth login, or a local Ollama.",
+         a valid Grok OAuth login, or a local Ollama. Run `/configure` in the construct TUI \
+         (or `M-x configure`) to check status and pick one.",
     );
     msg
 }

@@ -74,13 +74,21 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # model) from config.toml without exporting vars in the shell that starts the
 # daemon. Per-session `construct new --env KEY=VAL` takes precedence.
 #
-# Smith model selection (pick one, or omit to use whatever the CLI/env sets):
+# Smith model selection (pick one, or omit if ANTHROPIC_API_KEY / OPENAI_API_KEY /
+# GEMINI_API_KEY (or GOOGLE_API_KEY) is set in the daemon's environment — smith
+# auto-detects those three, in that order. Without a pin AND without one of those
+# three set, smith fails to start with an error rather than silently falling back
+# to a local Ollama that may not be running. OAuth subscriptions and Ollama always
+# need an explicit pin here (or --model / CONSTRUCT_SMITH_MODEL per-session) since
+# there's no way to auto-detect them safely. The construct TUI's `/configure`
+# dialog (smith-auth tab) writes this same key for you after showing live status
+# for every method below.
 #
 # [adapters.smith.env]
 # CONSTRUCT_SMITH_MODEL = "anthropic:claude-sonnet-4-6"   # direct API via ANTHROPIC_API_KEY
 # # CONSTRUCT_SMITH_MODEL = "claude-oauth:claude-sonnet-4-6"  # via Claude subscription
-# # CONSTRUCT_SMITH_MODEL = "openai:gpt-4o"                   # direct API via OPENAI_API_KEY
-# # CONSTRUCT_SMITH_MODEL = "codex-oauth:gpt-4o"              # via OpenAI subscription
+# # CONSTRUCT_SMITH_MODEL = "openai:gpt-5.5"                  # direct API via OPENAI_API_KEY
+# # CONSTRUCT_SMITH_MODEL = "codex-oauth:gpt-5.5"             # via OpenAI subscription
 # # CONSTRUCT_SMITH_MODEL = "grok-oauth:grok-2-latest"        # via Grok subscription
 # # CONSTRUCT_SMITH_MODEL = "gemini:gemini-2.5-pro"           # via GEMINI_API_KEY
 # # CONSTRUCT_SMITH_MODEL = "ollama:llama3.1"                 # local Ollama server
@@ -242,6 +250,58 @@ pub fn write_template(paths: &Paths) {
     } else {
         tracing::debug!(path = %path.display(), "wrote config.toml.template");
     }
+}
+
+/// Set (or clear) `[adapters.smith.env] CONSTRUCT_SMITH_MODEL` in the live
+/// `config.toml`, preserving every other table/comment via a format-
+/// preserving edit (`toml_edit`) — the `/configure` dialog's smith-auth tab
+/// (spec 0069) is the only caller, and users may have hand-written
+/// unrelated config alongside it. `model_spec: None` clears the pin,
+/// restoring smith's default auto-detect ladder.
+pub fn set_smith_model_pin(paths: &Paths, model_spec: Option<&str>) -> Result<()> {
+    let path = paths.config_file();
+    let existing = if path.exists() {
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?
+    } else {
+        String::new()
+    };
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parse {}", path.display()))?;
+    let adapters = ensure_subtable(&mut doc, "adapters")?;
+    let smith = ensure_subtable(adapters, "smith")?;
+    let env = ensure_subtable(smith, "env")?;
+    match model_spec {
+        Some(spec) => {
+            env.insert("CONSTRUCT_SMITH_MODEL", toml_edit::value(spec));
+        }
+        None => {
+            env.remove("CONSTRUCT_SMITH_MODEL");
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(&path, doc.to_string()).with_context(|| format!("write {}", path.display()))
+}
+
+/// Get-or-insert a subtable of `table`, marking a freshly-created one
+/// implicit so it doesn't print its own `[key]` header when it exists only
+/// to hold a deeper table (matches how `toml_edit` renders supertables of a
+/// dotted path like `[adapters.smith.env]`).
+fn ensure_subtable<'a>(
+    table: &'a mut toml_edit::Table,
+    key: &str,
+) -> Result<&'a mut toml_edit::Table> {
+    let entry = table.entry(key).or_insert_with(|| {
+        let mut t = toml_edit::Table::new();
+        t.set_implicit(true);
+        toml_edit::Item::Table(t)
+    });
+    entry
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("`{key}` in config.toml is not a table"))
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -445,6 +505,54 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tmp_paths(tmp: &std::path::Path) -> Paths {
+        Paths {
+            config_dir: tmp.to_path_buf(),
+            state_dir: tmp.to_path_buf(),
+            data_dir: tmp.to_path_buf(),
+            runtime_dir: tmp.to_path_buf(),
+        }
+    }
+
+    /// The `/configure` dialog's smith-auth tab (spec 0069) writes through
+    /// this function — it must round-trip the pin and leave everything else
+    /// in the file untouched (comments, unrelated tables).
+    #[test]
+    fn set_smith_model_pin_writes_and_preserves_unrelated_content() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = tmp_paths(tmp.path());
+        std::fs::write(
+            paths.config_file(),
+            "# a comment worth keeping\n[defaults]\nworktree = true\n",
+        )
+        .expect("write");
+
+        set_smith_model_pin(&paths, Some("claude-oauth:claude-sonnet-4-6")).expect("set pin");
+        let written = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(written.contains("# a comment worth keeping"));
+        assert!(written.contains("[defaults]"));
+        assert!(written.contains("worktree = true"));
+        assert!(written.contains("[adapters.smith.env]"));
+        assert!(written.contains(r#"CONSTRUCT_SMITH_MODEL = "claude-oauth:claude-sonnet-4-6""#));
+
+        set_smith_model_pin(&paths, None).expect("clear pin");
+        let cleared = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(!cleared.contains("CONSTRUCT_SMITH_MODEL"));
+        assert!(cleared.contains("# a comment worth keeping"));
+        assert!(cleared.contains("worktree = true"));
+    }
+
+    /// No pre-existing `config.toml` (fresh install): the write creates the
+    /// config dir and file rather than erroring.
+    #[test]
+    fn set_smith_model_pin_creates_file_when_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = tmp_paths(&tmp.path().join("nested"));
+        set_smith_model_pin(&paths, Some("ollama:llama3.1")).expect("set pin");
+        let written = std::fs::read_to_string(paths.config_file()).expect("read");
+        assert!(written.contains(r#"CONSTRUCT_SMITH_MODEL = "ollama:llama3.1""#));
+    }
 
     /// `[adapters.<name>].env` parses out of TOML and lands on the
     /// resolved AdapterConfig.

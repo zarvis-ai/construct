@@ -30,22 +30,31 @@ impl TextSink for CaptureSink {
     }
 }
 
-fn pick_default_spec_str() -> String {
+/// Mirrors `agent::resolve_model`'s auto-detect ladder (spec 0069): no
+/// implicit Ollama fallback. Title generation is best-effort and its
+/// caller (`generate_auto_title` in the daemon) already treats any failure
+/// — including this one — as "leave the title unset", so erroring here
+/// just means a session with no configured credential quietly keeps its
+/// default (hash-derived) name instead of shelling out to an Ollama server
+/// that likely isn't running.
+fn pick_default_spec_str() -> Result<String> {
     if let Ok(s) = std::env::var("CONSTRUCT_SMITH_MODEL") {
         if !s.trim().is_empty() {
-            return s;
+            return Ok(s);
         }
     }
     if std::env::var("ANTHROPIC_API_KEY").is_ok() {
-        return "anthropic:claude-haiku-4-5".to_string();
+        return Ok("anthropic:claude-haiku-4-5".to_string());
     }
     if std::env::var("OPENAI_API_KEY").is_ok() {
-        return "openai:gpt-5-mini".to_string();
+        return Ok("openai:gpt-5-mini".to_string());
     }
     if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok() {
-        return "gemini:gemini-2.5-flash".to_string();
+        return Ok("gemini:gemini-2.5-flash".to_string());
     }
-    "ollama:llama3.1".to_string()
+    Err(anyhow!(
+        "no auto-detected smith credential and no CONSTRUCT_SMITH_MODEL pin set; skipping auto-title"
+    ))
 }
 
 fn provider_for(p: Provider) -> Result<Box<dyn LlmProvider>> {
@@ -81,7 +90,7 @@ fn provider_for(p: Provider) -> Result<Box<dyn LlmProvider>> {
 /// Fails fast on missing API keys / network errors so the caller can
 /// silently fall back to the session's default (hash-derived) name.
 pub async fn suggest_title(user_prompt: &str) -> Result<String> {
-    let spec = provider::routing::parse_model_spec(&pick_default_spec_str())
+    let spec = provider::routing::parse_model_spec(&pick_default_spec_str()?)
         .map_err(|e| anyhow!("model-spec parse: {e}"))?;
     let provider = provider_for(spec.provider)?;
     let messages = vec![Message {

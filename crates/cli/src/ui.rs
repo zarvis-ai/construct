@@ -1,11 +1,11 @@
 //! Ratatui rendering for the TUI.
 
 use crate::app::{
-    App, HarnessHit, HintZone, ListItem as AppListItem, MainWindowTree, Minibuffer,
-    MinibufferIntent, PaneFocus, ScreenPoint, Selection, SessionTitleMenuAction,
-    TextSelectionRange, ViewMode, WindowDividerHit, WindowPaneHit, WindowSplitDirection, ZoomMode,
-    PROGRAM_COLLAB_CURSOR_TTL_MS, PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y,
-    PROGRAM_REVEAL_MS,
+    harness_guidance, smith_method_guidance, App, ConfigureTab, HarnessHit, HintZone,
+    ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferIntent, PaneFocus, ScreenPoint,
+    Selection, SessionTitleMenuAction, TextSelectionRange, ViewMode, WindowDividerHit,
+    WindowPaneHit, WindowSplitDirection, ZoomMode, CONFIGURE_TABS, PROGRAM_COLLAB_CURSOR_TTL_MS,
+    PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y, PROGRAM_REVEAL_MS,
 };
 use crate::keymap::{KeyAction, Profile};
 use crate::text_util::wrap_to_width;
@@ -290,10 +290,14 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn finish_frame(f: &mut Frame, app: &mut App) {
-    // The session-picker dialog is the topmost modal — drawn last so it sits
-    // over every base view (including zoomed layouts, which return through
-    // here) and before `capture_frame_text` so it lands in the frame snapshot.
+    // The session-picker dialog and the `/configure` dialog are the topmost
+    // modals — drawn last so they sit over every base view (including
+    // zoomed layouts, which return through here) and before
+    // `capture_frame_text` so they land in the frame snapshot. The two are
+    // mutually exclusive in practice (nothing opens one while the other is
+    // already up), so render order between them doesn't matter.
     render_session_picker(f, app);
+    render_configure_popup(f, app);
     capture_frame_text(f, app);
     render_hovered_url(f, app);
     render_text_selection(f, app);
@@ -6213,6 +6217,244 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme, profile: Profile) -> Re
     popup
 }
 
+/// `/configure` onboarding dialog (spec 0069): tabs across the top
+/// (Harnesses, Smith auth), a selectable list, and a diagnosis/guidance
+/// pane underneath the selected row. Modeled on [`render_help`]'s centered
+/// popup shell, but interactive rather than static.
+fn render_configure_popup(f: &mut Frame, app: &mut App) {
+    let Some(popup) = app.configure_popup.clone() else {
+        return;
+    };
+    let area = f.area();
+    const MARGIN: u16 = 1;
+    let width = 100u16
+        .min(area.width.saturating_sub(2 * MARGIN + 4))
+        .max(20);
+    let height = 24u16
+        .min(area.height.saturating_sub(2 * MARGIN + 2))
+        .max(10);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let outer = Rect {
+        x: x.saturating_sub(MARGIN),
+        y: y.saturating_sub(MARGIN),
+        width: width + 2 * MARGIN,
+        height: height + 2 * MARGIN,
+    };
+    f.render_widget(Clear, outer);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border_focused))
+        .title(" configure ");
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+    app.layout.modal_area = Some(popup_area);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // tabs
+            Constraint::Length(1), // rule
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // rule
+            Constraint::Length(6), // diagnosis / guidance
+            Constraint::Length(1), // footer hint
+        ])
+        .split(inner);
+
+    render_configure_tabs(f, sections[0], app, popup.tab);
+    render_configure_rule(f, sections[1], &app.theme);
+    match popup.tab {
+        ConfigureTab::Harnesses => render_configure_harness_list(f, sections[2], app, &popup),
+        ConfigureTab::SmithAuth => render_configure_smith_list(f, sections[2], app, &popup),
+    }
+    render_configure_rule(f, sections[3], &app.theme);
+    render_configure_diagnosis(f, sections[4], app, &popup);
+    render_configure_footer(f, sections[5], app, popup.tab);
+}
+
+fn render_configure_tabs(f: &mut Frame, area: Rect, app: &mut App, active: ConfigureTab) {
+    app.layout.configure_tab_hits.clear();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut col = area.x;
+    for (i, tab) in CONFIGURE_TABS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            col += 2;
+        }
+        let label = format!(" {} ", tab.label());
+        let w = UnicodeWidthStr::width(label.as_str()) as u16;
+        let style = if *tab == active {
+            Style::default()
+                .fg(app.theme.highlight_fg)
+                .bg(app.theme.highlight_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.dim)
+        };
+        spans.push(Span::styled(label, style));
+        app.layout.configure_tab_hits.push((
+            *tab,
+            Rect {
+                x: col,
+                y: area.y,
+                width: w,
+                height: 1,
+            },
+        ));
+        col += w;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn render_configure_rule(f: &mut Frame, area: Rect, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let rule: String = "─".repeat(area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            rule,
+            Style::default().fg(theme.border),
+        ))),
+        area,
+    );
+}
+
+fn render_configure_harness_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    popup: &crate::app::ConfigurePopup,
+) {
+    let width = area.width.max(1) as usize;
+    let mut lines: Vec<Line<'static>> = app
+        .harnesses
+        .iter()
+        .enumerate()
+        .map(|(i, h)| {
+            let selected = i == popup.harness_selected;
+            let marker = if selected { "› " } else { "  " };
+            let status = if h.available {
+                "available"
+            } else {
+                "unavailable"
+            };
+            let text = format!("{marker}{:<14}{status}", h.name);
+            let mut style = Style::default().fg(if h.available {
+                app.theme.success
+            } else {
+                app.theme.danger
+            });
+            if selected {
+                style = style.fg(app.theme.highlight_fg).bg(app.theme.highlight_bg);
+            }
+            Line::from(Span::styled(format!("{text:<width$}"), style))
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no harnesses registered",
+            Style::default().fg(app.theme.dim),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_configure_smith_list(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    popup: &crate::app::ConfigurePopup,
+) {
+    let width = area.width.max(1) as usize;
+    let mut lines: Vec<Line<'static>> = popup
+        .smith_methods
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let selected = i == popup.smith_selected;
+            let marker = if selected { "› " } else { "  " };
+            let current = if popup.smith_current.as_deref() == Some(m.id.as_str()) {
+                " (current)"
+            } else {
+                ""
+            };
+            let status = if m.available { "detected" } else { "not found" };
+            let text = format!("{marker}{:<22}{status}{current}", m.label);
+            let mut style = Style::default().fg(if m.available {
+                app.theme.success
+            } else {
+                app.theme.dim
+            });
+            if selected {
+                style = style.fg(app.theme.highlight_fg).bg(app.theme.highlight_bg);
+            }
+            Line::from(Span::styled(format!("{text:<width$}"), style))
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "fetching smith auth status…",
+            Style::default().fg(app.theme.dim),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn render_configure_diagnosis(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    popup: &crate::app::ConfigurePopup,
+) {
+    let text = match popup.tab {
+        ConfigureTab::Harnesses => match app.harnesses.get(popup.harness_selected) {
+            Some(h) => format!(
+                "{}\n\n{}",
+                h.detail.as_deref().unwrap_or(""),
+                harness_guidance(&h.name)
+            ),
+            None => "no harnesses registered".to_string(),
+        },
+        ConfigureTab::SmithAuth => match popup.smith_methods.get(popup.smith_selected) {
+            Some(m) => {
+                let mut s = format!("{}\n\n{}", m.detail, smith_method_guidance(&m.id));
+                if let Some(note) = &popup.note {
+                    s.push_str("\n\n");
+                    s.push_str(note);
+                }
+                s
+            }
+            None => "no smith auth data yet".to_string(),
+        },
+    };
+    let para = Paragraph::new(text)
+        .style(Style::default().fg(app.theme.text))
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+fn render_configure_footer(f: &mut Frame, area: Rect, app: &App, tab: ConfigureTab) {
+    let hint = match tab {
+        ConfigureTab::Harnesses => "↑/↓ select   ←/→ switch tab   Esc close",
+        ConfigureTab::SmithAuth => "↑/↓ select   ←/→ switch tab   Enter pick   Esc close",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(app.theme.dim),
+        ))),
+        area,
+    );
+}
+
 fn help_text_for_profile(profile: Profile) -> &'static str {
     match profile {
         Profile::Emacs => EMACS_HELP_TEXT,
@@ -6280,7 +6522,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
                     palette commands: new fork send delete rename program diff border
-                                      zoom interrupt refresh harnesses help
+                                      zoom interrupt refresh harnesses configure help
     ?               toggle this help
     C-x C-c          quit
 
@@ -6351,7 +6593,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
   global
     :               command palette
                     palette commands: new fork send delete rename program diff border
-                                      zoom interrupt refresh harnesses help
+                                      zoom interrupt refresh harnesses configure help
     A               cycle approval mode
     ?               toggle this help
     C-x C-c         quit

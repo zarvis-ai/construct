@@ -15,7 +15,8 @@ use agentd_protocol::{
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetFocusedParams, SessionSetPinnedParams, SessionSetProjectParams,
     SessionSetTitleParams, SessionSetViewParams, SessionSummary, SessionToolDecisionParams,
-    SubscribeParams, TranscriptParams, TranscriptResult,
+    SmithAuthStatusResult, SmithSetAuthMethodParams, SmithSetAuthMethodResult, SubscribeParams,
+    TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -207,6 +208,19 @@ impl Client {
     pub async fn harnesses(&self) -> Result<Vec<HarnessInfo>> {
         self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null)
             .await
+    }
+    pub async fn smith_auth_status(&self) -> Result<SmithAuthStatusResult> {
+        self.request(ipc_method::SMITH_AUTH_STATUS, &serde_json::Value::Null)
+            .await
+    }
+    pub async fn smith_set_auth_method(&self, method: &str) -> Result<SmithSetAuthMethodResult> {
+        self.request(
+            ipc_method::SMITH_SET_AUTH_METHOD,
+            &SmithSetAuthMethodParams {
+                method: method.to_string(),
+            },
+        )
+        .await
     }
     pub async fn program_get(&self, id: &str) -> Result<ProgramGetResult> {
         self.request(

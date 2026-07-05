@@ -12,8 +12,8 @@ use agentd_protocol::{
     ProgramRunProgress, ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult,
     PtyReplayResult, PtySize, SessionAttachClipboardParams, SessionAttachClipboardResult,
     SessionDetail, SessionEmitEventParams, SessionEvent, SessionStartParams, SessionState,
-    SessionSummary, StateNotificationPayload, TimestampedEvent, TranscriptResult,
-    PROGRAM_SMART_CLIP_DESCRIPTORS,
+    SessionSummary, SmithAuthMethodInfo, SmithAuthStatusResult, SmithSetAuthMethodResult,
+    StateNotificationPayload, TimestampedEvent, TranscriptResult, PROGRAM_SMART_CLIP_DESCRIPTORS,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -1603,6 +1603,58 @@ impl SessionManager {
             });
         }
         out
+    }
+
+    /// Per-method smith auth detection for the `/configure` dialog's
+    /// smith-auth tab (spec 0069): every method smith supports, each with
+    /// live-detected status, plus which one (if any) is currently pinned.
+    pub async fn smith_auth_status(&self) -> SmithAuthStatusResult {
+        let methods = crate::availability::smith_auth_methods(&self.availability_cache).await;
+        let pinned = self
+            .config
+            .adapters
+            .get("smith")
+            .and_then(|a| a.env.get("CONSTRUCT_SMITH_MODEL"))
+            .map(String::as_str);
+        let current = crate::availability::current_smith_auth_method(pinned, &methods);
+        SmithAuthStatusResult {
+            methods: methods
+                .into_iter()
+                .map(|m| SmithAuthMethodInfo {
+                    id: m.id.to_string(),
+                    label: m.label.to_string(),
+                    available: m.available,
+                    detail: m.detail,
+                })
+                .collect(),
+            current,
+        }
+    }
+
+    /// Pin (or clear) smith's default model by writing
+    /// `[adapters.smith.env] CONSTRUCT_SMITH_MODEL` in `config.toml` (spec
+    /// 0069). Does not affect already-running adapters — only sessions
+    /// started after a daemon restart pick up the new pin, which
+    /// `SmithSetAuthMethodResult::note` tells the caller.
+    pub async fn set_smith_auth_method(&self, method: &str) -> Result<SmithSetAuthMethodResult> {
+        let methods = crate::availability::smith_auth_methods(&self.availability_cache).await;
+        let model_spec = if method == "auto" {
+            None
+        } else {
+            let m = methods
+                .iter()
+                .find(|m| m.id == method)
+                .ok_or_else(|| anyhow!("unknown smith auth method `{method}`"))?;
+            Some(format!("{}:{}", m.model_prefix, m.default_model))
+        };
+        let paths = agentd_protocol::paths::Paths::discover();
+        crate::config::set_smith_model_pin(&paths, model_spec.as_deref())?;
+        Ok(SmithSetAuthMethodResult {
+            model_spec,
+            note: "new sessions pick up this default after `construct daemon restart`; \
+                   already-running sessions keep their current model"
+                .to_string(),
+        })
     }
 
     /// Probe real availability for one configured harness (spec 0068). The

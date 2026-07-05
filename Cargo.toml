@@ -41,6 +41,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 directories = "5"
 toml = "0.8"
+toml_edit = "0.22"
 nix = { version = "0.29", features = ["signal", "process"] }
 which = "6"
 futures = "0.3"

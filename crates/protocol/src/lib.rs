@@ -800,6 +800,16 @@ impl SessionState {
 pub mod ipc_method {
     pub const PING: &str = "ping";
     pub const HARNESS_LIST: &str = "harness.list";
+    /// Per-method smith auth detection, powering the `/configure` dialog's
+    /// smith-auth tab (spec 0069): which auth methods smith supports, whether
+    /// each is currently usable, and which (if any) `CONSTRUCT_SMITH_MODEL`
+    /// currently pins.
+    pub const SMITH_AUTH_STATUS: &str = "smith.auth_status";
+    /// Pin (or clear, with `method: "auto"`) smith's default model by writing
+    /// `[adapters.smith.env] CONSTRUCT_SMITH_MODEL` in the daemon's
+    /// `config.toml`. Takes effect for sessions started after the write —
+    /// see `SmithSetAuthMethodResult::note`.
+    pub const SMITH_SET_AUTH_METHOD: &str = "smith.set_auth_method";
     pub const PROGRAM_GET: &str = "program.get";
     pub const PROGRAM_UPDATE: &str = "program.update";
     pub const PROGRAM_EDIT: &str = "program.edit";
@@ -1652,6 +1662,55 @@ pub struct HarnessInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub capabilities: Capabilities,
+}
+
+/// One auth method the built-in `smith` harness can use, as detected by the
+/// daemon (spec 0069). Powers the `/configure` dialog's smith-auth tab: each
+/// method reports whether its credential currently exists, so the TUI can
+/// list them with live status and let the user pin one as smith's default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmithAuthMethodInfo {
+    /// Stable id, e.g. `"anthropic_api_key"` or `"auto"`. Sent back verbatim
+    /// in `SmithSetAuthMethodParams::method` to pick this method.
+    pub id: String,
+    /// Human label for display, e.g. "Anthropic API key".
+    pub label: String,
+    pub available: bool,
+    /// Short human-readable reason, e.g. "ANTHROPIC_API_KEY is set".
+    pub detail: String,
+}
+
+/// Result of `smith.auth_status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmithAuthStatusResult {
+    pub methods: Vec<SmithAuthMethodInfo>,
+    /// Which method id the daemon's config currently pins via
+    /// `CONSTRUCT_SMITH_MODEL` — `Some("auto")` when nothing is pinned,
+    /// `Some(id)` when the pin's prefix matches a known method, or `None`
+    /// when it's pinned to something the dialog doesn't recognize (e.g. an
+    /// `@profile` or a hand-edited spec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+}
+
+/// Params for `smith.set_auth_method`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmithSetAuthMethodParams {
+    /// One of `SmithAuthMethodInfo::id`, or `"auto"` to clear the pin.
+    pub method: String,
+}
+
+/// Result of `smith.set_auth_method`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmithSetAuthMethodResult {
+    /// The `CONSTRUCT_SMITH_MODEL` value now written to config.toml, or
+    /// `None` when `method: "auto"` cleared the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_spec: Option<String>,
+    /// Guidance shown in the dialog — always notes that already-running
+    /// adapters keep their current model and only sessions started after a
+    /// `construct daemon restart` pick up the new pin.
+    pub note: String,
 }
 
 /// Distinguishes the implicit orchestrator session — created by the

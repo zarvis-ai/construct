@@ -60,8 +60,19 @@ loads a bearer token from the Grok CLI auth file instead of `GROK_API_KEY` /
 If you don't pass a model and `CONSTRUCT_SMITH_MODEL` isn't set, smith
 picks: `ANTHROPIC_API_KEY` → `claude-opus-4-8`, else `OPENAI_API_KEY`
 → `gpt-5`, else `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) →
-`gemini-2.5-pro`, else `ollama:llama3.1`. The initial Status event
-records the chosen `provider:model` so you can verify.
+`gemini-2.5-pro`, else **smith fails to start** with an error explaining
+what's missing. The initial Status event records the chosen `provider:model`
+so you can verify.
+
+Earlier versions fell through to `ollama:llama3.1` here unconditionally, so a
+machine with no Ollama server running got a session that looked healthy and
+then died mid-turn with a raw transport error instead of failing loudly at
+start. OAuth subscriptions (`claude-oauth:`, `codex-oauth:`, `grok-oauth:`)
+and Ollama are still fully supported — pass one of the explicit prefixes
+above (or `CONSTRUCT_SMITH_MODEL`) rather than relying on auto-detect to
+guess them. In the construct TUI, run `/configure` (or `M-x configure`) to
+see every auth method smith supports, its live-detected status, and — when
+you pick one — persist it as smith's default via `CONSTRUCT_SMITH_MODEL`.
 
 ### Model profiles
 
