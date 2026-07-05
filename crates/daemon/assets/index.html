@@ -2404,6 +2404,13 @@ const state = {
     // In-flight run shimmer per session id:
     // { pendingIds:Set, tooltips:Map, startPerf, deadlinePerf }.
     runById: new Map(),
+    // Run overlap/idempotency guard (spec 0042 consequence), keyed by
+    // `${sessionId}::${hasSel}::${bodyHash}`. Value is "inflight" while
+    // the save/execute round trip for that exact key is still awaited,
+    // or the performance.now() it was dispatched at once it lands —
+    // an identical repeat within PROGRAM_RUN_DEDUP_WINDOW_MS of that
+    // instant is suppressed. See `programRun`.
+    runDispatch: new Map(),
     // Recently-settled block refs per session id: Map<id, Map<ref,startPerf>>.
     settleById: new Map(),
     settleTimer: 0,
@@ -4931,6 +4938,24 @@ function programStartOptimisticRun(id, body, isSelection, selectedBlockIds, prev
   return { pendingIds: pending, shimmer: spans.map((b) => pending.has(b.id)) };
 }
 
+// How long an identical Run (same session, scope, and executed body) is
+// suppressed after a successful dispatch (spec 0042 consequence): long
+// enough to absorb a double-click / Run-button-plus-Ctrl+Enter double fire,
+// short enough that a deliberate re-Run a moment later still goes through.
+const PROGRAM_RUN_DEDUP_WINDOW_MS = 1500;
+
+// FNV-1a 32-bit — good enough to key the Run overlap/idempotency guard
+// below; a collision would at worst suppress a legitimately different Run
+// for one dedup window, an acceptable trade against keying on the whole body.
+function programHashRunBody(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 async function programRun() {
   const id = state.program.mountedId;
   if (!id) return;
@@ -4939,10 +4964,29 @@ async function programRun() {
   const selMarkdown = programSelectionMarkdown();
   const hasSel = selMarkdown != null && selMarkdown.trim() !== "";
   const prevSaved = doc.saved || "";
+
+  // Run overlap/idempotency guard (spec 0042 consequence). The Run button
+  // and the Ctrl+Enter keybinding can both fire for one physical gesture,
+  // and a double-click delivers two click events — either way `programRun`
+  // can be entered twice for what the user experiences as a single Run.
+  // Keying on session + scope + executed body means only a truly identical
+  // repeat is coalesced: a selection run while a full run is in flight, a
+  // different selection, and a re-Run whose body changed all still dispatch.
+  const preSaveBody = hasSel ? programNormalizeClipIds(selMarkdown) : programNormalizeClipIds(programSerialize());
+  const dispatchKey = `${id}::${hasSel ? 1 : 0}::${programHashRunBody(preSaveBody)}`;
+  const guardState = state.program.runDispatch.get(dispatchKey);
+  const suppressed = guardState === "inflight"
+    || (typeof guardState === "number" && performance.now() - guardState < PROGRAM_RUN_DEDUP_WINDOW_MS);
+  if (suppressed) {
+    programSetMsg("run already dispatched");
+    return;
+  }
+  state.program.runDispatch.set(dispatchKey, "inflight");
+
   if (programNormalizeClipIds(programSerialize()) !== doc.saved) {
     await programSave();
     doc = state.program.docById.get(id);
-    if (!doc) return;
+    if (!doc) { state.program.runDispatch.delete(dispatchKey); return; }
   }
   let selection = null, selectedBlockIds = null;
   if (hasSel) {
@@ -4958,6 +5002,10 @@ async function programRun() {
     if (selection != null) params.selection = selection;
     if (optimistic && optimistic.shimmer && optimistic.shimmer.length) params.shimmer = optimistic.shimmer;
     const result = await rpc("program.execute", params);
+    // Dispatch landed: start the debounce window rather than clearing the
+    // guard outright, so an identical repeat arriving right behind it is
+    // still coalesced.
+    state.program.runDispatch.set(dispatchKey, performance.now());
     const runP = programRunFromProgress(result.active_run);
     if (runP) { state.program.runById.set(id, runP); if (state.program.mountedId === id) programStartShimmer(id); }
     else {
@@ -4968,6 +5016,9 @@ async function programRun() {
     if (runP && runP.firstOutputSeen) programClearRunButton(id);
     programSetMsg(`run sent (${hasSel ? "selection" : "program"}, v${result.program.version})`);
   } catch (e) {
+    // The request never landed — retract the guard so the user can retry
+    // immediately.
+    state.program.runDispatch.delete(dispatchKey);
     state.program.runById.delete(id);
     programClearRunButton(id);
     if (state.program.mountedId === id) { programStopShimmer(); programApplyShimmer(); }

@@ -452,6 +452,50 @@ async fn web_program_view_full_parity() {
         "tool_use should clear Run button pulse: {rerun:?}"
     );
 
+    // --- 6c. A double programRun() (double-click / Run button + Ctrl+Enter)
+    //         must dispatch exactly one execute turn (spec 0042 consequence:
+    //         Run overlap/idempotency guard). ------------------------------
+    let double_run: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              const md = "# Heading\n- alpha\n- beta\n";
+              window.__execs = [];
+              window.__mockProgramHandlers["program.get"] = () => ({ program: { session_id: "s-double-run", markdown: md, version: 2, template_id: null }, active_run: null, blocks: [], revisions: [] });
+              window.__mockProgramHandlers["program.execute"] = (p) => {
+                window.__execs.push(p);
+                const ids = programBlockSpans(md).map((b) => b.id);
+                const now = Date.now();
+                return { program: { session_id: "s-double-run", markdown: md, version: 2, template_id: null }, blocks: [], active_run: { run_id: "r-double", started_at_ms: now, expires_at_ms: now + 60000, pending_block_ids: ids, pending_block_tooltips: {}, seen_running: false, first_output_seen: false, agent_managed: false } };
+              };
+              setSession("s-double-run", "shell");
+              await switchCurrentViewMode("program");
+              programTestClearSel();
+              await programRun();
+              await programRun();
+              return { execs: window.__execs, msg: programMsgEl.textContent };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate double run")
+        .into_value()
+        .expect("json");
+    assert_eq!(
+        double_run["execs"].as_array().map(|a| a.len()),
+        Some(1),
+        "a double programRun() must send exactly one program.execute: {double_run:?}"
+    );
+    assert!(
+        double_run["msg"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("already dispatched"),
+        "{double_run:?}"
+    );
+
     // --- 7. Run with a selection scopes execute to the selected text. --------
     let run_sel: serde_json::Value = page
         .evaluate(
