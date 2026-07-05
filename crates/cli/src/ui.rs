@@ -129,6 +129,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_panel_close_hits.clear();
     app.layout.dynamic_ui_inline_hit = None;
     app.layout.matrix_operator_title_hit = None;
+    app.layout.matrix_theme_hit = None;
     app.layout.matrix_widget_hits.clear();
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_triggers.clear();
@@ -301,6 +302,24 @@ fn finish_frame(f: &mut Frame, app: &mut App) {
     capture_frame_text(f, app);
     render_hovered_url(f, app);
     render_text_selection(f, app);
+    paint_default_backgrounds(f, app.theme.background);
+}
+
+fn paint_default_backgrounds(f: &mut Frame, background: Option<Color>) {
+    let Some(background) = background else {
+        return;
+    };
+    let area = *f.buffer_mut().area();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = f.buffer_mut().cell_mut(Position { x, y }) else {
+                continue;
+            };
+            if cell.bg == Color::Reset {
+                cell.bg = background;
+            }
+        }
+    }
 }
 
 fn capture_frame_text(f: &mut Frame, app: &mut App) {
@@ -664,6 +683,18 @@ fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
                 f,
                 &app.theme,
                 &format!(" operator {} ", matrix_operator_status(app)),
+                xs,
+                y.saturating_add(2),
+            );
+            return;
+        }
+    }
+    if let Some((xs, xe, y)) = app.layout.matrix_theme_hit {
+        if my == y && mx >= xs && mx < xe {
+            render_button_tooltip(
+                f,
+                &app.theme,
+                &format!(" theme: {} - click to cycle ", app.theme_name.label()),
                 xs,
                 y.saturating_add(2),
             );
@@ -2217,13 +2248,25 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
         .set_string(label_x, area.y, label.as_str(), operator_style);
     app.layout.matrix_operator_title_hit = Some((operator_start, operator_end, area.y));
 
+    let toggle_glyph = if app.matrix_rain_hidden {
+        " + "
+    } else {
+        " − "
+    };
+    let toggle_x = area.x + area.width.saturating_sub(3);
+    let theme_label = format!(" theme:{} ", app.theme_name.label());
+    let theme_w = UnicodeWidthStr::width(theme_label.as_str()) as u16;
+    let theme_x = toggle_x.saturating_sub(theme_w.saturating_add(1));
+
     let separator_x = operator_end.saturating_add(1);
     if !panels.is_empty() {
         f.buffer_mut()
             .set_string(separator_x, area.y, "─", line_style);
     }
     let mut icon_x = separator_x.saturating_add(2);
-    let icon_limit = area.x + area.width.saturating_sub(5);
+    let icon_limit = theme_x
+        .checked_sub(1)
+        .unwrap_or_else(|| area.x + area.width.saturating_sub(5));
     for panel in panels {
         if icon_x >= icon_limit {
             break;
@@ -2268,12 +2311,25 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
         icon_x = icon_x.saturating_add(w + 1);
     }
 
-    let toggle_glyph = if app.matrix_rain_hidden {
-        " + "
-    } else {
-        " − "
-    };
-    let toggle_x = area.x + area.width.saturating_sub(3);
+    if theme_w > 0
+        && theme_x > separator_x.saturating_add(1)
+        && theme_x.saturating_add(theme_w) <= toggle_x
+    {
+        let theme_hovered = app.mouse_pos.is_some_and(|(mx, my)| {
+            my == area.y && mx >= theme_x && mx < theme_x.saturating_add(theme_w)
+        });
+        let theme_style = if theme_hovered {
+            Style::default()
+                .fg(app.theme.matrix_flash_good)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.muted)
+        };
+        f.buffer_mut()
+            .set_string(theme_x, area.y, theme_label.as_str(), theme_style);
+        app.layout.matrix_theme_hit = Some((theme_x, theme_x.saturating_add(theme_w), area.y));
+    }
+
     let toggle_hovered = app
         .mouse_pos
         .is_some_and(|(mx, my)| my == area.y && mx >= toggle_x && mx < toggle_x.saturating_add(3));
@@ -6528,7 +6584,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
                     palette commands: new fork send delete rename program diff border
-                                      zoom interrupt refresh harnesses configure help
+                                      theme zoom interrupt refresh harnesses configure help
     ?               toggle this help
     C-x C-c          quit
 
@@ -6596,7 +6652,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
   global
     :               command palette
                     palette commands: new fork send delete rename program diff border
-                                      zoom interrupt refresh harnesses configure help
+                                      theme zoom interrupt refresh harnesses configure help
     A               cycle approval mode
     ?               toggle this help
     C-x C-c         quit
@@ -14011,6 +14067,33 @@ mod tests {
 
         assert_eq!(glyph_cell.style().fg, Some(theme.accent));
         assert_eq!(text_cell.style().fg, Some(theme.text));
+    }
+
+    #[test]
+    fn default_background_pass_paints_reset_cells_only() {
+        let background = Color::Rgb(12, 18, 27);
+        let explicit_bg = Color::Rgb(121, 184, 255);
+        let backend = ratatui::backend::TestBackend::new(3, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| {
+                f.buffer_mut()
+                    .cell_mut((0, 0))
+                    .expect("fg-only cell")
+                    .set_style(Style::default().fg(Color::Red));
+                f.buffer_mut()
+                    .cell_mut((1, 0))
+                    .expect("explicit bg cell")
+                    .set_style(Style::default().fg(Color::White).bg(explicit_bg));
+                paint_default_backgrounds(f, Some(background));
+            })
+            .expect("draw");
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.cell((0, 0)).expect("cell").bg, background);
+        assert_eq!(buffer.cell((1, 0)).expect("cell").bg, explicit_bg);
+        assert_eq!(buffer.cell((2, 0)).expect("cell").bg, background);
     }
 
     #[test]

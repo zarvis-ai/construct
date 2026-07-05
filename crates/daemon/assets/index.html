@@ -38,6 +38,13 @@
     --bubble-system: rgba(4, 14, 8, 0.90);
     --session-scrollbar-track: rgba(190, 255, 205, 0.30);
     --session-scrollbar-thumb: rgba(190, 255, 205, 0.80);
+    --overlay-line-a: rgba(190, 255, 205, 0.025);
+    --overlay-line-b: rgba(0, 0, 0, 0.08);
+    --overlay-accent: rgba(57, 255, 136, 0.10);
+    --overlay-alt: rgba(92, 225, 255, 0.07);
+    --overlay-opacity: 0.70;
+    --header-tail: #04140a;
+    --button-pressed-fg: #06160c;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     --glow-soft: 0 0 18px rgba(57, 255, 136, 0.12);
     --glow-hard: 0 0 14px rgba(57, 255, 136, 0.28);
@@ -70,12 +77,12 @@
     pointer-events: none;
     z-index: 2000;
     background:
-      linear-gradient(rgba(190, 255, 205, 0.025) 50%, rgba(0, 0, 0, 0.08) 50%),
-      radial-gradient(circle at 16% 8%, rgba(57, 255, 136, 0.10), transparent 30%),
-      radial-gradient(circle at 88% 14%, rgba(92, 225, 255, 0.07), transparent 34%);
+      linear-gradient(var(--overlay-line-a) 50%, var(--overlay-line-b) 50%),
+      radial-gradient(circle at 16% 8%, var(--overlay-accent), transparent 30%),
+      radial-gradient(circle at 88% 14%, var(--overlay-alt), transparent 34%);
     background-size: 100% 4px, 100% 100%, 100% 100%;
     mix-blend-mode: screen;
-    opacity: 0.70;
+    opacity: var(--overlay-opacity);
   }
   header {
     --header-h: 44px;
@@ -85,9 +92,9 @@
     gap: 8px;
     min-height: var(--header-h);
     padding: 0 0 0 10px;
-    background: linear-gradient(90deg, var(--modeline-bg, #082e18), #04140a 70%);
+    background: linear-gradient(90deg, var(--modeline-bg, #082e18), var(--header-tail) 70%);
     border-bottom: 1px solid var(--border);
-    box-shadow: inset 0 -1px 0 rgba(57, 255, 136, 0.16), var(--glow-soft);
+    box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent) 16%, transparent), var(--glow-soft);
     /* Lets our pull-to-refresh handler track a vertical drag without the
        browser fighting it. Horizontal scroll on the header isn't useful. */
     touch-action: pan-y;
@@ -139,8 +146,8 @@
     display: block;
     border-left: 1px solid var(--border);
     border-radius: 0;
-    background: #020805;
-    box-shadow: inset 0 0 18px rgba(57, 255, 136, 0.14);
+    background: var(--bg);
+    box-shadow: inset 0 0 18px color-mix(in srgb, var(--accent) 14%, transparent);
   }
   @media (max-width: 720px) {
     .mini-matrix { width: 84px; }
@@ -161,7 +168,7 @@
     align-items: center;
     margin-left: 4px;
     border: 1px solid var(--border);
-    background: rgba(2, 8, 5, 0.44);
+    background: color-mix(in srgb, var(--bg) 70%, transparent);
   }
   .view-mode-toggle[hidden] { display: none; }
   .view-mode-toggle button {
@@ -184,8 +191,38 @@
   }
   .view-mode-toggle button[aria-pressed="true"] {
     background: var(--accent);
-    color: #06160c;
+    color: var(--button-pressed-fg);
     text-shadow: none;
+  }
+  .theme-picker {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    margin-left: 4px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg) 70%, transparent);
+  }
+  .theme-picker select {
+    appearance: none;
+    border: 0;
+    border-radius: 0;
+    padding: 5px 22px 5px 7px;
+    background:
+      linear-gradient(45deg, transparent 50%, var(--fg-dim) 50%) right 10px center / 5px 5px no-repeat,
+      linear-gradient(135deg, var(--fg-dim) 50%, transparent 50%) right 5px center / 5px 5px no-repeat,
+      transparent;
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  .theme-picker select:hover,
+  .theme-picker select:focus {
+    color: var(--fg);
+    outline: none;
+    background-color: var(--bg-elev-2);
   }
   .view-mode-toggle button:not([aria-pressed="true"]):hover {
     background: var(--bg-elev-2);
@@ -867,6 +904,7 @@
     border: 1px solid var(--border);
     border-radius: 0;
     background: #020805;
+    background: var(--bg);
     color: var(--fg);
     font: inherit;
     line-height: 1.4;
@@ -1947,6 +1985,13 @@
       <button type="button" id="viewModeProgram" data-view-mode="program"
               aria-pressed="false">Program</button>
     </div>
+    <label class="theme-picker" aria-label="theme">
+      <select id="themePicker" title="Theme">
+        <option value="matrix">Matrix</option>
+        <option value="dark">Dark</option>
+        <option value="light">Light</option>
+      </select>
+    </label>
     <div class="conn" id="conn" data-state="connecting" aria-label="connecting">
       <canvas class="mini-matrix" id="miniMatrix" width="192" height="84"
               aria-label="construct connecting" role="img"></canvas>
@@ -2330,7 +2375,205 @@ const approvalDenyBtn = $("approvalDeny");
 const approvalApproveBtn = $("approvalApprove");
 const approvalAutoReviewBtn = $("approvalAutoReview");
 const approvalUnsafeAutoBtn = $("approvalUnsafeAuto");
+const themePickerEl = $("themePicker");
 const VIEW_MODE_PREFS_KEY = "agentd.web.viewModePrefs";
+const WEB_THEME_KEY = "agentd.web.theme";
+
+const WEB_THEMES = {
+  matrix: {
+    css: {
+      "--bg": "#020805",
+      "--bg-elev": "#06150c",
+      "--bg-elev-2": "#0a2112",
+      "--border": "#186030",
+      "--border-faint": "rgba(24, 96, 48, 0.46)",
+      "--fg": "#beffcd",
+      "--fg-dim": "#4c965c",
+      "--fg-faint": "#20703a",
+      "--accent": "#39ff88",
+      "--accent-alt": "#5ce1ff",
+      "--modeline-bg": "#082e18",
+      "--ok": "#7dff73",
+      "--warn": "#ffd75c",
+      "--err": "#ff5f5a",
+      "--bubble-user": "rgba(8, 46, 24, 0.82)",
+      "--bubble-assistant": "rgba(6, 21, 12, 0.86)",
+      "--bubble-system": "rgba(4, 14, 8, 0.90)",
+      "--session-scrollbar-track": "rgba(190, 255, 205, 0.30)",
+      "--session-scrollbar-thumb": "rgba(190, 255, 205, 0.80)",
+      "--overlay-line-a": "rgba(190, 255, 205, 0.025)",
+      "--overlay-line-b": "rgba(0, 0, 0, 0.08)",
+      "--overlay-accent": "rgba(57, 255, 136, 0.10)",
+      "--overlay-alt": "rgba(92, 225, 255, 0.07)",
+      "--overlay-opacity": "0.70",
+      "--header-tail": "#04140a",
+      "--button-pressed-fg": "#06160c",
+      "--glow-soft": "0 0 18px rgba(57, 255, 136, 0.12)",
+      "--glow-hard": "0 0 14px rgba(57, 255, 136, 0.28)",
+    },
+    terminal: {
+      background: "#020805",
+      foreground: "#beffcd",
+      cursor: "#39ff88",
+      cursorAccent: "#06160c",
+      selectionBackground: "#1c4e2a",
+      black: "#020805",
+      red: "#ff5f5a",
+      green: "#7dff73",
+      yellow: "#ffd75c",
+      blue: "#5ce1ff",
+      magenta: "#ff7ad9",
+      cyan: "#5ce1ff",
+      white: "#beffcd",
+      brightBlack: "#20703a",
+      brightRed: "#ff8b86",
+      brightGreen: "#39ff88",
+      brightYellow: "#ffe58a",
+      brightBlue: "#8aeaff",
+      brightMagenta: "#ffa6e4",
+      brightCyan: "#8aeaff",
+      brightWhite: "#e1ffe6",
+    },
+  },
+  dark: {
+    css: {
+      "--bg": "#0c121b",
+      "--bg-elev": "#111a26",
+      "--bg-elev-2": "#182435",
+      "--border": "#465264",
+      "--border-faint": "rgba(70, 82, 100, 0.48)",
+      "--fg": "#e8ecf3",
+      "--fg-dim": "#9199a6",
+      "--fg-faint": "#667080",
+      "--accent": "#79b8ff",
+      "--accent-alt": "#ffb054",
+      "--modeline-bg": "#1d2634",
+      "--ok": "#63c97f",
+      "--warn": "#eebe5a",
+      "--err": "#f46b74",
+      "--bubble-user": "rgba(28, 43, 61, 0.86)",
+      "--bubble-assistant": "rgba(17, 26, 38, 0.90)",
+      "--bubble-system": "rgba(12, 18, 27, 0.94)",
+      "--session-scrollbar-track": "rgba(232, 236, 243, 0.22)",
+      "--session-scrollbar-thumb": "rgba(232, 236, 243, 0.70)",
+      "--overlay-line-a": "rgba(232, 236, 243, 0.018)",
+      "--overlay-line-b": "rgba(0, 0, 0, 0.08)",
+      "--overlay-accent": "rgba(121, 184, 255, 0.08)",
+      "--overlay-alt": "rgba(255, 176, 84, 0.06)",
+      "--overlay-opacity": "0.42",
+      "--header-tail": "#111a26",
+      "--button-pressed-fg": "#0c121b",
+      "--glow-soft": "0 0 18px rgba(121, 184, 255, 0.10)",
+      "--glow-hard": "0 0 14px rgba(121, 184, 255, 0.24)",
+    },
+    terminal: {
+      background: "#0c121b",
+      foreground: "#e8ecf3",
+      cursor: "#79b8ff",
+      cursorAccent: "#0c121b",
+      selectionBackground: "#2b3442",
+      black: "#0c121b",
+      red: "#f46b74",
+      green: "#63c97f",
+      yellow: "#eebe5a",
+      blue: "#79b8ff",
+      magenta: "#d9a3ff",
+      cyan: "#73d2de",
+      white: "#e8ecf3",
+      brightBlack: "#667080",
+      brightRed: "#ff9aa1",
+      brightGreen: "#90e0a5",
+      brightYellow: "#f4d284",
+      brightBlue: "#a6ceff",
+      brightMagenta: "#e5bdff",
+      brightCyan: "#9de1e9",
+      brightWhite: "#f5f7fa",
+    },
+  },
+  light: {
+    css: {
+      "--bg": "#f6f8fb",
+      "--bg-elev": "#ffffff",
+      "--bg-elev-2": "#e8eef6",
+      "--border": "#c3ccd8",
+      "--border-faint": "rgba(128, 145, 166, 0.44)",
+      "--fg": "#222831",
+      "--fg-dim": "#5c6776",
+      "--fg-faint": "#7d8794",
+      "--accent": "#2273c3",
+      "--accent-alt": "#ae601c",
+      "--modeline-bg": "#345680",
+      "--ok": "#258748",
+      "--warn": "#ac7118",
+      "--err": "#be3844",
+      "--bubble-user": "rgba(232, 238, 246, 0.95)",
+      "--bubble-assistant": "rgba(255, 255, 255, 0.98)",
+      "--bubble-system": "rgba(244, 247, 251, 0.98)",
+      "--session-scrollbar-track": "rgba(34, 40, 49, 0.16)",
+      "--session-scrollbar-thumb": "rgba(34, 40, 49, 0.46)",
+      "--overlay-line-a": "rgba(34, 40, 49, 0.018)",
+      "--overlay-line-b": "rgba(255, 255, 255, 0.10)",
+      "--overlay-accent": "rgba(34, 115, 195, 0.05)",
+      "--overlay-alt": "rgba(174, 96, 28, 0.04)",
+      "--overlay-opacity": "0.30",
+      "--header-tail": "#294565",
+      "--button-pressed-fg": "#ffffff",
+      "--glow-soft": "0 0 18px rgba(34, 115, 195, 0.08)",
+      "--glow-hard": "0 0 14px rgba(34, 115, 195, 0.18)",
+    },
+    terminal: {
+      background: "#f6f8fb",
+      foreground: "#222831",
+      cursor: "#2273c3",
+      cursorAccent: "#ffffff",
+      selectionBackground: "#d8e7f7",
+      black: "#222831",
+      red: "#be3844",
+      green: "#258748",
+      yellow: "#ac7118",
+      blue: "#2273c3",
+      magenta: "#8c4bb3",
+      cyan: "#247f8f",
+      white: "#f6f8fb",
+      brightBlack: "#7d8794",
+      brightRed: "#d85e67",
+      brightGreen: "#3aa763",
+      brightYellow: "#c88a2a",
+      brightBlue: "#4b91d6",
+      brightMagenta: "#a96fca",
+      brightCyan: "#3c9aaa",
+      brightWhite: "#ffffff",
+    },
+  },
+};
+
+function loadWebThemeName() {
+  const stored = localStorage.getItem(WEB_THEME_KEY);
+  return WEB_THEMES[stored] ? stored : "matrix";
+}
+
+function xtermThemeFor(name = loadWebThemeName()) {
+  return { ...WEB_THEMES[name].terminal };
+}
+
+function applyWebTheme(name, { persist = true } = {}) {
+  const themeName = WEB_THEMES[name] ? name : "matrix";
+  const theme = WEB_THEMES[themeName];
+  document.documentElement.dataset.theme = themeName;
+  document.documentElement.style.colorScheme = themeName === "light" ? "light" : "dark";
+  for (const [key, value] of Object.entries(theme.css)) {
+    document.documentElement.style.setProperty(key, value);
+  }
+  if (themePickerEl) themePickerEl.value = themeName;
+  if (persist) localStorage.setItem(WEB_THEME_KEY, themeName);
+  if (typeof state !== "undefined") {
+    for (const handle of state.terminalById.values()) {
+      if (handle.term) handle.term.options.theme = xtermThemeFor(themeName);
+    }
+    if (state.term) state.term.options.theme = xtermThemeFor(themeName);
+    if (state.program?.hover?.term) state.program.hover.term.options.theme = xtermThemeFor(themeName);
+  }
+}
 
 function sessionIdFromLocation() {
   const parts = location.pathname.split("/").filter(Boolean);
@@ -2521,6 +2764,8 @@ const state = {
     hoverSeq: 0,
   },
 };
+
+applyWebTheme(loadWebThemeName(), { persist: false });
 
 const LARGE_TEXT_PASTE_CHARS = 16 * 1024;
 const CODEX_COMPOSER_SUBMIT_DELAY_MS = 150;
@@ -4287,29 +4532,7 @@ function programCreateHoverTerm() {
     scrollback: 200,
     cols: 72,
     rows: 10,
-    theme: {
-      background: "#020805",
-      foreground: "#beffcd",
-      cursor: "#39ff88",
-      cursorAccent: "#06160c",
-      selectionBackground: "#1c4e2a",
-      black: "#020805",
-      red: "#ff5f5a",
-      green: "#7dff73",
-      yellow: "#ffd75c",
-      blue: "#5ce1ff",
-      magenta: "#ff7ad9",
-      cyan: "#5ce1ff",
-      white: "#beffcd",
-      brightBlack: "#20703a",
-      brightRed: "#ff8b86",
-      brightGreen: "#39ff88",
-      brightYellow: "#ffe58a",
-      brightBlue: "#8aeaff",
-      brightMagenta: "#ffa6e4",
-      brightCyan: "#8aeaff",
-      brightWhite: "#e1ffe6",
-    },
+    theme: xtermThemeFor(),
   });
   programHoverTerminalEl.replaceChildren();
   term.open(programHoverTerminalEl);
@@ -6428,32 +6651,7 @@ function createTerminalHandle(id) {
     // Mobile-friendly defaults; the daemon controls actual PTY size
     // via `session.pty_resize` after we report the fit.
     scrollback: 4000,
-    // Match the TUI's Matrix-inspired palette so terminal-mode
-    // sessions feel like the desktop terminal rather than a native
-    // browser widget.
-    theme: {
-      background: "#020805",
-      foreground: "#beffcd",
-      cursor: "#39ff88",
-      cursorAccent: "#06160c",
-      selectionBackground: "#1c4e2a",
-      black: "#020805",
-      red: "#ff5f5a",
-      green: "#7dff73",
-      yellow: "#ffd75c",
-      blue: "#5ce1ff",
-      magenta: "#ff7ad9",
-      cyan: "#5ce1ff",
-      white: "#beffcd",
-      brightBlack: "#20703a",
-      brightRed: "#ff8b86",
-      brightGreen: "#39ff88",
-      brightYellow: "#ffe58a",
-      brightBlue: "#8aeaff",
-      brightMagenta: "#ffa6e4",
-      brightCyan: "#8aeaff",
-      brightWhite: "#e1ffe6",
-    },
+    theme: xtermThemeFor(),
   });
   const fitAddon = new window.FitAddon.FitAddon();
   term.loadAddon(fitAddon);
@@ -9695,6 +9893,10 @@ viewModeToggleEl.addEventListener("click", (ev) => {
   const btn = ev.target.closest("[data-view-mode]");
   if (!btn) return;
   switchCurrentViewMode(btn.dataset.viewMode);
+});
+
+themePickerEl.addEventListener("change", () => {
+  applyWebTheme(themePickerEl.value);
 });
 
 // --- Mobile keyboard awareness ------------------------------------------

@@ -29,6 +29,11 @@ impl App {
                 return false;
             }
         }
+        if let Some((xs, xe, y)) = self.layout.matrix_theme_hit {
+            if row == y && col >= xs && col < xe {
+                return false;
+            }
+        }
         if self
             .layout
             .matrix_widget_hits
@@ -88,7 +93,8 @@ impl App {
                 mb.cursor = offset_cells.min(max);
             }
         } else {
-            self.run_action(crate::keymap::KeyAction::OpenCommandPalette).await;
+            self.run_action(crate::keymap::KeyAction::OpenCommandPalette)
+                .await;
         }
     }
 
@@ -134,6 +140,13 @@ impl App {
                         };
                         let _ = self.client.send_input(&id, cmd.to_string()).await;
                     }
+                    return;
+                }
+            }
+            if let Some((xs, xe, y)) = self.layout.matrix_theme_hit {
+                if row == y && col >= xs && col < xe {
+                    let next = self.theme_name.next();
+                    self.apply_named_theme(next);
                     return;
                 }
             }
@@ -265,7 +278,12 @@ impl App {
         }
     }
 
-    pub(super) async fn click_pin_strip(&mut self, strip: ratatui::layout::Rect, col: u16, row: u16) {
+    pub(super) async fn click_pin_strip(
+        &mut self,
+        strip: ratatui::layout::Rect,
+        col: u16,
+        row: u16,
+    ) {
         let pinned_ids: Vec<String> = self
             .list_items()
             .into_iter()

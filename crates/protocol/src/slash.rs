@@ -45,6 +45,7 @@ pub enum CommandId {
     Rename,
     Send,
     Tasks,
+    Theme,
     Zoom,
 }
 
@@ -284,6 +285,18 @@ pub const COMMANDS: &[SlashCommand] = &[
         in_popup: true,
     },
     SlashCommand {
+        id: CommandId::Theme,
+        name: "/theme",
+        aliases: &[],
+        args: Args::Optional,
+        routing: Routing::Client,
+        visibility: ModelVisibility::Hidden,
+        transcript: TranscriptPolicy::AuditOnly,
+        render: Render::SystemNote,
+        help: "Switch UI theme (/theme matrix|dark|light)",
+        in_popup: true,
+    },
+    SlashCommand {
         id: CommandId::RemoteControl,
         name: "/remote-control",
         aliases: &["remote"],
@@ -484,6 +497,14 @@ mod tests {
         );
         assert!(SlashCommand::resolve("/definitely-not-a-command").is_none());
         assert!(SlashCommand::resolve("/").is_none());
+    }
+
+    #[test]
+    fn theme_is_client_routed_and_in_popup() {
+        let cmd = SlashCommand::resolve("/theme").expect("/theme command");
+        assert_eq!(cmd.id, CommandId::Theme);
+        assert_eq!(cmd.routing, Routing::Client);
+        assert!(popup_names().any(|name| name == "/theme"));
     }
 
     #[test]
