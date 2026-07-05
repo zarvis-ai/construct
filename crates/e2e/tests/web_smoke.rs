@@ -681,6 +681,161 @@ async fn web_client_loads_and_websocket_connects() {
         "no dangling mocked older requests: {chat_history_toggle:?}"
     );
 
+    // Lazy surface loading: a session restored directly into Program mode
+    // should not fetch chat transcript, terminal replay, or session detail
+    // before mounting the Program document. Reconnect refreshes the visible
+    // Program surface as Program too, instead of falling back to transcript.
+    let lazy_program_surface: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const id = 's-lazy-program';
+              const saved = {
+                currentId: state.currentId,
+                sessions: state.sessions,
+                mode: state.mode,
+                viewModeById: state.viewModeById,
+                ws: state.ws,
+                widgetsById: state.widgetsById,
+                mountedId: state.program.mountedId,
+                docById: state.program.docById,
+                wrapHidden: programWrapEl.hidden,
+                transcriptHidden: transcriptEl.hidden,
+                terminalHidden: terminalWrapEl.hidden,
+                sessionWidgetsHidden: sessionWidgetsEl.hidden,
+                inputHtml: programInputEl.innerHTML,
+              };
+              const calls = [];
+              const tick = () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              try {
+                state.sessions = [{
+                  id,
+                  cwd: '/tmp',
+                  harness: 'codex',
+                  has_pty: true,
+                  mode: 'interactive',
+                  kind: 'user',
+                }];
+                state.currentId = null;
+                state.mode = 'chat';
+                state.viewModeById = new Map([[id, 'program']]);
+                state.widgetsById = new Map();
+                state.ws = {
+                  readyState: 1,
+                  send(raw) {
+                    const msg = JSON.parse(raw);
+                    calls.push(msg);
+                    const pending = state.pending.get(msg.id);
+                    state.pending.delete(msg.id);
+                    let result = {};
+                    if (msg.method === 'program.get') {
+                      result = {
+                        program: {
+                          session_id: id,
+                          markdown: '# Lazy Program\n- selected surface\n',
+                          version: 2,
+                          template_id: null,
+                        },
+                        active_run: null,
+                        blocks: [],
+                        collaborators: [],
+                      };
+                    } else if (msg.method === 'program.list_templates') {
+                      result = { templates: [] };
+                    } else if (msg.method === 'session.get') {
+                      result = { ui_panels: [{ id: 'should-not-block', markdown: 'widget' }] };
+                    } else if (msg.method === 'session.transcript') {
+                      result = { events: [], total: 0 };
+                    } else if (msg.method === 'session.pty_replay') {
+                      result = { data: '', start_offset: 0, end_offset: 0, total_bytes: 0 };
+                    }
+                    queueMicrotask(() => pending.resolve(result));
+                  },
+                };
+
+                await selectSession(id, { replaceUrl: true });
+                await tick();
+                const firstCalls = calls.map((c) => c.method);
+                const firstProgramText = programSerialize();
+                const firstWidgetsHidden = sessionWidgetsEl.hidden;
+                const firstTranscriptHidden = transcriptEl.hidden;
+                const firstTerminalHidden = terminalWrapEl.hidden;
+
+                calls.length = 0;
+                refreshCurrentSessionAfterReconnect();
+                for (let i = 0; i < 10; i++) await tick();
+                const reconnectCalls = calls.map((c) => c.method);
+
+                return {
+                  firstCalls,
+                  reconnectCalls,
+                  firstProgramText,
+                  firstWidgetsHidden,
+                  firstTranscriptHidden,
+                  firstTerminalHidden,
+                  mode: state.mode,
+                };
+              } finally {
+                state.currentId = saved.currentId;
+                state.sessions = saved.sessions;
+                state.mode = saved.mode;
+                state.viewModeById = saved.viewModeById;
+                state.ws = saved.ws;
+                state.widgetsById = saved.widgetsById;
+                state.program.mountedId = saved.mountedId;
+                state.program.docById = saved.docById;
+                programWrapEl.hidden = saved.wrapHidden;
+                transcriptEl.hidden = saved.transcriptHidden;
+                terminalWrapEl.hidden = saved.terminalHidden;
+                sessionWidgetsEl.hidden = saved.sessionWidgetsHidden;
+                programInputEl.innerHTML = saved.inputHtml;
+              }
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate lazy program surface loading")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert!(
+        lazy_program_surface["firstCalls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(|m| m == "program.get")),
+        "program surface should fetch program.get: {lazy_program_surface:?}"
+    );
+    for forbidden in ["session.get", "session.transcript", "session.pty_replay"] {
+        assert!(
+            !lazy_program_surface["firstCalls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m == forbidden),
+            "Program select should not fetch {forbidden}: {lazy_program_surface:?}"
+        );
+        assert!(
+            !lazy_program_surface["reconnectCalls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m == forbidden),
+            "Program reconnect should not fetch {forbidden}: {lazy_program_surface:?}"
+        );
+    }
+    assert!(
+        lazy_program_surface["reconnectCalls"]
+            .as_array()
+            .is_some_and(|calls| calls.iter().any(|m| m == "program.get")),
+        "Program reconnect should refresh program.get: {lazy_program_surface:?}"
+    );
+    assert_eq!(
+        lazy_program_surface["firstProgramText"], "# Lazy Program\n- selected surface\n",
+        "{lazy_program_surface:?}"
+    );
+    assert_eq!(lazy_program_surface["firstWidgetsHidden"], true);
+    assert_eq!(lazy_program_surface["firstTranscriptHidden"], true);
+    assert_eq!(lazy_program_surface["firstTerminalHidden"], true);
+    assert_eq!(lazy_program_surface["mode"], "program");
+
     // Connection state is rendered as a tiny matrix canvas rather than
     // a static "connected" text label. The accessible label remains
     // for screen readers.

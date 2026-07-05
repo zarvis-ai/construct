@@ -2899,9 +2899,9 @@ setInterval(() => {
 function refreshCurrentSessionAfterReconnect() {
   if (!state.currentId) return;
   const s = state.sessions.find((x) => x.id === state.currentId);
-  hydrateWidgets(state.currentId, { force: true });
   renderViewModeToggle(s);
   if (state.mode === "terminal") {
+    hydrateWidgets(state.currentId, { force: true });
     // Keep the live xterm buffer exactly where the user left it. Replaying
     // transcript or PTY history on reconnect appends old output into xterm,
     // which looks like terminal history replaying from the beginning. Mobile
@@ -2910,6 +2910,11 @@ function refreshCurrentSessionAfterReconnect() {
     refitTerminal();
     return;
   }
+  if (state.mode === "program") {
+    enterProgramMode(state.currentId, { focus: false });
+    return;
+  }
+  hydrateWidgets(state.currentId, { force: true });
   loadTranscript(state.currentId);
 }
 
@@ -3578,7 +3583,6 @@ async function selectSession(id, { replaceUrl = false } = {}) {
   if (isNarrowLayout()) {
     setSessionListVisible(false, false);
   }
-  hydrateWidgets(id);
   // Restore the view the *incoming* session last used, not the outgoing
   // session's global state.mode. Program is a per-session surface like
   // terminal/chat, so each session reopens in whatever view it last showed.
@@ -4862,6 +4866,10 @@ async function enterProgramMode(id, opts = {}) {
   composerEl.hidden = true;
   terminalWrapEl.hidden = true;
   terminalScrollOverlayEl.hidden = true;
+  widgetsTriggerBtn.hidden = true;
+  terminalWidgetsProxyBtn.hidden = true;
+  terminalWidgetControlsEl.hidden = true;
+  sessionWidgetsEl.hidden = true;
   if (typeof vkbdEl !== "undefined" && vkbdEl) vkbdEl.hidden = true;
   programWrapEl.hidden = false;
   programSetMsg("");
@@ -5914,6 +5922,7 @@ function enterChatMode() {
   terminalEl.classList.remove("hide-xterm-cursor");
   terminalScrollOverlayEl.hidden = true;
   renderWidgets();
+  hydrateWidgets(state.currentId);
   // Show minimal agent-status in chat mode so user sees "Working.. <elapsed>"
   // after send when a turn is active. We reuse renderEditorState with the
   // current session's agent status; queued/buffer lines are empty in chat mode.
@@ -5984,6 +5993,7 @@ async function enterTerminalMode(id, options = {}) {
   terminalWrapEl.hidden = false;
   terminalScrollOverlayEl.hidden = false;
   renderWidgets();
+  hydrateWidgets(id);
   vkbdEl.hidden = !showMobileControls;
   const session = state.sessions.find((x) => x.id === id);
   terminalEl.classList.toggle("hide-xterm-cursor", isStructuredToolSession(session));
@@ -7591,7 +7601,7 @@ function handleNotification(method, params) {
     } else if (session.id === state.currentId) {
       sessionTitleEl.textContent = sessionViewTitle(session);
       renderViewModeToggle(session);
-      hydrateWidgets(session.id);
+      if (state.mode !== "program") hydrateWidgets(session.id);
     }
   } else if (method === "session/deleted") {
     // Pick neighbor before removing from the list so position is still valid.
@@ -8425,6 +8435,15 @@ function isWidgetPopoverPinned() {
 }
 
 function renderWidgets() {
+  if (state.mode === "program") {
+    widgetsTriggerBtn.hidden = true;
+    terminalWidgetsProxyBtn.hidden = true;
+    terminalWidgetControlsEl.hidden = true;
+    inlineWidgetBackdropEl.hidden = true;
+    sessionWidgetsEl.hidden = true;
+    sessionWidgetsEl.classList.remove("inline-open");
+    return;
+  }
   const sessionId = state.currentId;
   const panels = sessionId ? (state.widgetsById.get(sessionId) || []) : [];
   const inlinePanel = sessionId ? currentInlineWidget(sessionId) : null;
