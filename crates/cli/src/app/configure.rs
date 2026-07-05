@@ -99,8 +99,10 @@ pub fn smith_method_guidance(id: &str) -> &'static str {
             "install Ollama and run `ollama serve` so it's reachable at localhost:11434 (or \
              set OLLAMA_HOST), then restart the daemon"
         }
-        "auto" => "uses the first detected API key: Anthropic, then OpenAI, then Gemini; \
-                   subscriptions and Ollama must be picked explicitly",
+        "auto" => {
+            "uses the first detected API key: Anthropic, then OpenAI, then Gemini; \
+             subscriptions and Ollama must be picked explicitly"
+        }
         _ => "",
     }
 }
@@ -265,51 +267,57 @@ impl App {
 
     /// Route a key while the dialog owns input. Esc closes; Left/Right (and
     /// Tab/BackTab) switch tabs; Up/Down move the selection; Enter confirms
-    /// a smith-auth pick. Anything else falls through to
-    /// [`Self::handle_configure_fallback_key`], which keeps the global quit
-    /// chord alive.
-    pub(super) async fn handle_configure_key(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Esc => self.close_configure_popup(),
-            KeyCode::Left | KeyCode::BackTab => self.configure_switch_tab_relative(-1),
-            KeyCode::Right | KeyCode::Tab => self.configure_switch_tab_relative(1),
-            KeyCode::Up => self.configure_move_selection(-1),
-            KeyCode::Down => self.configure_move_selection(1),
-            KeyCode::Enter => self.confirm_configure_selection().await,
-            _ => self.handle_configure_fallback_key(key),
-        }
-    }
-
-    /// Everything the dialog doesn't claim for its own navigation still
-    /// needs to reach the ordinary chord state machine — otherwise `C-x
-    /// C-c` (quit) is silently swallowed the instant this dialog owns
-    /// input. That's a real regression, not just a test artifact: this
-    /// dialog can auto-open on a user's very first launch (spec 0069), and
-    /// the welcome card advertises "`C-x C-c` exit TUI" right underneath
-    /// it — a first-run user who tries to quit would find the app
-    /// unresponsive to the one shortcut it just told them to use.
+    /// a smith-auth pick — these return `true` (key fully consumed, dialog
+    /// stays open unless it was Esc).
     ///
-    /// `Quit` is the only action actually executed here. Every other
-    /// resolved action (e.g. `C-x C-f` for a new session) is deliberately
-    /// left a no-op while this dialog is the topmost modal — running it
-    /// would open a second overlay (minibuffer, popup, …) underneath a
-    /// dialog that still believes it owns every keystroke, since `on_key`
-    /// checks `configure_popup` before anything else. The chord state is
-    /// still fed and `chord_label` still updates, so a partial `C-x` press
-    /// shows the usual pending-chord hint in the modeline instead of
-    /// looking stuck.
-    fn handle_configure_fallback_key(&mut self, key: KeyEvent) {
-        let res = self.chord_state.handle(key, &self.keymap);
-        self.chord_label = self.chord_state.label();
-        if matches!(res, KeymapResult::Action(KeyAction::Quit)) {
-            self.should_quit = true;
+    /// Anything else closes the dialog and returns `false`, telling the
+    /// caller (`App::on_key`) to re-dispatch the SAME key through ordinary
+    /// routing — exactly like clicking away from an open menu: the click
+    /// (or keystroke) that dismisses it still takes effect. This is a
+    /// general rule, not a quit-chord special case (spec 0069): `C-x x`
+    /// closes the dialog and opens the command palette, `C-x C-f` closes it
+    /// and opens the new-session picker, `C-x C-c` closes it and quits —
+    /// none of these need their own carve-out, and a first-run dialog that
+    /// happens to be on screen never again deadens a chord the user reaches
+    /// for out of muscle memory.
+    pub(super) async fn handle_configure_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Esc => {
+                self.close_configure_popup();
+                true
+            }
+            KeyCode::Left | KeyCode::BackTab => {
+                self.configure_switch_tab_relative(-1);
+                true
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.configure_switch_tab_relative(1);
+                true
+            }
+            KeyCode::Up => {
+                self.configure_move_selection(-1);
+                true
+            }
+            KeyCode::Down => {
+                self.configure_move_selection(1);
+                true
+            }
+            KeyCode::Enter => {
+                self.confirm_configure_selection().await;
+                true
+            }
+            _ => {
+                self.close_configure_popup();
+                false
+            }
         }
     }
 
-    /// Click on a tab header switches to it — the only mouse interaction
-    /// the dialog supports (spec 0069); row selection stays keyboard-only.
-    /// Returns whether the click hit a tab, so the caller can swallow the
-    /// rest of the click when the dialog is open regardless.
+    /// Click on a tab header switches to it and keeps the dialog open
+    /// (`true`). Any other click closes the dialog — like clicking away
+    /// from an open menu — and returns `false` so the caller lets the SAME
+    /// click still take effect on whatever's underneath (spec 0069),
+    /// mirroring [`Self::handle_configure_key`]'s fallthrough for keys.
     pub(super) fn configure_click_tab(&mut self, col: u16, row: u16) -> bool {
         let hit = self
             .layout
@@ -324,7 +332,10 @@ impl App {
                 }
                 true
             }
-            None => false,
+            None => {
+                self.close_configure_popup();
+                false
+            }
         }
     }
 }

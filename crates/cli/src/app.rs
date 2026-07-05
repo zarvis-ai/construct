@@ -6014,15 +6014,23 @@ impl App {
         // render against.
         let next_pos = (ev.column, ev.row);
         self.mouse_pos = Some(next_pos);
-        // The `/configure` dialog (spec 0069) is a topmost modal: swallow
-        // every click while it's open. A left-click is tested against the
-        // tab headers first; anything else (including a miss) is a no-op
-        // rather than falling through to the pane underneath.
+        // The `/configure` dialog (spec 0069) is a topmost modal: a
+        // left-click is tested against the tab headers first (dialog stays
+        // open); any other left-click closes it — like clicking away from
+        // an open menu — and the SAME click still takes effect on whatever
+        // is underneath, mirroring `on_key`'s fallthrough for keys. Every
+        // other mouse event kind (hover, scroll, drag, right-click) is
+        // swallowed without closing anything — only an actual click should
+        // dismiss the dialog.
         if self.configure_popup.is_some() {
-            if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.configure_click_tab(ev.column, ev.row);
+            match ev.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.configure_click_tab(ev.column, ev.row) {
+                        return;
+                    }
+                }
+                _ => return,
             }
-            return;
         }
         // If the cursor is over a pane whose child has grabbed the mouse
         // (e.g. Claude Code in fullscreen), forward the event into that PTY and
@@ -6881,10 +6889,15 @@ impl App {
             self.handle_session_picker_key(key);
             return;
         }
-        // The `/configure` dialog (spec 0069) is a topmost modal like the
-        // session picker above — it owns every keystroke while open.
-        if self.configure_popup.is_some() {
-            self.handle_configure_key(key).await;
+        // The `/configure` dialog (spec 0069) owns the keys it uses for its
+        // own navigation. Anything else closes it and falls through to
+        // ordinary routing below — same keystroke, re-dispatched exactly
+        // once — like clicking away from an open menu: `C-x x` closes the
+        // dialog and opens the command palette, `C-x C-f` closes it and
+        // opens the new-session picker, `C-x C-c` closes it and quits. No
+        // chord is ever a dead end just because this dialog happened to be
+        // on screen (it can auto-open with no prior user action).
+        if self.configure_popup.is_some() && self.handle_configure_key(key).await {
             return;
         }
         if self.tasks_popup.is_some() {
@@ -9956,15 +9969,23 @@ mod tests {
     }
 
     /// Regression: `on_key`'s configure-popup gate used to swallow every key
-    /// with a bare `_ => {}`, which silently ate the global quit chord too —
-    /// a real first-run bug since this dialog can auto-open with no prior
-    /// user action and the welcome card advertises `C-x C-c` right
-    /// underneath it. Drives the full `on_key` gate chain (not just
+    /// it didn't claim for its own navigation — first with a bare `_ => {}`,
+    /// then with a narrower "let only Quit through" special case — so any
+    /// *other* chord (the command palette's `C-x x`, the new-session
+    /// picker's `C-x C-f`, …) was a dead end while the dialog owned input.
+    /// That's a real first-run bug: this dialog can auto-open with no prior
+    /// user action, and every one of these is documented muscle-memory UX
+    /// (the welcome card advertises `C-x C-c`; the help text advertises
+    /// `C-x x`). The general rule fixes all of them at once: an unclaimed
+    /// key closes the dialog and is re-dispatched through ordinary `on_key`
+    /// routing exactly once — like clicking away from an open menu — so the
+    /// same keystroke that dismissed the dialog still does what it always
+    /// does. Drives the full `on_key` gate chain (not just
     /// `handle_configure_key` directly) so it also covers the `connected`/
     /// `session_picker`/`configure_popup` ordering actually deciding who
     /// owns the keystroke.
     #[tokio::test]
-    async fn configure_dialog_open_keeps_global_quit_chord_working() {
+    async fn configure_dialog_unclaimed_key_closes_and_reprocesses_through_normal_routing() {
         let (client, _dir, _server) = configure_mock_daemon(
             vec![harness_json("shell", true)],
             vec![smith_method_json("auto", "Auto-detect", true)],
@@ -9974,6 +9995,42 @@ mod tests {
         let mut app = test_app(client, Vec::new());
         app.open_configure_popup().await;
         assert!(app.configure_popup.is_some(), "dialog should be open");
+
+        // `C-x` isn't one of the dialog's own keys (Esc/Left/Right/Tab/
+        // BackTab/Up/Down/Enter), so it closes the dialog immediately and
+        // is fed to the ordinary chord state machine on this same call.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            app.configure_popup.is_none(),
+            "an unclaimed key must close the dialog rather than being swallowed"
+        );
+        // Completing the chord with a plain `x` opens the command palette —
+        // exactly as it would if the dialog had never been open.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+        assert!(
+            matches!(
+                app.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::CommandPalette)
+            ),
+            "C-x x must close the dialog AND open the command palette"
+        );
+    }
+
+    /// The global quit chord is not a special case anymore — it's just one
+    /// instance of the general "unclaimed key closes + reprocesses" rule
+    /// covered above. This test pins that specific, previously-broken case.
+    #[tokio::test]
+    async fn configure_dialog_quit_chord_works_via_the_general_rule() {
+        let (client, _dir, _server) = configure_mock_daemon(
+            vec![harness_json("shell", true)],
+            vec![smith_method_json("auto", "Auto-detect", true)],
+            Some("auto"),
+        )
+        .await;
+        let mut app = test_app(client, Vec::new());
+        app.open_configure_popup().await;
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
@@ -9985,7 +10042,7 @@ mod tests {
             .await;
         assert!(
             app.should_quit,
-            "C-x C-c must still quit the TUI while the configure dialog owns input"
+            "C-x C-c must still quit the TUI even though the configure dialog was open"
         );
     }
 
@@ -10068,7 +10125,16 @@ mod tests {
             app.configure_popup.as_ref().unwrap().tab,
             ConfigureTab::SmithAuth
         );
-        assert!(!app.configure_click_tab(12, 5), "miss outside any tab rect");
+        // A click outside any tab header closes the dialog — like clicking
+        // away from an open menu — mirroring the keyboard fallthrough rule.
+        assert!(
+            !app.configure_click_tab(12, 5),
+            "miss outside any tab rect returns false"
+        );
+        assert!(
+            app.configure_popup.is_none(),
+            "a click outside the tab headers must close the dialog"
+        );
     }
 
     #[test]
