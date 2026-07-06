@@ -2345,6 +2345,10 @@ pub struct LayoutSnapshot {
     /// Matrix-rain title-bar Operator label bounds: `(x_start, x_end, y)`.
     pub matrix_operator_title_hit: Option<(u16, u16, u16)>,
     /// Matrix-rain title-bar theme switcher bounds: `(x_start, x_end, y)`.
+    ///
+    /// Retained for stale-frame safety and older hit-test code; current
+    /// frames leave it unset because the theme switcher lives in the
+    /// minibuffer shortcut hints.
     pub matrix_theme_hit: Option<(u16, u16, u16)>,
     /// Matrix-rain title-bar widget viewport affordances for the operator session.
     pub matrix_widget_hits: Vec<MatrixWidgetHit>,
@@ -7889,6 +7893,9 @@ impl App {
             }
             ToggleMouseCapture => {
                 self.toggle_mouse_capture();
+            }
+            CycleTheme => {
+                self.apply_named_theme(self.theme_name.next());
             }
         }
     }
@@ -20272,6 +20279,33 @@ mod tests {
             col > 60,
             "notice should start in the right half (byte col {col}):\n{modeline}"
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn theme_indicator_renders_in_minibuffer_not_matrix_header() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("theme:matrix"),
+            "missing minibuffer theme label:\n{screen}"
+        );
+        assert!(
+            app.layout.matrix_theme_hit.is_none(),
+            "matrix rain header should not own theme click target"
+        );
+        assert!(app
+            .layout
+            .shortcut_hints
+            .iter()
+            .any(|h| h.action == KeyAction::CycleTheme));
         server.abort();
     }
 

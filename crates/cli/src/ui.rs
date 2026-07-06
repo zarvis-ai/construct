@@ -2254,9 +2254,6 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
         " − "
     };
     let toggle_x = area.x + area.width.saturating_sub(3);
-    let theme_label = format!(" theme:{} ", app.theme_name.label());
-    let theme_w = UnicodeWidthStr::width(theme_label.as_str()) as u16;
-    let theme_x = toggle_x.saturating_sub(theme_w.saturating_add(1));
 
     let separator_x = operator_end.saturating_add(1);
     if !panels.is_empty() {
@@ -2264,9 +2261,7 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
             .set_string(separator_x, area.y, "─", line_style);
     }
     let mut icon_x = separator_x.saturating_add(2);
-    let icon_limit = theme_x
-        .checked_sub(1)
-        .unwrap_or_else(|| area.x + area.width.saturating_sub(5));
+    let icon_limit = toggle_x.saturating_sub(1);
     for panel in panels {
         if icon_x >= icon_limit {
             break;
@@ -2309,25 +2304,6 @@ fn render_matrix_rain_header(f: &mut Frame, area: Rect, app: &mut App, now: Inst
                 end_col: icon_x.saturating_add(w),
             });
         icon_x = icon_x.saturating_add(w + 1);
-    }
-
-    if theme_w > 0
-        && theme_x > separator_x.saturating_add(1)
-        && theme_x.saturating_add(theme_w) <= toggle_x
-    {
-        let theme_hovered = app.mouse_pos.is_some_and(|(mx, my)| {
-            my == area.y && mx >= theme_x && mx < theme_x.saturating_add(theme_w)
-        });
-        let theme_style = if theme_hovered {
-            Style::default()
-                .fg(app.theme.matrix_flash_good)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(app.theme.muted)
-        };
-        f.buffer_mut()
-            .set_string(theme_x, area.y, theme_label.as_str(), theme_style);
-        app.layout.matrix_theme_hit = Some((theme_x, theme_x.saturating_add(theme_w), area.y));
     }
 
     let toggle_hovered = app
@@ -6241,6 +6217,32 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             action: *action,
         });
         col = x_end;
+    }
+    let theme_label = format!("theme:{}", app.theme_name.label());
+    let theme_w = UnicodeWidthStr::width(theme_label.as_str()) as u16;
+    let area_right = area.x.saturating_add(area.width);
+    let theme_x = area_right.saturating_sub(theme_w);
+    if theme_w > 0 && theme_x > col {
+        let pad_w = theme_x.saturating_sub(col);
+        if pad_w > 0 {
+            spans.push(Span::raw(" ".repeat(pad_w as usize)));
+        }
+        let hovered = match mouse {
+            Some((mx, my)) => my == area.y && mx >= theme_x && mx < theme_x.saturating_add(theme_w),
+            None => false,
+        };
+        let style = if hovered {
+            hover_style
+        } else {
+            Style::default().fg(app.theme.muted)
+        };
+        spans.push(Span::styled(theme_label, style));
+        app.layout.shortcut_hints.push(HintZone {
+            x_start: theme_x,
+            x_end: theme_x.saturating_add(theme_w),
+            y: area.y,
+            action: KeyAction::CycleTheme,
+        });
     }
     let para = Paragraph::new(Line::from(spans));
     f.render_widget(para, area);

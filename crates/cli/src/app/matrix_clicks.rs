@@ -29,11 +29,6 @@ impl App {
                 return false;
             }
         }
-        if let Some((xs, xe, y)) = self.layout.matrix_theme_hit {
-            if row == y && col >= xs && col < xe {
-                return false;
-            }
-        }
         if self
             .layout
             .matrix_widget_hits
@@ -140,13 +135,6 @@ impl App {
                         };
                         let _ = self.client.send_input(&id, cmd.to_string()).await;
                     }
-                    return;
-                }
-            }
-            if let Some((xs, xe, y)) = self.layout.matrix_theme_hit {
-                if row == y && col >= xs && col < xe {
-                    let next = self.theme_name.next();
-                    self.apply_named_theme(next);
                     return;
                 }
             }

@@ -100,6 +100,9 @@ pub enum KeyAction {
     /// Toggle terminal mouse capture. When disabled, native terminal
     /// selection works; agentd mouse interactions are suspended.
     ToggleMouseCapture,
+    /// Cycle the active UI color theme. Click-only for the minibuffer theme
+    /// affordance; `/theme` remains the keyboard-facing command.
+    CycleTheme,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
