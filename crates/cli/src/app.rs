@@ -10657,6 +10657,140 @@ mod tests {
         assert!(app.program_popups.contains_key("s2"));
     }
 
+    // Split-view focus cue: when focus moves to the session list, the pane
+    // the user was last in (`active_window_id`) keeps its title text at
+    // focused brightness — that's how the user can tell where `C-x o` will
+    // land — while its border still dims like every other unfocused pane.
+    // The other pane's title stays fully dimmed.
+    #[tokio::test]
+    async fn last_focused_split_keeps_bright_title_when_list_takes_focus() {
+        let (mut app, _dir, _server) = two_session_app().await;
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s2".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.selection = Selection::Session("s1".into());
+        app.focus = PaneFocus::List;
+
+        let backend = ratatui::backend::TestBackend::new(160, 45);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let buffer = term.backend().buffer().clone();
+
+        let bright = app.theme.border_focused;
+        let dim = app.theme.border;
+        assert_ne!(bright, dim, "theme must distinguish focused borders");
+        let pane_area = |app: &App, id: u64| {
+            app.layout
+                .main_window_areas
+                .iter()
+                .find(|hit| hit.id == id)
+                .map(|hit| hit.area)
+                .expect("split pane area")
+        };
+        let title_row_has =
+            |buffer: &ratatui::buffer::Buffer, area: Rect, color: ratatui::style::Color| {
+                (area.x..area.x + area.width)
+                    .any(|x| buffer.cell((x, area.y)).and_then(|c| c.style().fg) == Some(color))
+            };
+
+        let pane1 = pane_area(&app, 1);
+        let pane2 = pane_area(&app, 2);
+        assert_eq!(
+            buffer.cell((pane1.x, pane1.y)).and_then(|c| c.style().fg),
+            Some(dim),
+            "last-focused pane's border must still dim when the list has focus"
+        );
+        assert!(
+            title_row_has(&buffer, pane1, bright),
+            "last-focused pane's title text must keep focused brightness"
+        );
+        assert!(
+            !title_row_has(&buffer, pane2, bright),
+            "the other pane's title bar must stay fully dimmed"
+        );
+
+        // Sanity: focusing the pane again brightens its border as before.
+        app.focus = PaneFocus::View;
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let buffer = term.backend().buffer().clone();
+        let pane1 = pane_area(&app, 1);
+        assert_eq!(
+            buffer.cell((pane1.x, pane1.y)).and_then(|c| c.style().fg),
+            Some(bright),
+            "focused pane border renders at focused brightness"
+        );
+    }
+
+    // The active Program popup previously rendered with a hardcoded
+    // active=true, so its border never dimmed when focus moved to the
+    // session list. The border must dim like any other split pane while the
+    // session label in the title keeps full brightness (the popup belongs to
+    // the last-focused pane).
+    #[tokio::test]
+    async fn program_border_dims_when_list_takes_focus_but_label_stays_bright() {
+        let (mut app, _dir, _server) = two_session_app().await;
+        app.selection = Selection::Session("s1".into());
+        app.active_window_id = 1;
+        app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
+        let mut popup = program_popup_for_test("s1", "# Rule\n\nbody\n", 0);
+        // Skip the roll-down animation so the frame renders at full height.
+        popup.revealed_at = Instant::now() - Duration::from_secs(60);
+        popup.hide_after = Instant::now() + Duration::from_secs(600);
+        app.program_popup = Some(popup);
+        app.focus = PaneFocus::List;
+
+        let backend = ratatui::backend::TestBackend::new(160, 45);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let buffer = term.backend().buffer().clone();
+
+        let base = app.layout.program_base_area.expect("program base area");
+        let accent = app.theme.accent_alt;
+        let corner = buffer
+            .cell((base.x, base.y))
+            .expect("program corner cell")
+            .style();
+        assert_eq!(corner.fg, Some(accent), "program border keeps its hue");
+        assert!(
+            corner.add_modifier.contains(ratatui::style::Modifier::DIM),
+            "program border must dim when focus moves to the session list"
+        );
+        let label_bright = (base.x..base.x + base.width).any(|x| {
+            let style = buffer.cell((x, base.y)).expect("title row cell").style();
+            style.fg == Some(accent)
+                && style.add_modifier.contains(ratatui::style::Modifier::BOLD)
+                && !style.add_modifier.contains(ratatui::style::Modifier::DIM)
+        });
+        assert!(
+            label_bright,
+            "program title label must keep focused brightness while the list has focus"
+        );
+
+        // Sanity: with the pane focused the border is bright again.
+        app.focus = PaneFocus::View;
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let buffer = term.backend().buffer().clone();
+        let base = app.layout.program_base_area.expect("program base area");
+        let corner = buffer
+            .cell((base.x, base.y))
+            .expect("program corner cell")
+            .style();
+        assert!(
+            !corner.add_modifier.contains(ratatui::style::Modifier::DIM),
+            "focused program border renders at full brightness"
+        );
+    }
+
     // Concrete reproduction reported after the above fix shipped: a session
     // reassignment (the neighbor a deleted/archived session's window falls
     // back to — see `focus_neighbor_of`) can leave TWO split panes showing
