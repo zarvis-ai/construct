@@ -6009,17 +6009,25 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Persistent notices, right-aligned at the far edge of the status bar so
     // they stay visible without crowding transient inline status messages.
-    let mut persistent_notices = Vec::new();
+    let theme_label = format!("theme:{}", app.theme_name.label());
+    let mut persistent_notices: Vec<(String, Option<KeyAction>)> =
+        vec![(theme_label, Some(KeyAction::CycleTheme))];
     if app.daemon_build_mismatch {
-        persistent_notices.push(crate::app::DAEMON_BUILD_MISMATCH_NOTICE);
+        persistent_notices.push((crate::app::DAEMON_BUILD_MISMATCH_NOTICE.to_string(), None));
     }
     if let Some(notice) = app.update_notice.as_deref() {
-        persistent_notices.push(notice);
+        persistent_notices.push((notice.to_string(), None));
     }
     if !persistent_notices.is_empty() {
         use unicode_width::UnicodeWidthStr;
-        let text = format!(" {} ", persistent_notices.join(" | "));
-        let w = UnicodeWidthStr::width(text.as_str()) as u16;
+        let labels_width: usize = persistent_notices
+            .iter()
+            .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
+            .sum();
+        let separators_width = persistent_notices.len().saturating_sub(1) * 3;
+        let w = labels_width
+            .saturating_add(separators_width)
+            .saturating_add(2) as u16;
         if w > 0 && w < area.width {
             let nrect = Rect {
                 x: area.x + area.width - w,
@@ -6027,7 +6035,45 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
                 width: w,
                 height: area.height,
             };
-            let np = Paragraph::new(text).style(
+            let mut spans = Vec::new();
+            let mut col = nrect.x;
+            spans.push(Span::raw(" "));
+            col = col.saturating_add(1);
+            for (i, (label, action)) in persistent_notices.iter().enumerate() {
+                if i > 0 {
+                    spans.push(Span::raw(" | "));
+                    col = col.saturating_add(3);
+                }
+                let label_w = UnicodeWidthStr::width(label.as_str()) as u16;
+                let hovered = action.is_some()
+                    && app.mouse_pos.is_some_and(|(mx, my)| {
+                        my == nrect.y && mx >= col && mx < col.saturating_add(label_w)
+                    });
+                let style = Style::default()
+                    .bg(app.theme.modeline_bg)
+                    .fg(if hovered {
+                        app.theme.text
+                    } else {
+                        app.theme.modeline_fg
+                    })
+                    .add_modifier(if hovered {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    });
+                spans.push(Span::styled(label.clone(), style));
+                if let Some(action) = action {
+                    app.layout.shortcut_hints.push(HintZone {
+                        x_start: col,
+                        x_end: col.saturating_add(label_w),
+                        y: nrect.y,
+                        action: *action,
+                    });
+                }
+                col = col.saturating_add(label_w);
+            }
+            spans.push(Span::raw(" "));
+            let np = Paragraph::new(Line::from(spans)).style(
                 Style::default()
                     .bg(app.theme.modeline_bg)
                     .fg(app.theme.modeline_fg),
@@ -6217,32 +6263,6 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
             action: *action,
         });
         col = x_end;
-    }
-    let theme_label = format!("theme:{}", app.theme_name.label());
-    let theme_w = UnicodeWidthStr::width(theme_label.as_str()) as u16;
-    let area_right = area.x.saturating_add(area.width);
-    let theme_x = area_right.saturating_sub(theme_w);
-    if theme_w > 0 && theme_x > col {
-        let pad_w = theme_x.saturating_sub(col);
-        if pad_w > 0 {
-            spans.push(Span::raw(" ".repeat(pad_w as usize)));
-        }
-        let hovered = match mouse {
-            Some((mx, my)) => my == area.y && mx >= theme_x && mx < theme_x.saturating_add(theme_w),
-            None => false,
-        };
-        let style = if hovered {
-            hover_style
-        } else {
-            Style::default().fg(app.theme.muted)
-        };
-        spans.push(Span::styled(theme_label, style));
-        app.layout.shortcut_hints.push(HintZone {
-            x_start: theme_x,
-            x_end: theme_x.saturating_add(theme_w),
-            y: area.y,
-            action: KeyAction::CycleTheme,
-        });
     }
     let para = Paragraph::new(Line::from(spans));
     f.render_widget(para, area);
