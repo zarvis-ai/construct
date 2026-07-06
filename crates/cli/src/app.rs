@@ -93,6 +93,8 @@ pub(crate) const PROGRAM_COLLAB_CURSOR_TTL_MS: i64 = 60 * 1000;
 pub(crate) const PROGRAM_WHEEL_SCROLL_ROWS: usize = 3;
 const PROGRAM_UNDO_STACK_LIMIT: usize = 100;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
+const OSC11_BACKGROUND_QUERY_BEL: &[u8] = b"\x1b]11;?\x07";
+const OSC11_BACKGROUND_QUERY_ST: &[u8] = b"\x1b]11;?\x1b\\";
 
 /// A row in the rendered list view. Sessions and group headers share the
 /// list; key dispatch and selection are typed.
@@ -1210,6 +1212,9 @@ pub struct App {
     pub selected_text: Option<String>,
     pub selected_text_bounds: Option<ratatui::layout::Rect>,
     pub selected_text_range: Option<TextSelectionRange>,
+    /// Per-session tail used to recognize OSC 11 background probes split
+    /// across PTY chunks. Only stores a few bytes per active session.
+    pty_osc11_query_tails: HashMap<String, Vec<u8>>,
     pty_input_tx: mpsc::UnboundedSender<PtyInputJob>,
     pty_input_errors: mpsc::UnboundedReceiver<String>,
 }
@@ -1600,6 +1605,41 @@ fn coalesce_pty_input(
         }
     }
     (session_id, bytes, label, carried)
+}
+
+fn osc11_background_query_count(tail: &mut Vec<u8>, bytes: &[u8]) -> usize {
+    let mut combined = Vec::with_capacity(tail.len() + bytes.len());
+    combined.extend_from_slice(tail);
+    combined.extend_from_slice(bytes);
+    let count = combined
+        .windows(OSC11_BACKGROUND_QUERY_BEL.len())
+        .filter(|w| *w == OSC11_BACKGROUND_QUERY_BEL)
+        .count()
+        + combined
+            .windows(OSC11_BACKGROUND_QUERY_ST.len())
+            .filter(|w| *w == OSC11_BACKGROUND_QUERY_ST)
+            .count();
+    *tail = longest_osc11_query_prefix_suffix(&combined).to_vec();
+    count
+}
+
+fn longest_osc11_query_prefix_suffix(bytes: &[u8]) -> &[u8] {
+    let max = OSC11_BACKGROUND_QUERY_ST
+        .len()
+        .max(OSC11_BACKGROUND_QUERY_BEL.len())
+        .saturating_sub(1)
+        .min(bytes.len());
+    for len in (1..=max).rev() {
+        let suffix = &bytes[bytes.len() - len..];
+        if (suffix.len() < OSC11_BACKGROUND_QUERY_BEL.len()
+            && OSC11_BACKGROUND_QUERY_BEL.starts_with(suffix))
+            || (suffix.len() < OSC11_BACKGROUND_QUERY_ST.len()
+                && OSC11_BACKGROUND_QUERY_ST.starts_with(suffix))
+        {
+            return suffix;
+        }
+    }
+    &[]
 }
 
 /// State for the `/tasks` modal popup. v1 is read-only at the UI
@@ -2721,6 +2761,7 @@ async fn run_with_socket_initial_selection(
         selected_text: None,
         selected_text_bounds: None,
         selected_text_range: None,
+        pty_osc11_query_tails: HashMap::new(),
         pty_input_tx,
         pty_input_errors,
     };
@@ -3448,6 +3489,31 @@ impl App {
         {
             self.set_status(format!("{label} failed: input pump stopped"));
         }
+    }
+
+    fn answer_theme_background_query(&mut self, session_id: &str, bytes: &[u8]) {
+        let count = {
+            let tail = self
+                .pty_osc11_query_tails
+                .entry(session_id.to_string())
+                .or_default();
+            osc11_background_query_count(tail, bytes)
+        };
+        if count == 0 {
+            return;
+        }
+        let Some(response) = self.theme.osc11_background_response() else {
+            return;
+        };
+        let mut responses = Vec::with_capacity(response.len() * count);
+        for _ in 0..count {
+            responses.extend_from_slice(&response);
+        }
+        self.queue_pty_input(
+            session_id.to_string(),
+            responses,
+            "theme background response",
+        );
     }
 
     async fn on_paste(&mut self, text: String) {
@@ -5224,6 +5290,7 @@ impl App {
                                 if !agentd_protocol::is_pty_active_payload(b) {
                                     is_active = false;
                                 }
+                                self.answer_theme_background_query(&payload.session_id, b);
                                 let history = self
                                     .histories
                                     .entry(payload.session_id.clone())
@@ -9867,6 +9934,7 @@ mod tests {
             selected_text: None,
             selected_text_bounds: None,
             selected_text_range: None,
+            pty_osc11_query_tails: HashMap::new(),
             pty_input_tx,
             pty_input_errors,
         }
@@ -20743,6 +20811,56 @@ mod tests {
             app.view_scrollback, 0,
             "modeline scrollback value should be the effective rendered scrollback"
         );
+    }
+
+    #[test]
+    fn osc11_background_query_count_handles_split_and_st_terminated_queries() {
+        let mut tail = Vec::new();
+        assert_eq!(osc11_background_query_count(&mut tail, b"\x1b]11;?"), 0);
+        assert_eq!(tail, b"\x1b]11;?");
+        assert_eq!(osc11_background_query_count(&mut tail, b"\x07"), 1);
+        assert!(tail.is_empty());
+
+        assert_eq!(
+            osc11_background_query_count(
+                &mut tail,
+                b"noise\x1b]11;?\x1b\\more\x1b]11;?\x07"
+            ),
+            2
+        );
+        assert!(tail.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dark_theme_answers_child_osc11_background_query() {
+        let (mut app, _dir, server) = captured_app().await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+        app.theme = crate::theme::Theme::dark_ui();
+
+        app.answer_theme_background_query("s1", b"\x1b]11;?");
+        assert!(rx.try_recv().is_err(), "split query is incomplete");
+
+        app.answer_theme_background_query("s1", b"\x07");
+        let job = rx.try_recv().expect("dark theme should answer OSC 11");
+        assert_eq!(job.session_id, "s1");
+        assert_eq!(job.bytes, b"\x1b]11;rgb:0c0c/1212/1b1b\x07");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn matrix_theme_does_not_answer_child_osc11_background_query() {
+        let (mut app, _dir, server) = captured_app().await;
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+        app.theme = crate::theme::Theme::dark();
+
+        app.answer_theme_background_query("s1", b"\x1b]11;?\x07");
+        assert!(
+            rx.try_recv().is_err(),
+            "matrix stays background-aware instead of faking the terminal"
+        );
+        server.abort();
     }
 
     /// Starting a `C-x` chord is not a passthrough — it must redraw

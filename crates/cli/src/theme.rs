@@ -406,6 +406,80 @@ impl Theme {
             .border_style(self.border_style())
             .title(Line::from(title.into()))
     }
+
+    /// OSC 11 terminal background response for themes that paint the full
+    /// frame. Matrix returns `None` so the outer terminal remains the authority.
+    pub fn osc11_background_response(&self) -> Option<Vec<u8>> {
+        let (r, g, b) = color_to_rgb(self.background?)?;
+        Some(
+            format!(
+                "\x1b]11;rgb:{:04x}/{:04x}/{:04x}\x07",
+                r as u16 * 257,
+                g as u16 * 257,
+                b as u16 * 257
+            )
+            .into_bytes(),
+        )
+    }
+}
+
+fn color_to_rgb(color: Color) -> Option<(u8, u8, u8)> {
+    match color {
+        Color::Reset => None,
+        Color::Black => Some((0, 0, 0)),
+        Color::Red => Some((128, 0, 0)),
+        Color::Green => Some((0, 128, 0)),
+        Color::Yellow => Some((128, 128, 0)),
+        Color::Blue => Some((0, 0, 128)),
+        Color::Magenta => Some((128, 0, 128)),
+        Color::Cyan => Some((0, 128, 128)),
+        Color::Gray => Some((192, 192, 192)),
+        Color::DarkGray => Some((128, 128, 128)),
+        Color::LightRed => Some((255, 0, 0)),
+        Color::LightGreen => Some((0, 255, 0)),
+        Color::LightYellow => Some((255, 255, 0)),
+        Color::LightBlue => Some((0, 0, 255)),
+        Color::LightMagenta => Some((255, 0, 255)),
+        Color::LightCyan => Some((0, 255, 255)),
+        Color::White => Some((255, 255, 255)),
+        Color::Indexed(idx) => Some(indexed_color_to_rgb(idx)),
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+    }
+}
+
+fn indexed_color_to_rgb(idx: u8) -> (u8, u8, u8) {
+    const ANSI16: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    if idx < 16 {
+        return ANSI16[idx as usize];
+    }
+    if idx < 232 {
+        let n = idx - 16;
+        let component = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+        return (
+            component(n / 36),
+            component((n / 6) % 6),
+            component(n % 6),
+        );
+    }
+    let gray = 8 + (idx - 232) * 10;
+    (gray, gray, gray)
 }
 
 fn parse_mode(text: &str) -> ThemeMode {
@@ -827,6 +901,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cleared.background, None);
+    }
+
+    #[test]
+    fn osc11_background_response_reports_painted_theme_background() {
+        assert_eq!(
+            Theme::dark_ui().osc11_background_response().unwrap(),
+            b"\x1b]11;rgb:0c0c/1212/1b1b\x07"
+        );
+        assert_eq!(
+            Theme::light_ui().osc11_background_response().unwrap(),
+            b"\x1b]11;rgb:f6f6/f8f8/fbfb\x07"
+        );
+        assert_eq!(Theme::dark().osc11_background_response(), None);
     }
 
     #[test]
