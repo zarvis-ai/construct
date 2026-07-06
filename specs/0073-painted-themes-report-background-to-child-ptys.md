@@ -7,11 +7,11 @@ Scope: How TUI color themes answer terminal-background probes from child PTY ses
 
 ## Decision
 
-When a client theme paints the full terminal background itself, child PTY sessions that ask for the terminal background color must receive the theme's painted background color. Themes that intentionally leave the terminal background visible must not synthesize a background response.
+When a client theme paints the full terminal background itself, child PTY sessions that ask for the terminal background color must receive the theme's painted background color. Themes that intentionally leave the terminal background visible, such as Matrix and Basic, must not synthesize a background response.
 
 ## Reason
 
-Interactive CLIs often query terminal background color to choose readable foreground colors. For dark and light Construct themes, the visually relevant background is the one Construct paints, not the user's underlying terminal. Matrix remains background-aware by design, so the user's terminal must stay authoritative there.
+Interactive CLIs often query terminal background color to choose readable foreground colors. For dark and light Construct themes, the visually relevant background is the one Construct paints, not the user's underlying terminal. Matrix and Basic remain background-aware by design, so the user's terminal must stay authoritative there.
 
 ## Consequences
 

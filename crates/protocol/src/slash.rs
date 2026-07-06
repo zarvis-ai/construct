@@ -293,7 +293,7 @@ pub const COMMANDS: &[SlashCommand] = &[
         visibility: ModelVisibility::Hidden,
         transcript: TranscriptPolicy::AuditOnly,
         render: Render::SystemNote,
-        help: "Switch UI theme (/theme matrix|dark|light)",
+        help: "Switch UI theme (/theme matrix|basic|dark|light)",
         in_popup: true,
     },
     SlashCommand {

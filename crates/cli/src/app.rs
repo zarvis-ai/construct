@@ -832,6 +832,7 @@ pub struct App {
     pub program_templates_tx: mpsc::UnboundedSender<Vec<agentd_protocol::ProgramTemplate>>,
     pub theme: crate::theme::Theme,
     pub theme_name: crate::theme::ThemeName,
+    terminal_background_is_light: Option<bool>,
     pub help_visible: bool,
     pub profile: Profile,
     pub keymap: Keymap,
@@ -2652,6 +2653,7 @@ async fn run_with_socket_initial_selection(
         program_templates_tx,
         theme,
         theme_name: theme_config.active_name(None),
+        terminal_background_is_light: None,
         help_visible: false,
         profile,
         keymap,
@@ -2811,16 +2813,20 @@ async fn run_with_socket_initial_selection(
     // Terminal setup.
     enable_raw_mode().context("enable raw mode")?;
     // Now that the terminal is in raw mode (and before the event loop starts
-    // consuming stdin), resolve the palette against the terminal background for
-    // `mode = "auto"`. Forced light/dark skip the query; a non-answering
-    // terminal falls back to dark.
-    let detected_light = if theme_config.mode == crate::theme::ThemeMode::Auto {
+    // consuming stdin), resolve background-aware palettes against the terminal
+    // background. A non-answering terminal falls back to the dark variant.
+    let should_detect_background = theme_config
+        .name
+        .map(crate::theme::ThemeName::is_background_aware)
+        .unwrap_or(theme_config.mode == crate::theme::ThemeMode::Auto);
+    let detected_light = if should_detect_background {
         crate::theme::detect_terminal_is_light(std::time::Duration::from_millis(120))
     } else {
         None
     };
     app.theme = theme_config.resolve(detected_light);
     app.theme_name = theme_config.active_name(detected_light);
+    app.terminal_background_is_light = detected_light;
     tracing::info!(mode = ?theme_config.mode, theme = ?app.theme_name, ?detected_light, "tui theme resolved");
     let mut stdout = std::io::stdout();
     execute!(
@@ -8034,10 +8040,19 @@ impl App {
             self.queue_pty_input(orch_id, bytes, "orchestrator pty_input");
         }
     }
-
     pub(super) fn apply_named_theme(&mut self, name: crate::theme::ThemeName) {
         let mut cfg = crate::theme::ThemeConfig::load();
-        match cfg.select_named(name) {
+        let detected_light = if name.is_background_aware()
+            && self.terminal_background_is_light.is_none()
+        {
+            crate::theme::detect_terminal_is_light(std::time::Duration::from_millis(120))
+        } else {
+            self.terminal_background_is_light
+        };
+        if name.is_background_aware() {
+            self.terminal_background_is_light = detected_light;
+        }
+        match cfg.select_named_for_terminal(name, detected_light) {
             Ok(theme) => {
                 self.theme = theme;
                 self.theme_name = name;
@@ -8107,7 +8122,12 @@ impl App {
                 } else if let Some(name) = crate::theme::ThemeName::parse(arg) {
                     self.apply_named_theme(name);
                 } else {
-                    self.set_status(format!("theme: unknown '{arg}'; use matrix, dark, or light"));
+                    let names = crate::theme::ThemeName::ALL
+                        .iter()
+                        .map(|name| name.label())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    self.set_status(format!("theme: unknown '{arg}'; use {names}"));
                 }
             }
             "archived" | "archive" | "archives" => {
@@ -9834,6 +9854,7 @@ mod tests {
             program_templates_tx: mpsc::unbounded_channel().0,
             theme: crate::theme::Theme::default(),
             theme_name: crate::theme::ThemeName::Matrix,
+            terminal_background_is_light: None,
             help_visible: false,
             profile: Profile::Emacs,
             keymap: keymap::default_for(Profile::Emacs),
