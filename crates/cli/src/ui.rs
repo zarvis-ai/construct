@@ -8021,6 +8021,7 @@ fn render_program_hover_overlays(
             &overlay.popup,
             overlay.scroll_offset,
             overlay.inner,
+            overlay.clip_bounds,
             &overlay.clip_hits,
             now,
         );
@@ -9432,12 +9433,23 @@ fn render_session_hover_card(
 /// puts the terminal a scroll away, so shimmer hover stays a plain label.
 /// Hovering the `@{session:…}` clip chip itself is the distinct affordance for
 /// previewing a referenced worker's live output (see `render_program_clip_hover`).
+///
+/// Gated on pointer-enter, not mere position: a block that starts shimmering
+/// under an already-resting pointer (e.g. the selection-Run context menu sits
+/// adjacent to the selection, so the pointer is left resting on the block the
+/// instant it starts shimmering) must not immediately reveal the tooltip.
+/// Only a pointer that actually moves onto the block *after* it started
+/// shimmering arms it — see `App::mouse_moved_at` / `ProgramRun::pending_since`.
+/// When it does open, it anchors on the row directly below the block's last
+/// on-screen row (or above when that would be clipped by `bounds`'s bottom
+/// edge) so it never paints over the shimmering text it describes.
 fn render_program_shimmer_hover(
     f: &mut Frame,
     app: &App,
     popup: &crate::app::ProgramPopup,
     scroll_offset: usize,
     body: Rect,
+    bounds: Rect,
     clip_hits: &[crate::app::ProgramClipHit],
     now: Instant,
 ) {
@@ -9452,7 +9464,7 @@ fn render_program_shimmer_hover(
     let Some(shimmer) = program_run_shimmer(app, popup, now) else {
         return;
     };
-    let Some(block_id) = program_shimmer_block_at(
+    let Some((block_id, block_lines)) = program_shimmer_block_at(
         Some(app),
         &popup.buffer,
         (popup.buffer == popup.saved_markdown).then_some(popup.blocks.as_slice()),
@@ -9464,10 +9476,21 @@ fn render_program_shimmer_hover(
     ) else {
         return;
     };
+    let run = app.program_runs.get(&popup.program.session_id);
+    let armed = match run.and_then(|run| run.pending_since.get(&block_id)) {
+        Some(since) => app.mouse_moved_at.is_some_and(|at| at > *since),
+        // No tracked start time (legacy run state, or a run injected outside
+        // the normal pending-set mutation paths) — stay always-hoverable
+        // rather than block the affordance on bookkeeping that isn't there.
+        None => true,
+    };
+    if !armed {
+        return;
+    }
     // Agent-authored block tooltip wins; otherwise show the daemon-derived
     // run-level status before falling back to the optimistic legacy label.
     let system_tooltip;
-    let tooltip = match app.program_runs.get(&popup.program.session_id) {
+    let tooltip = match run {
         Some(run) => match run.pending_tooltips.get(&block_id) {
             Some(t) if !t.trim().is_empty() => t.as_str(),
             _ => {
@@ -9479,7 +9502,126 @@ fn render_program_shimmer_hover(
         },
         None => agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP,
     };
-    render_tooltip_at(f, &app.theme, tooltip, mx, my, 2, -1);
+    let (row_first, row_last) = program_block_visual_rows(
+        Some(app),
+        &popup.buffer,
+        block_lines.start,
+        block_lines.end,
+        body.width as usize,
+    )
+    .unwrap_or((scroll_offset, scroll_offset));
+    let block_first_row = program_clamp_visual_row_to_viewport(body, scroll_offset, row_first);
+    let block_last_row = program_clamp_visual_row_to_viewport(body, scroll_offset, row_last);
+    render_shimmer_hover_tooltip(
+        f,
+        &app.theme,
+        tooltip,
+        mx,
+        bounds,
+        block_first_row,
+        block_last_row,
+    );
+}
+
+/// Paint the shimmer hover tooltip box anchored beside (never over) the
+/// hovered block's on-screen rows, per `program_shimmer_hover_anchor_row`.
+fn render_shimmer_hover_tooltip(
+    f: &mut Frame,
+    theme: &Theme,
+    label: &str,
+    anchor_x: u16,
+    bounds: Rect,
+    block_first_row: u16,
+    block_last_row: u16,
+) {
+    let inner_w = UnicodeWidthStr::width(label) as u16;
+    let w = inner_w + 2;
+    let h: u16 = 3;
+    let bounds_right = bounds.x.saturating_add(bounds.width);
+    let mut tx = anchor_x.saturating_add(2);
+    if tx.saturating_add(w) > bounds_right {
+        tx = bounds_right.saturating_sub(w).max(bounds.x);
+    }
+    let ty = program_shimmer_hover_anchor_row(bounds, block_first_row, block_last_row, h);
+    render_tooltip_rect(
+        f,
+        theme,
+        label,
+        Rect {
+            x: tx,
+            y: ty,
+            width: w,
+            height: h,
+        },
+    );
+}
+
+/// Row (the top of a `box_height`-tall floating box) that anchors it directly
+/// below `block_last_row` — the hovered block's own last on-screen row — by
+/// default, falling back to directly above `block_first_row` when the popup's
+/// bottom edge would clip the box below. Either placement keeps the box off
+/// every row the hovered block itself occupies.
+fn program_shimmer_hover_anchor_row(
+    bounds: Rect,
+    block_first_row: u16,
+    block_last_row: u16,
+    box_height: u16,
+) -> u16 {
+    let bounds_bottom = bounds.y.saturating_add(bounds.height);
+    let below = block_last_row.saturating_add(1);
+    let row = if below.saturating_add(box_height) <= bounds_bottom {
+        below
+    } else {
+        block_first_row.saturating_sub(box_height)
+    };
+    row.clamp(bounds.y, bounds_bottom.saturating_sub(box_height).max(bounds.y))
+}
+
+/// Map an absolute visual row to the on-screen row it paints at within `area`
+/// given `scroll_offset`, pinned to the viewport's near edge when the row
+/// itself is scrolled out of view. Lets the hover-box anchor use whichever
+/// part of a (possibly partially scrolled) block is actually visible.
+fn program_clamp_visual_row_to_viewport(area: Rect, scroll_offset: usize, visual_row: usize) -> u16 {
+    if area.height == 0 {
+        return area.y;
+    }
+    if visual_row < scroll_offset {
+        return area.y;
+    }
+    let rel = (visual_row - scroll_offset).min(area.height.saturating_sub(1) as usize);
+    area.y + rel as u16
+}
+
+/// Absolute visual row range `(first, last)` (before scroll offset) that
+/// source lines `[start_line, end_line)` occupy when `markdown` wraps at
+/// `width` columns. Used to anchor the shimmer hover tooltip beside the
+/// hovered block instead of on top of it (spec 0057 placement).
+fn program_block_visual_rows(
+    app: Option<&App>,
+    markdown: &str,
+    start_line: usize,
+    end_line: usize,
+    width: usize,
+) -> Option<(usize, usize)> {
+    if width == 0 || end_line <= start_line {
+        return None;
+    }
+    let mut visual_row_base = 0usize;
+    let mut first = None;
+    let mut last = None;
+    for (i, raw) in markdown.lines().enumerate() {
+        if i >= end_line {
+            break;
+        }
+        let (rendered, _clips) = program_rendered_line_with_clips(app, raw);
+        let rows = program_wrap_row_starts(&rendered, width).len().max(1);
+        if i >= start_line {
+            first.get_or_insert(visual_row_base);
+            last = Some(visual_row_base + rows - 1);
+        }
+        visual_row_base += rows;
+    }
+    first.zip(last)
 }
 
 fn program_shimmer_block_at(
@@ -9491,7 +9633,7 @@ fn program_shimmer_block_at(
     area: Rect,
     col: u16,
     row: u16,
-) -> Option<String> {
+) -> Option<(String, std::ops::Range<usize>)> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
@@ -9524,13 +9666,13 @@ fn program_shimmer_block_at(
             .iter()
             .find(|block| (block.start_line..block.end_line).contains(&source_line))
         {
-            return Some(block.id.clone());
+            return Some((block.id.clone(), block.start_line..block.end_line));
         }
     }
     crate::app::program_blocks(markdown)
         .into_iter()
         .find(|block| (block.start_line..block.end_line).contains(&source_line))
-        .map(|block| block.id)
+        .map(|block| (block.id, block.start_line..block.end_line))
 }
 
 /// Paint a slim vertical scroll thumb on the program popup's right border when
@@ -12022,6 +12164,49 @@ mod tests {
             program_rect,
             "fallback to the Program pane when no broader view geometry is known"
         );
+    }
+
+    #[test]
+    fn program_shimmer_hover_anchor_row_prefers_below_the_block() {
+        let bounds = Rect::new(0, 0, 80, 40);
+        // Block occupies rows 9..=11; plenty of room below within `bounds`.
+        let row = program_shimmer_hover_anchor_row(bounds, 9, 11, 3);
+        assert_eq!(
+            row, 12,
+            "tooltip should anchor directly below the block's last row by default"
+        );
+    }
+
+    #[test]
+    fn program_shimmer_hover_anchor_row_flips_above_when_bottom_clipped() {
+        let bounds = Rect::new(0, 0, 80, 20);
+        // Block's last row (18) leaves no room for a 3-row box below the
+        // bounds' bottom edge (20), so the box must flip above the block's
+        // first row (16) instead of clipping into (or past) the boundary.
+        let row = program_shimmer_hover_anchor_row(bounds, 16, 18, 3);
+        assert_eq!(
+            row, 13,
+            "tooltip should anchor directly above the block's first row when clipped below"
+        );
+        assert!(
+            row + 3 <= 16,
+            "the flipped box must not overlap the block's first row"
+        );
+    }
+
+    #[test]
+    fn program_shimmer_hover_anchor_row_never_overlaps_the_block() {
+        let bounds = Rect::new(0, 0, 80, 40);
+        for last_row in 0..40u16 {
+            let first_row = last_row.saturating_sub(2);
+            let row = program_shimmer_hover_anchor_row(bounds, first_row, last_row, 3);
+            let box_range = row..row.saturating_add(3);
+            assert!(
+                !box_range.contains(&first_row) && !box_range.contains(&last_row),
+                "box [{row}, {}) must not cover block rows {first_row}..={last_row}",
+                row + 3
+            );
+        }
     }
 
     #[test]

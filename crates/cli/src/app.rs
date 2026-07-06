@@ -994,6 +994,15 @@ pub struct App {
     /// Terminal.app, which ignores `\x1b[?1003h` even though crossterm
     /// requests it).
     pub mouse_pos: Option<(u16, u16)>,
+    /// When `mouse_pos` last actually changed to a new cell — a genuine
+    /// pointer move, as opposed to the content under a stationary pointer
+    /// changing (e.g. a click starting a program Run shimmer at the same
+    /// cell the click itself landed on). Captured before any click handling
+    /// for that same event runs, so a click's own coordinates never count as
+    /// "arriving" at whatever starts shimmering as a result of that click.
+    /// Used to gate the program shimmer hover tooltip on pointer-enter (spec
+    /// 0057) rather than merely "pointer happens to be here".
+    pub mouse_moved_at: Option<Instant>,
     /// Whether terminal mouse capture is enabled. When false, agentd
     /// stops receiving mouse events so the user's terminal can perform
     /// native drag selection/copy.
@@ -1729,6 +1738,14 @@ pub struct ProgramRun {
     /// Per-block run-status tooltips keyed by stable block ref (spec 0057). Missing
     /// entries render the hardcoded fallback label on hover.
     pub pending_tooltips: HashMap<String, String>,
+    /// When each currently-pending block most recently joined the pending
+    /// set, keyed by stable block ref. Carried forward (not reset) across
+    /// re-Runs and daemon echoes for a block that stays pending — only a
+    /// block that's genuinely new to the set gets a fresh timestamp. Used to
+    /// gate the shimmer hover tooltip on pointer-enter (spec 0057): a block
+    /// with no entry here (e.g. legacy/injected state) is treated as always
+    /// hoverable.
+    pub pending_since: HashMap<String, Instant>,
     /// Daemon-derived run-level fallback for pending blocks with no
     /// agent-authored tooltip.
     pub system_status: Option<String>,
@@ -1770,10 +1787,16 @@ impl ProgramRun {
         let deadline = now + Duration::from_millis((progress.expires_at_ms - now_ms) as u64);
         let mut pending: HashSet<String> = progress.pending_block_refs.into_iter().collect();
         pending.extend(progress.pending_block_ids);
+        // Callers (`adopt_daemon_program_run`/`adopt_program_state_run`) merge
+        // this against the prior run's `pending_since` so a block that stays
+        // pending across the echo keeps its original timestamp; this default
+        // only sticks for blocks genuinely new to the set.
+        let pending_since = pending.iter().cloned().map(|id| (id, now)).collect();
         Some(Self {
             started_at,
             pending,
             pending_tooltips: progress.pending_block_tooltips,
+            pending_since,
             system_status: progress.system_status,
             deadline,
             first_output_seen: progress.first_output_seen,
@@ -1782,6 +1805,22 @@ impl ProgramRun {
             settled_block_count: progress.settled_block_count,
             total_block_count: progress.total_block_count,
         })
+    }
+
+    /// `pending_since` for `pending`, preserving `self`'s existing timestamps
+    /// for blocks that stay pending and stamping `now` only for blocks
+    /// genuinely new to the set. Call this when replacing an existing run
+    /// (re-Run, daemon echo) so a block already being hovered doesn't lose
+    /// its armed hover state just because an unrelated re-Run or heartbeat
+    /// rebuilt the `ProgramRun`.
+    fn merged_pending_since(&self, pending: &HashSet<String>, now: Instant) -> HashMap<String, Instant> {
+        pending
+            .iter()
+            .map(|id| {
+                let since = self.pending_since.get(id).copied().unwrap_or(now);
+                (id.clone(), since)
+            })
+            .collect()
     }
 }
 
@@ -2619,6 +2658,7 @@ async fn run_with_socket_initial_selection(
         layout: LayoutSnapshot::default(),
         session_title_menu: None,
         mouse_pos: None,
+        mouse_moved_at: None,
         mouse_capture_enabled: true,
         orchestrator_id: initial_orch_id,
         list_panel_w: persisted.list_panel_w.unwrap_or(LIST_PANEL_W_DEFAULT),
@@ -5692,7 +5732,10 @@ impl App {
         active_run: Option<agentd_protocol::ProgramRunProgress>,
     ) {
         match active_run.and_then(ProgramRun::from_progress) {
-            Some(run) => {
+            Some(mut run) => {
+                if let Some(old) = self.program_runs.get(session_id) {
+                    run.pending_since = old.merged_pending_since(&run.pending, Instant::now());
+                }
                 self.program_runs.insert(session_id.to_string(), run);
             }
             None => {
@@ -5707,7 +5750,10 @@ impl App {
         active_run: Option<agentd_protocol::ProgramRunProgress>,
     ) {
         match active_run.and_then(ProgramRun::from_progress) {
-            Some(run) => {
+            Some(mut run) => {
+                if let Some(old) = self.program_runs.get(session_id) {
+                    run.pending_since = old.merged_pending_since(&run.pending, Instant::now());
+                }
                 self.program_runs.insert(session_id.to_string(), run);
             }
             None => {
@@ -6069,6 +6115,13 @@ impl App {
         // tooltip, program shimmer preview, etc.) has a current position to
         // render against.
         let next_pos = (ev.column, ev.row);
+        // Record a genuine pointer move *before* any click handling below
+        // runs (and can start a program Run) — so a click's own coordinates
+        // are never mistaken for "the pointer arrived" at whatever starts
+        // shimmering as a result of that same click (spec 0057 hover-intent).
+        if self.mouse_pos != Some(next_pos) {
+            self.mouse_moved_at = Some(Instant::now());
+        }
         self.mouse_pos = Some(next_pos);
         // The `/configure` dialog (spec 0069) is a topmost modal: a
         // left-click is tested against the tab headers first (dialog stays
@@ -9724,6 +9777,7 @@ mod tests {
             layout: LayoutSnapshot::default(),
             session_title_menu: None,
             mouse_pos: None,
+            mouse_moved_at: None,
             mouse_capture_enabled: true,
             orchestrator_id: None,
             list_panel_w: LIST_PANEL_W_DEFAULT,
@@ -10603,6 +10657,7 @@ mod tests {
                 started_at: Instant::now(),
                 pending: ["s1-block".to_string()].into_iter().collect(),
                 pending_tooltips: HashMap::new(),
+                pending_since: HashMap::new(),
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(30),
                 first_output_seen: false,
@@ -13743,6 +13798,7 @@ mod tests {
                 started_at: Instant::now() - Duration::from_secs(5),
                 pending: HashSet::new(),
                 pending_tooltips: HashMap::new(),
+                pending_since: HashMap::new(),
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
@@ -14026,6 +14082,7 @@ mod tests {
                 started_at: Instant::now(),
                 pending: HashSet::from([block_id.clone()]),
                 pending_tooltips: HashMap::from([(block_id, "Still running".into())]),
+                pending_since: HashMap::new(),
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
@@ -14118,6 +14175,7 @@ mod tests {
                 started_at: Instant::now(),
                 pending: HashSet::from([block_id.clone()]),
                 pending_tooltips: HashMap::from([(block_id, "Building PR".into())]),
+                pending_since: HashMap::new(),
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
@@ -14195,6 +14253,7 @@ mod tests {
                 started_at: Instant::now(),
                 pending: HashSet::from([block_id.clone()]),
                 pending_tooltips: HashMap::from([(block_id, "Building PR".into())]),
+                pending_since: HashMap::new(),
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
@@ -14714,6 +14773,220 @@ mod tests {
             pending.contains(&agentd_protocol::program_block_id("alpha")),
             "the freshly-run selection should be optimistically shimmered too"
         );
+    }
+
+    #[tokio::test]
+    async fn program_selection_run_click_shimmer_tooltip_requires_pointer_enter() {
+        // Regression: the selection-Run context menu sits adjacent to the
+        // selection, so after the click resolves the mouse pointer is left
+        // resting on the block that just started shimmering. The shimmer
+        // hover tooltip must not open under that stationary pointer — only a
+        // pointer that actually moves onto the block *after* it starts
+        // shimmering should reveal it (spec 0057 hover-intent), and even then
+        // it must anchor beside the block, never over its own text.
+        use agentd_protocol::ipc_method;
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        // Block 1 spans three consecutive non-blank lines; block 2 is a
+        // single separate block after a blank-line gap. Selecting inside
+        // block 1's first line shimmers the *whole* block (all three lines),
+        // and the selection-Run menu (which opens two rows below the
+        // selection's cursor) lands the click on block 1's own third line —
+        // the exact "menu adjacent to selection" geometry from the bug report.
+        let markdown =
+            "Block one line one\nBlock one line two\nBlock one line three\n\nOther block\n";
+        let block_id = agentd_protocol::program_block_spans(markdown)
+            .into_iter()
+            .next()
+            .expect("first block")
+            .id;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let block_id_for_mock = block_id.clone();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                let program = serde_json::json!({
+                    "session_id": "s1",
+                    "markdown": markdown,
+                    "version": 2,
+                    "updated_at_ms": 0,
+                    "template_id": null,
+                });
+                // Daemon-shaped `active_run`: the freshly-run block is pending
+                // with no agent tooltip yet, so hover falls back to the
+                // hardcoded label (spec 0057) — the point of this test is
+                // *whether* it shows, not its exact text.
+                let result = match method.as_str() {
+                    ipc_method::PROGRAM_EXECUTE => serde_json::json!({
+                        "program": program,
+                        "prompt": "run",
+                        "blocks": [],
+                        "active_run": {
+                            "run_id": "run-1",
+                            "started_at_ms": now_ms,
+                            "expires_at_ms": now_ms + 60000,
+                            "pending_block_ids": [block_id_for_mock],
+                            "pending_block_refs": [],
+                            "pending_block_tooltips": {},
+                            "system_status": null,
+                            "seen_running": true,
+                            "first_output_seen": false,
+                            "queued_behind_current_turn": false,
+                            "agent_managed": false,
+                            "stage": "delivered",
+                            "settled_block_count": 0,
+                            "total_block_count": 1
+                        }
+                    }),
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut app = test_app(client, Vec::new());
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", markdown, 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.begin_program_selection();
+        app.move_program_cursor(5); // selects "Block" on block 1's first line
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let inner = app.layout.program_inner_area.expect("program inner area");
+        let run = app
+            .layout
+            .program_selection_run_hit
+            .expect("selection run hit registered");
+        // The menu (and its Run button) opens below the selection's cursor —
+        // confirm the click lands on block 1's own third line, not somewhere
+        // off the block, so this test actually exercises the bug.
+        assert_eq!(
+            run.2,
+            inner.y + 2,
+            "selection-Run button should land on block 1's third row"
+        );
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: run.0,
+            row: run.2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            app.program_runs
+                .get("s1")
+                .is_some_and(|run| run.pending.contains(&block_id)),
+            "daemon-confirmed active_run should mark block 1 pending"
+        );
+
+        // WITHOUT moving the mouse any further: the pointer is still resting
+        // exactly where the click landed, on block 1's own third row.
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("post-click frame should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            !text.contains(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
+            "a stationary pointer under a newly-started shimmer must not reveal the tooltip"
+        );
+        let clicked_row_text = text
+            .lines()
+            .nth(run.2 as usize)
+            .expect("clicked row exists");
+        assert!(
+            clicked_row_text.contains("Block one line three"),
+            "the shimmering block's own row must render its full text, got: {clicked_row_text:?}"
+        );
+
+        // Move away, then back onto the same cell the click left the pointer
+        // on — a genuine pointer-enter after the block started shimmering.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: inner.x,
+            row: inner.y + 10,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: run.0,
+            row: run.2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("hover-after-enter frame should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
+            "a pointer that genuinely moves onto the shimmering block should reveal its tooltip"
+        );
+        for block_row in [inner.y, inner.y + 1, inner.y + 2] {
+            let row_text = text
+                .lines()
+                .nth(block_row as usize)
+                .expect("block row exists");
+            assert!(
+                !row_text.contains(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
+                "the tooltip must anchor on an adjacent row, not over the hovered block's own \
+                 row {block_row}, got: {row_text:?}"
+            );
+        }
+        let clicked_row_text = text
+            .lines()
+            .nth(run.2 as usize)
+            .expect("clicked row exists");
+        assert!(
+            clicked_row_text.contains("Block one line three"),
+            "the hovered block's own row must still show its full text once the tooltip is \
+             open, got: {clicked_row_text:?}"
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -16355,6 +16628,7 @@ mod tests {
                 started_at: Instant::now(),
                 pending: HashSet::from(["block-a:1".into(), "block-b:1".into()]),
                 pending_tooltips: HashMap::new(),
+                pending_since: HashMap::new(),
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,

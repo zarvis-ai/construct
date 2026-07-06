@@ -597,6 +597,10 @@ impl App {
             return;
         }
         let now = Instant::now();
+        let pending_since = match self.program_runs.get(session_id) {
+            Some(old) => old.merged_pending_since(&pending, now),
+            None => pending.iter().cloned().map(|id| (id, now)).collect(),
+        };
         self.program_runs.insert(
             session_id.to_string(),
             ProgramRun {
@@ -604,6 +608,7 @@ impl App {
                 total_block_count: pending.len(),
                 pending,
                 pending_tooltips: HashMap::new(),
+                pending_since,
                 system_status: None,
                 deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,

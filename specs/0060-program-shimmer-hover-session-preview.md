@@ -15,6 +15,8 @@ Hovering a `@{session:…}` smart-clip chip is a distinct affordance and keeps p
 - The card's caption is the block's status tooltip, or its fallback label when none is stored, so the `0057` status text is never lost by upgrading to the richer preview.
 - It degrades to the bare text tooltip (`0057`) whenever a preview cannot be shown: the target session is unknown, or has produced no captured output yet.
 - It persists for as long as the pointer remains over the shimmering block, exactly like the clip-chip hover — it does not self-dismiss just because the pointer has been briefly still. It disappears only when the pointer leaves the block (or the block stops shimmering).
+- It opens only on pointer-enter (`0057`): a block that starts shimmering while the pointer already rests on it (e.g. a selection-Run context menu adjacent to the selection, leaving the pointer on the block the moment it starts shimmering) must not immediately reveal the card. Only a pointer that actually moves onto the block after its shimmer began opens it.
+- When it opens, it anchors beside the hovered block's on-screen rows — never over them (`0057`) — the same adjacent-row placement rule the bare text tooltip follows when no preview is available.
 
 ## Reason
 
@@ -28,6 +30,7 @@ Captioning the preview with the tooltip preserves the concise agent-authored sta
 - A shimmering block whose dispatching session has no captured output yet must still show the text tooltip — the preview is an upgrade, never a replacement that can blank the affordance.
 - A surface that cannot render a live terminal preview (or cannot support hover) remains free to show only the text tooltip and still satisfies `0057`.
 - Because the shimmer-text preview always targets the program's own session — already warm, since it's the currently rendered program's owner — it does not need referenced worker sessions hydrated. Only the clip-chip hover, which can target any worker named anywhere in the document, needs those referenced sessions' PTY history kept warm.
+- A surface needs a way to tell a genuine pointer-enter apart from content merely changing under a stationary pointer, and a way to place the card relative to the block's on-screen row span rather than only the pointer's own cell.
 
 ## Non-Goals
 
