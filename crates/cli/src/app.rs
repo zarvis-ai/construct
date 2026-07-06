@@ -20283,7 +20283,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn theme_indicator_renders_in_minibuffer_not_matrix_header() {
+    async fn theme_indicator_renders_in_minibuffer_status_bar_not_body() {
         let (mut app, _dir, server) = empty_app().await;
         let backend = ratatui::backend::TestBackend::new(120, 36);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
@@ -20293,19 +20293,36 @@ mod tests {
             .expect("draw");
 
         let screen = rendered_text(terminal.backend().buffer());
+        let modeline = screen
+            .lines()
+            .find(|line| line.contains("construct") && line.contains("theme:matrix"))
+            .expect("theme label should live in the modeline/status bar");
+        let minibuffer_line = screen
+            .lines()
+            .last()
+            .expect("screen should have a minibuffer row");
         assert!(
-            screen.contains("theme:matrix"),
-            "missing minibuffer theme label:\n{screen}"
+            modeline.trim_end().ends_with("theme:matrix"),
+            "theme label should be right-aligned in status bar:\n{modeline}"
+        );
+        assert!(
+            !minibuffer_line.contains("theme:matrix"),
+            "theme label should not render in minibuffer body:\n{minibuffer_line}"
         );
         assert!(
             app.layout.matrix_theme_hit.is_none(),
             "matrix rain header should not own theme click target"
         );
+        let minibuffer_y = app
+            .layout
+            .minibuffer_area
+            .expect("minibuffer area")
+            .y;
         assert!(app
             .layout
             .shortcut_hints
             .iter()
-            .any(|h| h.action == KeyAction::CycleTheme));
+            .any(|h| h.action == KeyAction::CycleTheme && h.y < minibuffer_y));
         server.abort();
     }
 
