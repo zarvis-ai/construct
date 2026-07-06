@@ -3089,8 +3089,12 @@ fn render_session_title_menu(f: &mut Frame, app: &App) {
 }
 
 fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64>) {
-    let focused =
-        app.focus == PaneFocus::View && window_id.is_none_or(|id| id == app.active_window_id);
+    // `active_window_id` survives focus moving to the session list, so it
+    // doubles as the "last focused pane" marker: that pane's title text keeps
+    // its focused brightness (the border still dims) so the user can see
+    // where `C-x o` will land.
+    let last_focused = window_id.is_none_or(|id| id == app.active_window_id);
+    let focused = app.focus == PaneFocus::View && last_focused;
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3132,20 +3136,24 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .saturating_sub(harness_w)
         .saturating_sub(close_w)
         .saturating_sub(3 + glyph_w);
+    // Title text keeps focused brightness on the last-focused pane even while
+    // the list holds focus; every other unfocused pane's title inherits the
+    // dimmed border style (a default span patches nothing over border cells).
+    let name_style = pane_title_name_style(&app.theme, last_focused);
     let title: Line<'static> = match (summary.as_ref(), group.as_ref()) {
         (Some(s), _) => {
             let glyph_style = session_title_glyph_style(&app.theme, program_open, focused);
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(mode_glyph.unwrap_or(""), glyph_style),
-                Span::raw(format!(
-                    " {} ",
-                    truncate_to_width(&primary_label(s), label_budget)
-                )),
+                Span::styled(
+                    format!(" {} ", truncate_to_width(&primary_label(s), label_budget)),
+                    name_style,
+                ),
             ])
         }
-        (None, Some(g)) => Line::from(format!(" project: {} ", g.name)),
-        (None, None) => Line::from(" no session "),
+        (None, Some(g)) => Line::from(Span::styled(format!(" project: {} ", g.name), name_style)),
+        (None, None) => Line::from(Span::styled(" no session ", name_style)),
     };
     // Right-side cluster (widget indicators, harness label, close button) is
     // shared with the program popup so the two title bars can't drift. Close is
@@ -7043,6 +7051,19 @@ fn pane_border_style(theme: &Theme, focused: bool) -> Style {
     }
 }
 
+/// Style for the title text of a session pane. The last-focused pane keeps
+/// the focused border hue even when focus sits on the session list — the
+/// border dims, the name doesn't — so the pane `C-x o` returns to stays
+/// identifiable. Other panes return an empty style, which lets the title
+/// inherit whatever the (dimmed) border painted underneath.
+fn pane_title_name_style(theme: &Theme, last_focused: bool) -> Style {
+    if last_focused {
+        Style::default().fg(theme.border_focused)
+    } else {
+        Style::default()
+    }
+}
+
 fn group_name_style(theme: &Theme) -> Style {
     Style::default()
         .fg(theme.group)
@@ -7946,7 +7967,12 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
         .program_popup
         .as_ref()
         .map(|popup| popup.program.session_id.clone());
-    let mut popups: Vec<(crate::app::ProgramPopup, Rect, bool)> = Vec::new();
+    // (popup, base_rect, active, focused): `active` marks the popup that owns
+    // interaction state (hitboxes, cursor, scroll persistence) — that stays
+    // with `app.program_popup` even while the list holds focus. `focused`
+    // drives border brightness only, so the program frame dims on focus-out
+    // like any other split pane.
+    let mut popups: Vec<(crate::app::ProgramPopup, Rect, bool, bool)> = Vec::new();
     for hit in &app.layout.main_window_areas {
         let Some(crate::app::Selection::Session(session_id)) = app.selection_for_window(hit.id)
         else {
@@ -7956,7 +7982,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
             continue;
         }
         if let Some(popup) = app.program_popups.get(&session_id) {
-            popups.push((popup.clone(), hit.area, false));
+            popups.push((popup.clone(), hit.area, false, false));
         }
     }
     if let Some(popup) = app.program_popup.as_ref() {
@@ -7968,11 +7994,13 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
             |id| app.selection_for_window(id),
             f.area(),
         );
-        popups.push((popup.clone(), base_rect, true));
+        popups.push((popup.clone(), base_rect, true, app.focus == PaneFocus::View));
     }
     let mut hover_overlays = Vec::new();
-    for (popup, base_rect, active) in popups {
-        if let Some(overlay) = render_program_popup_at(f, app, &popup, base_rect, active, now) {
+    for (popup, base_rect, active, popup_focused) in popups {
+        if let Some(overlay) =
+            render_program_popup_at(f, app, &popup, base_rect, active, popup_focused, now)
+        {
             hover_overlays.push(overlay);
         }
     }
@@ -8578,6 +8606,7 @@ fn render_program_popup_at(
     popup: &crate::app::ProgramPopup,
     base_rect: Rect,
     active: bool,
+    focused: bool,
     now: Instant,
 ) -> Option<ProgramPopupHoverOverlay> {
     if base_rect.width < 40 || base_rect.height < 8 {
@@ -8646,13 +8675,15 @@ fn render_program_popup_at(
         show_close,
         stage_label.as_deref(),
     );
-    let title = program_title_line(app, popup, active, now, &left);
+    let title = program_title_line(app, popup, active, focused, now, &left);
     let title_toggle_hit = program_title_toggle_button_range(summary_ref, rect);
 
     // The frame keeps the program's own border color even while the popup is
     // slid aside because the exposed terminal holds keyboard focus — the slide
-    // itself is the focus cue, not a hue change.
-    let border_style = program_border_style(&app.theme, active);
+    // itself is the focus cue, not a hue change. Brightness tracks `focused`,
+    // not `active`: the active program's border still dims when focus moves
+    // to the session list.
+    let border_style = program_border_style(&app.theme, focused);
     // The session-actions ☰ icon should read as part of the visible frame, so its
     // base hue tracks the current frame color rather than the default
     // session-view close color. Focus dimming + hover still compose via
@@ -8718,7 +8749,7 @@ fn render_program_popup_at(
         border_style,
         show_close,
         true,
-        active,
+        focused,
         menu_icon_color,
         block,
     );
@@ -9707,17 +9738,32 @@ fn program_run_stage_label(
     Some(truncate_to_width(&label, PROGRAM_RUN_STAGE_MAX_WIDTH))
 }
 
+/// `active` marks the popup owning interaction state (the last-focused
+/// pane's program); `focused` says whether that pane actually holds keyboard
+/// focus. The frame chrome (glyph, Run, markers) tracks `focused` so it dims
+/// with the border, while the session label keeps full brightness on the
+/// active program even when focus sits on the session list — mirroring the
+/// last-focused session pane's undimmed title.
 fn program_title_line<'a>(
     app: &App,
     popup: &crate::app::ProgramPopup,
     active: bool,
+    focused: bool,
     now: Instant,
     left: &ProgramTitleLeft,
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
     let toggle_glyph = program_mode_glyph();
-    let border_style = program_border_style(&app.theme, active);
-    let program_style = program_toggle_style(app, popup, active);
+    let border_style = program_border_style(&app.theme, focused);
+    // Title spans patch onto the border cells already painted underneath, so
+    // a bright label over a dimmed frame must explicitly subtract DIM — an
+    // additive style alone would keep the border's DIM modifier.
+    let label_style = if focused || active {
+        program_border_style(&app.theme, true).remove_modifier(Modifier::DIM)
+    } else {
+        program_border_style(&app.theme, false)
+    };
+    let program_style = program_toggle_style(app, popup, focused);
     let modified_style = Style::default()
         .fg(app.theme.warning)
         .add_modifier(Modifier::BOLD);
@@ -9756,7 +9802,7 @@ fn program_title_line<'a>(
         Span::styled(" ", border_style),
         Span::styled(toggle_glyph.to_string(), program_style),
         Span::styled(" ", border_style),
-        Span::styled(left.label.clone(), border_style),
+        Span::styled(left.label.clone(), label_style),
     ];
     // Run button sits in the left cluster, between the session name and the
     // dirty marker (rendered only when it actually fits the pane).
