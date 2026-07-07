@@ -3130,17 +3130,21 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     // the list holds focus; every other unfocused pane's title inherits the
     // dimmed border style (a default span patches nothing over border cells).
     let name_style = pane_title_name_style(&app.theme, last_focused);
+    // Only the pane the rename was started in renders the live edit buffer
+    // and cursor — a session shown in several split panes keeps its static
+    // title everywhere else, so the terminal cursor can't land on the wrong
+    // pane's title bar.
     let active_rename = summary.as_ref().and_then(|s| {
-        app.session_title_rename
-            .as_ref()
-            .filter(|r| r.session_id == s.id)
+        app.session_title_rename.as_ref().filter(|r| {
+            r.session_id == s.id && r.origin == crate::app::TitleRenameOrigin::Pane(window_id)
+        })
     });
     let title: Line<'static> = match (summary.as_ref(), group.as_ref()) {
         (Some(s), _) => {
             let glyph_style = session_title_glyph_style(&app.theme, program_open, focused);
-            let (rendered_label, cursor_col) = match active_rename {
+            let (rendered_label, cursor_col, window_start_chars) = match active_rename {
                 Some(rename) => visible_edit_window(&rename.buffer, rename.cursor, label_budget),
-                None => (truncate_to_width(&primary_label(s), label_budget), 0),
+                None => (truncate_to_width(&primary_label(s), label_budget), 0, 0),
             };
             // Name hit-rect: right after ` <glyph> ` (border + leading space +
             // glyph + the label span's own leading space) — mirrors
@@ -3152,9 +3156,11 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
                 .session_title_name_hits
                 .push(crate::app::SessionTitleNameHit {
                     session_id: s.id.clone(),
+                    window_id,
                     row: area.y,
                     start_col: name_x_start,
                     end_col: name_x_start.saturating_add(label_w),
+                    window_start_chars,
                 });
             if active_rename.is_some() {
                 f.set_cursor_position(Position {
@@ -7630,15 +7636,16 @@ fn truncate_to_width(s: &str, max: usize) -> String {
 /// Clip `text` to at most `budget` display columns while keeping `cursor`
 /// (a char index) visible — used to render an inline-rename edit buffer
 /// into a title-bar slot too narrow to show it in full. Returns the visible
-/// slice and the cursor's display column within it. Unlike
-/// `truncate_to_width`, this never appends `…`: the window just slides to
-/// follow the cursor, like a single-line text field.
-fn visible_edit_window(text: &str, cursor: usize, budget: usize) -> (String, u16) {
+/// slice, the cursor's display column within it, and the char offset of the
+/// slice's first char (so a click on the slice can map back to a char index).
+/// Unlike `truncate_to_width`, this never appends `…`: the window just
+/// slides to follow the cursor, like a single-line text field.
+fn visible_edit_window(text: &str, cursor: usize, budget: usize) -> (String, u16, usize) {
     use unicode_width::UnicodeWidthChar;
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     if budget == 0 {
-        return (String::new(), 0);
+        return (String::new(), 0, cursor);
     }
     let width_of = |cs: &[char]| -> usize {
         cs.iter()
@@ -7649,6 +7656,7 @@ fn visible_edit_window(text: &str, cursor: usize, budget: usize) -> (String, u16
         return (
             chars.iter().collect(),
             width_of(&chars[..cursor]) as u16,
+            0,
         );
     }
     // Grow the window left from the cursor first, then fill any remaining
@@ -7674,7 +7682,7 @@ fn visible_edit_window(text: &str, cursor: usize, budget: usize) -> (String, u16
     }
     let visible: String = chars[start..end].iter().collect();
     let cursor_col = width_of(&chars[start..cursor]) as u16;
-    (visible, cursor_col)
+    (visible, cursor_col, start)
 }
 
 fn render_pin_strip(f: &mut Frame, area: Rect, app: &mut App, pinned_ids: &[String]) {
@@ -8526,6 +8534,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_title_toggle_hit = None;
     app.layout.program_title_close_hit = None;
     app.layout.program_title_name_hit = None;
+    app.layout.program_title_name_window_start = 0;
     app.layout.program_selection_run_hit = None;
     app.layout.program_inner_area = None;
     app.layout.program_base_area = None;
@@ -9249,7 +9258,10 @@ fn render_program_popup_at(
     let rename = app
         .session_title_rename
         .as_ref()
-        .filter(|r| r.session_id == popup.program.session_id)
+        .filter(|r| {
+            r.session_id == popup.program.session_id
+                && r.origin == crate::app::TitleRenameOrigin::Program
+        })
         .map(|r| (r.buffer.as_str(), r.cursor));
     let left = program_title_left_layout(
         summary_ref,
@@ -9380,6 +9392,7 @@ fn render_program_popup_at(
         );
         app.layout.program_title_name_hit =
             clamp_title_hit_to_pane(Some((left.name.0, left.name.1, rect.y)), pane_right);
+        app.layout.program_title_name_window_start = left.name_window_start;
         if let Some(cursor_col) = left.cursor_col {
             f.set_cursor_position(Position {
                 x: left.name.0.saturating_add(cursor_col),
@@ -10371,6 +10384,9 @@ struct ProgramTitleLeft {
     name: (u16, u16),
     /// Cursor's display column within `label`, when `rename` was `Some`.
     cursor_col: Option<u16>,
+    /// Char offset into the rename buffer of `label`'s first char — non-zero
+    /// only when the edit window has slid right to keep the cursor visible.
+    name_window_start: usize,
 }
 
 fn program_title_left_layout(
@@ -10424,17 +10440,17 @@ fn program_title_left_layout(
         .saturating_sub(run_w)
         .saturating_sub(stage_w)
         .saturating_sub(marker_w);
-    let (label, cursor_col) = match rename {
+    let (label, cursor_col, name_window_start) = match rename {
         Some((buffer, cursor)) => {
-            let (visible, col) = visible_edit_window(buffer, cursor, label_budget);
-            (visible, Some(col))
+            let (visible, col, start) = visible_edit_window(buffer, cursor, label_budget);
+            (visible, Some(col), start)
         }
         None => {
             let label = match summary {
                 Some(s) => truncate_to_width(&primary_label(s), label_budget),
                 None => truncate_to_width(fallback_label, label_budget),
             };
-            (label, None)
+            (label, None, 0)
         }
     };
     let label_w = UnicodeWidthStr::width(label.as_str());
@@ -10472,6 +10488,7 @@ fn program_title_left_layout(
         modified,
         name: (name_x_start, run_x_start),
         cursor_col,
+        name_window_start,
     }
 }
 
@@ -10685,10 +10702,10 @@ fn render_program_title_tooltip(
         if my == y
             && mx >= xs
             && mx < xe
-            && !app
-                .session_title_rename
-                .as_ref()
-                .is_some_and(|r| r.session_id == popup.program.session_id)
+            && !app.session_title_rename.as_ref().is_some_and(|r| {
+                r.session_id == popup.program.session_id
+                    && r.origin == crate::app::TitleRenameOrigin::Program
+            })
         {
             render_button_tooltip(f, &app.theme, " Click to rename ", mx, my);
             return;

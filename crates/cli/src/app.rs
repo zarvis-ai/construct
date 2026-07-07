@@ -814,10 +814,24 @@ pub struct SessionTitleMenu {
 #[derive(Debug, Clone)]
 pub struct SessionTitleRename {
     pub session_id: String,
+    /// Which title bar the rename was started from. Splits can show the same
+    /// session in several panes at once; only the origin surface renders the
+    /// live edit buffer and cursor — the others keep the static title.
+    pub origin: TitleRenameOrigin,
     /// Live edit buffer, pre-filled with the session's current title.
     pub buffer: String,
     /// Char index into `buffer` (not byte index) — see `byte_pos`.
     pub cursor: usize,
+}
+
+/// The surface an inline title rename was started from (and is edited in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleRenameOrigin {
+    /// A session pane's title bar, keyed by main-window id so a session shown
+    /// in several split panes edits only in the clicked one.
+    Pane(Option<u64>),
+    /// The program popup's title bar.
+    Program,
 }
 
 impl SessionTitleMenu {
@@ -2414,10 +2428,17 @@ pub struct WindowDividerHit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionTitleNameHit {
     pub session_id: String,
+    /// Main-window id of the pane this title bar belongs to — the rename's
+    /// [`TitleRenameOrigin::Pane`] key.
+    pub window_id: Option<u64>,
     pub row: u16,
     pub start_col: u16,
     /// Exclusive end column.
     pub end_col: u16,
+    /// Char offset into the underlying text of the first rendered label char
+    /// — non-zero only mid-rename, when the edit window has slid right to
+    /// keep the cursor visible. Lets a click map back to a char index.
+    pub window_start_chars: usize,
 }
 
 impl SessionTitleNameHit {
@@ -2485,6 +2506,10 @@ pub struct LayoutSnapshot {
     /// starts an inline rename of the active popup's session — the program
     /// popup's counterpart to `session_title_name_hits`.
     pub program_title_name_hit: Option<(u16, u16, u16)>,
+    /// `SessionTitleNameHit::window_start_chars` counterpart for
+    /// `program_title_name_hit`: char offset of the first rendered label char,
+    /// non-zero only mid-rename when the edit window has slid.
+    pub program_title_name_window_start: usize,
     /// Program selected-text context Run button bounds: `(x_start, x_end, y)`.
     pub program_selection_run_hit: Option<(u16, u16, u16)>,
     /// Inner content rect of the active program popup from the last frame.
@@ -6458,6 +6483,36 @@ impl App {
                 _ => return,
             }
         }
+        // An in-progress inline title rename commits on any click outside its
+        // own name field — clicking away applies, like blurring an edited
+        // text field (`Esc` remains the cancel path). This must run before
+        // every other click consumer (program popup, child-mouse forwarding,
+        // pane hit-tests) so no click path can leave a stale rename behind;
+        // the click then proceeds normally on whatever it landed on. Clicks
+        // *inside* the field fall through to the cursor-repositioning
+        // handlers below.
+        if matches!(ev.kind, MouseEventKind::Down(_)) {
+            if let Some(rename) = self.session_title_rename.as_ref() {
+                let inside_own_field = match rename.origin {
+                    TitleRenameOrigin::Pane(window_id) => {
+                        self.layout.session_title_name_hits.iter().any(|hit| {
+                            hit.session_id == rename.session_id
+                                && hit.window_id == window_id
+                                && hit.contains(ev.column, ev.row)
+                        })
+                    }
+                    TitleRenameOrigin::Program => self
+                        .layout
+                        .program_title_name_hit
+                        .is_some_and(|(xs, xe, y)| {
+                            ev.row == y && ev.column >= xs && ev.column < xe
+                        }),
+                };
+                if !inside_own_field {
+                    self.commit_session_title_rename().await;
+                }
+            }
+        }
         // If the cursor is over a pane whose child has grabbed the mouse
         // (e.g. Claude Code in fullscreen), forward the event into that PTY and
         // stop — construct becomes a transparent mouse pipe for the pane, so
@@ -6531,7 +6586,10 @@ impl App {
                 }
                 // Session-name text on a pane's title bar: click starts an
                 // inline rename in place, rather than the bottom-minibuffer
-                // prompt the session-title menu's "rename" row opens.
+                // prompt the session-title menu's "rename" row opens — with
+                // the cursor on the clicked char. A click inside the field
+                // already being edited just repositions the cursor (any
+                // rename on another surface was committed above).
                 if let Some(hit) = self
                     .layout
                     .session_title_name_hits
@@ -6548,7 +6606,23 @@ impl App {
                     {
                         self.focus_main_window(pane.id);
                     }
-                    self.start_session_title_rename(hit.session_id);
+                    let display_col = ev.column.saturating_sub(hit.start_col) as usize;
+                    let editing_this_field = self.session_title_rename.as_ref().is_some_and(|r| {
+                        r.session_id == hit.session_id
+                            && r.origin == TitleRenameOrigin::Pane(hit.window_id)
+                    });
+                    if editing_this_field {
+                        self.session_title_rename_click_cursor(
+                            hit.window_start_chars,
+                            display_col,
+                        );
+                    } else {
+                        self.start_session_title_rename(
+                            hit.session_id,
+                            TitleRenameOrigin::Pane(hit.window_id),
+                            Some(display_col),
+                        );
+                    }
                     return;
                 }
                 // List ↔ view divider: clicking the list pane's
@@ -10060,6 +10134,7 @@ mod tests {
             program_title_toggle_hit: None,
             program_title_close_hit: None,
             program_title_name_hit: None,
+            program_title_name_window_start: 0,
             program_selection_run_hit: None,
             program_inner_area: None,
             program_base_area: None,
@@ -18796,7 +18871,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_session_name_starts_inline_rename_prefilled_at_end() {
+    async fn clicking_session_name_starts_inline_rename_cursor_at_click() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (mut app, _dir, server) = captured_app().await;
         app.sessions[0].title = Some("old-name".into());
@@ -18817,21 +18892,24 @@ mod tests {
             .first()
             .cloned()
             .expect("session name hit registered");
+        assert_eq!(hit.window_id, Some(1));
         let click = |kind, col, row| MouseEvent {
             kind,
             column: col,
             row,
             modifiers: crossterm::event::KeyModifiers::empty(),
         };
+        // Click on the 4th char ("old-|name") — the cursor must land there,
+        // not at the end of the buffer.
         app.on_mouse(click(
             MouseEventKind::Down(MouseButton::Left),
-            hit.start_col,
+            hit.start_col + 4,
             hit.row,
         ))
         .await;
         app.on_mouse(click(
             MouseEventKind::Up(MouseButton::Left),
-            hit.start_col,
+            hit.start_col + 4,
             hit.row,
         ))
         .await;
@@ -18841,8 +18919,32 @@ mod tests {
             .clone()
             .expect("clicking the name starts an inline rename");
         assert_eq!(rename.session_id, "s1");
+        assert_eq!(rename.origin, TitleRenameOrigin::Pane(Some(1)));
         assert_eq!(rename.buffer, "old-name");
-        assert_eq!(rename.cursor, "old-name".chars().count());
+        assert_eq!(rename.cursor, 4, "cursor lands on the clicked char");
+
+        // A second click inside the field being edited repositions the
+        // cursor without restarting (or committing) the rename.
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render mid-rename");
+        let hit = app
+            .layout
+            .session_title_name_hits
+            .first()
+            .cloned()
+            .expect("hit refreshed mid-rename");
+        app.on_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.start_col + 1,
+            hit.row,
+        ))
+        .await;
+        let rename = app
+            .session_title_rename
+            .clone()
+            .expect("rename still in progress after an in-field click");
+        assert_eq!(rename.cursor, 1);
+        assert_eq!(rename.buffer, "old-name");
         server.abort();
     }
 
@@ -18850,7 +18952,7 @@ mod tests {
     async fn session_title_rename_emacs_editing_mirrors_session_picker() {
         let (mut app, _dir, server) = captured_app().await;
         app.sessions[0].title = Some("ac".into());
-        app.start_session_title_rename("s1".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 2);
 
         app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
@@ -18895,7 +18997,7 @@ mod tests {
         let mut app = test_app(client, vec![session]);
         app.selection = Selection::Session("s1".into());
 
-        app.start_session_title_rename("s1".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
         app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -18921,7 +19023,7 @@ mod tests {
         let mut app = test_app(client, vec![session]);
         app.selection = Selection::Session("s1".into());
 
-        app.start_session_title_rename("s1".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
         for _ in 0..("old-name".chars().count()) {
             app.handle_session_title_rename_key(KeyEvent::new(
                 KeyCode::Backspace,
@@ -18943,7 +19045,7 @@ mod tests {
         app.sessions[0].title = Some("old-name".into());
         app.selection = Selection::Session("s1".into());
 
-        app.start_session_title_rename("s1".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
         app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
@@ -18966,7 +19068,7 @@ mod tests {
         // open minibuffer or session-picker dialog.
         let (mut app, _dir, server) = captured_app().await;
         app.selection = Selection::Session("s1".into());
-        app.start_session_title_rename("s1".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
 
         app.on_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
             .await;
@@ -18986,7 +19088,7 @@ mod tests {
         app.main_windows = MainWindowTree::single(1, Selection::Session("s1".into()));
         app.active_window_id = 1;
         app.selection = Selection::Session("s1".into());
-        app.start_session_title_rename("s1".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
         app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
             .await;
 
@@ -19043,7 +19145,180 @@ mod tests {
             .clone()
             .expect("clicking the program title name starts an inline rename");
         assert_eq!(rename.session_id, "s1");
+        assert_eq!(rename.origin, TitleRenameOrigin::Program);
         assert_eq!(rename.buffer, "old-name");
+        assert_eq!(rename.cursor, 0, "click on the first char lands there");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn session_title_rename_ctrl_d_deletes_forward() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.sessions[0].title = Some("abc".into());
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
+
+        // C-a to the start, then C-d deletes the char under the cursor.
+        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
+            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            .await;
+
+        let rename = app.session_title_rename.as_ref().unwrap();
+        assert_eq!(rename.buffer, "bc");
+        assert_eq!(rename.cursor, 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn title_rename_click_outside_commits_like_enter() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (client, _dir, server) = program_flow_mock_daemon().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.title = Some("old-name".into());
+        let mut app = test_app(client, vec![session]);
+        app.selection = Selection::Session("s1".into());
+
+        app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
+        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            .await;
+        // A click anywhere outside the name field applies the edit — same
+        // effect as Enter, not a silent discard.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 20,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert!(
+            app.session_title_rename.is_none(),
+            "click-away commits and clears the rename"
+        );
+        assert_eq!(
+            app.sessions[0].title.as_deref(),
+            Some("old-name!"),
+            "click-away applies the edit like Enter"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn title_rename_in_split_edits_only_the_clicked_pane() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = captured_app().await;
+        app.sessions[0].title = Some("old-name".into());
+        // Two split panes showing the SAME session — the rename (buffer and
+        // terminal cursor) must live in the clicked pane, not whichever pane
+        // happens to render last.
+        app.main_windows = MainWindowTree::Split {
+            direction: WindowSplitDirection::Right,
+            ratio_percent: 50,
+            first: Box::new(MainWindowTree::Leaf {
+                id: 1,
+                selection: Selection::Session("s1".into()),
+            }),
+            second: Box::new(MainWindowTree::Leaf {
+                id: 2,
+                selection: Selection::Session("s1".into()),
+            }),
+        };
+        app.active_window_id = 1;
+        app.next_window_id = 3;
+        app.selection = Selection::Session("s1".into());
+        app.focus = PaneFocus::View;
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render");
+
+        let hits = app.layout.session_title_name_hits.clone();
+        assert_eq!(hits.len(), 2, "one name hit per split pane: {hits:?}");
+        let second = hits
+            .iter()
+            .find(|h| h.window_id == Some(2))
+            .cloned()
+            .expect("second pane's name hit");
+
+        let click = |kind, col, row| MouseEvent {
+            kind,
+            column: col,
+            row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        app.on_mouse(click(
+            MouseEventKind::Down(MouseButton::Left),
+            second.start_col + 2,
+            second.row,
+        ))
+        .await;
+        app.on_mouse(click(
+            MouseEventKind::Up(MouseButton::Left),
+            second.start_col + 2,
+            second.row,
+        ))
+        .await;
+
+        let rename = app.session_title_rename.clone().expect("rename started");
+        assert_eq!(
+            rename.origin,
+            TitleRenameOrigin::Pane(Some(2)),
+            "the rename belongs to the clicked pane"
+        );
+        assert_eq!(rename.cursor, 2, "cursor lands on the clicked char");
+
+        // Edit a char so the live buffer is distinguishable from the static
+        // title, then re-render: only the clicked pane shows the edit, and
+        // the terminal cursor sits in that pane's title bar.
+        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            .await;
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("render mid-rename");
+
+        let h1 = app
+            .layout
+            .session_title_name_hits
+            .iter()
+            .find(|h| h.window_id == Some(1))
+            .cloned()
+            .expect("first pane's name hit");
+        let h2 = app
+            .layout
+            .session_title_name_hits
+            .iter()
+            .find(|h| h.window_id == Some(2))
+            .cloned()
+            .expect("second pane's name hit");
+        let buf = term.backend().buffer();
+        let row_text = |row: u16, start: u16, len: u16| -> String {
+            (start..start.saturating_add(len))
+                .filter_map(|x| buf.cell(ratatui::layout::Position { x, y: row }))
+                .map(|c| c.symbol())
+                .collect()
+        };
+        let left = row_text(h1.row, h1.start_col, 10);
+        let right = row_text(h2.row, h2.start_col, 10);
+        assert!(
+            right.starts_with("ol!d-name"),
+            "clicked pane renders the live edit buffer: {right:?}"
+        );
+        assert!(
+            left.starts_with("old-name"),
+            "the other split keeps the static title: {left:?}"
+        );
+
+        use ratatui::backend::Backend as _;
+        let pos = term
+            .backend_mut()
+            .get_cursor_position()
+            .expect("cursor position");
+        assert_eq!(pos.y, h2.row, "terminal cursor sits on the clicked pane's title row");
+        assert_eq!(
+            pos.x,
+            h2.start_col + 3,
+            "terminal cursor sits one cell right of the inserted char"
+        );
         server.abort();
     }
 

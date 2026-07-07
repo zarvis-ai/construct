@@ -6,18 +6,45 @@
 
 use super::*;
 
+/// Map a click at `display_col` (columns right of the rendered label's left
+/// edge) to a char index into `text`, given the label rendered `text` from
+/// char offset `window_start_chars`. The cursor lands before the clicked
+/// char; clicks past the end land at the end.
+pub(super) fn edit_click_char_index(
+    text: &str,
+    window_start_chars: usize,
+    display_col: usize,
+) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut idx = window_start_chars.min(text.chars().count());
+    let mut col = 0usize;
+    for c in text.chars().skip(idx) {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if col + w > display_col {
+            break;
+        }
+        col += w;
+        idx += 1;
+    }
+    idx
+}
+
 impl App {
-    /// Start (or re-seed) an inline rename of `session_id`, pre-filling the
-    /// edit buffer with its current title and placing the cursor at the end
-    /// — mirroring `OpenRename`'s minibuffer seed. A no-op if this session is
-    /// already being renamed; switching to a different session's name
-    /// silently discards any unsaved edit of the previous one, same as
-    /// clicking away from an unsaved text field.
-    pub(super) fn start_session_title_rename(&mut self, session_id: String) {
+    /// Start (or re-seed) an inline rename of `session_id` from `origin`,
+    /// pre-filling the edit buffer with its current title. The cursor lands
+    /// on the clicked char (`click_col`, columns right of the label's left
+    /// edge) or at the end when `None` — mirroring `OpenRename`'s minibuffer
+    /// seed. A no-op if this surface is already renaming this session.
+    pub(super) fn start_session_title_rename(
+        &mut self,
+        session_id: String,
+        origin: TitleRenameOrigin,
+        click_col: Option<usize>,
+    ) {
         if self
             .session_title_rename
             .as_ref()
-            .is_some_and(|r| r.session_id == session_id)
+            .is_some_and(|r| r.session_id == session_id && r.origin == origin)
         {
             return;
         }
@@ -25,12 +52,30 @@ impl App {
             return;
         };
         let current = s.title.clone().unwrap_or_default();
-        let cursor = current.chars().count();
+        let cursor = match click_col {
+            Some(col) => edit_click_char_index(&current, 0, col),
+            None => current.chars().count(),
+        };
         self.session_title_rename = Some(SessionTitleRename {
             session_id,
+            origin,
             buffer: current,
             cursor,
         });
+    }
+
+    /// Reposition the cursor of the in-progress rename from a click inside
+    /// its own name field. `window_start_chars` is the hit-rect's record of
+    /// where the rendered edit window started within the buffer.
+    pub(super) fn session_title_rename_click_cursor(
+        &mut self,
+        window_start_chars: usize,
+        display_col: usize,
+    ) {
+        if let Some(rename) = self.session_title_rename.as_mut() {
+            rename.cursor =
+                edit_click_char_index(&rename.buffer, window_start_chars, display_col);
+        }
     }
 
     fn session_title_rename_push_char(&mut self, c: char) {
@@ -90,9 +135,10 @@ impl App {
         self.session_title_rename = None;
     }
 
-    /// `Enter`: commit via `set_title`, matching `MinibufferIntent::Rename`
-    /// (empty buffer clears the title).
-    async fn commit_session_title_rename(&mut self) {
+    /// `Enter` — or any click outside the name field — commits via
+    /// `set_title`, matching `MinibufferIntent::Rename` (empty buffer clears
+    /// the title). A no-op when no rename is in progress.
+    pub(super) async fn commit_session_title_rename(&mut self) {
         let Some(rename) = self.session_title_rename.take() else {
             return;
         };
@@ -131,6 +177,7 @@ impl App {
             KeyCode::Char('b') if ctrl => self.session_title_rename_move_cursor(-1),
             KeyCode::Char('a') if ctrl => self.session_title_rename_cursor_to_edge(false),
             KeyCode::Char('e') if ctrl => self.session_title_rename_cursor_to_edge(true),
+            KeyCode::Char('d') if ctrl => self.session_title_rename_delete_forward(),
             KeyCode::Char('k') if ctrl => self.session_title_rename_kill_to_end(),
             KeyCode::Backspace => self.session_title_rename_backspace(),
             KeyCode::Delete => self.session_title_rename_delete_forward(),

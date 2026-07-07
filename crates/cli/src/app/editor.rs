@@ -140,7 +140,28 @@ impl App {
                         .as_ref()
                         .map(|popup| popup.program.session_id.clone())
                     {
-                        self.start_session_title_rename(session_id);
+                        // Cursor lands on the clicked char; a click inside the
+                        // field already being edited just repositions it.
+                        let display_col = title_name_hit
+                            .map(|(xs, _, _)| ev.column.saturating_sub(xs) as usize)
+                            .unwrap_or(0);
+                        let editing_this_field =
+                            self.session_title_rename.as_ref().is_some_and(|r| {
+                                r.session_id == session_id
+                                    && r.origin == TitleRenameOrigin::Program
+                            });
+                        if editing_this_field {
+                            self.session_title_rename_click_cursor(
+                                self.layout.program_title_name_window_start,
+                                display_col,
+                            );
+                        } else {
+                            self.start_session_title_rename(
+                                session_id,
+                                TitleRenameOrigin::Program,
+                                Some(display_col),
+                            );
+                        }
                     }
                 } else {
                     let selected = hit_selection_run.then(|| {
