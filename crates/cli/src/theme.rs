@@ -3,8 +3,8 @@
 //! Ships a Matrix-inspired palette in dark and light variants. By default
 //! (`mode = "auto"`) the active variant is chosen at startup by querying the
 //! terminal's background color (OSC 11); `mode = "light"`/`"dark"` force one.
-//! The runtime `/theme` command writes a named `theme = "matrix" | "dark" |
-//! "light"` choice, which takes precedence over legacy `mode`.
+//! The runtime `/theme` command writes a named `theme = "matrix" | "basic" |
+//! "dark" | "light"` choice, which takes precedence over legacy `mode`.
 //! Individual slots can be overridden on top of the active variant:
 //!
 //! ```toml
@@ -27,7 +27,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Theme {
     /// Full-frame terminal background. `None` leaves the terminal's own
-    /// background visible, which is intentional for the Matrix theme.
+    /// background visible, which is intentional for background-aware themes.
     pub background: Option<Color>,
     pub text: Color,
     pub dim: Color,
@@ -114,16 +114,23 @@ pub enum ThemeMode {
 pub enum ThemeName {
     #[default]
     Matrix,
+    Basic,
     Dark,
     Light,
 }
 
 impl ThemeName {
-    pub const ALL: [ThemeName; 3] = [ThemeName::Matrix, ThemeName::Dark, ThemeName::Light];
+    pub const ALL: [ThemeName; 4] = [
+        ThemeName::Matrix,
+        ThemeName::Basic,
+        ThemeName::Dark,
+        ThemeName::Light,
+    ];
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "matrix" | "green" => Some(Self::Matrix),
+            "basic" | "plain" | "ansi" => Some(Self::Basic),
             "dark" => Some(Self::Dark),
             "light" => Some(Self::Light),
             _ => None,
@@ -133,6 +140,7 @@ impl ThemeName {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Matrix => "matrix",
+            Self::Basic => "basic",
             Self::Dark => "dark",
             Self::Light => "light",
         }
@@ -141,6 +149,7 @@ impl ThemeName {
     pub fn label(self) -> &'static str {
         match self {
             Self::Matrix => "matrix",
+            Self::Basic => "basic",
             Self::Dark => "dark",
             Self::Light => "light",
         }
@@ -148,10 +157,15 @@ impl ThemeName {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Matrix => Self::Dark,
+            Self::Matrix => Self::Basic,
+            Self::Basic => Self::Dark,
             Self::Dark => Self::Light,
             Self::Light => Self::Matrix,
         }
+    }
+
+    pub fn is_background_aware(self) -> bool {
+        matches!(self, Self::Matrix | Self::Basic)
     }
 }
 
@@ -205,7 +219,7 @@ impl ThemeConfig {
     /// `Auto` (ignored for forced modes); `None` falls back to dark.
     pub fn resolve(&self, detected_light: Option<bool>) -> Theme {
         let base = match self.name {
-            Some(name) => Theme::named(name),
+            Some(name) => Theme::named_for_terminal(name, detected_light),
             None => {
                 let light = match self.mode {
                     ThemeMode::Light => true,
@@ -243,18 +257,35 @@ impl ThemeConfig {
         }
     }
 
-    pub fn select_named(&mut self, name: ThemeName) -> Result<Theme, String> {
+    pub fn select_named_for_terminal(
+        &mut self,
+        name: ThemeName,
+        detected_light: Option<bool>,
+    ) -> Result<Theme, String> {
         persist_named_theme(name)?;
         self.name = Some(name);
         self.text = set_theme_line(&self.text, name);
-        Ok(self.resolve(None))
+        Ok(self.resolve(detected_light))
     }
 }
 
 impl Theme {
-    pub fn named(name: ThemeName) -> Self {
+    pub fn named_for_terminal(name: ThemeName, detected_light: Option<bool>) -> Self {
         match name {
-            ThemeName::Matrix => Self::dark(),
+            ThemeName::Matrix => {
+                if detected_light.unwrap_or(false) {
+                    Self::light()
+                } else {
+                    Self::dark()
+                }
+            }
+            ThemeName::Basic => {
+                if detected_light.unwrap_or(false) {
+                    Self::basic_light()
+                } else {
+                    Self::basic_dark()
+                }
+            }
             ThemeName::Dark => Self::dark_ui(),
             ThemeName::Light => Self::light_ui(),
         }
@@ -301,6 +332,81 @@ impl Theme {
             matrix_flash_good: Color::Rgb(18, 150, 70),
             matrix_flash_warn: Color::Rgb(176, 126, 18),
             matrix_flash_bad: Color::Rgb(190, 50, 44),
+        }
+    }
+
+    /// Basic terminal-aware palette with common ANSI-style blues/grays instead
+    /// of the Matrix green treatment. Tuned for a dark terminal background.
+    pub fn basic_dark() -> Self {
+        Self {
+            background: None,
+            text: Color::Rgb(229, 231, 235),
+            dim: Color::Rgb(107, 114, 128),
+            muted: Color::Rgb(156, 163, 175),
+            border: Color::Rgb(75, 85, 99),
+            border_focused: Color::Rgb(96, 165, 250),
+            accent: Color::Rgb(96, 165, 250),
+            accent_alt: Color::Rgb(192, 132, 252),
+            highlight_fg: Color::Rgb(17, 24, 39),
+            highlight_bg: Color::Rgb(147, 197, 253),
+            inactive_highlight_bg: Color::Rgb(55, 65, 81),
+            modeline_fg: Color::Rgb(249, 250, 251),
+            modeline_bg: Color::Rgb(31, 41, 55),
+            success: Color::Rgb(34, 197, 94),
+            warning: Color::Rgb(234, 179, 8),
+            danger: Color::Rgb(239, 68, 68),
+            info: Color::Rgb(56, 189, 248),
+            group: Color::Rgb(209, 213, 219),
+            harness: Color::Rgb(209, 213, 219),
+            user: Color::Rgb(249, 250, 251),
+            assistant: Color::Rgb(191, 219, 254),
+            system: Color::Rgb(156, 163, 175),
+            tool: Color::Rgb(167, 139, 250),
+            matrix_dim: Color::Rgb(75, 85, 99),
+            matrix_line: Color::Rgb(107, 114, 128),
+            matrix_close: Color::Rgb(209, 213, 219),
+            matrix_glow: Color::Rgb(100, 116, 139),
+            matrix_flash_work: Color::Rgb(191, 219, 254),
+            matrix_flash_good: Color::Rgb(96, 165, 250),
+            matrix_flash_warn: Color::Rgb(234, 179, 8),
+            matrix_flash_bad: Color::Rgb(239, 68, 68),
+        }
+    }
+
+    /// Basic terminal-aware palette tuned for a light terminal background.
+    pub fn basic_light() -> Self {
+        Self {
+            background: None,
+            text: Color::Rgb(31, 41, 55),
+            dim: Color::Rgb(107, 114, 128),
+            muted: Color::Rgb(75, 85, 99),
+            border: Color::Rgb(156, 163, 175),
+            border_focused: Color::Rgb(37, 99, 235),
+            accent: Color::Rgb(37, 99, 235),
+            accent_alt: Color::Rgb(124, 58, 237),
+            highlight_fg: Color::Rgb(255, 255, 255),
+            highlight_bg: Color::Rgb(37, 99, 235),
+            inactive_highlight_bg: Color::Rgb(229, 231, 235),
+            modeline_fg: Color::Rgb(255, 255, 255),
+            modeline_bg: Color::Rgb(55, 65, 81),
+            success: Color::Rgb(22, 163, 74),
+            warning: Color::Rgb(202, 138, 4),
+            danger: Color::Rgb(220, 38, 38),
+            info: Color::Rgb(2, 132, 199),
+            group: Color::Rgb(55, 65, 81),
+            harness: Color::Rgb(55, 65, 81),
+            user: Color::Rgb(17, 24, 39),
+            assistant: Color::Rgb(29, 78, 216),
+            system: Color::Rgb(107, 114, 128),
+            tool: Color::Rgb(124, 58, 237),
+            matrix_dim: Color::Rgb(209, 213, 219),
+            matrix_line: Color::Rgb(156, 163, 175),
+            matrix_close: Color::Rgb(55, 65, 81),
+            matrix_glow: Color::Rgb(148, 163, 184),
+            matrix_flash_work: Color::Rgb(29, 78, 216),
+            matrix_flash_good: Color::Rgb(37, 99, 235),
+            matrix_flash_warn: Color::Rgb(202, 138, 4),
+            matrix_flash_bad: Color::Rgb(220, 38, 38),
         }
     }
 
@@ -816,6 +922,14 @@ mod tests {
     }
 
     #[test]
+    fn theme_name_parses_and_cycles_basic() {
+        assert_eq!(ThemeName::parse("basic"), Some(ThemeName::Basic));
+        assert_eq!(ThemeName::parse("plain"), Some(ThemeName::Basic));
+        assert_eq!(ThemeName::Matrix.next(), ThemeName::Basic);
+        assert_eq!(ThemeName::Basic.next(), ThemeName::Dark);
+    }
+
+    #[test]
     fn theme_mode_parses_from_config() {
         assert_eq!(parse_mode(""), ThemeMode::Auto);
         assert_eq!(parse_mode("mode = \"auto\""), ThemeMode::Auto);
@@ -868,14 +982,33 @@ mod tests {
     }
 
     #[test]
-    fn matrix_is_background_aware_but_named_dark_light_paint_backgrounds() {
-        assert_eq!(Theme::named(ThemeName::Matrix).background, None);
+    fn named_background_aware_themes_follow_terminal_detection() {
+        let cfg = ThemeConfig {
+            mode: ThemeMode::Dark,
+            name: Some(ThemeName::Basic),
+            text: String::new(),
+            warning: None,
+        };
+        assert_eq!(cfg.resolve(Some(false)).text, Theme::basic_dark().text);
+        assert_eq!(cfg.resolve(Some(true)).text, Theme::basic_light().text);
+    }
+
+    #[test]
+    fn matrix_and_basic_are_background_aware_but_dark_light_paint_backgrounds() {
         assert_eq!(
-            Theme::named(ThemeName::Dark).background,
+            Theme::named_for_terminal(ThemeName::Matrix, None).background,
+            None
+        );
+        assert_eq!(
+            Theme::named_for_terminal(ThemeName::Basic, None).background,
+            None
+        );
+        assert_eq!(
+            Theme::named_for_terminal(ThemeName::Dark, None).background,
             Some(Color::Rgb(12, 18, 27))
         );
         assert_eq!(
-            Theme::named(ThemeName::Light).background,
+            Theme::named_for_terminal(ThemeName::Light, None).background,
             Some(Color::Rgb(246, 248, 251))
         );
     }
@@ -914,6 +1047,7 @@ mod tests {
             b"\x1b]11;rgb:f6f6/f8f8/fbfb\x07"
         );
         assert_eq!(Theme::dark().osc11_background_response(), None);
+        assert_eq!(Theme::basic_dark().osc11_background_response(), None);
     }
 
     #[test]
