@@ -7757,11 +7757,22 @@ impl App {
                 // selection ▶ Run button: run just the highlighted selection
                 // when one is active, otherwise run the whole program. No-op
                 // (with a status hint) when no program surface is open.
-                let selection = self
-                    .program_popup
-                    .as_ref()
-                    .and_then(Self::selected_program_text);
-                self.execute_program_popup(selection, None).await;
+                let selected = self.program_popup.as_ref().and_then(|popup| {
+                    Some((
+                        Self::selected_program_text(popup)?,
+                        Self::selected_program_block_ids(popup)?,
+                    ))
+                });
+                let (selection, selected_block_ids) =
+                    selected.map_or((None, None), |(text, ids)| (Some(text), Some(ids)));
+                if selection.is_some() {
+                    if let Some(popup) = self.program_popup.as_mut() {
+                        popup.selection = None;
+                    }
+                    self.layout.program_selection_run_hit = None;
+                }
+                self.execute_program_popup(selection, selected_block_ids)
+                    .await;
             }
             ToggleProgramTerminalFocus => {
                 self.toggle_program_terminal_focus();
@@ -14935,6 +14946,165 @@ mod tests {
             Some("alpha")
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_selection_run_ctrl_x_ctrl_r_clears_menu_and_runs_selection() {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let _ = seen_tx.send((method.clone(), params.clone()));
+                let program = serde_json::json!({
+                    "session_id": "s1",
+                    "markdown": "alpha beta",
+                    "version": 1,
+                    "updated_at_ms": 0,
+                    "template_id": null,
+                });
+                let result = match method.as_str() {
+                    ipc_method::PROGRAM_EXECUTE => {
+                        serde_json::json!({ "program": program, "prompt": "sent", "active_run": null })
+                    }
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut app = test_app(client, Vec::new());
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        app.layout
+            .program_selection_run_hit
+            .expect("selection run hit registered");
+
+        app.run_action(KeyAction::RunProgram).await;
+
+        assert!(
+            app.program_popup
+                .as_ref()
+                .is_some_and(|popup| popup.selection.is_none()),
+            "C-x C-r on a selection should clear selection so the context menu disappears"
+        );
+        assert!(
+            app.layout.program_selection_run_hit.is_none(),
+            "selection Run hitbox should clear with the context menu"
+        );
+        let (method, params) = seen_rx.recv().await.expect("program execute request");
+        assert_eq!(method, ipc_method::PROGRAM_EXECUTE);
+        assert_eq!(
+            params.get("selection").and_then(Value::as_str),
+            Some("alpha")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_selection_run_ctrl_x_ctrl_r_preserves_other_pending_shimmer() {
+        // Regression: C-x C-r on a fresh selection while other blocks are
+        // already shimmering from an earlier run must keep that shimmer and
+        // optimistically add the newly-run block, not replace the whole
+        // pending set with just the new selection (mirrors the mouse-click
+        // regression above — both gestures funnel into the same
+        // `execute_program_popup` call and must behave identically).
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        // No accept loop: the action handler awaits the program/execute
+        // round trip, which we deliberately never let complete so a single
+        // poll observes only the synchronous optimistic shimmer update.
+        let _listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let client = Client::connect(&sock).await.expect("client connects");
+
+        let mut app = test_app(client, Vec::new());
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha\n\nbeta\n", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+
+        // "beta" is already shimmering from an earlier, separate run.
+        app.start_program_run("s1", "alpha\n\nbeta\n", false, "");
+        app.program_runs.get_mut("s1").expect("run").pending =
+            HashSet::from([agentd_protocol::program_block_id("beta")]);
+
+        app.begin_program_selection();
+        app.move_program_cursor(5); // selects "alpha"
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        app.layout
+            .program_selection_run_hit
+            .expect("selection run hit registered");
+
+        let fut = app.run_action(KeyAction::RunProgram);
+        assert!(
+            fut.now_or_never().is_none(),
+            "action handling should still be awaiting the daemon response"
+        );
+
+        let pending = &app.program_runs["s1"].pending;
+        assert!(
+            pending.contains(&agentd_protocol::program_block_id("beta")),
+            "C-x C-r on a new selection must not clear another block's existing shimmer"
+        );
+        assert!(
+            pending.contains(&agentd_protocol::program_block_id("alpha")),
+            "the freshly-run selection should be optimistically shimmered too"
+        );
     }
 
     #[tokio::test]
