@@ -1617,6 +1617,19 @@ pub struct ProgramExecuteParams {
     /// region shimmers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shimmer: Option<Vec<bool>>,
+    /// For a selection Run, the stable block ref/id of every real document
+    /// block the client's selection overlaps — computed via the same
+    /// containment logic as the TUI's `selected_program_block_ids` (overlap
+    /// of the selection's character range with each block's line range), not
+    /// by re-hashing the selected substring's own text. Lets the daemon trust
+    /// the client's block identity instead of re-parsing the raw selected
+    /// text as its own standalone document and hash-matching, which only
+    /// works when the selection exactly spans one or more whole blocks and
+    /// otherwise fabricates a phantom block for a partial-line/partial-block
+    /// selection. `None`/empty preserves today's substring-matching fallback,
+    /// for older clients and callers (e.g. the MCP tool) that don't send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_block_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

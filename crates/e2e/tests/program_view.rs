@@ -591,6 +591,60 @@ async fn web_program_view_full_parity() {
     assert_eq!(run_menu["hiddenAfter"], true, "{run_menu:?}");
     assert_eq!(run_menu["selectionCollapsed"], true, "{run_menu:?}");
 
+    // --- 7b. A partial-line selection (a strict SUBSTRING of a single line,
+    // not the whole line) sends the real enclosing block's id as
+    // `selection_block_ids`, not a phantom hash of the substring alone (the
+    // bug this fix addresses: such a phantom matches nothing in the document
+    // and the block never shimmers). The mock `program.execute` handler below
+    // stands in for the fixed daemon by echoing that id back as pending.
+    let partial: serde_json::Value = page
+        .evaluate(
+            r###"
+            withMockProgram({
+              "program.list_templates": () => ({ templates: [] }),
+            }, async () => {
+              const md = "Some long text here\n";
+              window.__execs = [];
+              window.__mockProgramHandlers["program.get"] = () => ({ program: { session_id: "s-partial", markdown: md, version: 1, template_id: null }, active_run: null, blocks: [], revisions: [] });
+              window.__mockProgramHandlers["program.execute"] = (p) => {
+                window.__execs.push(p);
+                const now = Date.now();
+                const realId = (p.selection_block_ids && p.selection_block_ids[0]) || "phantom-no-ids-sent";
+                return {
+                  program: { session_id: "s-partial", markdown: md, version: 1, template_id: null },
+                  blocks: [],
+                  active_run: { run_id: "r-partial", started_at_ms: now, expires_at_ms: now + 60000, pending_block_ids: [], pending_block_refs: [realId], pending_block_tooltips: {}, seen_running: false, first_output_seen: false, agent_managed: false },
+                };
+              };
+              setSession("s-partial", "shell");
+              await switchCurrentViewMode("program");
+              // Select "long text" out of "Some long text here" — a strict
+              // substring of the single line/block, not the whole line.
+              programTestSelectRange(0, 5, 14);
+              await programRun();
+              const line = programInputEl.querySelectorAll(":scope > div")[0];
+              return {
+                execs: window.__execs,
+                realBlockId: programBlockSpans(md)[0].id,
+                shimmering: line.classList.contains("is-running"),
+              };
+            })
+            "###,
+        )
+        .await
+        .expect("evaluate partial-line selection run")
+        .into_value()
+        .expect("json");
+    assert_eq!(partial["execs"][0]["selection"], "long text", "{partial:?}");
+    assert_eq!(
+        partial["execs"][0]["selection_block_ids"][0], partial["realBlockId"],
+        "the real enclosing block's id, not a phantom hash of the substring: {partial:?}"
+    );
+    assert_eq!(
+        partial["shimmering"], true,
+        "the block should shimmer once the (simulated fixed) daemon echoes the real id back: {partial:?}"
+    );
+
     // --- 8. Smart-clip (@) autocomplete inserts a session clip. --------------
     let clip: serde_json::Value = page
         .evaluate(
@@ -1213,6 +1267,7 @@ async fn program_instant_dispatch_fast_path() {
             selection: Some(item_text.to_string()),
             base_version: Some(updated.program.version),
             shimmer: None,
+            selection_block_ids: None,
         })
         .await
         .expect("program.execute");
@@ -1318,6 +1373,7 @@ async fn program_instant_dispatch_mixed_selection_falls_through() {
             selection: Some(selection.to_string()),
             base_version: None,
             shimmer: None,
+            selection_block_ids: None,
         })
         .await
         .expect("program.execute");
@@ -1379,6 +1435,7 @@ async fn program_instant_dispatch_preserves_nested_indentation() {
             selection: Some(selection.to_string()),
             base_version: None,
             shimmer: None,
+            selection_block_ids: None,
         })
         .await
         .expect("program.execute");
@@ -1484,6 +1541,18 @@ const SETUP_JS: &str = r###"
       const r = document.createRange();
       r.setStart(lines[a], 0);
       r.setEnd(lines[b], lines[b].childNodes.length);
+      sel.addRange(r);
+    };
+    // Selects characters [startCol, endCol) of a single line's first text
+    // node — a strict SUBSTRING of the line, not the whole line, for testing
+    // the partial-line selection Run fix.
+    window.programTestSelectRange = function (lineIndex, startCol, endCol) {
+      const line = programInputEl.querySelectorAll(":scope > div")[lineIndex];
+      const textNode = line.firstChild;
+      const sel = window.getSelection(); sel.removeAllRanges();
+      const r = document.createRange();
+      r.setStart(textNode, startCol);
+      r.setEnd(textNode, endCol);
       sel.addRange(r);
     };
     window.withMockProgram = async function (handlers, fn) {

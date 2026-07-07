@@ -24,7 +24,7 @@ Shimmer is carried across the program surfaces as follows:
 - **Read** returns an ordered projection of the document: each block with its stable ref (`id`/`block_ref`), legacy `content_id`, text or source line range, and current `shimmer` boolean.
 - **Edit** accepts an optional and partial list of `{id, shimmer}` declarations. The id may be a stable ref or a legacy content id. Declarations resolve against the document the call produces; a declaration whose id matches no block is dropped.
 - **Update** accepts a complete shimmer declaration over the blocks of the new Markdown. The daemon maps that ordered declaration to the new stable refs.
-- **Execute** lights the executed region optimistically immediately. The daemon then publishes stable refs for the active run so clients can replace the optimistic projection as soon as possible.
+- **Execute** lights the executed region optimistically immediately. The daemon then publishes stable refs for the active run so clients can replace the optimistic projection as soon as possible. For a selection Run, the client should tell the daemon which real document blocks its selection overlaps — computed by checking containment of the selection's range against each block's line range, not by re-parsing the raw selected text into its own standalone document and hash-matching the result. The daemon trusts that client-supplied identity when given. Hash-matching a re-parsed selection is a legacy fallback for callers that omit it; it only identifies the right block when the selection spans one or more whole blocks exactly, because a strict substring of a single block's text hashes differently from that block's real (full) content.
 
 Because shimmer is keyed by block ref, a block's prior shimmer does not carry across a semantic edit by default. Agents that edit a still-in-flight block must set `keep_pending: true` on that edit, or explicitly declare the resulting block's new ref pending in the same call. `keep_pending` is preferred because it re-adds the produced ref atomically, before any intermediate empty pending set can make the UI go dark.
 
@@ -47,6 +47,7 @@ The model remains plain-Markdown friendly: identity lives in program metadata, n
 - No write changes the shimmer of a stable-ref-addressed block it did not name, except `keep_pending`, which names blocks by the edit output instead of by a ref the caller cannot know yet.
 - A run is not destroyed by a transient empty pending set mid-turn. Text-changing edits can drop old refs before new refs are added; the run survives that gap and is reaped by the lifecycle defined in `0042`.
 - Smart-clip `clip_id` normalization is shimmer-neutral. Changing only instance metadata leaves block refs unchanged.
+- A selection Run's block identity is resolved from the client's explicit overlap-computed block ids when the client supplies them, not solely by re-parsing and hash-matching the raw selected text. A client that omits the ids falls back to hash-matching, a legacy path that cannot distinguish "the selection is this whole block" from "the selection is part of this block's text" — a strict partial-line/partial-block selection can therefore produce an identity that matches no real block in the document, and the client-supplied ids exist specifically to avoid that.
 
 ## Non-Goals
 

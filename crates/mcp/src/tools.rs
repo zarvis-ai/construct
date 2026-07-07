@@ -585,6 +585,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 selection: arg_str(&args, "selection").ok(),
                 base_version: args.get("base_version").and_then(|v| v.as_u64()),
                 shimmer,
+                selection_block_ids: None,
             };
             serde_json::to_value(client.program_execute(params).await?)?
         }

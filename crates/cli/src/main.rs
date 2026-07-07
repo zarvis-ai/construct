@@ -720,6 +720,7 @@ async fn run_program_command(client: &Client, command: ProgramCommand) -> Result
                     selection,
                     base_version,
                     shimmer: None,
+                    selection_block_ids: None,
                 })
                 .await?;
             println!(

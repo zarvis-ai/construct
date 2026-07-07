@@ -15612,6 +15612,154 @@ mod tests {
         server.abort();
     }
 
+    // The bug this fix addresses: selecting a strict SUBSTRING of a
+    // single-line block (not the whole line) and pressing Run. The TUI
+    // already computes the real enclosing block's id via
+    // `App::selected_program_block_ids` (overlap of the selection's char
+    // range with each block's line range, not by re-hashing the selected
+    // substring's own text) for its own optimistic shimmer — this asserts
+    // that same id is also threaded into the outgoing `program.execute`
+    // request as `selection_block_ids`, and that adopting a daemon response
+    // whose `active_run.pending_block_refs` echoes that real id lights the
+    // block's shimmer (the fixed daemon's authoritative response no longer
+    // overwrites the correct optimistic state with a phantom).
+    #[tokio::test]
+    async fn program_execute_partial_line_selection_sends_and_adopts_real_block_id() {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let markdown = "Some long text here";
+        let real_block_id = agentd_protocol::program_block_spans(markdown)
+            .into_iter()
+            .next()
+            .expect("one block")
+            .id;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel::<(String, Value)>();
+        let response_block_id = real_block_id.clone();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let _ = seen_tx.send((method.clone(), params.clone()));
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time")
+                    .as_millis() as i64;
+                let program = serde_json::json!({
+                    "session_id": "s1",
+                    "markdown": markdown,
+                    "version": 1,
+                    "updated_at_ms": 0,
+                    "template_id": null,
+                });
+                let result = match method.as_str() {
+                    ipc_method::PROGRAM_EXECUTE => serde_json::json!({
+                        "program": program,
+                        "prompt": "run",
+                        // Simulates the FIXED daemon: it trusted the
+                        // request's `selection_block_ids` and resolved the
+                        // real block instead of fabricating a phantom
+                        // hash-of-substring id.
+                        "active_run": {
+                            "run_id": "s1:1",
+                            "started_at_ms": now_ms,
+                            "expires_at_ms": now_ms + 60_000,
+                            "pending_block_refs": [response_block_id],
+                        },
+                    }),
+                    _ => Value::Null,
+                };
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut app = test_app(client, Vec::new());
+        app.program_popup = Some(program_popup_for_test("s1", markdown, 0));
+        // "long text" out of "Some long text here" — a strict substring of
+        // the single line/block, not the whole line.
+        app.program_popup.as_mut().unwrap().selection = Some(ProgramSelection {
+            anchor: 5,
+            head: 14,
+            dragged: false,
+        });
+
+        assert!(
+            app.execute_program_popup(Some("long text".to_string()), None)
+                .await,
+            "run should dispatch"
+        );
+
+        let (method, params) = seen_rx.recv().await.expect("program execute request");
+        assert_eq!(method, ipc_method::PROGRAM_EXECUTE);
+        assert_eq!(
+            params.get("selection").and_then(Value::as_str),
+            Some("long text")
+        );
+        let sent_ids: Vec<String> = params
+            .get("selection_block_ids")
+            .and_then(Value::as_array)
+            .expect("selection_block_ids present")
+            .iter()
+            .map(|v| v.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            sent_ids,
+            vec![real_block_id.clone()],
+            "the real enclosing block's id, not a phantom hash of the substring"
+        );
+
+        // Adopting the response lights the block's shimmer: replicate the
+        // exact check `ui::program_run_shimmer` performs for a popup whose
+        // `blocks` projection is empty (dirty/never-synced fallback) — match
+        // by recomputing the same content-hash id from the buffer.
+        let run = app
+            .program_runs
+            .get("s1")
+            .expect("run adopted from daemon response");
+        let popup = app.program_popup.as_ref().expect("popup");
+        let shimmers = crate::app::program_blocks(&popup.buffer)
+            .iter()
+            .any(|block| run.pending.contains(&block.id));
+        assert!(
+            shimmers,
+            "the real block should shimmer; run.pending = {:?}",
+            run.pending
+        );
+        server.abort();
+    }
+
     /// Mock daemon for the Run overlap/idempotency guard tests below: accepts
     /// a single connection, echoes `program.update`/`program.execute` bodies
     /// back at an incrementing version, and reports every method name it
@@ -16718,6 +16866,7 @@ mod tests {
                 selection: None,
                 base_version: Some(2),
                 shimmer: None,
+                selection_block_ids: None,
             })
             .await
             .expect("execute response");

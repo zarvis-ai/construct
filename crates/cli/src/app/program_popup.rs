@@ -455,6 +455,15 @@ impl App {
                     .and_then(Self::selected_program_block_ids)
             })
             .flatten();
+        // The overlap-based real block ids the selection covers (spec 0053
+        // consequence: partial-line/partial-block selection fix) — sent to
+        // the daemon as `selection_block_ids` so it trusts this identity
+        // instead of re-parsing the raw selected text and hash-matching,
+        // which only works when the selection exactly spans whole blocks.
+        let selection_block_ids: Option<Vec<String>> = selected_block_ids
+            .as_ref()
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| ids.iter().cloned().collect());
         let pending = match selected_block_ids {
             Some(ids) if is_selection => self.program_run_pending_with_existing(&session_id, ids),
             _ => self.program_run_pending_for_body(
@@ -478,6 +487,7 @@ impl App {
             // cannot be narrowed back to old pending refs before the planning
             // pass sees user-edited blocks.
             shimmer,
+            selection_block_ids,
         };
         match self.client.program_execute(params).await {
             Ok(result) => {
