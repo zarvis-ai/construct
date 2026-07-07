@@ -2602,6 +2602,11 @@ pub struct LayoutSnapshot {
     /// (`MinibufferIntent::NewSessionHarness`). Click → submit the
     /// matching name as if the user typed it and hit Enter.
     pub minibuffer_harness_hits: Vec<HarnessHit>,
+    /// Clickable choice labels (`y`, `N`, `d`, `a`, `y=approve`, ...) in the
+    /// last-rendered minibuffer confirm/approval prompt (spec 0075). Click →
+    /// dispatch exactly as the matching keypress would, via whichever of the
+    /// two keyboard mechanisms (`MinibufferChoiceAction`) the intent uses.
+    pub minibuffer_choice_hits: Vec<MinibufferChoiceHit>,
     /// Bounds of the topmost modal/dialog rendered in the last frame.
     /// Mouse clicks outside this rect dismiss the modal instead of
     /// falling through to panes underneath it.
@@ -2709,6 +2714,36 @@ pub struct HarnessHit {
     /// CLI not found on daemon PATH"), shown on hover/click when
     /// `available` is false.
     pub detail: Option<String>,
+}
+
+/// One clickable choice label within a minibuffer confirm/approval prompt
+/// (spec 0075) — the generalization of `HarnessHit` to every other
+/// minibuffer prompt that offers a small fixed set of keyboard choices
+/// (`y`/`N`, `y`/`n`/`a`/`f`, `d`/`a`/`N`, ...).
+#[derive(Debug, Clone)]
+pub struct MinibufferChoiceHit {
+    pub x_start: u16,
+    /// Exclusive end column.
+    pub x_end: u16,
+    pub y: u16,
+    /// How a click on this label should be dispatched. Always mirrors
+    /// whichever of the two keyboard mechanisms the owning intent already
+    /// uses — never a third, click-only decision path.
+    pub action: MinibufferChoiceAction,
+}
+
+/// Dispatch shape for a `MinibufferChoiceHit`.
+#[derive(Debug, Clone)]
+pub enum MinibufferChoiceAction {
+    /// Single-keypress fast path (the early-return `match key.code` blocks
+    /// near the top of `handle_minibuffer_key`): synthesize this key and
+    /// feed it through the same handler a real keypress goes through, so
+    /// the decision logic never gets duplicated for the click path.
+    Key(char),
+    /// Typed-then-submit path (`run_minibuffer_submit`): submit this
+    /// literal string, exactly as if the user had typed it and pressed
+    /// Enter.
+    Submit(String),
 }
 
 fn selection_bounds_for_layout(
@@ -6352,15 +6387,11 @@ impl App {
             agentd_protocol::ToolRisk::Risky => "risky",
         };
         let short_args: String = args_summary.chars().take(80).collect();
-        let auto_review_option = if allow_auto_review {
-            "  a=auto-review"
-        } else {
-            ""
-        };
-        let prompt = format!(
-            "approve [{risk_label}] {tool}({}) ▸ y=approve  n=deny{auto_review_option}  f=unsafe-auto",
-            short_args
-        );
+        // The choice cluster (`y=approve  n=deny  a=auto-review  f=unsafe-auto`)
+        // is no longer baked into the stored prompt text — it's rendered
+        // separately as clickable spans (spec 0075), built from
+        // `allow_auto_review` on the intent itself.
+        let prompt = format!("approve [{risk_label}] {tool}({}) ▸ ", short_args);
         self.minibuffer = Some(Minibuffer {
             prompt,
             input: String::new(),
@@ -7990,11 +8021,12 @@ impl App {
             },
             OpenDeleteConfirm => match self.selection.clone() {
                 Selection::Session(id) => {
+                    // The `[d]`/`[a]`/`[N]` choice cluster and its
+                    // descriptions render as clickable spans (spec 0075,
+                    // see `ui::minibuffer_choice_suffix`) — this prompt only
+                    // carries the data-dependent question prefix.
                     self.minibuffer = Some(Minibuffer {
-                        prompt: format!(
-                            "Session {}: [d/y] delete (drop transcript + worktree) / [a] archive (terminate, keep, hide) / [N] cancel: ",
-                            short_id(&id)
-                        ),
+                        prompt: format!("Session {}: ", short_id(&id)),
                         input: String::new(),
                         cursor: 0,
                         intent: MinibufferIntent::DeleteConfirm { session_id: id },
@@ -8009,10 +8041,7 @@ impl App {
                         .map(|g| g.name.clone())
                         .unwrap_or_default();
                     self.minibuffer = Some(Minibuffer {
-                        prompt: format!(
-                            "Delete project '{}'? (y = orphan members / type 'all' to delete sessions too / N = cancel): ",
-                            name
-                        ),
+                        prompt: format!("Delete project '{}'? ", name),
                         input: String::new(),
                         cursor: 0,
                         intent: MinibufferIntent::GroupDeleteConfirm { group_id: id },
@@ -8031,7 +8060,7 @@ impl App {
                         let label = self.archive_section_label(&section);
                         self.minibuffer = Some(Minibuffer {
                             prompt: format!(
-                                "Delete all {} archived session(s) in {}? (drops transcript + worktree) [y/N]: ",
+                                "Delete all {} archived session(s) in {}? (drops transcript + worktree) ",
                                 ids.len(),
                                 label
                             ),
@@ -8129,7 +8158,7 @@ impl App {
                         let session_id = s.id.clone();
                         let short = short_id(&session_id).to_string();
                         self.minibuffer = Some(Minibuffer {
-                            prompt: format!("Restart session {short}? (y/N): "),
+                            prompt: format!("Restart session {short}? "),
                             input: String::new(),
                             cursor: 0,
                             intent: MinibufferIntent::RestartConfirm { session_id },
@@ -8376,7 +8405,7 @@ impl App {
             }
             OpenRestartDaemonConfirm => {
                 self.minibuffer = Some(Minibuffer {
-                    prompt: "Restart daemon? (y/N): ".to_string(),
+                    prompt: "Restart daemon? ".to_string(),
                     input: String::new(),
                     cursor: 0,
                     intent: MinibufferIntent::RestartDaemonConfirm,
@@ -8386,7 +8415,7 @@ impl App {
             OpenUpgradeConfirm => {
                 if let Some(version) = self.latest_version.clone() {
                     self.minibuffer = Some(Minibuffer {
-                        prompt: format!("Upgrade to {version} and restart the daemon? (y/N): "),
+                        prompt: format!("Upgrade to {version} and restart the daemon? "),
                         input: String::new(),
                         cursor: 0,
                         intent: MinibufferIntent::UpgradeConfirm { version },
@@ -10202,6 +10231,7 @@ mod tests {
             list_scroll_offset: 0,
             shortcut_hints: Vec::new(),
             minibuffer_harness_hits: Vec::new(),
+            minibuffer_choice_hits: Vec::new(),
             modal_area: None,
             session_title_name_hits: Vec::new(),
             program_title_run_hit: None,
@@ -21168,12 +21198,14 @@ mod tests {
 
         assert!(matches!(
             app.minibuffer.as_ref().map(|mb| &mb.intent),
-            Some(MinibufferIntent::ApproveTool { session_id, .. }) if session_id == "s1"
+            Some(MinibufferIntent::ApproveTool { session_id, allow_auto_review: true, .. }) if session_id == "s1"
         ));
         let prompt = &app.minibuffer.as_ref().unwrap().prompt;
         assert!(prompt.contains("approve [risky] shell(echo hi)"));
-        assert!(prompt.contains("y=approve"));
-        assert!(prompt.contains("a=auto-review"));
+        // The `y=approve  n=deny  a=auto-review  f=unsafe-auto` choice
+        // cluster is no longer baked into the stored prompt text — it
+        // renders as clickable spans built from `allow_auto_review` on the
+        // intent (spec 0075); see the render tests below.
         server.abort();
     }
 
@@ -21232,11 +21264,13 @@ mod tests {
             false,
         );
 
-        let prompt = &app.minibuffer.as_ref().unwrap().prompt;
-        assert!(prompt.contains("y=approve"));
-        assert!(prompt.contains("n=deny"));
-        assert!(prompt.contains("f=unsafe-auto"));
-        assert!(!prompt.contains("a=auto-review"));
+        assert!(matches!(
+            app.minibuffer.as_ref().map(|mb| &mb.intent),
+            Some(MinibufferIntent::ApproveTool {
+                allow_auto_review: false,
+                ..
+            })
+        ));
         server.abort();
     }
 
@@ -21260,6 +21294,531 @@ mod tests {
         assert!(
             app.minibuffer.is_none(),
             "background approval requests should not open the global minibuffer"
+        );
+        server.abort();
+    }
+
+    // --- minibuffer choice-click tests (spec 0075) ---
+    //
+    // Every confirm/approval prompt's keyboard choices are also
+    // mouse-clickable now. These cover one family-A intent
+    // (single-keypress fast path: `RestartConfirm`), one family-B intent
+    // (typed-then-submit path: `DeleteConfirm`, which also has 3+ choices
+    // for the hit-geometry check), and `ApproveTool` — previously a hard
+    // no-op on click, now real per-choice dispatch.
+
+    /// Mock daemon for these tests: accepts one connection, echoes back
+    /// `null` for every request (fine for the RPCs exercised here —
+    /// delete/restart/tool_decision all deserialize their result into a
+    /// generic `serde_json::Value`), and records every `(method, params)`
+    /// it receives so tests can assert exactly which RPC — if any — fired.
+    async fn choice_click_app(
+        sessions: Vec<SessionSummary>,
+    ) -> (
+        App,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+        mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) {
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (calls_tx, calls_rx) = mpsc::unbounded_channel::<(String, Value)>();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                let _ = calls_tx.send((method, params));
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let app = test_app(client, sessions);
+        (app, dir, server, calls_rx)
+    }
+
+    /// Drain every `(method, params)` call `choice_click_app`'s mock daemon
+    /// has recorded so far. Safe to call right after an awaited
+    /// click/keypress dispatch — its RPC has already completed (and so
+    /// already reported itself) by the time the call returns.
+    fn drain_calls(
+        rx: &mut mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> Vec<(String, serde_json::Value)> {
+        let mut calls = Vec::new();
+        while let Ok(call) = rx.try_recv() {
+            calls.push(call);
+        }
+        calls
+    }
+
+    /// Render the current minibuffer into a scratch terminal so
+    /// `app.layout.minibuffer_choice_hits` (and `minibuffer_area`) reflect
+    /// this frame, then return the minibuffer's rect.
+    fn render_minibuffer_for_test(app: &mut App) -> ratatui::layout::Rect {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, app)).expect("render");
+        app.layout
+            .minibuffer_area
+            .expect("minibuffer area registered")
+    }
+
+    #[tokio::test]
+    async fn restart_confirm_keypress_y_restarts_session_baseline() {
+        // Baseline for the click-parity test below: `y` through the
+        // single-keypress fast path restarts and closes the prompt.
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Restart session s1? ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::RestartConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        app.handle_minibuffer_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "confirming should close the prompt"
+        );
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| m
+                == agentd_protocol::ipc_method::SESSION_RESTART
+                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            "restart RPC should fire for s1, got {calls:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_confirm_click_y_matches_keypress_outcome() {
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Restart session s1? ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::RestartConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(h.action, MinibufferChoiceAction::Key('y')))
+            .cloned()
+            .expect("y choice hit registered");
+        assert_eq!(hit.y, mb_area.y);
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking the y choice should close the prompt, same as pressing y"
+        );
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| m
+                == agentd_protocol::ipc_method::SESSION_RESTART
+                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            "clicking y should fire the same restart RPC the keypress does, got {calls:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_confirm_click_n_cancels_without_restart() {
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Restart session s1? ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::RestartConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(h.action, MinibufferChoiceAction::Key('n')))
+            .cloned()
+            .expect("N choice hit registered");
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking N should close the prompt"
+        );
+        assert!(
+            drain_calls(&mut calls).is_empty(),
+            "cancelling must not fire the restart RPC"
+        );
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("restart cancelled")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_render_has_three_non_overlapping_choice_hits() {
+        let (mut app, _dir, server, _calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Session s1: ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::DeleteConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let mut hits = app.layout.minibuffer_choice_hits.clone();
+        hits.sort_by_key(|h| h.x_start);
+        assert_eq!(
+            hits.len(),
+            3,
+            "delete/archive/cancel should each get one choice hit, got {hits:?}"
+        );
+        for h in &hits {
+            assert_eq!(h.y, mb_area.y);
+            assert!(h.x_start < h.x_end, "hit must have positive width: {h:?}");
+        }
+        for pair in hits.windows(2) {
+            assert!(
+                pair[0].x_end <= pair[1].x_start,
+                "choice hits must not overlap: {hits:?}"
+            );
+        }
+        assert!(matches!(&hits[0].action, MinibufferChoiceAction::Submit(s) if s == "d"));
+        assert!(matches!(&hits[1].action, MinibufferChoiceAction::Submit(s) if s == "a"));
+        assert!(matches!(&hits[2].action, MinibufferChoiceAction::Submit(s) if s == "N"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_typed_submit_d_deletes_session_baseline() {
+        // Baseline for the click-parity test below: typing "d" then Enter
+        // goes through `run_minibuffer_submit` (family B's keyboard path).
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        let intent = MinibufferIntent::DeleteConfirm {
+            session_id: "s1".into(),
+        };
+        app.run_minibuffer_submit(intent, "d".to_string()).await;
+
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| m
+                == agentd_protocol::ipc_method::SESSION_DELETE
+                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            "typing d then Enter should delete the session, got {calls:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_click_d_matches_typed_submit_outcome() {
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Session s1: ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::DeleteConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(&h.action, MinibufferChoiceAction::Submit(s) if s == "d"))
+            .cloned()
+            .expect("d choice hit registered");
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking d should close the prompt"
+        );
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| m
+                == agentd_protocol::ipc_method::SESSION_DELETE
+                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            "clicking d should fire the same delete RPC the typed-submit path does, got {calls:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn delete_confirm_click_n_cancels_without_delete() {
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Session s1: ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::DeleteConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(&h.action, MinibufferChoiceAction::Submit(s) if s == "N"))
+            .cloned()
+            .expect("N choice hit registered");
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking N should close the prompt"
+        );
+        assert!(
+            drain_calls(&mut calls).is_empty(),
+            "cancelling a delete must not fire any destructive RPC"
+        );
+        assert_eq!(
+            app.status.as_ref().map(|(s, _)| s.as_str()),
+            Some("cancelled")
+        );
+        server.abort();
+    }
+
+    fn approve_tool_minibuffer(allow_auto_review: bool) -> Minibuffer {
+        Minibuffer {
+            prompt: "approve [risky] shell(echo hi) \u{25b8} ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::ApproveTool {
+                session_id: "s1".into(),
+                call_id: "call-1".into(),
+                tool: "shell".into(),
+                args_summary: "echo hi".into(),
+                risk: agentd_protocol::ToolRisk::Risky,
+                allow_auto_review,
+            },
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn approve_tool_render_shows_all_choices_when_auto_review_allowed() {
+        let (mut app, _dir, server, _calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(approve_tool_minibuffer(true));
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hits = &app.layout.minibuffer_choice_hits;
+        assert_eq!(hits.len(), 4, "y/n/a/f should each get one choice hit");
+        for h in hits {
+            assert_eq!(h.y, mb_area.y);
+        }
+        for expected in ['y', 'n', 'a', 'f'] {
+            assert!(
+                hits.iter()
+                    .any(|h| matches!(h.action, MinibufferChoiceAction::Key(c) if c == expected)),
+                "missing choice hit for {expected}"
+            );
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn approve_tool_hides_auto_review_choice_when_disallowed() {
+        let (mut app, _dir, server, _calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(approve_tool_minibuffer(false));
+
+        render_minibuffer_for_test(&mut app);
+        let hits = &app.layout.minibuffer_choice_hits;
+        assert_eq!(
+            hits.len(),
+            3,
+            "no auto-review choice when the daemon disallowed it"
+        );
+        assert!(!hits
+            .iter()
+            .any(|h| matches!(h.action, MinibufferChoiceAction::Key('a'))));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn approve_tool_click_n_denies_where_it_used_to_no_op() {
+        // Before spec 0075, `click_minibuffer` explicitly no-op'd on every
+        // click while an `ApproveTool` prompt was open. Regression guard:
+        // clicking "n=deny" must now actually deny the call.
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(approve_tool_minibuffer(true));
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(h.action, MinibufferChoiceAction::Key('n')))
+            .cloned()
+            .expect("n=deny choice hit registered");
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking a decision should close the prompt"
+        );
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| {
+                m == agentd_protocol::ipc_method::SESSION_TOOL_DECISION
+                    && p.get("call_id").and_then(|v| v.as_str()) == Some("call-1")
+                    && p.get("decision").and_then(|v| v.as_str()) == Some("deny")
+            }),
+            "clicking n=deny should send a deny decision, got {calls:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn group_delete_confirm_click_all_deletes_members() {
+        // Covers the third distinct choice-cluster shape (3 choices, none
+        // of them plain y/N: `y`/`all`/`N`).
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Delete project 'demo'? ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::GroupDeleteConfirm {
+                group_id: "g1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(&h.action, MinibufferChoiceAction::Submit(s) if s == "all"))
+            .cloned()
+            .expect("all choice hit registered");
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking all should close the prompt"
+        );
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| {
+                m == agentd_protocol::ipc_method::PROJECT_DELETE
+                    && p.get("project_id").and_then(|v| v.as_str()) == Some("g1")
+                    && p.get("delete_members").and_then(|v| v.as_bool()) == Some(true)
+            }),
+            "clicking all should cascade-delete the project's members, got {calls:?}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn menu_archive_confirm_click_y_archives_session() {
+        // Covers the shared plain-y/N typed-submit cluster used by
+        // `ArchivedDeleteConfirm` / `MenuArchiveConfirm` /
+        // `MenuUnarchiveConfirm` / `MenuDeleteConfirm`.
+        let (mut app, _dir, server, mut calls) =
+            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Archive session s1? ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::MenuArchiveConfirm {
+                session_id: "s1".into(),
+            },
+            error: None,
+        });
+
+        let mb_area = render_minibuffer_for_test(&mut app);
+        let hit = app
+            .layout
+            .minibuffer_choice_hits
+            .iter()
+            .find(|h| matches!(&h.action, MinibufferChoiceAction::Submit(s) if s == "y"))
+            .cloned()
+            .expect("y choice hit registered");
+
+        app.click_minibuffer(mb_area, hit.x_start).await;
+
+        assert!(
+            app.minibuffer.is_none(),
+            "clicking y should close the prompt"
+        );
+        let calls = drain_calls(&mut calls);
+        assert!(
+            calls.iter().any(|(m, p)| m
+                == agentd_protocol::ipc_method::SESSION_ARCHIVE
+                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            "clicking y should archive the session, got {calls:?}"
         );
         server.abort();
     }
