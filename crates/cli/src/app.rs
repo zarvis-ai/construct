@@ -38,6 +38,7 @@ mod mouse;
 mod program_popup;
 mod session_picker;
 mod session_title_menu;
+mod title_rename;
 pub use configure::{
     harness_guidance, no_agent_harness_available, smith_method_guidance, ConfigurePopup,
     ConfigureTab, CONFIGURE_TABS,
@@ -786,6 +787,41 @@ pub struct SessionTitleMenu {
     pub area: ratatui::layout::Rect,
 }
 
+/// In-progress inline rename of a session's title-bar name (spec: click the
+/// name in the session view or the program popup title to edit it in place,
+/// rather than opening the bottom minibuffer `Rename` prompt). Only one can
+/// be active at a time, tracked globally rather than per-pane.
+#[derive(Debug, Clone)]
+pub struct TitleRename {
+    pub session_id: String,
+    /// Live edit buffer, seeded from the session's current title (empty
+    /// string when it has none) — same prefill `OpenRename` uses.
+    pub buffer: String,
+    /// Char index into `buffer` (not byte offset).
+    pub cursor: usize,
+}
+
+/// On-screen column range of a session's rendered title-bar name, for the
+/// normal (non-program) session view. Captured each frame by `render_detail`
+/// so a click on the name can start [`TitleRename`]. Splits can show several
+/// panes at once, so this is a per-pane list rather than a single hit like
+/// the program popup's (only one program popup is ever interactive at a
+/// time).
+#[derive(Debug, Clone)]
+pub struct SessionTitleNameHit {
+    pub session_id: String,
+    pub row: u16,
+    pub start_col: u16,
+    /// Exclusive end column.
+    pub end_col: u16,
+}
+
+impl SessionTitleNameHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.start_col && col < self.end_col
+    }
+}
+
 impl SessionTitleMenu {
     pub fn item_at(&self, col: u16, row: u16) -> Option<SessionTitleMenuAction> {
         if col <= self.area.x
@@ -1041,6 +1077,8 @@ pub struct App {
     pub layout: LayoutSnapshot,
     /// Session-view title hamburger dropdown.
     pub session_title_menu: Option<SessionTitleMenu>,
+    /// In-progress inline rename of a session's title-bar name, if any.
+    pub title_rename: Option<TitleRename>,
     /// Most-recently observed mouse cursor position (terminal cell).
     /// `None` until the first `MouseEventKind::Moved` arrives — and stays
     /// `None` on terminals that don't forward motion events (e.g. macOS
@@ -2406,6 +2444,15 @@ pub struct LayoutSnapshot {
     pub program_title_toggle_hit: Option<(u16, u16, u16)>,
     /// Program title-bar close button bounds: `(x_start, x_end, y)`.
     pub program_title_close_hit: Option<(u16, u16, u16)>,
+    /// Program title-bar session-name bounds: `(x_start, x_end, y)`. Clicking
+    /// it starts an inline rename of the popup's session, same as
+    /// `session_title_name_hits` for the normal session view. Only set for
+    /// the active popup, mirroring `program_title_run_hit` et al.
+    pub program_title_name_hit: Option<(u16, u16, u16)>,
+    /// On-screen column ranges of each visible pane's rendered title-bar
+    /// name, refreshed every frame by `render_detail`. Clicking one starts an
+    /// inline rename of that session.
+    pub session_title_name_hits: Vec<SessionTitleNameHit>,
     /// Program selected-text context Run button bounds: `(x_start, x_end, y)`.
     pub program_selection_run_hit: Option<(u16, u16, u16)>,
     /// Inner content rect of the active program popup from the last frame.
@@ -2775,6 +2822,7 @@ async fn run_with_socket_initial_selection(
         start_instant: now,
         layout: LayoutSnapshot::default(),
         session_title_menu: None,
+        title_rename: None,
         mouse_pos: None,
         mouse_moved_at: None,
         mouse_capture_enabled: true,
@@ -6407,6 +6455,30 @@ impl App {
                     }
                     return;
                 }
+                // Clicking a session's rendered name in its title bar starts
+                // an inline rename in place — a faster path than the ☰ menu's
+                // "rename" item / `r` key, which opens the bottom minibuffer
+                // prompt instead. Checked alongside the close-button hit test
+                // above since both live on the same title row.
+                if let Some(name_hit) = self
+                    .layout
+                    .session_title_name_hits
+                    .iter()
+                    .find(|hit| hit.contains(ev.column, ev.row))
+                    .cloned()
+                {
+                    if let Some(pane) = self
+                        .layout
+                        .main_window_areas
+                        .iter()
+                        .find(|hit| Self::rect_contains(hit.area, ev.column, ev.row))
+                        .copied()
+                    {
+                        self.focus_main_window(pane.id);
+                    }
+                    self.start_title_rename(name_hit.session_id);
+                    return;
+                }
                 // List ↔ view divider: clicking the list pane's
                 // right border (col = list_width - 1), the view's
                 // left border (col = list_width), or the first pin
@@ -7251,6 +7323,15 @@ impl App {
         // captures input instead of leaking it into the program buffer.
         if self.session_picker_active() {
             self.handle_session_picker_key(key);
+            return;
+        }
+        // An in-progress inline title-bar rename (started by clicking a
+        // session's name) owns all input the same way the bottom minibuffer
+        // does — checked here, before the program-popup gate below, so
+        // renaming a program popup's own title doesn't leak keystrokes into
+        // the program buffer.
+        if self.title_rename.is_some() {
+            self.handle_title_rename_key(key).await;
             return;
         }
         // The `/configure` dialog (spec 0069) owns the keys it uses for its
@@ -9906,6 +9987,8 @@ mod tests {
             program_title_run_hit: None,
             program_title_toggle_hit: None,
             program_title_close_hit: None,
+            program_title_name_hit: None,
+            session_title_name_hits: Vec::new(),
             program_selection_run_hit: None,
             program_inner_area: None,
             program_base_area: None,
@@ -10004,6 +10087,7 @@ mod tests {
             start_instant: now,
             layout: LayoutSnapshot::default(),
             session_title_menu: None,
+            title_rename: None,
             mouse_pos: None,
             mouse_moved_at: None,
             mouse_capture_enabled: true,
@@ -24001,6 +24085,355 @@ mod tests {
         assert_eq!(adjusted_list_scroll_offset(0, 99, 10, 4), 6);
         assert_eq!(adjusted_list_scroll_offset(9, 0, 10, 4), 6);
         assert_eq!(adjusted_list_scroll_offset(2, 1, 3, 4), 0);
+    }
+
+    // --- Inline title-bar rename ---------------------------------------
+
+    #[tokio::test]
+    async fn clicking_session_title_name_starts_inline_rename_prefilled() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (client, _dir, server) = program_flow_mock_daemon().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        session.title = Some("my session".into());
+        let mut app = test_app(client, vec![session]);
+        app.selection = Selection::Session("s1".into());
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("session view should render");
+
+        let hit = app
+            .layout
+            .session_title_name_hits
+            .iter()
+            .find(|h| h.session_id == "s1")
+            .cloned()
+            .expect("name hit registered");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.start_col,
+            row: hit.row,
+            modifiers: KeyModifiers::empty(),
+        })
+        .await;
+
+        let rename = app
+            .title_rename
+            .as_ref()
+            .expect("rename should have started");
+        assert_eq!(rename.session_id, "s1");
+        assert_eq!(rename.buffer, "my session");
+        assert_eq!(rename.cursor, "my session".chars().count());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clicking_program_title_name_starts_inline_rename() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        session.title = Some("my session".into());
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+
+        let name_hit = app
+            .layout
+            .program_title_name_hit
+            .expect("program title name hit registered");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: name_hit.0,
+            row: name_hit.2,
+            modifiers: KeyModifiers::empty(),
+        })
+        .await;
+
+        let rename = app
+            .title_rename
+            .as_ref()
+            .expect("rename should have started");
+        assert_eq!(rename.session_id, "s1");
+        assert_eq!(rename.buffer, "my session");
+        assert_eq!(rename.cursor, "my session".chars().count());
+        server.abort();
+    }
+
+    /// Mirrors `session_picker_emacs_cursor_motion_edits_at_point` /
+    /// `session_picker_ctrl_k_kills_to_end_of_line`: the inline-rename buffer
+    /// supports the same insert/backspace/delete/motion primitives.
+    #[tokio::test]
+    async fn title_rename_editing_keys_mutate_buffer() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.title_rename = Some(TitleRename {
+            session_id: "s1".into(),
+            buffer: String::new(),
+            cursor: 0,
+        });
+        for c in "ac".chars() {
+            app.handle_title_rename_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+                .await;
+        }
+        assert_eq!(app.title_rename.as_ref().unwrap().buffer, "ac");
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 2);
+
+        // C-b steps back one; inserting there splits "ac" -> "abc".
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 1);
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().buffer, "abc");
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 2);
+
+        // C-e jumps to the end; backspace there deletes the last char.
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 3);
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().buffer, "ab");
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 2);
+
+        // Home moves to the start; Delete forward-deletes from there.
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 0);
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().buffer, "b");
+
+        // Right moves forward; End jumps to the end.
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 1);
+        app.handle_title_rename_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .await;
+        assert_eq!(app.title_rename.as_ref().unwrap().cursor, 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn title_rename_enter_commits_via_set_title() {
+        use agentd_protocol::ipc_method;
+        use serde_json::Value;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let Ok(n) = reader.read_line(&mut line).await else {
+                    break;
+                };
+                if n == 0 {
+                    break;
+                }
+                let req: Value = serde_json::from_str(&line).expect("json request");
+                let id = req.get("id").cloned().unwrap_or(Value::Null);
+                let method = req
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let params = req.get("params").cloned().unwrap_or(Value::Null);
+                if method == ipc_method::SESSION_SET_TITLE {
+                    let _ = seen_tx.send(params.clone());
+                }
+                let resp = serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null });
+                if writer
+                    .write_all((resp.to_string() + "\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        session.title = Some("old".into());
+        let mut app = test_app(client, vec![session]);
+        app.title_rename = Some(TitleRename {
+            session_id: "s1".into(),
+            buffer: "new name".into(),
+            cursor: "new name".chars().count(),
+        });
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        let params = seen_rx.try_recv().expect("session.set_title RPC observed");
+        assert_eq!(params.get("session_id").and_then(Value::as_str), Some("s1"));
+        assert_eq!(
+            params.get("title").and_then(Value::as_str),
+            Some("new name")
+        );
+        assert!(
+            app.title_rename.is_none(),
+            "rename state should clear after commit"
+        );
+        assert_eq!(
+            app.sessions[0].title.as_deref(),
+            Some("new name"),
+            "commit should optimistically update the local session title"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn title_rename_enter_with_empty_buffer_clears_title() {
+        let (client, _dir, server) = program_flow_mock_daemon().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        session.title = Some("old".into());
+        let mut app = test_app(client, vec![session]);
+        app.title_rename = Some(TitleRename {
+            session_id: "s1".into(),
+            buffer: "   ".into(),
+            cursor: 3,
+        });
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+
+        assert!(app.title_rename.is_none());
+        assert_eq!(
+            app.sessions[0].title, None,
+            "a blank buffer should clear the title, matching MinibufferIntent::Rename"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn title_rename_esc_cancels_without_mutation() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        session.title = Some("old".into());
+        app.sessions = vec![session];
+        app.title_rename = Some(TitleRename {
+            session_id: "s1".into(),
+            buffer: "discard me".into(),
+            cursor: "discard me".chars().count(),
+        });
+
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        assert!(
+            app.title_rename.is_none(),
+            "Esc should clear the rename state"
+        );
+        assert_eq!(
+            app.sessions[0].title.as_deref(),
+            Some("old"),
+            "Esc must not mutate the session's title"
+        );
+        server.abort();
+    }
+
+    /// Same precedence class as an open minibuffer (see
+    /// `ctrl_x_ctrl_x_forwards_literal_ctrl_x_to_focused_pty` for the
+    /// baseline PTY-forwarding behavior this must NOT fall into while a
+    /// rename is in progress).
+    #[tokio::test]
+    async fn title_rename_intercepts_keys_before_pty_forwarding() {
+        let (mut app, _dir, _srv) = captured_app().await;
+        assert!(app.is_pty_captured(), "precondition: PTY-capture mode");
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        app.title_rename = Some(TitleRename {
+            session_id: "s1".into(),
+            buffer: "old".into(),
+            cursor: 3,
+        });
+
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(
+            app.title_rename.as_ref().unwrap().buffer,
+            "oldq",
+            "the key should edit the rename buffer instead of leaking through"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "keys must not be forwarded to the PTY while a rename is in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn title_rename_renders_live_buffer_and_cursor_in_session_title_bar() {
+        let (client, _dir, server) = program_flow_mock_daemon().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        session.title = Some("old name".into());
+        let mut app = test_app(client, vec![session]);
+        app.title_rename = Some(TitleRename {
+            session_id: "s1".into(),
+            buffer: "editing now".into(),
+            cursor: "editing now".chars().count(),
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("session view should render");
+
+        let hit = app
+            .layout
+            .session_title_name_hits
+            .iter()
+            .find(|h| h.session_id == "s1")
+            .cloned()
+            .expect("name hit registered");
+        let title_row = app
+            .frame_text
+            .get(hit.row as usize)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            title_row.contains("editing now"),
+            "title bar row should show the live edit buffer, got: {title_row:?}"
+        );
+        assert!(
+            !title_row.contains("old name"),
+            "the static title must not render in the title bar while mid-rename, got: {title_row:?}"
+        );
+
+        let expected_x = hit.start_col + "editing now".chars().count() as u16;
+        let cursor = term.get_cursor_position().expect("cursor position set");
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (expected_x, hit.row),
+            "cursor should sit right after the live buffer's last char"
+        );
+        server.abort();
     }
 }
 

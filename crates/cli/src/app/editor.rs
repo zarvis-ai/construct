@@ -110,6 +110,7 @@ impl App {
         let title_run_hit = self.layout.program_title_run_hit;
         let title_toggle_hit = self.layout.program_title_toggle_hit;
         let title_close_hit = self.layout.program_title_close_hit;
+        let title_name_hit = self.layout.program_title_name_hit;
         let selection_run_hit = self.layout.program_selection_run_hit;
         let hit_title_toggle = title_toggle_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
@@ -117,9 +118,16 @@ impl App {
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_title_close = title_close_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
+        let hit_title_name = title_name_hit
+            .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_selection_run = selection_run_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
-        if hit_title_toggle || hit_title_run || hit_title_close || hit_selection_run {
+        if hit_title_toggle
+            || hit_title_run
+            || hit_title_close
+            || hit_title_name
+            || hit_selection_run
+        {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
                 if hit_title_toggle {
                     self.close_program_popup().await;
@@ -130,6 +138,16 @@ impl App {
                         .map(|popup| popup.program.session_id.clone())
                     {
                         self.open_session_title_menu(session_id, modal);
+                    }
+                } else if hit_title_name {
+                    // Same faster inline-edit path as clicking a name in the
+                    // normal session view's title bar (see `title_rename.rs`).
+                    if let Some(session_id) = self
+                        .program_popup
+                        .as_ref()
+                        .map(|popup| popup.program.session_id.clone())
+                    {
+                        self.start_title_rename(session_id);
                     }
                 } else {
                     let selected = hit_selection_run.then(|| {
