@@ -306,7 +306,11 @@ impl App {
         true
     }
 
-    async fn dispatch_dynamic_ui_action(
+    /// Deliver a UI action to `session_id` as user intent
+    /// (`OBSERVATION: ui.action …`). `pub(super)` because the program editor's
+    /// action-link click handler (spec 0074: action links are dialect-wide)
+    /// dispatches through this same path, with `panel_id: None`.
+    pub(super) async fn dispatch_dynamic_ui_action(
         &mut self,
         session_id: String,
         panel_id: Option<String>,

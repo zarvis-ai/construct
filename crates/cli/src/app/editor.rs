@@ -187,6 +187,24 @@ impl App {
                 return true;
             }
         }
+        // Clicking an action link in the program body dispatches it to the
+        // program's owning session as user intent — the same
+        // `OBSERVATION: ui.action …` path widget action links use, minus the
+        // panel id (the program is not a widget panel). Keyboard shortcuts
+        // are deliberately NOT wired here: the program is a typing surface.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let Some(hit) = self
+                .layout
+                .program_action_link_hits
+                .iter()
+                .find(|hit| hit.contains(ev.column, ev.row))
+                .cloned()
+            {
+                self.dispatch_dynamic_ui_action(hit.session_id, None, hit.action)
+                    .await;
+                return true;
+            }
+        }
         // Clicking a session smart-clip focuses that session, just like clicking
         // its row in the session list. The program follows selection, so the
         // clicked session's program reveals in place.

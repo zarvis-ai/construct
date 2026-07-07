@@ -72,6 +72,36 @@ impl App {
         }
     }
 
+    /// Fetch `session_id`'s program document in the background for a widget
+    /// `:::clip program` projection (spec 0074). Non-blocking: the widget
+    /// renders a "loading program…" line this frame and the projection paints
+    /// once the fetch lands on `program_projection_tx`; afterwards the cache
+    /// stays fresh through `program/state` notifications, which the daemon
+    /// broadcasts for every program change regardless of open program views.
+    /// At most one fetch per session is in flight; a failed fetch stays
+    /// pending (no per-frame retry) until a notification fills the cache.
+    pub(crate) fn request_program_projection(&mut self, session_id: String) {
+        if self.program_markdown_cache.contains_key(&session_id) {
+            return;
+        }
+        if !self.program_projection_pending.insert(session_id.clone()) {
+            return;
+        }
+        // Renders can run outside a tokio runtime (pure render tests); no
+        // runtime simply means no fetch — the projection keeps its loading
+        // line, exactly like a fetch that has not landed yet.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let client = self.client.clone();
+        let tx = self.program_projection_tx.clone();
+        handle.spawn(async move {
+            if let Ok(result) = client.program_get(&session_id).await {
+                let _ = tx.send((session_id, result.program.markdown));
+            }
+        });
+    }
+
     /// Fetch program templates from the daemon in the background and deliver them
     /// to the event loop via `program_templates_tx`. Non-blocking: the program
     /// opens immediately against the cached list and swaps to the fresh one when

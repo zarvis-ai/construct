@@ -656,6 +656,26 @@ impl ProgramClipHit {
     }
 }
 
+/// On-screen cell range of an `[label](agentd:action/…)` action link rendered
+/// in the program body (spec 0074: action links are part of the shared
+/// dialect on every surface). Captured each frame like [`ProgramClipHit`] —
+/// one hit per wrapped-row segment — so a click can dispatch the action as
+/// user intent to the program's owning session. `col_end` is exclusive.
+#[derive(Debug, Clone)]
+pub struct ProgramActionLinkHit {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub row: u16,
+    pub session_id: String,
+    pub action: agentd_protocol::UiAction,
+}
+
+impl ProgramActionLinkHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.col_start && col < self.col_end
+    }
+}
+
 /// A clickable template button drawn in the empty-program placeholder. The box
 /// spans `row_start..=row_end` (top border, label, bottom border) over the
 /// columns `col_start..col_end`; clicking anywhere inside fills the program with
@@ -828,6 +848,22 @@ pub struct App {
     /// loop applies it on the next iteration (no flicker — the placeholder keeps
     /// the cached list until the fresh one lands).
     pub program_templates_tx: mpsc::UnboundedSender<Vec<agentd_protocol::ProgramTemplate>>,
+    /// Latest daemon-side program Markdown per session id, backing widget
+    /// `:::clip program` projections (spec 0074: a widget mirrors a program
+    /// region by reference, never by copy). Kept fresh by `program/state`
+    /// notifications — the daemon broadcasts every program change to every
+    /// client, not only to open program views — and seeded on first use by a
+    /// non-blocking `request_program_projection` fetch.
+    pub program_markdown_cache: HashMap<String, String>,
+    /// Session ids with a background program fetch in flight, so a projection
+    /// rendered every frame spawns at most one fetch. An entry whose fetch
+    /// failed stays pending (the widget keeps its "loading program…" line)
+    /// until the next `program/state` notification fills the cache — retrying
+    /// per frame would hammer a struggling daemon.
+    pub program_projection_pending: HashSet<String>,
+    /// Background channel delivering `(session_id, program_markdown)` fetch
+    /// results into the event loop; drained alongside the template channel.
+    pub program_projection_tx: mpsc::UnboundedSender<(String, String)>,
     pub theme: crate::theme::Theme,
     pub theme_name: crate::theme::ThemeName,
     pub help_visible: bool,
@@ -2321,6 +2357,12 @@ pub struct LayoutSnapshot {
     /// Session smart-clip hitboxes in the active program body from the last
     /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
     pub program_clip_hits: Vec<ProgramClipHit>,
+    /// Action-link hitboxes in the active program body from the last frame.
+    /// Clicking one dispatches the action to the program's owning session as
+    /// user intent (`OBSERVATION: ui.action …`), the same path widget action
+    /// links use. No keyboard shortcuts on this surface — the program is a
+    /// typing surface, so keys must keep typing.
+    pub program_action_link_hits: Vec<ProgramActionLinkHit>,
     /// Template-button hitboxes drawn in the empty-program placeholder. Clicking
     /// one fills the program with that template's Markdown. Empty unless the
     /// active program is showing the empty-state placeholder.
@@ -2587,8 +2629,9 @@ async fn run_with_socket_initial_selection(
     let now = Instant::now();
     let socket = client.socket_path().to_path_buf();
     let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
-    // Placeholder sender; `run_loop` installs the live channel it actually drains.
+    // Placeholder senders; `run_loop` installs the live channels it actually drains.
     let program_templates_tx = mpsc::unbounded_channel().0;
+    let program_projection_tx = mpsc::unbounded_channel().0;
     let mut app = App {
         client: client.clone(),
         last_reported_view: None,
@@ -2610,6 +2653,9 @@ async fn run_with_socket_initial_selection(
         harnesses,
         program_templates,
         program_templates_tx,
+        program_markdown_cache: HashMap::new(),
+        program_projection_pending: HashSet::new(),
+        program_projection_tx,
         theme,
         theme_name: theme_config.active_name(None),
         help_visible: false,
@@ -2854,6 +2900,13 @@ async fn run_loop(
     let (program_templates_tx, mut program_templates_rx) =
         mpsc::unbounded_channel::<Vec<agentd_protocol::ProgramTemplate>>();
     app.program_templates_tx = program_templates_tx;
+    // Background channel for widget program projections: `request_program_projection`
+    // (kicked off by the widget renderer when a `:::clip program` block has no
+    // cached program yet) delivers `(session_id, markdown)` here; the loop
+    // fills the cache so the projection paints on the next frame.
+    let (program_projection_tx, mut program_projection_rx) =
+        mpsc::unbounded_channel::<(String, String)>();
+    app.program_projection_tx = program_projection_tx;
     let mut reconnect: Option<ReconnectState> = None;
     // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
@@ -3290,6 +3343,21 @@ async fn run_loop(
                     }
                     if !latest.is_empty() {
                         app.program_templates = latest;
+                    }
+                }
+            }
+            fetched = program_projection_rx.recv() => {
+                // A background program fetch for a widget `:::clip program`
+                // projection landed; cache it (draining any queued siblings)
+                // so the projection replaces its "loading program…" line on
+                // the next frame. Later `program/state` notifications keep
+                // the entry fresh.
+                if let Some((session_id, markdown)) = fetched {
+                    app.program_projection_pending.remove(&session_id);
+                    app.program_markdown_cache.insert(session_id, markdown);
+                    while let Ok((session_id, markdown)) = program_projection_rx.try_recv() {
+                        app.program_projection_pending.remove(&session_id);
+                        app.program_markdown_cache.insert(session_id, markdown);
                     }
                 }
             }
@@ -5809,6 +5877,14 @@ impl App {
         active_run: Option<agentd_protocol::ProgramRunProgress>,
         blocks: Vec<agentd_protocol::ProgramBlockView>,
     ) {
+        // Keep the widget-projection cache fresh for every session, before
+        // any open-popup early return below: `:::clip program` projections
+        // update through the same notification that keeps program views in
+        // sync (spec 0074's liveness consequence), whether or not a program
+        // view is open for this session.
+        self.program_markdown_cache
+            .insert(program.session_id.clone(), program.markdown.clone());
+        self.program_projection_pending.remove(&program.session_id);
         let previous_pending = self
             .program_runs
             .get(&program.session_id)
@@ -6065,6 +6141,8 @@ impl App {
         self.program_runs.remove(id);
         self.program_settle_flourishes.remove(id);
         self.program_view_memory.remove(id);
+        self.program_markdown_cache.remove(id);
+        self.program_projection_pending.remove(id);
         self.program_collaborators
             .retain(|_, cursor| cursor.session_id != id);
         // Orchestrator session went away → palette fallback after the
@@ -9722,6 +9800,7 @@ mod tests {
             program_resize_hit: None,
             program_smart_clip_anchor: None,
             program_clip_hits: Vec::new(),
+            program_action_link_hits: Vec::new(),
             program_template_hits: Vec::new(),
             browser_preview_area: None,
             browser_preview_close: None,
@@ -9765,6 +9844,9 @@ mod tests {
             harnesses: Vec::new(),
             program_templates: Vec::new(),
             program_templates_tx: mpsc::unbounded_channel().0,
+            program_markdown_cache: HashMap::new(),
+            program_projection_pending: HashSet::new(),
+            program_projection_tx: mpsc::unbounded_channel().0,
             theme: crate::theme::Theme::default(),
             theme_name: crate::theme::ThemeName::Matrix,
             help_visible: false,
@@ -19917,6 +19999,220 @@ mod tests {
         s2.id = "s2".into();
         let app = test_app(client, vec![s1, s2]);
         (app, dir, server)
+    }
+
+    /// Spec 0074: a `@{session:…}` chip in a widget resolves live status from
+    /// the same `app.sessions` lookup the program surface uses — a running
+    /// worker paints the running chip color on both surfaces.
+    #[tokio::test]
+    async fn widget_session_clip_chip_reflects_live_session_status() {
+        let (app, _dir, _server) = two_session_app().await;
+        assert_eq!(app.sessions[0].state, agentd_protocol::SessionState::Running);
+        let theme = app.theme.clone();
+        let mut wanted = Vec::new();
+        let lines = crate::ui::render_agentd_markdown_lines_for_test(
+            Some(&app),
+            "worker: @{session:s1}",
+            &theme,
+            Rect::new(0, 0, 80, 10),
+            Some("s2"),
+            &mut wanted,
+        );
+        let chip = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.style.bg == Some(theme.success))
+            .expect("live session chip colored by running status");
+        assert!(
+            chip.content.contains("shell"),
+            "chip label carries the resolved session's harness: {chip:?}"
+        );
+    }
+
+    /// A widget `:::clip program` block with the program cached projects the
+    /// named section live: heading plus content, stopping at the next
+    /// same-level heading, with no fetch requested.
+    #[tokio::test]
+    async fn widget_program_clip_projects_cached_program_section() {
+        let (mut app, _dir, _server) = two_session_app().await;
+        app.program_markdown_cache.insert(
+            "s1".into(),
+            "# Plan\nintro\n## Progress\n- [x] step one\n## Next\nrest".into(),
+        );
+        let theme = app.theme.clone();
+        let mut wanted = Vec::new();
+        let lines = crate::ui::render_agentd_markdown_lines_for_test(
+            Some(&app),
+            ":::clip program\nsection=\"progress\"\n:::",
+            &theme,
+            Rect::new(0, 0, 80, 20),
+            Some("s1"),
+            &mut wanted,
+        );
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(wanted.is_empty(), "cached program must not request a fetch");
+        assert!(
+            rendered.iter().any(|l| l.contains("Progress")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("step one")),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|l| l.contains("rest")),
+            "projection must stop at the next same-level heading: {rendered:?}"
+        );
+    }
+
+    /// The first render of a program projection without a cached document
+    /// shows the loading line and reports the owning session so the caller
+    /// can start a background fetch.
+    #[tokio::test]
+    async fn widget_program_clip_without_cache_reports_wanted_program() {
+        let (app, _dir, _server) = two_session_app().await;
+        let theme = app.theme.clone();
+        let mut wanted = Vec::new();
+        let lines = crate::ui::render_agentd_markdown_lines_for_test(
+            Some(&app),
+            ":::clip program\n:::",
+            &theme,
+            Rect::new(0, 0, 80, 10),
+            Some("s1"),
+            &mut wanted,
+        );
+        assert_eq!(wanted, vec!["s1".to_string()]);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rendered.iter().any(|l| l.contains("loading program…")),
+            "{rendered:?}"
+        );
+    }
+
+    /// Recursion guard, end to end: a cached program that itself contains a
+    /// `:::clip program` block projects once — the nested clip renders as an
+    /// inert chip instead of projecting again.
+    #[tokio::test]
+    async fn widget_program_projection_never_recurses() {
+        let (mut app, _dir, _server) = two_session_app().await;
+        app.program_markdown_cache.insert(
+            "s1".into(),
+            "## Progress\n:::clip program\n:::\n- [~] active step".into(),
+        );
+        let theme = app.theme.clone();
+        let mut wanted = Vec::new();
+        let lines = crate::ui::render_agentd_markdown_lines_for_test(
+            Some(&app),
+            ":::clip program\n:::",
+            &theme,
+            Rect::new(0, 0, 80, 20),
+            Some("s1"),
+            &mut wanted,
+        );
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(wanted.is_empty(), "nested clip must not request a fetch");
+        assert!(
+            rendered.iter().any(|l| l.contains("active step")),
+            "outer projection still renders: {rendered:?}"
+        );
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|l| l.contains("clip program"))
+                .count(),
+            2,
+            "outer chip + one inert nested chip, no deeper projection: {rendered:?}"
+        );
+    }
+
+    /// Spec 0074 display extensions on the program surface, editor-style:
+    /// timeline fences and table delimiter rows render dim with their source
+    /// text literal, checklist items get the shared glyph colors, and every
+    /// source line stays exactly one visual line (no connector rows).
+    #[tokio::test]
+    async fn program_markdown_renders_display_extensions_editor_conservatively() {
+        let (app, _dir, _server) = two_session_app().await;
+        let md = ":::timeline\n- [x] done step\n- [!] blocked step\n:::\n| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let lines = crate::ui::render_program_markdown_lines_for_test(&app, md);
+        assert_eq!(
+            lines.len(),
+            md.lines().count(),
+            "one visual line per source line"
+        );
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        // Timeline fence: dim, source text kept literal.
+        assert_eq!(rendered[0], ":::timeline");
+        assert_eq!(lines[0].spans[0].style.fg, Some(app.theme.dim));
+        // Checklist items carry the shared glyph colors.
+        assert!(
+            lines[1]
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(app.theme.matrix_flash_good)),
+            "[x] item colored as done"
+        );
+        assert!(
+            lines[2]
+                .spans
+                .iter()
+                .any(|s| s.style.fg == Some(app.theme.warning)),
+            "[!] item colored as blocked"
+        );
+        // Closer renders as the dim end line (shared with clip fences).
+        assert!(rendered[3].contains("end clip"), "{rendered:?}");
+        // Table delimiter row dim; content rows stay plain literal text.
+        assert_eq!(lines[5].spans[0].style.fg, Some(app.theme.dim));
+        assert_eq!(rendered[6], "| 1 | 2 |");
+    }
+
+    /// `program/state` notifications refresh the projection cache for every
+    /// session — the same update channel that keeps open program views fresh
+    /// (spec 0074's liveness consequence) — even with no program view open.
+    #[tokio::test]
+    async fn program_state_notification_refreshes_projection_cache() {
+        let (mut app, _dir, _server) = two_session_app().await;
+        assert!(app.program_markdown_cache.is_empty());
+        app.on_program_state(
+            program_doc_for_test("s2", "# Doc\nbody", 1),
+            None,
+            Vec::new(),
+        );
+        assert_eq!(
+            app.program_markdown_cache.get("s2").map(String::as_str),
+            Some("# Doc\nbody")
+        );
     }
 
     fn rendered_text(buffer: &ratatui::buffer::Buffer) -> String {

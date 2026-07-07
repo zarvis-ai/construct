@@ -730,6 +730,19 @@
   .timeline-marker.active { color: var(--accent); }
   .timeline-main { min-width: 0; }
   .timeline-nested { margin-top: 4px; display: grid; gap: 2px; }
+  /* Shared-dialect smart clips inside widget Markdown (spec 0074): the same
+     .program-clip chips the Program editor mounts, sized down to widget text. */
+  .widget-body .program-clip { font-size: 12px; }
+  /* `:::clip <type>` fenced blocks mirror the TUI program treatment: the
+     opening fence renders as a chip line, the closing `:::` as a dim marker. */
+  .widget-clip-line { margin: 2px 0 4px; }
+  .widget-clip-end { color: var(--fg-faint); font-size: 11px; margin: 0 0 8px; }
+  /* Live read-only projection of the owning session's program (spec 0074:
+     `:::clip program section="…"`). One source of truth: the block re-renders
+     from program/state pushes, never from a maintained copy. */
+  .widget-projection { border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent); padding-left: 8px; margin: 4px 0 8px; }
+  .widget-projection-note { color: var(--fg-faint); font-style: italic; font-size: 12px; margin: 2px 0 8px; }
+  .widget-projection.is-loading { color: var(--fg-faint); font-style: italic; font-size: 12px; }
   .tool summary {
     cursor: pointer;
     color: var(--fg-faint);
@@ -1733,6 +1746,35 @@
     text-decoration: line-through;
     opacity: 0.78;
   }
+  /* agentd action link rendered as an atomic clickable chip in the Program
+     editor (spec 0074 shared dialect). Styling only — serialization reads
+     data-raw, never the label — so the source round-trips byte-identically. */
+  .program-clip.program-action {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+    cursor: pointer;
+    user-select: none;
+  }
+  .program-clip.program-action:hover {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+    color: var(--ok);
+  }
+  /* Display-extension source lines (`:::timeline`, `:::clip …`, bare `:::`
+     fences, table delimiter rows) stay fully editable text in the Program
+     editor; they only recede visually (spec 0074: the editor shows source,
+     widgets show the rendered form). Class toggles never touch text content,
+     so serialization is untouched. */
+  .program-line.pl-fence,
+  .program-line.pl-table-delim { color: var(--fg-faint); }
+  /* Checklist status markers ([x] [~] [ ] [!]) at the start of list items:
+     the wrapping span keeps the exact source text (its textContent serializes
+     verbatim) and only colors it. */
+  .program-check { font-weight: 600; }
+  .program-check.done { color: var(--ok); }
+  .program-check.active { color: var(--accent); }
+  .program-check.warn { color: var(--warn); }
+  .program-check.todo { color: var(--fg-faint); font-weight: 400; }
   /* Program session clips animate by swapping their leading glyph in JS on
      the same 120ms cadence as the TUI. Keep the chip body still: no bounce,
      pulse, or transform while a referenced session is active. */
@@ -2702,6 +2744,12 @@ const state = {
   // Current durable UI widgets keyed by session id. Hydrated from
   // `session.get().ui_panels` and updated by live ui_panel/ui_delete events.
   widgetsById: new Map(),
+  // Program snapshots backing widget `:::clip program` projections (spec
+  // 0074), keyed by session id: { markdown, version, pending, error }.
+  // Fetched once per session on first projection render, then kept fresh by
+  // `program/state` pushes; cleared on WS reconnect so a projection never
+  // shows a document from before a connectivity gap.
+  widgetProgramById: new Map(),
   widgetsDropdownOpen: false,
   widgetTemporaryUntilById: new Map(),
   focusedWidgetPanelId: null,
@@ -3118,6 +3166,10 @@ function connect() {
     // between the snapshot and the subscription (e.g. a rename from the
     // TUI) isn't lost in the gap (#272).
     rpc("subscribe.events", { session_id: null }).catch(() => {});
+    // Program snapshots behind widget projections may have gone stale while
+    // disconnected (program/state pushes were missed); drop them so the next
+    // widget render refetches.
+    state.widgetProgramById.clear();
     refreshSessions();
     refreshCurrentSessionAfterReconnect();
   });
@@ -4316,6 +4368,26 @@ function programLineClipRanges(line) {
   return ranges;
 }
 
+// All construct-dialect inline tokens in one source line, in order: typed
+// `@{…}` references ("clip") and `[label](agentd:action/…)` action links
+// ("action"). Shared by the Program editor and the widget renderer (spec
+// 0074: one dialect, one tokenizer). Action links overlapping a clip range
+// are ignored (a clip body wins).
+const PROGRAM_ACTION_LINK_RE = /\[([^\]\n]*)\]\(agentd:action\/([^()\s]*)\)/g;
+function programLineInlineTokens(line) {
+  const tokens = programLineClipRanges(line).map(([s, e]) => ({ start: s, end: e, kind: "clip" }));
+  PROGRAM_ACTION_LINK_RE.lastIndex = 0;
+  let m;
+  while ((m = PROGRAM_ACTION_LINK_RE.exec(line))) {
+    const start = m.index;
+    const end = m.index + m[0].length;
+    if (tokens.some((t) => start < t.end && end > t.start)) continue;
+    tokens.push({ start, end, kind: "action" });
+  }
+  tokens.sort((a, b) => a.start - b.start);
+  return tokens;
+}
+
 // Split a clip body (`session:abc`, `harness:codex`, or `session:abc
 // clip_id=3`) into its `(kind, id)`, mirroring the TUI's
 // `program_smart_clip_target`.
@@ -4413,15 +4485,52 @@ function programChipEl(rawClip) {
   return span;
 }
 
+// Atomic, non-editable chip for an `[label](agentd:action/…)` link in the
+// Program editor (spec 0074 shared dialect). dataset.raw carries the exact
+// source text so programSerializeInline round-trips byte-identically —
+// the visible label is presentation only. Clicking dispatches the same
+// `OBSERVATION: ui.action` input a widget button does, with no panel_id
+// (the program is not a panel). No `?key=` keyboard shortcuts here: the
+// editor is a typing surface, so single keys must keep inserting text.
+function programActionChipEl(raw) {
+  const span = document.createElement("span");
+  span.className = "program-clip program-action";
+  span.setAttribute("contenteditable", "false");
+  span.dataset.raw = raw;
+  const m = /^\[([^\]\n]*)\]\(agentd:action\/([^()\s]*)\)$/.exec(raw);
+  const label = m ? m[1] : raw;
+  const action = parseWidgetActionTarget(m ? m[2] : "");
+  span.dataset.actionId = action.id;
+  span.dataset.actionLabel = label;
+  span.textContent = label;
+  span.title = `action: ${action.id}`;
+  span.setAttribute("role", "button");
+  span.setAttribute("aria-label", `action ${label}`);
+  return span;
+}
+
+// Every mounted smart-clip chip across both chip-bearing surfaces — the
+// Program editor and widget cards (spec 0074: same chips, same live
+// repaint). Action chips share the .program-clip class but not the `@{…}`
+// raw shape; callers skip those via the startsWith("@{") guard.
+function allMountedClipChips(selector) {
+  const chips = [];
+  if (programInputEl) chips.push(...programInputEl.querySelectorAll(selector));
+  if (sessionWidgetsEl) chips.push(...sessionWidgetsEl.querySelectorAll(selector));
+  return chips;
+}
+
 // Repaint every mounted session smart-clip chip referencing `sessionId` with
 // its current label/status/tooltip. Called on live `session/state` and
 // `session/deleted` pushes so a worker dying (or getting deleted) turns its
 // chip red — or struck-through — instantly without a full document
-// re-render (which would clobber the caret/selection mid-edit).
+// re-render (which would clobber the caret/selection mid-edit). Covers both
+// chip-bearing surfaces — the Program editor and widget cards — with one
+// pass (spec 0074: same chips, same liveness).
 function programUpdateChipStatuses(sessionId) {
-  if (!programInputEl) return;
-  const chips = programInputEl.querySelectorAll(".program-clip[data-raw]");
+  const chips = allMountedClipChips(".program-clip[data-raw]");
   for (const chip of chips) {
+    if (!chip.dataset.raw.startsWith("@{")) continue;
     const body = chip.dataset.raw.slice(2, -1);
     const [kind, id] = programClipTarget(body);
     if (kind !== "session" || id !== sessionId) continue;
@@ -4436,8 +4545,7 @@ function programUpdateChipStatuses(sessionId) {
 }
 
 function refreshProgramSessionClipGlyphs(now = Date.now()) {
-  if (!programInputEl) return;
-  const chips = programInputEl.querySelectorAll('.program-clip[data-session-id]');
+  const chips = allMountedClipChips(".program-clip[data-session-id]");
   for (const chip of chips) {
     const id = chip.dataset.sessionId;
     const s = state.sessions.find((x) => x.id === id);
@@ -4657,19 +4765,66 @@ function programHandleHoverPointerMove(e) {
   }
 }
 
-// Fill a line element with text nodes + atomic chip widgets for one source line.
+// Fill a line element with text nodes + atomic chip widgets for one source
+// line: `@{…}` typed references and `[label](agentd:action/…)` action links
+// both become chips; a leading checklist marker gets a status-colored span
+// whose textContent is the exact source chars (so serialization — which
+// walks text nodes and chip data-raw — is untouched by any of this).
 function programFillLine(div, text) {
   while (div.firstChild) div.removeChild(div.firstChild);
   if (text === "") { div.appendChild(document.createElement("br")); return div; }
-  const ranges = programLineClipRanges(text);
+  const tokens = programLineInlineTokens(text);
   let pos = 0;
-  for (const [cs, ce] of ranges) {
-    if (cs > pos) div.appendChild(document.createTextNode(text.slice(pos, cs)));
-    div.appendChild(programChipEl(text.slice(cs, ce)));
-    pos = ce;
+  for (const t of tokens) {
+    if (t.start > pos) programAppendLineText(div, text.slice(pos, t.start), pos === 0);
+    const raw = text.slice(t.start, t.end);
+    div.appendChild(t.kind === "action" ? programActionChipEl(raw) : programChipEl(raw));
+    pos = t.end;
   }
-  if (pos < text.length) div.appendChild(document.createTextNode(text.slice(pos)));
+  if (pos < text.length) programAppendLineText(div, text.slice(pos), pos === 0);
   return div;
+}
+
+// Checklist status marker at the start of a (possibly bulleted, possibly
+// indented) list item. Group 1 = everything before the marker, group 2 =
+// the marker itself, group 3 = its state class.
+const PROGRAM_CHECK_MARKER_RE = /^(\s*(?:[-*+]\s+)?)(\[( |x|X|~|!)\])(?=\s|$)/;
+function programCheckStateClass(ch) {
+  if (ch === "x" || ch === "X") return "done";
+  if (ch === "~") return "active";
+  if (ch === "!") return "warn";
+  return "todo";
+}
+
+// Append one inter-chip text chunk to a line element. When the chunk opens
+// the line and starts with a checklist marker, the marker chars are wrapped
+// in a status-colored span; the span stays editable (it is presentation
+// only) and serializes as its literal text.
+function programAppendLineText(div, chunk, atLineStart) {
+  const m = atLineStart ? PROGRAM_CHECK_MARKER_RE.exec(chunk) : null;
+  if (!m) {
+    div.appendChild(document.createTextNode(chunk));
+    return;
+  }
+  if (m[1]) div.appendChild(document.createTextNode(m[1]));
+  const marker = document.createElement("span");
+  marker.className = `program-check ${programCheckStateClass(m[3])}`;
+  marker.textContent = m[2];
+  div.appendChild(marker);
+  const rest = chunk.slice(m[0].length);
+  if (rest) div.appendChild(document.createTextNode(rest));
+}
+
+// Line-level display-extension styling (dim `:::` fences and table delimiter
+// rows). Pure class toggles on the existing line divs — no DOM restructuring,
+// so it is caret-safe and runs on every input to keep up with edits.
+function programApplyLineDecorations() {
+  for (const el of programInputEl.querySelectorAll(":scope > div")) {
+    const t = programSerializeInline(el).trim();
+    const fence = t.startsWith(":::");
+    el.classList.toggle("pl-fence", fence);
+    el.classList.toggle("pl-table-delim", !fence && isTableDelimiterRow(t));
+  }
 }
 
 function programLineDiv(text) {
@@ -4684,6 +4839,7 @@ function programLineDiv(text) {
 function programRenderDoc(markdown) {
   while (programInputEl.firstChild) programInputEl.removeChild(programInputEl.firstChild);
   for (const line of markdown.split("\n")) programInputEl.appendChild(programLineDiv(line));
+  programApplyLineDecorations();
   programApplyShimmer();
   programRenderCursors();
   programHideSelectionMenu();
@@ -5414,6 +5570,8 @@ function handleProgramState(params) {
   const program = params.program;
   if (!program) return;
   const id = program.session_id;
+  // Widget projections of this program follow the same push (spec 0074).
+  widgetProgramNoteUpdate(id, program);
   const previousRun = state.program.runById.get(id);
   const nextPending = params.active_run ? programPendingIdsFromProgress(params.active_run) : null;
   if (previousRun && nextPending) programRecordSettleFlourishes(id, previousRun.pendingIds, nextPending);
@@ -6153,6 +6311,7 @@ function programFindMove(delta) {
 
 function programOnInput() {
   programNormalizeLines();
+  programApplyLineDecorations();
   programRefreshEmptyState();
   programUpdateDirty();
   programApplyShimmer();
@@ -6214,6 +6373,18 @@ function programWireEvents() {
     programUpdateSelectionMenu();
     programPublishCursor();
     programRenderCursors();
+  });
+  // Action-link chips dispatch the same OBSERVATION ui.action input as widget
+  // buttons, addressed to the mounted session with no panel_id (spec 0074:
+  // action links express user intent wherever they appear). Running a program
+  // never activates its links — only this explicit click does.
+  programInputEl.addEventListener("click", (e) => {
+    const chip = e.target && e.target.closest ? e.target.closest(".program-action[data-action-id]") : null;
+    if (!chip || !programInputEl.contains(chip)) return;
+    const sessionId = state.program.mountedId;
+    if (!sessionId) return;
+    e.preventDefault();
+    dispatchWidgetAction(sessionId, null, chip.dataset.actionId, chip.dataset.actionLabel, false);
   });
   programInputEl.addEventListener("click", () => { programUpdateClipMenu(); programUpdateSelectionMenu(); programPublishCursor(); programRenderCursors(); });
   programInputEl.addEventListener("pointerup", () => programUpdateSelectionMenu());
@@ -7994,6 +8165,7 @@ function handleNotification(method, params) {
     state.chatWorkingById.delete(params.session_id);
     state.ptyActivityById.delete(params.session_id);
     state.widgetsById.delete(params.session_id);
+    state.widgetProgramById.delete(params.session_id);
     state.program.docById.delete(params.session_id);
     state.program.runById.delete(params.session_id);
     state.program.settleById.delete(params.session_id);
@@ -8895,6 +9067,7 @@ function renderWidgetCard(sessionId, panel) {
 
 function renderWidgetMarkdown(markdown, sessionId, panelId, options = {}) {
   const lines = String(markdown || "").split(/\r?\n/);
+  const projectionDepth = options.projectionDepth || 0;
   let skippedFirstHeading = false;
   const html = [];
   for (let i = 0; i < lines.length; i += 1) {
@@ -8907,6 +9080,39 @@ function renderWidgetMarkdown(markdown, sessionId, panelId, options = {}) {
         i += 1;
       }
       html.push(renderTimeline(block, sessionId, panelId));
+      continue;
+    }
+    const clipOpen = parseWidgetClipOpen(line);
+    if (clipOpen) {
+      if (clipOpen.type === "program") {
+        // `:::clip program [section="…"]` — a live read-only projection of the
+        // owning session's program (spec 0074). Attributes may sit on the
+        // opening fence or on body lines. Inside a projection it renders as an
+        // inert chip instead (recursion guard: a program region embedding a
+        // program clip must not recurse).
+        const attrs = { ...clipOpen.attrs };
+        i += 1;
+        while (i < lines.length && lines[i].trim() !== ":::") {
+          parseWidgetClipAttrs(lines[i], attrs);
+          i += 1;
+        }
+        if (projectionDepth > 0) {
+          const label = ("clip " + clipOpen.rest).trim();
+          html.push(`<div class="widget-clip-line"><span class="program-clip">${escape(label)}</span></div>`);
+        } else {
+          html.push(widgetProgramProjectionHtml(sessionId, panelId, attrs.section || null, projectionDepth));
+        }
+        continue;
+      }
+      // Other `:::clip <type>` fences mirror the TUI program treatment: the
+      // opening fence is a chip line, the body renders normally, and the
+      // closing `:::` becomes a dim end marker below.
+      const label = ("clip " + clipOpen.rest).trim();
+      html.push(`<div class="widget-clip-line"><span class="program-clip">${escape(label)}</span></div>`);
+      continue;
+    }
+    if (line.trim() === ":::") {
+      html.push(`<div class="widget-clip-end">end clip</div>`);
       continue;
     }
     if (isTableStart(lines, i)) {
@@ -8930,10 +9136,151 @@ function renderWidgetMarkdown(markdown, sessionId, panelId, options = {}) {
     if (parsed) {
       html.push(renderWidgetLine(parsed, sessionId, panelId));
     } else {
-      html.push(`<p>${renderInlineActions(stripMarkdownEmphasis(line), sessionId, panelId)}</p>`);
+      html.push(`<p>${renderWidgetInline(line, sessionId, panelId)}</p>`);
     }
   }
   return html.join("");
+}
+
+// One line of widget text through the shared construct dialect (spec 0074):
+// inline `@{…}` typed references become the exact live chips the Program
+// editor mounts (programChipEl — display-only here, no serialization), and
+// the remaining segments go through the existing action-link pipeline.
+// Clip ranges are cut from the RAW text before any emphasis stripping so a
+// target like `s_123` keeps its underscore.
+function renderWidgetInline(text, sessionId, panelId) {
+  const s = String(text || "");
+  const ranges = programLineClipRanges(s);
+  if (!ranges.length) return renderInlineActions(s, sessionId, panelId);
+  let out = "";
+  let pos = 0;
+  for (const [cs, ce] of ranges) {
+    if (cs > pos) out += renderInlineActions(s.slice(pos, cs), sessionId, panelId);
+    out += programChipEl(s.slice(cs, ce)).outerHTML;
+    pos = ce;
+  }
+  if (pos < s.length) out += renderInlineActions(s.slice(pos), sessionId, panelId);
+  return out;
+}
+
+// `:::clip <type> [key="value" …]` opening fence, or null. `rest` is the
+// verbatim text after `:::clip` (for chip labels); `attrs` are any
+// key="value" pairs already present on the fence line.
+function parseWidgetClipOpen(line) {
+  const m = String(line || "").trim().match(/^:::clip\b(.*)$/);
+  if (!m) return null;
+  const rest = m[1].trim();
+  const type = (rest.split(/\s+/)[0] || "").split("=")[0] || "clip";
+  const attrs = {};
+  parseWidgetClipAttrs(rest, attrs);
+  return { type, rest, attrs };
+}
+
+// Collect `key="value"` / `key=value` pairs from a clip fence or body line.
+function parseWidgetClipAttrs(line, attrs) {
+  const re = /([A-Za-z_][\w-]*)\s*=\s*(?:"([^"]*)"|(\S+))/g;
+  let m;
+  while ((m = re.exec(String(line || "")))) {
+    attrs[m[1]] = m[2] !== undefined ? m[2] : m[3];
+  }
+  return attrs;
+}
+
+// The named section of a Markdown document: the first heading (any level)
+// whose text matches `section` case-insensitively, plus its content up to
+// the next heading of the same or higher level. Null when nothing matches.
+function extractMarkdownSection(markdown, section) {
+  const lines = String(markdown || "").split(/\r?\n/);
+  const want = stripMarkdownEmphasis(String(section || "")).trim().toLowerCase();
+  let start = -1;
+  let level = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = lines[i].match(/^\s{0,3}(#{1,6})\s+(.+?)\s*$/);
+    if (!m) continue;
+    if (start === -1) {
+      if (stripMarkdownEmphasis(m[2]).trim().toLowerCase() === want) {
+        start = i;
+        level = m[1].length;
+      }
+    } else if (m[1].length <= level) {
+      return lines.slice(start, i).join("\n");
+    }
+  }
+  return start === -1 ? null : lines.slice(start).join("\n");
+}
+
+// Render the live projection of `sessionId`'s program (whole document, or one
+// section). Serves the cached snapshot synchronously — rendering never blocks
+// on the fetch; the first render shows a loading placeholder and the resolved
+// fetch re-renders the widgets.
+function widgetProgramProjectionHtml(sessionId, panelId, section, depth) {
+  const entry = state.widgetProgramById.get(sessionId);
+  if (!entry || entry.markdown == null) {
+    widgetFetchProgramProjection(sessionId);
+    if (entry && entry.error) {
+      return `<div class="widget-projection-note">program unavailable</div>`;
+    }
+    return `<div class="widget-projection is-loading">loading program…</div>`;
+  }
+  let body = entry.markdown;
+  if (section) {
+    const extracted = extractMarkdownSection(entry.markdown, section);
+    if (extracted == null) {
+      return `<div class="widget-projection-note">section “${escape(section)}” not found in program</div>`;
+    }
+    body = extracted;
+  }
+  const inner = renderWidgetMarkdown(body, sessionId, panelId, { projectionDepth: (depth || 0) + 1 });
+  return `<div class="widget-projection" data-projection-session="${attr(sessionId)}">${inner}</div>`;
+}
+
+// Fetch the program snapshot behind a widget projection, once per session.
+// Freshness afterwards comes from `program/state` pushes (the same channel
+// that keeps the Program editor live — spec 0065), and the cache is dropped
+// on WS reconnect. A failed fetch is sticky for the same reasons: retrying
+// from the render path would loop.
+async function widgetFetchProgramProjection(sessionId) {
+  if (!sessionId) return;
+  const entry = state.widgetProgramById.get(sessionId);
+  if (entry) return; // pending, resolved, or failed — program/state refreshes it
+  state.widgetProgramById.set(sessionId, { markdown: null, version: 0, pending: true, error: null });
+  try {
+    const result = await rpc("program.get", { session_id: sessionId });
+    const p = (result && result.program) || {};
+    // A live program/state push may have landed (and been cached) while this
+    // round-trip was in flight; never clobber a newer snapshot with an older one.
+    const current = state.widgetProgramById.get(sessionId);
+    if (!current || current.markdown == null || (p.version || 0) >= (current.version || 0)) {
+      state.widgetProgramById.set(sessionId, {
+        markdown: String(p.markdown || ""),
+        version: p.version || 0,
+        pending: false,
+        error: null,
+      });
+    }
+  } catch (e) {
+    const current = state.widgetProgramById.get(sessionId);
+    if (!current || current.markdown == null) {
+      state.widgetProgramById.set(sessionId, { markdown: null, version: 0, pending: false, error: e.message || "error" });
+    }
+  }
+  if (sessionId === state.currentId) renderWidgets();
+}
+
+// A `program/state` push landed for `sessionId` — refresh any widget
+// projection of that program (spec 0074: projections follow the source
+// through the same update channel that keeps the program surface fresh).
+function widgetProgramNoteUpdate(sessionId, program) {
+  const entry = state.widgetProgramById.get(sessionId);
+  if (!entry) return; // no projection has needed this program yet
+  if (!entry.error && entry.markdown === program.markdown) return;
+  state.widgetProgramById.set(sessionId, {
+    markdown: program.markdown,
+    version: program.version,
+    pending: false,
+    error: null,
+  });
+  if (sessionId === state.currentId) renderWidgets();
 }
 
 function tableCells(line) {
@@ -8980,7 +9327,7 @@ function renderTableFrom(lines, start, sessionId, panelId) {
   }
   const cell = (text, c, tag) => {
     const align = aligns[c] || "left";
-    const inner = renderInlineActions(stripMarkdownEmphasis(text || ""), sessionId, panelId);
+    const inner = renderWidgetInline(text || "", sessionId, panelId);
     return `<${tag} style="text-align:${align}">${inner}</${tag}>`;
   };
   const thead = `<thead><tr>${header.map((c, idx) => cell(c, idx, "th")).join("")}</tr></thead>`;
@@ -9005,7 +9352,7 @@ function renderTimeline(rawLines, sessionId, panelId) {
   }
   return `<div class="widget-timeline">${items.map((item) => {
     const parsed = parseWidgetListItem(item.raw) || { glyph: "•", state: "bullet", text: stripPlainBullet(item.raw.trim()), indent: 0 };
-    return `<div class="timeline-item"><div class="timeline-rail"><span class="timeline-marker ${attr(parsed.state)}">${escape(parsed.glyph)}</span></div><div class="timeline-main"><div>${renderInlineActions(parsed.text, sessionId, panelId)}</div><div class="timeline-nested">${item.children.map((child) => renderWidgetLine(parseWidgetListItem(child) || { glyph: "•", state: "bullet", text: stripPlainBullet(child.trim()), indent: indentDepth(child) }, sessionId, panelId)).join("")}</div></div></div>`;
+    return `<div class="timeline-item"><div class="timeline-rail"><span class="timeline-marker ${attr(parsed.state)}">${escape(parsed.glyph)}</span></div><div class="timeline-main"><div>${renderWidgetInline(parsed.text, sessionId, panelId)}</div><div class="timeline-nested">${item.children.map((child) => renderWidgetLine(parseWidgetListItem(child) || { glyph: "•", state: "bullet", text: stripPlainBullet(child.trim()), indent: indentDepth(child) }, sessionId, panelId)).join("")}</div></div></div>`;
   }).join("")}</div>`;
 }
 
@@ -9038,7 +9385,7 @@ function indentDepth(line) {
 
 function renderWidgetLine(item, sessionId, panelId) {
   const indent = Math.max(0, item.indent || 0);
-  return `<div class="widget-line"><span class="widget-indent" style="width:${indent * 1.25}em"></span><span class="widget-glyph ${attr(item.state)}">${escape(item.glyph)}</span><span>${renderInlineActions(item.text, sessionId, panelId)}</span></div>`;
+  return `<div class="widget-line"><span class="widget-indent" style="width:${indent * 1.25}em"></span><span class="widget-glyph ${attr(item.state)}">${escape(item.glyph)}</span><span>${renderWidgetInline(item.text, sessionId, panelId)}</span></div>`;
 }
 
 function renderInlineActions(text, sessionId, panelId) {
@@ -9092,12 +9439,17 @@ async function deleteWidgetPanel(sessionId, panelId) {
   }
 }
 
+// Deliver an activated action link to its owning session as user intent.
+// `panelId` is null when the link lives outside a widget panel (the Program
+// editor) — the payload then carries no panel_id and `close` is meaningless.
 async function dispatchWidgetAction(sessionId, panelId, actionId, label, close) {
   if (!sessionId || !actionId) return;
-  const payload = { panel_id: panelId, action_id: actionId, label };
+  const payload = panelId
+    ? { panel_id: panelId, action_id: actionId, label }
+    : { action_id: actionId, label };
   try {
     await rpc("session.input", { session_id: sessionId, text: `OBSERVATION: ui.action ${JSON.stringify(payload)}` });
-    if (close) await deleteWidgetPanel(sessionId, panelId);
+    if (close && panelId) await deleteWidgetPanel(sessionId, panelId);
   } catch (e) {
     appendError(`widget action failed: ${e.message}`);
   }

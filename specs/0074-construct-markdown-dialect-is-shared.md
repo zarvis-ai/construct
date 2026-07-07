@@ -1,6 +1,6 @@
 # 0074-construct-markdown-dialect-is-shared
 
-Status: proposed
+Status: accepted
 Date: 2026-07-07
 Area: ux
 Scope: One construct-flavored Markdown dialect shared by all session Markdown surfaces, with one renderer per client.
@@ -27,6 +27,8 @@ Surfaces compose by reference, not by merging:
 - A projection is read-only at the point of display; edits happen at the source through that surface's own write path.
 
 Stored documents remain plain Markdown, and the dialect must degrade readably: a document viewed in a generic Markdown renderer (a code host, an editor preview) stays legible, with extensions appearing as inert text rather than corrupting the prose around them.
+
+An editable surface renders the dialect conservatively. The program surface is an editor over source Markdown, so it must preserve the mapping between what is shown and what is stored: display extensions style lines in place rather than collapsing or inserting visual structure, action links render as atomic interactive elements that serialize back to their exact source text, and bare action-link keyboard shortcuts stay inactive because an editor is a typing surface. A rendered (non-editing) surface, such as a widget or a projection, uses full display rendering. Both are renderings of the same dialect with the same meaning; only the fidelity of decoration differs, per the interaction-mechanics split this spec inherits.
 
 ## Reason
 

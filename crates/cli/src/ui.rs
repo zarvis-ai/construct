@@ -2000,17 +2000,27 @@ fn render_matrix_widget_viewport(f: &mut Frame, rain_area: Rect, app: &mut App, 
         return;
     }
     let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+    let mut hits = Vec::new();
+    let mut url_hits = Vec::new();
+    let mut wanted_programs = Vec::new();
     let mut lines = render_agentd_markdown_lines(
+        Some(app),
         &panel.markdown,
         &app.theme,
         app.mouse_pos,
         inner,
         Some(session_id.as_str()),
         Some(panel.id.as_str()),
-        &mut app.layout.dynamic_ui_action_hits,
-        &mut app.layout.dynamic_ui_url_hits,
+        &mut hits,
+        &mut url_hits,
         suppress_first_heading,
+        &mut wanted_programs,
     );
+    app.layout.dynamic_ui_action_hits.extend(hits);
+    app.layout.dynamic_ui_url_hits.extend(url_hits);
+    for owner in wanted_programs {
+        app.request_program_projection(owner);
+    }
     let viewport_rows = inner.height as usize;
     let padding_rows = viewport_rows.saturating_sub(lines.len());
     lines.extend(std::iter::repeat(Line::raw("")).take(padding_rows));
@@ -3387,7 +3397,16 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     let agent_status = app.agent_statuses.get(&id).cloned();
     let inline_rows = inline_panel
         .as_ref()
-        .map(|panel| inline_widget_rows(panel, area.width, area.height, &app.theme))
+        .map(|panel| {
+            inline_widget_rows(
+                Some(&*app),
+                panel,
+                Some(id.as_str()),
+                area.width,
+                area.height,
+                &app.theme,
+            )
+        })
         .unwrap_or(0);
     let base_area = Rect {
         x: area.x,
@@ -3628,7 +3647,9 @@ fn latest_inline_panel(panels: &[agentd_protocol::UiPanel]) -> Option<agentd_pro
 /// same parse against the real panel area and pushes hits into
 /// `app.layout.dynamic_ui_action_hits`.
 fn inline_widget_rows(
+    app: Option<&App>,
     panel: &agentd_protocol::UiPanel,
+    session_id: Option<&str>,
     width: u16,
     available_height: u16,
     theme: &Theme,
@@ -3651,16 +3672,22 @@ fn inline_widget_rows(
     let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
     let mut throwaway_hits = Vec::new();
     let mut throwaway_url_hits = Vec::new();
+    let mut throwaway_wanted = Vec::new();
+    // `app` + the owning session id keep the measured chip labels and any
+    // program projection identical to what the real render below paints, so
+    // the measured height matches the painted height.
     let lines = render_agentd_markdown_lines(
+        app,
         &panel.markdown,
         theme,
         None,
         measure_area,
-        None,
+        session_id,
         None,
         &mut throwaway_hits,
         &mut throwaway_url_hits,
         suppress_first_heading,
+        &mut throwaway_wanted,
     );
     let body_rows = visual_line_count(lines.iter(), content_width) as u16;
     let wanted = body_rows.saturating_add(2).max(3);
@@ -3703,17 +3730,27 @@ fn render_inline_dynamic_ui_panel(
         height: inner.height,
     };
     let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+    let mut hits = Vec::new();
+    let mut url_hits = Vec::new();
+    let mut wanted_programs = Vec::new();
     let lines = render_agentd_markdown_lines(
+        Some(app),
         &panel.markdown,
         &app.theme,
         app.mouse_pos,
         content_area,
         Some(session_id),
         Some(panel.id.as_str()),
-        &mut app.layout.dynamic_ui_action_hits,
-        &mut app.layout.dynamic_ui_url_hits,
+        &mut hits,
+        &mut url_hits,
         suppress_first_heading,
+        &mut wanted_programs,
     );
+    app.layout.dynamic_ui_action_hits.extend(hits);
+    app.layout.dynamic_ui_url_hits.extend(url_hits);
+    for owner in wanted_programs {
+        app.request_program_projection(owner);
+    }
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         content_area,
@@ -4034,17 +4071,27 @@ fn render_dynamic_ui_stack_lines(
             height: area.height,
         };
         let suppress_first_heading = leading_markdown_heading(&panel.markdown).is_some();
+        let mut hits = Vec::new();
+        let mut url_hits = Vec::new();
+        let mut wanted_programs = Vec::new();
         let lines = render_agentd_markdown_lines(
+            Some(app),
             &panel.markdown,
             &app.theme,
             hover,
             content_area,
             Some(session_id),
             Some(panel.id.as_str()),
-            &mut app.layout.dynamic_ui_action_hits,
-            &mut app.layout.dynamic_ui_url_hits,
+            &mut hits,
+            &mut url_hits,
             suppress_first_heading,
+            &mut wanted_programs,
         );
+        app.layout.dynamic_ui_action_hits.extend(hits);
+        app.layout.dynamic_ui_url_hits.extend(url_hits);
+        for owner in wanted_programs {
+            app.request_program_projection(owner);
+        }
         rows.extend(lines);
         rows.push(Line::raw(""));
     }
@@ -4134,7 +4181,25 @@ fn parse_markdown_heading(line: &str) -> Option<String> {
     Some(strip_markdown_emphasis(rest).trim().to_string()).filter(|s| !s.is_empty())
 }
 
+/// Whether the construct Markdown dialect registry (spec 0074) enables the
+/// extension `name` on `surface`. Renderers consult the shared registry
+/// instead of ad-hoc per-surface booleans, so adding or restricting an
+/// extension in `agentd_protocol::dialect` changes every client surface at
+/// once.
+fn surface_allows_extension(surface: &str, name: &str) -> bool {
+    agentd_protocol::dialect::extensions_for_surface(surface).any(|ext| ext.name == name)
+}
+
+/// Render widget-surface construct Markdown (spec 0074: one shared dialect).
+/// `app` powers the shared smart-clip chips (live session status from
+/// `app.sessions`, same lookup the program surface uses) and the
+/// `:::clip program` projection cache; `None` (measuring paths, tests)
+/// degrades to static clip labels and a "loading program…" placeholder.
+/// `wanted_programs` collects owning-session ids whose program document is
+/// needed for a projection but not cached yet — callers kick off a
+/// non-blocking fetch for each so the render loop never stalls.
 fn render_agentd_markdown_lines(
+    app: Option<&App>,
     markdown: &str,
     theme: &Theme,
     hover: Option<(u16, u16)>,
@@ -4144,6 +4209,42 @@ fn render_agentd_markdown_lines(
     hits: &mut Vec<crate::app::DynamicUiActionHit>,
     url_hits: &mut Vec<crate::app::DynamicUiUrlHit>,
     suppress_first_heading: bool,
+    wanted_programs: &mut Vec<String>,
+) -> Vec<Line<'static>> {
+    render_agentd_markdown_lines_at_depth(
+        app,
+        markdown,
+        theme,
+        hover,
+        panel_area,
+        session_id,
+        panel_id,
+        hits,
+        url_hits,
+        suppress_first_heading,
+        wanted_programs,
+        0,
+    )
+}
+
+/// The recursive body of [`render_agentd_markdown_lines`]. `depth` is the
+/// projection nesting level: a `:::clip program` block projects the owning
+/// session's program document only at depth 0 — inside a projection it
+/// renders as an inert chip, so a program that embeds a program clip can
+/// never recurse.
+fn render_agentd_markdown_lines_at_depth(
+    app: Option<&App>,
+    markdown: &str,
+    theme: &Theme,
+    hover: Option<(u16, u16)>,
+    panel_area: Rect,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+    url_hits: &mut Vec<crate::app::DynamicUiUrlHit>,
+    suppress_first_heading: bool,
+    wanted_programs: &mut Vec<String>,
+    depth: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let mut pending_action_spans: Vec<Span<'static>> = Vec::new();
@@ -4164,6 +4265,7 @@ fn render_agentd_markdown_lines(
         if let Some(timeline) = in_timeline.as_mut() {
             if line.trim() == ":::" {
                 let rendered = render_timeline_block(
+                    app,
                     timeline,
                     theme,
                     hover,
@@ -4205,6 +4307,110 @@ fn render_agentd_markdown_lines(
                 lines.push(line);
             }
             in_timeline = Some(TimelineBlock { items: Vec::new() });
+            continue;
+        }
+        // Construct clip blocks (spec 0074): the fence line renders as the
+        // same chip the program surface paints. `:::clip program` in a widget
+        // additionally projects the owning session's program document (or one
+        // section of it) live — the dialect registry restricts that
+        // projection to the widget surface, so the gate consults the registry
+        // rather than a local boolean. Any other clip type stays inert: chip
+        // line here, body through the normal pipeline, dim end line at the
+        // `:::` closer below.
+        if let Some(rest) = line.trim().strip_prefix(":::clip") {
+            if !pending_action_spans.is_empty() {
+                let flushed = Line::from(std::mem::take(&mut pending_action_spans));
+                rendered_rows += visual_line_count(std::iter::once(&flushed), panel_area.width);
+                lines.push(flushed);
+            }
+            let chip_label = format!("clip {}", rest.trim());
+            let clip_type = rest.trim().split_whitespace().next().unwrap_or("");
+            let project_program = clip_type == "program"
+                && depth == 0
+                && surface_allows_extension(
+                    agentd_protocol::dialect::SURFACE_WIDGET,
+                    "program-section",
+                );
+            if project_program {
+                let (section, consumed) = parse_widget_clip_block(&src_lines, cur);
+                let mut block_lines = vec![Line::from(vec![
+                    Span::raw("  "),
+                    program_chip_span(chip_label.trim(), theme.highlight_fg, theme.info),
+                ])];
+                let cached_program = match (app, session_id) {
+                    (Some(app), Some(owner)) => {
+                        let cached = app.program_markdown_cache.get(owner).cloned();
+                        if cached.is_none() {
+                            wanted_programs.push(owner.to_string());
+                        }
+                        cached
+                    }
+                    _ => None,
+                };
+                match cached_program {
+                    None => block_lines.push(widget_dim_note_line(theme, "loading program…")),
+                    Some(program_md) => {
+                        match program_section_projection(&program_md, section.as_deref()) {
+                            None => block_lines.push(widget_dim_note_line(
+                                theme,
+                                &format!(
+                                    "section not found: {}",
+                                    section.as_deref().unwrap_or_default()
+                                ),
+                            )),
+                            Some(fragment) => {
+                                // Offset the sub-render's row math by the rows
+                                // already emitted so hit geometry inside the
+                                // projection lands where its lines paint.
+                                let consumed_rows = rendered_rows
+                                    + visual_line_count(block_lines.iter(), panel_area.width);
+                                let sub_area = Rect {
+                                    y: panel_area.y.saturating_add(
+                                        consumed_rows.min(u16::MAX as usize) as u16,
+                                    ),
+                                    ..panel_area
+                                };
+                                block_lines.extend(render_agentd_markdown_lines_at_depth(
+                                    app,
+                                    &fragment,
+                                    theme,
+                                    hover,
+                                    sub_area,
+                                    session_id,
+                                    panel_id,
+                                    hits,
+                                    url_hits,
+                                    false,
+                                    wanted_programs,
+                                    depth + 1,
+                                ));
+                            }
+                        }
+                    }
+                }
+                block_lines.push(widget_dim_note_line(theme, "end clip"));
+                rendered_rows += visual_line_count(block_lines.iter(), panel_area.width);
+                lines.extend(block_lines);
+                li = cur + consumed;
+                continue;
+            }
+            let chip = Line::from(vec![
+                Span::raw("  "),
+                program_chip_span(chip_label.trim(), theme.highlight_fg, theme.info),
+            ]);
+            rendered_rows += visual_line_count(std::iter::once(&chip), panel_area.width);
+            lines.push(chip);
+            continue;
+        }
+        if line.trim() == ":::" {
+            if !pending_action_spans.is_empty() {
+                let flushed = Line::from(std::mem::take(&mut pending_action_spans));
+                rendered_rows += visual_line_count(std::iter::once(&flushed), panel_area.width);
+                lines.push(flushed);
+            }
+            let end = widget_dim_note_line(theme, "end clip");
+            rendered_rows += visual_line_count(std::iter::once(&end), panel_area.width);
+            lines.push(end);
             continue;
         }
         let action_links = parse_agentd_action_links(line);
@@ -4301,6 +4507,7 @@ fn render_agentd_markdown_lines(
                 lines.push(Line::raw(strip_markdown_emphasis(line)));
             }
         } else if let Some(line) = parse_checkline(
+            app,
             line,
             theme,
             hover,
@@ -4313,17 +4520,18 @@ fn render_agentd_markdown_lines(
         ) {
             lines.push(line);
         } else {
-            // Paragraph fallback: route through `render_inline_action_spans`
+            // Paragraph fallback: route through `render_inline_widget_spans`
             // so `[text](https?://…)` URLs register as `DynamicUiUrlHit`s
-            // and get the underline affordance. Lines containing only
+            // and get the underline affordance, and inline `@{…}` typed
+            // references render as live chips. Lines containing only
             // `agentd:action/...` links are caught by the dedicated
             // action-line branch above; this catch-all picks up the mixed
             // paragraph case ("See [docs](https://…) for details.") that
             // would otherwise render the URL as inert text.
             let start_col = panel_area.x.saturating_add(1);
             let row = panel_area.y.saturating_add(rendered_rows as u16);
-            let spans = render_inline_action_spans(
-                line, theme, hover, row, start_col, session_id, panel_id, hits, url_hits,
+            let spans = render_inline_widget_spans(
+                app, line, theme, hover, row, start_col, session_id, panel_id, hits, url_hits,
             );
             lines.push(Line::from(spans));
         }
@@ -4337,6 +4545,7 @@ fn render_agentd_markdown_lines(
     }
     if let Some(timeline) = in_timeline.as_ref() {
         lines.extend(render_timeline_block(
+            app,
             timeline,
             theme,
             hover,
@@ -4349,6 +4558,72 @@ fn render_agentd_markdown_lines(
         ));
     }
     lines
+}
+
+/// A dim informational line inside a widget clip block ("end clip",
+/// "loading program…", "section not found: …"), indented to match the
+/// program surface's clip end line.
+fn widget_dim_note_line(theme: &Theme, text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {text}"),
+        Style::default().fg(theme.dim),
+    ))
+}
+
+/// Consume a `:::clip …` fenced block starting at `lines[start]` (the fence
+/// line): returns the optional `section="…"` attribute found in the body and
+/// how many source lines the block spans — fence line through the `:::`
+/// closer, or to end-of-input for an unterminated block.
+fn parse_widget_clip_block(lines: &[&str], start: usize) -> (Option<String>, usize) {
+    let mut section = None;
+    let mut i = start + 1;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        i += 1;
+        if t == ":::" {
+            return (section, i - start);
+        }
+        if let Some(value) = t.strip_prefix("section=") {
+            let value = value.trim().trim_matches('"').trim();
+            if !value.is_empty() {
+                section = Some(value.to_string());
+            }
+        }
+    }
+    (section, i - start)
+}
+
+/// Project one section out of a program document for a widget `:::clip
+/// program` block (spec 0074: compose by reference, not by copying). With no
+/// `section` the whole document projects. With one, the heading line whose
+/// text matches case-insensitively (at any level) projects together with its
+/// content, up to the next heading of the same or higher level. `None` when
+/// the named section does not exist.
+fn program_section_projection(markdown: &str, section: Option<&str>) -> Option<String> {
+    let Some(section) = section else {
+        return Some(markdown.to_string());
+    };
+    let want = section.trim().to_lowercase();
+    if want.is_empty() {
+        return Some(markdown.to_string());
+    }
+    let lines: Vec<&str> = markdown.lines().collect();
+    let heading_level = |line: &str| -> Option<usize> {
+        parse_markdown_heading(line)?;
+        Some(line.trim_start().chars().take_while(|c| *c == '#').count())
+    };
+    let (start, level) = lines.iter().enumerate().find_map(|(i, line)| {
+        let level = heading_level(line)?;
+        let text = parse_markdown_heading(line)?;
+        (text.trim().to_lowercase() == want).then_some((i, level))
+    })?;
+    let end = lines
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find_map(|(i, line)| heading_level(line).filter(|l| *l <= level).map(|_| i))
+        .unwrap_or(lines.len());
+    Some(lines[start..end].join("\n"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4622,6 +4897,7 @@ fn visual_line_count<'a>(lines: impl IntoIterator<Item = &'a Line<'static>>, wid
 }
 
 fn render_timeline_block(
+    app: Option<&App>,
     block: &TimelineBlock,
     theme: &Theme,
     hover: Option<(u16, u16)>,
@@ -4652,7 +4928,8 @@ fn render_timeline_block(
             .saturating_add(UnicodeWidthStr::width("  ") as u16)
             .saturating_add(UnicodeWidthStr::width(format!("{glyph} ").as_str()) as u16);
         let mut spans = vec![Span::raw("  "), Span::styled(format!("{glyph} "), style)];
-        spans.extend(render_inline_action_spans(
+        spans.extend(render_inline_widget_spans(
+            app,
             &text,
             theme,
             hover,
@@ -4666,6 +4943,7 @@ fn render_timeline_block(
         lines.push(Line::from(spans));
         for nested in &item.nested {
             render_timeline_nested_line(
+                app,
                 &mut lines,
                 nested,
                 theme,
@@ -4721,6 +4999,7 @@ fn is_indented(line: &str) -> bool {
 }
 
 fn render_timeline_nested_line(
+    app: Option<&App>,
     lines: &mut Vec<Line<'static>>,
     nested: &str,
     theme: &Theme,
@@ -4758,7 +5037,8 @@ fn render_timeline_nested_line(
         Span::raw(" ".repeat(indent_cols)),
         Span::styled(format!("{glyph} "), style),
     ];
-    spans.extend(render_inline_action_spans(
+    spans.extend(render_inline_widget_spans(
+        app,
         &text,
         theme,
         hover,
@@ -4779,52 +5059,83 @@ fn nested_indent_cols(line: &str) -> usize {
         .sum()
 }
 
-fn timeline_item_parts(item: &str, theme: &Theme) -> (&'static str, String, Color, bool) {
-    let trimmed = item.trim();
-    if let Some(text) = trimmed
-        .strip_prefix("[x] ")
-        .or_else(|| trimmed.strip_prefix("- [x] "))
-    {
-        (
-            "✓",
-            strip_markdown_emphasis(text),
-            theme.matrix_flash_good,
-            true,
-        )
-    } else if let Some(text) = trimmed
-        .strip_prefix("[~] ")
-        .or_else(|| trimmed.strip_prefix("- [~] "))
-    {
-        ("◉", strip_markdown_emphasis(text), theme.accent, true)
-    } else if let Some(text) = trimmed
-        .strip_prefix("[!] ")
-        .or_else(|| trimmed.strip_prefix("- [!] "))
-    {
-        ("!", strip_markdown_emphasis(text), theme.warning, true)
-    } else if let Some(text) = trimmed
-        .strip_prefix("[ ] ")
-        .or_else(|| trimmed.strip_prefix("- [ ] "))
-    {
-        ("○", strip_markdown_emphasis(text), theme.dim, false)
+/// One `[x]`/`[~]`/`[!]`/`[ ]` checklist marker. The classification and its
+/// glyph/color treatment are shared between the widget renderer (checklists,
+/// timeline items) and the program renderer (checklist line coloring), per
+/// spec 0074's one-dialect rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChecklistMark {
+    Done,
+    Active,
+    Blocked,
+    Todo,
+}
+
+/// Parse the checklist marker opening `text` (after any `- ` bullet),
+/// returning the mark and the text following the marker.
+fn checklist_mark_prefix(text: &str) -> Option<(ChecklistMark, &str)> {
+    if let Some(rest) = text.strip_prefix("[x] ") {
+        Some((ChecklistMark::Done, rest))
+    } else if let Some(rest) = text.strip_prefix("[~] ") {
+        Some((ChecklistMark::Active, rest))
+    } else if let Some(rest) = text.strip_prefix("[!] ") {
+        Some((ChecklistMark::Blocked, rest))
+    } else if let Some(rest) = text.strip_prefix("[ ] ") {
+        Some((ChecklistMark::Todo, rest))
     } else {
-        let text = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-            .or_else(|| trimmed.strip_prefix("+ "))
-            .unwrap_or(trimmed);
-        ("•", strip_markdown_emphasis(text), theme.accent_alt, false)
+        None
     }
 }
 
+fn checklist_mark_glyph(mark: ChecklistMark) -> &'static str {
+    match mark {
+        ChecklistMark::Done => "✓",
+        ChecklistMark::Active => "◉",
+        ChecklistMark::Blocked => "!",
+        ChecklistMark::Todo => "○",
+    }
+}
+
+/// `(color, bold)` for a checklist mark — the shared glyph treatment: done
+/// glows, active is accented, blocked warns, todo recedes.
+fn checklist_mark_style(mark: ChecklistMark, theme: &Theme) -> (Color, bool) {
+    match mark {
+        ChecklistMark::Done => (theme.matrix_flash_good, true),
+        ChecklistMark::Active => (theme.accent, true),
+        ChecklistMark::Blocked => (theme.warning, true),
+        ChecklistMark::Todo => (theme.dim, false),
+    }
+}
+
+fn timeline_item_parts(item: &str, theme: &Theme) -> (&'static str, String, Color, bool) {
+    let trimmed = item.trim();
+    let unbulleted = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+    if let Some((mark, text)) = checklist_mark_prefix(unbulleted) {
+        let (color, bold) = checklist_mark_style(mark, theme);
+        return (
+            checklist_mark_glyph(mark),
+            strip_markdown_emphasis(text),
+            color,
+            bold,
+        );
+    }
+    let text = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .or_else(|| trimmed.strip_prefix("+ "))
+        .unwrap_or(trimmed);
+    ("•", strip_markdown_emphasis(text), theme.accent_alt, false)
+}
+
 fn is_checkline(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("- [x] ")
-        || trimmed.starts_with("- [~] ")
-        || trimmed.starts_with("- [!] ")
-        || trimmed.starts_with("- [ ] ")
+    line.trim_start()
+        .strip_prefix("- ")
+        .and_then(checklist_mark_prefix)
+        .is_some()
 }
 
 fn parse_checkline(
+    app: Option<&App>,
     line: &str,
     theme: &Theme,
     hover: Option<(u16, u16)>,
@@ -4841,17 +5152,9 @@ fn parse_checkline(
         .collect::<String>()
         .replace('\t', "    ");
     let trimmed = line.trim_start();
-    let (glyph, item, color, bold) = if let Some(item) = trimmed.strip_prefix("- [x] ") {
-        ("✓", item, theme.matrix_flash_good, true)
-    } else if let Some(item) = trimmed.strip_prefix("- [~] ") {
-        ("◉", item, theme.accent, true)
-    } else if let Some(item) = trimmed.strip_prefix("- [!] ") {
-        ("!", item, theme.warning, true)
-    } else if let Some(item) = trimmed.strip_prefix("- [ ] ") {
-        ("○", item, theme.dim, false)
-    } else {
-        return None;
-    };
+    let (mark, item) = checklist_mark_prefix(trimmed.strip_prefix("- ")?)?;
+    let glyph = checklist_mark_glyph(mark);
+    let (color, bold) = checklist_mark_style(mark, theme);
     let mut style = Style::default().fg(color);
     if bold {
         style = style.add_modifier(Modifier::BOLD);
@@ -4866,7 +5169,8 @@ fn parse_checkline(
         .saturating_add(UnicodeWidthStr::width(indent.as_str()) as u16)
         .saturating_add(UnicodeWidthStr::width(format!("{glyph} ").as_str()) as u16);
     let mut spans = vec![Span::raw(indent), Span::styled(format!("{glyph} "), style)];
-    spans.extend(render_inline_action_spans(
+    spans.extend(render_inline_widget_spans(
+        app,
         item,
         theme,
         hover,
@@ -4878,6 +5182,63 @@ fn parse_checkline(
         url_hits,
     ));
     Some(Line::from(spans))
+}
+
+/// Inline widget-surface span renderer: splits `text` on `@{…}` typed
+/// references, rendering each as the shared smart-clip chip (the very same
+/// span builder the program surface uses, so a session chip means the same
+/// thing on both surfaces per spec 0074), and routes the text between chips
+/// through [`render_inline_action_spans`] for action/URL links. Chip labels
+/// and live status come from `app`; without one the chips render inertly with
+/// static labels.
+fn render_inline_widget_spans(
+    app: Option<&App>,
+    text: &str,
+    theme: &Theme,
+    hover: Option<(u16, u16)>,
+    row: u16,
+    start_col: u16,
+    session_id: Option<&str>,
+    panel_id: Option<&str>,
+    hits: &mut Vec<crate::app::DynamicUiActionHit>,
+    url_hits: &mut Vec<crate::app::DynamicUiUrlHit>,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    let mut col = start_col;
+    while let Some(start) = rest.find("@{") {
+        let after_marker = &rest[start + 2..];
+        // Malformed `@{` without a closing `}`: fall through and render the
+        // remainder (including the marker) as regular link/text spans.
+        let Some(end) = after_marker.find('}') else {
+            break;
+        };
+        let before = &rest[..start];
+        if !before.is_empty() {
+            let segment = render_inline_action_spans(
+                before, theme, hover, row, col, session_id, panel_id, hits, url_hits,
+            );
+            col = col.saturating_add(spans_display_width(&segment) as u16);
+            spans.extend(segment);
+        }
+        let raw_clip = &after_marker[..end];
+        spans.push(program_smart_clip_span(app, theme, raw_clip, false, false));
+        col = col.saturating_add(program_smart_clip_visual_width(app, raw_clip) as u16);
+        rest = &after_marker[end + 1..];
+    }
+    if !rest.is_empty() {
+        spans.extend(render_inline_action_spans(
+            rest, theme, hover, row, col, session_id, panel_id, hits, url_hits,
+        ));
+    }
+    spans
+}
+
+fn spans_display_width(spans: &[Span<'_>]) -> usize {
+    spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
 }
 
 fn render_inline_action_spans(
@@ -5032,30 +5393,62 @@ fn parse_action_target(target: &str) -> (String, Option<String>, bool) {
     (id.to_string(), key, close)
 }
 
-fn parse_agentd_action_links(line: &str) -> Vec<(String, String, Option<String>, bool)> {
+/// One `[label](agentd:action/…)` occurrence in a line of construct
+/// Markdown. `start..end` is the byte range of the whole link construct, so
+/// the program surface (which renders the source literally) can style and
+/// hit-test it in place; the widget surface consumes the parsed fields via
+/// [`parse_agentd_action_links`]. One scanner serves both surfaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentdActionLink {
+    start: usize,
+    end: usize,
+    label: String,
+    id: String,
+    key: Option<String>,
+    close: bool,
+}
+
+fn scan_agentd_action_links(line: &str) -> Vec<AgentdActionLink> {
     let mut out = Vec::new();
-    let mut rest = line;
-    while let Some(label_start) = rest.find('[') {
-        rest = &rest[label_start + 1..];
-        let Some(label_end) = rest.find(']') else {
+    let mut idx = 0usize;
+    while let Some(rel) = line[idx..].find('[') {
+        let label_start = idx + rel;
+        let after_open = &line[label_start + 1..];
+        let Some(label_len) = after_open.find(']') else {
             break;
         };
-        let label = &rest[..label_end];
-        let after_label = &rest[label_end + 1..];
-        let Some(after_open) = after_label.strip_prefix("(agentd:action/") else {
-            rest = after_label;
+        let label = &after_open[..label_len];
+        let after_label = &after_open[label_len + 1..];
+        let Some(after_paren) = after_label.strip_prefix("(agentd:action/") else {
+            idx = label_start + 1 + label_len + 1;
             continue;
         };
-        let Some(id_end) = after_open.find(')') else {
+        let Some(target_len) = after_paren.find(')') else {
             break;
         };
-        let (id, key, close) = parse_action_target(&after_open[..id_end]);
+        let (id, key, close) = parse_action_target(&after_paren[..target_len]);
+        let end =
+            label_start + 1 + label_len + 1 + "(agentd:action/".len() + target_len + 1;
         if !label.is_empty() && !id.is_empty() {
-            out.push((label.to_string(), id, key, close));
+            out.push(AgentdActionLink {
+                start: label_start,
+                end,
+                label: label.to_string(),
+                id,
+                key,
+                close,
+            });
         }
-        rest = &after_open[id_end + 1..];
+        idx = end;
     }
     out
+}
+
+fn parse_agentd_action_links(line: &str) -> Vec<(String, String, Option<String>, bool)> {
+    scan_agentd_action_links(line)
+        .into_iter()
+        .map(|link| (link.label, link.id, link.key, link.close))
+        .collect()
 }
 
 fn strip_markdown_emphasis(s: &str) -> String {
@@ -7957,6 +8350,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_resize_hit = None;
     app.layout.program_smart_clip_anchor = None;
     app.layout.program_clip_hits.clear();
+    app.layout.program_action_link_hits.clear();
     if app
         .program_popup
         .as_ref()
@@ -8920,8 +9314,19 @@ fn render_program_popup_at(
     // visible program, even when another split is focused. Only the active program
     // publishes click hitboxes into layout state.
     let clip_hits = program_session_clip_hits(Some(app), &popup.buffer, scroll_offset, inner);
+    // Action links register alongside clips through the same wrap-aware
+    // geometry; only the active program owns click hitboxes, mirroring
+    // `program_clip_hits`.
+    let action_link_hits = program_action_link_hits(
+        Some(app),
+        &popup.buffer,
+        &popup.program.session_id,
+        scroll_offset,
+        inner,
+    );
     if active {
         app.layout.program_clip_hits = clip_hits.clone();
+        app.layout.program_action_link_hits = action_link_hits;
     }
     if active && !popup.closing {
         if let Some(pos) =
@@ -11194,46 +11599,133 @@ pub(crate) fn program_session_clip_hits(
             if kind != "session" {
                 continue;
             }
-            // Walk the clip's display columns, mapping each to a wrapped row and
-            // merging contiguous same-row cells into one hit.
-            let mut segment: Option<(u16, u16, u16)> = None; // (row, start, end)
-            for vcol in clip.visual_start..clip.visual_start.saturating_add(clip.visual_width) {
-                let (row_in_line, col_in_row) = program_wrap_locate(&starts, vcol, width);
-                let abs_row = visual_row_base.saturating_add(row_in_line);
-                if abs_row < scroll_offset {
-                    continue; // above the fold (rows grow with the column)
-                }
-                if abs_row >= viewport_end {
-                    break; // below the fold; later cells only sit lower
-                }
-                let screen_row = area.y.saturating_add((abs_row - scroll_offset) as u16);
-                let screen_col = area.x.saturating_add(col_in_row as u16);
-                match segment.as_mut() {
-                    // A collapsed break-whitespace cell can map back onto a column
-                    // already inside the current segment — leave it covered.
-                    Some((r, s, e)) if *r == screen_row && screen_col >= *s && screen_col < *e => {}
-                    Some((r, _s, e)) if *r == screen_row && *e == screen_col => {
-                        *e = screen_col.saturating_add(1);
-                    }
-                    _ => {
-                        if let Some((row, col_start, col_end)) = segment.take() {
-                            hits.push(crate::app::ProgramClipHit {
-                                col_start,
-                                col_end,
-                                row,
-                                session_id: id.to_string(),
-                            });
-                        }
-                        segment = Some((screen_row, screen_col, screen_col.saturating_add(1)));
-                    }
-                }
-            }
-            if let Some((row, col_start, col_end)) = segment.take() {
+            for (row, col_start, col_end) in program_visual_span_segments(
+                &starts,
+                clip.visual_start,
+                clip.visual_width,
+                width,
+                visual_row_base,
+                scroll_offset,
+                viewport_end,
+                area,
+            ) {
                 hits.push(crate::app::ProgramClipHit {
                     col_start,
                     col_end,
                     row,
                     session_id: id.to_string(),
+                });
+            }
+        }
+        visual_row_base = visual_row_base.saturating_add(starts.len());
+    }
+    hits
+}
+
+/// Map one visual-column span of a rendered program line to its on-screen
+/// `(row, col_start, col_end)` segments, walking each display column through
+/// the wrap math and merging contiguous same-row cells. Shared by smart-clip
+/// and action-link hit-testing so both resolve identically under scrolling
+/// and word-wrap.
+fn program_visual_span_segments(
+    starts: &[usize],
+    visual_start: usize,
+    visual_width: usize,
+    width: usize,
+    visual_row_base: usize,
+    scroll_offset: usize,
+    viewport_end: usize,
+    area: Rect,
+) -> Vec<(u16, u16, u16)> {
+    let mut segments = Vec::new();
+    let mut segment: Option<(u16, u16, u16)> = None; // (row, start, end)
+    for vcol in visual_start..visual_start.saturating_add(visual_width) {
+        let (row_in_line, col_in_row) = program_wrap_locate(starts, vcol, width);
+        let abs_row = visual_row_base.saturating_add(row_in_line);
+        if abs_row < scroll_offset {
+            continue; // above the fold (rows grow with the column)
+        }
+        if abs_row >= viewport_end {
+            break; // below the fold; later cells only sit lower
+        }
+        let screen_row = area.y.saturating_add((abs_row - scroll_offset) as u16);
+        let screen_col = area.x.saturating_add(col_in_row as u16);
+        match segment.as_mut() {
+            // A collapsed break-whitespace cell can map back onto a column
+            // already inside the current segment — leave it covered.
+            Some((r, s, e)) if *r == screen_row && screen_col >= *s && screen_col < *e => {}
+            Some((r, _s, e)) if *r == screen_row && *e == screen_col => {
+                *e = screen_col.saturating_add(1);
+            }
+            _ => {
+                if let Some(done) = segment.take() {
+                    segments.push(done);
+                }
+                segment = Some((screen_row, screen_col, screen_col.saturating_add(1)));
+            }
+        }
+    }
+    if let Some(done) = segment.take() {
+        segments.push(done);
+    }
+    segments
+}
+
+/// On-screen cell ranges of every `[label](agentd:action/…)` link in the
+/// program body — the editor's clickable-affordance sibling of
+/// [`program_session_clip_hits`], registered through the same wrap-aware
+/// geometry so clicks resolve correctly under scrolling and wrapping. The
+/// link text renders literally on this surface (an editor never collapses
+/// source), so ranges come from scanning the rendered line text; visual
+/// columns account for smart-clip chip expansion earlier in the line.
+pub(crate) fn program_action_link_hits(
+    app: Option<&App>,
+    markdown: &str,
+    session_id: &str,
+    scroll_offset: usize,
+    area: Rect,
+) -> Vec<crate::app::ProgramActionLinkHit> {
+    let mut hits = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    if !surface_allows_extension(agentd_protocol::dialect::SURFACE_PROGRAM, "action-link") {
+        return hits;
+    }
+    let width = area.width as usize;
+    let viewport_end = scroll_offset.saturating_add(area.height as usize);
+    let mut visual_row_base = 0usize;
+    for raw in markdown.lines() {
+        if visual_row_base >= viewport_end {
+            break;
+        }
+        let rendered = program_rendered_line_text(app, raw);
+        let starts = program_wrap_row_starts(&rendered, width);
+        for link in scan_agentd_action_links(&rendered) {
+            let visual_start = UnicodeWidthStr::width(&rendered[..link.start]);
+            let visual_width = UnicodeWidthStr::width(&rendered[link.start..link.end]);
+            for (row, col_start, col_end) in program_visual_span_segments(
+                &starts,
+                visual_start,
+                visual_width,
+                width,
+                visual_row_base,
+                scroll_offset,
+                viewport_end,
+                area,
+            ) {
+                hits.push(crate::app::ProgramActionLinkHit {
+                    col_start,
+                    col_end,
+                    row,
+                    session_id: session_id.to_string(),
+                    action: agentd_protocol::UiAction {
+                        id: link.id.clone(),
+                        label: link.label.clone(),
+                        key: link.key.clone(),
+                        style: None,
+                        close: link.close,
+                    },
                 });
             }
         }
@@ -11339,11 +11831,26 @@ fn render_program_markdown_lines<'a>(
     search_matches: Option<&'a [(usize, usize)]>,
     search_selected: Option<usize>,
 ) -> Vec<Line<'a>> {
+    // Action links are part of the shared dialect on the program surface too
+    // (spec 0074); consult the registry rather than hardcoding it, so a
+    // future restriction lands here without a code change.
+    let action_links_enabled =
+        surface_allows_extension(agentd_protocol::dialect::SURFACE_PROGRAM, "action-link");
     let mut out = Vec::new();
     let mut line_start = 0usize;
     for raw in markdown.lines() {
         let trimmed = raw.trim();
         let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
+        // `[label](agentd:action/…)` char ranges on this line, in absolute
+        // buffer char offsets — the editor styles the literal source text as
+        // an interactive span (never collapsing it, so cursor math and
+        // editing stay untouched) and registers click hits separately via
+        // `program_action_link_hits`.
+        let action_ranges: Vec<(usize, usize)> = if action_links_enabled {
+            program_line_action_link_char_ranges(raw, line_start)
+        } else {
+            Vec::new()
+        };
         if trimmed.is_empty() {
             out.push(Line::from(""));
         } else if let Some(level) = program_heading_level(trimmed) {
@@ -11361,24 +11868,62 @@ fn render_program_markdown_lines<'a>(
                 search_matches,
                 search_selected,
             ));
+        } else if is_timeline_open(trimmed) {
+            // Timeline fences render dim, like clip fences; the items between
+            // them are ordinary checklist lines and get the shared glyph
+            // colors below — one visual line per source line, no connector
+            // rows (this is an editable surface with cursor mapping).
+            out.push(Line::from(program_text_spans(
+                &app.theme,
+                raw,
+                line_start,
+                Style::default().fg(app.theme.dim),
+                selection,
+                search_matches,
+                search_selected,
+                &[],
+            )));
         } else if let Some((_, rest)) = program_list_item_content(raw) {
             // Nesting is encoded as leading spaces on the source line; render it
             // as proportional indentation before the bullet so deeper items sit
             // visibly further right than their parents. `rest` keeps any trailing
             // whitespace so a space typed at the end of the bullet paints a cell
-            // for the cursor to land on.
+            // for the cursor to land on. Checklist markers get the same glyph
+            // color treatment the widget surface uses ([x] done, [~] active,
+            // [!] blocked, [ ] todo) while keeping the source text literal.
+            let mark = checklist_mark_prefix(rest.trim_start()).map(|(mark, _)| mark);
+            let (bullet_style, base_style) = match mark {
+                Some(mark) => {
+                    let (color, bold) = checklist_mark_style(mark, &app.theme);
+                    let mut style = Style::default().fg(color);
+                    if bold {
+                        style = style.add_modifier(Modifier::BOLD);
+                    }
+                    (style, style)
+                }
+                None => (
+                    Style::default().fg(app.theme.accent),
+                    Style::default().fg(app.theme.text),
+                ),
+            };
             let bullet = format!("{}  • ", " ".repeat(leading));
-            let mut spans = vec![Span::styled(bullet, Style::default().fg(app.theme.accent))];
+            let mut spans = vec![Span::styled(bullet, bullet_style)];
             spans.extend(render_program_inline_spans(
                 app,
                 rest,
                 line_start + leading + 2,
+                base_style,
                 selection,
                 search_matches,
                 search_selected,
+                &action_ranges,
             ));
             out.push(Line::from(spans));
         } else if let Some(rest) = trimmed.strip_prefix(":::clip") {
+            // Every clip fence renders as an inert chip on this surface —
+            // program-section projection is widget-only per the dialect
+            // registry's recorded restriction, so `:::clip program` never
+            // recurses here.
             out.push(Line::from(vec![
                 Span::raw("  "),
                 program_chip_span(
@@ -11392,19 +11937,49 @@ fn render_program_markdown_lines<'a>(
                 "  end clip",
                 Style::default().fg(app.theme.dim),
             )));
+        } else if trimmed.contains('|') && is_delimiter_row(trimmed) {
+            // GFM table delimiter rows render dim; content rows stay plain
+            // text (full table layout is out of scope for the editor — one
+            // visual line per source line).
+            out.push(Line::from(program_text_spans(
+                &app.theme,
+                raw,
+                line_start,
+                Style::default().fg(app.theme.dim),
+                selection,
+                search_matches,
+                search_selected,
+                &[],
+            )));
         } else {
             out.push(Line::from(render_program_inline_spans(
                 app,
                 raw,
                 line_start,
+                Style::default().fg(app.theme.text),
                 selection,
                 search_matches,
                 search_selected,
+                &action_ranges,
             )));
         }
         line_start += raw.chars().count() + 1;
     }
     out
+}
+
+/// Absolute buffer char ranges (matching the selection/search coordinate
+/// space) of every `[label](agentd:action/…)` construct on `raw`, whose
+/// first char sits at buffer char offset `line_start`.
+fn program_line_action_link_char_ranges(raw: &str, line_start: usize) -> Vec<(usize, usize)> {
+    scan_agentd_action_links(raw)
+        .into_iter()
+        .map(|link| {
+            let start_chars = raw[..link.start].chars().count();
+            let end_chars = raw[..link.end].chars().count();
+            (line_start + start_chars, line_start + end_chars)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -11413,6 +11988,34 @@ pub(crate) fn render_program_markdown_lines_for_test<'a>(
     markdown: &'a str,
 ) -> Vec<Line<'a>> {
     render_program_markdown_lines(app, markdown, None, None, None)
+}
+
+/// Widget-surface renderer entry point for tests outside this module (the
+/// app-level tests exercising live chip status and program projections).
+#[cfg(test)]
+pub(crate) fn render_agentd_markdown_lines_for_test(
+    app: Option<&App>,
+    markdown: &str,
+    theme: &Theme,
+    area: Rect,
+    session_id: Option<&str>,
+    wanted_programs: &mut Vec<String>,
+) -> Vec<Line<'static>> {
+    let mut hits = Vec::new();
+    let mut url_hits = Vec::new();
+    render_agentd_markdown_lines(
+        app,
+        markdown,
+        theme,
+        None,
+        area,
+        session_id,
+        Some("panel"),
+        &mut hits,
+        &mut url_hits,
+        false,
+        wanted_programs,
+    )
 }
 
 fn program_heading_level(trimmed: &str) -> Option<u8> {
@@ -11450,6 +12053,7 @@ fn render_program_heading_line<'a>(
         selection,
         search_matches,
         search_selected,
+        &[],
     ))
 }
 
@@ -11457,9 +12061,11 @@ fn render_program_inline_spans<'a>(
     app: &App,
     text: &'a str,
     base: usize,
+    base_style: Style,
     selection: Option<(usize, usize)>,
     search_matches: Option<&'a [(usize, usize)]>,
     search_selected: Option<usize>,
+    action_ranges: &[(usize, usize)],
 ) -> Vec<Span<'a>> {
     let mut spans = Vec::new();
     let mut rest = text;
@@ -11471,10 +12077,11 @@ fn render_program_inline_spans<'a>(
                 &app.theme,
                 before,
                 base + offset,
-                Style::default().fg(app.theme.text),
+                base_style,
                 selection,
                 search_matches,
                 search_selected,
+                action_ranges,
             ));
         }
         let after_marker = &after_start[2..];
@@ -11483,10 +12090,11 @@ fn render_program_inline_spans<'a>(
                 &app.theme,
                 after_start,
                 base + offset + before.chars().count(),
-                Style::default().fg(app.theme.text),
+                base_style,
                 selection,
                 search_matches,
                 search_selected,
+                action_ranges,
             ));
             return spans;
         };
@@ -11502,7 +12110,8 @@ fn render_program_inline_spans<'a>(
         });
         let clip_is_active_match = clip_match_idx.is_some_and(|idx| search_selected == Some(idx));
         spans.push(program_smart_clip_span(
-            app,
+            Some(app),
+            &app.theme,
             raw_clip,
             clip_match_idx.is_some(),
             clip_is_active_match,
@@ -11515,10 +12124,11 @@ fn render_program_inline_spans<'a>(
             &app.theme,
             rest,
             base + offset,
-            Style::default().fg(app.theme.text),
+            base_style,
             selection,
             search_matches,
             search_selected,
+            action_ranges,
         ));
     }
     spans
@@ -11532,12 +12142,14 @@ fn program_text_spans<'a>(
     selection: Option<(usize, usize)>,
     search_matches: Option<&'a [(usize, usize)]>,
     search_selected: Option<usize>,
+    action_ranges: &[(usize, usize)],
 ) -> Vec<Span<'a>> {
     let mut spans = Vec::new();
     let mut chunk = String::new();
     let mut chunk_selected: Option<bool> = None;
     let mut chunk_in_match: Option<bool> = None;
     let mut chunk_in_active_match: Option<bool> = None;
+    let mut chunk_in_action: Option<bool> = None;
     for (idx, ch) in text.chars().enumerate() {
         let absolute_idx = base + idx;
         let match_idx =
@@ -11547,9 +12159,15 @@ fn program_text_spans<'a>(
             Some(search_selected.is_some_and(|selected| Some(selected) == match_idx));
         let selected = selection
             .map(|(sel_start, sel_end)| absolute_idx >= sel_start && absolute_idx < sel_end);
+        let in_action = Some(
+            action_ranges
+                .iter()
+                .any(|&(start, end)| absolute_idx >= start && absolute_idx < end),
+        );
         if chunk_selected.is_some_and(|current| Some(current) != selected)
             || chunk_in_match.is_some_and(|current| Some(current) != in_match)
             || chunk_in_active_match.is_some_and(|current| Some(current) != in_active_match)
+            || chunk_in_action.is_some_and(|current| Some(current) != in_action)
         {
             if !chunk.is_empty() {
                 spans.push(Span::styled(
@@ -11560,6 +12178,7 @@ fn program_text_spans<'a>(
                         chunk_selected,
                         chunk_in_match,
                         chunk_in_active_match,
+                        chunk_in_action,
                     ),
                 ));
             }
@@ -11567,6 +12186,7 @@ fn program_text_spans<'a>(
         chunk_selected = selected;
         chunk_in_match = in_match;
         chunk_in_active_match = in_active_match;
+        chunk_in_action = in_action;
         chunk.push(ch);
     }
     if !chunk.is_empty() {
@@ -11578,6 +12198,7 @@ fn program_text_spans<'a>(
                 chunk_selected,
                 chunk_in_match,
                 chunk_in_active_match,
+                chunk_in_action,
             ),
         ));
     }
@@ -11590,7 +12211,16 @@ fn program_text_span_style(
     selected: Option<bool>,
     in_match: Option<bool>,
     in_active_match: Option<bool>,
+    in_action: Option<bool>,
 ) -> Style {
+    // Action links read as interactive affordances (accent + underline, the
+    // widget surface's link language) while keeping the source text literal;
+    // search/selection backgrounds still overlay them below.
+    if in_action.unwrap_or(false) {
+        style = style
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
     if in_active_match.unwrap_or(false) {
         style = style
             .fg(theme.highlight_fg)
@@ -11612,43 +12242,48 @@ fn program_search_match_index(matches: &[(usize, usize)], idx: usize) -> Option<
         .find_map(|(i, &(start, end))| (idx >= start && idx < end).then_some(i))
 }
 
+/// The ONE smart-clip chip builder (spec 0074): both the program surface and
+/// the widget surface render `@{…}` typed references through this function,
+/// so a session chip carries the same label, live status color, and
+/// missing-reference strike-through everywhere. Without an `App` (measuring
+/// paths, tests) it degrades to an inert chip with a static label — "not
+/// loaded yet" rather than "deleted".
 fn program_smart_clip_span<'a>(
-    app: &App,
+    app: Option<&App>,
+    theme: &Theme,
     raw_clip: &str,
     in_match: bool,
     is_active_match: bool,
 ) -> Span<'a> {
-    let (kind, label) = program_smart_clip_label(Some(app), raw_clip);
+    let (kind, label) = program_smart_clip_label(app, raw_clip);
     let mut modifier = Modifier::BOLD;
-    let bg = if is_active_match {
-        app.theme.highlight_bg
-    } else if in_match {
-        app.theme.highlight_bg
+    let bg = if is_active_match || in_match {
+        theme.highlight_bg
     } else {
         match kind {
-            "session" => {
-                let status = program_session_clip_status(app, raw_clip);
-                if status.is_none() {
-                    // A dead reference reads as struck-through, not just
-                    // recolored, so it's unmistakable at a glance.
-                    modifier |= Modifier::CROSSED_OUT;
-                } else if program_session_chip_is_dimmed(status) {
-                    modifier |= Modifier::DIM;
+            "session" => match app {
+                Some(app) => {
+                    let status = program_session_clip_status(app, raw_clip);
+                    if status.is_none() {
+                        // A dead reference reads as struck-through, not just
+                        // recolored, so it's unmistakable at a glance.
+                        modifier |= Modifier::CROSSED_OUT;
+                    } else if program_session_chip_is_dimmed(status) {
+                        modifier |= Modifier::DIM;
+                    }
+                    program_session_chip_bg(theme, status)
                 }
-                program_session_chip_bg(&app.theme, status)
-            }
-            "harness" => app.theme.harness,
-            "session-response" => app.theme.info,
-            _ => app.theme.inactive_highlight_bg,
+                None => theme.muted,
+            },
+            "harness" => theme.harness,
+            "session-response" => theme.info,
+            _ => theme.inactive_highlight_bg,
         }
     };
-    let mut style = Style::default()
-        .fg(app.theme.highlight_fg)
+    let style = Style::default()
+        .fg(theme.highlight_fg)
         .bg(bg)
         .add_modifier(modifier);
-    if is_active_match {
-        style = style.fg(app.theme.highlight_fg);
-    }
     Span::styled(format!(" {} ", label), style)
 }
 
@@ -13039,6 +13674,7 @@ mod tests {
             None,
             Some(&[(0, 5), (6, 11)]),
             Some(1),
+            &[],
         );
         let mut inactive_highlight = false;
         let mut active_highlight = false;
@@ -13642,7 +14278,9 @@ mod tests {
         let mut hits = Vec::new();
         let mut url_hits = Vec::new();
         let markdown = "# Timeline demo\n\n:::timeline\n- [~] [Start demo](agentd:action/start-demo?key=d)\n  - [x] Prepare demo workspace\n    - [ ] Record demo\n- [ ] [Run checks](agentd:action/run-checks?key=r)\n- Plain milestone\n:::";
+        let mut wanted = Vec::new();
         let lines = render_agentd_markdown_lines(
+            None,
             markdown,
             &Theme::default(),
             None,
@@ -13652,6 +14290,7 @@ mod tests {
             &mut hits,
             &mut url_hits,
             true,
+            &mut wanted,
         );
         let rendered: Vec<_> = lines.iter().map(line_text).collect();
         assert!(rendered
@@ -13681,7 +14320,9 @@ mod tests {
         let mut hits = Vec::new();
         let mut url_hits = Vec::new();
         let markdown = "- [x] [Run checks](agentd:action/run-checks?key=r) and [Start demo](agentd:action/start-demo)";
+        let mut wanted = Vec::new();
         let lines = render_agentd_markdown_lines(
+            None,
             markdown,
             &Theme::default(),
             None,
@@ -13691,6 +14332,7 @@ mod tests {
             &mut hits,
             &mut url_hits,
             false,
+            &mut wanted,
         );
         assert_eq!(line_text(&lines[0]), "✓ [r] Run checks and Start demo");
         assert_eq!(hits.len(), 2);
@@ -13709,7 +14351,9 @@ mod tests {
         let mut hits = Vec::new();
         let mut url_hits = Vec::new();
         let markdown = "See [docs](https://example.com/x) for details.";
+        let mut wanted = Vec::new();
         render_agentd_markdown_lines(
+            None,
             markdown,
             &Theme::default(),
             None,
@@ -13719,6 +14363,7 @@ mod tests {
             &mut hits,
             &mut url_hits,
             false,
+            &mut wanted,
         );
         assert!(
             hits.is_empty(),
@@ -13742,7 +14387,9 @@ mod tests {
         let mut hits = Vec::new();
         let mut url_hits = Vec::new();
         let markdown = "- [ ] visit [home](http://example.com)";
+        let mut wanted = Vec::new();
         render_agentd_markdown_lines(
+            None,
             markdown,
             &Theme::default(),
             None,
@@ -13752,6 +14399,7 @@ mod tests {
             &mut hits,
             &mut url_hits,
             false,
+            &mut wanted,
         );
         assert!(hits.is_empty());
         assert_eq!(url_hits.len(), 1);
@@ -13769,7 +14417,9 @@ mod tests {
         let mut hits = Vec::new();
         let mut url_hits = Vec::new();
         let markdown = "[Run](agentd:action/run)\n\nSee [docs](https://example.com) for details.";
+        let mut wanted = Vec::new();
         render_agentd_markdown_lines(
+            None,
             markdown,
             &Theme::default(),
             None,
@@ -13779,6 +14429,7 @@ mod tests {
             &mut hits,
             &mut url_hits,
             false,
+            &mut wanted,
         );
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].action.id, "run");
@@ -13795,7 +14446,9 @@ mod tests {
         let mut hits = Vec::new();
         let mut url_hits = Vec::new();
         let markdown = "[email](mailto:me@example.com) and [file](file:///etc/passwd)";
+        let mut wanted = Vec::new();
         render_agentd_markdown_lines(
+            None,
             markdown,
             &Theme::default(),
             None,
@@ -13805,9 +14458,291 @@ mod tests {
             &mut hits,
             &mut url_hits,
             false,
+            &mut wanted,
         );
         assert!(hits.is_empty());
         assert!(url_hits.is_empty());
+    }
+
+    /// Spec 0074: the widget surface renders inline `@{…}` typed references
+    /// through the same chip builder the program surface uses. Without an
+    /// App the chip degrades to a static label but still reads as a chip
+    /// (bold, colored background), and the surrounding text stays intact.
+    #[test]
+    fn widget_markdown_renders_session_smart_clip_chip() {
+        let theme = Theme::default();
+        let mut hits = Vec::new();
+        let mut url_hits = Vec::new();
+        let mut wanted = Vec::new();
+        let lines = render_agentd_markdown_lines(
+            None,
+            "worker: @{session:s1} live",
+            &theme,
+            None,
+            Rect::new(0, 0, 80, 10),
+            Some("owner"),
+            Some("panel"),
+            &mut hits,
+            &mut url_hits,
+            false,
+            &mut wanted,
+        );
+        assert_eq!(lines.len(), 1);
+        let chip = lines[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == " session s1 ")
+            .expect("smart-clip chip span");
+        assert!(chip.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(chip.style.bg, Some(theme.muted));
+        let text = line_text(&lines[0]);
+        assert!(text.contains("worker:"), "{text:?}");
+        assert!(text.contains("live"), "{text:?}");
+    }
+
+    /// A smart clip inside a checklist item renders as a chip too — the
+    /// checkline path routes through the same inline widget span renderer.
+    #[test]
+    fn widget_checklist_line_renders_smart_clip_chip() {
+        let mut hits = Vec::new();
+        let mut url_hits = Vec::new();
+        let mut wanted = Vec::new();
+        let lines = render_agentd_markdown_lines(
+            None,
+            "- [~] deploy @{session:abc}",
+            &Theme::default(),
+            None,
+            Rect::new(0, 0, 80, 10),
+            Some("owner"),
+            Some("panel"),
+            &mut hits,
+            &mut url_hits,
+            false,
+            &mut wanted,
+        );
+        assert!(lines[0]
+            .spans
+            .iter()
+            .any(|span| span.content.as_ref() == " session abc "));
+        assert!(line_text(&lines[0]).contains("◉ deploy"));
+    }
+
+    #[test]
+    fn program_section_projection_extracts_named_section() {
+        let md = "# Plan\nintro\n## Progress\n- [x] step one\n### Detail\nnested\n## Next\nrest";
+        assert_eq!(
+            program_section_projection(md, Some("Progress")).as_deref(),
+            Some("## Progress\n- [x] step one\n### Detail\nnested"),
+            "a section projects its heading plus content up to the next \
+             same-or-higher-level heading, keeping deeper subsections"
+        );
+    }
+
+    #[test]
+    fn program_section_projection_matches_case_insensitively() {
+        let md = "## Progress\n- [ ] todo\n## Next\nrest";
+        assert_eq!(
+            program_section_projection(md, Some("progress")).as_deref(),
+            Some("## Progress\n- [ ] todo")
+        );
+    }
+
+    #[test]
+    fn program_section_projection_without_section_is_whole_document() {
+        let md = "# Plan\nintro\n## Progress\ndone";
+        assert_eq!(program_section_projection(md, None).as_deref(), Some(md));
+    }
+
+    #[test]
+    fn program_section_projection_missing_section_is_none() {
+        let md = "# Plan\nintro";
+        assert_eq!(program_section_projection(md, Some("Progress")), None);
+    }
+
+    /// A widget `:::clip program` with no cached program renders the chip, a
+    /// dim loading line, and the dim end line — never blocking the render
+    /// loop on a fetch.
+    #[test]
+    fn widget_clip_program_renders_loading_placeholder_without_cache() {
+        let mut hits = Vec::new();
+        let mut url_hits = Vec::new();
+        let mut wanted = Vec::new();
+        let lines = render_agentd_markdown_lines(
+            None,
+            ":::clip program\nsection=\"Progress\"\n:::\nafter",
+            &Theme::default(),
+            None,
+            Rect::new(0, 0, 80, 10),
+            Some("owner"),
+            Some("panel"),
+            &mut hits,
+            &mut url_hits,
+            false,
+            &mut wanted,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(rendered[0].contains("clip program"), "{rendered:?}");
+        assert!(rendered[1].contains("loading program…"), "{rendered:?}");
+        assert!(rendered[2].contains("end clip"), "{rendered:?}");
+        assert_eq!(rendered[3], "after", "{rendered:?}");
+        // The attribute line was consumed by the block, not rendered as text.
+        assert!(
+            !rendered.iter().any(|l| l.contains("section=")),
+            "{rendered:?}"
+        );
+    }
+
+    /// Recursion guard: inside a projection (depth > 0) a `:::clip program`
+    /// block renders as an inert chip — it never projects again, so a
+    /// program embedding a program clip cannot recurse.
+    #[test]
+    fn widget_clip_program_inside_projection_renders_inert_chip() {
+        let mut hits = Vec::new();
+        let mut url_hits = Vec::new();
+        let mut wanted = Vec::new();
+        let lines = render_agentd_markdown_lines_at_depth(
+            None,
+            ":::clip program\nsection=\"Progress\"\n:::",
+            &Theme::default(),
+            None,
+            Rect::new(0, 0, 80, 10),
+            Some("owner"),
+            Some("panel"),
+            &mut hits,
+            &mut url_hits,
+            false,
+            &mut wanted,
+            1,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(rendered[0].contains("clip program"), "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|l| l.contains("loading program…")),
+            "a nested program clip must not try to project: {rendered:?}"
+        );
+        assert!(wanted.is_empty(), "no fetch for a nested program clip");
+    }
+
+    /// Non-program clip blocks in widgets render as the program surface
+    /// renders them: chip fence line, body as ordinary lines, dim end line.
+    #[test]
+    fn widget_clip_fence_of_other_types_renders_chip_and_end_line() {
+        let mut hits = Vec::new();
+        let mut url_hits = Vec::new();
+        let mut wanted = Vec::new();
+        let lines = render_agentd_markdown_lines(
+            None,
+            ":::clip task\nbody text\n:::",
+            &Theme::default(),
+            None,
+            Rect::new(0, 0, 80, 10),
+            Some("owner"),
+            Some("panel"),
+            &mut hits,
+            &mut url_hits,
+            false,
+            &mut wanted,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(rendered[0].contains("clip task"), "{rendered:?}");
+        assert!(rendered[1].contains("body text"), "{rendered:?}");
+        assert!(rendered[2].contains("end clip"), "{rendered:?}");
+        assert!(wanted.is_empty());
+    }
+
+    #[test]
+    fn scan_agentd_action_links_reports_ranges_and_targets() {
+        let line = "run [Re-run checks](agentd:action/run-checks?key=r&close=1) now";
+        let links = scan_agentd_action_links(line);
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        assert_eq!(
+            &line[link.start..link.end],
+            "[Re-run checks](agentd:action/run-checks?key=r&close=1)"
+        );
+        assert_eq!(link.label, "Re-run checks");
+        assert_eq!(link.id, "run-checks");
+        assert_eq!(link.key.as_deref(), Some("r"));
+        assert!(link.close);
+    }
+
+    /// Program surface action links: the literal source text is styled as an
+    /// interactive span (accent, bold, underlined) without collapsing it —
+    /// the editor keeps its cursor math — while surrounding text stays plain.
+    #[test]
+    fn program_text_spans_style_action_ranges_as_interactive() {
+        let theme = Theme::default();
+        let raw = "run [Go](agentd:action/go) now";
+        let ranges = program_line_action_link_char_ranges(raw, 0);
+        assert_eq!(ranges, vec![(4, 26)]);
+        let spans = program_text_spans(
+            &theme,
+            raw,
+            0,
+            Style::default().fg(theme.text),
+            None,
+            None,
+            None,
+            &ranges,
+        );
+        let link = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "[Go](agentd:action/go)")
+            .expect("action-link span");
+        assert_eq!(link.style.fg, Some(theme.accent));
+        assert!(link.style.add_modifier.contains(Modifier::BOLD));
+        assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
+        let plain = spans
+            .iter()
+            .find(|span| span.content.as_ref() == "run ")
+            .expect("plain prefix span");
+        assert_eq!(plain.style.fg, Some(theme.text));
+        assert!(!plain.style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// Program surface action links are clickable: hits register through the
+    /// same wrap-aware geometry as smart-clip hits, carrying the parsed
+    /// `UiAction` and the program's owning session id.
+    #[test]
+    fn program_action_link_hits_map_click_geometry() {
+        let area = Rect::new(0, 0, 80, 6);
+        let hits =
+            program_action_link_hits(None, "run [Go](agentd:action/go?key=g) now", "sess", 0, area);
+        assert_eq!(hits.len(), 1);
+        let hit = &hits[0];
+        assert_eq!(hit.session_id, "sess");
+        assert_eq!(hit.action.id, "go");
+        assert_eq!(hit.action.key.as_deref(), Some("g"));
+        assert_eq!(hit.row, 0);
+        assert_eq!(hit.col_start, 4);
+        assert_eq!(
+            hit.col_end,
+            4 + "[Go](agentd:action/go?key=g)".len() as u16,
+            "the hit covers the literal source construct"
+        );
+        assert!(hit.contains(hit.col_start, 0));
+        assert!(!hit.contains(hit.col_end, 0));
+    }
+
+    #[test]
+    fn checklist_mark_prefix_classifies_shared_markers() {
+        assert_eq!(
+            checklist_mark_prefix("[x] done"),
+            Some((ChecklistMark::Done, "done"))
+        );
+        assert_eq!(
+            checklist_mark_prefix("[~] active"),
+            Some((ChecklistMark::Active, "active"))
+        );
+        assert_eq!(
+            checklist_mark_prefix("[!] blocked"),
+            Some((ChecklistMark::Blocked, "blocked"))
+        );
+        assert_eq!(
+            checklist_mark_prefix("[ ] todo"),
+            Some((ChecklistMark::Todo, "todo"))
+        );
+        assert_eq!(checklist_mark_prefix("plain"), None);
     }
 
     #[test]
@@ -14594,7 +15529,7 @@ mod tests {
         // top + bottom borders plus at least one content line, so an empty
         // widget doesn't render as just a single fused border).
         let panel = widget("");
-        let h = inline_widget_rows(&panel, 40, 50, &Theme::default());
+        let h = inline_widget_rows(None, &panel, None, 40, 50, &Theme::default());
         assert_eq!(h, 3);
     }
 
@@ -14606,8 +15541,8 @@ mod tests {
         let long = "x".repeat(200);
         let panel = widget(&long);
         let theme = Theme::default();
-        let narrow = inline_widget_rows(&panel, 40, 50, &theme);
-        let wide = inline_widget_rows(&panel, 220, 50, &theme);
+        let narrow = inline_widget_rows(None, &panel, None, 40, 50, &theme);
+        let wide = inline_widget_rows(None, &panel, None, 220, 50, &theme);
         assert!(
             narrow > wide,
             "narrow panel should need more rows (wrapping): narrow={narrow} wide={wide}"
@@ -14619,7 +15554,7 @@ mod tests {
     fn inline_widget_rows_caps_at_available_height() {
         let huge = "line\n".repeat(500);
         let panel = widget(&huge);
-        let h = inline_widget_rows(&panel, 40, 12, &Theme::default());
+        let h = inline_widget_rows(None, &panel, None, 40, 12, &Theme::default());
         assert_eq!(h, 12, "must never exceed available_height");
     }
 
