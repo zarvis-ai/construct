@@ -63,7 +63,7 @@ impl App {
                     )
                 };
                 self.minibuffer = Some(Minibuffer {
-                    prompt: format!("{verb} session {}? (y/N): ", short_id(&session_id)),
+                    prompt: format!("{verb} session {}? ", short_id(&session_id)),
                     input: String::new(),
                     cursor: 0,
                     intent,
@@ -73,7 +73,7 @@ impl App {
             SessionTitleMenuAction::Delete => {
                 self.minibuffer = Some(Minibuffer {
                     prompt: format!(
-                        "Delete session {}? This drops transcript + worktree. (y/N): ",
+                        "Delete session {}? This drops transcript + worktree. ",
                         short_id(&session_id)
                     ),
                     input: String::new(),

@@ -1,7 +1,8 @@
 use super::{
-    list_session_indent_cells, App, ListItem, MatrixWidgetHitKind, MinibufferIntent, PaneFocus,
-    SESSION_LIST_H_MIN,
+    list_session_indent_cells, App, ListItem, MatrixWidgetHitKind, MinibufferChoiceAction,
+    MinibufferIntent, PaneFocus, SESSION_LIST_H_MIN,
 };
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 impl App {
     pub(super) fn is_on_matrix_rain_title_bar(&self, col: u16, row: u16) -> bool {
@@ -51,9 +52,6 @@ impl App {
 
     pub(super) async fn click_minibuffer(&mut self, mb_area: ratatui::layout::Rect, col: u16) {
         if let Some(mb) = self.minibuffer.as_mut() {
-            if matches!(mb.intent, MinibufferIntent::ApproveTool { .. }) {
-                return;
-            }
             // Harness picker: clicking an available name submits it
             // as if the user typed and pressed Enter. Unavailable
             // names are visually disabled (strikethrough); clicks
@@ -76,6 +74,32 @@ impl App {
                         self.run_minibuffer_submit(intent, hit.name).await;
                         return;
                     }
+                }
+            }
+            // Confirm/approval choice clusters (spec 0075: `y`/`N`,
+            // `d`/`a`/`N`, `y=approve`/`n=deny`/..., ...). A click on a
+            // rendered choice label dispatches exactly as the matching
+            // keypress would, through whichever of the two keyboard
+            // mechanisms the intent already uses — never a third,
+            // click-only decision path. This replaces the previous
+            // blanket no-op for `ApproveTool` with real per-choice
+            // handling, and is the only place any of these intents gets
+            // mouse support at all.
+            let choice_hits = self.layout.minibuffer_choice_hits.clone();
+            for hit in choice_hits {
+                if hit.y == mb_area.y && col >= hit.x_start && col < hit.x_end {
+                    match hit.action {
+                        MinibufferChoiceAction::Key(c) => {
+                            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+                            self.handle_minibuffer_key(key).await;
+                        }
+                        MinibufferChoiceAction::Submit(choice) => {
+                            let intent = mb.intent.clone();
+                            self.minibuffer = None;
+                            self.run_minibuffer_submit(intent, choice).await;
+                        }
+                    }
+                    return;
                 }
             }
             let prompt_w = unicode_width::UnicodeWidthStr::width(mb.prompt.as_str()) as u16;

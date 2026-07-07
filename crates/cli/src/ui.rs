@@ -2,9 +2,10 @@
 
 use crate::app::{
     harness_guidance, smith_method_guidance, App, ConfigureTab, HarnessHit, HintZone,
-    ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferIntent, PaneFocus, ScreenPoint,
-    Selection, SessionTitleMenuAction, TextSelectionRange, ViewMode, WindowDividerHit,
-    WindowPaneHit, WindowSplitDirection, ZoomMode, CONFIGURE_TABS, PROGRAM_COLLAB_CURSOR_TTL_MS,
+    ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferChoiceAction,
+    MinibufferChoiceHit, MinibufferIntent, PaneFocus, ScreenPoint, Selection,
+    SessionTitleMenuAction, TextSelectionRange, ViewMode, WindowDividerHit, WindowPaneHit,
+    WindowSplitDirection, ZoomMode, CONFIGURE_TABS, PROGRAM_COLLAB_CURSOR_TTL_MS,
     PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y, PROGRAM_REVEAL_MS,
 };
 use crate::keymap::{KeyAction, Profile};
@@ -1204,6 +1205,214 @@ fn render_harness_picker(f: &mut Frame, area: Rect, app: &mut App, mb: &Minibuff
     f.render_widget(para, area);
     // Cursor on the input — same shape as the default minibuffer
     // render uses.
+    let cursor_x = input_x + mb.cursor as u16;
+    f.set_cursor_position(Position {
+        x: cursor_x,
+        y: area.y,
+    });
+}
+
+/// One piece of a minibuffer confirm prompt's choice-cluster suffix (spec
+/// 0075): either literal, non-clickable text, or a clickable choice label.
+/// `label` is always a `'static` literal — every choice offered by these
+/// prompts is a fixed keyboard shortcut, never user data.
+enum PromptPart {
+    Text(&'static str),
+    Choice {
+        label: &'static str,
+        action: MinibufferChoiceAction,
+    },
+}
+
+/// The clickable choice cluster appended after a confirm/approval prompt's
+/// data-dependent prefix (`mb.prompt`, built by whichever call site opened
+/// the minibuffer). Returns `None` for intents that don't offer per-choice
+/// clicks — those keep the default flat prompt+input rendering.
+///
+/// Each intent reuses whichever of the two keyboard mechanisms it already
+/// dispatches through (see `handle_minibuffer_key` / `run_minibuffer_submit`
+/// in `app/minibuffer.rs`): `MinibufferChoiceAction::Key` for the
+/// single-keypress fast-path intents, `::Submit` for the typed-then-submit
+/// intents. This function only decides how the choice renders — never how
+/// it's decided.
+fn minibuffer_choice_suffix(intent: &MinibufferIntent) -> Option<Vec<PromptPart>> {
+    use MinibufferChoiceAction::{Key, Submit};
+    use MinibufferIntent::*;
+    Some(match intent {
+        // Single-keypress fast path, plain y/N.
+        RestartConfirm { .. } | RestartDaemonConfirm | UpgradeConfirm { .. } => vec![
+            PromptPart::Text("("),
+            PromptPart::Choice {
+                label: "y",
+                action: Key('y'),
+            },
+            PromptPart::Text("/"),
+            PromptPart::Choice {
+                label: "N",
+                action: Key('n'),
+            },
+            PromptPart::Text("): "),
+        ],
+        // Single-keypress fast path, tool approval. `a=auto-review` only
+        // appears when the daemon allowed it for this call.
+        ApproveTool {
+            allow_auto_review, ..
+        } => {
+            let mut parts = vec![
+                PromptPart::Choice {
+                    label: "y=approve",
+                    action: Key('y'),
+                },
+                PromptPart::Text("  "),
+                PromptPart::Choice {
+                    label: "n=deny",
+                    action: Key('n'),
+                },
+            ];
+            if *allow_auto_review {
+                parts.push(PromptPart::Text("  "));
+                parts.push(PromptPart::Choice {
+                    label: "a=auto-review",
+                    action: Key('a'),
+                });
+            }
+            parts.push(PromptPart::Text("  "));
+            parts.push(PromptPart::Choice {
+                label: "f=unsafe-auto",
+                action: Key('f'),
+            });
+            parts
+        }
+        // Typed-then-submit path, three choices with per-choice
+        // descriptions. Canonical letters only (`d`, not the `y` alias) —
+        // typing `y` still works, it just isn't a separate click target.
+        DeleteConfirm { .. } => vec![
+            PromptPart::Text("["),
+            PromptPart::Choice {
+                label: "d",
+                action: Submit("d".to_string()),
+            },
+            PromptPart::Text("] delete (drop transcript + worktree) / ["),
+            PromptPart::Choice {
+                label: "a",
+                action: Submit("a".to_string()),
+            },
+            PromptPart::Text("] archive (terminate, keep, hide) / ["),
+            PromptPart::Choice {
+                label: "N",
+                action: Submit("N".to_string()),
+            },
+            PromptPart::Text("] cancel: "),
+        ],
+        // Typed-then-submit path, three choices (orphan / cascade-delete /
+        // cancel). `all` requires the full word so a stray keystroke can't
+        // trigger the cascade — same click target.
+        GroupDeleteConfirm { .. } => vec![
+            PromptPart::Text("("),
+            PromptPart::Choice {
+                label: "y",
+                action: Submit("y".to_string()),
+            },
+            PromptPart::Text(" = orphan members / "),
+            PromptPart::Choice {
+                label: "all",
+                action: Submit("all".to_string()),
+            },
+            PromptPart::Text(" = delete sessions too / "),
+            PromptPart::Choice {
+                label: "N",
+                action: Submit("N".to_string()),
+            },
+            PromptPart::Text(" = cancel): "),
+        ],
+        // Typed-then-submit path, plain y/N.
+        ArchivedDeleteConfirm { .. }
+        | MenuArchiveConfirm { .. }
+        | MenuUnarchiveConfirm { .. }
+        | MenuDeleteConfirm { .. } => vec![
+            PromptPart::Text("("),
+            PromptPart::Choice {
+                label: "y",
+                action: Submit("y".to_string()),
+            },
+            PromptPart::Text("/"),
+            PromptPart::Choice {
+                label: "N",
+                action: Submit("N".to_string()),
+            },
+            PromptPart::Text("): "),
+        ],
+        _ => return None,
+    })
+}
+
+/// Render a confirm/approval minibuffer prompt with its choice cluster as
+/// individually clickable + hoverable spans, registering each one's column
+/// range in `app.layout.minibuffer_choice_hits` for `click_minibuffer` to
+/// dispatch. Mirrors `render_harness_picker`'s hover treatment (bold +
+/// underline on hover, plain underline otherwise) for a consistent
+/// clickable-affordance look across both minibuffer flavors.
+fn render_minibuffer_choices(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    mb: &Minibuffer,
+    parts: Vec<PromptPart>,
+) {
+    let mouse = app.mouse_pos;
+    let base_style = Style::default()
+        .fg(app.theme.info)
+        .add_modifier(Modifier::UNDERLINED);
+    let hover_style = Style::default()
+        .fg(app.theme.text)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(parts.len() + 4);
+    let mut col = area.x;
+
+    col += UnicodeWidthStr::width(mb.prompt.as_str()) as u16;
+    spans.push(Span::raw(mb.prompt.clone()));
+
+    for part in parts {
+        match part {
+            PromptPart::Text(s) => {
+                col += UnicodeWidthStr::width(s) as u16;
+                spans.push(Span::raw(s.to_string()));
+            }
+            PromptPart::Choice { label, action } => {
+                let w = UnicodeWidthStr::width(label) as u16;
+                let x_start = col;
+                let x_end = col + w;
+                let hovered = matches!(
+                    mouse,
+                    Some((mx, my)) if my == area.y && mx >= x_start && mx < x_end
+                );
+                spans.push(Span::styled(
+                    label.to_string(),
+                    if hovered { hover_style } else { base_style },
+                ));
+                app.layout.minibuffer_choice_hits.push(MinibufferChoiceHit {
+                    x_start,
+                    x_end,
+                    y: area.y,
+                    action,
+                });
+                col = x_end;
+            }
+        }
+    }
+
+    let input_x = col;
+    spans.push(Span::raw(mb.input.clone()));
+    if let Some(err) = &mb.error {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            err.clone(),
+            Style::default().fg(app.theme.danger),
+        ));
+    }
+    let para = Paragraph::new(Line::from(spans));
+    f.render_widget(para, area);
     let cursor_x = input_x + mb.cursor as u16;
     f.set_cursor_position(Position {
         x: cursor_x,
@@ -6663,6 +6872,7 @@ fn minibuffer_panel_height(preferred: Option<u16>, total_h: u16) -> u16 {
 
 fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.minibuffer_harness_hits.clear();
+    app.layout.minibuffer_choice_hits.clear();
 
     // Orchestrator panel: events above, input row at the bottom.
     if matches!(
@@ -6683,6 +6893,14 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         ) {
             let mb_clone = mb.clone();
             render_harness_picker(f, area, app, &mb_clone);
+            return;
+        }
+        // Confirm/approval prompts: render the y/N (or richer) choice
+        // cluster as clickable spans (spec 0075), same precedent as the
+        // harness picker above.
+        if let Some(parts) = minibuffer_choice_suffix(&mb.intent) {
+            let mb_clone = mb.clone();
+            render_minibuffer_choices(f, area, app, &mb_clone, parts);
             return;
         }
         let mut spans = vec![Span::raw(mb.prompt.clone()), Span::raw(mb.input.clone())];
