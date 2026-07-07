@@ -2078,6 +2078,7 @@ impl SessionManager {
             is_selection,
             params.shimmer.as_deref(),
             queued_behind_current_turn,
+            params.selection_block_ids.as_deref(),
         );
         self.broadcast_program_state(result.program.clone());
         let blocks = self.program_blocks_projection(&params.session_id, &result.program.markdown);
@@ -2152,13 +2153,20 @@ impl SessionManager {
 
         // Seed the run's pending set over every dispatched item now that every
         // subagent exists, so the response/active_run projection reflects the
-        // started run (spec 0042) even before the edit below lands.
+        // started run (spec 0042) even before the edit below lands. No
+        // `selection_block_ids` to thread here: `program_dispatch_plan` (this
+        // function's only caller) only ever matches when every re-parsed span
+        // is a whole list item containing exactly one `@{harness:<name>}`
+        // clip, which a strict partial-line/partial-block selection can never
+        // satisfy (the marker and/or clip would be cut off) — this path is
+        // unreachable for the substring-selection bug this param exists to fix.
         self.start_program_run_with_dispatch_state(
             session_id,
             body,
             true,
             Some(&vec![true; items.len()]),
             false,
+            None,
         );
 
         // The edit below broadcasts `program/state` after applying the
@@ -6702,6 +6710,7 @@ done
                 selection: None,
                 base_version: Some(update.program.version),
                 shimmer: None,
+                selection_block_ids: None,
             })
             .await
             .expect("execute");
@@ -6776,7 +6785,7 @@ done
         assert_eq!(narrowed.pending_block_refs, vec![a_ref.clone()]);
 
         let selection_run = mgr
-            .start_program_run_with_dispatch_state(&id, "# B\n", true, Some(&[true]), true)
+            .start_program_run_with_dispatch_state(&id, "# B\n", true, Some(&[true]), true, None)
             .expect("selection run");
 
         assert!(
@@ -6825,12 +6834,125 @@ done
             .clone();
 
         let run = mgr
-            .start_program_run_with_dispatch_state(&id, "# B\n", true, Some(&[true]), false)
+            .start_program_run_with_dispatch_state(&id, "# B\n", true, Some(&[true]), false, None)
             .expect("selection run");
 
         assert_eq!(run.pending_block_refs, vec![b_ref]);
         assert_eq!(run.total_block_count, 1);
         assert!(!run.agent_managed);
+    }
+
+    // The bug this fix addresses: selecting a strict SUBSTRING of a single
+    // line/block (not the whole line) and running it must resolve to the
+    // real block, not a phantom hash-of-substring id that matches nothing in
+    // the document (which is why it never shimmered). Without
+    // `selection_block_ids`, the daemon falls back to re-parsing the raw
+    // selected text and hash-matching, which misses on a partial-line
+    // selection; this asserts the improved fallback's second attempt (text
+    // containment against the saved blocks) still recovers the real block
+    // when exactly one candidate contains the substring.
+    #[tokio::test]
+    async fn program_partial_line_selection_without_ids_resolves_via_containment_fallback() {
+        let md = "Some long text here\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        let get = mgr.program_get(&id).await.expect("get");
+        let real_ref = get.blocks[0].id.clone();
+
+        let run = mgr
+            .start_program_run_with_dispatch_state(&id, "long text", true, None, false, None)
+            .expect("selection run");
+
+        assert_eq!(
+            run.pending_block_refs,
+            vec![real_ref],
+            "a partial-line selection should resolve to the real block via \
+             containment, not fabricate a phantom hash-of-substring id"
+        );
+    }
+
+    // The real fix: when the client supplies `selection_block_ids` (the
+    // overlap-based real block ids it computed locally), the daemon trusts
+    // that identity directly instead of re-parsing/hash-matching the raw
+    // selected substring at all.
+    #[tokio::test]
+    async fn program_partial_line_selection_with_explicit_ids_resolves_real_block() {
+        let md = "Some long text here\n";
+        let (mgr, _storage, id) = program_test_mgr(md).await;
+        let get = mgr.program_get(&id).await.expect("get");
+        let real_ref = get.blocks[0].id.clone();
+
+        let run = mgr
+            .start_program_run_with_dispatch_state(
+                &id,
+                "long text",
+                true,
+                None,
+                false,
+                Some(&[real_ref.clone()]),
+            )
+            .expect("selection run");
+
+        assert_eq!(run.pending_block_refs, vec![real_ref]);
+        assert_eq!(run.total_block_count, 1);
+    }
+
+    // The containment fallback is a heuristic, not a guarantee: when the
+    // selected substring appears in more than one real block, which real
+    // block it refers to is genuinely ambiguous without the client's overlap
+    // info, so this still falls back to a phantom scoped to the substring
+    // alone — a known limitation of running without `selection_block_ids`.
+    // Supplying the explicit id resolves it unambiguously regardless.
+    #[tokio::test]
+    async fn program_partial_line_selection_duplicate_content_ambiguous_without_ids() {
+        let md = "Some long text here\n\nAnother long text passage\n";
+
+        // Two independent sessions/managers: a selection run always adds to
+        // (rather than replaces) an already in-flight run for the same
+        // session (spec 0042), so the two scenarios below must not share one.
+        let (mgr_a, _storage_a, id_a) = program_test_mgr(md).await;
+        let get_a = mgr_a.program_get(&id_a).await.expect("get");
+        let first_ref = get_a
+            .blocks
+            .iter()
+            .find(|b| b.text.contains("Some long text here"))
+            .expect("first block")
+            .id
+            .clone();
+        let second_ref = get_a
+            .blocks
+            .iter()
+            .find(|b| b.text.contains("Another long text passage"))
+            .expect("second block")
+            .id
+            .clone();
+
+        let ambiguous = mgr_a
+            .start_program_run_with_dispatch_state(&id_a, "long text", true, None, false, None)
+            .expect("selection run");
+        assert!(
+            !ambiguous.pending_block_refs.contains(&first_ref)
+                && !ambiguous.pending_block_refs.contains(&second_ref),
+            "duplicate content is ambiguous without ids, so neither real block's \
+             ref should appear: {:?}",
+            ambiguous.pending_block_refs
+        );
+
+        let (mgr_b, _storage_b, id_b) = program_test_mgr(md).await;
+        let resolved = mgr_b
+            .start_program_run_with_dispatch_state(
+                &id_b,
+                "long text",
+                true,
+                None,
+                false,
+                Some(&[first_ref.clone()]),
+            )
+            .expect("selection run");
+        assert_eq!(
+            resolved.pending_block_refs,
+            vec![first_ref],
+            "explicit selection_block_ids resolves the ambiguity unambiguously"
+        );
     }
 
     #[tokio::test]
@@ -6900,7 +7022,7 @@ done
             .clone();
 
         let run = mgr
-            .start_program_run_with_dispatch_state(&id, edited, false, Some(&[true, true]), true)
+            .start_program_run_with_dispatch_state(&id, edited, false, Some(&[true, true]), true, None)
             .expect("explicit full re-run");
 
         assert!(
@@ -7877,7 +7999,7 @@ done
         );
 
         let run = mgr
-            .start_program_run_with_dispatch_state(&id, body, false, None, true)
+            .start_program_run_with_dispatch_state(&id, body, false, None, true, None)
             .expect("start queued run");
         assert_eq!(
             run.system_status.as_deref(),

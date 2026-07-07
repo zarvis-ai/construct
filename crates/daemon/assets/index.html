@@ -5638,6 +5638,35 @@ async function programSave() {
 
 // --- run (whole program, or the current selection) ---
 
+// The real block ids a selection overlaps, computed against the FULL
+// document (mirrors the TUI's App::selected_program_block_ids): a block's id
+// is included when the selection's whole-document character range [selStart,
+// selEnd) overlaps that block's line range, not by re-hashing the selected
+// substring's own text. That distinction matters for a selection that is a
+// strict substring of a single block (e.g. "long text" out of "Some long
+// text here") — the substring's own content hash never equals the real
+// block's (computed over the full line), so hashing the substring alone
+// fabricates a ghost id that matches nothing in the document and never
+// shimmers. Returns null for a collapsed/empty range.
+function programOverlapSelectedBlockIds(markdown, selStart, selEnd) {
+  if (selEnd <= selStart) return null;
+  const lineRanges = [];
+  let lineStart = 0;
+  for (const line of programLines(markdown)) {
+    const lineEnd = lineStart + programCharCount(line);
+    lineRanges.push([lineStart, lineEnd]);
+    lineStart = lineEnd + 1;
+  }
+  const ids = new Set();
+  for (const block of programBlockSpans(markdown)) {
+    const startRange = lineRanges[block.start_line];
+    const endRange = lineRanges[block.end_line - 1];
+    if (!startRange || !endRange) continue;
+    if (selStart < endRange[1] && selEnd > startRange[0]) ids.add(block.id);
+  }
+  return ids;
+}
+
 function programStartOptimisticRun(id, body, isSelection, selectedBlockIds, prevSaved) {
   const spans = programBlockSpans(body);
   const bodyIds = new Set(spans.map((b) => b.id));
@@ -5705,6 +5734,12 @@ async function programRun() {
   const selMarkdown = programSelectionMarkdown();
   const hasSel = selMarkdown != null && selMarkdown.trim() !== "";
   const prevSaved = doc.saved || "";
+  // Captured now (pre-save, same snapshot `selMarkdown` itself is pinned to)
+  // because `programSave()` below can rebuild the editor DOM and collapse the
+  // live browser selection — there's no reliable post-save equivalent to
+  // recompute this from, unlike the TUI's in-memory selection model.
+  const selOffsetsPreSave = hasSel ? programSelectionOffsets() : null;
+  const fullMarkdownPreSave = programSerialize();
 
   // Run overlap/idempotency guard (spec 0042 consequence). The Run button
   // and the Ctrl+Enter keybinding can both fire for one physical gesture,
@@ -5732,7 +5767,19 @@ async function programRun() {
   let selection = null, selectedBlockIds = null;
   if (hasSel) {
     selection = programNormalizeClipIds(selMarkdown);
-    selectedBlockIds = new Set(programBlockSpans(selection).map((b) => b.id));
+    if (selOffsetsPreSave) {
+      selectedBlockIds = programOverlapSelectedBlockIds(
+        fullMarkdownPreSave,
+        Math.min(selOffsetsPreSave.anchor, selOffsetsPreSave.head),
+        Math.max(selOffsetsPreSave.anchor, selOffsetsPreSave.head),
+      );
+    }
+    // Fallback (known limitation, matches the daemon's own legacy path):
+    // hashing the substring alone only identifies a real block when the
+    // selection happens to span one or more whole blocks exactly.
+    if (!selectedBlockIds || !selectedBlockIds.size) {
+      selectedBlockIds = new Set(programBlockSpans(selection).map((b) => b.id));
+    }
   }
   const runBody = hasSel ? selection : programSerialize();
   const optimistic = programStartOptimisticRun(id, runBody, hasSel, selectedBlockIds, prevSaved);
@@ -5741,6 +5788,7 @@ async function programRun() {
   try {
     const params = { session_id: id, base_version: doc.version };
     if (selection != null) params.selection = selection;
+    if (selectedBlockIds && selectedBlockIds.size) params.selection_block_ids = Array.from(selectedBlockIds);
     if (optimistic && optimistic.shimmer && optimistic.shimmer.length) params.shimmer = optimistic.shimmer;
     const result = await rpc("program.execute", params);
     // Dispatch landed: start the debounce window rather than clearing the

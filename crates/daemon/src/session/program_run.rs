@@ -18,6 +18,42 @@ fn program_block_ids(
         .collect()
 }
 
+/// Resolve a selection Run's blocks from the client-supplied
+/// `selection_block_ids` (spec 0053 consequence, partial-selection fix): each
+/// id is matched against a saved block's stable ref/id or its content id.
+/// Ids that no longer exist (the document changed underneath the caller) are
+/// silently dropped rather than fabricated — the caller falls back to an
+/// empty/short result the same way an unresolvable span would. Document order
+/// is preserved by iterating `saved_blocks`, matching the ordering guarantee
+/// callers rely on for an explicit initial pending declaration.
+fn program_run_blocks_from_ids(
+    ids: &[String],
+    saved_blocks: &[agentd_protocol::ProgramBlockView],
+) -> Vec<agentd_protocol::ProgramBlockView> {
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    saved_blocks
+        .iter()
+        .filter(|block| {
+            wanted.contains(block_ref_or_id(block).as_str())
+                || wanted.contains(block.content_id.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Legacy fallback for when no `selection_block_ids` were supplied: re-parse
+/// the raw selected text as its own standalone Markdown document and match
+/// each resulting span's content-hash against the real document's saved
+/// blocks. This only works precisely when the selection exactly spans one or
+/// more whole blocks. When it's a strict substring of a single block (e.g. a
+/// partial-line selection), the substring's own content-hash never equals the
+/// real block's (computed over the full block text), so the exact-hash lookup
+/// misses; as a second attempt, fall back to text containment — if exactly
+/// one saved block's text contains the span's (trimmed) text, trust that
+/// match. Containment is ambiguous (zero or multiple candidates) when the
+/// document repeats the same text in more than one block, in which case this
+/// still fabricates a phantom block scoped to just the selected substring —
+/// a known limitation of running without `selection_block_ids`.
 fn program_run_blocks_from_spans(
     body: &str,
     saved_blocks: &[agentd_protocol::ProgramBlockView],
@@ -38,6 +74,16 @@ fn program_run_blocks_from_spans(
         .map(|span| {
             if let Some(matches) = by_content.get(&span.id) {
                 if let [block] = matches.as_slice() {
+                    return (*block).clone();
+                }
+            }
+            let trimmed = span.text.trim();
+            if !trimmed.is_empty() {
+                let containing: Vec<&agentd_protocol::ProgramBlockView> = saved_blocks
+                    .iter()
+                    .filter(|block| block.text.contains(trimmed))
+                    .collect();
+                if let [block] = containing.as_slice() {
                     return (*block).clone();
                 }
             }
@@ -189,7 +235,14 @@ impl SessionManager {
         is_selection: bool,
         initial: Option<&[bool]>,
     ) -> Option<ProgramRunProgress> {
-        self.start_program_run_with_dispatch_state(session_id, body, is_selection, initial, false)
+        self.start_program_run_with_dispatch_state(
+            session_id,
+            body,
+            is_selection,
+            initial,
+            false,
+            None,
+        )
     }
 
     pub(super) fn start_program_run_with_dispatch_state(
@@ -199,6 +252,7 @@ impl SessionManager {
         is_selection: bool,
         initial: Option<&[bool]>,
         queued_behind_current_turn: bool,
+        selection_block_ids: Option<&[String]>,
     ) -> Option<ProgramRunProgress> {
         let (blocks, is_full_document_body) =
             match self.storage.read_program_with_blocks(session_id) {
@@ -206,7 +260,12 @@ impl SessionManager {
                     (saved_blocks, true)
                 }
                 Ok((_program, saved_blocks)) => {
-                    (program_run_blocks_from_spans(body, &saved_blocks), false)
+                    let by_ids = selection_block_ids
+                        .filter(|ids| !ids.is_empty())
+                        .map(|ids| program_run_blocks_from_ids(ids, &saved_blocks));
+                    let blocks = by_ids
+                        .unwrap_or_else(|| program_run_blocks_from_spans(body, &saved_blocks));
+                    (blocks, false)
                 }
                 Err(_) => (program_run_blocks_from_spans(body, &[]), false),
             };
