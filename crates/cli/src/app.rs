@@ -213,6 +213,120 @@ fn pane_sizes_diverged(
         .any(|(id, size)| last_sent.get(id) != Some(size))
 }
 
+/// What [`ResizeDebounce::observe`] decided the run loop should send this
+/// frame.
+#[derive(Debug, PartialEq, Eq)]
+enum ResizeFire {
+    /// No visible window pane reported a size: fall back to broadcasting the
+    /// active-pane size to the pinned + selected sessions.
+    Window((u16, u16)),
+    /// Send `pty_resize` to each session at its own visible pane size.
+    Panes(Vec<(String, (u16, u16))>),
+}
+
+/// Debounced PTY resize decision for the main-window panes, extracted from
+/// the run loop so the fire/keep-waiting choice is unit-testable. Terminal
+/// and divider drags flood the loop with close-spaced sizes; firing
+/// `pty_resize` per frame creates IPC churn and asks every child PTY to
+/// reflow repeatedly, so a size is held pending until it stays stable for
+/// the debounce window.
+struct ResizeDebounce {
+    debounce: Duration,
+    /// The active-pane size most recently fired.
+    last_size_sent: (u16, u16),
+    /// Armed size and when it was first seen at that value.
+    pending: Option<((u16, u16), Instant)>,
+    /// Most recent selected session fired for. Switching sessions counts as
+    /// a resize-event-of-interest even at unchanged dimensions —
+    /// claude/codex draw their UI to the PTY size they last received and
+    /// don't refresh past content without a SIGWINCH, so the focused
+    /// session needs a fresh resize every time it gains focus.
+    last_session_sent: Option<String>,
+    /// The PTY size last pushed to each visible session, keyed by id. The
+    /// fire is otherwise gated on the *active* pane's size; a passive split
+    /// pane whose own size changed (split created, divider dragged, sibling
+    /// swapped) without the active pane changing would never get resized,
+    /// leaving its child emitting at a stale width that the pane then
+    /// renders into a different-width grid. Tracking per-session sizes lets
+    /// the gate fire on any pane's divergence.
+    last_pane_sizes_sent: HashMap<String, (u16, u16)>,
+}
+
+impl ResizeDebounce {
+    fn new(debounce: Duration) -> Self {
+        Self {
+            debounce,
+            last_size_sent: (0, 0),
+            pending: None,
+            last_session_sent: None,
+            last_pane_sizes_sent: HashMap::new(),
+        }
+    }
+
+    /// Forget everything sent (daemon reconnect) so the next observation
+    /// re-fires for whatever is visible.
+    fn reset(&mut self) {
+        self.last_size_sent = (0, 0);
+        self.last_session_sent = None;
+        self.last_pane_sizes_sent.clear();
+    }
+
+    /// Feed one frame's observations; returns what to send, if anything.
+    /// `visible` is the `window_session_pane_sizes()` list; `resizable`
+    /// filters to sessions whose child can accept a `pty_resize` right now.
+    fn observe(
+        &mut self,
+        cur: (u16, u16),
+        visible: &[(String, (u16, u16))],
+        cur_session: Option<String>,
+        resizable: impl Fn(&str) -> bool,
+        now: Instant,
+    ) -> Option<ResizeFire> {
+        let session_changed = cur_session != self.last_session_sent;
+        let diverged = pane_sizes_diverged(visible, &self.last_pane_sizes_sent);
+        if cur.0 > 0 && cur.1 > 0 && (cur != self.last_size_sent || session_changed || diverged) {
+            match self.pending {
+                // Keep the original stamp while the size holds still so the
+                // debounce can elapse. `diverged` must stay out of this
+                // guard: it remains true until a fire updates
+                // `last_pane_sizes_sent`, so re-stamping on it pushes the
+                // deadline out on every iteration of a busy loop (any
+                // streaming child) and the resize never fires — an
+                // alt-screen child then never gets its SIGWINCH after a
+                // window resize until a session switch forces one.
+                Some((p, _)) if p == cur && !session_changed => {}
+                _ => self.pending = Some((cur, now)),
+            }
+        } else {
+            self.pending = None;
+        }
+        let (size, at) = self.pending?;
+        if now.duration_since(at) < self.debounce && !session_changed {
+            return None;
+        }
+        self.pending = None;
+        self.last_size_sent = size;
+        self.last_session_sent = cur_session;
+        if visible.is_empty() {
+            return Some(ResizeFire::Window(size));
+        }
+        let panes: Vec<(String, (u16, u16))> = visible
+            .iter()
+            .filter(|(id, _)| resizable(id))
+            .cloned()
+            .collect();
+        for (id, pane) in &panes {
+            self.last_pane_sizes_sent.insert(id.clone(), *pane);
+        }
+        // Forget sizes for sessions no longer visible so a stale entry
+        // can't suppress a needed resize when they reappear, and the map
+        // stays bounded.
+        self.last_pane_sizes_sent
+            .retain(|id, _| visible.iter().any(|(vid, _)| vid == id));
+        Some(ResizeFire::Panes(panes))
+    }
+}
+
 /// Whether the connected daemon is running a different build than this
 /// client. A missing daemon build id counts as a mismatch — that is how a
 /// new TUI recognizes an older, stale daemon that predates build-id
@@ -3094,26 +3208,9 @@ async fn run_loop(
     // child PTY to reflow repeatedly. Sitting on the size until it
     // stays stable for this window collapses the storm into one IPC.
     let resize_debounce = Duration::from_millis(100);
-    let mut last_size_sent: (u16, u16) = (0, 0);
-    let mut pending_size: Option<((u16, u16), Instant)> = None;
+    let mut main_resize = ResizeDebounce::new(resize_debounce);
     let mut last_orch_sent: (u16, u16) = (0, 0);
     let mut pending_orch: Option<((u16, u16), Instant)> = None;
-    // Track the most recent session we've sent a resize for. Switching
-    // sessions counts as a resize-event-of-interest even when the
-    // dimensions are unchanged — claude/codex draw their UI to the
-    // PTY size they last received and don't refresh past content
-    // without a SIGWINCH, so the focused session needs a fresh resize
-    // every time it gains focus.
-    let mut last_session_sent: Option<String> = None;
-    // The PTY size we last pushed to each visible session, keyed by id.
-    // The resize fire below is otherwise gated on the *active* pane's
-    // size; a passive split pane whose own size changed (split created,
-    // divider dragged, sibling swapped) without the active pane changing
-    // would never get resized, leaving its child emitting at a stale
-    // width that the pane then renders into a different-width grid —
-    // the garbled split pane that only a window resize cleared. Tracking
-    // per-session sizes lets the gate fire on any pane's divergence.
-    let mut last_pane_sizes_sent: HashMap<String, (u16, u16)> = HashMap::new();
     let mut hydration_tasks: tokio::task::JoinSet<(String, Result<SessionHydration>)> =
         tokio::task::JoinSet::new();
     let mut hydration_sessions: HashSet<String> = HashSet::new();
@@ -3141,10 +3238,8 @@ async fn run_loop(
                     Ok(rx) => {
                         notifications = rx;
                         reconnect = None;
-                        last_size_sent = (0, 0);
+                        main_resize.reset();
                         last_orch_sent = (0, 0);
-                        last_session_sent = None;
-                        last_pane_sizes_sent.clear();
                         hydration_sessions.clear();
                         pinned_hydration_session = None;
                         pinned_hydration_queue.clear();
@@ -3236,47 +3331,26 @@ async fn run_loop(
             // or if any visible split pane's size diverged from what its
             // child was last told (a passive pane the active-pane gate
             // would otherwise miss).
-            let cur = app.active_pane_size();
             let split_sizes = app.window_session_pane_sizes();
-            let cur_session = app.selected_id();
-            let session_changed = cur_session != last_session_sent;
-            let pane_sizes_diverged = pane_sizes_diverged(&split_sizes, &last_pane_sizes_sent);
-            if cur.0 > 0
-                && cur.1 > 0
-                && (cur != last_size_sent || session_changed || pane_sizes_diverged)
-            {
-                match pending_size {
-                    Some((p, _)) if p == cur && !session_changed && !pane_sizes_diverged => {}
-                    _ => pending_size = Some((cur, Instant::now())),
-                }
-            } else {
-                pending_size = None;
-            }
-            if let Some((size, at)) = pending_size {
-                if at.elapsed() >= resize_debounce || session_changed {
-                    if split_sizes.is_empty() {
-                        app.notify_pane_size(size.0, size.1).await;
-                    } else {
-                        let sessions = app.sessions.clone();
-                        for (id, (cols, rows)) in &split_sizes {
-                            if sessions
-                                .iter()
-                                .any(|s| s.id == *id && s.has_pty && !s.state.is_terminal())
-                            {
-                                let _ = app.client.pty_resize(id, *cols, *rows).await;
-                                last_pane_sizes_sent.insert(id.clone(), (*cols, *rows));
-                            }
-                        }
-                        // Forget sizes for sessions no longer visible so a
-                        // stale entry can't suppress a needed resize when
-                        // they reappear, and the map stays bounded.
-                        last_pane_sizes_sent
-                            .retain(|id, _| split_sizes.iter().any(|(vid, _)| vid == id));
+            let fire = main_resize.observe(
+                app.active_pane_size(),
+                &split_sizes,
+                app.selected_id(),
+                |id| {
+                    app.sessions
+                        .iter()
+                        .any(|s| s.id == id && s.has_pty && !s.state.is_terminal())
+                },
+                Instant::now(),
+            );
+            match fire {
+                Some(ResizeFire::Window((cols, rows))) => app.notify_pane_size(cols, rows).await,
+                Some(ResizeFire::Panes(panes)) => {
+                    for (id, (cols, rows)) in panes {
+                        let _ = app.client.pty_resize(&id, cols, rows).await;
                     }
-                    last_size_sent = size;
-                    last_session_sent = cur_session;
-                    pending_size = None;
                 }
+                None => {}
             }
             // Orchestrator panel resize — same debounce, separate target.
             if let Some(orch_size) = app.orchestrator_desired_size {
@@ -19222,6 +19296,199 @@ mod tests {
             ("s2".to_string(), (28u16, 18u16)),
         ];
         assert!(pane_sizes_diverged(&after_drag, &last_sent));
+    }
+
+    /// Regression for the resize livelock introduced with the divergence
+    /// gate (#485): after a window resize, `pane_sizes_diverged` stays true
+    /// until the fire itself updates the per-pane bookkeeping. The pending
+    /// stamp must survive that divergence — re-stamping on it pushes the
+    /// debounce deadline out on every loop iteration (a streaming child
+    /// keeps the loop hot), the resize never fires, and an alt-screen child
+    /// (claude fullscreen, vim) never repaints at the new size until a
+    /// session switch happens to force one.
+    #[test]
+    fn resize_debounce_fires_after_window_resize_despite_divergence() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let all = |_: &str| true;
+
+        // First observation: the selection going None -> s1 fires
+        // immediately and records the starting pane size.
+        let split = vec![("s1".to_string(), (80u16, 24u16))];
+        assert_eq!(
+            deb.observe((80, 24), &split, Some("s1".into()), all, t0),
+            Some(ResizeFire::Panes(vec![("s1".to_string(), (80, 24))]))
+        );
+        // Quiescent frames send nothing.
+        assert_eq!(
+            deb.observe(
+                (80, 24),
+                &split,
+                Some("s1".into()),
+                all,
+                t0 + Duration::from_millis(50)
+            ),
+            None
+        );
+
+        // The window is resized once at t=200ms; the child streams output,
+        // so observations arrive every 5ms — far faster than the debounce
+        // window ever elapses if each one re-stamps the deadline.
+        let split = vec![("s1".to_string(), (120u16, 40u16))];
+        let mut fired = None;
+        for i in 0..60u64 {
+            let now = t0 + Duration::from_millis(200 + i * 5);
+            if let Some(fire) = deb.observe((120, 40), &split, Some("s1".into()), all, now) {
+                fired = Some((200 + i * 5, fire));
+                break;
+            }
+        }
+        let (at_ms, fire) = fired.expect("resize must fire once the debounce elapses");
+        assert_eq!(
+            at_ms, 300,
+            "fires at the first observation ≥100ms after the size change"
+        );
+        assert_eq!(
+            fire,
+            ResizeFire::Panes(vec![("s1".to_string(), (120, 40))])
+        );
+    }
+
+    /// Switching sessions fires immediately — the newly focused child needs
+    /// its SIGWINCH now, not after the debounce.
+    #[test]
+    fn resize_debounce_session_switch_fires_immediately() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let all = |_: &str| true;
+        let split = vec![("s1".to_string(), (80u16, 24u16))];
+        deb.observe((80, 24), &split, Some("s1".into()), all, t0);
+
+        // Same dimensions, new selection: no debounce wait.
+        let split = vec![("s2".to_string(), (80u16, 24u16))];
+        assert_eq!(
+            deb.observe(
+                (80, 24),
+                &split,
+                Some("s2".into()),
+                all,
+                t0 + Duration::from_millis(1)
+            ),
+            Some(ResizeFire::Panes(vec![("s2".to_string(), (80, 24))]))
+        );
+    }
+
+    /// #485's case: a passive split pane's size changes while the active
+    /// pane (and the selection) stay put. The divergence arms the debounce
+    /// and the fire covers the passive pane at its own size.
+    #[test]
+    fn resize_debounce_passive_pane_divergence_fires_after_debounce() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let all = |_: &str| true;
+        let split = vec![
+            ("s1".to_string(), (40u16, 20u16)),
+            ("s2".to_string(), (40u16, 20u16)),
+        ];
+        deb.observe((40, 20), &split, Some("s1".into()), all, t0);
+
+        // The passive pane (s2) is swapped to a different size; the active
+        // pane's size and the selection are untouched.
+        let split = vec![
+            ("s1".to_string(), (40u16, 20u16)),
+            ("s2".to_string(), (28u16, 20u16)),
+        ];
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("s1".into()), all, at(10)),
+            None
+        );
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("s1".into()), all, at(60)),
+            None
+        );
+        let fire = deb
+            .observe((40, 20), &split, Some("s1".into()), all, at(115))
+            .expect("passive divergence must fire after the debounce");
+        match fire {
+            ResizeFire::Panes(panes) => {
+                assert!(panes.contains(&("s2".to_string(), (28, 20))));
+            }
+            other => panic!("expected a pane fire, got {other:?}"),
+        }
+    }
+
+    /// A live drag changes the size on every observation; nothing fires
+    /// until the size holds still for the full debounce window, and the
+    /// fire uses the final size.
+    #[test]
+    fn resize_debounce_defers_fire_while_size_churns() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let all = |_: &str| true;
+        let split_at = |w: u16| vec![("s1".to_string(), (w, 24u16))];
+        deb.observe((80, 24), &split_at(80), Some("s1".into()), all, t0);
+
+        // Size changes every 30ms — each change re-stamps the deadline.
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        for (i, w) in [(1u64, 81u16), (2, 82), (3, 83), (4, 84), (5, 85)] {
+            assert_eq!(
+                deb.observe((w, 24), &split_at(w), Some("s1".into()), all, at(i * 30)),
+                None,
+                "no fire while the size is still moving"
+            );
+        }
+        // Holds at 85 columns: still quiet inside the debounce window …
+        assert_eq!(
+            deb.observe((85, 24), &split_at(85), Some("s1".into()), all, at(200)),
+            None
+        );
+        // … and fires at the final size once it has held still long enough.
+        assert_eq!(
+            deb.observe((85, 24), &split_at(85), Some("s1".into()), all, at(255)),
+            Some(ResizeFire::Panes(vec![("s1".to_string(), (85, 24))]))
+        );
+    }
+
+    /// With no visible window panes the fire falls back to the active-pane
+    /// broadcast, and a reset (daemon reconnect) forgets what was sent so
+    /// the same observation re-fires.
+    #[test]
+    fn resize_debounce_window_fallback_and_reset() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let all = |_: &str| true;
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert_eq!(deb.observe((80, 24), &[], None, all, t0), None);
+        assert_eq!(
+            deb.observe((80, 24), &[], None, all, at(120)),
+            Some(ResizeFire::Window((80, 24)))
+        );
+        // Steady state is quiet; reset forgets what was sent…
+        assert_eq!(deb.observe((80, 24), &[], None, all, at(130)), None);
+        deb.reset();
+        // …so the same observation re-arms and fires after the debounce.
+        assert_eq!(deb.observe((80, 24), &[], None, all, at(140)), None);
+        assert_eq!(
+            deb.observe((80, 24), &[], None, all, at(245)),
+            Some(ResizeFire::Window((80, 24)))
+        );
+    }
+
+    /// Sessions whose child can't take a resize right now (no PTY, already
+    /// exited) are filtered out of the fire.
+    #[test]
+    fn resize_debounce_skips_unresizable_sessions() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let split = vec![
+            ("live".to_string(), (40u16, 20u16)),
+            ("exited".to_string(), (40u16, 20u16)),
+        ];
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("live".into()), |id| id == "live", t0),
+            Some(ResizeFire::Panes(vec![("live".to_string(), (40, 20))]))
+        );
     }
 
     /// Regression: in a single-pane (non-split) layout the render path still
