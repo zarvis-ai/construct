@@ -1449,7 +1449,7 @@ pub struct App {
     pty_osc11_query_tails: HashMap<String, Vec<u8>>,
     pty_input_tx: mpsc::UnboundedSender<PtyInputJob>,
     pty_input_errors: mpsc::UnboundedReceiver<String>,
-    /// Interactive tutorial (spec 0076): `None` = no tour active. See
+    /// Interactive tutorial (spec 0077): `None` = no tour active. See
     /// `app/tutorial.rs` for the full state machine and hooks.
     pub tutorial: Option<TutorialState>,
 }
@@ -5555,7 +5555,7 @@ impl App {
     }
 
     async fn on_notification(&mut self, n: agentd_protocol::Notification) {
-        // Tutorial hook (b) — spec 0076: the one place daemon-pushed state
+        // Tutorial hook (b) — spec 0077: the one place daemon-pushed state
         // changes are applied to app state. Re-parses the payload itself so
         // this stays a single thin call; all step logic lives in
         // `app/tutorial.rs`.
@@ -7554,7 +7554,7 @@ impl App {
     }
 
     fn forward_key_to_selected_pty(&mut self, key: KeyEvent) {
-        // Tutorial hook — spec 0076 step 3 ("say something to it"): a
+        // Tutorial hook — spec 0077 step 3 ("say something to it"): a
         // PTY-captured session (any real agent harness) never routes typed
         // input through `run_action` or a notification, so this is the only
         // chokepoint that sees "the user submitted a line" for that case.
@@ -7845,7 +7845,7 @@ impl App {
         self.chord_label = self.chord_state.label();
         // Tutorial hook — step 1's pending-chord echo / C-g cancel / wrong-key
         // correction is driven off the raw `KeymapResult`, since `C-x` and
-        // `C-g` alone never resolve to a `KeyAction` (spec 0076).
+        // `C-g` alone never resolve to a `KeyAction` (spec 0077).
         self.tutorial_observe_key_result(&res, key);
         match res {
             KeymapResult::Action(a) => self.run_action(a).await,
@@ -7945,7 +7945,7 @@ impl App {
 
     async fn run_action(&mut self, action: KeyAction) {
         use KeyAction::*;
-        // Tutorial hook (a) — spec 0076: `run_action` is the one chokepoint
+        // Tutorial hook (a) — spec 0077: `run_action` is the one chokepoint
         // every `KeyAction` passes through, whether it came from a chord,
         // a palette command, or a `HintZone` click. Kept thin; all logic
         // lives in `app/tutorial.rs`.
@@ -23444,7 +23444,7 @@ mod tests {
         server.abort();
     }
 
-    // --- Interactive tutorial (spec 0076) -----------------------------
+    // --- Interactive tutorial (spec 0077) -----------------------------
 
     #[tokio::test]
     async fn welcome_card_tour_line_starts_tutorial_via_key_and_click() {

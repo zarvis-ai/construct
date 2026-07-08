@@ -1535,7 +1535,7 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
-    // Tutorial pane highlight (spec 0076, step 4 "get around"): reuses
+    // Tutorial pane highlight (spec 0077, step 4 "get around"): reuses
     // `pane_border_style`'s focused styling as the highlight rather than
     // inventing new styling.
     let focused = app.focus == PaneFocus::List || app.tutorial_wants_list_highlight();
@@ -3299,7 +3299,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     // its focused brightness (the border still dims) so the user can see
     // where `C-x o` will land.
     let last_focused = window_id.is_none_or(|id| id == app.active_window_id);
-    // Tutorial pane highlight (spec 0076, steps 2/3 "create"/"say
+    // Tutorial pane highlight (spec 0077, steps 2/3 "create"/"say
     // something"): reuses `pane_border_style`'s focused styling.
     let focused = last_focused
         && (app.focus == PaneFocus::View || app.tutorial_wants_view_highlight());
@@ -3454,7 +3454,7 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
     let label_style = Style::default().fg(app.theme.accent);
     let hover_style = label_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     // The tour line is highlighted (accent + bold) as an invitation — not an
-    // auto-start — whenever the tour hasn't been completed yet (spec 0076).
+    // auto-start — whenever the tour hasn't been completed yet (spec 0077).
     let tour_not_done = !crate::tui_state::tutorial_done();
     let tour_invite_style = label_style.add_modifier(Modifier::BOLD);
     let mouse = app.mouse_pos;
@@ -3589,7 +3589,7 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-/// Interactive tutorial coach-mark card (spec 0076). A small floating,
+/// Interactive tutorial coach-mark card (spec 0077). A small floating,
 /// NEVER-modal card anchored top-right of the main view pane — it never
 /// covers the session list, minibuffer, or modeline, and (unlike
 /// `render_help`/`render_configure_popup`) never sets `layout.modal_area`,
@@ -8971,7 +8971,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
             |id| app.selection_for_window(id),
             f.area(),
         );
-        // Tutorial pane highlight (spec 0076, steps 5/6 "program board" /
+        // Tutorial pane highlight (spec 0077, steps 5/6 "program board" /
         // "split screen"): reuses the popup's normal focused-border styling.
         let popup_focused =
             app.focus == PaneFocus::View || app.tutorial_wants_program_highlight();

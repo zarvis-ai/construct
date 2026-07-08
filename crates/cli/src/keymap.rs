@@ -110,7 +110,7 @@ pub enum KeyAction {
     /// Open the "upgrade to <version>?" confirmation. Click-only, bound to
     /// the `<version> available` segment of the status-bar version notice.
     OpenUpgradeConfirm,
-    /// Start the interactive tutorial (spec 0076). Bound to bare `t` in both
+    /// Start the interactive tutorial (spec 0077). Bound to bare `t` in both
     /// profiles (verified unbound elsewhere in both tables). A no-op while a
     /// tour is already active.
     StartTutorial,
@@ -339,7 +339,7 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
         // Help
         (Chord(vec![ch('?')]), ToggleHelp),
-        // Interactive tutorial (spec 0076). Bare `t` is otherwise unbound in
+        // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
         // this profile (the closest existing binding is `C-x t`, ToggleView).
         (Chord(vec![ch('t')]), StartTutorial),
     ];
@@ -453,7 +453,7 @@ fn vim() -> Keymap {
         (Chord(vec![shift('A')]), ToggleAutomode),
         (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
         (Chord(vec![ch('?')]), ToggleHelp),
-        // Interactive tutorial (spec 0076). Bare `t` is otherwise unbound in
+        // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
         // this profile too (vim binds `C-x t` to ToggleView, not bare `t`).
         (Chord(vec![ch('t')]), StartTutorial),
     ];

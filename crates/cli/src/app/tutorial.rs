@@ -1,4 +1,4 @@
-//! Interactive tutorial ("tour") of the construct TUI (spec 0076).
+//! Interactive tutorial ("tour") of the construct TUI (spec 0077).
 //!
 //! A small floating coach-mark card that tells the user what to do,
 //! observes the *real* [`KeyAction`] dispatch and daemon events, and
@@ -15,14 +15,14 @@
 
 use super::*;
 
-/// Number of steps in the tour (spec 0076).
+/// Number of steps in the tour (spec 0077).
 pub const STEP_COUNT: u8 = 8;
 
 /// How long step 5/6 waits for progress before showing the stall hint.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Sub-phase of step 1's two real-keystroke micro-exercises. Step 1 is the
-/// only step whose key labels are not click-advance (spec 0076) — it's
+/// only step whose key labels are not click-advance (spec 0077) — it's
 /// teaching fingers, not testing recognition — so this phase machine is
 /// driven entirely by [`App::tutorial_observe_key_result`], not by
 /// [`App::tutorial_observe_action`].
@@ -517,7 +517,7 @@ fn done_section_has_task(markdown: &str) -> bool {
 
 impl App {
     /// Entry point (1 of 2): bare `t` in the welcome card / palette command
-    /// `tutorial`. A no-op while a tour is already active (spec 0076); the
+    /// `tutorial`. A no-op while a tour is already active (spec 0077); the
     /// second entry point (`t`/`tutorial`) is registered as a `HintZone` and
     /// a `run_slash_command` arm, both of which route through
     /// [`Self::run_action`] like any other `KeyAction`.
@@ -558,7 +558,7 @@ impl App {
     /// Closes the tour. Writes the done marker only when invoked from the
     /// final step (or after it already completed) — an early `[end tour]`
     /// leaves the marker absent so the welcome card keeps inviting the user
-    /// back (spec 0076).
+    /// back (spec 0077).
     pub fn tutorial_end_tour(&mut self) {
         let Some(t) = self.tutorial.as_ref() else {
             return;

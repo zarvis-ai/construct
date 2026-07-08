@@ -51,7 +51,7 @@ pub struct TuiState {
     pub open_program_session_ids: Vec<String>,
     #[serde(default)]
     pub widgets: HashMap<String, WidgetState>,
-    /// Step (1..=8) of an interactive tutorial (spec 0076) in progress when
+    /// Step (1..=8) of an interactive tutorial (spec 0077) in progress when
     /// the TUI last quit, so an interrupted tour resumes at the same step
     /// instead of restarting from step 1. `None` = no tour in progress —
     /// cleared as soon as the tour ends, whether by completion or
@@ -106,7 +106,7 @@ pub fn mark_configure_dialog_seen() {
     let _ = std::fs::write(&path, b"");
 }
 
-/// Marker file (spec 0076) recording that the interactive tutorial has been
+/// Marker file (spec 0077) recording that the interactive tutorial has been
 /// completed at least once. Only written on a genuine finish (the final
 /// step's completion, or `[end tour]` clicked from that final step) — never
 /// on an early `[end tour]` or a mid-tour quit, so a user who bails out
