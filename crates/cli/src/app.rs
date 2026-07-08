@@ -23152,8 +23152,12 @@ mod tests {
             "empty state should not show q as the quit shortcut:\n{screen}"
         );
         assert!(
-            screen.contains("new: C-x C-f  help: ?  palette: C-x x"),
-            "missing modeline hint:\n{screen}"
+            screen.contains("new: C-x C-f  help: ?  palette: C-x x  tour: t"),
+            "missing modeline hint (incl. the tour segment):\n{screen}"
+        );
+        assert!(
+            screen.contains("[start the interactive tour]  — or press t"),
+            "missing the welcome-card tour call-to-action:\n{screen}"
         );
         assert!(
             !screen.contains("CLI examples:"),
@@ -23539,15 +23543,15 @@ mod tests {
             .expect("draw");
         let screen = rendered_text(terminal.backend().buffer());
         assert!(
-            screen.contains("take the 2-minute tour"),
-            "missing tour line:\n{screen}"
+            screen.contains("[start the interactive tour]"),
+            "missing tour call-to-action:\n{screen}"
         );
         assert!(
             app.layout
                 .shortcut_hints
                 .iter()
                 .any(|h| h.action == KeyAction::StartTutorial),
-            "tour line should register a HintZone"
+            "the CTA should register a HintZone"
         );
 
         // Key path: bare `t`.
@@ -23556,7 +23560,8 @@ mod tests {
         assert!(app.tutorial.is_some(), "bare t should start the tour");
         app.tutorial = None;
 
-        // Click path.
+        // Click path — the card's CTA is the first StartTutorial zone
+        // registered (the card renders before the modeline hint).
         terminal
             .draw(|f| crate::ui::render(f, &mut app))
             .expect("draw");
@@ -23567,12 +23572,80 @@ mod tests {
             .find(|h| h.action == KeyAction::StartTutorial)
             .expect("tour hint")
             .clone();
+        // Zone/text alignment guard: the zone's first cell is the CTA's
+        // opening bracket.
+        let first_cell = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert_eq!(first_cell, "[", "CTA zone must start on its label");
         app.handle_left_click(hit.x_start, hit.y).await;
         assert!(
             app.tutorial.is_some(),
-            "clicking the tour hint should start the tour"
+            "clicking the tour CTA should start the tour"
         );
         server.abort();
+    }
+
+    // The empty-state modeline's onboarding hint gains a clickable
+    // `tour: t` segment; the with-sessions modeline must not grow one.
+    #[tokio::test]
+    async fn modeline_tour_hint_clickable_only_in_empty_state() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        // The modeline hint renders after the welcome card, so its zone is
+        // the LAST StartTutorial zone of the frame.
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.action == KeyAction::StartTutorial)
+            .next_back()
+            .copied()
+            .expect("modeline tour segment zone");
+        // Alignment guard: the zone starts on the 't' of "tour: t".
+        let first_cell = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert_eq!(first_cell, "t", "modeline tour zone must start on its label");
+        app.handle_left_click(hit.x_start, hit.y).await;
+        assert!(
+            app.tutorial.is_some(),
+            "clicking the modeline tour segment should start the tour"
+        );
+        server.abort();
+
+        // With sessions, neither the hint text nor a StartTutorial zone
+        // exists anywhere in the frame.
+        let (mut app, _dir2, server2) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            !screen.contains("tour: t"),
+            "with-sessions modeline must not show the tour hint:\n{screen}"
+        );
+        assert!(
+            !app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.action == KeyAction::StartTutorial),
+            "no StartTutorial zone outside the empty state"
+        );
+        server2.abort();
     }
 
     #[tokio::test]

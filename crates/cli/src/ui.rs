@@ -3441,11 +3441,12 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
 }
 
 fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
-    // Base content (title, blurb, five shortcut lines) is 9 rows; the
+    // Base content (title, blurb, the tour call-to-action, four shortcut
+    // lines, and the blank separators between them) is 10 rows; the
     // harness status section below adds a blank separator + header + one
     // row per registered harness. Grow the card to fit instead of clipping
     // — `centered_rect` already clamps to the pane's actual height.
-    let base_rows: u16 = 9;
+    let base_rows: u16 = 10;
     let harness_rows: u16 = if app.harnesses.is_empty() {
         0
     } else {
@@ -3454,25 +3455,34 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
     let card = centered_rect(area, 72, (base_rows + harness_rows).max(11));
     let label_style = Style::default().fg(app.theme.accent);
     let hover_style = label_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-    // The tour line is highlighted (accent + bold) as an invitation — not an
-    // auto-start — once the configure dialog has been dismissed at least
-    // once AND the tour hasn't been completed yet (spec 0077). The configure
-    // condition avoids competing for attention with the (modal, drawn on
-    // top) first-run configure popup — in practice `configure_dialog_seen`
-    // is already true by the time this card is ever visibly on screen
-    // (`open_configure_popup` marks it immediately on open, before the
-    // first render), so this mostly guards a state a live launch never
-    // reaches.
+    // The tour CTA row always renders; only its EMPHASIS (accent + bold, an
+    // invitation — not an auto-start) is gated: once the configure dialog
+    // has been dismissed at least once AND the tour hasn't been completed
+    // yet (spec 0077). The configure condition avoids competing for
+    // attention with the (modal, drawn on top) first-run configure popup —
+    // in practice `configure_dialog_seen` is already true by the time this
+    // card is ever visibly on screen (`open_configure_popup` marks it
+    // immediately on open, before the first render), so this mostly guards
+    // a state a live launch never reaches.
     let tour_not_done =
         crate::tui_state::configure_dialog_seen() && !crate::tui_state::tutorial_done();
     let tour_invite_style = label_style.add_modifier(Modifier::BOLD);
     let mouse = app.mouse_pos;
+    // The tour CTA (row 4) sits under the blurb, above the chord list —
+    // the audience the tour serves can't parse chord tables yet, so it
+    // must not hide among them. `t` stays bound; the CTA label is the
+    // clickable affordance.
     let shortcut_rows = [
-        (4_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
-        (5_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
-        (6_u16, 2_u16, "?", KeyAction::ToggleHelp),
-        (7_u16, 2_u16, "C-x C-c", KeyAction::Quit),
-        (8_u16, 2_u16, "t", KeyAction::StartTutorial),
+        (6_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
+        (7_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
+        (8_u16, 2_u16, "?", KeyAction::ToggleHelp),
+        (9_u16, 2_u16, "C-x C-c", KeyAction::Quit),
+        (
+            4_u16,
+            2_u16,
+            "[start the interactive tour]",
+            KeyAction::StartTutorial,
+        ),
     ];
     let mut hovered = [false; 5];
     for (i, (row, col, label, action)) in shortcut_rows.iter().enumerate() {
@@ -3511,6 +3521,21 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(app.theme.dim),
         )),
         Line::raw(""),
+        // Tour call-to-action. "▶ " is 2 cols, matching the CTA zone's
+        // col offset in `shortcut_rows` above.
+        Line::from(vec![
+            Span::styled("▶ ", label_style),
+            Span::styled(
+                "[start the interactive tour]",
+                tour_style(if tour_not_done {
+                    tour_invite_style
+                } else {
+                    label_style
+                }),
+            ),
+            Span::styled("  — or press t", Style::default().fg(app.theme.dim)),
+        ]),
+        Line::raw(""),
         Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -3536,18 +3561,6 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
                 if hovered[3] { hover_style } else { label_style },
             ),
             Span::raw("  exit TUI"),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                "t",
-                tour_style(if tour_not_done {
-                    tour_invite_style
-                } else {
-                    label_style
-                }),
-            ),
-            Span::raw("        take the 2-minute tour"),
         ]),
     ];
     if !app.harnesses.is_empty() {
@@ -6768,11 +6781,21 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     let status = search_status
         .as_deref()
         .unwrap_or_else(|| app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or(""));
-    let empty_hint = if s.is_none() && app.list_items().is_empty() && status.is_empty() {
-        "new: C-x C-f  help: ?  palette: C-x x"
-    } else {
-        ""
-    };
+    // Empty/welcome-state onboarding hint, rendered as individually
+    // clickable segments (the same HintZone pattern as the minibuffer hint
+    // and the persistent notices below). Only while no session exists —
+    // the with-sessions modeline never shows these.
+    let empty_hint_segments: &[(&str, KeyAction)] =
+        if s.is_none() && app.list_items().is_empty() && status.is_empty() {
+            &[
+                ("new: C-x C-f", KeyAction::OpenNewSession),
+                ("help: ?", KeyAction::ToggleHelp),
+                ("palette: C-x x", KeyAction::OpenCommandPalette),
+                ("tour: t", KeyAction::StartTutorial),
+            ]
+        } else {
+            &[]
+        };
     let modeline_before_approval_mode = format!(
         " construct  {vim_mode}focus:{focus}  {sel}  {model}  {remote}",
         vim_mode = vim_mode_label,
@@ -6808,18 +6831,23 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             }
         }
     }
-    let modeline_after_approval_mode = format!(
-        "{scrollback}{chord}{empty_hint}{status}{conn} ",
+    let modeline_pre_hint = format!(
+        "{scrollback}{chord}",
         scrollback = scrollback_label,
         chord = if app.chord_label.is_empty() {
             String::new()
         } else {
             format!("({})  ", app.chord_label)
         },
-        empty_hint = empty_hint,
-        status = status,
     );
+    let modeline_post_hint = format!("{status}{conn} ", status = status);
     let mut spans = Vec::new();
+    // Running column so the empty-hint segments below can register exact
+    // HintZones; accumulated from the widths of every span pushed ahead of
+    // them.
+    let mut hint_col = area
+        .x
+        .saturating_add(UnicodeWidthStr::width(modeline_before_approval_mode.as_str()) as u16);
     spans.push(Span::raw(modeline_before_approval_mode));
     if let Some(badge) = approval_mode_badge {
         let hovered = app
@@ -6838,10 +6866,45 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Modifier::UNDERLINED
             });
+        hint_col = hint_col
+            .saturating_add(UnicodeWidthStr::width(badge.as_str()) as u16)
+            .saturating_add(2);
         spans.push(Span::styled(badge, badge_style));
         spans.push(Span::raw("  "));
     }
-    spans.push(Span::raw(modeline_after_approval_mode));
+    hint_col = hint_col.saturating_add(UnicodeWidthStr::width(modeline_pre_hint.as_str()) as u16);
+    spans.push(Span::raw(modeline_pre_hint));
+    for (i, (label, action)) in empty_hint_segments.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            hint_col = hint_col.saturating_add(2);
+        }
+        let w = UnicodeWidthStr::width(*label) as u16;
+        let hovered = app
+            .mouse_pos
+            .is_some_and(|(mx, my)| my == area.y && mx >= hint_col && mx < hint_col + w);
+        let style = Style::default()
+            .bg(app.theme.modeline_bg)
+            .fg(if hovered {
+                app.theme.text
+            } else {
+                app.theme.modeline_fg
+            })
+            .add_modifier(if hovered {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        spans.push(Span::styled((*label).to_string(), style));
+        app.layout.shortcut_hints.push(HintZone {
+            x_start: hint_col,
+            x_end: hint_col.saturating_add(w),
+            y: area.y,
+            action: *action,
+        });
+        hint_col = hint_col.saturating_add(w);
+    }
+    spans.push(Span::raw(modeline_post_hint));
     let para = Paragraph::new(Line::from(spans)).style(
         Style::default()
             .bg(app.theme.modeline_bg)

@@ -35,11 +35,15 @@ wrong-key correction, or a mini-checklist for steps with more than one
 sub-condition — sourced from the same dispatch and event machinery the rest
 of the TUI uses, not a scripted narration.
 
-The tour never starts on its own. It has exactly two entry points: a line in
-the empty-state welcome card, and a command-palette command. Starting the
-tour while one is already active is a no-op. Starting it when sessions
-already exist is allowed — the tour creates an additional practice session
-rather than requiring an empty fleet.
+The tour never starts on its own. Its entry points are the empty/welcome
+state (a prominent call-to-action on the welcome card — set apart from the
+keybinding list, since the audience the tour serves can't parse chord
+tables yet — plus a segment in the empty-state onboarding hint) and a
+command-palette command; the with-sessions UI carries no tour affordance
+beyond the palette. Starting the tour while one is already active is a
+no-op. Starting it when sessions already exist is allowed — the tour
+creates an additional practice session rather than requiring an empty
+fleet.
 
 The card's footer offers plain step navigation — go to the next step
 without completing the current one's condition, go back to the previous
