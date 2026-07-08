@@ -72,6 +72,24 @@ pub fn catalog() -> Vec<Value> {
             schema_obj(&[("session_id", "string", false)]),
         ),
         tool(
+            "construct_search",
+            "Search across session names, program contents, and session history (transcripts). Case-insensitive substring match, newest activity first. Transcript hits include `seq`; pass it as `from` to construct_get_transcript to read the surrounding context. Results may be truncated (see `truncated` in the response) if a session's history is very large or the global hit limit is reached — narrow with `session_id` or `scopes` to dig further into one place.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Case-insensitive substring to search for." },
+                    "scopes": {
+                        "type": "array",
+                        "description": "Restrict the search to these scopes. Omit to search all three.",
+                        "items": { "type": "string", "enum": ["name", "program", "transcript"] }
+                    },
+                    "session_id": { "type": "string", "description": "Restrict the search to one session." },
+                    "limit": { "type": "integer", "minimum": 1, "description": "Global cap on returned hits (default 50)." }
+                },
+                "required": ["query"]
+            }),
+        ),
+        tool(
             "construct_program_list_templates",
             "List built-in and user program templates. User templates live under the daemon data directory at `program/templates/*.md`.",
             schema_empty(),
@@ -480,6 +498,23 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             let tasks = client.list_tasks(&sid).await?;
             json!({ "tasks": tasks })
         }
+        "construct_search" => {
+            let query = arg_str(&args, "query")?;
+            let scopes = arg_scopes(&args, "scopes");
+            let session_ids = arg_str(&args, "session_id").ok().map(|id| vec![id]);
+            let limit = arg_usize(&args, "limit");
+            serde_json::to_value(
+                client
+                    .search(agentd_protocol::SearchParams {
+                        query,
+                        scopes,
+                        session_ids,
+                        limit,
+                        per_session_limit: None,
+                    })
+                    .await?,
+            )?
+        }
         "construct_program_get" => {
             let sid = optional_session_arg(&args, session_id)?;
             serde_json::to_value(client.program_get(&sid).await?)?
@@ -851,6 +886,29 @@ fn arg_u64(args: &Value, name: &str) -> Result<u64> {
 
 fn arg_usize(args: &Value, name: &str) -> Option<usize> {
     args.get(name).and_then(|v| v.as_u64()).map(|n| n as usize)
+}
+
+/// Parse an optional array-of-strings arg into [`agentd_protocol::SearchScope`]s.
+/// Unrecognized entries are ignored rather than erroring, so a caller passing
+/// e.g. a stray plural ("names") degrades to "search everything" instead of
+/// failing the whole call.
+fn arg_scopes(args: &Value, name: &str) -> Option<Vec<agentd_protocol::SearchScope>> {
+    let arr = args.get(name).and_then(|v| v.as_array())?;
+    let scopes: Vec<agentd_protocol::SearchScope> = arr
+        .iter()
+        .filter_map(|v| v.as_str())
+        .filter_map(|s| match s {
+            "name" => Some(agentd_protocol::SearchScope::Name),
+            "program" => Some(agentd_protocol::SearchScope::Program),
+            "transcript" => Some(agentd_protocol::SearchScope::Transcript),
+            _ => None,
+        })
+        .collect();
+    if scopes.is_empty() {
+        None
+    } else {
+        Some(scopes)
+    }
 }
 
 fn require_session_id(session_id: Option<&str>) -> Result<String> {

@@ -11,10 +11,10 @@ use agentd_protocol::{
     GroupSummary, HarnessInfo, MessageRole, MoveDirection, ProgramDocument, ProgramEditParams,
     ProgramExecuteParams, ProgramExecuteResult, ProgramGetResult, ProgramListTemplatesResult,
     ProgramRunProgress, ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult,
-    PtyReplayResult, PtySize, SessionAttachClipboardParams, SessionAttachClipboardResult,
-    SessionDetail, SessionEmitEventParams, SessionEvent, SessionStartParams, SessionState,
-    SessionSummary, SmithAuthMethodInfo, SmithAuthStatusResult, SmithSetAuthMethodResult,
-    StateNotificationPayload, TimestampedEvent, TranscriptResult,
+    PtyReplayResult, PtySize, SearchParams, SearchResult, SessionAttachClipboardParams,
+    SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionEvent,
+    SessionStartParams, SessionState, SessionSummary, SmithAuthMethodInfo, SmithAuthStatusResult,
+    SmithSetAuthMethodResult, StateNotificationPayload, TimestampedEvent, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -1767,6 +1767,17 @@ impl SessionManager {
             return Ok(TranscriptResult { events, total });
         }
         self.storage.read_transcript(id, from, limit)
+    }
+
+    /// Substring search across session name/metadata, stored program
+    /// contents, and transcript history (spec 0076). The scan itself is
+    /// synchronous file I/O in `Storage::search`, run inline like the other
+    /// storage reads on this type (`transcript`, `diff`, …) rather than via
+    /// `spawn_blocking` — consistent with the rest of this file's storage
+    /// access, and the byte budgets keep a single call bounded.
+    pub async fn search(&self, params: SearchParams) -> Result<SearchResult> {
+        let sessions = self.list().await;
+        self.storage.search(&sessions, &params)
     }
 
     pub async fn diff(&self, id: &str) -> Result<String> {
@@ -5369,6 +5380,63 @@ mod tests {
         assert_eq!(result.events.len(), 50);
         assert_eq!(result.events.first().unwrap().seq, 1185);
         assert_eq!(result.events.last().unwrap().seq, 1234);
+    }
+
+    /// `SessionManager::search` must use the live, in-memory session list
+    /// (`self.list()`), not a fresh read of `meta.json` — a session whose
+    /// title was only just updated in memory (not yet flushed to disk)
+    /// must still be found by name.
+    #[tokio::test]
+    async fn search_finds_name_and_transcript_hits_from_live_state() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let storage_handle = storage.clone();
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "ssearch";
+        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        entry.summary.write().await.title = Some("Investigate flaky needle test".to_string());
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+        // Never written to disk — proves `search` isn't relying on
+        // `meta.json`.
+        assert!(!storage_handle.meta_path(id).exists());
+
+        storage_handle
+            .append_event(
+                id,
+                &agentd_protocol::TimestampedEvent {
+                    seq: 1,
+                    at: chrono::Utc::now(),
+                    event: agentd_protocol::SessionEvent::Message {
+                        role: agentd_protocol::MessageRole::Assistant,
+                        text: "found the needle in the haystack".to_string(),
+                    },
+                },
+            )
+            .expect("append event");
+
+        let result = mgr
+            .search(agentd_protocol::SearchParams {
+                query: "needle".to_string(),
+                scopes: None,
+                session_ids: None,
+                limit: None,
+                per_session_limit: None,
+            })
+            .await
+            .expect("search");
+
+        let scopes: std::collections::HashSet<_> = result.hits.iter().map(|h| h.scope).collect();
+        assert!(scopes.contains(&agentd_protocol::SearchScope::Name));
+        assert!(scopes.contains(&agentd_protocol::SearchScope::Transcript));
+        assert!(result.hits.iter().all(|h| h.session_id == id));
     }
 
     #[tokio::test]

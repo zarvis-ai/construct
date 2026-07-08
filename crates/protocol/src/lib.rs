@@ -876,6 +876,10 @@ pub mod ipc_method {
     pub const PROJECT_MOVE: &str = "project.move";
     pub const SESSION_DIFF: &str = "session.diff";
     pub const SESSION_TRANSCRIPT: &str = "session.transcript";
+    /// Substring search across session name/metadata, stored program
+    /// contents, and transcript history — see [`crate::SearchParams`] /
+    /// [`crate::SearchResult`].
+    pub const SESSION_SEARCH: &str = "session.search";
     /// A client reports which surface (chat vs terminal) it is currently
     /// showing a session through. The daemon tracks this per connection so it
     /// can answer `session.chat_viewer_active`.
@@ -2085,6 +2089,72 @@ pub struct TranscriptParams {
 pub struct TranscriptResult {
     pub events: Vec<TimestampedEvent>,
     pub total: u64,
+}
+
+/// Which corner of a session's stored data `session.search` looks in.
+/// `Name` is the same instant, in-memory match the TUI's `C-x b` picker
+/// already does (title/id/short-id/harness); `Program` and `Transcript`
+/// scan on-disk files and are what the daemon-side search engine adds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    Name,
+    Program,
+    Transcript,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchParams {
+    pub query: String,
+    /// Which scopes to search. `None` searches all three.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<Vec<SearchScope>>,
+    /// Restrict the search to these session ids. `None` searches every
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ids: Option<Vec<String>>,
+    /// Global cap on the number of hits returned across all sessions and
+    /// scopes. Defaults to 50.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Cap on hits contributed by a single session for each scope.
+    /// Defaults to 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_session_limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    pub session_id: String,
+    /// `session_switch`-style label: the session's title, or its short id
+    /// when untitled.
+    pub title: String,
+    pub harness: String,
+    pub scope: SearchScope,
+    /// Transcript hits only: the event's sequence number, usable as
+    /// [`TranscriptParams::from`] to read the surrounding context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Context around the match, trimmed to ~200 chars.
+    pub snippet: String,
+    /// Byte offsets of the match within `snippet` (not within the source
+    /// document), for highlighting.
+    pub match_start: usize,
+    pub match_end: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    pub hits: Vec<SearchHit>,
+    /// True if any per-session or global budget/limit cut coverage short —
+    /// there may be more matches than what's returned.
+    pub truncated: bool,
+    /// Number of sessions the search actually looked at (may be less than
+    /// the total session count when the global hit limit was reached
+    /// early).
+    pub sessions_scanned: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

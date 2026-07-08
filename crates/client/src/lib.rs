@@ -10,8 +10,8 @@ use agentd_protocol::{
     ProgramUpdateActor, ProgramUpdateParams, ProgramUpdateResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectMoveParams, ProjectRenameParams,
     ProjectSetCollapsedParams, ProjectSummary, PtyReplayResult, PtySize, Request, Response,
-    SessionAttachClipboardParams, SessionAttachClipboardResult, SessionDetail,
-    SessionEmitEventParams, SessionIdParams, SessionInputParams, SessionMoveParams,
+    SearchParams, SearchResult, SessionAttachClipboardParams, SessionAttachClipboardResult,
+    SessionDetail, SessionEmitEventParams, SessionIdParams, SessionInputParams, SessionMoveParams,
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetFocusedParams, SessionSetPinnedParams, SessionSetProjectParams,
     SessionSetTitleParams, SessionSetViewParams, SessionSummary, SessionToolDecisionParams,
@@ -1042,6 +1042,11 @@ impl Client {
             },
         )
         .await
+    }
+    /// Substring search across session name/metadata, stored program
+    /// contents, and transcript history (spec 0076).
+    pub async fn search(&self, params: SearchParams) -> Result<SearchResult> {
+        self.request(ipc_method::SESSION_SEARCH, &params).await
     }
     pub async fn subscribe(&self, session_id: Option<String>) -> Result<()> {
         let _: serde_json::Value = self

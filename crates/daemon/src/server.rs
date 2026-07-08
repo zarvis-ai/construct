@@ -12,8 +12,8 @@ use agentd_protocol::{
     ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
     ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
     ProjectSetCollapsedParams, ProjectStateNotificationPayload, PtyReplayParams, Request, Response,
-    SessionAttachClipboardParams, SessionIdParams, SessionInputParams, SessionMoveParams,
-    SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
+    SearchParams, SessionAttachClipboardParams, SessionIdParams, SessionInputParams,
+    SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetFocusedParams, SessionSetGroupParams, SessionSetPinnedParams,
     SessionSetProjectParams, SessionSetTitleParams, SessionSetViewParams, SessionToolActionParams,
     SessionToolDecisionParams, SmithSetAuthMethodParams, SubscribeParams, TranscriptParams,
@@ -1502,6 +1502,13 @@ async fn dispatch(
             .transcript(&p.session_id, p.from, p.limit, p.tail)
             .await
         {
+            Ok(r) => ok!(req, &r),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::SESSION_SEARCH, {
+        let p = params!(req, SearchParams);
+        match manager.search(p).await {
             Ok(r) => ok!(req, &r),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }

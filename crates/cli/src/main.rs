@@ -56,6 +56,20 @@ enum Command {
     Harnesses,
     /// List sessions.
     List,
+    /// Search session names, program contents, and transcript history.
+    Search {
+        query: String,
+        /// Global cap on returned hits (default 50).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Restrict to one session. Repeatable.
+        #[arg(long = "session")]
+        session_ids: Vec<String>,
+        /// Restrict to these scopes (name, program, transcript). Repeatable;
+        /// default searches all three.
+        #[arg(long = "scope", value_enum)]
+        scopes: Vec<SearchScopeArg>,
+    },
     /// Create a new interactive session and open the TUI.
     New {
         /// Harness name (shell, claude, codex, …).
@@ -246,6 +260,25 @@ enum ProgramCommand {
     Templates,
 }
 
+/// CLI-facing mirror of `agentd_protocol::SearchScope` so `--scope` gets a
+/// clap-validated enum instead of a free-form string.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum SearchScopeArg {
+    Name,
+    Program,
+    Transcript,
+}
+
+impl From<SearchScopeArg> for agentd_protocol::SearchScope {
+    fn from(v: SearchScopeArg) -> Self {
+        match v {
+            SearchScopeArg::Name => agentd_protocol::SearchScope::Name,
+            SearchScopeArg::Program => agentd_protocol::SearchScope::Program,
+            SearchScopeArg::Transcript => agentd_protocol::SearchScope::Transcript,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum AdapterCommand {
     #[command(hide = true)]
@@ -381,6 +414,48 @@ async fn main() -> Result<()> {
                         .as_ref()
                         .map(|t| format!("  — {t}"))
                         .unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        Command::Search {
+            query,
+            limit,
+            session_ids,
+            scopes,
+        } => {
+            let c = connect(&socket).await?;
+            let result = c
+                .search(agentd_protocol::SearchParams {
+                    query,
+                    scopes: (!scopes.is_empty())
+                        .then(|| scopes.into_iter().map(Into::into).collect()),
+                    session_ids: (!session_ids.is_empty()).then_some(session_ids),
+                    limit,
+                    per_session_limit: None,
+                })
+                .await?;
+            if result.hits.is_empty() {
+                println!("(no matches)");
+            }
+            for hit in &result.hits {
+                let scope = match hit.scope {
+                    agentd_protocol::SearchScope::Name => "name",
+                    agentd_protocol::SearchScope::Program => "program",
+                    agentd_protocol::SearchScope::Transcript => "transcript",
+                };
+                let seq = hit.seq.map(|s| format!(" seq={s}")).unwrap_or_default();
+                println!(
+                    "{id}  {title:<20}  {scope:<10}{seq}  {snippet}",
+                    id = &hit.session_id[..hit.session_id.len().min(10)],
+                    title = hit.title,
+                    snippet = hit.snippet,
+                );
+            }
+            if result.truncated {
+                println!(
+                    "(truncated — {} session(s) scanned; narrow with --session or --scope for more)",
+                    result.sessions_scanned
                 );
             }
             Ok(())

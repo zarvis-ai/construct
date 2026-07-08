@@ -11641,7 +11641,81 @@ fn render_session_picker_row(
             };
             Line::from(Span::styled(format!("{prefix}   {text}"), style))
         }
+        SessionPickerRow::ContentMatchHeader {
+            searching,
+            truncated,
+        } => {
+            let mut label = "▾ content matches".to_string();
+            if *searching {
+                label.push_str("  (searching…)");
+            } else if *truncated {
+                label.push_str("  (truncated)");
+            }
+            Line::from(Span::styled(
+                label,
+                Style::default()
+                    .fg(app.theme.group)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        }
+        SessionPickerRow::ContentMatch { hit } => {
+            let prefix = if selected { ">" } else { " " };
+            let scope_tag = match hit.scope {
+                agentd_protocol::SearchScope::Name => "name",
+                agentd_protocol::SearchScope::Program => "program",
+                agentd_protocol::SearchScope::Transcript => "history",
+            };
+            let base_style = if selected {
+                Style::default()
+                    .fg(app.theme.highlight_fg)
+                    .bg(app.theme.highlight_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.text)
+            };
+            let muted_style = if selected {
+                base_style
+            } else {
+                Style::default().fg(app.theme.muted)
+            };
+            let snippet_style = if selected {
+                base_style
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            let match_style = if selected {
+                base_style.add_modifier(Modifier::UNDERLINED)
+            } else {
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD)
+            };
+            let (start, end) = safe_slice_bounds(&hit.snippet, hit.match_start, hit.match_end);
+            Line::from(vec![
+                Span::styled(format!("{prefix}   {}", hit.title), base_style),
+                Span::styled(format!(" [{scope_tag}] "), muted_style),
+                Span::styled(hit.snippet[..start].to_string(), snippet_style),
+                Span::styled(hit.snippet[start..end].to_string(), match_style),
+                Span::styled(hit.snippet[end..].to_string(), snippet_style),
+            ])
+        }
     }
+}
+
+/// Clamp a byte range to `s`'s bounds and snap outward to char boundaries,
+/// so a highlight range sourced from another process (over IPC) can never
+/// panic a slice even if it's stale or malformed.
+fn safe_slice_bounds(s: &str, start: usize, end: usize) -> (usize, usize) {
+    let len = s.len();
+    let mut start = start.min(len);
+    let mut end = end.clamp(start, len);
+    while start > 0 && !s.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < len && !s.is_char_boundary(end) {
+        end += 1;
+    }
+    (start, end)
 }
 
 /// Absolute wrapped position of the cursor within the program body:

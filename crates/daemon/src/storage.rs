@@ -16,7 +16,8 @@
 
 use agentd_protocol::{
     GroupSummary, ProgramBlockView, ProgramDocument, ProgramEdit, ProgramRevision, ProgramTemplate,
-    ProgramUpdateActor, SessionSummary, TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
+    ProgramUpdateActor, SearchHit, SearchParams, SearchResult, SearchScope, SessionSummary,
+    TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
 };
 use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
@@ -28,6 +29,17 @@ const GLOBAL_MEMORY_TEMPLATE: &str =
 const PROJECT_MEMORY_TEMPLATE: &str =
     "# Project Memory\n\n## Overview\n\n## Architecture\n\n## Workflows\n\n## Decisions\n\n## Pitfalls\n";
 const PROGRAM_REVISION_LIMIT: usize = 50;
+/// Per-session cap on transcript bytes read from the tail while searching
+/// (spec 0076), mirroring `PTY_REPLAY_CAP`'s "bound the worst case, not the
+/// common case" role for `session.pty_replay`.
+const PER_SESSION_TRANSCRIPT_SCAN_CAP: u64 = 8 * 1024 * 1024;
+/// Global cap on transcript bytes read across every session in one
+/// `session.search` call, so a fleet of huge transcripts can't turn a
+/// search into a multi-GB scan.
+const GLOBAL_TRANSCRIPT_SCAN_CAP: u64 = 64 * 1024 * 1024;
+/// Search hit snippets are trimmed to roughly this many characters,
+/// centered on the match.
+const SEARCH_SNIPPET_MAX_CHARS: usize = 200;
 const BLANK_PROGRAM: &str = "";
 const TASKS_PROGRAM: &str = concat!(
     "# Rule\n",
@@ -1009,6 +1021,253 @@ impl Storage {
         Ok(events)
     }
 
+    /// Substring search across session name/metadata, stored `program.md`
+    /// contents, and transcript history (spec 0076). The file-scanning core
+    /// of `session.search`: `SessionManager::search` is a thin async
+    /// wrapper around this.
+    /// `sessions` is the caller's current session list (`SessionManager`
+    /// passes its live, in-memory summaries — this method doesn't re-read
+    /// `meta.json` itself, so it always sees the up-to-the-millisecond
+    /// state, including sessions whose latest activity hasn't been synced
+    /// to disk yet). This method re-orders and filters that list itself
+    /// (by recency and `params.session_ids`) and only touches disk for
+    /// each session's `program.md` / `transcript.jsonl`.
+    pub fn search(
+        &self,
+        sessions: &[SessionSummary],
+        params: &SearchParams,
+    ) -> Result<SearchResult> {
+        self.search_with_budgets(
+            sessions,
+            params,
+            PER_SESSION_TRANSCRIPT_SCAN_CAP,
+            GLOBAL_TRANSCRIPT_SCAN_CAP,
+        )
+    }
+
+    /// `search` with the transcript byte budgets as explicit parameters, so
+    /// tests can exercise truncation without writing tens of megabytes of
+    /// fixture data.
+    fn search_with_budgets(
+        &self,
+        sessions: &[SessionSummary],
+        params: &SearchParams,
+        per_session_cap: u64,
+        global_cap: u64,
+    ) -> Result<SearchResult> {
+        let query = params.query.trim();
+        if query.is_empty() {
+            return Ok(SearchResult {
+                hits: Vec::new(),
+                truncated: false,
+                sessions_scanned: 0,
+            });
+        }
+        let query_lower = query.to_lowercase();
+        let scopes: Vec<SearchScope> = params.scopes.clone().unwrap_or_else(|| {
+            vec![
+                SearchScope::Name,
+                SearchScope::Program,
+                SearchScope::Transcript,
+            ]
+        });
+        let limit = params.limit.unwrap_or(50);
+        let per_session_limit = params.per_session_limit.unwrap_or(5);
+
+        let mut sessions: Vec<&SessionSummary> = match &params.session_ids {
+            Some(ids) => {
+                let allow: std::collections::HashSet<&str> =
+                    ids.iter().map(String::as_str).collect();
+                sessions
+                    .iter()
+                    .filter(|s| allow.contains(s.id.as_str()))
+                    .collect()
+            }
+            None => sessions.iter().collect(),
+        };
+        // Most-recent-activity first, not the user-controlled list-view
+        // `position` order — a search wants the sessions most likely to be
+        // relevant right now, which is recency of activity.
+        sessions.sort_by(|a, b| {
+            let ka = a.last_event_at.unwrap_or(a.created_at);
+            let kb = b.last_event_at.unwrap_or(b.created_at);
+            kb.cmp(&ka)
+        });
+
+        let mut hits: Vec<SearchHit> = Vec::new();
+        let mut truncated = false;
+        let mut sessions_scanned = 0usize;
+        let mut transcript_budget = global_cap;
+
+        'sessions: for summary in sessions.iter().copied() {
+            if hits.len() >= limit {
+                truncated = true;
+                break;
+            }
+            sessions_scanned += 1;
+
+            if scopes.contains(&SearchScope::Name) {
+                if let Some(hit) = search_name(summary, &query_lower) {
+                    hits.push(hit);
+                    if hits.len() >= limit {
+                        truncated = true;
+                        break 'sessions;
+                    }
+                }
+            }
+            if scopes.contains(&SearchScope::Program) {
+                let (program_hits, program_truncated) =
+                    self.search_program(summary, &query_lower, per_session_limit)?;
+                truncated |= program_truncated;
+                for hit in program_hits {
+                    hits.push(hit);
+                    if hits.len() >= limit {
+                        truncated = true;
+                        break 'sessions;
+                    }
+                }
+            }
+            if scopes.contains(&SearchScope::Transcript) {
+                if transcript_budget == 0 {
+                    truncated = true;
+                    continue;
+                }
+                let session_cap = per_session_cap.min(transcript_budget);
+                let (transcript_hits, bytes_read, session_truncated) =
+                    self.search_transcript(summary, &query_lower, per_session_limit, session_cap)?;
+                transcript_budget = transcript_budget.saturating_sub(bytes_read);
+                truncated |= session_truncated;
+                for hit in transcript_hits {
+                    hits.push(hit);
+                    if hits.len() >= limit {
+                        truncated = true;
+                        break 'sessions;
+                    }
+                }
+            }
+        }
+        if sessions_scanned < sessions.len() {
+            truncated = true;
+        }
+
+        Ok(SearchResult {
+            hits,
+            truncated,
+            sessions_scanned,
+        })
+    }
+
+    /// Scope `program`: line-by-line substring search over the session's
+    /// `program.md` (via [`Self::read_program`], which also runs the
+    /// canvas→program legacy migration). Returns up to `per_session_limit`
+    /// hits and whether that limit cut the scan short.
+    fn search_program(
+        &self,
+        summary: &SessionSummary,
+        query_lower: &str,
+        per_session_limit: usize,
+    ) -> Result<(Vec<SearchHit>, bool)> {
+        let doc = self.read_program(&summary.id)?;
+        let mut hits = Vec::new();
+        let mut truncated = false;
+        for line in doc.markdown.lines() {
+            if hits.len() >= per_session_limit {
+                truncated = true;
+                break;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            if let Some((snippet, match_start, match_end)) =
+                build_snippet(line, query_lower, SEARCH_SNIPPET_MAX_CHARS)
+            {
+                hits.push(SearchHit {
+                    session_id: summary.id.clone(),
+                    title: session_label(summary),
+                    harness: summary.harness.clone(),
+                    scope: SearchScope::Program,
+                    seq: None,
+                    at: None,
+                    snippet,
+                    match_start,
+                    match_end,
+                });
+            }
+        }
+        Ok((hits, truncated))
+    }
+
+    /// Scope `transcript`: scan `transcript.jsonl` backward from the tail
+    /// (newest first) via [`BackwardLineReader`], stopping at
+    /// `per_session_limit` hits or `byte_budget` bytes read, whichever
+    /// comes first. Returns the hits, the bytes actually read (for the
+    /// caller's global budget), and whether a cap cut the scan short.
+    fn search_transcript(
+        &self,
+        summary: &SessionSummary,
+        query_lower: &str,
+        per_session_limit: usize,
+        byte_budget: u64,
+    ) -> Result<(Vec<SearchHit>, u64, bool)> {
+        let path = self.transcript_path(&summary.id);
+        let mut reader = match BackwardLineReader::open(&path)? {
+            Some(r) => r,
+            None => return Ok((Vec::new(), 0, false)),
+        };
+        if byte_budget == 0 {
+            return Ok((Vec::new(), 0, true));
+        }
+        let mut hits = Vec::new();
+        let mut truncated = false;
+        loop {
+            if hits.len() >= per_session_limit {
+                truncated = true;
+                break;
+            }
+            if reader.bytes_read() >= byte_budget {
+                truncated = true;
+                break;
+            }
+            let line = match reader.next_line()? {
+                Some(l) => l,
+                None => break,
+            };
+            if line.trim().is_empty() {
+                continue;
+            }
+            let ev: TimestampedEvent = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(session = %summary.id, error = %e, "skip bad transcript line during search");
+                    continue;
+                }
+            };
+            if agentd_protocol::slash::is_model_hidden(&ev.event) {
+                continue;
+            }
+            let Some(text) = searchable_event_text(&ev.event) else {
+                continue;
+            };
+            let Some((snippet, match_start, match_end)) =
+                build_snippet(&text, query_lower, SEARCH_SNIPPET_MAX_CHARS)
+            else {
+                continue;
+            };
+            hits.push(SearchHit {
+                session_id: summary.id.clone(),
+                title: session_label(summary),
+                harness: summary.harness.clone(),
+                scope: SearchScope::Transcript,
+                seq: Some(ev.seq),
+                at: Some(ev.at),
+                snippet,
+                match_start,
+                match_end,
+            });
+        }
+        Ok((hits, reader.bytes_read(), truncated))
+    }
+
     pub fn truncate_transcript(&self, id: &str) -> Result<()> {
         let path = self.transcript_path(id);
         if !path.exists() {
@@ -1104,6 +1363,230 @@ impl Storage {
             std::fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
         }
         Ok(())
+    }
+}
+
+/// `session_switch`-style label: title if set and non-blank, else the
+/// short (first-10-char) id. Mirrors the TUI picker's own label so a
+/// `session.search` hit reads the same as the row it corresponds to.
+fn session_label(summary: &SessionSummary) -> String {
+    summary
+        .title
+        .as_ref()
+        .filter(|t| !t.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| summary.id[..summary.id.len().min(10)].to_string())
+}
+
+/// Scope `name`: match against the same fields the TUI's `C-x b` picker
+/// matches (label, full id, short id, harness). One hit per session at
+/// most for this scope — there's only one name.
+fn search_name(summary: &SessionSummary, query_lower: &str) -> Option<SearchHit> {
+    let label = session_label(summary);
+    let short_id = &summary.id[..summary.id.len().min(10)];
+    let is_match = [
+        label.as_str(),
+        summary.id.as_str(),
+        short_id,
+        summary.harness.as_str(),
+    ]
+    .iter()
+    .any(|field| field.to_lowercase().contains(query_lower));
+    if !is_match {
+        return None;
+    }
+    // Best-effort highlight: only the label is ever shown as the snippet,
+    // so if the match actually landed in the id/harness instead, there's
+    // nothing in the snippet to highlight.
+    let (snippet, match_start, match_end) =
+        build_snippet(&label, query_lower, SEARCH_SNIPPET_MAX_CHARS)
+            .unwrap_or_else(|| (label.clone(), 0, 0));
+    Some(SearchHit {
+        session_id: summary.id.clone(),
+        title: label,
+        harness: summary.harness.clone(),
+        scope: SearchScope::Name,
+        seq: None,
+        at: None,
+        snippet,
+        match_start,
+        match_end,
+    })
+}
+
+/// Extract the searchable text from a transcript event. Only
+/// message/reasoning/tool_use/tool_result events carry text worth
+/// searching (spec 0076) — everything else (status, PTY bytes, UI panels,
+/// approval/lifecycle plumbing) is noise for this purpose. Callers are
+/// expected to have already filtered out `is_model_hidden` events (which
+/// would otherwise let the legacy `tui` dispatch `ToolUse` leak in).
+fn searchable_event_text(ev: &agentd_protocol::SessionEvent) -> Option<String> {
+    use agentd_protocol::SessionEvent;
+    match ev {
+        SessionEvent::Message { text, .. } => Some(text.clone()),
+        SessionEvent::Reasoning { text } => Some(text.clone()),
+        SessionEvent::ToolUse { tool, args, .. } => {
+            let args_text = if args.is_null() {
+                String::new()
+            } else {
+                args.to_string()
+            };
+            Some(format!("{tool} {args_text}"))
+        }
+        SessionEvent::ToolResult { tool, output, .. } => Some(format!("{tool} {output}")),
+        _ => None,
+    }
+}
+
+/// Case-insensitive substring search. Returns the byte range of the first
+/// match within `haystack`, in `haystack`'s own byte indexing. `needle_lower`
+/// must already be lowercased and non-empty.
+///
+/// Assumes lowercasing doesn't change a string's byte length, which holds
+/// for ASCII (the overwhelmingly common case for session titles/ids and
+/// transcript text); exotic Unicode casing (Turkish İ, German ß, …) may
+/// shift the returned offsets slightly. Acceptable for a substring-match
+/// search feature with no regex/whole-word ambitions.
+fn find_ci(haystack: &str, needle_lower: &str) -> Option<(usize, usize)> {
+    if needle_lower.is_empty() {
+        return None;
+    }
+    let hay_lower = haystack.to_lowercase();
+    let start = hay_lower.find(needle_lower)?;
+    Some((start, start + needle_lower.len()))
+}
+
+/// Build a match snippet: `text` trimmed to roughly `max_chars` centered on
+/// the match, with the match's byte range re-expressed relative to the
+/// snippet (for highlighting). Returns `None` when `text` doesn't contain
+/// `needle_lower`. Window boundaries are snapped outward to char
+/// boundaries so multi-byte UTF-8 is never sliced mid-codepoint.
+fn build_snippet(
+    text: &str,
+    needle_lower: &str,
+    max_chars: usize,
+) -> Option<(String, usize, usize)> {
+    let (match_start, match_end) = find_ci(text, needle_lower)?;
+    if text.len() <= max_chars {
+        return Some((text.to_string(), match_start, match_end));
+    }
+    let match_len = match_end - match_start;
+    let context = max_chars.saturating_sub(match_len) / 2;
+    let mut win_start = match_start.saturating_sub(context);
+    let mut win_end = (match_end + context).min(text.len());
+    while win_start > 0 && !text.is_char_boundary(win_start) {
+        win_start -= 1;
+    }
+    while win_end < text.len() && !text.is_char_boundary(win_end) {
+        win_end += 1;
+    }
+    let prefix = if win_start > 0 { "…" } else { "" };
+    let suffix = if win_end < text.len() { "…" } else { "" };
+    let snippet = format!("{prefix}{}{suffix}", &text[win_start..win_end]);
+    let new_start = prefix.len() + (match_start - win_start);
+    let new_end = prefix.len() + (match_end - win_start);
+    Some((snippet, new_start, new_end))
+}
+
+/// Backward, budget-capped line reader over an append-only line file
+/// (`transcript.jsonl`). Generalizes [`Storage::read_transcript_tail`]'s
+/// chunked seek-backward approach: instead of reading a fixed number of
+/// trailing lines in one shot, it yields lines one at a time (newest
+/// first) so a caller doing early-exit work (stop once N matches found)
+/// never reads more of a multi-GB file than it needs to.
+///
+/// Reads 64 KiB chunks from the tail, prepending each to an internal
+/// buffer. The buffer's leading line is uncertain (it may be a partial
+/// line whose earlier bytes haven't been read yet) until the file start is
+/// reached, so it's dropped from the confirmed set on every refill; the
+/// confirmed suffix is stable across refills (prepending more history
+/// can only complete that leading fragment into whole line(s), never
+/// change the lines after it), which is what lets `yielded` keep counting
+/// from the end without renumbering after each refill.
+struct BackwardLineReader {
+    file: std::fs::File,
+    /// Bytes [0, cursor) of the file have not been read yet.
+    cursor: u64,
+    buf: Vec<u8>,
+    /// How many lines (from the end of the current confirmed split of
+    /// `buf`) have already been yielded.
+    yielded: usize,
+    bytes_read: u64,
+}
+
+impl BackwardLineReader {
+    const CHUNK: u64 = 64 * 1024;
+
+    fn open(path: &Path) -> Result<Option<Self>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        if len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            file,
+            cursor: len,
+            buf: Vec::new(),
+            yielded: 0,
+            bytes_read: 0,
+        }))
+    }
+
+    /// Total bytes read from disk so far — the caller's signal for its own
+    /// byte budget.
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Read one more chunk from before `cursor`, prepending it to `buf`.
+    /// Returns `false` when the start of the file has already been reached.
+    fn refill(&mut self) -> Result<bool> {
+        if self.cursor == 0 {
+            return Ok(false);
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let to_read = Self::CHUNK.min(self.cursor);
+        self.cursor -= to_read;
+        self.file.seek(SeekFrom::Start(self.cursor))?;
+        let mut chunk = vec![0u8; to_read as usize];
+        self.file.read_exact(&mut chunk)?;
+        self.bytes_read += to_read;
+        chunk.extend_from_slice(&self.buf);
+        self.buf = chunk;
+        Ok(true)
+    }
+
+    /// Pop the next line, newest first. `Ok(None)` once the start of the
+    /// file has been reached and every line has been yielded.
+    ///
+    /// Recomputes the line split from `buf` on every call rather than
+    /// caching it, so a chunk boundary that lands inside a multi-byte
+    /// codepoint only ever corrupts the (always-dropped) leading line: any
+    /// line at index >= 1 is built entirely from bytes that were already
+    /// fully present in `buf` before this refill, so `from_utf8_lossy`
+    /// decodes it correctly. Bounded by the caller's byte budget, so the
+    /// repeated re-split is cheap in practice (at most `budget / CHUNK`
+    /// refills, each re-splitting at most `budget` bytes).
+    fn next_line(&mut self) -> Result<Option<String>> {
+        loop {
+            let text = String::from_utf8_lossy(&self.buf).into_owned();
+            let mut lines: Vec<&str> = text.lines().collect();
+            if self.cursor > 0 && !lines.is_empty() {
+                // Leading line may still be partial — more file precedes it.
+                lines.remove(0);
+            }
+            if self.yielded < lines.len() {
+                let idx = lines.len() - 1 - self.yielded;
+                self.yielded += 1;
+                return Ok(Some(lines[idx].to_string()));
+            }
+            if !self.refill()? {
+                return Ok(None);
+            }
+        }
     }
 }
 
@@ -1718,5 +2201,367 @@ mod memory_tests {
 
         assert!(!storage.project_meta_path(&group.id).exists());
         assert!(storage.project_memory_path(&group.id).exists());
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    use agentd_protocol::{ApprovalMode, MessageRole, SessionEvent, SessionKind, SessionState};
+    use chrono::{Duration as ChronoDuration, Utc};
+
+    /// A minimal `SessionSummary` for search tests. `age_secs` controls
+    /// both `created_at` and `last_event_at` (older == smaller `age_secs`
+    /// is more recent), so callers can control recency ordering directly.
+    fn make_summary(id: &str, title: Option<&str>, harness: &str, age_secs: i64) -> SessionSummary {
+        let at = Utc::now() - ChronoDuration::seconds(age_secs);
+        SessionSummary {
+            id: id.to_string(),
+            harness: harness.to_string(),
+            cwd: "/tmp".into(),
+            title: title.map(str::to_string),
+            state: SessionState::Running,
+            created_at: at,
+            last_event_at: Some(at),
+            cost_usd: None,
+            model: None,
+            worktree: None,
+            pending_input: false,
+            last_prompt: None,
+            event_count: 0,
+            has_pty: false,
+            mode: None,
+            pinned: false,
+            position: 0,
+            group_id: None,
+            parent_session_id: None,
+            last_pty_at_ms: None,
+            approval_mode: ApprovalMode::Manual,
+            kind: SessionKind::User,
+            archived: false,
+            operator_loop_disabled: false,
+            needs_attention: false,
+        }
+    }
+
+    fn message_event(seq: u64, text: &str) -> TimestampedEvent {
+        TimestampedEvent {
+            seq,
+            at: Utc::now(),
+            event: SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: text.to_string(),
+            },
+        }
+    }
+
+    fn search(storage: &Storage, sessions: &[SessionSummary], query: &str) -> SearchResult {
+        storage
+            .search(
+                sessions,
+                &SearchParams {
+                    query: query.to_string(),
+                    scopes: None,
+                    session_ids: None,
+                    limit: None,
+                    per_session_limit: None,
+                },
+            )
+            .unwrap()
+    }
+
+    fn search_scoped(
+        storage: &Storage,
+        sessions: &[SessionSummary],
+        query: &str,
+        scopes: Vec<SearchScope>,
+    ) -> SearchResult {
+        storage
+            .search(
+                sessions,
+                &SearchParams {
+                    query: query.to_string(),
+                    scopes: Some(scopes),
+                    session_ids: None,
+                    limit: None,
+                    per_session_limit: None,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn empty_query_returns_empty_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", Some("hello world"), "shell", 0)];
+
+        let result = search(&storage, &sessions, "   ");
+
+        assert!(result.hits.is_empty());
+        assert!(!result.truncated);
+        assert_eq!(result.sessions_scanned, 0);
+    }
+
+    #[test]
+    fn name_scope_matches_title_and_reports_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![
+            make_summary("sabc1234567", Some("Fix the flaky test"), "claude", 0),
+            make_summary("sxyz9999999", Some("unrelated session"), "shell", 10),
+        ];
+
+        let result = search_scoped(&storage, &sessions, "flaky", vec![SearchScope::Name]);
+
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.session_id, "sabc1234567");
+        assert_eq!(hit.scope, SearchScope::Name);
+        assert_eq!(
+            hit.snippet[hit.match_start..hit.match_end].to_lowercase(),
+            "flaky"
+        );
+    }
+
+    #[test]
+    fn name_scope_matches_short_id_and_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("scodexsession12345", None, "codex", 0)];
+
+        let by_id = search_scoped(&storage, &sessions, "codexsess", vec![SearchScope::Name]);
+        assert_eq!(by_id.hits.len(), 1);
+
+        let by_harness = search_scoped(&storage, &sessions, "codex", vec![SearchScope::Name]);
+        assert_eq!(by_harness.hits.len(), 1);
+    }
+
+    #[test]
+    fn session_ids_filter_restricts_the_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![
+            make_summary("s1", Some("needle here"), "shell", 0),
+            make_summary("s2", Some("needle here too"), "shell", 5),
+        ];
+
+        let result = storage
+            .search(
+                &sessions,
+                &SearchParams {
+                    query: "needle".into(),
+                    scopes: Some(vec![SearchScope::Name]),
+                    session_ids: Some(vec!["s2".into()]),
+                    limit: None,
+                    per_session_limit: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].session_id, "s2");
+        assert_eq!(result.sessions_scanned, 1);
+    }
+
+    #[test]
+    fn program_scope_matches_lines_and_trims_long_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        storage.ensure_session_dir("s1").unwrap();
+        let filler = "z".repeat(300);
+        std::fs::write(
+            storage.program_path("s1"),
+            format!("# Title\n\n{filler} needle {filler}\n\nanother line\n"),
+        )
+        .unwrap();
+
+        let result = search_scoped(&storage, &sessions, "needle", vec![SearchScope::Program]);
+
+        assert_eq!(result.hits.len(), 1);
+        let hit = &result.hits[0];
+        assert_eq!(hit.scope, SearchScope::Program);
+        assert!(hit.snippet.len() < filler.len());
+        assert_eq!(
+            hit.snippet[hit.match_start..hit.match_end].to_lowercase(),
+            "needle"
+        );
+    }
+
+    #[test]
+    fn transcript_hits_are_newest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        // Fewer than the default per_session_limit (5) so this exercises
+        // ordering without also tripping the limit-truncation path.
+        for seq in 1..=3 {
+            storage
+                .append_event(
+                    "s1",
+                    &message_event(seq, &format!("needle occurrence {seq}")),
+                )
+                .unwrap();
+        }
+
+        let result = search_scoped(&storage, &sessions, "needle", vec![SearchScope::Transcript]);
+
+        let seqs: Vec<u64> = result.hits.iter().map(|h| h.seq.unwrap()).collect();
+        assert_eq!(seqs, vec![3, 2, 1]);
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn transcript_per_session_limit_enforced_and_sets_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        for seq in 1..=10 {
+            storage
+                .append_event("s1", &message_event(seq, "needle"))
+                .unwrap();
+        }
+
+        let result = storage
+            .search(
+                &sessions,
+                &SearchParams {
+                    query: "needle".into(),
+                    scopes: Some(vec![SearchScope::Transcript]),
+                    session_ids: None,
+                    limit: None,
+                    per_session_limit: Some(3),
+                },
+            )
+            .unwrap();
+
+        let seqs: Vec<u64> = result.hits.iter().map(|h| h.seq.unwrap()).collect();
+        assert_eq!(seqs, vec![10, 9, 8]);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn global_limit_enforced_and_sets_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions: Vec<SessionSummary> = (0..5)
+            .map(|i| make_summary(&format!("s{i}"), Some("needle session"), "shell", i as i64))
+            .collect();
+
+        let result = storage
+            .search(
+                &sessions,
+                &SearchParams {
+                    query: "needle".into(),
+                    scopes: Some(vec![SearchScope::Name]),
+                    session_ids: None,
+                    limit: Some(2),
+                    per_session_limit: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.hits.len(), 2);
+        assert!(result.truncated);
+        assert_eq!(result.sessions_scanned, 2);
+    }
+
+    #[test]
+    fn transcript_byte_budget_truncates_long_transcript_and_sets_truncated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        let filler = "x".repeat(2000);
+        for seq in 1..=200u64 {
+            storage
+                .append_event("s1", &message_event(seq, &format!("{filler} needle {seq}")))
+                .unwrap();
+        }
+
+        // A tiny per-session cap (well under the ~400 KiB transcript) forces
+        // the scan to stop well before the start of the file.
+        let result = storage
+            .search_with_budgets(
+                &sessions,
+                &SearchParams {
+                    query: "needle".into(),
+                    scopes: Some(vec![SearchScope::Transcript]),
+                    session_ids: None,
+                    limit: None,
+                    per_session_limit: Some(1000),
+                },
+                8 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+
+        assert!(!result.hits.is_empty());
+        assert!(result.hits.len() < 200);
+        assert!(result.truncated);
+        // Newest-first: the tail of the file is scanned first.
+        assert_eq!(result.hits[0].seq, Some(200));
+    }
+
+    #[test]
+    fn transcript_skips_hidden_and_non_searchable_events() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        // A raw PTY chunk mentioning "needle" must never surface as a hit —
+        // `Pty` isn't a searchable event variant.
+        storage
+            .append_event(
+                "s1",
+                &TimestampedEvent {
+                    seq: 1,
+                    at: Utc::now(),
+                    event: SessionEvent::Pty {
+                        data: "needle".into(),
+                    },
+                },
+            )
+            .unwrap();
+        // The legacy `tui` dispatch tool is `is_model_hidden` even though
+        // `ToolUse` is otherwise a searchable variant.
+        storage
+            .append_event(
+                "s1",
+                &TimestampedEvent {
+                    seq: 2,
+                    at: Utc::now(),
+                    event: SessionEvent::ToolUse {
+                        tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
+                        args: serde_json::json!({ "cmd": "needle" }),
+                        call_id: None,
+                    },
+                },
+            )
+            .unwrap();
+        storage
+            .append_event("s1", &message_event(3, "needle for real"))
+            .unwrap();
+
+        let result = search_scoped(&storage, &sessions, "needle", vec![SearchScope::Transcript]);
+
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(result.hits[0].seq, Some(3));
+    }
+
+    #[test]
+    fn build_snippet_centers_window_and_offsets_delimit_match() {
+        let long = format!("{}{}{}", "a".repeat(300), "NEEDLE", "b".repeat(300));
+
+        let (snippet, start, end) =
+            build_snippet(&long, "needle", SEARCH_SNIPPET_MAX_CHARS).unwrap();
+
+        assert!(snippet.starts_with('…'));
+        assert!(snippet.ends_with('…'));
+        assert_eq!(snippet[start..end].to_lowercase(), "needle");
+    }
+
+    #[test]
+    fn build_snippet_returns_none_without_a_match() {
+        assert!(build_snippet("no match here", "needle", SEARCH_SNIPPET_MAX_CHARS).is_none());
     }
 }
