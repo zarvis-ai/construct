@@ -11004,8 +11004,12 @@ fn render_program_selection_context_menu(
     let comment_text = truncate_to_width(&comment_text, comment_budget);
     let comment_style = if menu.comment.is_empty() {
         Style::default().fg(app.theme.muted)
+    } else if comment_selected {
+        Style::default()
+            .fg(app.theme.text)
+            .add_modifier(Modifier::UNDERLINED)
     } else {
-        row_style(comment_selected)
+        Style::default().fg(app.theme.accent)
     };
     let comment_suffix_style = row_style(comment_selected);
     let block = Block::default()

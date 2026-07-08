@@ -13088,6 +13088,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn program_selection_comment_text_is_underlined_not_highlighted() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+        app.program_popup.as_mut().unwrap().selection_menu = Some(ProgramSelectionMenu {
+            focused: true,
+            selected: ProgramSelectionMenuItem::CommentRun,
+            comment: "focus".into(),
+            cursor: 5,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let buf = term.backend().buffer();
+        let mut focus_pos = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect();
+            if let Some(x) = row.find("focus  Run") {
+                focus_pos = Some((x as u16, y));
+                break;
+            }
+        }
+        let (x, y) = focus_pos.expect("comment row rendered");
+        let comment_cell = buf.cell((x, y)).expect("comment cell");
+        assert!(
+            comment_cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "typed comment text should be underlined"
+        );
+        assert_ne!(
+            comment_cell.style().bg,
+            Some(app.theme.accent),
+            "typed comment text should not use the button highlight background"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_remote_cursor_does_not_replace_underlying_character_and_labels_are_tagged() {
         let (mut app, _dir, server) = empty_app().await;
         let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
