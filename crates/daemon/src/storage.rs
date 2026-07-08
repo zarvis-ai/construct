@@ -1210,7 +1210,7 @@ impl Storage {
         byte_budget: u64,
     ) -> Result<(Vec<SearchHit>, u64, bool)> {
         let path = self.transcript_path(&summary.id);
-        let mut reader = match BackwardLineReader::open(&path)? {
+        let mut reader = match BackwardLineReader::open(&path, byte_budget)? {
             Some(r) => r,
             None => return Ok((Vec::new(), 0, false)),
         };
@@ -1238,7 +1238,10 @@ impl Storage {
             let ev: TimestampedEvent = match serde_json::from_str(&line) {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!(session = %summary.id, error = %e, "skip bad transcript line during search");
+                    // debug, not warn: a search sweeps every session, so a
+                    // handful of historically corrupt lines would spam the
+                    // daemon log on every keystroke-debounced query.
+                    tracing::debug!(session = %summary.id, error = %e, "skip bad transcript line during search");
                     continue;
                 }
             };
@@ -1265,7 +1268,7 @@ impl Storage {
                 match_end,
             });
         }
-        Ok((hits, reader.bytes_read(), truncated))
+        Ok((hits, reader.bytes_read(), truncated || reader.hit_budget()))
     }
 
     pub fn truncate_transcript(&self, id: &str) -> Result<()> {
@@ -1495,29 +1498,39 @@ fn build_snippet(
 /// first) so a caller doing early-exit work (stop once N matches found)
 /// never reads more of a multi-GB file than it needs to.
 ///
-/// Reads 64 KiB chunks from the tail, prepending each to an internal
-/// buffer. The buffer's leading line is uncertain (it may be a partial
-/// line whose earlier bytes haven't been read yet) until the file start is
-/// reached, so it's dropped from the confirmed set on every refill; the
-/// confirmed suffix is stable across refills (prepending more history
-/// can only complete that leading fragment into whole line(s), never
-/// change the lines after it), which is what lets `yielded` keep counting
-/// from the end without renumbering after each refill.
+/// Reads 64 KiB chunks from the tail. Each refill splits only the newly
+/// read chunk (plus the carried partial-line prefix from the previous
+/// refill) into complete lines, so every byte of the file is copied and
+/// scanned O(1) times regardless of how many lines are yielded. Lines are
+/// assembled as raw bytes before UTF-8 decoding, so a chunk boundary that
+/// lands inside a multi-byte codepoint can never corrupt a yielded line.
+///
+/// The reader owns the byte budget: once `bytes_read` reaches it, refills
+/// stop as if the file start had been reached and the carried partial line
+/// is discarded. Without this, a single line larger than the budget would
+/// force refills until the whole file had been read — the caller only
+/// checks the budget between yielded lines.
 struct BackwardLineReader {
     file: std::fs::File,
     /// Bytes [0, cursor) of the file have not been read yet.
     cursor: u64,
-    buf: Vec<u8>,
-    /// How many lines (from the end of the current confirmed split of
-    /// `buf`) have already been yielded.
-    yielded: usize,
+    /// Complete lines from the chunks read so far, in file order; yielded
+    /// newest-first by popping from the back. Refilled only when empty —
+    /// every line a refill completes precedes everything already yielded.
+    pending: Vec<String>,
+    /// Bytes of the earliest read chunk that precede its first newline: a
+    /// line whose start hasn't been read yet. Completed by a later refill,
+    /// or yielded as the file's first line once `cursor` reaches 0.
+    carry: Vec<u8>,
     bytes_read: u64,
+    budget: u64,
+    hit_budget: bool,
 }
 
 impl BackwardLineReader {
     const CHUNK: u64 = 64 * 1024;
 
-    fn open(path: &Path) -> Result<Option<Self>> {
+    fn open(path: &Path, budget: u64) -> Result<Option<Self>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -1529,59 +1542,80 @@ impl BackwardLineReader {
         Ok(Some(Self {
             file,
             cursor: len,
-            buf: Vec::new(),
-            yielded: 0,
+            pending: Vec::new(),
+            carry: Vec::new(),
             bytes_read: 0,
+            budget,
+            hit_budget: false,
         }))
     }
 
     /// Total bytes read from disk so far — the caller's signal for its own
-    /// byte budget.
+    /// (e.g. global, cross-session) byte budget.
     fn bytes_read(&self) -> u64 {
         self.bytes_read
     }
 
-    /// Read one more chunk from before `cursor`, prepending it to `buf`.
-    /// Returns `false` when the start of the file has already been reached.
+    /// Did the reader stop because its own byte budget ran out (as opposed
+    /// to reaching the start of the file)?
+    fn hit_budget(&self) -> bool {
+        self.hit_budget
+    }
+
+    /// Strip the CR of a CRLF ending (mirroring `str::lines`) and decode.
+    fn decode_line(bytes: &[u8]) -> String {
+        let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    /// Read one more chunk from before `cursor` and split it (together
+    /// with the carried partial line it completes) into `pending`.
+    /// Returns `false` when the file start was already reached or the
+    /// byte budget is exhausted.
     fn refill(&mut self) -> Result<bool> {
+        // Only ever called with `pending` drained — a refill overwrites it.
+        debug_assert!(self.pending.is_empty());
         if self.cursor == 0 {
             return Ok(false);
         }
+        if self.bytes_read >= self.budget {
+            self.hit_budget = true;
+            self.carry.clear();
+            return Ok(false);
+        }
         use std::io::{Read, Seek, SeekFrom};
+        let first_refill = self.bytes_read == 0;
         let to_read = Self::CHUNK.min(self.cursor);
         self.cursor -= to_read;
         self.file.seek(SeekFrom::Start(self.cursor))?;
-        let mut chunk = vec![0u8; to_read as usize];
-        self.file.read_exact(&mut chunk)?;
+        let mut data = vec![0u8; to_read as usize];
+        self.file.read_exact(&mut data)?;
         self.bytes_read += to_read;
-        chunk.extend_from_slice(&self.buf);
-        self.buf = chunk;
+        // The carry holds bytes that come directly after this chunk.
+        data.extend_from_slice(&self.carry);
+        let mut segments: Vec<&[u8]> = data.split(|b| *b == b'\n').collect();
+        if first_refill && data.ends_with(b"\n") {
+            // The file's trailing newline terminates its last line rather
+            // than opening an empty one (mirrors `str::lines`).
+            segments.pop();
+        }
+        if self.cursor > 0 {
+            // The first segment's start hasn't been read yet.
+            self.carry = segments.remove(0).to_vec();
+        } else {
+            self.carry = Vec::new();
+        }
+        self.pending = segments.into_iter().map(Self::decode_line).collect();
         Ok(true)
     }
 
-    /// Pop the next line, newest first. `Ok(None)` once the start of the
-    /// file has been reached and every line has been yielded.
-    ///
-    /// Recomputes the line split from `buf` on every call rather than
-    /// caching it, so a chunk boundary that lands inside a multi-byte
-    /// codepoint only ever corrupts the (always-dropped) leading line: any
-    /// line at index >= 1 is built entirely from bytes that were already
-    /// fully present in `buf` before this refill, so `from_utf8_lossy`
-    /// decodes it correctly. Bounded by the caller's byte budget, so the
-    /// repeated re-split is cheap in practice (at most `budget / CHUNK`
-    /// refills, each re-splitting at most `budget` bytes).
+    /// Pop the next line, newest first. `Ok(None)` once every line has
+    /// been yielded — because the file start was reached or the byte
+    /// budget ran out (see [`Self::hit_budget`]).
     fn next_line(&mut self) -> Result<Option<String>> {
         loop {
-            let text = String::from_utf8_lossy(&self.buf).into_owned();
-            let mut lines: Vec<&str> = text.lines().collect();
-            if self.cursor > 0 && !lines.is_empty() {
-                // Leading line may still be partial — more file precedes it.
-                lines.remove(0);
-            }
-            if self.yielded < lines.len() {
-                let idx = lines.len() - 1 - self.yielded;
-                self.yielded += 1;
-                return Ok(Some(lines[idx].to_string()));
+            if let Some(line) = self.pending.pop() {
+                return Ok(Some(line));
             }
             if !self.refill()? {
                 return Ok(None);
@@ -2501,6 +2535,104 @@ mod search_tests {
         assert!(result.truncated);
         // Newest-first: the tail of the file is scanned first.
         assert_eq!(result.hits[0].seq, Some(200));
+    }
+
+    #[test]
+    fn transcript_line_larger_than_budget_is_dropped_not_scanned_past_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        // One event far larger than the byte budget (oldest), then a few
+        // normal events after it. The backward scan must yield the normal
+        // hits, then stop at the budget instead of refilling until the
+        // whole giant line has been read.
+        let giant = format!("haystack {}", "y".repeat(300 * 1024));
+        storage.append_event("s1", &message_event(1, &giant)).unwrap();
+        for seq in 2..=21u64 {
+            storage
+                .append_event("s1", &message_event(seq, &format!("needle {seq}")))
+                .unwrap();
+        }
+
+        let result = storage
+            .search_with_budgets(
+                &sessions,
+                &SearchParams {
+                    query: "needle".into(),
+                    scopes: Some(vec![SearchScope::Transcript]),
+                    session_ids: None,
+                    limit: None,
+                    per_session_limit: Some(1000),
+                },
+                128 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+
+        assert_eq!(result.hits.len(), 20);
+        assert_eq!(result.hits[0].seq, Some(21));
+        assert!(result.truncated);
+
+        // Same shape with the giant line as the only content: the scan must
+        // terminate at the budget with no hits rather than reading the
+        // whole line.
+        let solo = vec![make_summary("s2", None, "shell", 0)];
+        storage.append_event("s2", &message_event(1, &giant)).unwrap();
+        let result = storage
+            .search_with_budgets(
+                &solo,
+                &SearchParams {
+                    query: "haystack".into(),
+                    scopes: Some(vec![SearchScope::Transcript]),
+                    session_ids: None,
+                    limit: None,
+                    per_session_limit: None,
+                },
+                64 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+        assert!(result.hits.is_empty());
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn transcript_lines_reassemble_exactly_across_chunk_boundaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        let sessions = vec![make_summary("s1", None, "shell", 0)];
+        // ~1.4 KiB of multi-byte codepoints per line across ~300 KiB of
+        // transcript, so 64 KiB chunk boundaries land mid-line and often
+        // mid-codepoint. Every line must survive reassembly byte-exact —
+        // a line corrupted at a boundary would fail JSON parsing and drop
+        // out of the hit count.
+        let filler = "λ".repeat(700);
+        for seq in 1..=200u64 {
+            storage
+                .append_event("s1", &message_event(seq, &format!("{filler} needle {seq}")))
+                .unwrap();
+        }
+
+        let result = storage
+            .search_with_budgets(
+                &sessions,
+                &SearchParams {
+                    query: "needle".into(),
+                    scopes: Some(vec![SearchScope::Transcript]),
+                    session_ids: None,
+                    limit: Some(1000),
+                    per_session_limit: Some(1000),
+                },
+                64 * 1024 * 1024,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+
+        assert_eq!(result.hits.len(), 200);
+        let seqs: Vec<u64> = result.hits.iter().filter_map(|h| h.seq).collect();
+        let expected: Vec<u64> = (1..=200u64).rev().collect();
+        assert_eq!(seqs, expected);
+        assert!(!result.truncated);
     }
 
     #[test]

@@ -3485,21 +3485,30 @@ async fn run_loop(
                         let generation = dialog.content_search_generation;
                         dialog.content_search_in_flight = true;
                         dialog.content_search_deadline = None;
-                        let client = app.client.clone();
+                        // Dial a dedicated connection per sweep: the daemon
+                        // dispatches a connection's requests sequentially,
+                        // so running the search on the app's main connection
+                        // would queue every other UI request behind it.
+                        let socket = app.client.socket_path().to_path_buf();
                         let tx = content_search_tx.clone();
                         tokio::spawn(async move {
-                            let result = client
-                                .search(agentd_protocol::SearchParams {
-                                    query,
-                                    scopes: Some(vec![
-                                        agentd_protocol::SearchScope::Program,
-                                        agentd_protocol::SearchScope::Transcript,
-                                    ]),
-                                    session_ids: None,
-                                    limit: Some(20),
-                                    per_session_limit: None,
-                                })
-                                .await;
+                            let result = match Client::connect(&socket).await {
+                                Ok(search_client) => {
+                                    search_client
+                                        .search(agentd_protocol::SearchParams {
+                                            query,
+                                            scopes: Some(vec![
+                                                agentd_protocol::SearchScope::Program,
+                                                agentd_protocol::SearchScope::Transcript,
+                                            ]),
+                                            session_ids: None,
+                                            limit: Some(20),
+                                            per_session_limit: None,
+                                        })
+                                        .await
+                                }
+                                Err(e) => Err(e),
+                            };
                             let _ = tx.send((generation, result));
                         });
                     }

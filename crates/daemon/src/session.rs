@@ -1770,14 +1770,17 @@ impl SessionManager {
     }
 
     /// Substring search across session name/metadata, stored program
-    /// contents, and transcript history (spec 0076). The scan itself is
-    /// synchronous file I/O in `Storage::search`, run inline like the other
-    /// storage reads on this type (`transcript`, `diff`, …) rather than via
-    /// `spawn_blocking` — consistent with the rest of this file's storage
-    /// access, and the byte budgets keep a single call bounded.
+    /// contents, and transcript history (spec 0076). The scan is
+    /// synchronous file I/O over up to the global byte budget, so unlike
+    /// this type's small point reads (`transcript`, `diff`, …) it runs on
+    /// the blocking pool — inline it would pin a runtime worker for the
+    /// whole sweep and stall the connection's dispatch loop behind it.
     pub async fn search(&self, params: SearchParams) -> Result<SearchResult> {
         let sessions = self.list().await;
-        self.storage.search(&sessions, &params)
+        let storage = self.storage.clone();
+        tokio::task::spawn_blocking(move || storage.search(&sessions, &params))
+            .await
+            .map_err(|e| anyhow!("search task failed: {e}"))?
     }
 
     pub async fn diff(&self, id: &str) -> Result<String> {
