@@ -12982,7 +12982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn program_tab_indents_multi_line_selection() {
+    async fn program_tab_focuses_selection_menu_for_multi_line_selection() {
         let (mut app, _dir, server) = empty_app().await;
         app.program_popup = Some(program_popup_for_test("s1", "- one\n- two", 0));
         // Select from the start of the buffer through the end of the second
@@ -12995,9 +12995,14 @@ mod tests {
 
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(
-            popup.buffer, "  - one\n  - two",
-            "Tab indents every selected list line"
+            popup.buffer, "- one\n- two",
+            "Tab focuses the selected-text run menu instead of editing the selection"
         );
+        let menu = popup
+            .selection_menu
+            .as_ref()
+            .expect("selection run menu should be present");
+        assert!(menu.focused, "Tab should focus the selection run menu");
         server.abort();
     }
 
@@ -13071,8 +13076,8 @@ mod tests {
             "selection run menu should render: {text:?}"
         );
         assert!(
-            text.contains("type additional instruction"),
-            "selection run menu should render the comment placeholder: {text:?}"
+            text.contains("type additional") && text.contains("instruction"),
+            "selection run menu should render the comment placeholder even when wrapped: {text:?}"
         );
         assert!(app.layout.program_title_run_hit.is_some());
         assert!(app.layout.program_title_toggle_hit.is_some());
