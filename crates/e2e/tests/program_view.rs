@@ -1268,6 +1268,7 @@ async fn program_instant_dispatch_fast_path() {
             base_version: Some(updated.program.version),
             shimmer: None,
             selection_block_ids: None,
+            comment: None,
         })
         .await
         .expect("program.execute");
@@ -1374,6 +1375,7 @@ async fn program_instant_dispatch_mixed_selection_falls_through() {
             base_version: None,
             shimmer: None,
             selection_block_ids: None,
+            comment: None,
         })
         .await
         .expect("program.execute");
@@ -1436,6 +1438,7 @@ async fn program_instant_dispatch_preserves_nested_indentation() {
             base_version: None,
             shimmer: None,
             selection_block_ids: None,
+            comment: None,
         })
         .await
         .expect("program.execute");
