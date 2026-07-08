@@ -365,12 +365,15 @@ impl SessionManager {
             _ => {}
         }
 
-        // Auto-title hook: trigger on the FIRST User message we record
-        // regardless of where it came from (the daemon's create()
-        // prompt-as-event, send_input, or an adapter that re-emits the
-        // user's typed prompt — smith interactive does this). The
-        // `title_gen_attempted` AtomicBool inside maybe_spawn_auto_title
-        // ensures only the first one wins.
+        // Auto-title hook: feed every User message we record to
+        // maybe_spawn_auto_title, regardless of where it came from (the
+        // daemon's create() prompt-as-event, send_input, or an adapter
+        // that re-emits the user's typed prompt — smith interactive
+        // does this). Generation itself only fires on the first
+        // non-slash-command message (leading `/model ...`-style
+        // messages are accumulated as context, not treated as the
+        // trigger); the `title_gen_attempted` AtomicBool inside
+        // maybe_spawn_auto_title ensures only the first firing wins.
         if let SessionEvent::Message {
             role: MessageRole::User,
             text,
