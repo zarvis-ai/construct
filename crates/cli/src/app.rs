@@ -39,6 +39,7 @@ mod program_popup;
 mod session_picker;
 mod session_title_menu;
 mod session_title_rename;
+mod tutorial;
 pub use configure::{
     harness_guidance, no_agent_harness_available, smith_method_guidance, ConfigurePopup,
     ConfigureTab, CONFIGURE_TABS,
@@ -46,6 +47,7 @@ pub use configure::{
 pub use session_picker::{
     session_picker_scroll, SessionPickerDialog, SessionPickerPurpose, SessionPickerRow,
 };
+pub use tutorial::{Step1Phase, TutorialState};
 
 pub const TERMINAL_SCROLLBAR_TTL: Duration = Duration::from_millis(1200);
 pub(crate) const DYNAMIC_UI_AUTOHIDE_SECS: u64 = 15;
@@ -1447,6 +1449,9 @@ pub struct App {
     pty_osc11_query_tails: HashMap<String, Vec<u8>>,
     pty_input_tx: mpsc::UnboundedSender<PtyInputJob>,
     pty_input_errors: mpsc::UnboundedReceiver<String>,
+    /// Interactive tutorial (spec 0076): `None` = no tour active. See
+    /// `app/tutorial.rs` for the full state machine and hooks.
+    pub tutorial: Option<TutorialState>,
 }
 
 struct ReconnectState {
@@ -3096,7 +3101,11 @@ async fn run_with_socket_initial_selection(
         pty_osc11_query_tails: HashMap::new(),
         pty_input_tx,
         pty_input_errors,
+        tutorial: None,
     };
+    if let Some(step) = persisted.tutorial_step {
+        app.tutorial_resume(step);
+    }
     if let Some(warning) = theme_warning {
         app.status = Some((warning, Instant::now()));
     }
@@ -3209,6 +3218,7 @@ async fn run_with_socket_initial_selection(
         active_window_id: Some(app.active_window_id),
         open_program_session_ids: app.open_program_session_ids(),
         widgets,
+        tutorial_step: app.tutorial.as_ref().filter(|t| !t.completed).map(|t| t.step),
     });
 
     result
@@ -3672,6 +3682,7 @@ async fn run_loop(
                 }
                 app.update_browser_preview_hover_and_expiry();
                 app.expire_program_runs(Instant::now());
+                app.tutorial_tick(Instant::now());
             }
             _ = harness_refresh.tick(), if app.connected
                 && (app.selected_id().is_none() || app.configure_popup.is_some()) => {
@@ -5526,6 +5537,11 @@ impl App {
     }
 
     async fn on_notification(&mut self, n: agentd_protocol::Notification) {
+        // Tutorial hook (b) — spec 0076: the one place daemon-pushed state
+        // changes are applied to app state. Re-parses the payload itself so
+        // this stays a single thin call; all step logic lives in
+        // `app/tutorial.rs`.
+        self.tutorial_observe_notification(&n);
         // Default: assume the notification changes something visible, so the
         // run loop repaints. Only an off-screen `Pty` chunk clears this (see
         // the `Pty` arm below) — every other event kind keeps it set.
@@ -7520,6 +7536,13 @@ impl App {
     }
 
     fn forward_key_to_selected_pty(&mut self, key: KeyEvent) {
+        // Tutorial hook — spec 0076 step 3 ("say something to it"): a
+        // PTY-captured session (any real agent harness) never routes typed
+        // input through `run_action` or a notification, so this is the only
+        // chokepoint that sees "the user submitted a line" for that case.
+        if matches!(key.code, KeyCode::Enter) {
+            self.tutorial_observe_pty_enter();
+        }
         let was_scrolled = self.snap_pty_scrollback_to_live();
         if let Some(bytes) = encode_key_to_bytes(key) {
             self.queue_selected_pty_input(bytes);
@@ -7802,6 +7825,10 @@ impl App {
 
         let res = self.chord_state.handle(key, &self.keymap);
         self.chord_label = self.chord_state.label();
+        // Tutorial hook — step 1's pending-chord echo / C-g cancel / wrong-key
+        // correction is driven off the raw `KeymapResult`, since `C-x` and
+        // `C-g` alone never resolve to a `KeyAction` (spec 0076).
+        self.tutorial_observe_key_result(&res, key);
         match res {
             KeymapResult::Action(a) => self.run_action(a).await,
             KeymapResult::Pending(label) => self.chord_label = label,
@@ -7900,6 +7927,11 @@ impl App {
 
     async fn run_action(&mut self, action: KeyAction) {
         use KeyAction::*;
+        // Tutorial hook (a) — spec 0076: `run_action` is the one chokepoint
+        // every `KeyAction` passes through, whether it came from a chord,
+        // a palette command, or a `HintZone` click. Kept thin; all logic
+        // lives in `app/tutorial.rs`.
+        self.tutorial_observe_action(action);
         match action {
             Quit => self.should_quit = true,
             NextSession => self.step_selection(1).await,
@@ -8424,6 +8456,10 @@ impl App {
                     });
                 }
             }
+            StartTutorial => self.tutorial_start(),
+            TutorialSkipStep => self.tutorial_skip_step(),
+            TutorialEndTour => self.tutorial_end_tour(),
+            TutorialNudge => self.tutorial_nudge(),
         }
     }
 
@@ -8655,6 +8691,7 @@ impl App {
             "configure" => {
                 self.open_configure_popup().await;
             }
+            "tutorial" | "tour" => self.run_action(KeyAction::StartTutorial).await,
             "construct" => {
                 // Subcommand dispatch:
                 //
@@ -10405,6 +10442,7 @@ mod tests {
             pty_osc11_query_tails: HashMap::new(),
             pty_input_tx,
             pty_input_errors,
+            tutorial: None,
         }
     }
 
@@ -22891,6 +22929,272 @@ mod tests {
         let (x, y) = click(&app, KeyAction::Quit);
         app.handle_left_click(x, y).await;
         assert!(app.should_quit);
+        server.abort();
+    }
+
+    // --- Interactive tutorial (spec 0076) -----------------------------
+
+    #[tokio::test]
+    async fn welcome_card_tour_line_starts_tutorial_via_key_and_click() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("take the 2-minute tour"),
+            "missing tour line:\n{screen}"
+        );
+        assert!(
+            app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.action == KeyAction::StartTutorial),
+            "tour line should register a HintZone"
+        );
+
+        // Key path: bare `t`.
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .await;
+        assert!(app.tutorial.is_some(), "bare t should start the tour");
+        app.tutorial = None;
+
+        // Click path.
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("tour hint")
+            .clone();
+        app.handle_left_click(hit.x_start, hit.y).await;
+        assert!(
+            app.tutorial.is_some(),
+            "clicking the tour hint should start the tour"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn starting_tutorial_renders_step1_card() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(screen.contains("tour 1/8"), "missing step title:\n{screen}");
+        assert!(
+            screen.contains("A chord like C-x C-f means"),
+            "missing step1 body:\n{screen}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn step1_chord_flow_pending_cancel_and_wrong_key() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().step1_phase,
+            Step1Phase::AwaitCtrlG
+        );
+        assert!(
+            app.tutorial
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("pending"),
+            "C-x should show pending feedback"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().step1_phase,
+            Step1Phase::AwaitNewSession
+        );
+        assert!(
+            app.tutorial
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("cancelled"),
+            "C-g should advance the micro-exercise with a cancel message"
+        );
+
+        // A wrong key here (not the create-session chord) should show a
+        // correction naming the actual key pressed, without advancing.
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .await;
+        let feedback = app
+            .tutorial
+            .as_ref()
+            .unwrap()
+            .feedback
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            feedback.contains("you pressed"),
+            "expected a wrong-key correction, got: {feedback}"
+        );
+        assert_eq!(app.tutorial.as_ref().unwrap().step, 1, "still on step 1");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn completing_step1_opens_new_session_and_advances_to_step2() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            matches!(
+                app.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::NewSessionHarness)
+            ),
+            "C-x C-f should still open the new-session picker"
+        );
+        assert_eq!(
+            app.tutorial.as_ref().map(|t| t.step),
+            Some(2),
+            "tour should advance to step 2"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn end_tour_click_closes_without_writing_marker() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start(); // step 1 — not the final step.
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::TutorialEndTour)
+            .expect("end tour hint")
+            .clone();
+        app.handle_left_click(hit.x_start, hit.y).await;
+
+        let marker_written = crate::tui_state::tutorial_done();
+        match saved {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+        assert!(app.tutorial.is_none(), "end tour should close the card");
+        assert!(
+            !marker_written,
+            "ending early must not write the done marker"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn welcome_tour_line_unhighlighted_once_done_marker_present() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+        crate::tui_state::mark_tutorial_done();
+
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("tour hint")
+            .clone();
+        let done_bold = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.style().add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .unwrap_or(false);
+
+        match saved {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+        assert!(
+            !done_bold,
+            "tour line should not be highlighted once the done marker exists"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn welcome_tour_line_highlighted_when_marker_absent() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+        assert!(!crate::tui_state::tutorial_done(), "fresh state dir starts unmarked");
+
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("tour hint")
+            .clone();
+        let not_done_bold = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.style().add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .unwrap_or(false);
+
+        match saved {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+        assert!(
+            not_done_bold,
+            "tour line should be highlighted (accent + bold) while unmarked"
+        );
         server.abort();
     }
 

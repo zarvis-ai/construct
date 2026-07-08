@@ -293,6 +293,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
     }
     render_session_title_menu(f, app);
+    render_tutorial_card(f, app);
     finish_frame(f, app);
 }
 
@@ -1533,7 +1534,10 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
-    let focused = app.focus == PaneFocus::List;
+    // Tutorial pane highlight (spec 0076, step 4 "get around"): reuses
+    // `pane_border_style`'s focused styling as the highlight rather than
+    // inventing new styling.
+    let focused = app.focus == PaneFocus::List || app.tutorial_wants_list_highlight();
     // Collapsed render path: a thin column with a `>` expand glyph
     // on the top border. Anywhere inside the pane click-expands.
     let effective_collapsed = app.list_collapsed && !focused;
@@ -3294,7 +3298,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     // its focused brightness (the border still dims) so the user can see
     // where `C-x o` will land.
     let last_focused = window_id.is_none_or(|id| id == app.active_window_id);
-    let focused = app.focus == PaneFocus::View && last_focused;
+    // Tutorial pane highlight (spec 0076, steps 2/3 "create"/"say
+    // something"): reuses `pane_border_style`'s focused styling.
+    let focused = last_focused
+        && (app.focus == PaneFocus::View || app.tutorial_wants_view_highlight());
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3432,27 +3439,32 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
 }
 
 fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
-    // Base content (title, blurb, four shortcut lines) is 8 rows; the
+    // Base content (title, blurb, five shortcut lines) is 9 rows; the
     // harness status section below adds a blank separator + header + one
     // row per registered harness. Grow the card to fit instead of clipping
     // — `centered_rect` already clamps to the pane's actual height.
-    let base_rows: u16 = 8;
+    let base_rows: u16 = 9;
     let harness_rows: u16 = if app.harnesses.is_empty() {
         0
     } else {
         2 + app.harnesses.len() as u16
     };
-    let card = centered_rect(area, 72, (base_rows + harness_rows).max(10));
+    let card = centered_rect(area, 72, (base_rows + harness_rows).max(11));
     let label_style = Style::default().fg(app.theme.accent);
     let hover_style = label_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    // The tour line is highlighted (accent + bold) as an invitation — not an
+    // auto-start — whenever the tour hasn't been completed yet (spec 0076).
+    let tour_not_done = !crate::tui_state::tutorial_done();
+    let tour_invite_style = label_style.add_modifier(Modifier::BOLD);
     let mouse = app.mouse_pos;
     let shortcut_rows = [
         (4_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
         (5_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
         (6_u16, 2_u16, "?", KeyAction::ToggleHelp),
         (7_u16, 2_u16, "C-x C-c", KeyAction::Quit),
+        (8_u16, 2_u16, "t", KeyAction::StartTutorial),
     ];
-    let mut hovered = [false; 4];
+    let mut hovered = [false; 5];
     for (i, (row, col, label, action)) in shortcut_rows.iter().enumerate() {
         let x_start = card.x + *col;
         let y = card.y + *row;
@@ -3468,6 +3480,13 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
             action: *action,
         });
     }
+    let tour_style = |base: Style| {
+        if hovered[4] {
+            base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            base
+        }
+    };
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -3507,6 +3526,18 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
                 if hovered[3] { hover_style } else { label_style },
             ),
             Span::raw("  exit TUI"),
+        ]),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "t",
+                tour_style(if tour_not_done {
+                    tour_invite_style
+                } else {
+                    label_style
+                }),
+            ),
+            Span::raw("        take the 2-minute tour"),
         ]),
     ];
     if !app.harnesses.is_empty() {
@@ -3556,6 +3587,150 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// Interactive tutorial coach-mark card (spec 0076). A small floating,
+/// NEVER-modal card anchored top-right of the main view pane — it never
+/// covers the session list, minibuffer, or modeline, and (unlike
+/// `render_help`/`render_configure_popup`) never sets `layout.modal_area`,
+/// so clicks outside it fall straight through to whatever's underneath.
+/// Every key label it renders (except step 1's, which teach real
+/// keystrokes) is a real `HintZone` dispatching the exact `KeyAction` a
+/// keypress would, following `render_empty_session_state`'s pattern of
+/// building spans directly (rather than composing strings) so hit-testing
+/// is exact.
+fn render_tutorial_card(f: &mut Frame, app: &mut App) {
+    let Some(state) = app.tutorial.clone() else {
+        return;
+    };
+    let anchor = app.layout.view_area.unwrap_or(f.area());
+    if anchor.width < 8 || anchor.height < 4 {
+        return;
+    }
+    let width = 46u16.min(anchor.width.saturating_sub(1)).max(8);
+    let height = 12u16.min(anchor.height.saturating_sub(1)).max(6);
+    // Top-right corner of the view pane, inset by one cell so the card
+    // floats clear of the pane's own border/title row.
+    let x = anchor.x + anchor.width.saturating_sub(width + 1);
+    let y = anchor.y + 1;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent))
+        .title(state.card_title());
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mouse = app.mouse_pos;
+    let bottom = inner.y + inner.height;
+    let mut row = inner.y;
+
+    let render_segments = |f: &mut Frame, app: &mut App, row: u16, segs: &[(String, Option<KeyAction>)]| {
+        if row >= bottom {
+            return;
+        }
+        let mut col = inner.x;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(segs.len());
+        for (text, action) in segs {
+            let w = UnicodeWidthStr::width(text.as_str()) as u16;
+            match action {
+                Some(action) => {
+                    let hovered = mouse
+                        .map(|(mx, my)| my == row && mx >= col && mx < col + w)
+                        .unwrap_or(false);
+                    let mut style = Style::default().fg(app.theme.accent);
+                    if hovered {
+                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    }
+                    spans.push(Span::styled(text.clone(), style));
+                    app.layout.shortcut_hints.push(HintZone {
+                        x_start: col,
+                        x_end: col + w,
+                        y: row,
+                        action: *action,
+                    });
+                }
+                None => {
+                    spans.push(Span::styled(
+                        text.clone(),
+                        Style::default().fg(app.theme.text),
+                    ));
+                }
+            }
+            col += w;
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: inner.x,
+                y: row,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    };
+
+    for line in state.lines() {
+        if row >= bottom {
+            break;
+        }
+        render_segments(f, app, row, &line);
+        row += 1;
+    }
+    row += 1;
+
+    if let Some(feedback) = &state.feedback {
+        if row < bottom {
+            let style = Style::default().fg(app.theme.warning);
+            f.render_widget(
+                Paragraph::new(feedback.clone())
+                    .style(style)
+                    .wrap(Wrap { trim: false }),
+                Rect {
+                    x: inner.x,
+                    y: row,
+                    width: inner.width,
+                    height: (bottom - row).min(2),
+                },
+            );
+            row += 2;
+        }
+    }
+
+    let checklist = state.checklist();
+    if !checklist.is_empty() {
+        for (label, done) in &checklist {
+            if row >= bottom {
+                break;
+            }
+            let mark = if *done { "[x]" } else { "[ ]" };
+            let style = Style::default().fg(if *done {
+                app.theme.success
+            } else {
+                app.theme.dim
+            });
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("{mark} {label}"), style))),
+                Rect {
+                    x: inner.x,
+                    y: row,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+            row += 1;
+        }
+    }
+
+    // Footer pinned to the card's last row.
+    let footer_row = inner.y + inner.height.saturating_sub(1);
+    render_segments(f, app, footer_row, &state.footer());
 }
 
 fn render_group_overview(
@@ -8800,7 +8975,11 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
             |id| app.selection_for_window(id),
             f.area(),
         );
-        popups.push((popup.clone(), base_rect, true, app.focus == PaneFocus::View));
+        // Tutorial pane highlight (spec 0076, steps 5/6 "program board" /
+        // "split screen"): reuses the popup's normal focused-border styling.
+        let popup_focused =
+            app.focus == PaneFocus::View || app.tutorial_wants_program_highlight();
+        popups.push((popup.clone(), base_rect, true, popup_focused));
     }
     let mut hover_overlays = Vec::new();
     for (popup, base_rect, active, popup_focused) in popups {

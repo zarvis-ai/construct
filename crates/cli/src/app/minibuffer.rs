@@ -275,6 +275,11 @@ impl App {
     }
 
     pub(super) async fn run_minibuffer_submit(&mut self, intent: MinibufferIntent, input: String) {
+        // Tutorial hook — spec 0076 step 3 ("say something to it"): a
+        // headless (non-PTY) session sends input through this exact submit
+        // path, which never resolves to a `KeyAction` or a distinguishable
+        // notification. Kept thin; logic lives in `app/tutorial.rs`.
+        self.tutorial_observe_minibuffer_submit(&intent, &input);
         match intent {
             MinibufferIntent::SendInput { session_id } => {
                 if input.is_empty() {
