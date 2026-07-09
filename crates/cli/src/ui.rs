@@ -1535,6 +1535,11 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// Secondary session-list labels stay readable without competing with titles.
+fn session_list_secondary_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.muted)
+}
+
 fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // Tutorial pane highlight (spec 0077, step 4 "get around"): reuses
     // `pane_border_style`'s focused styling as the highlight rather than
@@ -1694,7 +1699,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         Span::raw("  "),
                         Span::styled(
                             format!("({member_count})"),
-                            Style::default().fg(app.theme.dim),
+                            session_list_secondary_style(&app.theme),
                         ),
                     ]))
                 }
@@ -1715,9 +1720,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     };
                     ListItem::new(Line::from(Span::styled(
                         format!("{indent}{disclosure} {count} archived"),
-                        Style::default()
-                            .fg(app.theme.dim)
-                            .add_modifier(Modifier::DIM),
+                        session_list_secondary_style(&app.theme),
                     )))
                 }
             }
@@ -13598,6 +13601,18 @@ fn render_remote_err<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_list_secondary_labels_use_readable_muted_style() {
+        let theme = Theme::default();
+        let style = session_list_secondary_style(&theme);
+
+        assert_eq!(style.fg, Some(theme.muted));
+        assert!(
+            !style.add_modifier.contains(Modifier::DIM),
+            "archived rows must not apply a second dimming pass"
+        );
+    }
 
     /// GAP D: `program_agent_reveal_progress` must sweep linearly from `0.0`
     /// right when the edit is received to `1.0` once the reveal window has
