@@ -194,36 +194,6 @@
     color: var(--button-pressed-fg);
     text-shadow: none;
   }
-  .theme-picker {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    margin-left: 4px;
-    border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg) 70%, transparent);
-  }
-  .theme-picker select {
-    appearance: none;
-    border: 0;
-    border-radius: 0;
-    padding: 5px 22px 5px 7px;
-    background:
-      linear-gradient(45deg, transparent 50%, var(--fg-dim) 50%) right 10px center / 5px 5px no-repeat,
-      linear-gradient(135deg, var(--fg-dim) 50%, transparent 50%) right 5px center / 5px 5px no-repeat,
-      transparent;
-    color: var(--fg-dim);
-    font: inherit;
-    font-size: 10px;
-    line-height: 1;
-    text-transform: uppercase;
-    cursor: pointer;
-  }
-  .theme-picker select:hover,
-  .theme-picker select:focus {
-    color: var(--fg);
-    outline: none;
-    background-color: var(--bg-elev-2);
-  }
   .view-mode-toggle button:not([aria-pressed="true"]):hover {
     background: var(--bg-elev-2);
     color: var(--fg);
@@ -276,6 +246,7 @@
       border-bottom: none;
     }
     .session-list-wrap:has(.session-list.collapsed) .new-session-btn,
+    .session-list-wrap:has(.session-list.collapsed) .theme-picker,
     .session-list-wrap:has(.session-list.collapsed) .list-toolbar {
       display: none;
     }
@@ -1437,6 +1408,46 @@
     color: var(--fg);
     border-style: solid;
   }
+  /* Theme picker row under the "+ new session" button — lives in the
+     collapsible sidebar the `≡` menu toggles, so the header stays
+     uncluttered. */
+  .theme-picker {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 8px 6px;
+    color: var(--fg-dim);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .theme-picker-label { flex: 0 0 auto; }
+  .theme-picker select {
+    flex: 1 1 auto;
+    min-width: 0;
+    appearance: none;
+    border: 1px solid var(--border);
+    border-radius: 0;
+    padding: 5px 22px 5px 7px;
+    background:
+      linear-gradient(45deg, transparent 50%, var(--fg-dim) 50%) right 10px center / 5px 5px no-repeat,
+      linear-gradient(135deg, var(--fg-dim) 50%, transparent 50%) right 5px center / 5px 5px no-repeat,
+      color-mix(in srgb, var(--bg) 70%, transparent);
+    color: var(--fg-dim);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+  }
+  .theme-picker select:hover,
+  .theme-picker select:focus {
+    color: var(--fg);
+    outline: none;
+    background-color: var(--bg-elev-2);
+  }
   /* When `.session-list-wrap` becomes the list container, the
      inner `<aside>` keeps its scrollbar but loses its right border
      (the wrap has it now). */
@@ -2027,14 +2038,6 @@
       <button type="button" id="viewModeProgram" data-view-mode="program"
               aria-pressed="false">Program</button>
     </div>
-    <label class="theme-picker" aria-label="theme">
-      <select id="themePicker" title="Theme">
-        <option value="matrix">Matrix</option>
-        <option value="basic">Basic</option>
-        <option value="dark">Dark</option>
-        <option value="light">Light</option>
-      </select>
-    </label>
     <div class="conn" id="conn" data-state="connecting" aria-label="connecting">
       <canvas class="mini-matrix" id="miniMatrix" width="192" height="84"
               aria-label="construct connecting" role="img"></canvas>
@@ -2050,6 +2053,20 @@
       -->
       <button type="button" class="new-session-btn" id="newSessionBtn"
               aria-label="new session">+ new session</button>
+      <!--
+        Theme picker lives in the collapsible sidebar (under the `≡`
+        menu) rather than the header, keeping the title bar free for
+        the session title and view controls.
+      -->
+      <label class="theme-picker" aria-label="theme">
+        <span class="theme-picker-label">theme</span>
+        <select id="themePicker" title="Theme">
+          <option value="matrix">Matrix</option>
+          <option value="basic">Basic</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+        </select>
+      </label>
       <span class="session-list-sr-label">sessions</span>
       <aside class="session-list" id="sessionList">
         <div class="empty">connecting…</div>
