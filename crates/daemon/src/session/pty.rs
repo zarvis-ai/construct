@@ -5,7 +5,7 @@ impl SessionManager {
         self.pty_input_inner(id, bytes, true).await
     }
 
-    async fn pty_input_without_capture(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
+    pub(crate) async fn pty_input_without_capture(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
         self.pty_input_inner(id, bytes, false).await
     }
 

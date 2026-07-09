@@ -52,6 +52,51 @@ impl SessionManager {
                 }));
             return;
         }
+        // OSC 11 background probes (spec 0073): when a connected client
+        // paints the frame background, the daemon — the single authority in
+        // front of the child PTY — answers the probe with that color,
+        // writing the reply straight into the child's stdin. The query is
+        // stripped from the downstream stream (transcript marker, pty.log,
+        // broadcast) so no attached terminal emulator answers a second
+        // time. Live adapter output only: replay reads pty.log, which never
+        // contains the stripped probes.
+        let mut event = event;
+        if matches!(&event, SessionEvent::Pty { .. }) {
+            if let Some(rgb) = self.effective_terminal_background() {
+                let bytes = event.pty_bytes().unwrap_or_default();
+                let (passthrough, count) = {
+                    let mut tail = entry.osc11_tail.lock().expect("osc11_tail mutex poisoned");
+                    agentd_protocol::osc11::scan_and_strip_queries(&mut tail, &bytes)
+                };
+                if count > 0 {
+                    let response = agentd_protocol::osc11::response_bytes((rgb[0], rgb[1], rgb[2]));
+                    // Boxed: pty_input can re-enter handle_event (captured
+                    // input echo), which would otherwise make this future's
+                    // type infinitely recursive.
+                    if let Err(e) =
+                        Box::pin(self.pty_input_without_capture(
+                            &entry.id,
+                            response.as_slice().repeat(count),
+                        ))
+                        .await
+                    {
+                        tracing::debug!(
+                            session = %entry.id,
+                            error = %e,
+                            "osc11 background response failed",
+                        );
+                    }
+                }
+                if passthrough.is_empty() {
+                    // The whole chunk was probe bytes (or a withheld query
+                    // prefix) — nothing to persist or broadcast.
+                    return;
+                }
+                if passthrough.len() != bytes.len() {
+                    event = SessionEvent::pty(&passthrough);
+                }
+            }
+        }
         // Persist smith/chat PTY bytes in the transcript as lightweight
         // ordering markers. PTY replay still comes from pty.log, but these
         // markers let a fresh TUI interleave transcript-only items (tool

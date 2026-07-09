@@ -15,8 +15,8 @@ use agentd_protocol::{
     SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetFocusedParams, SessionSetPinnedParams, SessionSetProjectParams,
     SessionSetTitleParams, SessionSetViewParams, SessionSummary, SessionToolDecisionParams,
-    SmithAuthStatusResult, SmithSetAuthMethodParams, SmithSetAuthMethodResult, SubscribeParams,
-    TranscriptParams, TranscriptResult,
+    SetTerminalBackgroundParams, SmithAuthStatusResult, SmithSetAuthMethodParams,
+    SmithSetAuthMethodResult, SubscribeParams, TranscriptParams, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use serde::de::DeserializeOwned;
@@ -676,6 +676,19 @@ impl Client {
         Ok(())
     }
     /// Update the set of visible/focused sessions in the daemon.
+    /// Report this connection's painted terminal background (spec 0073):
+    /// `Some([r, g, b])` when the client's theme paints the frame background,
+    /// `None` for background-aware themes that leave the terminal visible.
+    pub async fn set_terminal_background(&self, background: Option<[u8; 3]>) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::CLIENT_SET_TERMINAL_BACKGROUND,
+                &SetTerminalBackgroundParams { background },
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn set_focused_sessions(&self, ids: Vec<String>) -> Result<()> {
         let _: serde_json::Value = self
             .request(

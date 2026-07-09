@@ -327,6 +327,12 @@ pub struct SessionEntry {
     /// harnesses, filtering out idle housekeeping repaints. Advanced by
     /// [`pty_burst_advance`]. Not persisted — restarts as "no burst".
     pty_burst_start_ms: AtomicI64,
+    /// Carry-over for OSC 11 background-probe scanning across PTY chunk
+    /// boundaries (spec 0073): holds an ambiguous trailing prefix of a query
+    /// (≤7 bytes) withheld from the downstream stream until the next chunk
+    /// resolves it. `std::sync::Mutex`: touched only by the session's single
+    /// adapter-drain task, never held across an `.await`.
+    osc11_tail: std::sync::Mutex<Vec<u8>>,
 }
 
 /// Tracking state for the per-session "active client wins" PTY
@@ -978,6 +984,16 @@ pub struct SessionManager {
     /// queries. A `std::sync::Mutex` is fine — every critical section is a
     /// tiny insert/remove/scan never held across an `.await`.
     conn_views: std::sync::Mutex<HashMap<u64, (String, ClientView)>>,
+    /// Per-connection painted-terminal-background reports (spec 0073):
+    /// `conn_id -> (report_seq, Option<rgb>)`. The most recent report among
+    /// live connections is the color the daemon answers child OSC 11
+    /// background probes with; `None` (background-aware client themes, e.g.
+    /// matrix/basic) means "don't answer". Entries are removed on
+    /// disconnect. `std::sync::Mutex`: tiny insert/remove/scan sections,
+    /// never held across an `.await`.
+    terminal_backgrounds: std::sync::Mutex<HashMap<u64, (u64, Option<[u8; 3]>)>>,
+    /// Monotonic sequence for `terminal_backgrounds` recency ordering.
+    terminal_background_seq: AtomicU64,
     /// Cache for the expensive bits of harness-availability probing
     /// (macOS keychain read, Ollama reachability) — see
     /// `crate::availability`. `std::sync::Mutex` deliberately: every
@@ -1155,6 +1171,7 @@ impl SessionManager {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -1221,6 +1238,8 @@ impl SessionManager {
                 agent_program_cursor_conn_ids: std::sync::Mutex::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
                 conn_views: std::sync::Mutex::new(HashMap::new()),
+                terminal_backgrounds: std::sync::Mutex::new(HashMap::new()),
+                terminal_background_seq: AtomicU64::new(1),
                 availability_cache: std::sync::Mutex::new(
                     crate::availability::AvailabilityCache::default(),
                 ),
@@ -1246,8 +1265,32 @@ impl SessionManager {
     }
 
     /// Drop a connection's view registration when it disconnects.
+    /// Record a connection's painted-terminal-background report (spec 0073).
+    pub fn set_terminal_background(&self, conn_id: u64, background: Option<[u8; 3]>) {
+        let seq = self.terminal_background_seq.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut m) = self.terminal_backgrounds.lock() {
+            m.insert(conn_id, (seq, background));
+        }
+    }
+
+    /// The background color child OSC 11 probes should be answered with: the
+    /// most recent report among live connections. `None` when no client
+    /// paints (or the most recent reporter doesn't) — probes then pass
+    /// through unanswered, as before spec 0073.
+    pub fn effective_terminal_background(&self) -> Option<[u8; 3]> {
+        self.terminal_backgrounds
+            .lock()
+            .ok()?
+            .values()
+            .max_by_key(|(seq, _)| *seq)
+            .and_then(|(_, bg)| *bg)
+    }
+
     pub fn clear_conn(&self, conn_id: u64) {
         if let Ok(mut m) = self.conn_views.lock() {
+            m.remove(&conn_id);
+        }
+        if let Ok(mut m) = self.terminal_backgrounds.lock() {
             m.remove(&conn_id);
         }
         if let Ok(mut cursors) = self.program_cursors.lock() {
@@ -4100,6 +4143,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -4156,6 +4200,102 @@ mod tests {
         assert_eq!(b.position, 10);
         assert_eq!(a.position, 30);
         assert_eq!(hidden.position, 20);
+    }
+
+    /// Spec 0073: with a painted background reported, the daemon strips
+    /// child OSC 11 probes from the persisted/broadcast stream (so no
+    /// attached terminal answers a second time); with no report, the probe
+    /// passes through untouched.
+    #[tokio::test]
+    async fn painted_background_strips_osc11_probe_from_stream() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        mgr.sessions.write().await.insert(
+            "s1".into(),
+            synthetic_entry("s1", agentd_protocol::SessionKind::User, 0),
+        );
+        let entry = mgr.get_entry("s1").await.expect("entry");
+
+        // No painted background reported: the probe passes through.
+        mgr.handle_event(&entry, SessionEvent::pty(b"a\x1b]11;?\x07b"))
+            .await;
+        assert_eq!(
+            storage.read_pty_tail("s1", 64).expect("pty tail"),
+            b"a\x1b]11;?\x07b",
+            "without a report the probe must pass through untouched",
+        );
+
+        // A painted background is reported: the probe is stripped.
+        mgr.set_terminal_background(7, Some([0x0c, 0x12, 0x1b]));
+        let mut rx = mgr.subscribe();
+        mgr.handle_event(&entry, SessionEvent::pty(b"c\x1b]11;?\x07d"))
+            .await;
+        assert_eq!(
+            storage.read_pty_tail("s1", 64).expect("pty tail"),
+            b"a\x1b]11;?\x07bcd",
+            "with a painted background the probe must not reach the pty log",
+        );
+        let broadcast_bytes = loop {
+            match rx.try_recv().expect("broadcast event") {
+                BroadcastMsg::Event(p) => {
+                    if let Some(bytes) = p.event.pty_bytes() {
+                        break bytes;
+                    }
+                }
+                _ => continue,
+            }
+        };
+        assert_eq!(
+            broadcast_bytes, b"cd",
+            "clients must receive the stripped stream",
+        );
+
+        // The reporting connection goes away: probes pass through again.
+        mgr.clear_conn(7);
+        assert_eq!(mgr.effective_terminal_background(), None);
+    }
+
+    /// Spec 0073: the effective background is the most recent report among
+    /// live connections; a later "none" report (background-aware theme)
+    /// overrides an older painted one.
+    #[tokio::test]
+    async fn effective_terminal_background_is_latest_report() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        assert_eq!(mgr.effective_terminal_background(), None);
+        mgr.set_terminal_background(1, Some([1, 2, 3]));
+        assert_eq!(mgr.effective_terminal_background(), Some([1, 2, 3]));
+        mgr.set_terminal_background(2, None);
+        assert_eq!(
+            mgr.effective_terminal_background(),
+            None,
+            "the most recent reporter wins even when it reports none",
+        );
+        mgr.set_terminal_background(1, Some([4, 5, 6]));
+        assert_eq!(mgr.effective_terminal_background(), Some([4, 5, 6]));
+        mgr.clear_conn(1);
+        assert_eq!(
+            mgr.effective_terminal_background(),
+            None,
+            "conn 2's `none` remains after the painted reporter disconnects",
+        );
     }
 
     #[tokio::test]
@@ -4879,6 +5019,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
         manager
             .sessions
@@ -5012,6 +5153,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
         manager
             .sessions
@@ -5168,6 +5310,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
 
@@ -5255,6 +5398,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
 
@@ -5365,6 +5509,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
 
@@ -5446,6 +5591,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
 

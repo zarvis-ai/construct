@@ -11,6 +11,7 @@ pub mod adapter;
 pub mod agent_context;
 pub mod dialect;
 pub mod jsonrpc;
+pub mod osc11;
 pub mod paths;
 pub mod slash;
 pub mod transport;
@@ -170,6 +171,15 @@ pub struct SessionSetFocusedParams {
 pub struct SessionInputParams {
     pub session_id: String,
     pub text: String,
+}
+
+/// Per-connection report of the background color the client paints over the
+/// terminal, or `None` when the client's theme leaves the terminal background
+/// visible (spec 0073). The daemon uses the most recent report among live
+/// connections to answer child OSC 11 background probes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetTerminalBackgroundParams {
+    pub background: Option<[u8; 3]>,
 }
 
 /// Which surface a client is currently showing a session through. Reported by
@@ -845,6 +855,10 @@ pub mod ipc_method {
     /// session (so a concurrent non-`Running` transition won't re-raise it).
     pub const SESSION_MARK_SEEN: &str = "session.mark_seen";
     pub const SESSION_SET_FOCUSED: &str = "session.set_focused";
+    /// Report the connection's painted terminal background (spec 0073).
+    /// `background: [r, g, b]` when the client's theme paints the frame,
+    /// `null` for background-aware themes that leave the terminal visible.
+    pub const CLIENT_SET_TERMINAL_BACKGROUND: &str = "client.set_terminal_background";
     pub const SESSION_SET_TITLE: &str = "session.set_title";
     pub const SESSION_SET_APPROVAL_MODE: &str = "session.set_approval_mode";
     pub const SESSION_TOOL_DECISION: &str = "session.tool_decision";

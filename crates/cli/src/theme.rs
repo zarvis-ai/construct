@@ -513,19 +513,12 @@ impl Theme {
             .title(Line::from(title.into()))
     }
 
-    /// OSC 11 terminal background response for themes that paint the full
-    /// frame. Matrix returns `None` so the outer terminal remains the authority.
-    pub fn osc11_background_response(&self) -> Option<Vec<u8>> {
+    /// The frame background this theme paints, as 8-bit RGB, reported to the
+    /// daemon so it can answer child OSC 11 background probes (spec 0073).
+    /// Matrix/basic return `None` so the outer terminal remains the authority.
+    pub fn background_rgb(&self) -> Option<[u8; 3]> {
         let (r, g, b) = color_to_rgb(self.background?)?;
-        Some(
-            format!(
-                "\x1b]11;rgb:{:04x}/{:04x}/{:04x}\x07",
-                r as u16 * 257,
-                g as u16 * 257,
-                b as u16 * 257
-            )
-            .into_bytes(),
-        )
+        Some([r, g, b])
     }
 }
 
@@ -1037,17 +1030,11 @@ mod tests {
     }
 
     #[test]
-    fn osc11_background_response_reports_painted_theme_background() {
-        assert_eq!(
-            Theme::dark_ui().osc11_background_response().unwrap(),
-            b"\x1b]11;rgb:0c0c/1212/1b1b\x07"
-        );
-        assert_eq!(
-            Theme::light_ui().osc11_background_response().unwrap(),
-            b"\x1b]11;rgb:f6f6/f8f8/fbfb\x07"
-        );
-        assert_eq!(Theme::dark().osc11_background_response(), None);
-        assert_eq!(Theme::basic_dark().osc11_background_response(), None);
+    fn background_rgb_reports_painted_theme_background() {
+        assert_eq!(Theme::dark_ui().background_rgb(), Some([0x0c, 0x12, 0x1b]));
+        assert_eq!(Theme::light_ui().background_rgb(), Some([0xf6, 0xf8, 0xfb]));
+        assert_eq!(Theme::dark().background_rgb(), None);
+        assert_eq!(Theme::basic_dark().background_rgb(), None);
     }
 
     #[test]

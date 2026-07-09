@@ -202,6 +202,7 @@ impl SessionManager {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+            osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
 
         // Record the user's initial prompt as the first transcript event so

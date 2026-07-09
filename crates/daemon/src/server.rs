@@ -16,8 +16,8 @@ use agentd_protocol::{
     SessionMoveParams, SessionPtyInputParams, SessionPtyResizeParams, SessionSetApprovalModeParams,
     SessionSetFocusedParams, SessionSetGroupParams, SessionSetPinnedParams,
     SessionSetProjectParams, SessionSetTitleParams, SessionSetViewParams, SessionToolActionParams,
-    SessionToolDecisionParams, SmithSetAuthMethodParams, SubscribeParams, TranscriptParams,
-    IPC_VERSION,
+    SessionToolDecisionParams, SetTerminalBackgroundParams, SmithSetAuthMethodParams,
+    SubscribeParams, TranscriptParams, IPC_VERSION,
 };
 use anyhow::{Context, Result};
 use futures::{SinkExt as _, StreamExt as _};
@@ -1132,6 +1132,11 @@ async fn dispatch(
             Ok(result) => ok!(req, &result),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
+    });
+    dispatch_entry!(ipc_method::CLIENT_SET_TERMINAL_BACKGROUND, {
+        let p = params!(req, SetTerminalBackgroundParams);
+        manager.set_terminal_background(conn_id, p.background);
+        Response::ok(req.id.clone(), serde_json::Value::Null)
     });
     dispatch_entry!(ipc_method::PROGRAM_EXECUTE, {
         let p = params!(req, ProgramExecuteParams);
