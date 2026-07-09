@@ -878,8 +878,12 @@ async fn ensure_daemon_running(socket: &std::path::Path) {
     }
     tracing::info!(socket = %socket.display(), "no daemon running; auto-started one");
 
-    // The daemon binds the socket early in startup; poll for readiness (~5s).
-    for _ in 0..50 {
+    // The daemon binds the socket early in startup, but on a large session
+    // state it can take tens of seconds to get there. Poll for readiness for
+    // up to ~60s — comfortably past reported ~30s slow starts — returning as
+    // soon as the socket is live, so the common fast-start case (well under a
+    // second) isn't slowed down by the higher ceiling.
+    for _ in 0..600 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         if socket_is_live(socket) {
             return;

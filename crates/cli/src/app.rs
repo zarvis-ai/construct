@@ -2887,11 +2887,28 @@ pub async fn run_with_socket_selected(
     run_with_socket_initial_selection(socket, Some(session_id)).await
 }
 
+/// Connect to the daemon, retrying for a few seconds on failure. Backstops a
+/// race against `ensure_daemon_running`'s own readiness poll: an auto-started
+/// daemon can bind the socket a beat after that poll gives up, and without
+/// this the very next connect attempt would surface a hard error instead of
+/// just taking a little longer to open.
+async fn connect_retrying(socket: &std::path::Path) -> Result<Arc<Client>> {
+    let mut last_err = None;
+    for _ in 0..50 {
+        match Client::connect(socket).await {
+            Ok(client) => return Ok(client),
+            Err(e) => last_err = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(last_err.expect("loop runs at least once"))
+}
+
 async fn run_with_socket_initial_selection(
     socket: std::path::PathBuf,
     initial_session_id: Option<String>,
 ) -> Result<()> {
-    let client = Client::connect(&socket).await?;
+    let client = connect_retrying(&socket).await?;
     let profile = Profile::from_env();
     let keymap = keymap::default_for(profile);
 
