@@ -832,6 +832,8 @@ mod tests {
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
+            forked_from: None,
+            harvest: None,
         }
     }
 

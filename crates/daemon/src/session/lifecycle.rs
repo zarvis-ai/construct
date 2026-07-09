@@ -50,9 +50,11 @@ impl SessionManager {
                             s.clone()
                         };
                         self.storage.save_summary(&snapshot)?;
-                        let _ = self.broadcast.send(BroadcastMsg::State(StateNotificationPayload {
-                            session: snapshot,
-                        }));
+                        let _ =
+                            self.broadcast
+                                .send(BroadcastMsg::State(StateNotificationPayload {
+                                    session: snapshot,
+                                }));
                     }
                 }
                 position = placement.position;
@@ -90,6 +92,8 @@ impl SessionManager {
             archived: false,
             operator_loop_disabled: params.kind == agentd_protocol::SessionKind::Orchestrator,
             needs_attention: false,
+            forked_from: params.forked_from.clone(),
+            harvest: None,
         };
         self.storage.save_summary(&summary)?;
 
@@ -119,6 +123,23 @@ impl SessionManager {
         let mut env_with_meta = adapter_cfg.env.clone();
         for (k, v) in &params.env {
             env_with_meta.insert(k.clone(), v.clone());
+        }
+        // A same-harness Claude quest can continue byte-for-byte using Claude's
+        // native fork operation. The native id is deliberately adapter-private;
+        // only the daemon reads it from the source session directory.
+        if harness == "claude" {
+            if let Some(parent) = params.forked_from.as_ref().map(|f| &f.session_id) {
+                let native_id = self
+                    .storage
+                    .session_dir(parent)
+                    .join("claude_session_id.txt");
+                if let Ok(id) = std::fs::read_to_string(native_id) {
+                    let id = id.trim();
+                    if !id.is_empty() {
+                        env_with_meta.insert("CONSTRUCT_CLAUDE_FORK_FROM".into(), id.into());
+                    }
+                }
+            }
         }
         let session_dir = self.storage.session_dir(&id);
         let widgets_dir = self.storage.ensure_widgets_dir(&id).unwrap_or_else(|e| {
@@ -220,7 +241,10 @@ impl SessionManager {
         }
 
         adapter
-            .request(ahp_method::SESSION_START, serde_json::to_value(&start_params)?)
+            .request(
+                ahp_method::SESSION_START,
+                serde_json::to_value(&start_params)?,
+            )
             .await
             .context("adapter session.start failed")?;
 
@@ -312,6 +336,7 @@ impl SessionManager {
             parent_session_id: None,
             group_id: None,
             position_after_session_id: None,
+            forked_from: None,
         };
         match self.create(params).await {
             Ok(id) => tracing::info!(
@@ -409,9 +434,10 @@ impl SessionManager {
         // Re-inject the operator loop toggle so the resumed adapter starts
         // with the same enabled/disabled state the user left it in.
         if operator_loop_disabled {
-            start_params
-                .env
-                .insert("CONSTRUCT_OPERATOR_LOOP_DISABLED".to_string(), "1".to_string());
+            start_params.env.insert(
+                "CONSTRUCT_OPERATOR_LOOP_DISABLED".to_string(),
+                "1".to_string(),
+            );
         } else {
             start_params.env.remove("CONSTRUCT_OPERATOR_LOOP_DISABLED");
         }
@@ -424,9 +450,10 @@ impl SessionManager {
             "CONSTRUCT_SESSION_WIDGETS_DIR".to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
-        start_params
-            .env
-            .insert(agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(), widgets_dir.to_string_lossy().to_string());
+        start_params.env.insert(
+            agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
+            widgets_dir.to_string_lossy().to_string(),
+        );
         self.install_program_run_context_env(&mut start_params.env, id);
         // Use the last-known PTY size so the resumed adapter (which
         // sizes its PTY off start_params on session.start) doesn't draw
@@ -588,9 +615,11 @@ impl SessionManager {
             s.clone()
         };
         let _ = self.storage.save_summary(&snapshot);
-        let _ = self.broadcast.send(BroadcastMsg::State(StateNotificationPayload {
-            session: snapshot,
-        }));
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
 
         // Drain adapter messages just like a fresh create.
         let manager = self.clone();
@@ -637,7 +666,9 @@ impl SessionManager {
                 let _ = manager_for_redraw
                     .pty_resize(&id_owned, bumped_cols, size.rows)
                     .await;
-                let _ = manager_for_redraw.pty_resize(&id_owned, size.cols, size.rows).await;
+                let _ = manager_for_redraw
+                    .pty_resize(&id_owned, size.cols, size.rows)
+                    .await;
             });
         }
 
@@ -711,7 +742,11 @@ pub(super) fn start_params_for_create(
 // or [`RESPAWN_REDRAW_MAX_WAIT`] has elapsed (so a child that streams
 // forever, or never draws, still gets a redraw). `last_pty_at_ms` is the
 // child's most recent PTY-output timestamp (`None` = nothing yet).
-pub(super) fn resume_redraw_ready(last_pty_at_ms: Option<i64>, now_ms: i64, elapsed: Duration) -> bool {
+pub(super) fn resume_redraw_ready(
+    last_pty_at_ms: Option<i64>,
+    now_ms: i64,
+    elapsed: Duration,
+) -> bool {
     if elapsed >= RESPAWN_REDRAW_MAX_WAIT {
         return true;
     }

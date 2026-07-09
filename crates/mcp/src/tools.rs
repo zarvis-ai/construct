@@ -653,6 +653,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 parent_session_id: None,
                 group_id: arg_str(&args, "group_id").ok(),
                 position_after_session_id: None,
+                forked_from: None,
             };
             let sid = client.create(params).await?;
             json!({ "session_id": sid })
@@ -790,6 +791,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 parent_session_id: Some(parent_id),
                 group_id: None,
                 position_after_session_id: None,
+                forked_from: None,
             };
             let sid = client.create(params).await?;
             json!({ "subagent_id": sid })

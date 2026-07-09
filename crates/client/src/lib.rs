@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -385,11 +385,12 @@ impl Client {
         let src = self.get(source_id).await?.summary;
 
         let mut prompt_parts: Vec<String> = Vec::new();
+        let transcript_seq = self.transcript(source_id, 0, None).await.ok();
         if opts.seed && harness != "shell" {
             // Full transcript from the start (seq 0) so the original objective
             // — usually stated in the opening message — is carried, not just
             // the recent tail.
-            if let Ok(tr) = self.transcript(source_id, 0, None).await {
+            if let Some(tr) = transcript_seq.as_ref() {
                 if let Some(seed) = render_fork_seed(&tr.events, opts.max_seed_bytes) {
                     prompt_parts.push(seed);
                 }
@@ -447,6 +448,14 @@ impl Client {
                 parent_session_id: None,        // sibling, not a subagent
                 group_id: src.group_id.clone(), // same group → rendered alongside the source
                 position_after_session_id: Some(src.id.clone()),
+                forked_from: opts.side_quest.then(|| agentd_protocol::ForkedFrom {
+                    session_id: src.id.clone(),
+                    transcript_seq: transcript_seq.as_ref().map(|t| t.total).unwrap_or(0),
+                    at_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64,
+                }),
             })
             .await?;
 
@@ -619,6 +628,18 @@ impl Client {
                 ipc_method::SESSION_ARCHIVE,
                 &SessionIdParams {
                     session_id: id.to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+    pub async fn harvest(&self, id: &str, mode: agentd_protocol::QuestHarvestMode) -> Result<()> {
+        let _: serde_json::Value = self
+            .request(
+                ipc_method::SESSION_HARVEST,
+                &agentd_protocol::SessionHarvestParams {
+                    session_id: id.to_string(),
+                    mode,
                 },
             )
             .await?;
@@ -1101,6 +1122,8 @@ pub struct ForkOptions {
     /// Initial PTY size for forks of terminal sessions. When omitted, the
     /// client uses a standard terminal default.
     pub pty_size: Option<PtySize>,
+    /// Mark this sibling fork as a user-driven side quest.
+    pub side_quest: bool,
 }
 
 impl Default for ForkOptions {
@@ -1111,6 +1134,7 @@ impl Default for ForkOptions {
             seed: true,
             max_seed_bytes: 0,
             pty_size: None,
+            side_quest: false,
         }
     }
 }
@@ -1169,6 +1193,14 @@ fn render_fork_seed(
          are continuing from — treat it as background; do not re-run past tool \
          calls.]\n\n{body}\n\n[End of forked context.]"
     ))
+}
+
+/// Compact portable transcript rendering for a side-quest result.
+pub fn render_fork_seed_for_harvest(
+    events: &[agentd_protocol::TimestampedEvent],
+    max_bytes: usize,
+) -> Option<String> {
+    render_fork_seed(events, max_bytes)
 }
 
 /// Keep roughly the first and last halves of `s` within `budget` bytes,

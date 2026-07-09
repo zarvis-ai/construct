@@ -19,6 +19,12 @@ pub enum KeyAction {
     /// chosen harness (reuses the harness picker). Bound to `C-x f`
     /// (emacs) / `f` (vim) — distinct from "new session" (`C-x C-f` / `n`).
     OpenFork,
+    /// Start a same-harness side quest with a typed first prompt.
+    OpenSideQuest,
+    /// Show / manage side quests belonging to the selected parent.
+    OpenQuestLog,
+    /// Harvest or discard the selected side quest.
+    OpenHarvest,
     /// Zoom: the session view fills the screen (list / pin strip / modeline
     /// all hidden; only the minibuffer stays). Toggling again restores the
     /// default layout. Bound to `C-x z` (emacs) / `z` (vim), matching
@@ -272,7 +278,10 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), key(KeyCode::Up)]), FocusWindowUp),
         (Chord(vec![ctrl('x'), key(KeyCode::Down)]), FocusWindowDown),
         (Chord(vec![ctrl('x'), key(KeyCode::Left)]), FocusWindowLeft),
-        (Chord(vec![ctrl('x'), key(KeyCode::Right)]), FocusWindowRight),
+        (
+            Chord(vec![ctrl('x'), key(KeyCode::Right)]),
+            FocusWindowRight,
+        ),
         (Chord(vec![ctrl('x'), ch('2')]), SplitWindowBelow),
         (Chord(vec![ctrl('x'), ch('3')]), SplitWindowRight),
         (Chord(vec![ctrl('x'), ch('0')]), DeleteWindow),
@@ -309,6 +318,9 @@ fn emacs() -> Keymap {
         // `C-x f` forks the selected session into a new harness (distinct
         // from `C-x C-f`, which creates a fresh session).
         (Chord(vec![ctrl('x'), ch('f')]), OpenFork),
+        (Chord(vec![ch('s')]), OpenSideQuest),
+        (Chord(vec![ctrl('x'), ch('q')]), OpenQuestLog),
+        (Chord(vec![ctrl('x'), ch('h')]), OpenHarvest),
         // Pin / unpin selected session (or all members of a selected group)
         (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
         (Chord(vec![ch(' ')]), TogglePin),
@@ -381,6 +393,9 @@ fn vim() -> Keymap {
         (Chord(vec![ch('r')]), OpenRename),
         (Chord(vec![shift('O')]), OpenFork),
         (Chord(vec![ch('f')]), OpenFork),
+        (Chord(vec![ch('s')]), OpenSideQuest),
+        (Chord(vec![ch('q')]), OpenQuestLog),
+        (Chord(vec![ch('h')]), OpenHarvest),
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch('z')]), ToggleZoom),
         (Chord(vec![shift('Z'), shift('Z')]), Quit),
@@ -410,7 +425,10 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('x'), key(KeyCode::Up)]), FocusWindowUp),
         (Chord(vec![ctrl('x'), key(KeyCode::Down)]), FocusWindowDown),
         (Chord(vec![ctrl('x'), key(KeyCode::Left)]), FocusWindowLeft),
-        (Chord(vec![ctrl('x'), key(KeyCode::Right)]), FocusWindowRight),
+        (
+            Chord(vec![ctrl('x'), key(KeyCode::Right)]),
+            FocusWindowRight,
+        ),
         (Chord(vec![ctrl('x'), ch('2')]), SplitWindowBelow),
         (Chord(vec![ctrl('x'), ch('3')]), SplitWindowRight),
         (Chord(vec![ctrl('x'), ch('0')]), DeleteWindow),

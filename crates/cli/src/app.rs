@@ -360,7 +360,10 @@ impl ResizeDebounce {
 /// client. A missing daemon build id counts as a mismatch — that is how a
 /// new TUI recognizes an older, stale daemon that predates build-id
 /// reporting.
-pub(crate) fn daemon_build_ids_differ(client_build_id: &str, daemon_build_id: Option<&str>) -> bool {
+pub(crate) fn daemon_build_ids_differ(
+    client_build_id: &str,
+    daemon_build_id: Option<&str>,
+) -> bool {
     daemon_build_id != Some(client_build_id)
 }
 
@@ -702,6 +705,12 @@ pub enum MinibufferIntent {
     /// `NewSessionHarness`; on submit, calls `client.fork_session`.
     ForkSessionHarness {
         source_session_id: String,
+    },
+    SideQuest {
+        source_session_id: String,
+    },
+    HarvestMenu {
+        session_id: String,
     },
     /// Second stage of the new-session wizard when the user typed `group`:
     /// asks for the group's name.
@@ -2084,7 +2093,11 @@ impl ProgramRun {
     /// (re-Run, daemon echo) so a block already being hovered doesn't lose
     /// its armed hover state just because an unrelated re-Run or heartbeat
     /// rebuilt the `ProgramRun`.
-    fn merged_pending_since(&self, pending: &HashSet<String>, now: Instant) -> HashMap<String, Instant> {
+    fn merged_pending_since(
+        &self,
+        pending: &HashSet<String>,
+        now: Instant,
+    ) -> HashMap<String, Instant> {
         pending
             .iter()
             .map(|id| {
@@ -3252,7 +3265,11 @@ async fn run_with_socket_initial_selection(
         active_window_id: Some(app.active_window_id),
         open_program_session_ids: app.open_program_session_ids(),
         widgets,
-        tutorial_step: app.tutorial.as_ref().filter(|t| !t.completed).map(|t| t.step),
+        tutorial_step: app
+            .tutorial
+            .as_ref()
+            .filter(|t| !t.completed)
+            .map(|t| t.step),
     });
 
     result
@@ -4550,6 +4567,15 @@ impl App {
                     .then_with(|| b.created_at.cmp(&a.created_at))
             });
         }
+        let mut quests_by_parent: HashMap<&str, Vec<&SessionSummary>> = HashMap::new();
+        for s in self.sessions.iter().filter(|s| s.forked_from.is_some()) {
+            if let Some(parent) = s.forked_from.as_ref().map(|f| f.session_id.as_str()) {
+                quests_by_parent.entry(parent).or_default().push(s);
+            }
+        }
+        for quests in quests_by_parent.values_mut() {
+            quests.sort_by_key(|s| s.position);
+        }
 
         let push_session = |out: &mut Vec<ListItem>, s: &SessionSummary, indented: bool| {
             let children = subagents_by_parent.get(s.id.as_str());
@@ -4597,6 +4623,16 @@ impl App {
                     }
                 }
             }
+            if let Some(quests) = quests_by_parent.get(s.id.as_str()) {
+                for quest in quests.iter().copied().filter(|q| !q.archived) {
+                    out.push(ListItem::Session {
+                        summary: quest.clone(),
+                        indented: true,
+                        has_children: false,
+                        children_expanded: false,
+                    });
+                }
+            }
         };
 
         let mut ungrouped: Vec<&SessionSummary> = self
@@ -4608,6 +4644,7 @@ impl App {
             // of their parent session.
             .filter(|s| Some(s.id.as_str()) != orch_id)
             .filter(|s| is_user_list_session(s))
+            .filter(|s| s.forked_from.is_none())
             .collect();
         ungrouped.sort_by(|a, b| {
             a.position
@@ -4644,6 +4681,7 @@ impl App {
                 .iter()
                 .filter(|s| s.group_id.as_deref() == Some(g.id.as_str()))
                 .filter(|s| is_user_list_session(s))
+                .filter(|s| s.forked_from.is_none())
                 .collect();
             members.sort_by_key(|s| s.position);
             let (active, archived): (Vec<&SessionSummary>, Vec<&SessionSummary>) =
@@ -6290,8 +6328,7 @@ impl App {
             Some(progress) => match ProgramRun::from_progress(progress) {
                 Some(mut run) => {
                     if let Some(old) = self.program_runs.get(session_id) {
-                        run.pending_since =
-                            old.merged_pending_since(&run.pending, Instant::now());
+                        run.pending_since = old.merged_pending_since(&run.pending, Instant::now());
                     }
                     self.program_runs.insert(session_id.to_string(), run);
                 }
@@ -6720,12 +6757,13 @@ impl App {
                                 && hit.contains(ev.column, ev.row)
                         })
                     }
-                    TitleRenameOrigin::Program => self
-                        .layout
-                        .program_title_name_hit
-                        .is_some_and(|(xs, xe, y)| {
-                            ev.row == y && ev.column >= xs && ev.column < xe
-                        }),
+                    TitleRenameOrigin::Program => {
+                        self.layout
+                            .program_title_name_hit
+                            .is_some_and(|(xs, xe, y)| {
+                                ev.row == y && ev.column >= xs && ev.column < xe
+                            })
+                    }
                 };
                 if !inside_own_field {
                     self.commit_session_title_rename().await;
@@ -6873,10 +6911,7 @@ impl App {
                             && r.origin == TitleRenameOrigin::Pane(hit.window_id)
                     });
                     if editing_this_field {
-                        self.session_title_rename_click_cursor(
-                            hit.window_start_chars,
-                            display_col,
-                        );
+                        self.session_title_rename_click_cursor(hit.window_start_chars, display_col);
                     } else {
                         self.start_session_title_rename(
                             hit.session_id,
@@ -8185,6 +8220,56 @@ impl App {
                     error: None,
                 });
             }
+            OpenSideQuest => {
+                let Some(id) = self.selected_id() else {
+                    self.set_status("side quest: no session selected".into());
+                    return;
+                };
+                self.minibuffer = Some(Minibuffer {
+                    prompt: "Side quest: ".into(),
+                    input: String::new(),
+                    cursor: 0,
+                    intent: MinibufferIntent::SideQuest {
+                        source_session_id: id,
+                    },
+                    error: None,
+                });
+            }
+            OpenHarvest => {
+                let Some(id) = self.selected_id() else {
+                    return;
+                };
+                if self
+                    .sessions
+                    .iter()
+                    .any(|s| s.id == id && s.forked_from.is_some())
+                {
+                    self.minibuffer = Some(Minibuffer {
+                        prompt: "Harvest [result/discard]: ".into(),
+                        input: String::new(),
+                        cursor: 0,
+                        intent: MinibufferIntent::HarvestMenu { session_id: id },
+                        error: None,
+                    });
+                } else {
+                    self.set_status("harvest: select a side quest".into());
+                }
+            }
+            OpenQuestLog => {
+                let Some(id) = self.selected_id() else {
+                    return;
+                };
+                let quests = self
+                    .sessions
+                    .iter()
+                    .filter(|s| {
+                        s.forked_from.as_ref().map(|f| f.session_id.as_str()) == Some(id.as_str())
+                    })
+                    .count();
+                self.set_status(format!(
+                    "⑂{quests} side quests — select one to open; C-x h harvests"
+                ));
+            }
             OpenRename => match self.selection.clone() {
                 Selection::Session(id) => {
                     let Some(s) = self.sessions.iter().find(|s| s.id == id) else {
@@ -8713,13 +8798,12 @@ impl App {
 
     pub(super) fn apply_named_theme(&mut self, name: crate::theme::ThemeName) {
         let mut cfg = crate::theme::ThemeConfig::load();
-        let detected_light = if name.is_background_aware()
-            && self.terminal_background_is_light.is_none()
-        {
-            crate::theme::detect_terminal_is_light(std::time::Duration::from_millis(120))
-        } else {
-            self.terminal_background_is_light
-        };
+        let detected_light =
+            if name.is_background_aware() && self.terminal_background_is_light.is_none() {
+                crate::theme::detect_terminal_is_light(std::time::Duration::from_millis(120))
+            } else {
+                self.terminal_background_is_light
+            };
         if name.is_background_aware() {
             self.terminal_background_is_light = detected_light;
         }
@@ -8896,7 +8980,10 @@ impl App {
                     "restart" => {
                         let exe = (!rest.is_empty()).then(|| rest.to_string());
                         let result = self.client.daemon_restart(exe, false).await;
-                        self.set_status(daemon_restart_status_message(result, "construct: restart"));
+                        self.set_status(daemon_restart_status_message(
+                            result,
+                            "construct: restart",
+                        ));
                     }
                     "" => self.set_status("construct: subcommand required (e.g. `restart`)".into()),
                     other => self.set_status(format!(
@@ -9892,10 +9979,7 @@ fn program_document_diff_span(old: &str, new: &str) -> Option<(usize, usize, usi
     }
     let mut old_end = old_chars.len();
     let mut new_end = new_chars.len();
-    while old_end > prefix
-        && new_end > prefix
-        && old_chars[old_end - 1] == new_chars[new_end - 1]
-    {
+    while old_end > prefix && new_end > prefix && old_chars[old_end - 1] == new_chars[new_end - 1] {
         old_end -= 1;
         new_end -= 1;
     }
@@ -10626,7 +10710,7 @@ mod tests {
             selected_text: None,
             selected_text_bounds: None,
             selected_text_range: None,
-                pty_input_tx,
+            pty_input_tx,
             pty_input_errors,
             tutorial: None,
         }
@@ -10789,6 +10873,8 @@ mod tests {
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
+            forked_from: None,
+            harvest: None,
         }
     }
 
@@ -13396,8 +13482,7 @@ mod tests {
             "comment Run button should be aligned to the menu's right edge"
         );
         assert_eq!(
-            buf.cell((focus_x.saturating_sub(1), y))
-                .map(|c| c.symbol()),
+            buf.cell((focus_x.saturating_sub(1), y)).map(|c| c.symbol()),
             Some(" "),
             "comment text should have one-column left padding inside the menu"
         );
@@ -14725,17 +14810,20 @@ mod tests {
                 < 0.01,
             "the slide starts anchored, not snapped right"
         );
-        let half = app.program_popup.as_ref().unwrap().slide_fraction(
-            changed_at + Duration::from_millis(PROGRAM_REVEAL_MS / 2),
-        );
+        let half = app
+            .program_popup
+            .as_ref()
+            .unwrap()
+            .slide_fraction(changed_at + Duration::from_millis(PROGRAM_REVEAL_MS / 2));
         assert!(
             (half - 0.5).abs() < 0.05,
             "halfway through the popup is mid-slide, got {half}"
         );
         assert_eq!(
-            app.program_popup.as_ref().unwrap().slide_fraction(
-                changed_at + Duration::from_millis(PROGRAM_REVEAL_MS),
-            ),
+            app.program_popup
+                .as_ref()
+                .unwrap()
+                .slide_fraction(changed_at + Duration::from_millis(PROGRAM_REVEAL_MS),),
             1.0,
             "the slide settles fully slid"
         );
@@ -14997,7 +15085,9 @@ mod tests {
                 .iter()
                 .find(|h| h.session_id == id)
                 .unwrap_or_else(|| panic!("no clip hit for {id}"));
-            buf.cell((hit.col_start + 2, hit.row)).expect("cell").style()
+            buf.cell((hit.col_start + 2, hit.row))
+                .expect("cell")
+                .style()
         };
 
         let running_style = style_of("s-run");
@@ -17166,9 +17256,7 @@ mod tests {
             "first run dispatches"
         );
         assert!(
-            !app
-                .execute_program_popup(None, None, None)
-                .await,
+            !app.execute_program_popup(None, None, None).await,
             "identical immediate re-Run must be suppressed"
         );
         assert!(
@@ -17181,7 +17269,10 @@ mod tests {
 
         let methods = drain_methods(&mut methods);
         assert_eq!(
-            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            methods
+                .iter()
+                .filter(|m| *m == ipc_method::PROGRAM_EXECUTE)
+                .count(),
             1,
             "exactly one program.execute request, got: {methods:?}"
         );
@@ -17207,7 +17298,10 @@ mod tests {
 
         let methods = drain_methods(&mut methods);
         assert_eq!(
-            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            methods
+                .iter()
+                .filter(|m| *m == ipc_method::PROGRAM_EXECUTE)
+                .count(),
             2,
             "both dispatches should have sent program.execute, got: {methods:?}"
         );
@@ -17242,7 +17336,10 @@ mod tests {
 
         let methods = drain_methods(&mut methods);
         assert_eq!(
-            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            methods
+                .iter()
+                .filter(|m| *m == ipc_method::PROGRAM_EXECUTE)
+                .count(),
             2,
             "both dispatches should have sent program.execute, got: {methods:?}"
         );
@@ -17272,7 +17369,10 @@ mod tests {
 
         let methods = drain_methods(&mut methods);
         assert_eq!(
-            methods.iter().filter(|m| *m == ipc_method::PROGRAM_EXECUTE).count(),
+            methods
+                .iter()
+                .filter(|m| *m == ipc_method::PROGRAM_EXECUTE)
+                .count(),
             2,
             "both the full run and the selection run should have dispatched, got: {methods:?}"
         );
@@ -17328,7 +17428,10 @@ mod tests {
         );
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.program.version, 2);
-        assert_eq!(popup.buffer, "# In progress\n\n# Done\n- task @{session:sub1}\n");
+        assert_eq!(
+            popup.buffer,
+            "# In progress\n\n# Done\n- task @{session:sub1}\n"
+        );
         server.abort();
     }
 
@@ -17384,7 +17487,10 @@ mod tests {
             Vec::new(),
         );
         let popup = app.program_popup.as_ref().unwrap();
-        assert_eq!(popup.cursor, 19, "caret should shift by the 9-char insertion");
+        assert_eq!(
+            popup.cursor, 19,
+            "caret should shift by the 9-char insertion"
+        );
         server.abort();
     }
 
@@ -19983,8 +20089,11 @@ mod tests {
         app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 2);
 
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL))
-            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 1);
         // Insert between the two chars: "ac" -> "abc".
         app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
@@ -19992,27 +20101,45 @@ mod tests {
         assert_eq!(app.session_title_rename.as_ref().unwrap().buffer, "abc");
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 2);
         // C-a jumps to the start; C-f steps one char forward.
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
-            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 0);
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
-            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 1);
         // C-e jumps to the end; backspace there deletes the last char, "abc" -> "ab".
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL))
-            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 3);
         app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
             .await;
         assert_eq!(app.session_title_rename.as_ref().unwrap().buffer, "ab");
         assert_eq!(app.session_title_rename.as_ref().unwrap().cursor, 2);
         // C-k kills from the cursor to the end.
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
-            .await;
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
-            .await;
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL))
-            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
         assert_eq!(app.session_title_rename.as_ref().unwrap().buffer, "a");
         server.abort();
     }
@@ -20079,7 +20206,10 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await;
 
-        assert!(app.session_title_rename.is_none(), "Esc clears the rename state");
+        assert!(
+            app.session_title_rename.is_none(),
+            "Esc clears the rename state"
+        );
         assert_eq!(
             app.sessions[0].title.as_deref(),
             Some("old-name"),
@@ -20186,10 +20316,16 @@ mod tests {
         app.start_session_title_rename("s1".into(), TitleRenameOrigin::Pane(Some(1)), None);
 
         // C-a to the start, then C-d deletes the char under the cursor.
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))
-            .await;
-        app.handle_session_title_rename_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
-            .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
+        app.handle_session_title_rename_key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        ))
+        .await;
 
         let rename = app.session_title_rename.as_ref().unwrap();
         assert_eq!(rename.buffer, "bc");
@@ -20341,7 +20477,10 @@ mod tests {
             .backend_mut()
             .get_cursor_position()
             .expect("cursor position");
-        assert_eq!(pos.y, h2.row, "terminal cursor sits on the clicked pane's title row");
+        assert_eq!(
+            pos.y, h2.row,
+            "terminal cursor sits on the clicked pane's title row"
+        );
         assert_eq!(
             pos.x,
             h2.start_col + 3,
@@ -20577,10 +20716,7 @@ mod tests {
             at_ms, 300,
             "fires at the first observation ≥100ms after the size change"
         );
-        assert_eq!(
-            fire,
-            ResizeFire::Panes(vec![("s1".to_string(), (120, 40))])
-        );
+        assert_eq!(fire, ResizeFire::Panes(vec![("s1".to_string(), (120, 40))]));
     }
 
     /// Switching sessions fires immediately — the newly focused child needs
@@ -20967,9 +21103,8 @@ mod tests {
         {
             let popup = app.program_popup.as_mut().expect("active s1 program");
             popup.slide_from = 1.0;
-            popup.slide_changed_at = Some(
-                Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS),
-            );
+            popup.slide_changed_at =
+                Some(Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS));
         }
 
         app.handle_left_click(65, 5).await;
@@ -22463,9 +22598,10 @@ mod tests {
         );
         let calls = drain_calls(&mut calls);
         assert!(
-            calls.iter().any(|(m, p)| m
-                == agentd_protocol::ipc_method::SESSION_RESTART
-                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            calls
+                .iter()
+                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_RESTART
+                    && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "restart RPC should fire for s1, got {calls:?}"
         );
         server.abort();
@@ -22503,9 +22639,10 @@ mod tests {
         );
         let calls = drain_calls(&mut calls);
         assert!(
-            calls.iter().any(|(m, p)| m
-                == agentd_protocol::ipc_method::SESSION_RESTART
-                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            calls
+                .iter()
+                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_RESTART
+                    && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "clicking y should fire the same restart RPC the keypress does, got {calls:?}"
         );
         server.abort();
@@ -22602,9 +22739,10 @@ mod tests {
 
         let calls = drain_calls(&mut calls);
         assert!(
-            calls.iter().any(|(m, p)| m
-                == agentd_protocol::ipc_method::SESSION_DELETE
-                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            calls
+                .iter()
+                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_DELETE
+                    && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "typing d then Enter should delete the session, got {calls:?}"
         );
         server.abort();
@@ -22641,9 +22779,10 @@ mod tests {
         );
         let calls = drain_calls(&mut calls);
         assert!(
-            calls.iter().any(|(m, p)| m
-                == agentd_protocol::ipc_method::SESSION_DELETE
-                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            calls
+                .iter()
+                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_DELETE
+                    && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "clicking d should fire the same delete RPC the typed-submit path does, got {calls:?}"
         );
         server.abort();
@@ -22860,9 +22999,10 @@ mod tests {
         );
         let calls = drain_calls(&mut calls);
         assert!(
-            calls.iter().any(|(m, p)| m
-                == agentd_protocol::ipc_method::SESSION_ARCHIVE
-                && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
+            calls
+                .iter()
+                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_ARCHIVE
+                    && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "clicking y should archive the session, got {calls:?}"
         );
         server.abort();
@@ -22992,7 +23132,10 @@ mod tests {
     #[tokio::test]
     async fn widget_session_clip_chip_reflects_live_session_status() {
         let (app, _dir, _server) = two_session_app().await;
-        assert_eq!(app.sessions[0].state, agentd_protocol::SessionState::Running);
+        assert_eq!(
+            app.sessions[0].state,
+            agentd_protocol::SessionState::Running
+        );
         let theme = app.theme.clone();
         let mut wanted = Vec::new();
         let lines = crate::ui::render_agentd_markdown_lines_for_test(
@@ -23558,8 +23701,7 @@ mod tests {
             "version should sit at the right edge:\n{modeline}"
         );
         assert!(
-            !app
-                .layout
+            !app.layout
                 .shortcut_hints
                 .iter()
                 .any(|h| h.action == KeyAction::OpenRestartDaemonConfirm),
@@ -23570,8 +23712,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_build_renders_both_versions_and_daemon_segment_click_opens_restart_confirm(
-    ) {
+    async fn mismatched_build_renders_both_versions_and_daemon_segment_click_opens_restart_confirm()
+    {
         let (mut app, _dir, server) = empty_app().await;
         app.daemon_build_id = Some("0.1.0+deadbee".to_string());
         let backend = ratatui::backend::TestBackend::new(120, 36);
@@ -23880,11 +24022,7 @@ mod tests {
             app.layout.matrix_theme_hit.is_none(),
             "matrix rain header should not own theme click target"
         );
-        let minibuffer_y = app
-            .layout
-            .minibuffer_area
-            .expect("minibuffer area")
-            .y;
+        let minibuffer_y = app.layout.minibuffer_area.expect("minibuffer area").y;
         assert!(app
             .layout
             .shortcut_hints
@@ -24090,7 +24228,10 @@ mod tests {
             .cell((hit.x_start, hit.y))
             .map(|c| c.symbol().to_string())
             .unwrap_or_default();
-        assert_eq!(first_cell, "t", "modeline tour zone must start on its label");
+        assert_eq!(
+            first_cell, "t",
+            "modeline tour zone must start on its label"
+        );
         app.handle_left_click(hit.x_start, hit.y).await;
         assert!(
             app.tutorial.is_some(),
@@ -24722,9 +24863,8 @@ mod tests {
                 serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
                     program: agentd_protocol::ProgramDocument {
                         session_id: "s1".into(),
-                        markdown:
-                            "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n"
-                                .into(),
+                        markdown: "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n"
+                            .into(),
                         version: 2,
                         updated_at_ms: 0,
                         template_id: Some("tasks".into()),
@@ -24765,9 +24905,7 @@ mod tests {
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
             method: agentd_protocol::ipc_notif::STATE.into(),
-            params: Some(
-                serde_json::to_value(StateNotificationPayload { session: sub }).unwrap(),
-            ),
+            params: Some(serde_json::to_value(StateNotificationPayload { session: sub }).unwrap()),
         })
         .await;
         let t = app.tutorial.as_ref().unwrap();
@@ -24794,8 +24932,7 @@ mod tests {
                 serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
                     program: agentd_protocol::ProgramDocument {
                         session_id: "s1".into(), // selected in captured_app
-                        markdown: "## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n"
-                            .into(),
+                        markdown: "## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n".into(),
                         version: 1,
                         updated_at_ms: 0,
                         template_id: Some("tasks".into()),
@@ -24861,13 +24998,15 @@ mod tests {
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
             method: agentd_protocol::ipc_notif::STATE.into(),
-            params: Some(
-                serde_json::to_value(StateNotificationPayload { session: sub }).unwrap(),
-            ),
+            params: Some(serde_json::to_value(StateNotificationPayload { session: sub }).unwrap()),
         })
         .await;
         assert_eq!(
-            app.tutorial.as_ref().unwrap().subagent_session_id.as_deref(),
+            app.tutorial
+                .as_ref()
+                .unwrap()
+                .subagent_session_id
+                .as_deref(),
             Some("sub-9")
         );
 
@@ -24884,7 +25023,11 @@ mod tests {
         })
         .await;
         assert_eq!(
-            app.tutorial.as_ref().unwrap().subagent_session_id.as_deref(),
+            app.tutorial
+                .as_ref()
+                .unwrap()
+                .subagent_session_id
+                .as_deref(),
             Some("sub-9"),
             "unrelated subagents must not overwrite the tour's"
         );
@@ -25046,7 +25189,11 @@ mod tests {
             .backend()
             .buffer()
             .cell((hit.x_start, hit.y))
-            .map(|c| c.style().add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .map(|c| {
+                c.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            })
             .unwrap_or(false);
 
         match saved {
@@ -25066,7 +25213,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
         std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
-        assert!(!crate::tui_state::tutorial_done(), "fresh state dir starts unmarked");
+        assert!(
+            !crate::tui_state::tutorial_done(),
+            "fresh state dir starts unmarked"
+        );
         // The invite also requires the configure dialog to have been seen
         // at least once — true by the time a real launch ever shows this
         // card (see the comment on `tour_not_done` in ui.rs).
@@ -25089,7 +25239,11 @@ mod tests {
             .backend()
             .buffer()
             .cell((hit.x_start, hit.y))
-            .map(|c| c.style().add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .map(|c| {
+                c.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::BOLD)
+            })
             .unwrap_or(false);
 
         match saved {

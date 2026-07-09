@@ -18,9 +18,10 @@ seeding is disabled or the target harness takes commands rather than
 conversation (`shell`), the fork's initial prompt is seeded with a rendered
 summary of the source transcript.
 
-Context transfer across harnesses is **best-effort and limited to the
-harness-agnostic transcript**. The fork does not adopt the source harness's
-private resume state.
+Context transfer across different harnesses is **best-effort and limited to the
+harness-agnostic transcript**. A same-harness fork may use that harness's
+native fork/resume facility when available; this is a faithful continuation
+within one harness, never a cross-harness state translation.
 
 ## Reason
 
@@ -57,9 +58,8 @@ can and cannot cross the boundary.
   harnesses that consume commands rather than conversation. A caller may set a
   byte ceiling; when hit, the opening (objective) and the most-recent activity
   are preserved and the middle is elided, so the goal is never dropped.
-- Because the harness-private state does not transfer, a fork is a fresh agent
-  run primed with context — not a perfect continuation. Surfaces should present
-  it that way.
+- Cross-harness forks are fresh agent runs primed with context. Same-harness
+  forks may be native continuations when the adapter supports it.
 
 ## Non-Goals
 

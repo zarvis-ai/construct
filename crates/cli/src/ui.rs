@@ -1615,7 +1615,13 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         None
                     };
-                    let pin_glyph = if s.pinned { "★" } else { " " };
+                    let pin_glyph = if s.forked_from.is_some() {
+                        "⑂"
+                    } else if s.pinned {
+                        "★"
+                    } else {
+                        " "
+                    };
                     let indent_prefix = " ".repeat(crate::app::list_session_indent_cells(
                         s,
                         *indented,
@@ -1637,7 +1643,21 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     // Always leave at least one cell of gap between the name
                     // and the right-aligned harness.
                     let name_avail = row_w.saturating_sub(prefix_w + 1 + harness_w + marker_w);
-                    let raw_name = primary_label(s);
+                    let mut raw_name = primary_label(s);
+                    if s.forked_from.is_none() {
+                        let quests = app
+                            .sessions
+                            .iter()
+                            .filter(|q| {
+                                q.forked_from.as_ref().map(|f| f.session_id.as_str())
+                                    == Some(s.id.as_str())
+                                    && !q.archived
+                            })
+                            .count();
+                        if quests > 0 {
+                            raw_name.push_str(&format!(" ⑂{quests}"));
+                        }
+                    }
                     let scroll = if is_selected && focused {
                         // ~6 chars/sec (was 5; +20% per user feedback).
                         Some((app.start_instant.elapsed().as_millis() / 167) as usize)
@@ -1651,13 +1671,14 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let gap_str: String = " ".repeat(gap);
                     // Archived sessions read as muted — they're terminated and
                     // only visible because the "show archived" toggle is on.
-                    let name_style = if s.archived {
-                        Style::default()
-                            .fg(app.theme.dim)
-                            .add_modifier(Modifier::DIM)
-                    } else {
-                        Style::default().fg(app.theme.text)
-                    };
+                    let name_style =
+                        if s.archived || (s.forked_from.is_some() && !s.needs_attention) {
+                            Style::default()
+                                .fg(app.theme.dim)
+                                .add_modifier(Modifier::DIM)
+                        } else {
+                            Style::default().fg(app.theme.text)
+                        };
                     let mut spans = vec![Span::raw(indent_prefix.to_string())];
                     if let Some(expand_glyph) = expand_glyph {
                         spans.push(Span::styled(
@@ -3302,8 +3323,8 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     let last_focused = window_id.is_none_or(|id| id == app.active_window_id);
     // Tutorial pane highlight (spec 0077, steps 2/3 "create"/"say
     // something"): reuses `pane_border_style`'s focused styling.
-    let focused = last_focused
-        && (app.focus == PaneFocus::View || app.tutorial_wants_view_highlight());
+    let focused =
+        last_focused && (app.focus == PaneFocus::View || app.tutorial_wants_view_highlight());
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3695,50 +3716,51 @@ fn render_tutorial_card(f: &mut Frame, app: &mut App) {
     let bottom = inner.y + inner.height;
     let mut row = inner.y;
 
-    let render_segments = |f: &mut Frame, app: &mut App, row: u16, segs: &[(String, Option<KeyAction>)]| {
-        if row >= bottom {
-            return;
-        }
-        let mut col = inner.x;
-        let mut spans: Vec<Span<'static>> = Vec::with_capacity(segs.len());
-        for (text, action) in segs {
-            let w = UnicodeWidthStr::width(text.as_str()) as u16;
-            match action {
-                Some(action) => {
-                    let hovered = mouse
-                        .map(|(mx, my)| my == row && mx >= col && mx < col + w)
-                        .unwrap_or(false);
-                    let mut style = Style::default().fg(app.theme.accent);
-                    if hovered {
-                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                    }
-                    spans.push(Span::styled(text.clone(), style));
-                    app.layout.shortcut_hints.push(HintZone {
-                        x_start: col,
-                        x_end: col + w,
-                        y: row,
-                        action: *action,
-                    });
-                }
-                None => {
-                    spans.push(Span::styled(
-                        text.clone(),
-                        Style::default().fg(app.theme.text),
-                    ));
-                }
+    let render_segments =
+        |f: &mut Frame, app: &mut App, row: u16, segs: &[(String, Option<KeyAction>)]| {
+            if row >= bottom {
+                return;
             }
-            col += w;
-        }
-        f.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect {
-                x: inner.x,
-                y: row,
-                width: inner.width,
-                height: 1,
-            },
-        );
-    };
+            let mut col = inner.x;
+            let mut spans: Vec<Span<'static>> = Vec::with_capacity(segs.len());
+            for (text, action) in segs {
+                let w = UnicodeWidthStr::width(text.as_str()) as u16;
+                match action {
+                    Some(action) => {
+                        let hovered = mouse
+                            .map(|(mx, my)| my == row && mx >= col && mx < col + w)
+                            .unwrap_or(false);
+                        let mut style = Style::default().fg(app.theme.accent);
+                        if hovered {
+                            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                        }
+                        spans.push(Span::styled(text.clone(), style));
+                        app.layout.shortcut_hints.push(HintZone {
+                            x_start: col,
+                            x_end: col + w,
+                            y: row,
+                            action: *action,
+                        });
+                    }
+                    None => {
+                        spans.push(Span::styled(
+                            text.clone(),
+                            Style::default().fg(app.theme.text),
+                        ));
+                    }
+                }
+                col += w;
+            }
+            f.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: inner.x,
+                    y: row,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        };
 
     for line in &body_lines {
         if row >= bottom {
@@ -6895,8 +6917,8 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     };
     // Left column the notice will occupy from (its leading pad space
     // included), or None when the notice doesn't fit / render at all.
-    let notice_start_x = (notice_width > 0 && notice_width < area.width)
-        .then(|| area.x + area.width - notice_width);
+    let notice_start_x =
+        (notice_width > 0 && notice_width < area.width).then(|| area.x + area.width - notice_width);
     let mut spans = Vec::new();
     // Running column so the empty-hint segments below can register exact
     // HintZones; accumulated from the widths of every span pushed ahead of
@@ -9122,8 +9144,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
         );
         // Tutorial pane highlight (spec 0077, steps 5/6 "program board" /
         // "split screen"): reuses the popup's normal focused-border styling.
-        let popup_focused =
-            app.focus == PaneFocus::View || app.tutorial_wants_program_highlight();
+        let popup_focused = app.focus == PaneFocus::View || app.tutorial_wants_program_highlight();
         popups.push((popup.clone(), base_rect, true, popup_focused));
     }
     let mut hover_overlays = Vec::new();
@@ -11401,17 +11422,16 @@ fn render_program_selection_context_menu(
                 .unwrap_or(0);
             let visible_row = cursor_row.min(visible_comment_rows.saturating_sub(1));
             let y = inner_y.saturating_add(visible_row as u16);
-            let x = inner_x
-                .saturating_add((cursor_col.min(comment_width.saturating_sub(1))) as u16);
+            let x =
+                inner_x.saturating_add((cursor_col.min(comment_width.saturating_sub(1))) as u16);
             f.set_cursor_position(Position { x, y });
         }
     }
 }
 
 pub(crate) fn program_selection_comment_width(menu_width: u16) -> usize {
-    let inner_width = menu_width
-        .saturating_sub(2 + PROGRAM_SELECTION_RUN_MENU_PAD_X.saturating_mul(2))
-        as usize;
+    let inner_width =
+        menu_width.saturating_sub(2 + PROGRAM_SELECTION_RUN_MENU_PAD_X.saturating_mul(2)) as usize;
     let run_button_width = UnicodeWidthStr::width(PROGRAM_SELECTION_RUN_BUTTON);
     let comment_gap = usize::from(inner_width > run_button_width);
     inner_width
@@ -13885,6 +13905,8 @@ mod tests {
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
+            forked_from: None,
+            harvest: None,
         }
     }
 

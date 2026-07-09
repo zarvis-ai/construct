@@ -324,6 +324,7 @@ impl Tool for CreateSession {
                 cols: 100,
                 rows: 30,
             }),
+            forked_from: None,
             worktree: input
                 .get("worktree")
                 .and_then(|v| v.as_bool())
