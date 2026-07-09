@@ -110,6 +110,26 @@ pub enum KeyAction {
     /// Open the "upgrade to <version>?" confirmation. Click-only, bound to
     /// the `<version> available` segment of the status-bar version notice.
     OpenUpgradeConfirm,
+    /// Start the interactive tutorial (spec 0077). Bound to bare `t` in both
+    /// profiles (verified unbound elsewhere in both tables). A no-op while a
+    /// tour is already active.
+    StartTutorial,
+    /// Tutorial footer: advance to the next step without completing the
+    /// current one's condition. Click-only — the card is the only entry
+    /// point.
+    TutorialNextStep,
+    /// Tutorial footer: go back one step. Purely navigational — re-arms the
+    /// previous step's transient progress flags so it can be demonstrated
+    /// again, but never undoes real-world effects (sessions, program
+    /// contents). Click-only; hidden on step 1.
+    TutorialPrevStep,
+    /// Tutorial footer: close the tour immediately. Click-only. Writes the
+    /// done marker only when invoked from the final step.
+    TutorialEndTour,
+    /// Click on one of step 1's key labels, which teach real keystrokes
+    /// rather than being click-advance. Click-only; shows a gentle nudge
+    /// instead of dispatching the underlying chord.
+    TutorialNudge,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +345,9 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
         // Help
         (Chord(vec![ch('?')]), ToggleHelp),
+        // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
+        // this profile (the closest existing binding is `C-x t`, ToggleView).
+        (Chord(vec![ch('t')]), StartTutorial),
     ];
     Keymap { bindings }
 }
@@ -436,6 +459,9 @@ fn vim() -> Keymap {
         (Chord(vec![shift('A')]), ToggleAutomode),
         (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
         (Chord(vec![ch('?')]), ToggleHelp),
+        // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
+        // this profile too (vim binds `C-x t` to ToggleView, not bare `t`).
+        (Chord(vec![ch('t')]), StartTutorial),
     ];
     Keymap { bindings }
 }

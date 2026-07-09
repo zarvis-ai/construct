@@ -51,6 +51,13 @@ pub struct TuiState {
     pub open_program_session_ids: Vec<String>,
     #[serde(default)]
     pub widgets: HashMap<String, WidgetState>,
+    /// Step (1..=8) of an interactive tutorial (spec 0077) in progress when
+    /// the TUI last quit, so an interrupted tour resumes at the same step
+    /// instead of restarting from step 1. `None` = no tour in progress —
+    /// cleared as soon as the tour ends, whether by completion or
+    /// `[end tour]`.
+    #[serde(default)]
+    pub tutorial_step: Option<u8>,
 }
 
 impl Default for TuiState {
@@ -69,6 +76,7 @@ impl Default for TuiState {
             active_window_id: None,
             open_program_session_ids: Vec::new(),
             widgets: HashMap::new(),
+            tutorial_step: None,
         }
     }
 }
@@ -92,6 +100,29 @@ pub fn configure_dialog_seen() -> bool {
 
 pub fn mark_configure_dialog_seen() {
     let path = configure_seen_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"");
+}
+
+/// Marker file (spec 0077) recording that the interactive tutorial has been
+/// completed at least once. Only written on a genuine finish (the final
+/// step's completion, or `[end tour]` clicked from that final step) — never
+/// on an early `[end tour]` or a mid-tour quit, so a user who bails out
+/// partway is still invited to come back and finish. A separate file from
+/// `configure-seen`, following the same rationale: cheap "have we shown this"
+/// check without parsing the full state blob.
+fn tutorial_done_marker_path() -> PathBuf {
+    Paths::discover().state_dir.join("tutorial-done")
+}
+
+pub fn tutorial_done() -> bool {
+    tutorial_done_marker_path().exists()
+}
+
+pub fn mark_tutorial_done() {
+    let path = tutorial_done_marker_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -145,5 +176,26 @@ mod tests {
         let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(restored.open_program_session_ids, vec!["s1", "s2"]);
+    }
+
+    #[test]
+    fn state_round_trips_tutorial_step() {
+        let state = TuiState {
+            tutorial_step: Some(4),
+            ..TuiState::default()
+        };
+
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(restored.tutorial_step, Some(4));
+    }
+
+    #[test]
+    fn legacy_state_defaults_tutorial_step_to_none() {
+        let state: TuiState = serde_json::from_str(r#"{"last_selected_session_id": "s1"}"#)
+            .expect("legacy state should deserialize");
+
+        assert_eq!(state.tutorial_step, None);
     }
 }

@@ -39,6 +39,7 @@ mod program_popup;
 mod session_picker;
 mod session_title_menu;
 mod session_title_rename;
+mod tutorial;
 pub use configure::{
     harness_guidance, no_agent_harness_available, smith_method_guidance, ConfigurePopup,
     ConfigureTab, CONFIGURE_TABS,
@@ -46,6 +47,7 @@ pub use configure::{
 pub use session_picker::{
     session_picker_scroll, SessionPickerDialog, SessionPickerPurpose, SessionPickerRow,
 };
+pub use tutorial::{Step1Phase, TutorialState};
 
 pub const TERMINAL_SCROLLBAR_TTL: Duration = Duration::from_millis(1200);
 pub(crate) const DYNAMIC_UI_AUTOHIDE_SECS: u64 = 15;
@@ -1447,6 +1449,9 @@ pub struct App {
     pty_osc11_query_tails: HashMap<String, Vec<u8>>,
     pty_input_tx: mpsc::UnboundedSender<PtyInputJob>,
     pty_input_errors: mpsc::UnboundedReceiver<String>,
+    /// Interactive tutorial (spec 0077): `None` = no tour active. See
+    /// `app/tutorial.rs` for the full state machine and hooks.
+    pub tutorial: Option<TutorialState>,
 }
 
 struct ReconnectState {
@@ -2617,6 +2622,17 @@ pub struct LayoutSnapshot {
     /// (palette / send-input / etc.) is open for minibuffer hints, but may
     /// still contain main-view shortcut affordances.
     pub shortcut_hints: Vec<HintZone>,
+    /// Bounds of the floating tutorial coach-mark card rendered this frame
+    /// (`render_tutorial_card`), or `None` when the tour isn't active. The
+    /// card is deliberately non-modal — it never sets `modal_area`, whose
+    /// outside-click-dismisses semantics don't apply here — but while the
+    /// tour is active the card (painted last, on top, opaque) owns every
+    /// button event inside this rect regardless of what's underneath: not
+    /// the pane's mouse-grabbing child, not the program editor's cursor
+    /// placement, not pane focus/selection (#735). Scroll events fall
+    /// through (the card has nothing to scroll), in-flight drags keep
+    /// their owner, and an open help modal's close-on-interaction wins.
+    pub tutorial_card_area: Option<ratatui::layout::Rect>,
     /// Clickable harness names in the new-session picker prompt
     /// (`MinibufferIntent::NewSessionHarness`). Click → submit the
     /// matching name as if the user typed it and hit Enter.
@@ -3114,7 +3130,11 @@ async fn run_with_socket_initial_selection(
         pty_osc11_query_tails: HashMap::new(),
         pty_input_tx,
         pty_input_errors,
+        tutorial: None,
     };
+    if let Some(step) = persisted.tutorial_step {
+        app.tutorial_resume(step);
+    }
     if let Some(warning) = theme_warning {
         app.status = Some((warning, Instant::now()));
     }
@@ -3227,6 +3247,7 @@ async fn run_with_socket_initial_selection(
         active_window_id: Some(app.active_window_id),
         open_program_session_ids: app.open_program_session_ids(),
         widgets,
+        tutorial_step: app.tutorial.as_ref().filter(|t| !t.completed).map(|t| t.step),
     });
 
     result
@@ -3772,6 +3793,7 @@ async fn run_loop(
                 }
                 app.update_browser_preview_hover_and_expiry();
                 app.expire_program_runs(Instant::now());
+                app.tutorial_tick(Instant::now());
             }
             _ = harness_refresh.tick(), if app.connected
                 && (app.selected_id().is_none() || app.configure_popup.is_some()) => {
@@ -5632,6 +5654,11 @@ impl App {
     }
 
     async fn on_notification(&mut self, n: agentd_protocol::Notification) {
+        // Tutorial hook (b) — spec 0077: the one place daemon-pushed state
+        // changes are applied to app state. Re-parses the payload itself so
+        // this stays a single thin call; all step logic lives in
+        // `app/tutorial.rs`.
+        self.tutorial_observe_notification(&n);
         // Default: assume the notification changes something visible, so the
         // run loop repaints. Only an off-screen `Pty` chunk clears this (see
         // the `Pty` arm below) — every other event kind keeps it set.
@@ -6735,7 +6762,39 @@ impl App {
         // content, so its action rows must take mouse priority over the child
         // (otherwise a mouse-grabbing child swallows every menu click and the
         // split/close/rename actions silently do nothing).
-        if self.handle_program_mouse(&ev).await {
+        // While the tour is active, its card — always painted topmost, opaque
+        // (`Clear`) — owns every button/motion event inside its rect, no
+        // matter what surface lies underneath: a mouse-grabbing PTY child, the
+        // program editor, anything. Same principle as the URL-click intercept
+        // below: if the card shows its controls as clickable (hover underline
+        // every frame), they must respond to clicks. Three carve-outs:
+        //  - in-flight construct drag gestures keep their owner — a drag that
+        //    started outside the card must not be hijacked crossing it (the
+        //    program's own resize drag included);
+        //  - scroll wheels fall through — the card has nothing to scroll, so
+        //    the surface underneath keeps scrolling as if the card weren't
+        //    there (program scroll, PTY scroll forward, pane scrollback);
+        //  - while the help modal is open, help's any-key/any-click close
+        //    semantics win over the card (step 7 opens help on purpose).
+        let card_owns_event = !self.help_visible
+            && !matches!(
+                ev.kind,
+                MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+            && self.session_title_menu.is_none()
+            && self.resizing_list.is_none()
+            && self.resizing_pin_strip.is_none()
+            && self.resizing_orchestrator_panel.is_none()
+            && self.resizing_matrix_rain.is_none()
+            && self.resizing_main_window.is_none()
+            && self.resizing_program_popup.is_none()
+            && self.dragging_terminal_scrollbar.is_none()
+            && self.text_selection.is_none()
+            && self.mouse_over_tutorial_card(ev.column, ev.row);
+        if !card_owns_event && self.handle_program_mouse(&ev).await {
             return;
         }
         // URL clicks must be intercepted before the child-mouse-forward path so
@@ -6743,6 +6802,8 @@ impl App {
         // Code in full-screen mode) actually opens the browser.  The hover
         // underline is rendered every frame — if we show the link as clickable it
         // must respond to clicks regardless of whether the child owns the mouse.
+        // (URL hits are read from the rendered frame text, and the card paints
+        // opaquely over it, so a URL can never hijack a card-rect click.)
         if matches!(ev.kind, MouseEventKind::Up(MouseButton::Left)) {
             if let Some(hit) = self.url_hit_at(ev.column, ev.row) {
                 match open_url(&hit.url) {
@@ -6760,6 +6821,7 @@ impl App {
             && self.resizing_main_window.is_none()
             && self.dragging_terminal_scrollbar.is_none()
             && self.text_selection.is_none()
+            && !card_owns_event
             && self.forward_mouse_to_child(&ev)
         {
             return;
@@ -6780,6 +6842,13 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
+                // A press inside the tour card must not start any construct
+                // gesture on the surfaces underneath (text selection,
+                // divider/scrollbar drags, pane focus) — the card is opaque
+                // and its zones dispatch on mouse-up via handle_left_click.
+                if card_owns_event {
+                    return;
+                }
                 if let Some(hit) = self
                     .layout
                     .main_window_areas
@@ -7131,6 +7200,33 @@ impl App {
             self.session_title_menu = None;
         }
         if self.handle_dynamic_ui_overlay_click(col, row).await {
+            return;
+        }
+        // Tour card clicks — checked BEFORE the modal branch below, because
+        // an open program sets `modal_area` and would otherwise claim the
+        // click for cursor placement even though the card paints on top of
+        // it. Deliberately NOT a reordering of the shortcut_hints loop
+        // further down: only zones inside the card rect gain this pre-modal
+        // priority; every other zone keeps its place in the pipeline (and
+        // stays unclickable through modals). While the help modal is open,
+        // help's close-on-interaction semantics win instead (the card
+        // never swallows a click meant to dismiss help).
+        if !self.help_visible && self.mouse_over_tutorial_card(col, row) {
+            let zone = self
+                .layout
+                .shortcut_hints
+                .iter()
+                // Last-pushed zone wins: the card renders last (topmost), so
+                // its zones shadow any coincident zone of a covered surface.
+                .rev()
+                .find(|hint| row == hint.y && col >= hint.x_start && col < hint.x_end)
+                .map(|hint| hint.action);
+            if let Some(action) = zone {
+                self.run_action(action).await;
+            }
+            // Zone hit or not, the click stops here: the card is painted
+            // opaque, so falling through to program-cursor placement / pane
+            // focus / selection on the surface underneath is always wrong.
             return;
         }
         if let Some(modal) = self.layout.modal_area {
@@ -7626,6 +7722,13 @@ impl App {
     }
 
     fn forward_key_to_selected_pty(&mut self, key: KeyEvent) {
+        // Tutorial hook — spec 0077 step 3 ("say something to it"): a
+        // PTY-captured session (any real agent harness) never routes typed
+        // input through `run_action` or a notification, so this is the only
+        // chokepoint that sees "the user submitted a line" for that case.
+        if matches!(key.code, KeyCode::Enter) {
+            self.tutorial_observe_pty_enter();
+        }
         let was_scrolled = self.snap_pty_scrollback_to_live();
         if let Some(bytes) = encode_key_to_bytes(key) {
             self.queue_selected_pty_input(bytes);
@@ -7908,6 +8011,10 @@ impl App {
 
         let res = self.chord_state.handle(key, &self.keymap);
         self.chord_label = self.chord_state.label();
+        // Tutorial hook — step 1's pending-chord echo / C-g cancel / wrong-key
+        // correction is driven off the raw `KeymapResult`, since `C-x` and
+        // `C-g` alone never resolve to a `KeyAction` (spec 0077).
+        self.tutorial_observe_key_result(&res, key);
         match res {
             KeymapResult::Action(a) => self.run_action(a).await,
             KeymapResult::Pending(label) => self.chord_label = label,
@@ -8006,6 +8113,11 @@ impl App {
 
     async fn run_action(&mut self, action: KeyAction) {
         use KeyAction::*;
+        // Tutorial hook (a) — spec 0077: `run_action` is the one chokepoint
+        // every `KeyAction` passes through, whether it came from a chord,
+        // a palette command, or a `HintZone` click. Kept thin; all logic
+        // lives in `app/tutorial.rs`.
+        self.tutorial_observe_action(action);
         match action {
             Quit => self.should_quit = true,
             NextSession => self.step_selection(1).await,
@@ -8531,6 +8643,11 @@ impl App {
                     });
                 }
             }
+            StartTutorial => self.tutorial_start(),
+            TutorialNextStep => self.tutorial_next_step(),
+            TutorialPrevStep => self.tutorial_prev_step(),
+            TutorialEndTour => self.tutorial_end_tour(),
+            TutorialNudge => self.tutorial_nudge(),
         }
     }
 
@@ -8762,6 +8879,7 @@ impl App {
             "configure" => {
                 self.open_configure_popup().await;
             }
+            "tutorial" | "tour" => self.run_action(KeyAction::StartTutorial).await,
             "construct" => {
                 // Subcommand dispatch:
                 //
@@ -10339,6 +10457,7 @@ mod tests {
             list_items_area: None,
             list_scroll_offset: 0,
             shortcut_hints: Vec::new(),
+            tutorial_card_area: None,
             minibuffer_harness_hits: Vec::new(),
             minibuffer_choice_hits: Vec::new(),
             modal_area: None,
@@ -10516,6 +10635,7 @@ mod tests {
             pty_osc11_query_tails: HashMap::new(),
             pty_input_tx,
             pty_input_errors,
+            tutorial: None,
         }
     }
 
@@ -23263,8 +23383,12 @@ mod tests {
             "empty state should not show q as the quit shortcut:\n{screen}"
         );
         assert!(
-            screen.contains("new: C-x C-f  help: ?  palette: C-x x"),
-            "missing modeline hint:\n{screen}"
+            screen.contains("new: C-x C-f  help: ?  palette: C-x x  tour: t"),
+            "missing modeline hint (incl. the tour segment):\n{screen}"
+        );
+        assert!(
+            screen.contains("[start the interactive tour]  — or press t"),
+            "missing the welcome-card tour call-to-action:\n{screen}"
         );
         assert!(
             !screen.contains("CLI examples:"),
@@ -23411,6 +23535,134 @@ mod tests {
             ),
             "clicking the update-available segment should open the upgrade confirm"
         );
+        server.abort();
+    }
+
+    // BUILD_ID-independent regression for the CI-only failure of
+    // `mismatched_build_renders_both_versions_and_daemon_segment_click_opens_restart_confirm`:
+    // the empty-state hint (lengthened by the `tour: t` segment) and the
+    // right-aligned version notice both register HintZones on the modeline
+    // row, and `handle_left_click` is first-match-wins — when they
+    // overlapped, clicking the daemon segment dispatched the hint action
+    // hidden beneath it instead. The collision column depends on
+    // `crate::BUILD_ID`'s length (clean CI build vs `-dirty` local), which
+    // is why it only failed in CI. A long daemon build id forces the
+    // collision pressure regardless of BUILD_ID; the hint must yield.
+    #[tokio::test]
+    async fn modeline_hint_yields_to_version_notice_without_zone_overlap() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.daemon_build_id = Some("0.1.0+deadbeefcafebabe".to_string());
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        // (a) No two zones overlap anywhere in the frame (same row).
+        let hints = &app.layout.shortcut_hints;
+        for (i, a) in hints.iter().enumerate() {
+            for b in hints.iter().skip(i + 1) {
+                if a.y == b.y {
+                    assert!(
+                        a.x_end <= b.x_start || b.x_end <= a.x_start,
+                        "overlapping zones on row {}: {:?} vs {:?}",
+                        a.y,
+                        a,
+                        b
+                    );
+                }
+            }
+        }
+
+        // (b) Clicking the daemon segment's own x_start opens the
+        // restart-daemon confirm — not whatever hint used to sit there.
+        let hit = *app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::OpenRestartDaemonConfirm)
+            .expect("daemon segment zone");
+        app.handle_left_click(hit.x_start, hit.y).await;
+        assert!(
+            matches!(
+                app.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::RestartDaemonConfirm)
+            ),
+            "clicking the daemon segment must open the restart-daemon confirm"
+        );
+
+        // (c) The modeline text doesn't interleave hint and notice
+        // fragments: the notice renders intact at the right edge, and the
+        // hint segments that couldn't fit are dropped whole (`tour: t`
+        // first) rather than half-painted under the notice.
+        let screen = rendered_text(terminal.backend().buffer());
+        let modeline = screen
+            .lines()
+            .find(|l| l.contains("(daemon)"))
+            .expect("modeline row with the version notice");
+        assert!(
+            modeline.contains("0.1.0+deadbeefcafebabe (daemon)"),
+            "daemon segment must render intact:\n{modeline}"
+        );
+        assert!(
+            modeline
+                .trim_end()
+                .ends_with(&format!("{} (tui)", crate::BUILD_ID)),
+            "notice keeps right-edge alignment:\n{modeline}"
+        );
+        assert!(
+            !modeline.contains("tour: t") && !modeline.contains("help: ?"),
+            "hint segments that no longer fit must drop whole:\n{modeline}"
+        );
+        // Dropped segments register no zones on the modeline row.
+        assert!(
+            !app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.y == hit.y && h.action == KeyAction::StartTutorial),
+            "no tour zone may hide under the notice"
+        );
+
+        // Width sweep: shifting the terminal width moves the collision
+        // point exactly the way a different BUILD_ID length would (CI's
+        // clean build id is ~6 cols shorter than a local `-dirty` one), so
+        // holding the invariants across a width range proves the fix for
+        // every realistic BUILD_ID. At each width: no same-row zone
+        // overlap, and the daemon segment click dispatches its own action.
+        for width in [92u16, 100, 108, 116, 124, 132] {
+            app.minibuffer = None;
+            let backend = ratatui::backend::TestBackend::new(width, 36);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|f| crate::ui::render(f, &mut app))
+                .expect("draw");
+            let hints = app.layout.shortcut_hints.clone();
+            for (i, a) in hints.iter().enumerate() {
+                for b in hints.iter().skip(i + 1) {
+                    if a.y == b.y {
+                        assert!(
+                            a.x_end <= b.x_start || b.x_end <= a.x_start,
+                            "overlapping zones at width {width}, row {}: {:?} vs {:?}",
+                            a.y,
+                            a,
+                            b
+                        );
+                    }
+                }
+            }
+            let hit = *hints
+                .iter()
+                .find(|h| h.action == KeyAction::OpenRestartDaemonConfirm)
+                .unwrap_or_else(|| panic!("daemon zone missing at width {width}"));
+            app.handle_left_click(hit.x_start, hit.y).await;
+            assert!(
+                matches!(
+                    app.minibuffer.as_ref().map(|m| &m.intent),
+                    Some(MinibufferIntent::RestartDaemonConfirm)
+                ),
+                "daemon segment click hijacked at width {width}"
+            );
+        }
         server.abort();
     }
 
@@ -23634,6 +23886,1106 @@ mod tests {
         let (x, y) = click(&app, KeyAction::Quit);
         app.handle_left_click(x, y).await;
         assert!(app.should_quit);
+        server.abort();
+    }
+
+    // --- Interactive tutorial (spec 0077) -----------------------------
+
+    #[tokio::test]
+    async fn welcome_card_tour_line_starts_tutorial_via_key_and_click() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            screen.contains("[start the interactive tour]"),
+            "missing tour call-to-action:\n{screen}"
+        );
+        assert!(
+            app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.action == KeyAction::StartTutorial),
+            "the CTA should register a HintZone"
+        );
+
+        // Key path: bare `t`.
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE))
+            .await;
+        assert!(app.tutorial.is_some(), "bare t should start the tour");
+        app.tutorial = None;
+
+        // Click path — the card's CTA is the first StartTutorial zone
+        // registered (the card renders before the modeline hint).
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("tour hint")
+            .clone();
+        // Zone/text alignment guard: the zone's first cell is the CTA's
+        // opening bracket.
+        let first_cell = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert_eq!(first_cell, "[", "CTA zone must start on its label");
+        app.handle_left_click(hit.x_start, hit.y).await;
+        assert!(
+            app.tutorial.is_some(),
+            "clicking the tour CTA should start the tour"
+        );
+        server.abort();
+    }
+
+    // The empty-state modeline's onboarding hint gains a clickable
+    // `tour: t` segment; the with-sessions modeline must not grow one.
+    #[tokio::test]
+    async fn modeline_tour_hint_clickable_only_in_empty_state() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        // The modeline hint renders after the welcome card, so its zone is
+        // the LAST StartTutorial zone of the frame.
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.action == KeyAction::StartTutorial)
+            .next_back()
+            .copied()
+            .expect("modeline tour segment zone");
+        // Alignment guard: the zone starts on the 't' of "tour: t".
+        let first_cell = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.symbol().to_string())
+            .unwrap_or_default();
+        assert_eq!(first_cell, "t", "modeline tour zone must start on its label");
+        app.handle_left_click(hit.x_start, hit.y).await;
+        assert!(
+            app.tutorial.is_some(),
+            "clicking the modeline tour segment should start the tour"
+        );
+        server.abort();
+
+        // With sessions, neither the hint text nor a StartTutorial zone
+        // exists anywhere in the frame.
+        let (mut app, _dir2, server2) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(
+            !screen.contains("tour: t"),
+            "with-sessions modeline must not show the tour hint:\n{screen}"
+        );
+        assert!(
+            !app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.action == KeyAction::StartTutorial),
+            "no StartTutorial zone outside the empty state"
+        );
+        server2.abort();
+    }
+
+    // While a tour is running, StartTutorial is a no-op — so neither the
+    // welcome-card CTA nor the modeline "tour: t" segment may keep looking
+    // clickable (the inverse of the card's click-ownership rule: if it
+    // can't respond it must not look clickable). The row dims, hover shows
+    // nothing, and no StartTutorial HintZone exists anywhere in the frame;
+    // both return to normal on the first frame after the tour ends.
+    #[tokio::test]
+    async fn tour_cta_dims_and_loses_zone_while_tour_active() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+
+        // Baseline: no tour → both zones (card CTA + modeline segment).
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let zones = |app: &App| {
+            app.layout
+                .shortcut_hints
+                .iter()
+                .filter(|h| h.action == KeyAction::StartTutorial)
+                .count()
+        };
+        assert_eq!(zones(&app), 2, "card CTA + modeline segment when idle");
+        let cta = *app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("card CTA zone");
+
+        app.tutorial_start();
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        assert_eq!(
+            zones(&app),
+            0,
+            "no StartTutorial zone may exist while a tour is running"
+        );
+        // The CTA label cell (where the zone used to start) renders dim,
+        // with none of the invite bold.
+        let cell_style = terminal
+            .backend()
+            .buffer()
+            .cell((cta.x_start, cta.y))
+            .map(|c| c.style())
+            .expect("CTA cell");
+        assert_eq!(
+            cell_style.fg,
+            Some(app.theme.dim),
+            "CTA must render dim while the tour runs"
+        );
+        assert!(
+            !cell_style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "no invite emphasis while the tour runs"
+        );
+
+        // Tour ends → both affordances come back on the next frame.
+        app.tutorial_end_tour();
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        assert_eq!(zones(&app), 2, "zones return once the tour ends");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn starting_tutorial_renders_step1_card() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let screen = rendered_text(terminal.backend().buffer());
+        assert!(screen.contains("tour 1/8"), "missing step title:\n{screen}");
+        assert!(
+            screen.contains("A chord like C-x C-f"),
+            "missing step1 body:\n{screen}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn step1_chord_flow_pending_cancel_and_wrong_key() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().step1_phase,
+            Step1Phase::AwaitCtrlG
+        );
+        assert!(
+            app.tutorial
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("pending"),
+            "C-x should show pending feedback"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().step1_phase,
+            Step1Phase::AwaitNewSession
+        );
+        assert!(
+            app.tutorial
+                .as_ref()
+                .unwrap()
+                .feedback
+                .as_deref()
+                .unwrap_or("")
+                .contains("cancelled"),
+            "C-g should advance the micro-exercise with a cancel message"
+        );
+
+        // A wrong key here (not the create-session chord) should show a
+        // correction naming the actual key pressed, without advancing.
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
+            .await;
+        let feedback = app
+            .tutorial
+            .as_ref()
+            .unwrap()
+            .feedback
+            .clone()
+            .unwrap_or_default();
+        assert!(
+            feedback.contains("you pressed"),
+            "expected a wrong-key correction, got: {feedback}"
+        );
+        assert_eq!(app.tutorial.as_ref().unwrap().step, 1, "still on step 1");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn completing_step1_opens_new_session_and_advances_to_step2() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            matches!(
+                app.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::NewSessionHarness)
+            ),
+            "C-x C-f should still open the new-session picker"
+        );
+        assert_eq!(
+            app.tutorial.as_ref().map(|t| t.step),
+            Some(2),
+            "tour should advance to step 2"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn end_tour_click_closes_without_writing_marker() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start(); // step 1 — not the final step.
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::TutorialEndTour)
+            .expect("end tour hint")
+            .clone();
+        app.handle_left_click(hit.x_start, hit.y).await;
+
+        let marker_written = crate::tui_state::tutorial_done();
+        match saved {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+        assert!(app.tutorial.is_none(), "end tour should close the card");
+        assert!(
+            !marker_written,
+            "ending early must not write the done marker"
+        );
+        server.abort();
+    }
+
+    // Regression for #735: hovering the tour card's footer labels (then
+    // "[skip step]" / "[end tour]", since renamed to "[next step]" /
+    // "[end tour]") underlined them (hover is computed render-side from
+    // `app.mouse_pos`), but clicking did nothing once the practice session's
+    // child grabbed the mouse (e.g. Claude Code enabling DECSET mouse
+    // tracking). The sibling test above,
+    // `end_tour_click_closes_without_writing_marker`, calls
+    // `handle_left_click` directly, which skips the real dispatch path:
+    // `on_mouse` → `forward_mouse_to_child` used to hand every mouse event
+    // over a mouse-tracking pane to its child's PTY and return *before* the
+    // click pipeline (and the card's own hint zones) ever ran. This drives
+    // the real `on_mouse` Down+Up path with a mouse-tracking child behind the
+    // card to catch that regression.
+    #[tokio::test]
+    async fn tutorial_card_click_reaches_card_through_on_mouse_over_grabbing_child() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = captured_app().await;
+        app.view = ViewMode::Terminal;
+
+        // s1's child enables mouse tracking (DECSET ?1000h), same setup as
+        // `click_in_mouse_grabbing_pane_still_focuses_it`.
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"\x1b[?1000h");
+        let _ = history.replay(120, 36, 0);
+        app.histories.insert("s1".into(), history);
+        assert_ne!(
+            app.histories.get("s1").unwrap().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "test setup must put the pane's child in a mouse-tracking mode"
+        );
+
+        app.tutorial_start(); // step 1 — footer has [next step] / [end tour].
+
+        // Swap in a test PTY-input channel so we can assert the click never
+        // leaked into the child as a forwarded mouse report.
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+
+        assert!(
+            app.layout.tutorial_card_area.is_some(),
+            "the card must register its rect while the tour is active"
+        );
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::TutorialEndTour)
+            .expect("end tour hint")
+            .clone();
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert!(
+            app.tutorial.is_none(),
+            "clicking [end tour] through on_mouse should close the card even \
+             though the pane underneath grabbed the mouse"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the click must not also leak into the mouse-grabbing child's PTY \
+             as a forwarded mouse report"
+        );
+        server.abort();
+    }
+
+    // Inverse guard for the fix above: with no tour active, a click at the
+    // same kind of coordinates over a mouse-tracking child must still
+    // forward to the child as normal PTY mouse pass-through (#480/#728
+    // behavior) — the tutorial-card guard must only claim the mouse while
+    // there's an actual card rect to protect.
+    #[tokio::test]
+    async fn mouse_still_forwards_to_child_when_no_tutorial_card() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = captured_app().await;
+        app.view = ViewMode::Terminal;
+
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"\x1b[?1000h");
+        let _ = history.replay(120, 36, 0);
+        app.histories.insert("s1".into(), history);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+
+        assert!(
+            app.layout.tutorial_card_area.is_none(),
+            "no tour running means no card rect to protect"
+        );
+        let inner = app
+            .layout
+            .main_window_areas
+            .first()
+            .expect("rendered session pane")
+            .inner_area;
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner.x + inner.width / 2,
+            row: inner.y + inner.height / 2,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        let job = rx.try_recv().expect(
+            "without an active tour, a click over a mouse-tracking child must \
+             still forward as a normal PTY mouse report",
+        );
+        assert_eq!(job.session_id, "s1");
+        server.abort();
+    }
+
+    // Step 4 with exactly ONE session, driven through the REAL `on_key`
+    // path (the user report: "C-n is not effective"). Confirms both halves
+    // of the diagnosis:
+    //  (a) from view focus the PTY captures a bare C-n — it's forwarded to
+    //      the child and never resolves to `NextSession`, so the sub-check
+    //      cannot tick until the user hops to the list first (which is why
+    //      the card now teaches `C-x o` as step 1 of an ordered list);
+    //  (b) from list focus the action fires and the sub-check ticks even
+    //      though the selection has nowhere visible to move.
+    #[tokio::test]
+    async fn step4_single_session_c_n_ticks_from_list_focus_via_on_key() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.view = ViewMode::Terminal;
+        assert_eq!(app.sessions.len(), 1, "fixture: exactly one session");
+        app.tutorial_start();
+        app.tutorial.as_mut().unwrap().step = 4;
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        // (a) View focus: the PTY owns bare C-n. It must be forwarded (the
+        // tour never steals keys from the child) and must NOT tick.
+        app.focus = PaneFocus::View;
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await;
+        let job = rx
+            .try_recv()
+            .expect("C-n from view focus goes to the child's PTY");
+        assert_eq!(job.session_id, "s1");
+        assert!(
+            !app.tutorial.as_ref().unwrap().selection_moved,
+            "a PTY-swallowed C-n must not tick the selection sub-check"
+        );
+
+        // (b) List focus: the action fires and the sub-check completes on
+        // the dispatch itself, even though there is only one session so
+        // nothing visibly moves.
+        app.focus = PaneFocus::List;
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .await;
+        assert!(
+            app.tutorial.as_ref().unwrap().selection_moved,
+            "NextSession firing must tick even with a single session"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the list-focused C-n stays a construct action, not PTY input"
+        );
+
+        // The taught order completes the step: C-x o ticks the focus
+        // sub-check and step 4 advances.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.tutorial.as_ref().map(|t| t.step),
+            Some(5),
+            "focus hop + selection move must complete step 4"
+        );
+        server.abort();
+    }
+
+    // Item: the tour card must own clicks over the PROGRAM view exactly as
+    // it does over a mouse-grabbing PTY. An open program sets
+    // `layout.modal_area`, and `handle_program_mouse` used to consume the
+    // Down (cursor placement / focus) before the click pipeline ever saw
+    // the card's zones.
+    #[tokio::test]
+    async fn tour_card_click_over_program_dispatches_card_zone() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = captured_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 3));
+        app.tutorial_start();
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let card = app.layout.tutorial_card_area.expect("card rect");
+        assert!(
+            app.layout.modal_area.is_some(),
+            "fixture: the open program must be registered as the modal"
+        );
+
+        // A card BODY click (inside the card, on no zone) is consumed: the
+        // program's cursor must not move and its popup must stay open.
+        let body = (card.x + 1, card.y);
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: body.0,
+            row: body.1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: body.0,
+            row: body.1,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(app.tutorial.is_some(), "body click is not an action");
+        let popup = app.program_popup.as_ref().expect("program stays open");
+        assert_eq!(
+            popup.cursor, 3,
+            "a card-body click must not place the program cursor"
+        );
+
+        // A card ZONE click dispatches the card's action through the full
+        // on_mouse path even with the program modal underneath.
+        let hit = *app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::TutorialEndTour)
+            .expect("end tour hint");
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            app.tutorial.is_none(),
+            "[end tour] must dispatch even with the program modal underneath"
+        );
+        assert!(
+            app.program_popup.is_some(),
+            "the card click must not disturb the program popup"
+        );
+        server.abort();
+    }
+
+    // Item: while the help modal is open (step 7 opens it on purpose), its
+    // close-on-interaction semantics win over the card — a click on the
+    // card rect must not dispatch a card action behind help's back.
+    #[tokio::test]
+    async fn help_modal_wins_over_tour_card_clicks() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        app.help_visible = true;
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let hit = *app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::TutorialEndTour)
+            .expect("end tour hint");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            app.tutorial.is_some(),
+            "the card must not swallow interactions meant for the help modal"
+        );
+
+        // And help still closes on any key while the tour is active.
+        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await;
+        assert!(!app.help_visible, "any key must still close help");
+        assert!(app.tutorial.is_some(), "closing help leaves the tour alone");
+        server.abort();
+    }
+
+    // Step 6's sub-checks tick on either member of each taught pair:
+    // C-x 2 / C-x 3 for the split, C-x 0 / C-x 1 for the collapse.
+    #[tokio::test]
+    async fn step6_either_split_and_either_collapse_tick_subchecks() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        {
+            let t = app.tutorial.as_mut().unwrap();
+            t.step = 6;
+            t.degraded = true; // degraded gate = the three user actions
+        }
+        app.run_action(KeyAction::SplitWindowRight).await;
+        assert!(
+            app.tutorial.as_ref().unwrap().split_done,
+            "C-x 3 must count for the split sub-check"
+        );
+        app.run_action(KeyAction::FocusWindowDown).await;
+        assert!(
+            app.tutorial.as_ref().unwrap().hop_done,
+            "C-x <arrow> must count for the hop sub-check"
+        );
+        app.run_action(KeyAction::DeleteOtherWindows).await;
+        assert_eq!(
+            app.tutorial.as_ref().map(|t| t.step),
+            Some(7),
+            "C-x 1 must count for the collapse sub-check and complete step 6"
+        );
+
+        // The other member of each pair works too.
+        let (mut app2, _dir2, server2) = captured_app().await;
+        app2.tutorial_start();
+        {
+            let t = app2.tutorial.as_mut().unwrap();
+            t.step = 6;
+            t.degraded = true;
+        }
+        app2.run_action(KeyAction::SplitWindowBelow).await;
+        app2.run_action(KeyAction::FocusWindowUp).await;
+        app2.run_action(KeyAction::DeleteWindow).await;
+        assert_eq!(app2.tutorial.as_ref().map(|t| t.step), Some(7));
+        server.abort();
+        server2.abort();
+    }
+
+    // Regression for the step-6 user report: the agent's task-to-## Done
+    // move was never detected. That edit reaches the TUI ONLY through the
+    // daemon's program/state event (an open popup deliberately does not
+    // absorb daemon updates into a locally-edited buffer), so the event
+    // path must tick the gate even while the popup shows a stale buffer.
+    #[tokio::test]
+    async fn program_state_event_ticks_done_with_stale_popup_buffer() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        {
+            let t = app.tutorial.as_mut().unwrap();
+            t.step = 6;
+            t.practice_session_id = Some("s1".into());
+        }
+        // The user's popup still shows the task under Todo (stale view of
+        // the agent's edit).
+        app.program_popup = Some(program_popup_for_test(
+            "s1",
+            "# Rule\n\n## Todo\n\n- Test task\n\n## In Progress\n\n## Done\n",
+            0,
+        ));
+
+        app.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            params: Some(
+                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
+                    program: agentd_protocol::ProgramDocument {
+                        session_id: "s1".into(),
+                        markdown:
+                            "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n"
+                                .into(),
+                        version: 2,
+                        updated_at_ms: 0,
+                        template_id: Some("tasks".into()),
+                    },
+                    active_run: None,
+                    blocks: Vec::new(),
+                })
+                .unwrap(),
+            ),
+        })
+        .await;
+        assert!(
+            app.tutorial.as_ref().unwrap().task_done,
+            "the daemon program/state event must tick the Done gate even \
+             while the popup buffer is stale"
+        );
+        server.abort();
+    }
+
+    // The practice session is unknown after a tour resume or [next step]
+    // navigation past step 2 (`practice_session_id` is never persisted) —
+    // the old strict scoping then silently dropped every program event and
+    // subagent creation, which is how the step-6 detections died in the
+    // user's flow. Unknown-practice events for the program/session the
+    // user is actually working with must tick AND adopt.
+    #[tokio::test]
+    async fn step6_detections_adopt_practice_when_unknown() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        app.tutorial.as_mut().unwrap().step = 6;
+        assert!(app.tutorial.as_ref().unwrap().practice_session_id.is_none());
+
+        // A subagent spawning during step 6 (kind Subagent, parented to the
+        // session the agent runs in) is accepted and its parent adopted.
+        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        sub.id = "sub-1".into();
+        sub.parent_session_id = Some("s1".into());
+        app.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::STATE.into(),
+            params: Some(
+                serde_json::to_value(StateNotificationPayload { session: sub }).unwrap(),
+            ),
+        })
+        .await;
+        let t = app.tutorial.as_ref().unwrap();
+        assert_eq!(
+            t.subagent_session_id.as_deref(),
+            Some("sub-1"),
+            "unknown-practice tours must still see the board's subagent"
+        );
+        assert_eq!(
+            t.practice_session_id.as_deref(),
+            Some("s1"),
+            "the subagent's parent is adopted as the practice session"
+        );
+
+        // Program events: unknown practice + program for the SELECTED
+        // session ticks and adopts too.
+        let (mut app2, _dir2, server2) = captured_app().await;
+        app2.tutorial_start();
+        app2.tutorial.as_mut().unwrap().step = 6;
+        app2.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            params: Some(
+                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
+                    program: agentd_protocol::ProgramDocument {
+                        session_id: "s1".into(), // selected in captured_app
+                        markdown: "## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n"
+                            .into(),
+                        version: 1,
+                        updated_at_ms: 0,
+                        template_id: Some("tasks".into()),
+                    },
+                    active_run: None,
+                    blocks: Vec::new(),
+                })
+                .unwrap(),
+            ),
+        })
+        .await;
+        let t2 = app2.tutorial.as_ref().unwrap();
+        assert!(t2.task_done, "selected session's program event must tick");
+        assert_eq!(t2.practice_session_id.as_deref(), Some("s1"));
+
+        // Negative: a program for some unrelated session (not displayed,
+        // not selected) never ticks an unknown-practice tour.
+        let (mut app3, _dir3, server3) = captured_app().await;
+        app3.tutorial_start();
+        app3.tutorial.as_mut().unwrap().step = 6;
+        app3.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            params: Some(
+                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
+                    program: agentd_protocol::ProgramDocument {
+                        session_id: "unrelated".into(),
+                        markdown: "## Done\n\n- Test task\n".into(),
+                        version: 1,
+                        updated_at_ms: 0,
+                        template_id: None,
+                    },
+                    active_run: None,
+                    blocks: Vec::new(),
+                })
+                .unwrap(),
+            ),
+        })
+        .await;
+        let t3 = app3.tutorial.as_ref().unwrap();
+        assert!(!t3.task_done, "unrelated programs must not tick");
+        assert!(t3.practice_session_id.is_none());
+        server.abort();
+        server2.abort();
+        server3.abort();
+    }
+
+    // Known-practice subagent linkage through the real STATE notification:
+    // `construct_subagent_create` stamps kind Subagent + parent_session_id
+    // of the creating session; the observer matches that parentage.
+    #[tokio::test]
+    async fn subagent_state_notification_registers_for_known_practice() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        {
+            let t = app.tutorial.as_mut().unwrap();
+            t.step = 6;
+            t.practice_session_id = Some("s1".into());
+        }
+        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        sub.id = "sub-9".into();
+        sub.parent_session_id = Some("s1".into());
+        app.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::STATE.into(),
+            params: Some(
+                serde_json::to_value(StateNotificationPayload { session: sub }).unwrap(),
+            ),
+        })
+        .await;
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().subagent_session_id.as_deref(),
+            Some("sub-9")
+        );
+
+        // A child of some OTHER session is ignored when practice is known.
+        let mut other = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        other.id = "sub-other".into();
+        other.parent_session_id = Some("someone-else".into());
+        app.on_notification(Notification {
+            jsonrpc: "2.0".into(),
+            method: agentd_protocol::ipc_notif::STATE.into(),
+            params: Some(
+                serde_json::to_value(StateNotificationPayload { session: other }).unwrap(),
+            ),
+        })
+        .await;
+        assert_eq!(
+            app.tutorial.as_ref().unwrap().subagent_session_id.as_deref(),
+            Some("sub-9"),
+            "unrelated subagents must not overwrite the tour's"
+        );
+        server.abort();
+    }
+
+    // Regression for the step-5 user report: "apply the Tasks template" and
+    // "add a task under Todo" never ticked. Both are LOCAL edits to the
+    // program popup's buffer — `apply_program_template` and typing mutate
+    // only client state, and the daemon (whose PROGRAM_STATE event was the
+    // only detector) learns about them on save/run. The checkmarks must
+    // appear as the user acts, before any save, via the render tick's
+    // buffer observation.
+    #[tokio::test]
+    async fn step5_local_template_and_task_edits_tick_before_any_save() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        {
+            let t = app.tutorial.as_mut().unwrap();
+            t.step = 5;
+            t.practice_session_id = Some("s1".into());
+        }
+        let board = "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n";
+
+        // A program on some OTHER session never ticks the practice checks.
+        app.program_popup = Some(program_popup_for_test("other", board, 0));
+        app.tutorial_tick(Instant::now());
+        let t = app.tutorial.as_ref().unwrap();
+        assert!(
+            !t.template_applied && !t.task_line_present,
+            "another session's program must not tick the sub-checks"
+        );
+
+        // Blank program on the practice session: still nothing.
+        app.program_popup = Some(program_popup_for_test("s1", "", 0));
+        app.tutorial_tick(Instant::now());
+        let t = app.tutorial.as_ref().unwrap();
+        assert!(!t.template_applied && !t.task_line_present);
+
+        // Apply the Tasks template — a purely client-side buffer swap, no
+        // daemon event. The template box ticks; the (empty) Todo must not
+        // tick the task box.
+        app.apply_program_template("tasks".into(), board.into());
+        app.tutorial_tick(Instant::now());
+        let t = app.tutorial.as_ref().unwrap();
+        assert!(
+            t.template_applied,
+            "template application must tick before any save"
+        );
+        assert!(
+            !t.task_line_present,
+            "the template's empty Todo must not tick the task box"
+        );
+
+        // Type a task line under ## Todo (still local, still unsaved).
+        app.program_popup.as_mut().unwrap().buffer =
+            "# Rule\n\n## Todo\n\n- Test task\n\n## In Progress\n\n## Done\n".into();
+        app.tutorial_tick(Instant::now());
+        let t = app.tutorial.as_ref().unwrap();
+        assert!(
+            t.task_line_present,
+            "a task line under Todo must tick before any save"
+        );
+        assert_eq!(t.step, 5, "non-degraded step 5 still waits for the run");
+
+        // Sticky: wiping the buffer afterwards never unticks.
+        app.program_popup.as_mut().unwrap().buffer = String::new();
+        app.tutorial_tick(Instant::now());
+        let t = app.tutorial.as_ref().unwrap();
+        assert!(
+            t.template_applied && t.task_line_present,
+            "ticks are sticky across later edits"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn step5_task_under_done_only_does_not_tick_task_box() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.tutorial_start();
+        {
+            let t = app.tutorial.as_mut().unwrap();
+            t.step = 5;
+            t.practice_session_id = Some("s1".into());
+        }
+        // Sections present (template box ticks on content), but the only
+        // task line sits under ## Done — the Todo box must stay unticked.
+        let md = "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n";
+        app.program_popup = Some(program_popup_for_test("s1", md, 0));
+        app.tutorial_tick(Instant::now());
+        let t = app.tutorial.as_ref().unwrap();
+        assert!(t.template_applied, "board sections tick the template box");
+        assert!(
+            !t.task_line_present,
+            "a task under Done only must not tick the Todo box"
+        );
+        server.abort();
+    }
+
+    // Footer [prev step] through the real click pipeline: prev from step 2
+    // returns to a re-armed step 1, whose footer then hides [prev step].
+    #[tokio::test]
+    async fn prev_step_click_navigates_back_and_hides_on_step1() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.tutorial_start();
+        app.tutorial.as_mut().unwrap().step = 2;
+
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let hit = *app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::TutorialPrevStep)
+            .expect("[prev step] zone on step 2");
+        app.handle_left_click(hit.x_start, hit.y).await;
+        let t = app.tutorial.as_ref().expect("tour still active");
+        assert_eq!(t.step, 1, "prev navigates back one step");
+        assert_eq!(
+            t.step1_phase,
+            Step1Phase::AwaitCtrlX,
+            "step 1 is re-armed from its first phase"
+        );
+
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(
+            !app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.action == KeyAction::TutorialPrevStep),
+            "step 1 must not offer [prev step]"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn welcome_tour_line_unhighlighted_once_done_marker_present() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+        crate::tui_state::mark_tutorial_done();
+
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("tour hint")
+            .clone();
+        let done_bold = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.style().add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .unwrap_or(false);
+
+        match saved {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+        assert!(
+            !done_bold,
+            "tour line should not be highlighted once the done marker exists"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn welcome_tour_line_highlighted_when_marker_absent() {
+        let _lock = CONFIGURE_SEEN_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var("CONSTRUCT_STATE_DIR").ok();
+        std::env::set_var("CONSTRUCT_STATE_DIR", tmp.path());
+        assert!(!crate::tui_state::tutorial_done(), "fresh state dir starts unmarked");
+        // The invite also requires the configure dialog to have been seen
+        // at least once — true by the time a real launch ever shows this
+        // card (see the comment on `tour_not_done` in ui.rs).
+        crate::tui_state::mark_configure_dialog_seen();
+
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::StartTutorial)
+            .expect("tour hint")
+            .clone();
+        let not_done_bold = terminal
+            .backend()
+            .buffer()
+            .cell((hit.x_start, hit.y))
+            .map(|c| c.style().add_modifier.contains(ratatui::style::Modifier::BOLD))
+            .unwrap_or(false);
+
+        match saved {
+            Some(v) => std::env::set_var("CONSTRUCT_STATE_DIR", v),
+            None => std::env::remove_var("CONSTRUCT_STATE_DIR"),
+        }
+        assert!(
+            not_done_bold,
+            "tour line should be highlighted (accent + bold) while unmarked"
+        );
         server.abort();
     }
 

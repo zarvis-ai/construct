@@ -195,6 +195,17 @@ impl App {
         true
     }
 
+    /// True when `(col, row)` lands inside the floating tutorial card
+    /// rendered this frame. Used to keep the card's own click handling (and
+    /// the URL-click intercept's sibling logic) from being shadowed by
+    /// `forward_mouse_to_child` when the pane underneath has grabbed the
+    /// mouse — see `LayoutSnapshot::tutorial_card_area`.
+    pub(super) fn mouse_over_tutorial_card(&self, col: u16, row: u16) -> bool {
+        self.layout
+            .tutorial_card_area
+            .is_some_and(|r| Self::rect_contains(r, col, row))
+    }
+
     /// Forward a mouse event into the child PTY of the pane under the cursor,
     /// if that child has requested mouse tracking. Returns `true` when the
     /// event was consumed (encoded and queued for the child), `false` when no

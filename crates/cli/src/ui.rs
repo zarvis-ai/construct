@@ -137,6 +137,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.dynamic_ui_trigger = None;
     app.layout.dynamic_ui_triggers.clear();
     app.layout.shortcut_hints.clear();
+    app.layout.tutorial_card_area = None;
     app.layout.modeline_approval_mode_hit = None;
     app.layout.modeline_theme_hit = None;
     app.layout.main_window_areas.clear();
@@ -294,6 +295,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
     }
     render_session_title_menu(f, app);
+    render_tutorial_card(f, app);
     finish_frame(f, app);
 }
 
@@ -1534,7 +1536,10 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
-    let focused = app.focus == PaneFocus::List;
+    // Tutorial pane highlight (spec 0077, step 4 "get around"): reuses
+    // `pane_border_style`'s focused styling as the highlight rather than
+    // inventing new styling.
+    let focused = app.focus == PaneFocus::List || app.tutorial_wants_list_highlight();
     // Collapsed render path: a thin column with a `>` expand glyph
     // on the top border. Anywhere inside the pane click-expands.
     let effective_collapsed = app.list_collapsed && !focused;
@@ -3295,7 +3300,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     // its focused brightness (the border still dims) so the user can see
     // where `C-x o` will land.
     let last_focused = window_id.is_none_or(|id| id == app.active_window_id);
-    let focused = app.focus == PaneFocus::View && last_focused;
+    // Tutorial pane highlight (spec 0077, steps 2/3 "create"/"say
+    // something"): reuses `pane_border_style`'s focused styling.
+    let focused = last_focused
+        && (app.focus == PaneFocus::View || app.tutorial_wants_view_highlight());
     if let Some(diff) = &app.last_diff {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -3433,28 +3441,61 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
 }
 
 fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
-    // Base content (title, blurb, four shortcut lines) is 8 rows; the
+    // Base content (title, blurb, the tour call-to-action, four shortcut
+    // lines, and the blank separators between them) is 10 rows; the
     // harness status section below adds a blank separator + header + one
     // row per registered harness. Grow the card to fit instead of clipping
     // — `centered_rect` already clamps to the pane's actual height.
-    let base_rows: u16 = 8;
+    let base_rows: u16 = 10;
     let harness_rows: u16 = if app.harnesses.is_empty() {
         0
     } else {
         2 + app.harnesses.len() as u16
     };
-    let card = centered_rect(area, 72, (base_rows + harness_rows).max(10));
+    let card = centered_rect(area, 72, (base_rows + harness_rows).max(11));
     let label_style = Style::default().fg(app.theme.accent);
     let hover_style = label_style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    // The tour CTA row always renders; only its EMPHASIS (accent + bold, an
+    // invitation — not an auto-start) is gated: once the configure dialog
+    // has been dismissed at least once AND the tour hasn't been completed
+    // yet (spec 0077). The configure condition avoids competing for
+    // attention with the (modal, drawn on top) first-run configure popup —
+    // in practice `configure_dialog_seen` is already true by the time this
+    // card is ever visibly on screen (`open_configure_popup` marks it
+    // immediately on open, before the first render), so this mostly guards
+    // a state a live launch never reaches.
+    let tour_not_done =
+        crate::tui_state::configure_dialog_seen() && !crate::tui_state::tutorial_done();
+    let tour_invite_style = label_style.add_modifier(Modifier::BOLD);
+    // While a tour is running, StartTutorial is a no-op — so the CTA must
+    // not look clickable (the inverse of the tour card's click-ownership
+    // rule: if it looks clickable it must respond; if it can't respond it
+    // must not look clickable). The row still renders, but dimmed, with no
+    // hover treatment and no HintZone; it comes back to life on the next
+    // frame after the tour ends.
+    let tour_active = app.tutorial.is_some();
     let mouse = app.mouse_pos;
+    // The tour CTA (row 4) sits under the blurb, above the chord list —
+    // the audience the tour serves can't parse chord tables yet, so it
+    // must not hide among them. `t` stays bound; the CTA label is the
+    // clickable affordance.
     let shortcut_rows = [
-        (4_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
-        (5_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
-        (6_u16, 2_u16, "?", KeyAction::ToggleHelp),
-        (7_u16, 2_u16, "C-x C-c", KeyAction::Quit),
+        (6_u16, 2_u16, "C-x C-f", KeyAction::OpenNewSession),
+        (7_u16, 2_u16, "C-x x", KeyAction::OpenCommandPalette),
+        (8_u16, 2_u16, "?", KeyAction::ToggleHelp),
+        (9_u16, 2_u16, "C-x C-c", KeyAction::Quit),
+        (
+            4_u16,
+            2_u16,
+            "[start the interactive tour]",
+            KeyAction::StartTutorial,
+        ),
     ];
-    let mut hovered = [false; 4];
+    let mut hovered = [false; 5];
     for (i, (row, col, label, action)) in shortcut_rows.iter().enumerate() {
+        if *action == KeyAction::StartTutorial && tour_active {
+            continue; // inert while the tour runs: no zone, no hover
+        }
         let x_start = card.x + *col;
         let y = card.y + *row;
         let w = UnicodeWidthStr::width(*label) as u16;
@@ -3469,6 +3510,13 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
             action: *action,
         });
     }
+    let tour_style = |base: Style| {
+        if hovered[4] {
+            base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+        } else {
+            base
+        }
+    };
 
     let mut lines = vec![
         Line::from(Span::styled(
@@ -3482,6 +3530,33 @@ fn render_empty_session_state(f: &mut Frame, area: Rect, app: &mut App) {
             "Start with a session. Sessions are the live terminals construct tracks.",
             Style::default().fg(app.theme.dim),
         )),
+        Line::raw(""),
+        // Tour call-to-action. "▶ " is 2 cols, matching the CTA zone's
+        // col offset in `shortcut_rows` above. Dimmed whole (marker + label
+        // + suffix) while a tour is already running — `t` is inert then too.
+        Line::from(vec![
+            Span::styled(
+                "▶ ",
+                if tour_active {
+                    Style::default().fg(app.theme.dim)
+                } else {
+                    label_style
+                },
+            ),
+            Span::styled(
+                "[start the interactive tour]",
+                if tour_active {
+                    Style::default().fg(app.theme.dim)
+                } else {
+                    tour_style(if tour_not_done {
+                        tour_invite_style
+                    } else {
+                        label_style
+                    })
+                },
+            ),
+            Span::styled("  — or press t", Style::default().fg(app.theme.dim)),
+        ]),
         Line::raw(""),
         Line::from(vec![
             Span::raw("  "),
@@ -3556,6 +3631,169 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         width,
         height,
     }
+}
+
+/// Interactive tutorial coach-mark card (spec 0077). A small floating,
+/// NEVER-modal card anchored top-right of the main view pane — it never
+/// covers the session list, minibuffer, or modeline, and (unlike
+/// `render_help`/`render_configure_popup`) never sets `layout.modal_area`,
+/// so clicks outside it fall straight through to whatever's underneath.
+/// Every key label it renders (except step 1's, which teach real
+/// keystrokes) is a real `HintZone` dispatching the exact `KeyAction` a
+/// keypress would, following `render_empty_session_state`'s pattern of
+/// building spans directly (rather than composing strings) so hit-testing
+/// is exact.
+fn render_tutorial_card(f: &mut Frame, app: &mut App) {
+    let Some(state) = app.tutorial.clone() else {
+        return;
+    };
+    let ctx = app.tutorial_card_ctx();
+    let body_lines = state.lines(ctx);
+    let checklist = state.checklist();
+    let anchor = app.layout.view_area.unwrap_or(f.area());
+    if anchor.width < 8 || anchor.height < 4 {
+        return;
+    }
+    let width = 46u16.min(anchor.width.saturating_sub(1)).max(8);
+    // Content-driven height: body + the gap row + (optional) 2 feedback
+    // rows + checklist + footer, plus the 2 border rows. Steps vary a lot
+    // (step 6's state-aware copy plus its 4-row checklist vs. the tiny
+    // completed card), so a fixed height either clips or wastes space.
+    let content_rows = body_lines.len() as u16
+        + 1
+        + if state.feedback.is_some() { 2 } else { 0 }
+        + checklist.len() as u16
+        + 1;
+    let height = (content_rows + 2)
+        .min(anchor.height.saturating_sub(1))
+        .max(6);
+    // Top-right corner of the view pane, inset by one cell so the card
+    // floats clear of the pane's own border/title row.
+    let x = anchor.x + anchor.width.saturating_sub(width + 1);
+    let y = anchor.y + 1;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    // Claim this rect for the mouse: the card floats over whatever pane is
+    // underneath, and if that pane's child has grabbed the mouse (e.g.
+    // Claude Code fullscreen), `on_mouse` must not let the child swallow
+    // clicks meant for the card's own shortcut zones. See the tutorial_card_area
+    // doc comment for the non-modal rationale.
+    app.layout.tutorial_card_area = Some(rect);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.accent))
+        .title(state.card_title());
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mouse = app.mouse_pos;
+    let bottom = inner.y + inner.height;
+    let mut row = inner.y;
+
+    let render_segments = |f: &mut Frame, app: &mut App, row: u16, segs: &[(String, Option<KeyAction>)]| {
+        if row >= bottom {
+            return;
+        }
+        let mut col = inner.x;
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(segs.len());
+        for (text, action) in segs {
+            let w = UnicodeWidthStr::width(text.as_str()) as u16;
+            match action {
+                Some(action) => {
+                    let hovered = mouse
+                        .map(|(mx, my)| my == row && mx >= col && mx < col + w)
+                        .unwrap_or(false);
+                    let mut style = Style::default().fg(app.theme.accent);
+                    if hovered {
+                        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                    }
+                    spans.push(Span::styled(text.clone(), style));
+                    app.layout.shortcut_hints.push(HintZone {
+                        x_start: col,
+                        x_end: col + w,
+                        y: row,
+                        action: *action,
+                    });
+                }
+                None => {
+                    spans.push(Span::styled(
+                        text.clone(),
+                        Style::default().fg(app.theme.text),
+                    ));
+                }
+            }
+            col += w;
+        }
+        f.render_widget(
+            Paragraph::new(Line::from(spans)),
+            Rect {
+                x: inner.x,
+                y: row,
+                width: inner.width,
+                height: 1,
+            },
+        );
+    };
+
+    for line in &body_lines {
+        if row >= bottom {
+            break;
+        }
+        render_segments(f, app, row, line);
+        row += 1;
+    }
+    row += 1;
+
+    if let Some(feedback) = &state.feedback {
+        if row < bottom {
+            let style = Style::default().fg(app.theme.warning);
+            f.render_widget(
+                Paragraph::new(feedback.clone())
+                    .style(style)
+                    .wrap(Wrap { trim: false }),
+                Rect {
+                    x: inner.x,
+                    y: row,
+                    width: inner.width,
+                    height: (bottom - row).min(2),
+                },
+            );
+            row += 2;
+        }
+    }
+
+    if !checklist.is_empty() {
+        for (label, done) in &checklist {
+            if row >= bottom {
+                break;
+            }
+            let mark = if *done { "[x]" } else { "[ ]" };
+            let style = Style::default().fg(if *done {
+                app.theme.success
+            } else {
+                app.theme.dim
+            });
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!("{mark} {label}"), style))),
+                Rect {
+                    x: inner.x,
+                    y: row,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+            row += 1;
+        }
+    }
+
+    // Footer pinned to the card's last row.
+    let footer_row = inner.y + inner.height.saturating_sub(1);
+    render_segments(f, app, footer_row, &state.footer());
 }
 
 fn render_group_overview(
@@ -6565,11 +6803,21 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     let status = search_status
         .as_deref()
         .unwrap_or_else(|| app.status.as_ref().map(|(m, _)| m.as_str()).unwrap_or(""));
-    let empty_hint = if s.is_none() && app.list_items().is_empty() && status.is_empty() {
-        "new: C-x C-f  help: ?  palette: C-x x"
-    } else {
-        ""
-    };
+    // Empty/welcome-state onboarding hint, rendered as individually
+    // clickable segments (the same HintZone pattern as the minibuffer hint
+    // and the persistent notices below). Only while no session exists —
+    // the with-sessions modeline never shows these.
+    let empty_hint_segments: &[(&str, KeyAction)] =
+        if s.is_none() && app.list_items().is_empty() && status.is_empty() {
+            &[
+                ("new: C-x C-f", KeyAction::OpenNewSession),
+                ("help: ?", KeyAction::ToggleHelp),
+                ("palette: C-x x", KeyAction::OpenCommandPalette),
+                ("tour: t", KeyAction::StartTutorial),
+            ]
+        } else {
+            &[]
+        };
     let modeline_before_approval_mode = format!(
         " construct  {vim_mode}focus:{focus}  {sel}  {model}  {remote}",
         vim_mode = vim_mode_label,
@@ -6605,18 +6853,57 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             }
         }
     }
-    let modeline_after_approval_mode = format!(
-        "{scrollback}{chord}{empty_hint}{status}{conn} ",
+    let modeline_pre_hint = format!(
+        "{scrollback}{chord}",
         scrollback = scrollback_label,
         chord = if app.chord_label.is_empty() {
             String::new()
         } else {
             format!("({})  ", app.chord_label)
         },
-        empty_hint = empty_hint,
-        status = status,
     );
+    let modeline_post_hint = format!("{status}{conn} ", status = status);
+    // Persistent notices (theme label, version notice, update-available),
+    // right-aligned at the far edge. Built BEFORE the left-side spans so the
+    // empty-state hint below can stay clear of the notice's footprint: both
+    // sides register HintZones on the same row, and `handle_left_click`'s
+    // zone loop is first-match-wins — an overlap doesn't just overprint
+    // text, it makes a click on a notice segment silently dispatch the
+    // left-side hint underneath (CI-only failure: the notice width varies
+    // with BUILD_ID, so the collision point moves between a clean and a
+    // `-dirty` build).
+    let theme_label = format!("theme:{}", app.theme_name.label());
+    let mut persistent_notices: Vec<Vec<(String, Option<KeyAction>)>> =
+        vec![vec![(theme_label, Some(KeyAction::CycleTheme))]];
+    persistent_notices.push(version_notice_segments(app));
+    if let Some(latest) = app.latest_version.as_deref() {
+        persistent_notices.push(vec![(
+            format!("{latest} available"),
+            Some(KeyAction::OpenUpgradeConfirm),
+        )]);
+    }
+    let notice_width = {
+        let labels_width: usize = persistent_notices
+            .iter()
+            .flatten()
+            .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
+            .sum();
+        let separators_width = persistent_notices.len().saturating_sub(1) * 3;
+        labels_width
+            .saturating_add(separators_width)
+            .saturating_add(2) as u16
+    };
+    // Left column the notice will occupy from (its leading pad space
+    // included), or None when the notice doesn't fit / render at all.
+    let notice_start_x = (notice_width > 0 && notice_width < area.width)
+        .then(|| area.x + area.width - notice_width);
     let mut spans = Vec::new();
+    // Running column so the empty-hint segments below can register exact
+    // HintZones; accumulated from the widths of every span pushed ahead of
+    // them.
+    let mut hint_col = area
+        .x
+        .saturating_add(UnicodeWidthStr::width(modeline_before_approval_mode.as_str()) as u16);
     spans.push(Span::raw(modeline_before_approval_mode));
     if let Some(badge) = approval_mode_badge {
         let hovered = app
@@ -6635,10 +6922,67 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 Modifier::UNDERLINED
             });
+        hint_col = hint_col
+            .saturating_add(UnicodeWidthStr::width(badge.as_str()) as u16)
+            .saturating_add(2);
         spans.push(Span::styled(badge, badge_style));
         spans.push(Span::raw("  "));
     }
-    spans.push(Span::raw(modeline_after_approval_mode));
+    hint_col = hint_col.saturating_add(UnicodeWidthStr::width(modeline_pre_hint.as_str()) as u16);
+    spans.push(Span::raw(modeline_pre_hint));
+    for (i, (label, action)) in empty_hint_segments.iter().enumerate() {
+        let w = UnicodeWidthStr::width(*label) as u16;
+        let sep_w = if i > 0 { 2 } else { 0 };
+        // Collision guard: the hint segments are ordered highest-priority
+        // first, so when the right-aligned notice leaves too little room,
+        // whole segments drop from the tail (`tour: t` first, `new:` last)
+        // rather than rendering under the notice. A dropped segment
+        // registers no HintZone, so a click on the notice can never
+        // dispatch a hint action hidden beneath it.
+        if let Some(nx) = notice_start_x {
+            if hint_col.saturating_add(sep_w).saturating_add(w) > nx {
+                break;
+            }
+        }
+        if i > 0 {
+            spans.push(Span::raw("  "));
+            hint_col = hint_col.saturating_add(2);
+        }
+        // "tour: t" goes inert while a tour is already running — the action
+        // would be a no-op, so it must not look clickable: dimmed, no hover,
+        // no HintZone. (Same inverse of the tour card's click-ownership
+        // rule as the welcome-card CTA.)
+        let inert = *action == KeyAction::StartTutorial && app.tutorial.is_some();
+        let hovered = !inert
+            && app
+                .mouse_pos
+                .is_some_and(|(mx, my)| my == area.y && mx >= hint_col && mx < hint_col + w);
+        let style = Style::default()
+            .bg(app.theme.modeline_bg)
+            .fg(if inert {
+                app.theme.dim
+            } else if hovered {
+                app.theme.text
+            } else {
+                app.theme.modeline_fg
+            })
+            .add_modifier(if hovered {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            });
+        spans.push(Span::styled((*label).to_string(), style));
+        if !inert {
+            app.layout.shortcut_hints.push(HintZone {
+                x_start: hint_col,
+                x_end: hint_col.saturating_add(w),
+                y: area.y,
+                action: *action,
+            });
+        }
+        hint_col = hint_col.saturating_add(w);
+    }
+    spans.push(Span::raw(modeline_post_hint));
     let para = Paragraph::new(Line::from(spans)).style(
         Style::default()
             .bg(app.theme.modeline_bg)
@@ -6651,35 +6995,15 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     // Each notice is a run of one or more (label, action) segments rendered
     // back-to-back with no separator (e.g. the version notice's clickable
     // "<daemon> (daemon)" segment followed by a plain " - <tui> (tui)"
-    // segment); separate notices are joined by " | ".
-    let theme_label = format!("theme:{}", app.theme_name.label());
-    let mut persistent_notices: Vec<Vec<(String, Option<KeyAction>)>> =
-        vec![vec![(theme_label, Some(KeyAction::CycleTheme))]];
-    persistent_notices.push(version_notice_segments(app));
-    if let Some(latest) = app.latest_version.as_deref() {
-        persistent_notices.push(vec![(
-            format!("{latest} available"),
-            Some(KeyAction::OpenUpgradeConfirm),
-        )]);
-    }
-    if !persistent_notices.is_empty() {
-        use unicode_width::UnicodeWidthStr;
-        let group_width = |group: &[(String, Option<KeyAction>)]| -> usize {
-            group
-                .iter()
-                .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
-                .sum()
-        };
-        let labels_width: usize = persistent_notices.iter().map(|g| group_width(g)).sum();
-        let separators_width = persistent_notices.len().saturating_sub(1) * 3;
-        let w = labels_width
-            .saturating_add(separators_width)
-            .saturating_add(2) as u16;
-        if w > 0 && w < area.width {
+    // segment); separate notices are joined by " | ". Built (and its width
+    // measured) above, before the left-side spans, so the empty-state hint
+    // could stay clear of this footprint.
+    {
+        if let Some(nx) = notice_start_x {
             let nrect = Rect {
-                x: area.x + area.width - w,
+                x: nx,
                 y: area.y,
-                width: w,
+                width: notice_width,
                 height: area.height,
             };
             let mut spans = Vec::new();
@@ -8796,7 +9120,11 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
             |id| app.selection_for_window(id),
             f.area(),
         );
-        popups.push((popup.clone(), base_rect, true, app.focus == PaneFocus::View));
+        // Tutorial pane highlight (spec 0077, steps 5/6 "program board" /
+        // "split screen"): reuses the popup's normal focused-border styling.
+        let popup_focused =
+            app.focus == PaneFocus::View || app.tutorial_wants_program_highlight();
+        popups.push((popup.clone(), base_rect, true, popup_focused));
     }
     let mut hover_overlays = Vec::new();
     for (popup, base_rect, active, popup_focused) in popups {
