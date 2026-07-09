@@ -40,6 +40,18 @@ on you."
     process-group signal can't distinguish busy from idle) — an output
     quiescence timeout: no terminal output for a short fixed window means the
     session is awaiting input. Output resuming returns it to running.
+- **Idle housekeeping is not activity.** Full-screen TUI harnesses repaint
+  status-line housekeeping while sitting idle — e.g. a periodic auto-update
+  check that paints a message and erases it a moment later. Byte-wise that is
+  indistinguishable from real output; what distinguishes it is that it does
+  not persist. For quiescence-detected harnesses, output counts as genuine
+  activity — both for the unseen-activity signal and for undoing a
+  quiescence-driven idle — only once a burst of output has kept arriving for
+  a short window comparable to the quiescence window itself, where a burst is
+  broken by any silence long enough to have triggered quiescence. Shorter
+  blips leave the session's state and markers completely untouched; without
+  this rule every idle, unfocused session re-raises its marker on each
+  housekeeping repaint, showing the operator a dot with nothing new to see.
 - **The marker is persisted** and survives daemon and client restarts. On
   restart, sessions that were waiting still show the marker; a reconnecting
   viewer re-asserts focus so the session it is looking at clears.
@@ -74,6 +86,15 @@ daemon, which already tracks last-output time.
   long-thinking session that emits nothing for the whole window is briefly
   marked awaiting; output resuming clears it. Keep the window long enough to
   avoid flapping.
+- The burst filter trades a small delay and a rare miss for precision: a
+  quiescence-detected session reads as running only once its output has
+  persisted past the blip window, and a genuine turn whose entire output fits
+  inside the window never flags. Accepted — these harnesses repaint
+  continuously (spinners, streaming) during real turns, so sub-window turns
+  are vanishingly rare, while idle housekeeping blips arrive forever.
+- A housekeeping message that paints and stays (e.g. "update available") does
+  not flag either — a single repaint is not a sustained burst. Accepted: the
+  marker signals a stop after work, not passive notices.
 - The "focused session" used to suppress the marker is global to the daemon
   (last switch wins). With multiple simultaneous viewers this is approximate;
   single-operator use is exact. Don't build per-viewer marker state on top of
@@ -102,3 +123,7 @@ daemon, which already tracks last-output time.
 - The daemon restarts while three sessions were waiting → all three still show
   the dot; the session the operator reopens clears as the viewer re-asserts
   focus.
+- An idle coding-assistant session paints "Checking for updates" in its status
+  bar every 30 minutes and erases it half a second later → no state change, no
+  dot. The same session streaming a real answer for several seconds and then
+  stopping → dot.

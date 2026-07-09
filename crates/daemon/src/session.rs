@@ -21,7 +21,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, RwLock};
@@ -76,6 +76,17 @@ const PROGRAM_AGENT_CURSOR_TTL_MS: i64 = 2 * 1000;
 /// the daemon treats it as awaiting input. Line-oriented shells use
 /// foreground-process-group detection in the adapter and are exempt.
 const PTY_QUIESCENCE: Duration = Duration::from_secs(2);
+/// How long a PTY output burst must persist before it counts as genuine
+/// activity for quiescence-detected harnesses. Full-screen TUI harnesses
+/// repaint status-line housekeeping while idle — claude paints "Checking for
+/// updates" every 30 minutes and erases it half a second later — and
+/// byte-wise that is indistinguishable from a real turn; what distinguishes
+/// it is that it doesn't persist. Sub-window bursts neither mark unseen
+/// activity nor undo an AwaitingInput (spec 0054). A burst ends when output
+/// pauses for [`PTY_QUIESCENCE`]; with the two windows equal, a lone
+/// paint+erase pair can never qualify — its two events would need a gap
+/// under the quiescence window spanning at least this window.
+const PTY_BLIP_WINDOW: Duration = Duration::from_secs(2);
 const PROGRAM_RUN_MAX_MS: i64 = 10 * 60 * 1000;
 
 const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
@@ -309,6 +320,13 @@ pub struct SessionEntry {
     /// only flags when there was unseen activity — not from the operator's own
     /// keystrokes echoing in a focused session. Not persisted. See spec 0054.
     unseen_activity: AtomicBool,
+    /// Start (epoch ms) of the current PTY output burst; 0 = no burst yet. A
+    /// burst is a run of active output events with gaps shorter than
+    /// [`PTY_QUIESCENCE`]; only bursts that have persisted for
+    /// [`PTY_BLIP_WINDOW`] count as genuine activity for quiescence-detected
+    /// harnesses, filtering out idle housekeeping repaints. Advanced by
+    /// [`pty_burst_advance`]. Not persisted — restarts as "no burst".
+    pty_burst_start_ms: AtomicI64,
 }
 
 /// Tracking state for the per-session "active client wins" PTY
@@ -1136,6 +1154,7 @@ impl SessionManager {
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
         }
@@ -3488,6 +3507,22 @@ fn harness_uses_quiescence(s: &SessionSummary) -> bool {
         )
 }
 
+/// Advance a session's PTY burst tracker for one active output event.
+/// Returns the burst's start time and whether the burst has persisted for
+/// [`PTY_BLIP_WINDOW`] — i.e. whether this event counts as genuine activity
+/// rather than an idle housekeeping blip. A gap of [`PTY_QUIESCENCE`] or more
+/// since the previous output starts a new burst: that is the same silence
+/// that flips the session to AwaitingInput, so a burst can't straddle it.
+fn pty_burst_advance(burst_start_ms: i64, prev_pty_at_ms: Option<i64>, now_ms: i64) -> (i64, bool) {
+    let new_burst = burst_start_ms <= 0
+        || prev_pty_at_ms.map_or(true, |last| {
+            now_ms.saturating_sub(last) >= PTY_QUIESCENCE.as_millis() as i64
+        });
+    let start = if new_burst { now_ms } else { burst_start_ms };
+    let sustained = now_ms.saturating_sub(start) >= PTY_BLIP_WINDOW.as_millis() as i64;
+    (start, sustained)
+}
+
 fn effective_mode(params: &CreateSessionParams) -> String {
     match params.mode.as_ref() {
         Some(mode) => mode.clone(),
@@ -4064,6 +4099,7 @@ mod tests {
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
+            pty_burst_start_ms: AtomicI64::new(0),
         })
     }
 
@@ -4842,6 +4878,7 @@ mod tests {
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
+            pty_burst_start_ms: AtomicI64::new(0),
         });
         manager
             .sessions
@@ -4974,6 +5011,7 @@ mod tests {
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
+            pty_burst_start_ms: AtomicI64::new(0),
         });
         manager
             .sessions
@@ -5001,7 +5039,9 @@ mod tests {
         );
         drop(sum);
 
-        // 2. Send active/visible PTY event (actual printable character).
+        // 2. Send active/visible PTY event (actual printable character). It
+        // starts an output burst but is not yet sustained (PTY_BLIP_WINDOW),
+        // so the state must NOT flip yet — only the activity timestamp moves.
         manager
             .handle_event(&entry, SessionEvent::pty(b"visible output"))
             .await;
@@ -5009,10 +5049,171 @@ mod tests {
         let sum = entry.summary.read().await;
         assert_eq!(
             sum.state,
-            SessionState::Running,
-            "should transition to Running"
+            SessionState::AwaitingInput,
+            "a fresh burst is still a potential housekeeping blip"
         );
         assert!(sum.last_pty_at_ms.is_some(), "should update last_pty_at_ms");
+        drop(sum);
+
+        // 3. Simulate the burst having persisted past PTY_BLIP_WINDOW (as a
+        // real turn's continuous repaints do): backdate the burst start, keep
+        // the last-output gap under PTY_QUIESCENCE so the burst is unbroken.
+        let now_ms = Utc::now().timestamp_millis();
+        entry
+            .pty_burst_start_ms
+            .store(now_ms - PTY_BLIP_WINDOW.as_millis() as i64 - 1_000, Ordering::Relaxed);
+        entry.summary.write().await.last_pty_at_ms = Some(now_ms - 100);
+        manager
+            .handle_event(&entry, SessionEvent::pty(b"more visible output"))
+            .await;
+
+        let sum = entry.summary.read().await;
+        assert_eq!(
+            sum.state,
+            SessionState::Running,
+            "sustained output transitions to Running"
+        );
+    }
+
+    /// A paint→erase housekeeping blip (claude's periodic "Checking for
+    /// updates") must never register as sustained activity; output that keeps
+    /// arriving past PTY_BLIP_WINDOW must. Spec 0054.
+    #[test]
+    fn pty_burst_blips_are_not_sustained() {
+        let t0: i64 = 1_000_000;
+        // First output after long silence starts a burst; not sustained.
+        let (start, sustained) = pty_burst_advance(0, None, t0);
+        assert_eq!(start, t0);
+        assert!(!sustained);
+        // The erase repaint ~530ms later (observed updater cadence): same
+        // burst, still a blip.
+        let (start, sustained) = pty_burst_advance(start, Some(t0), t0 + 530);
+        assert_eq!(start, t0);
+        assert!(!sustained);
+        // The next updater blip 30 minutes later: the gap ends the burst.
+        let (start, sustained) = pty_burst_advance(start, Some(t0 + 530), t0 + 30 * 60 * 1_000);
+        assert_eq!(start, t0 + 30 * 60 * 1_000);
+        assert!(!sustained);
+    }
+
+    #[test]
+    fn pty_burst_sustained_output_is_genuine() {
+        let t0: i64 = 5_000_000;
+        // A real turn: output keeps arriving with sub-quiescence gaps and
+        // becomes genuine once the burst spans PTY_BLIP_WINDOW.
+        let (start, sustained) = pty_burst_advance(0, Some(t0 - 60_000), t0);
+        assert!(!sustained);
+        let (start, sustained) = pty_burst_advance(start, Some(t0), t0 + 1_000);
+        assert!(!sustained);
+        let (start, sustained) = pty_burst_advance(start, Some(t0 + 1_000), t0 + 2_000);
+        assert_eq!(start, t0, "the burst is unbroken");
+        assert!(sustained, "a burst spanning PTY_BLIP_WINDOW is genuine");
+    }
+
+    /// A lone paint→erase pair can never qualify as sustained regardless of
+    /// its spacing: a gap under PTY_QUIESCENCE keeps the pair one burst but
+    /// spans less than PTY_BLIP_WINDOW; a wider gap starts a new burst.
+    #[test]
+    fn pty_burst_two_event_pair_never_sustained() {
+        let t0: i64 = 1_000_000;
+        for gap in [100, 500, 1_999, 2_000, 5_000, 30 * 60 * 1_000] {
+            let (start, _) = pty_burst_advance(0, None, t0);
+            let (_, sustained) = pty_burst_advance(start, Some(t0), t0 + gap);
+            assert!(
+                !sustained,
+                "paint→erase pair with {gap}ms spacing must stay a blip"
+            );
+        }
+    }
+
+    /// Regression: claude's idle housekeeping — a "Checking for updates"
+    /// painted into the status area every 30 minutes and erased half a second
+    /// later — must not flip an idle unfocused session to Running, and must
+    /// not re-raise its needs_attention dot. Before the burst filter, each
+    /// blip marked unseen activity and undid the AwaitingInput, so the next
+    /// quiescence sweep re-flagged the session: a blue dot with nothing to
+    /// see. Payloads captured from a real session transcript. Spec 0054.
+    #[tokio::test]
+    async fn marker_ignores_idle_housekeeping_blips() {
+        use tempfile::tempdir;
+        use tokio::sync::RwLock;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        let manager = Arc::new(mgr);
+
+        let build = |id: &str, state: SessionState| {
+            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            summary.harness = "claude".into();
+            summary.has_pty = true;
+            summary.state = state;
+            Arc::new(SessionEntry {
+                id: id.to_string(),
+                summary: RwLock::new(summary),
+                transcript_count: AtomicU64::new(0),
+                adapter: tokio::sync::Mutex::new(None),
+                pty: tokio::sync::Mutex::new(PtyState::default()),
+                deleted: AtomicBool::new(false),
+                archived: AtomicBool::new(false),
+                title_gen_attempted: AtomicBool::new(false),
+                pending_title_prompts: std::sync::Mutex::new(Vec::new()),
+                pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+                tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+                pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+                unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
+            })
+        };
+
+        // An idle claude session; the operator is looking at another one.
+        let s = build("idle", SessionState::AwaitingInput);
+        let other = build("other", SessionState::Running);
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert("idle".into(), s.clone());
+            sessions.insert("other".into(), other.clone());
+        }
+        manager.mark_seen("other").await.expect("mark_seen other");
+
+        // The exact bytes claude paints while idle: "Checking for updates"
+        // in the status area, erased ~530ms later.
+        let paint: &[u8] = b"\x1b[?25l\x1b[H\r\x1b[27C\x1b[48B\x1b[38;2;153;153;153mChecking for updates\x1b[39m\x1b[53;1H\x1b[51;3H\x1b[?25h";
+        let erase: &[u8] = b"\x1b[?25l\x1b[H\r\x1b[27C\x1b[48B\x1b[K\x1b[53;1H\x1b[51;3H\x1b[?25h";
+        manager.handle_event(&s, SessionEvent::pty(paint)).await;
+        manager.handle_event(&s, SessionEvent::pty(erase)).await;
+
+        // The blip must not undo the idle state — that flip is what used to
+        // hand the quiescence sweep a fresh Running→AwaitingInput transition.
+        assert_eq!(
+            s.summary.read().await.state,
+            SessionState::AwaitingInput,
+            "housekeeping blip must not flip an idle session to Running",
+        );
+        assert!(
+            !s.unseen_activity.load(Ordering::Relaxed),
+            "housekeeping blip must not count as unseen activity",
+        );
+
+        // Even if a quiescence sweep lands afterwards, no dot.
+        manager
+            .handle_event(
+                &s,
+                SessionEvent::Status {
+                    state: SessionState::AwaitingInput,
+                    detail: None,
+                },
+            )
+            .await;
+        assert!(
+            !s.summary.read().await.needs_attention,
+            "an idle session repainting housekeeping must not light the blue dot",
+        );
     }
 
     /// The `needs_attention` marker tracks "this session needs you": raised when
@@ -5053,6 +5254,7 @@ mod tests {
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
             })
         };
 
@@ -5162,6 +5364,7 @@ mod tests {
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
             })
         };
 
@@ -5174,9 +5377,15 @@ mod tests {
             sessions.insert("other".into(), other.clone());
         }
 
-        // Focus it, then type at the prompt (PTY echo while focused). The echo
-        // flips it to Running (busy look) but is NOT unseen activity.
+        // Focus it, then type at the prompt (PTY echo while focused). The
+        // operator has been typing for a bit, so the echo burst is sustained
+        // (past PTY_BLIP_WINDOW) and flips it to Running (busy look) — but it
+        // is NOT unseen activity.
         manager.mark_seen("s").await.expect("mark_seen s");
+        let now_ms = Utc::now().timestamp_millis();
+        s.pty_burst_start_ms
+            .store(now_ms - PTY_BLIP_WINDOW.as_millis() as i64 - 1_000, Ordering::Relaxed);
+        s.summary.write().await.last_pty_at_ms = Some(now_ms - 100);
         manager
             .handle_event(&s, SessionEvent::pty(b"sleep 30"))
             .await;
@@ -5236,6 +5445,7 @@ mod tests {
                 tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
             })
         };
 

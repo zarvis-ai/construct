@@ -178,19 +178,45 @@ impl SessionManager {
                 }
             }
             let now = Utc::now();
-            // PTY output the operator isn't looking at is unseen activity — it's
-            // what makes a later idle "need you". Output in the focused session
-            // (their own keystrokes echoing) must not count. See spec 0054.
-            if is_active && !self.focused_sessions.lock().unwrap().contains(&entry.id) {
-                entry.unseen_activity.store(true, Ordering::Relaxed);
-            }
+            let is_focused = self.focused_sessions.lock().unwrap().contains(&entry.id);
             // Track activity for the "session looks busy" signal, and undo a
-            // quiescence-driven AwaitingInput the moment output resumes — so the
+            // quiescence-driven AwaitingInput when output resumes — so the
             // session reads as Running again and its marker clears.
             let resumed = if is_active {
+                let now_ms = now.timestamp_millis();
                 let mut s = entry.summary.write().await;
-                s.last_pty_at_ms = Some(now.timestamp_millis());
-                if harness_uses_quiescence(&s) && s.state == SessionState::AwaitingInput {
+                let prev_pty_at_ms = s.last_pty_at_ms;
+                s.last_pty_at_ms = Some(now_ms);
+                // Quiescence-detected harnesses repaint status-line housekeeping
+                // while idle (claude paints "Checking for updates" every 30
+                // minutes and erases it half a second later). Byte-wise that is
+                // real output; what distinguishes it is that it doesn't persist.
+                // Only a burst that has kept producing for PTY_BLIP_WINDOW counts
+                // as genuine activity — shorter blips must neither mark unseen
+                // activity nor undo an AwaitingInput, or every idle unfocused
+                // session re-raises its needs_attention dot on each repaint.
+                // See spec 0054.
+                let genuine = if harness_uses_quiescence(&s) {
+                    let (burst_start, sustained) = pty_burst_advance(
+                        entry.pty_burst_start_ms.load(Ordering::Relaxed),
+                        prev_pty_at_ms,
+                        now_ms,
+                    );
+                    entry
+                        .pty_burst_start_ms
+                        .store(burst_start, Ordering::Relaxed);
+                    sustained
+                } else {
+                    true
+                };
+                // PTY output the operator isn't looking at is unseen activity — it's
+                // what makes a later idle "need you". Output in the focused session
+                // (their own keystrokes echoing) must not count. See spec 0054.
+                if genuine && !is_focused {
+                    entry.unseen_activity.store(true, Ordering::Relaxed);
+                }
+                if genuine && harness_uses_quiescence(&s) && s.state == SessionState::AwaitingInput
+                {
                     s.state = SessionState::Running;
                     s.pending_input = false;
                     s.needs_attention = false;

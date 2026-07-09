@@ -201,6 +201,7 @@ impl SessionManager {
             tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
+            pty_burst_start_ms: AtomicI64::new(0),
         });
 
         // Record the user's initial prompt as the first transcript event so
