@@ -3997,7 +3997,10 @@ impl App {
         // `dispatch_paste_text` below routes the paste to the minibuffer /
         // orchestrator instead; with focus on the list, it routes to the
         // selected session rather than editing the program.
-        if self.program_popup.is_some()
+        if self
+            .program_popup
+            .as_ref()
+            .is_some_and(|popup| !popup.terminal_focus)
             && self.minibuffer.is_none()
             && self.focus == PaneFocus::View
         {
@@ -13242,6 +13245,24 @@ mod tests {
         assert_eq!(search.matches, vec![(0, 5), (11, 16)]);
         assert_eq!(search.selected, 1);
         assert_eq!(popup.cursor, 11);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_focused_program_routes_paste_to_session_pty() {
+        let (mut app, _dir, server) = captured_app().await;
+        let mut popup = program_popup_for_test("s1", "draft", 5);
+        popup.set_terminal_focus(true);
+        app.program_popup = Some(popup);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        app.on_paste("pasted text".to_string()).await;
+
+        let job = rx.try_recv().expect("paste should reach the session PTY");
+        assert_eq!(job.session_id, "s1");
+        assert_eq!(job.bytes, b"pasted text");
+        assert_eq!(app.program_popup.as_ref().unwrap().buffer, "draft");
         server.abort();
     }
 
