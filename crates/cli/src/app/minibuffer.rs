@@ -347,6 +347,7 @@ impl App {
                     parent_session_id: None,
                     group_id,
                     position_after_session_id: None,
+                    forked_from: None,
                 };
                 match self.client.create(params).await {
                     Ok(id) => {
@@ -409,6 +410,60 @@ impl App {
                     }
                     Err(e) => self.set_status(format!("fork failed: {e}")),
                 }
+            }
+            MinibufferIntent::MergeMenu { session_id } => {
+                let choice = input.trim().to_ascii_lowercase();
+                let Some(fork) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
+                    return;
+                };
+                let Some(parent) = fork.forked_from.as_ref().map(|f| f.session_id.clone()) else {
+                    return;
+                };
+                let mode = match choice.as_str() {
+                    "result" | "take result" => agentd_protocol::ForkMergeMode::Result,
+                    "discard" | "d" => agentd_protocol::ForkMergeMode::Discard,
+                    _ => {
+                        self.set_status("merge: type result or discard".into());
+                        return;
+                    }
+                };
+                if mode == agentd_protocol::ForkMergeMode::Result {
+                    match self.client.transcript(&session_id, 0, None).await {
+                        Ok(tr) => {
+                            if let Some(summary) =
+                                agentd_client::render_fork_seed_for_merge(&tr.events, 6000)
+                            {
+                                let title = fork.title.as_deref().unwrap_or("fork");
+                                if let Err(e) = self
+                                    .client
+                                    .send_input(
+                                        &parent,
+                                        format!("⑂ fork result ({title}): {summary}"),
+                                    )
+                                    .await
+                                {
+                                    self.set_status(format!("merge input failed: {e}"));
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.set_status(format!("merge transcript failed: {e}"));
+                            return;
+                        }
+                    }
+                }
+                if let Err(e) = self.client.merge(&session_id, mode).await {
+                    self.set_status(format!("merge failed: {e}"));
+                    return;
+                }
+                if let Err(e) = self.client.archive(&session_id).await {
+                    self.set_status(format!("archive failed: {e}"));
+                    return;
+                }
+                self.refresh_sessions().await;
+                self.select_session(parent);
+                self.set_status("fork merged".into());
             }
             MinibufferIntent::GroupDeleteConfirm { group_id } => {
                 let choice = parse_group_delete_choice(&input);

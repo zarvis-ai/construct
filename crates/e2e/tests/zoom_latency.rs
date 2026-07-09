@@ -47,6 +47,7 @@ async fn zoom_toggle_latency() {
             group_id: None,
             parent_session_id: None,
             position_after_session_id: None,
+            forked_from: None,
         })
         .await
         .expect("create shell session");

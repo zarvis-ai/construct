@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
 use agentd_client::Client;
 use agentd_protocol::{
     jsonrpc::{self, ErrorObject, Response},
     transport, EventNotificationPayload, MessageRole, SessionEvent, SessionKind, TimestampedEvent,
 };
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{self, BufReader, BufWriter};
@@ -96,10 +96,12 @@ pub async fn run(
                 }
 
                 let payload = match notif.params {
-                    Some(params) => match serde_json::from_value::<EventNotificationPayload>(params) {
-                        Ok(p) => p,
-                        Err(_) => continue,
-                    },
+                    Some(params) => {
+                        match serde_json::from_value::<EventNotificationPayload>(params) {
+                            Ok(p) => p,
+                            Err(_) => continue,
+                        }
+                    }
                     None => continue,
                 };
 
@@ -132,7 +134,9 @@ pub async fn run(
                 let method = raw.get("method").and_then(Value::as_str).unwrap_or("");
                 let id = raw.get("id").cloned();
                 let params = raw.get("params").cloned().unwrap_or_else(|| json!({}));
-                if let Err(err) = handle_request(method, id.clone(), params, &client, &out_tx, &mut state).await {
+                if let Err(err) =
+                    handle_request(method, id.clone(), params, &client, &out_tx, &mut state).await
+                {
                     if let Some(req_id) = id {
                         let fallback_id = req_id.clone();
                         let _ = out_tx.send(
@@ -203,9 +207,7 @@ async fn handle_request(
             let req: NewSessionRequest = serde_json::from_value(params)
                 .map_err(|e| anyhow!("invalid session/new params: {e}"))?;
             let cwd = resolve_cwd(req.cwd.as_deref(), &state.default_cwd);
-            let harness = req
-                .harness
-                .unwrap_or_else(|| state.default_harness.clone());
+            let harness = req.harness.unwrap_or_else(|| state.default_harness.clone());
             let model = req.model.or_else(|| state.default_model.clone());
             let prompt = extract_prompt_text(req.prompt.as_ref());
 
@@ -225,6 +227,7 @@ async fn handle_request(
                     parent_session_id: None,
                     group_id: None,
                     position_after_session_id: None,
+                    forked_from: None,
                 })
                 .await
                 .context("create construct session")?;
@@ -235,12 +238,7 @@ async fn handle_request(
         "session/load" => {
             ensure_initialized(state)?;
             if !state.load_supported {
-                maybe_respond(
-                    id,
-                    json!({ "error": "session/load not supported" }),
-                    out_tx,
-                )
-                .await?;
+                maybe_respond(id, json!({ "error": "session/load not supported" }), out_tx).await?;
                 return Ok(());
             }
 
@@ -299,12 +297,10 @@ async fn handle_request(
         }
         _ => {
             if let Some(req_id) = id {
-                out_tx.send(
-                    serde_json::to_value(Response::err(
-                        req_id,
-                        ErrorObject::method_not_found(method),
-                    ))?,
-                )?;
+                out_tx.send(serde_json::to_value(Response::err(
+                    req_id,
+                    ErrorObject::method_not_found(method),
+                ))?)?;
             }
             Ok(())
         }
@@ -338,8 +334,7 @@ async fn maybe_respond(
 ) -> Result<()> {
     if let Some(id) = id {
         out_tx.send(
-            serde_json::to_value(Response::ok(id, result))
-                .context("serialize ACP response")?,
+            serde_json::to_value(Response::ok(id, result)).context("serialize ACP response")?,
         )?;
     }
     Ok(())
@@ -424,9 +419,7 @@ fn session_update_from_event(event: &SessionEvent, seq: u64) -> Option<Value> {
 
     match event {
         SessionEvent::Message { role, text } => match role {
-            MessageRole::User => {
-                Some(build_chunk_update("user_message_chunk", &message_id, text))
-            }
+            MessageRole::User => Some(build_chunk_update("user_message_chunk", &message_id, text)),
             _ => Some(build_chunk_update("agent_message_chunk", &message_id, text)),
         },
         SessionEvent::Reasoning { text } => {
@@ -465,20 +458,20 @@ fn session_update_from_event(event: &SessionEvent, seq: u64) -> Option<Value> {
                 Some(output.clone()),
             ))
         }
-        SessionEvent::TaskStart {
-            call_id,
-            tool,
-            ..
-        } => Some(build_tool_call_update(
+        SessionEvent::TaskStart { call_id, tool, .. } => Some(build_tool_call_update(
             "tool_call_update",
             call_id,
             tool,
             "in_progress",
             None,
         )),
-        SessionEvent::TaskBackgrounded { call_id } => {
-            Some(build_tool_call_update("tool_call_update", call_id, "", "in_progress", None))
-        }
+        SessionEvent::TaskBackgrounded { call_id } => Some(build_tool_call_update(
+            "tool_call_update",
+            call_id,
+            "",
+            "in_progress",
+            None,
+        )),
         SessionEvent::TaskEnd {
             call_id,
             ok,
@@ -504,9 +497,11 @@ fn session_update_from_event(event: &SessionEvent, seq: u64) -> Option<Value> {
                 "currency": "USD",
             },
         })),
-        SessionEvent::Error { message } => {
-            Some(build_chunk_update("agent_message_chunk", &message_id, &format!("error: {message}")))
-        }
+        SessionEvent::Error { message } => Some(build_chunk_update(
+            "agent_message_chunk",
+            &message_id,
+            &format!("error: {message}"),
+        )),
         SessionEvent::AwaitingInput { prompt } => {
             let text = match prompt {
                 Some(p) => p,
@@ -524,7 +519,11 @@ fn session_update_from_event(event: &SessionEvent, seq: u64) -> Option<Value> {
             if text.is_empty() {
                 None
             } else {
-                Some(build_chunk_update("agent_message_chunk", &message_id, &text))
+                Some(build_chunk_update(
+                    "agent_message_chunk",
+                    &message_id,
+                    &text,
+                ))
             }
         }
         _ => None,

@@ -498,6 +498,7 @@ async fn main() -> Result<()> {
                     parent_session_id: None,
                     group_id: None,
                     position_after_session_id: None,
+                    forked_from: None,
                 })
                 .await?;
             if open_tui {

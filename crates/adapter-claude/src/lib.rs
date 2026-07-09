@@ -154,6 +154,9 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let sid_file = std::env::var("CONSTRUCT_SESSION_DATA_DIR")
         .ok()
         .map(|d| std::path::PathBuf::from(d).join("claude_session_id.txt"));
+    let fork_from = std::env::var("CONSTRUCT_CLAUDE_FORK_FROM")
+        .ok()
+        .filter(|s| !s.is_empty());
     let claude_session_id = match (resuming, sid_file.as_ref()) {
         (true, Some(p)) if p.exists() => std::fs::read_to_string(p)
             .ok()
@@ -161,7 +164,20 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             .filter(|s| !s.is_empty()),
         _ => None,
     };
-    let watch_session_id = if let Some(sid) = &claude_session_id {
+    let watch_session_id = if let Some(parent) = &fork_from {
+        // Claude creates a new native conversation inheriting the parent's
+        // exact context; keep a fresh id file for future daemon resumes.
+        args.push("--resume".into());
+        args.push(parent.clone());
+        args.push("--fork-session".into());
+        if let Some(p) = &sid_file {
+            let id = uuid::Uuid::new_v4().to_string();
+            let _ = std::fs::write(p, &id);
+            Some(id)
+        } else {
+            None
+        }
+    } else if let Some(sid) = &claude_session_id {
         args.push("--resume".into());
         args.push(sid.clone());
         Some(sid.clone())
@@ -672,10 +688,7 @@ fn tool_uses_from_message(msg: Option<&Value>) -> Vec<SessionEvent> {
                 .unwrap_or("?")
                 .to_string();
             let input = block.get("input").cloned().unwrap_or(Value::Null);
-            let call_id = block
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
+            let call_id = block.get("id").and_then(|v| v.as_str()).map(str::to_string);
             out.push(SessionEvent::ToolUse {
                 tool: name,
                 args: input,

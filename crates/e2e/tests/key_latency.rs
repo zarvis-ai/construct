@@ -51,6 +51,7 @@ async fn repeated_key_latency() {
             parent_session_id: None,
             group_id: None,
             position_after_session_id: None,
+            forked_from: None,
         })
         .await
         .expect("create shell session");

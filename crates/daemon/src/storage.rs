@@ -2273,6 +2273,8 @@ mod search_tests {
             approval_mode: ApprovalMode::Manual,
             kind: SessionKind::User,
             archived: false,
+            forked_from: None,
+            merge: None,
             operator_loop_disabled: false,
             needs_attention: false,
         }

@@ -202,6 +202,7 @@ impl Tool for Create {
                 .get("worktree")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            forked_from: None,
             env,
             args: Vec::new(),
             kind: agentd_protocol::SessionKind::Subagent,

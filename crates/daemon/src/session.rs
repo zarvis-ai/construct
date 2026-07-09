@@ -2246,6 +2246,7 @@ impl SessionManager {
                     parent_session_id: Some(session_id.to_string()),
                     group_id: None,
                     position_after_session_id: None,
+                    forked_from: None,
                 })
                 .await?;
             let new_string = format!("{} @{{session:{}}}", item.text, subagent_id);
@@ -2868,6 +2869,33 @@ impl SessionManager {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Persist the terminal outcome of a fork. Archiving remains a
+    /// separate primitive so callers can inject a result before retiring it.
+    pub async fn merge(&self, id: &str, mode: agentd_protocol::ForkMergeMode) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("unknown session: {id}"))?;
+        let snapshot = {
+            let mut summary = entry.summary.write().await;
+            if summary.forked_from.is_none() {
+                anyhow::bail!("session is not a fork");
+            }
+            summary.merge = Some(agentd_protocol::ForkMerge {
+                mode,
+                at_ms: chrono::Utc::now().timestamp_millis(),
+            });
+            summary.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
         Ok(())
     }
 
@@ -3699,6 +3727,8 @@ mod tests {
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
+            forked_from: None,
+            merge: None,
         }
     }
 
@@ -4130,6 +4160,8 @@ mod tests {
                 archived: false,
                 operator_loop_disabled: false,
                 needs_attention: false,
+                forked_from: None,
+                merge: None,
             }),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
@@ -4143,7 +4175,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
-                osc11_tail: std::sync::Mutex::new(Vec::new()),
+            osc11_tail: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -5000,6 +5032,8 @@ mod tests {
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
+            forked_from: None,
+            merge: None,
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
@@ -5019,7 +5053,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
-                osc11_tail: std::sync::Mutex::new(Vec::new()),
+            osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
         manager
             .sessions
@@ -5137,6 +5171,8 @@ mod tests {
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
+            forked_from: None,
+            merge: None,
         };
         let entry = Arc::new(SessionEntry {
             id: id.clone(),
@@ -5153,7 +5189,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
-                osc11_tail: std::sync::Mutex::new(Vec::new()),
+            osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
         manager
             .sessions
@@ -5201,9 +5237,10 @@ mod tests {
         // real turn's continuous repaints do): backdate the burst start, keep
         // the last-output gap under PTY_QUIESCENCE so the burst is unbroken.
         let now_ms = Utc::now().timestamp_millis();
-        entry
-            .pty_burst_start_ms
-            .store(now_ms - PTY_BLIP_WINDOW.as_millis() as i64 - 1_000, Ordering::Relaxed);
+        entry.pty_burst_start_ms.store(
+            now_ms - PTY_BLIP_WINDOW.as_millis() as i64 - 1_000,
+            Ordering::Relaxed,
+        );
         entry.summary.write().await.last_pty_at_ms = Some(now_ms - 100);
         manager
             .handle_event(&entry, SessionEvent::pty(b"more visible output"))
@@ -5528,8 +5565,10 @@ mod tests {
         // is NOT unseen activity.
         manager.mark_seen("s").await.expect("mark_seen s");
         let now_ms = Utc::now().timestamp_millis();
-        s.pty_burst_start_ms
-            .store(now_ms - PTY_BLIP_WINDOW.as_millis() as i64 - 1_000, Ordering::Relaxed);
+        s.pty_burst_start_ms.store(
+            now_ms - PTY_BLIP_WINDOW.as_millis() as i64 - 1_000,
+            Ordering::Relaxed,
+        );
         s.summary.write().await.last_pty_at_ms = Some(now_ms - 100);
         manager
             .handle_event(&s, SessionEvent::pty(b"sleep 30"))
@@ -5648,6 +5687,7 @@ mod tests {
             parent_session_id: None,
             group_id: None,
             position_after_session_id: None,
+            forked_from: None,
         }
     }
 
@@ -6945,8 +6985,10 @@ mod tests {
                 .expect("lock")
                 .get(&id)
                 .expect("reserved agent conn id");
-            cursors.get_mut(&agent_conn_id).expect("stored cursor").updated_at_ms =
-                stamped_at - 500;
+            cursors
+                .get_mut(&agent_conn_id)
+                .expect("stored cursor")
+                .updated_at_ms = stamped_at - 500;
         }
         let backdated_at = stamped_at - 500;
 

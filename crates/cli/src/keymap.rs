@@ -15,10 +15,26 @@ pub enum KeyAction {
     OpenNewSession,
     OpenDeleteConfirm,
     OpenRename,
-    /// Fork the selected session into a new sibling session backed by a
-    /// chosen harness (reuses the harness picker). Bound to `C-x f`
-    /// (emacs) / `f` (vim) — distinct from "new session" (`C-x C-f` / `n`).
+    /// Fork the selected session instantly, using its own harness — no
+    /// minibuffer prompt at all. The new sibling session is selected and
+    /// keyboard focus lands directly in its live input, like continuing any
+    /// normal session. Every fork carries lineage (`forked_from`), so the
+    /// branch rail and fork log apply uniformly regardless of which fork
+    /// path created it. Bound to `C-x f` (emacs) / `f` (vim) — distinct from
+    /// "new session" (`C-x C-f` / `n`) and from the explicit cross-harness
+    /// picker (`OpenForkCrossHarness`).
     OpenFork,
+    /// Fork the selected session into a different harness, via the harness
+    /// picker (`"Fork → [...] (Tab completes): "`). The explicit,
+    /// cross-harness counterpart to `OpenFork`'s instant same-harness path;
+    /// lands the same way once a harness is chosen — no forced prompt,
+    /// focus moves straight to the new session. Bound to `C-x F` (emacs) /
+    /// `O` (vim).
+    OpenForkCrossHarness,
+    /// Show / manage forks belonging to the selected parent.
+    OpenForkLog,
+    /// Merge or discard the selected fork.
+    OpenMerge,
     /// Zoom: the session view fills the screen (list / pin strip / modeline
     /// all hidden; only the minibuffer stays). Toggling again restores the
     /// default layout. Bound to `C-x z` (emacs) / `z` (vim), matching
@@ -98,7 +114,9 @@ pub enum KeyAction {
     /// `C-x A` (emacs) / `A` (vim).
     ToggleAutomode,
     /// Toggle terminal mouse capture. When disabled, native terminal
-    /// selection works; agentd mouse interactions are suspended.
+    /// selection works; agentd mouse interactions are suspended. Bound to
+    /// `C-x c` in both profiles (moved off `C-x m`, which now merges the
+    /// selected fork).
     ToggleMouseCapture,
     /// Cycle the active UI color theme. Click-only for the minibuffer theme
     /// affordance; `/theme` remains the keyboard-facing command.
@@ -272,7 +290,10 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), key(KeyCode::Up)]), FocusWindowUp),
         (Chord(vec![ctrl('x'), key(KeyCode::Down)]), FocusWindowDown),
         (Chord(vec![ctrl('x'), key(KeyCode::Left)]), FocusWindowLeft),
-        (Chord(vec![ctrl('x'), key(KeyCode::Right)]), FocusWindowRight),
+        (
+            Chord(vec![ctrl('x'), key(KeyCode::Right)]),
+            FocusWindowRight,
+        ),
         (Chord(vec![ctrl('x'), ch('2')]), SplitWindowBelow),
         (Chord(vec![ctrl('x'), ch('3')]), SplitWindowRight),
         (Chord(vec![ctrl('x'), ch('0')]), DeleteWindow),
@@ -306,9 +327,14 @@ fn emacs() -> Keymap {
         // Refresh moved to the command palette (M-x refresh) — it's rarely
         // needed since the daemon pushes state changes automatically.
         (Chord(vec![ctrl('x'), ch('r')]), OpenRename),
-        // `C-x f` forks the selected session into a new harness (distinct
-        // from `C-x C-f`, which creates a fresh session).
+        // `C-x f` forks the selected session instantly, same harness, no
+        // prompt (distinct from `C-x C-f`, which creates a fresh session).
         (Chord(vec![ctrl('x'), ch('f')]), OpenFork),
+        // `C-x F` is the explicit cross-harness fork (harness picker),
+        // mirroring the `C-x A` → ToggleAutomode shifted-letter pattern.
+        (Chord(vec![ctrl('x'), shift('F')]), OpenForkCrossHarness),
+        (Chord(vec![ctrl('x'), ch('q')]), OpenForkLog),
+        (Chord(vec![ctrl('x'), ch('m')]), OpenMerge),
         // Pin / unpin selected session (or all members of a selected group)
         (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
         (Chord(vec![ch(' ')]), TogglePin),
@@ -342,7 +368,7 @@ fn emacs() -> Keymap {
         // Cycle approval mode on the selected session (smith / future agents).
         (Chord(vec![ctrl('x'), shift('A')]), ToggleAutomode),
         // Give the terminal mouse back for native text selection/copy.
-        (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
+        (Chord(vec![ctrl('x'), ch('c')]), ToggleMouseCapture),
         // Help
         (Chord(vec![ch('?')]), ToggleHelp),
         // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
@@ -379,8 +405,13 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('c')]), Interrupt),
         // `r` opens the rename minibuffer; refresh moved to M-x refresh.
         (Chord(vec![ch('r')]), OpenRename),
-        (Chord(vec![shift('O')]), OpenFork),
+        // `f` forks the selected session instantly, same harness, no
+        // prompt. `O` is repurposed as the explicit cross-harness picker
+        // (it used to be a redundant alias of bare `f`).
         (Chord(vec![ch('f')]), OpenFork),
+        (Chord(vec![shift('O')]), OpenForkCrossHarness),
+        (Chord(vec![ch('q')]), OpenForkLog),
+        (Chord(vec![ch('m')]), OpenMerge),
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch('z')]), ToggleZoom),
         (Chord(vec![shift('Z'), shift('Z')]), Quit),
@@ -410,7 +441,10 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('x'), key(KeyCode::Up)]), FocusWindowUp),
         (Chord(vec![ctrl('x'), key(KeyCode::Down)]), FocusWindowDown),
         (Chord(vec![ctrl('x'), key(KeyCode::Left)]), FocusWindowLeft),
-        (Chord(vec![ctrl('x'), key(KeyCode::Right)]), FocusWindowRight),
+        (
+            Chord(vec![ctrl('x'), key(KeyCode::Right)]),
+            FocusWindowRight,
+        ),
         (Chord(vec![ctrl('x'), ch('2')]), SplitWindowBelow),
         (Chord(vec![ctrl('x'), ch('3')]), SplitWindowRight),
         (Chord(vec![ctrl('x'), ch('0')]), DeleteWindow),
@@ -457,7 +491,7 @@ fn vim() -> Keymap {
         (Chord(vec![ch('g'), ch('g')]), ScrollTop),
         (Chord(vec![shift('G')]), ScrollBottom),
         (Chord(vec![shift('A')]), ToggleAutomode),
-        (Chord(vec![ctrl('x'), ch('m')]), ToggleMouseCapture),
+        (Chord(vec![ctrl('x'), ch('c')]), ToggleMouseCapture),
         (Chord(vec![ch('?')]), ToggleHelp),
         // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
         // this profile too (vim binds `C-x t` to ToggleView, not bare `t`).
@@ -747,8 +781,10 @@ mod tests {
         assert_action(&km, vec![ch('g'), ch('d')], KeyAction::OpenDiff);
         assert_action(&km, vec![ch('o')], KeyAction::OpenNewSession);
         assert_action(&km, vec![ch('n')], KeyAction::OpenNewSession);
-        assert_action(&km, vec![shift('O')], KeyAction::OpenFork);
+        assert_action(&km, vec![shift('O')], KeyAction::OpenForkCrossHarness);
         assert_action(&km, vec![ch('f')], KeyAction::OpenFork);
+        assert_action(&km, vec![ch('q')], KeyAction::OpenForkLog);
+        assert_action(&km, vec![ch('m')], KeyAction::OpenMerge);
         assert_action(&km, vec![shift('J')], KeyAction::MoveSelectedDown);
         assert_action(&km, vec![shift('K')], KeyAction::MoveSelectedUp);
         assert_action(&km, vec![ch('/')], KeyAction::OpenSwitchSession);

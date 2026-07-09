@@ -1470,6 +1470,7 @@ fn shell_session_params(cwd: &str, title: &str) -> agentd_protocol::CreateSessio
         parent_session_id: None,
         group_id: None,
         position_after_session_id: None,
+        forked_from: None,
     }
 }
 
