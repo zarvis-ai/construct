@@ -284,7 +284,22 @@ impl ResizeDebounce {
         now: Instant,
     ) -> Option<ResizeFire> {
         let session_changed = cur_session != self.last_session_sent;
-        let diverged = pane_sizes_diverged(visible, &self.last_pane_sizes_sent);
+        // Divergence is judged over the panes we could actually resize. A
+        // visible pane whose session can't take a `pty_resize` right now
+        // (done, errored, adapter not yet respawned after a daemon restart)
+        // must not hold divergence true: it can never be marked sent, so it
+        // would re-arm a fire every debounce period forever — and with
+        // several clients attached at different sizes those redundant fires
+        // bypass the daemon's same-size dedup, hammering dead sessions with
+        // failing resizes and SIGWINCH-storming every live child (the
+        // post-restart "resize burst"). A session that later *becomes*
+        // resizable shows up here with no map entry and fires then.
+        let live: Vec<(String, (u16, u16))> = visible
+            .iter()
+            .filter(|(id, _)| resizable(id))
+            .cloned()
+            .collect();
+        let diverged = pane_sizes_diverged(&live, &self.last_pane_sizes_sent);
         if cur.0 > 0 && cur.1 > 0 && (cur != self.last_size_sent || session_changed || diverged) {
             match self.pending {
                 // Keep the original stamp while the size holds still so the
@@ -311,10 +326,20 @@ impl ResizeDebounce {
         if visible.is_empty() {
             return Some(ResizeFire::Window(size));
         }
-        let panes: Vec<(String, (u16, u16))> = visible
-            .iter()
-            .filter(|(id, _)| resizable(id))
-            .cloned()
+        // Send only what needs sending: panes whose size differs from the
+        // one last sent, plus the newly focused session on a switch even at
+        // an unchanged size (claude/codex repaint on SIGWINCH, and the
+        // active-client-wins policy keys on the resize call itself).
+        // Re-sending every visible pane on every trigger looks harmless —
+        // the daemon dedups unchanged sizes — but with two clients attached
+        // at different pane sizes that dedup never engages, so each
+        // redundant fire reflows every child.
+        let panes: Vec<(String, (u16, u16))> = live
+            .into_iter()
+            .filter(|(id, pane)| {
+                self.last_pane_sizes_sent.get(id) != Some(pane)
+                    || (session_changed && Some(id) == self.last_session_sent.as_ref())
+            })
             .collect();
         for (id, pane) in &panes {
             self.last_pane_sizes_sent.insert(id.clone(), *pane);
@@ -324,6 +349,9 @@ impl ResizeDebounce {
         // stays bounded.
         self.last_pane_sizes_sent
             .retain(|id, _| visible.iter().any(|(vid, _)| vid == id));
+        if panes.is_empty() {
+            return None;
+        }
         Some(ResizeFire::Panes(panes))
     }
 }
@@ -20605,6 +20633,127 @@ mod tests {
             deb.observe((40, 20), &split, Some("live".into()), |id| id == "live", t0),
             Some(ResizeFire::Panes(vec![("live".to_string(), (40, 20))]))
         );
+    }
+
+    /// Regression for the post-restart resize burst: a visible pane whose
+    /// session can't take a resize (done/errored/not-yet-respawned) can
+    /// never be marked "sent", so it must not hold divergence true — that
+    /// re-armed a fire every debounce period forever, hammering the daemon
+    /// (and, with two clients at different sizes, SIGWINCH-storming every
+    /// live child).
+    #[test]
+    fn resize_debounce_dead_pane_does_not_rearm_divergence() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let live_only = |id: &str| id == "live";
+        let split = vec![
+            ("live".to_string(), (40u16, 20u16)),
+            ("dead".to_string(), (40u16, 20u16)),
+        ];
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("live".into()), live_only, t0),
+            Some(ResizeFire::Panes(vec![("live".to_string(), (40, 20))]))
+        );
+        // Steady state: the dead pane stays visible and unsendable. Nothing
+        // may fire again, no matter how long the loop spins.
+        for i in 1..=50u64 {
+            assert_eq!(
+                deb.observe(
+                    (40, 20),
+                    &split,
+                    Some("live".into()),
+                    live_only,
+                    t0 + Duration::from_millis(i * 120),
+                ),
+                None,
+                "a dead pane must not re-arm the debounce (iteration {i})"
+            );
+        }
+    }
+
+    /// A session switch fires immediately, but only re-sends the newly
+    /// focused pane — other panes whose sizes are unchanged stay quiet.
+    /// (The daemon's same-size dedup can't be relied on to absorb the
+    /// redundant sends: with two clients attached at different pane sizes
+    /// it never engages.)
+    #[test]
+    fn resize_debounce_session_switch_resends_only_focused_pane() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let all = |_: &str| true;
+        let split = vec![
+            ("s1".to_string(), (40u16, 20u16)),
+            ("s2".to_string(), (40u16, 20u16)),
+        ];
+        deb.observe((40, 20), &split, Some("s1".into()), all, t0);
+        assert_eq!(
+            deb.observe(
+                (40, 20),
+                &split,
+                Some("s2".into()),
+                all,
+                t0 + Duration::from_millis(1),
+            ),
+            Some(ResizeFire::Panes(vec![("s2".to_string(), (40, 20))])),
+            "only the newly focused pane needs its SIGWINCH"
+        );
+    }
+
+    /// A pane whose session becomes resizable later (adapter respawned
+    /// after a daemon restart) fires once at that point: it appears in the
+    /// live set with no bookkeeping entry.
+    #[test]
+    fn resize_debounce_fires_when_pane_becomes_resizable() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let split = vec![
+            ("live".to_string(), (40u16, 20u16)),
+            ("respawning".to_string(), (40u16, 20u16)),
+        ];
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        deb.observe((40, 20), &split, Some("live".into()), |id| id == "live", t0);
+
+        // The second session's adapter comes up: divergence arms …
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("live".into()), |_| true, at(10)),
+            None
+        );
+        // … and the fire covers exactly the newly resizable pane.
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("live".into()), |_| true, at(115)),
+            Some(ResizeFire::Panes(vec![(
+                "respawning".to_string(),
+                (40, 20)
+            )]))
+        );
+        // Then it goes quiet.
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("live".into()), |_| true, at(240)),
+            None
+        );
+    }
+
+    /// A consumed trigger with nothing sendable (every visible pane
+    /// unresizable) returns no fire and stays quiet afterwards.
+    #[test]
+    fn resize_debounce_nothing_sendable_is_quiet() {
+        let mut deb = ResizeDebounce::new(Duration::from_millis(100));
+        let t0 = Instant::now();
+        let none = |_: &str| false;
+        let split = vec![("dead".to_string(), (40u16, 20u16))];
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        // Selection change consumes the trigger, but there is nothing to
+        // send — and nothing to keep re-firing.
+        assert_eq!(
+            deb.observe((40, 20), &split, Some("dead".into()), none, t0),
+            None
+        );
+        for i in 1..=10u64 {
+            assert_eq!(
+                deb.observe((40, 20), &split, Some("dead".into()), none, at(i * 120)),
+                None
+            );
+        }
     }
 
     /// Regression: in a single-pane (non-split) layout the render path still
