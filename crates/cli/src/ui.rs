@@ -6863,6 +6863,40 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
         },
     );
     let modeline_post_hint = format!("{status}{conn} ", status = status);
+    // Persistent notices (theme label, version notice, update-available),
+    // right-aligned at the far edge. Built BEFORE the left-side spans so the
+    // empty-state hint below can stay clear of the notice's footprint: both
+    // sides register HintZones on the same row, and `handle_left_click`'s
+    // zone loop is first-match-wins — an overlap doesn't just overprint
+    // text, it makes a click on a notice segment silently dispatch the
+    // left-side hint underneath (CI-only failure: the notice width varies
+    // with BUILD_ID, so the collision point moves between a clean and a
+    // `-dirty` build).
+    let theme_label = format!("theme:{}", app.theme_name.label());
+    let mut persistent_notices: Vec<Vec<(String, Option<KeyAction>)>> =
+        vec![vec![(theme_label, Some(KeyAction::CycleTheme))]];
+    persistent_notices.push(version_notice_segments(app));
+    if let Some(latest) = app.latest_version.as_deref() {
+        persistent_notices.push(vec![(
+            format!("{latest} available"),
+            Some(KeyAction::OpenUpgradeConfirm),
+        )]);
+    }
+    let notice_width = {
+        let labels_width: usize = persistent_notices
+            .iter()
+            .flatten()
+            .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
+            .sum();
+        let separators_width = persistent_notices.len().saturating_sub(1) * 3;
+        labels_width
+            .saturating_add(separators_width)
+            .saturating_add(2) as u16
+    };
+    // Left column the notice will occupy from (its leading pad space
+    // included), or None when the notice doesn't fit / render at all.
+    let notice_start_x = (notice_width > 0 && notice_width < area.width)
+        .then(|| area.x + area.width - notice_width);
     let mut spans = Vec::new();
     // Running column so the empty-hint segments below can register exact
     // HintZones; accumulated from the widths of every span pushed ahead of
@@ -6897,11 +6931,23 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     hint_col = hint_col.saturating_add(UnicodeWidthStr::width(modeline_pre_hint.as_str()) as u16);
     spans.push(Span::raw(modeline_pre_hint));
     for (i, (label, action)) in empty_hint_segments.iter().enumerate() {
+        let w = UnicodeWidthStr::width(*label) as u16;
+        let sep_w = if i > 0 { 2 } else { 0 };
+        // Collision guard: the hint segments are ordered highest-priority
+        // first, so when the right-aligned notice leaves too little room,
+        // whole segments drop from the tail (`tour: t` first, `new:` last)
+        // rather than rendering under the notice. A dropped segment
+        // registers no HintZone, so a click on the notice can never
+        // dispatch a hint action hidden beneath it.
+        if let Some(nx) = notice_start_x {
+            if hint_col.saturating_add(sep_w).saturating_add(w) > nx {
+                break;
+            }
+        }
         if i > 0 {
             spans.push(Span::raw("  "));
             hint_col = hint_col.saturating_add(2);
         }
-        let w = UnicodeWidthStr::width(*label) as u16;
         // "tour: t" goes inert while a tour is already running — the action
         // would be a no-op, so it must not look clickable: dimmed, no hover,
         // no HintZone. (Same inverse of the tour card's click-ownership
@@ -6949,35 +6995,15 @@ fn render_modeline(f: &mut Frame, area: Rect, app: &mut App) {
     // Each notice is a run of one or more (label, action) segments rendered
     // back-to-back with no separator (e.g. the version notice's clickable
     // "<daemon> (daemon)" segment followed by a plain " - <tui> (tui)"
-    // segment); separate notices are joined by " | ".
-    let theme_label = format!("theme:{}", app.theme_name.label());
-    let mut persistent_notices: Vec<Vec<(String, Option<KeyAction>)>> =
-        vec![vec![(theme_label, Some(KeyAction::CycleTheme))]];
-    persistent_notices.push(version_notice_segments(app));
-    if let Some(latest) = app.latest_version.as_deref() {
-        persistent_notices.push(vec![(
-            format!("{latest} available"),
-            Some(KeyAction::OpenUpgradeConfirm),
-        )]);
-    }
-    if !persistent_notices.is_empty() {
-        use unicode_width::UnicodeWidthStr;
-        let group_width = |group: &[(String, Option<KeyAction>)]| -> usize {
-            group
-                .iter()
-                .map(|(label, _)| UnicodeWidthStr::width(label.as_str()))
-                .sum()
-        };
-        let labels_width: usize = persistent_notices.iter().map(|g| group_width(g)).sum();
-        let separators_width = persistent_notices.len().saturating_sub(1) * 3;
-        let w = labels_width
-            .saturating_add(separators_width)
-            .saturating_add(2) as u16;
-        if w > 0 && w < area.width {
+    // segment); separate notices are joined by " | ". Built (and its width
+    // measured) above, before the left-side spans, so the empty-state hint
+    // could stay clear of this footprint.
+    {
+        if let Some(nx) = notice_start_x {
             let nrect = Rect {
-                x: area.x + area.width - w,
+                x: nx,
                 y: area.y,
-                width: w,
+                width: notice_width,
                 height: area.height,
             };
             let mut spans = Vec::new();

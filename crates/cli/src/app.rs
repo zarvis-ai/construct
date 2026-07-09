@@ -23307,6 +23307,134 @@ mod tests {
         server.abort();
     }
 
+    // BUILD_ID-independent regression for the CI-only failure of
+    // `mismatched_build_renders_both_versions_and_daemon_segment_click_opens_restart_confirm`:
+    // the empty-state hint (lengthened by the `tour: t` segment) and the
+    // right-aligned version notice both register HintZones on the modeline
+    // row, and `handle_left_click` is first-match-wins — when they
+    // overlapped, clicking the daemon segment dispatched the hint action
+    // hidden beneath it instead. The collision column depends on
+    // `crate::BUILD_ID`'s length (clean CI build vs `-dirty` local), which
+    // is why it only failed in CI. A long daemon build id forces the
+    // collision pressure regardless of BUILD_ID; the hint must yield.
+    #[tokio::test]
+    async fn modeline_hint_yields_to_version_notice_without_zone_overlap() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.daemon_build_id = Some("0.1.0+deadbeefcafebabe".to_string());
+        let backend = ratatui::backend::TestBackend::new(120, 36);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        // (a) No two zones overlap anywhere in the frame (same row).
+        let hints = &app.layout.shortcut_hints;
+        for (i, a) in hints.iter().enumerate() {
+            for b in hints.iter().skip(i + 1) {
+                if a.y == b.y {
+                    assert!(
+                        a.x_end <= b.x_start || b.x_end <= a.x_start,
+                        "overlapping zones on row {}: {:?} vs {:?}",
+                        a.y,
+                        a,
+                        b
+                    );
+                }
+            }
+        }
+
+        // (b) Clicking the daemon segment's own x_start opens the
+        // restart-daemon confirm — not whatever hint used to sit there.
+        let hit = *app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::OpenRestartDaemonConfirm)
+            .expect("daemon segment zone");
+        app.handle_left_click(hit.x_start, hit.y).await;
+        assert!(
+            matches!(
+                app.minibuffer.as_ref().map(|m| &m.intent),
+                Some(MinibufferIntent::RestartDaemonConfirm)
+            ),
+            "clicking the daemon segment must open the restart-daemon confirm"
+        );
+
+        // (c) The modeline text doesn't interleave hint and notice
+        // fragments: the notice renders intact at the right edge, and the
+        // hint segments that couldn't fit are dropped whole (`tour: t`
+        // first) rather than half-painted under the notice.
+        let screen = rendered_text(terminal.backend().buffer());
+        let modeline = screen
+            .lines()
+            .find(|l| l.contains("(daemon)"))
+            .expect("modeline row with the version notice");
+        assert!(
+            modeline.contains("0.1.0+deadbeefcafebabe (daemon)"),
+            "daemon segment must render intact:\n{modeline}"
+        );
+        assert!(
+            modeline
+                .trim_end()
+                .ends_with(&format!("{} (tui)", crate::BUILD_ID)),
+            "notice keeps right-edge alignment:\n{modeline}"
+        );
+        assert!(
+            !modeline.contains("tour: t") && !modeline.contains("help: ?"),
+            "hint segments that no longer fit must drop whole:\n{modeline}"
+        );
+        // Dropped segments register no zones on the modeline row.
+        assert!(
+            !app.layout
+                .shortcut_hints
+                .iter()
+                .any(|h| h.y == hit.y && h.action == KeyAction::StartTutorial),
+            "no tour zone may hide under the notice"
+        );
+
+        // Width sweep: shifting the terminal width moves the collision
+        // point exactly the way a different BUILD_ID length would (CI's
+        // clean build id is ~6 cols shorter than a local `-dirty` one), so
+        // holding the invariants across a width range proves the fix for
+        // every realistic BUILD_ID. At each width: no same-row zone
+        // overlap, and the daemon segment click dispatches its own action.
+        for width in [92u16, 100, 108, 116, 124, 132] {
+            app.minibuffer = None;
+            let backend = ratatui::backend::TestBackend::new(width, 36);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|f| crate::ui::render(f, &mut app))
+                .expect("draw");
+            let hints = app.layout.shortcut_hints.clone();
+            for (i, a) in hints.iter().enumerate() {
+                for b in hints.iter().skip(i + 1) {
+                    if a.y == b.y {
+                        assert!(
+                            a.x_end <= b.x_start || b.x_end <= a.x_start,
+                            "overlapping zones at width {width}, row {}: {:?} vs {:?}",
+                            a.y,
+                            a,
+                            b
+                        );
+                    }
+                }
+            }
+            let hit = *hints
+                .iter()
+                .find(|h| h.action == KeyAction::OpenRestartDaemonConfirm)
+                .unwrap_or_else(|| panic!("daemon zone missing at width {width}"));
+            app.handle_left_click(hit.x_start, hit.y).await;
+            assert!(
+                matches!(
+                    app.minibuffer.as_ref().map(|m| &m.intent),
+                    Some(MinibufferIntent::RestartDaemonConfirm)
+                ),
+                "daemon segment click hijacked at width {width}"
+            );
+        }
+        server.abort();
+    }
+
     #[tokio::test]
     async fn hovering_daemon_segment_shows_restart_tooltip() {
         let (mut app, _dir, server) = empty_app().await;
