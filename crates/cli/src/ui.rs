@@ -145,7 +145,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.session_title_name_hits.clear();
     app.layout.lineage_area = None;
     app.layout.lineage_header_hit = None;
+    app.layout.lineage_collapse_hit = None;
     app.layout.lineage_toggle_hit = None;
+    app.layout.lineage_v_overflow = false;
+    app.layout.lineage_h_overflow = false;
     app.layout.lineage_box_hits.clear();
     app.window_pane_sizes.clear();
     app.terminal_replayed_sessions_this_frame.clear();
@@ -1581,10 +1584,15 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // Tutorial pane highlight (spec 0077, step 4 "get around"): reuses
     // `pane_border_style`'s focused styling as the highlight rather than
     // inventing new styling.
-    let focused = app.focus == PaneFocus::List || app.tutorial_wants_list_highlight();
+    // Exactly one sidebar region reads as keyboard-focused at a time: the
+    // session rows OR the lineage section (whose header highlights via
+    // `lineage_focused` in `render_lineage_section`).
+    let focused = app.session_rows_focused() || app.tutorial_wants_list_highlight();
     // Collapsed render path: a thin column with a `>` expand glyph
-    // on the top border. Anywhere inside the pane click-expands.
-    let effective_collapsed = app.list_collapsed && !focused;
+    // on the top border. Anywhere inside the pane click-expands. Keyed off
+    // raw list focus so the sidebar stays expanded while the lineage
+    // section is focused too.
+    let effective_collapsed = app.list_collapsed && app.focus != PaneFocus::List;
     if effective_collapsed {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1808,14 +1816,12 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // the session rows and the operator/matrix-rain panel.
     let lineage = app
         .lineage_section_session()
-        .map(|id| (id.clone(), app.lineage_section_diagram(&id)));
+        .map(|id| (id.clone(), app.lineage_section_rows(&id)));
     let (list_items_area, lineage_rect) = split_lineage_section(
         list_items_area,
-        lineage
-            .as_ref()
-            .map(|(_, (rows, _))| rows.len())
-            .unwrap_or(0),
+        lineage.as_ref().map(|(_, rows)| rows.len()).unwrap_or(0),
         app.lineage_collapsed,
+        app.lineage_h,
     );
     let max_scroll = app_items
         .len()
@@ -1850,19 +1856,25 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_scroll_offset = visible_start + state.offset();
     app.list_scroll_offset = app.layout.list_scroll_offset;
     clear_pane_side_borders(f, area, app);
-    if let (Some(rect), Some((id, (rows, boxes)))) = (lineage_rect, lineage) {
-        render_lineage_section(f, rect, app, &id, &rows, &boxes);
+    if let (Some(rect), Some((id, mut rows))) = (lineage_rect, lineage) {
+        render_lineage_section(f, rect, app, &id, &mut rows);
     }
     render_matrix_rain(f, matrix_area, app);
 }
 
 /// Carve the sidebar's lineage section (spec 0081) from the bottom of the
-/// session-rows region: a 1-row header plus (when expanded) the diagram
-/// rows. The section never squeezes the rows below `SESSION_LIST_H_MIN`
-/// and never takes more than half the region, so a deep tree scrolls
-/// instead of crowding the list out. `content_rows == 0` (no lineage to
-/// show) yields no section at all.
-fn split_lineage_section(list: Rect, content_rows: usize, collapsed: bool) -> (Rect, Option<Rect>) {
+/// session-rows region: a 1-row header bar plus (when expanded) the diagram
+/// rows with one blank padding row above and below. The section never
+/// squeezes the rows below `SESSION_LIST_H_MIN` and never takes more than
+/// half the region, so a deep tree scrolls instead of crowding the list
+/// out; a user drag-height (`lineage_h`) wins within those same caps.
+/// `content_rows == 0` (no lineage to show) yields no section at all.
+fn split_lineage_section(
+    list: Rect,
+    content_rows: usize,
+    collapsed: bool,
+    override_h: Option<u16>,
+) -> (Rect, Option<Rect>) {
     if content_rows == 0 {
         return (list, None);
     }
@@ -1870,15 +1882,17 @@ fn split_lineage_section(list: Rect, content_rows: usize, collapsed: bool) -> (R
         .height
         .saturating_sub(crate::app::SESSION_LIST_H_MIN)
         .min(list.height / 2);
-    let want = if collapsed {
-        1
-    } else {
-        (content_rows as u16).saturating_add(1)
-    };
-    let h = want.min(avail.max(u16::from(avail >= 1)));
-    if h == 0 {
+    if avail == 0 {
         return (list, None);
     }
+    let h = if collapsed {
+        1
+    } else {
+        // Header + top pad + diagram + bottom pad, unless the user dragged
+        // the header to an explicit height.
+        let content = (content_rows as u16).saturating_add(3);
+        override_h.unwrap_or(content).max(2).min(avail)
+    };
     let rows = Rect {
         x: list.x,
         y: list.y,
@@ -1894,24 +1908,29 @@ fn split_lineage_section(list: Rect, content_rows: usize, collapsed: bool) -> (R
     (rows, Some(section))
 }
 
-/// Render the sidebar's lineage section: a header row (`▾ ⑂ lineage` with a
-/// right-aligned view-mode toggle) above the selected session's lineage
-/// diagram. Reuses `App::lineage_section_diagram`
-/// (`crate::lineage::build_tree`/`flatten` underneath) for the tree and
-/// `render_lineage_row` for each row's formatting.
+/// Render the sidebar's lineage section: a header bar (a `─` rule carrying
+/// the `⑂ lineage` label, the view-mode toggle, and a `−`/`+` collapse
+/// button — the same furniture as the operator panel's title bar below it)
+/// above the selected session's lineage diagram. Reuses
+/// `App::lineage_section_rows` (`crate::lineage::build_tree`/`flatten`
+/// underneath) for the tree and `render_lineage_row` for each row's
+/// formatting.
 ///
 /// Highlighting: while the section owns keyboard focus
 /// (`App::lineage_focused`), the highlighted node follows its own row
 /// selection; otherwise it follows the LIST selection, so the section reads
-/// as a detail panel for the selected session. Hovering a node's box
-/// brightens its border; clicking it jumps to that session (`click_list`).
+/// as a detail panel for the selected session. Hovering ANY cell a session
+/// owns — box, lane bar, branch glyph, turn-info text — brightens that
+/// session across the diagram; clicking it jumps there (`click_list`).
+/// Status glyphs animate exactly like the session list's (the shared
+/// spinner while a session is actively working), and a working session's
+/// live turn-info bullet spins along with it.
 fn render_lineage_section(
     f: &mut Frame,
     rect: Rect,
     app: &mut App,
     session_id: &str,
-    rows: &[crate::lineage::LineageRow],
-    boxes: &[crate::lineage::LineageBoxBounds],
+    rows: &mut [crate::lineage::LineageRow],
 ) {
     use unicode_width::UnicodeWidthStr;
     if rect.height == 0 || rect.width == 0 {
@@ -1920,7 +1939,13 @@ fn render_lineage_section(
     app.layout.lineage_area = Some(rect);
     let focused = app.lineage_focused;
 
-    // Header: disclosure + title left, current view mode + ⇄ right.
+    // Header bar: a full-width `─` rule (the operator panel's visual
+    // language), label at the left, mode toggle + collapse button at the
+    // right. The bare bar doubles as the height drag handle.
+    let line_style = Style::default().fg(app.theme.matrix_line);
+    for x in rect.x..rect.x + rect.width {
+        f.buffer_mut().set_string(x, rect.y, "─", line_style);
+    }
     let header_rect = Rect {
         x: rect.x,
         y: rect.y,
@@ -1928,34 +1953,73 @@ fn render_lineage_section(
         height: 1,
     };
     app.layout.lineage_header_hit = Some(header_rect);
+    let title = " ⑂ lineage ";
     let title_style = if focused {
         Style::default()
-            .fg(app.theme.text)
+            .fg(app.theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
         session_list_secondary_style(&app.theme)
     };
-    let disclosure = if app.lineage_collapsed { "▸" } else { "▾" };
-    let toggle_label = format!("{} ⇄ ", app.lineage_mode.short_label());
-    let toggle_w = UnicodeWidthStr::width(toggle_label.as_str()) as u16;
-    let title = format!("{disclosure} ⑂ lineage");
-    let title_w = UnicodeWidthStr::width(title.as_str()) as u16;
-    let gap = rect.width.saturating_sub(title_w).saturating_sub(toggle_w) as usize;
-    let mut spans = vec![Span::styled(title, title_style)];
-    if !app.lineage_collapsed && gap > 0 {
-        spans.push(Span::raw(" ".repeat(gap)));
-        spans.push(Span::styled(
-            toggle_label,
-            session_list_secondary_style(&app.theme),
-        ));
-        app.layout.lineage_toggle_hit = Some(Rect {
-            x: rect.x + rect.width - toggle_w,
+    f.buffer_mut()
+        .set_string(rect.x + 1, rect.y, title, title_style);
+    // Collapse/expand button at the right end, exactly like the operator
+    // panel's (`matrix_rain_close_button_range` geometry).
+    if rect.width >= 8 {
+        let glyph = if app.lineage_collapsed {
+            " + "
+        } else {
+            " − "
+        };
+        let bx = rect.x + rect.width.saturating_sub(4);
+        let button = Rect {
+            x: bx,
             y: rect.y,
-            width: toggle_w,
+            width: 3,
             height: 1,
-        });
+        };
+        let hovered = app
+            .mouse_pos
+            .is_some_and(|(mx, my)| contains_rect(button, mx, my));
+        let style = if hovered {
+            Style::default()
+                .fg(app.theme.matrix_flash_good)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(app.theme.matrix_close)
+                .add_modifier(Modifier::BOLD)
+        };
+        f.buffer_mut().set_string(bx, rect.y, glyph, style);
+        app.layout.lineage_collapse_hit = Some(button);
+        // View-mode toggle just left of the collapse button (expanded only —
+        // a collapsed header has no diagram to re-draw).
+        if !app.lineage_collapsed {
+            let label = format!(" {} ⇄ ", app.lineage_mode.short_label());
+            let w = UnicodeWidthStr::width(label.as_str()) as u16;
+            if bx > rect.x + 1 + w {
+                let tx = bx - w - 1;
+                let toggle = Rect {
+                    x: tx,
+                    y: rect.y,
+                    width: w,
+                    height: 1,
+                };
+                let hovered = app
+                    .mouse_pos
+                    .is_some_and(|(mx, my)| contains_rect(toggle, mx, my));
+                let style = if hovered {
+                    Style::default()
+                        .fg(app.theme.matrix_flash_good)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    session_list_secondary_style(&app.theme)
+                };
+                f.buffer_mut().set_string(tx, rect.y, label, style);
+                app.layout.lineage_toggle_hit = Some(toggle);
+            }
+        }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), header_rect);
     if rect.height == 1 {
         return;
     }
@@ -1966,12 +2030,65 @@ fn render_lineage_section(
         width: rect.width,
         height: rect.height - 1,
     };
+    // One blank padding row above and below the diagram, when there's room.
+    let inner = if body.height >= 3 {
+        Rect {
+            x: body.x,
+            y: body.y + 1,
+            width: body.width,
+            height: body.height - 2,
+        }
+    } else {
+        body
+    };
+
+    let by_id: HashMap<&str, &SessionSummary> =
+        app.sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    // Live animation: node status glyphs use the same spinner the session
+    // list uses while a session is actively working, and a working
+    // session's LIVE turn-info bullet (the last `•` on its lane — earlier
+    // windows are history) spins in phase with it.
+    let mut node_updates: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut animating: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_bullet: HashMap<String, (usize, usize)> = HashMap::new();
+    for (ri, row) in rows.iter().enumerate() {
+        for (si, span) in row.spans.iter().enumerate() {
+            match &span.role {
+                crate::lineage::LineageSpan::NodeStatus { session_id } => {
+                    if let Some(s) = by_id.get(session_id.as_str()) {
+                        let glyph = session_status_glyph(app, s);
+                        if glyph != span.text {
+                            node_updates.push((ri, si, glyph));
+                        }
+                        if glyph != s.state.glyph() {
+                            animating.insert(session_id.clone());
+                        }
+                    }
+                }
+                crate::lineage::LineageSpan::SegmentBullet { session_id } => {
+                    last_bullet.insert(session_id.clone(), (ri, si));
+                }
+                _ => {}
+            }
+        }
+    }
+    let frame_glyph = app.spinner_frame();
+    for (ri, si, glyph) in node_updates {
+        rows[ri].spans[si].text = glyph.to_string();
+    }
+    for (sid, (ri, si)) in last_bullet {
+        if animating.contains(&sid) {
+            rows[ri].spans[si].text = frame_glyph.to_string();
+        }
+    }
+
     let content_w = rows
         .iter()
         .map(|r| UnicodeWidthStr::width(r.text().as_str()))
         .max()
         .unwrap_or(0);
-    let visible = body.height as usize;
+    let visible = (inner.height as usize).max(1);
     let scroll = if focused {
         // Keyboard selection drags the viewport; wheel scrolling moved it
         // too, so reconcile from whichever state is current.
@@ -1984,40 +2101,42 @@ fn render_lineage_section(
         app.lineage_scroll.min(rows.len().saturating_sub(visible))
     };
     app.lineage_scroll = scroll;
-    let max_scroll_x = content_w.saturating_sub(body.width as usize);
+    let max_scroll_x = content_w.saturating_sub(inner.width as usize);
     let scroll_x = app.lineage_scroll_x.min(max_scroll_x);
     app.lineage_scroll_x = scroll_x;
+    app.layout.lineage_v_overflow = rows.len() > visible;
+    app.layout.lineage_h_overflow = content_w > inner.width as usize;
 
-    // Box hit regions in screen coordinates (clipped to the viewport) —
-    // hover brightens a box's border, click jumps to its session. A box
-    // lying entirely outside the viewport on ANY side (including past the
-    // right edge, common when the diagram is wider than the sidebar) is
-    // skipped, and the arithmetic saturates so a clipped edge can never
-    // underflow.
-    let view_right = scroll_x + body.width as usize;
-    let view_bottom = scroll + visible;
-    for b in boxes {
-        let right = b.x + b.width;
-        let bottom = b.y + b.height;
-        if bottom <= scroll || b.y >= view_bottom || right <= scroll_x || b.x >= view_right {
-            continue;
+    // Hit regions for every cell a session owns — box borders and labels,
+    // lane bars, branch glyphs, turn-info markers and text — in screen
+    // coordinates, clipped to the viewport. Hovering any of them brightens
+    // that session across the diagram; clicking jumps to it.
+    let view_right = scroll_x + inner.width as usize;
+    for (ri, row) in rows.iter().enumerate().skip(scroll).take(visible) {
+        let y = inner.y + (ri - scroll) as u16;
+        let mut x = 0usize;
+        for span in &row.spans {
+            let start = x;
+            let end = start + UnicodeWidthStr::width(span.text.as_str());
+            x = end;
+            let Some(owner) = span.role.owner() else {
+                continue;
+            };
+            let vis_start = start.max(scroll_x);
+            let vis_end = end.min(view_right);
+            if vis_start >= vis_end {
+                continue;
+            }
+            app.layout.lineage_box_hits.push(crate::app::LineageBoxHit {
+                session_id: owner.to_string(),
+                area: Rect {
+                    x: inner.x + (vis_start - scroll_x) as u16,
+                    y,
+                    width: (vis_end - vis_start) as u16,
+                    height: 1,
+                },
+            });
         }
-        let vis_x = b.x.max(scroll_x);
-        let vis_y = b.y.max(scroll);
-        let w = right.min(view_right).saturating_sub(vis_x);
-        let h = bottom.min(view_bottom).saturating_sub(vis_y);
-        if w == 0 || h == 0 {
-            continue;
-        }
-        app.layout.lineage_box_hits.push(crate::app::LineageBoxHit {
-            session_id: b.session_id.clone(),
-            area: Rect {
-                x: body.x + (vis_x - scroll_x) as u16,
-                y: body.y + (vis_y - scroll) as u16,
-                width: w as u16,
-                height: h as u16,
-            },
-        });
     }
     let hovered_session: Option<String> = app.mouse_pos.and_then(|(mx, my)| {
         app.layout
@@ -2036,8 +2155,6 @@ fn render_lineage_section(
         Some(session_id.to_string())
     };
 
-    let by_id: HashMap<&str, &SessionSummary> =
-        app.sessions.iter().map(|s| (s.id.as_str(), s)).collect();
     let lines: Vec<Line<'static>> = rows
         .iter()
         .skip(scroll)
@@ -2055,7 +2172,7 @@ fn render_lineage_section(
             )
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), body);
+    f.render_widget(Paragraph::new(lines), inner);
 
     // Scrollbars when the diagram overflows the viewport — background
     // tints only (same opacity approximation as the terminal scrollbar),
@@ -2063,7 +2180,7 @@ fn render_lineage_section(
     // column, horizontal along the bottom row.
     let track_color = blend_color(Color::Black, app.theme.text, 0.30);
     let thumb_color = blend_color(Color::Black, app.theme.text, 0.80);
-    if rows.len() > visible && body.width > 0 {
+    if rows.len() > visible && inner.width > 0 {
         let track_h = visible;
         let thumb_h = (track_h * track_h / rows.len().max(1)).clamp(1, track_h);
         let denom = rows.len() - visible;
@@ -2073,11 +2190,11 @@ fn render_lineage_section(
         } else {
             (scroll * max_top + denom / 2) / denom
         };
-        let x = body.x + body.width - 1;
+        let x = inner.x + inner.width - 1;
         for r in 0..track_h {
             if let Some(cell) = f.buffer_mut().cell_mut(ratatui::layout::Position {
                 x,
-                y: body.y + r as u16,
+                y: inner.y + r as u16,
             }) {
                 cell.set_bg(if r >= top && r < top + thumb_h {
                     thumb_color
@@ -2087,8 +2204,8 @@ fn render_lineage_section(
             }
         }
     }
-    if content_w > body.width as usize && body.height > 0 {
-        let track_w = body.width as usize;
+    if content_w > inner.width as usize && inner.height > 0 {
+        let track_w = inner.width as usize;
         let thumb_w = (track_w * track_w / content_w.max(1)).clamp(1, track_w);
         let denom = content_w - track_w;
         let max_left = track_w - thumb_w;
@@ -2097,10 +2214,10 @@ fn render_lineage_section(
         } else {
             (scroll_x * max_left + denom / 2) / denom
         };
-        let y = body.y + body.height - 1;
+        let y = inner.y + inner.height - 1;
         for cidx in 0..track_w {
             if let Some(cell) = f.buffer_mut().cell_mut(ratatui::layout::Position {
-                x: body.x + cidx as u16,
+                x: inner.x + cidx as u16,
                 y,
             }) {
                 cell.set_bg(if cidx >= left && cidx < left + thumb_w {

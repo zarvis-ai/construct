@@ -62,6 +62,10 @@ pub struct TuiState {
     /// just its header when the TUI last quit.
     #[serde(default)]
     pub lineage_collapsed: bool,
+    /// User drag-resized height of the lineage section (header included);
+    /// `None` = size to content.
+    #[serde(default)]
+    pub lineage_h: Option<u16>,
     /// Whether the lineage section was in the compact (rails) view.
     /// Defaults to compact — the narrow sidebar is what that mode is for;
     /// state blobs that explicitly chose the boxed diagram keep it.
@@ -91,6 +95,7 @@ impl Default for TuiState {
             widgets: HashMap::new(),
             tutorial_step: None,
             lineage_collapsed: false,
+            lineage_h: None,
             lineage_view_compact: true,
         }
     }

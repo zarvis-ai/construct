@@ -20,12 +20,21 @@ in the diagram.
 Visibility is automatic, not user-armed: the section appears whenever the
 selected session has lineage to show (more than its own lone node) and
 disappears entirely otherwise — no hover trigger, no pin, no per-session
-open state. A click on its one-row header collapses it to just that header;
-the collapse state and view mode persist across launches (collapse is
-global, not per session). The section never squeezes the session rows below
-their minimum height and never takes more than half the rows region — a
-deep tree scrolls (vertically and horizontally) inside the section instead
-of crowding the list out.
+open state. A session's own upward links count as lineage too: selecting a
+subagent (or a fork) keeps the section on screen showing its parent's
+tree. The section never squeezes the session rows below their minimum
+height and never takes more than half the rows region — a deep tree
+scrolls (vertically and horizontally) inside the section instead of
+crowding the list out — and keeps one blank padding row above and below
+the diagram.
+
+The section's header is a one-row horizontal rule carrying its label and
+controls — the same visual furniture as the operator panel's title bar
+below it: a `−`/`+` collapse button at the right end, the view-mode toggle
+beside it, and the bare rule doubling as a height drag handle (dragging up
+grows the section, within the same caps). The collapse state, the dragged
+height, and the view mode persist across launches (all global, not per
+session).
 
 Keyboard focus:
 
@@ -46,11 +55,17 @@ Keyboard focus:
 - Focusing the section counts as sidebar (list-pane) focus; jumping into a
   session moves focus to the view pane.
 
-Mouse: clicking the header collapses/expands, clicking the header's mode
-toggle switches diagram modes, clicking a session's box jumps to it,
-clicking anywhere else in the body focuses the section, the wheel scrolls
-it (shift for horizontal), and clicking outside blurs it. There is no
-drag-resize: the section sizes itself to content within its caps.
+Mouse: every cell a session owns — its box, lane bar, branch glyph, or
+turn-info text — is a hover/click target: hovering brightens that session
+across the diagram, clicking jumps to it. Clicking empty body cells
+focuses the section; clicking outside blurs it. The wheel scrolls
+vertically (shift, or a horizontal-wheel event, scrolls sideways — and a
+plain wheel goes sideways when sideways is the only axis with overflow).
+
+Liveness: node status glyphs animate with the same shared spinner and the
+same gate as the session list's rows, and a working session's LIVE
+turn-info bullet (its last window's marker — earlier windows are history)
+spins in phase with its status glyph.
 
 Relatedly, the session list itself shows lineage structure ambiently: a
 fork renders as an indented child row under its parent (like subagent
@@ -83,7 +98,7 @@ captures the benefits of both.
   lineage surface, showing the selected session's tree. Features that need
   lineage for a non-selected session must select it first.
 - The section's visibility is derived state; nothing persists per session.
-  Only the global collapse flag and view mode persist.
+  Only the global collapse flag, dragged height, and view mode persist.
 - Bare Tab in the list pane is now taken. Future bindings must not claim
   it, and the sessions⇄lineage switch must stay scoped so PTY sessions
   keep receiving Tab.

@@ -88,7 +88,10 @@ pub struct LineageNode {
 pub fn has_lineage(session_id: &str, sessions: &[SessionSummary]) -> bool {
     sessions.iter().any(|s| {
         if s.id == session_id {
+            // Its own upward links count too: a subagent (or a fork) sits in
+            // its parent's tree even when nothing points down at it yet.
             s.forked_from.is_some()
+                || (matches!(s.kind, SessionKind::Subagent) && s.parent_session_id.is_some())
         } else {
             (matches!(s.kind, SessionKind::Subagent)
                 && s.parent_session_id.as_deref() == Some(session_id))
@@ -331,6 +334,25 @@ impl LineageViewMode {
         match self {
             LineageViewMode::Boxes => "full",
             LineageViewMode::Rails => "compact",
+        }
+    }
+}
+
+impl LineageSpan {
+    /// The session a span belongs to, when it has one — plain rail filler
+    /// and `+N more` markers don't. Drives hover/click hit-testing: any
+    /// owned cell (box border, lane bar, branch glyph, turn-info text)
+    /// highlights and jumps to its session.
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            LineageSpan::Rail | LineageSpan::More(_) => None,
+            LineageSpan::Border { session_id }
+            | LineageSpan::Edge { session_id, .. }
+            | LineageSpan::Segment { session_id, .. }
+            | LineageSpan::SegmentBullet { session_id }
+            | LineageSpan::SegmentOutcome { session_id, .. }
+            | LineageSpan::NodeStatus { session_id }
+            | LineageSpan::Node { session_id } => Some(session_id),
         }
     }
 }

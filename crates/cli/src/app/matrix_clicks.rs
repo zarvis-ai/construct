@@ -187,7 +187,7 @@ impl App {
         }
         if self
             .layout
-            .lineage_header_hit
+            .lineage_collapse_hit
             .is_some_and(|r| Self::rect_contains(r, col, row))
         {
             self.lineage_collapsed = !self.lineage_collapsed;

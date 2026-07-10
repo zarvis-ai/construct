@@ -45,6 +45,42 @@ impl App {
             .is_some_and(|area| Self::rect_contains(area, col, row))
     }
 
+    /// Whether `(col, row)` lands on the section header's bare bar — the
+    /// height drag handle. The header's own buttons (collapse, mode toggle)
+    /// are excluded so their clicks stay clicks, mirroring
+    /// `is_on_matrix_rain_title_bar`.
+    pub(super) fn is_on_lineage_header_bar(&self, col: u16, row: u16) -> bool {
+        let Some(header) = self.layout.lineage_header_hit else {
+            return false;
+        };
+        if !Self::rect_contains(header, col, row) {
+            return false;
+        }
+        if self
+            .layout
+            .lineage_collapse_hit
+            .is_some_and(|r| Self::rect_contains(r, col, row))
+        {
+            return false;
+        }
+        if self
+            .layout
+            .lineage_toggle_hit
+            .is_some_and(|r| Self::rect_contains(r, col, row))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Whether the session ROWS (not the lineage section) should read as
+    /// the keyboard-focused sidebar region. Exactly one of the two sidebar
+    /// regions highlights at a time: focusing the lineage section takes the
+    /// highlight off the sessions title bar, and vice versa.
+    pub(crate) fn session_rows_focused(&self) -> bool {
+        self.focus == PaneFocus::List && !self.lineage_focused
+    }
+
     /// `C-x Tab`: toggle the lineage section's keyboard focus from anywhere —
     /// the same chord that used to focus the floating preview. A no-op when
     /// the selected session has no lineage section to focus.
