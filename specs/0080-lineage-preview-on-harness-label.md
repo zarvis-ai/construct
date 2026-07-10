@@ -135,11 +135,16 @@ ellipsizes; box width is capped so one verbose title can't stretch the
 whole diagram. Fork/subagent labels style exactly like any normal
 session's (by live state) — a session is never dimmed for being a fork;
 a discarded fork adds a strikethrough on top of its state color. A fork branches off the parent's lane with an
-arrow (`├─⑂──▸`, icon-only — the glyph alone marks the edge kind) into
-the child's box, placed to the right with its own lane below it; a fork
-that merged returns to the parent's lane with an icon-only merge arrow
-(`│◂─↩──┘`). A subagent branches the same way (`▸` arrow, same
-brightness) but never merges back. A merged fork's box
+arrow (`├─ ⑂ ──▸`, icon-only with a space either side of the glyph —
+the glyph alone marks the edge kind) into the child's box, placed to
+the right with its own lane below it; a fork that merged returns to the
+parent's lane with an icon-only merge arrow (`│◂─ ↩ ──┘`). A subagent
+branches the same way (`▸` arrow, same brightness) but never merges
+back. Turn-info labels reserve NO horizontal space: boxes pack at the
+arrows' minimum offsets, and a window's text simply runs underneath any
+lane bar it crosses (the bar shows a gap on that row); two windows that
+would collide on a shared closing row stagger onto adjacent rows
+instead. A merged fork's box
 carries NO marker (the merge arrow and its ✓'d final window already say
 it); a discarded fork's box keeps `✗ discarded`, since a discard draws
 no arrow. Rows pack tight — no blank spacer rows between elements.

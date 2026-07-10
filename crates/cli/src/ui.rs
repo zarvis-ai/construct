@@ -14486,7 +14486,7 @@ mod tests {
             "a merged fork's box carries no marker — the merge arrow and \
              its ✓'d final window already say it: {text}"
         );
-        assert!(text.contains("◂─↩"), "merge-back arrow expected: {text}");
+        assert!(text.contains("◂─ ↩"), "merge-back arrow expected: {text}");
         assert!(
             text.contains("✓"),
             "the merged fork's final window leads with ✓: {text}"
