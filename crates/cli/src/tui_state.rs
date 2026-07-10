@@ -66,15 +66,14 @@ pub struct TuiState {
     /// `None` = size to content.
     #[serde(default)]
     pub lineage_h: Option<u16>,
-    /// Whether the lineage section was in the compact (rails) view.
-    /// Defaults to compact — the narrow sidebar is what that mode is for;
-    /// state blobs that explicitly chose the boxed diagram keep it.
-    #[serde(default = "default_lineage_view_compact")]
-    pub lineage_view_compact: bool,
-}
-
-fn default_lineage_view_compact() -> bool {
-    true
+    /// Whether the lineage section is in the compact (rails) view. The
+    /// default is the full boxed-lane diagram. Deliberately a NEW key
+    /// (`lineage_compact`, not the old `lineage_view_compact`): every state
+    /// blob auto-saved while compact was briefly the default carries a
+    /// stale `true` that never reflected a user choice, so the old key is
+    /// ignored rather than migrated.
+    #[serde(default)]
+    pub lineage_compact: bool,
 }
 
 impl Default for TuiState {
@@ -96,7 +95,7 @@ impl Default for TuiState {
             tutorial_step: None,
             lineage_collapsed: false,
             lineage_h: None,
-            lineage_view_compact: true,
+            lineage_compact: false,
         }
     }
 }
@@ -215,20 +214,23 @@ mod tests {
     fn state_round_trips_lineage_collapse_and_view_mode() {
         let state = TuiState {
             lineage_collapsed: true,
-            lineage_view_compact: false,
+            lineage_compact: true,
             ..TuiState::default()
         };
         let json = serde_json::to_string(&state).expect("serialize");
         let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
         assert!(restored.lineage_collapsed);
-        assert!(!restored.lineage_view_compact);
+        assert!(restored.lineage_compact);
 
-        // Legacy blobs default to an expanded section in the compact view
-        // (the mode built for the narrow sidebar).
-        let legacy: TuiState =
-            serde_json::from_str(r#"{"last_selected_session_id": "s1"}"#).expect("legacy");
+        // Legacy blobs default to an expanded section in the FULL boxed
+        // view — including blobs carrying the retired `lineage_view_compact`
+        // key, whose auto-saved value never reflected a user choice.
+        let legacy: TuiState = serde_json::from_str(
+            r#"{"last_selected_session_id": "s1", "lineage_view_compact": true}"#,
+        )
+        .expect("legacy");
         assert!(!legacy.lineage_collapsed);
-        assert!(legacy.lineage_view_compact);
+        assert!(!legacy.lineage_compact);
     }
 
     #[test]

@@ -3137,7 +3137,7 @@ async fn run_with_socket_initial_selection(
         lineage_selected: 0,
         lineage_scroll: 0,
         lineage_scroll_x: 0,
-        lineage_mode: crate::lineage::LineageViewMode::Rails,
+        lineage_mode: crate::lineage::LineageViewMode::Boxes,
         lineage_h: None,
         resizing_lineage: None,
         configure_popup: None,
@@ -3250,7 +3250,7 @@ async fn run_with_socket_initial_selection(
     // restarts.
     app.lineage_collapsed = persisted.lineage_collapsed;
     app.lineage_h = persisted.lineage_h;
-    app.lineage_mode = if persisted.lineage_view_compact {
+    app.lineage_mode = if persisted.lineage_compact {
         crate::lineage::LineageViewMode::Rails
     } else {
         crate::lineage::LineageViewMode::Boxes
@@ -3365,7 +3365,7 @@ async fn run_with_socket_initial_selection(
             .map(|t| t.step),
         lineage_collapsed: app.lineage_collapsed,
         lineage_h: app.lineage_h,
-        lineage_view_compact: app.lineage_mode == crate::lineage::LineageViewMode::Rails,
+        lineage_compact: app.lineage_mode == crate::lineage::LineageViewMode::Rails,
     });
 
     result
@@ -11000,7 +11000,7 @@ mod tests {
             lineage_selected: 0,
             lineage_scroll: 0,
             lineage_scroll_x: 0,
-            lineage_mode: crate::lineage::LineageViewMode::Rails,
+            lineage_mode: crate::lineage::LineageViewMode::Boxes,
             lineage_h: None,
             resizing_lineage: None,
             configure_popup: None,
