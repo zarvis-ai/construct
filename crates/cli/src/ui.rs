@@ -10230,6 +10230,14 @@ fn render_program_popup_at(
     // instead.
     let safe_inner = inner.intersection(buffer_area);
     let safe_block_inner = block_inner.intersection(buffer_area);
+    // The lineage preview must NOT slide with the popup when `C-x C-o`
+    // shifts terminal focus to the pane underneath (`program_popup_visible_rect`
+    // offsets `rect.x`, which `block_inner`/`safe_block_inner` inherit) — it
+    // stays anchored to the pane's own fixed boundary instead, computed from
+    // `base_rect` (the unslid rect) rather than the popup's current `rect`.
+    // `block` isn't consumed until further down (`block.render`/`render_widget`
+    // below), so it's still valid to call `.inner()` on again here.
+    let lineage_anchor = block.inner(base_rect).intersection(buffer_area);
     // Vertical scroll geometry: the body can exceed `inner.height` wrapped
     // rows. Clamp the popup's stored offset to the current geometry (content
     // edits or a resize may have shrunk the scrollable range).
@@ -10438,8 +10446,11 @@ fn render_program_popup_at(
         // Same reasoning as the sticky-widget re-render just above: the
         // lineage preview is armed by the harness label
         // `apply_pane_title_right_cluster` painted, but the program's own
-        // `Clear` wipes whatever the session view drew underneath it.
-        render_lineage_preview(f, safe_block_inner, app, &popup.program.session_id);
+        // `Clear` wipes whatever the session view drew underneath it. Anchored
+        // to `lineage_anchor` (derived from `base_rect`, not `safe_block_inner`)
+        // so it stays fixed in place while the program itself slides right for
+        // terminal focus, rather than sliding along with it.
+        render_lineage_preview(f, lineage_anchor, app, &popup.program.session_id);
     }
     // Capture session-clip hitboxes for this program so hover can work for any
     // visible program, even when another split is focused. Only the active program

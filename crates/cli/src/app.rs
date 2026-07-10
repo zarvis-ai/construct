@@ -7367,6 +7367,16 @@ impl App {
         if self.is_over_lineage_preview(col, row) {
             return;
         }
+        // Reaching here means the click landed on neither a harness label,
+        // nor any preview's body, nor any preview's border — genuinely
+        // elsewhere. If a preview currently owns keyboard focus, clicking
+        // away from it loses that focus, the same way clicking away from any
+        // other focused element in this UI (a text field, a focused pane)
+        // does. This does NOT touch the pin: a preview the user pinned open
+        // stays visible after losing focus, same as `Esc` (spec 0080).
+        if self.lineage_preview_focused.is_some() {
+            self.lineage_preview_focused = None;
+        }
         // Tour card clicks — checked BEFORE the modal branch below, because
         // an open program sets `modal_area` and would otherwise claim the
         // click for cursor placement even though the card paints on top of
@@ -26905,6 +26915,139 @@ mod tests {
             app.lineage_preview_pinned.contains("s1"),
             "entering focus should pin the preview open so a hover-timeout \
              can't yank it away mid-interaction"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clicking_the_preview_body_via_real_mouse_events_focuses_it() {
+        // Companion to `clicking_the_preview_body_focuses_and_pins_it` above,
+        // which calls `handle_left_click` directly — this goes through the
+        // real `on_mouse` Down-then-Up sequence a genuine click generates
+        // (clicks are processed on release in this app; see
+        // `MouseEventKind::Up(MouseButton::Left)` in `on_mouse`), to rule out
+        // any discrepancy between the two paths (e.g. `Down`'s
+        // `is_over_lineage_preview` swallow-and-return interacting badly with
+        // the click ultimately reaching `handle_left_click` on `Up`).
+        use crossterm::event::MouseButton;
+        let (mut app, _dir, server) = test_app_with_lineage().await;
+        app.select_session("s1".to_string());
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let hit = app
+            .layout
+            .harness_label_hits
+            .iter()
+            .find(|h| h.session_id == "s1")
+            .cloned()
+            .expect("harness label hit registered");
+
+        app.mouse_pos = Some((hit.start_col, hit.row));
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(app.lineage_preview_visible("s1"));
+
+        let body = app
+            .layout
+            .lineage_preview_body_hit
+            .clone()
+            .expect("preview body hit registered while visible");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: body.area.x,
+            row: body.area.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            app.text_selection.is_none(),
+            "mouse-down over the preview body must not start a text selection"
+        );
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: body.area.x,
+            row: body.area.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert_eq!(
+            app.lineage_preview_focused.as_deref(),
+            Some("s1"),
+            "a real click (Down then Up) inside the preview body should focus it"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn clicking_elsewhere_clears_lineage_preview_focus() {
+        let (mut app, _dir, server) = test_app_with_lineage().await;
+        app.select_session("s1".to_string());
+        app.activate_lineage_preview_focus("s1".to_string());
+        assert_eq!(app.lineage_preview_focused.as_deref(), Some("s1"));
+
+        // Click a screen cell nowhere near the preview (top-left corner).
+        app.handle_left_click(0, 0).await;
+
+        assert!(
+            app.lineage_preview_focused.is_none(),
+            "clicking elsewhere should clear focus"
+        );
+        assert!(
+            app.lineage_preview_pinned.contains("s1"),
+            "clicking elsewhere must not un-pin — only lose focus, same as Esc"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lineage_preview_stays_put_while_program_slides_right_for_terminal_focus() {
+        // Regression test: `render_lineage_preview`'s call site inside the
+        // Program popup used to be handed `safe_block_inner` — derived from
+        // the popup's own `rect`, which `program_popup_visible_rect` shifts
+        // right while terminal focus is active (`C-x C-o`) so the terminal
+        // underneath is exposed. Since the preview anchors to the RIGHT edge
+        // of whatever rect it's given, it slid right along with the popup
+        // instead of staying fixed to the pane's own boundary.
+        let (mut app, _dir, server) = test_app_with_lineage().await;
+        app.select_session("s1".to_string());
+        app.lineage_preview_pinned.insert("s1".to_string());
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        {
+            let popup = app.program_popup.as_mut().expect("program just set");
+            // Backdate the open-reveal so the popup renders fully open, not
+            // mid-animation (a documented pitfall: a fresh `revealed_at`
+            // renders blank for the first `PROGRAM_REVEAL_MS`).
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let area_before_slide = app
+            .layout
+            .lineage_preview_area
+            .expect("preview area recorded with the program open, not yet slid");
+
+        app.set_program_terminal_focus(true);
+        {
+            let popup = app.program_popup.as_mut().expect("program remains open");
+            // Backdate the slide-changed timestamp too, so the popup renders
+            // fully slid (fraction 1.0) rather than mid-animation.
+            popup.slide_from = 1.0;
+            popup.slide_changed_at =
+                Some(Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS));
+        }
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let area_after_slide = app
+            .layout
+            .lineage_preview_area
+            .expect("preview area recorded with the program slid for terminal focus");
+
+        assert_eq!(
+            area_before_slide, area_after_slide,
+            "the lineage preview must stay anchored to the pane's own boundary, \
+             not slide along with the Program popup"
         );
         server.abort();
     }

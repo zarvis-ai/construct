@@ -282,6 +282,23 @@ impl App {
                     .await;
                 true
             }
+            // `C-x Tab` (`ToggleLineagePreviewFocus`) is itself the keyboard
+            // toggle that closes a focused preview — but it's a two-key
+            // chord, and its own prefix key (`C-x`) isn't otherwise in this
+            // handler's vocabulary. Without this arm, `C-x` would hit the
+            // fallback below, clear focus, and fall through BEFORE `Tab`
+            // ever arrives — so by the time the chord completes and
+            // `App::toggle_lineage_preview_focus` runs, focus already reads
+            // as "not focused" and it re-opens instead of closing. Let both
+            // keys of the chord fall through without touching focus so the
+            // toggle handler sees the true prior state and can tell open
+            // from close correctly. `Char('x')` is checked with the CONTROL
+            // modifier specifically (not bare `x`, which isn't otherwise
+            // bound here); the chord's second key arrives as a bare `Tab`
+            // per its `key(KeyCode::Tab)` binding in `keymap.rs`, no
+            // modifier to check.
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => false,
+            KeyCode::Tab => false,
             _ => {
                 self.lineage_preview_focused = None;
                 false
@@ -389,6 +406,45 @@ mod tests {
         assert!(
             app.lineage_preview_focused.is_none(),
             "a second press on the same session must close it"
+        );
+        assert!(
+            !app.lineage_preview_pinned.contains("root"),
+            "closing via C-x Tab must also un-pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn c_x_tab_keystrokes_toggle_open_then_closed() {
+        // Regression test for a bug where `toggle_lineage_preview_focus`
+        // toggling correctly in isolation (see the test above) did NOT mean
+        // the actual `C-x Tab` KEYSTROKES toggled correctly through
+        // `App::on_key`'s chord dispatch: `C-x` isn't in this preview's own
+        // key vocabulary, so on a second press it used to get treated as an
+        // "unhandled key" that cleared focus and fell through BEFORE `Tab`
+        // arrived — so by the time the chord completed, focus already read
+        // as "not focused" and the toggle re-opened instead of closing.
+        let fork = fork_of(summary("fork"), "root");
+        let (mut app, _dir, _server) = test_app_with_sessions(vec![summary("root"), fork]).await;
+        app.select_session("root".to_string());
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.lineage_preview_focused.as_deref(),
+            Some("root"),
+            "first C-x Tab should open and focus the preview"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await;
+        assert!(
+            app.lineage_preview_focused.is_none(),
+            "second C-x Tab (as real keystrokes through on_key) must close it, \
+             not re-open it"
         );
         assert!(
             !app.lineage_preview_pinned.contains("root"),
