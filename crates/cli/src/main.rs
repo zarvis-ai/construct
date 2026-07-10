@@ -7,6 +7,7 @@ use std::path::PathBuf;
 mod acp;
 mod app;
 mod keymap;
+mod lineage;
 mod matrix_rain;
 mod mouse_forward;
 mod pty_render;

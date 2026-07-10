@@ -54,8 +54,13 @@ impl SessionManager {
                 let mut s = entry.summary.write().await;
                 s.last_event_at = Some(now);
                 s.event_count = 0;
+                s.message_count = 0;
                 s.last_pty_at_ms = None;
-                s.state = SessionState::AwaitingInput;
+                crate::session::set_state_tracked(
+                    &mut s,
+                    SessionState::AwaitingInput,
+                    now.timestamp_millis(),
+                );
                 s.pending_input = true;
                 s.clone()
             };
@@ -285,7 +290,7 @@ impl SessionManager {
                 }
                 if genuine && harness_uses_quiescence(&s) && s.state == SessionState::AwaitingInput
                 {
-                    s.state = SessionState::Running;
+                    crate::session::set_state_tracked(&mut s, SessionState::Running, now_ms);
                     s.pending_input = false;
                     s.needs_attention = false;
                     Some(s.clone())
@@ -337,15 +342,22 @@ impl SessionManager {
             let mut s = entry.summary.write().await;
             s.last_event_at = Some(now);
             s.event_count = seq;
+            if matches!(&event, SessionEvent::Message { .. }) {
+                s.message_count = s.message_count.saturating_add(1);
+            }
             let prev_state = s.state;
             match &event {
                 SessionEvent::Status { state, .. } => {
-                    s.state = *state;
+                    crate::session::set_state_tracked(&mut s, *state, now.timestamp_millis());
                     s.pending_input = matches!(state, SessionState::AwaitingInput);
                 }
                 SessionEvent::AgentStatus(_) => {}
                 SessionEvent::AwaitingInput { prompt } => {
-                    s.state = SessionState::AwaitingInput;
+                    crate::session::set_state_tracked(
+                        &mut s,
+                        SessionState::AwaitingInput,
+                        now.timestamp_millis(),
+                    );
                     s.pending_input = true;
                     if let Some(p) = prompt {
                         s.last_prompt = Some(p.clone());
@@ -355,15 +367,20 @@ impl SessionManager {
                     s.cost_usd = Some(s.cost_usd.unwrap_or(0.0) + *usd);
                 }
                 SessionEvent::Done { exit_code } => {
-                    s.state = if *exit_code == 0 {
+                    let terminal = if *exit_code == 0 {
                         SessionState::Done
                     } else {
                         SessionState::Errored
                     };
+                    crate::session::set_state_tracked(&mut s, terminal, now.timestamp_millis());
                     s.pending_input = false;
                 }
                 SessionEvent::Error { .. } => {
-                    s.state = SessionState::Errored;
+                    crate::session::set_state_tracked(
+                        &mut s,
+                        SessionState::Errored,
+                        now.timestamp_millis(),
+                    );
                     s.pending_input = false;
                 }
                 SessionEvent::Reset
@@ -550,6 +567,9 @@ impl SessionManager {
                     native_id: native_id.clone(),
                 }),
                 last_pty_at_ms: None,
+                busy_ms: 0,
+                busy_running_since_ms: None,
+                message_count: 0,
                 approval_mode: owner_summary.approval_mode,
                 kind: agentd_protocol::SessionKind::Subagent,
                 archived: false,

@@ -143,6 +143,13 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.main_window_areas.clear();
     app.layout.main_window_dividers.clear();
     app.layout.session_title_name_hits.clear();
+    app.layout.lineage_area = None;
+    app.layout.lineage_header_hit = None;
+    app.layout.lineage_collapse_hit = None;
+    app.layout.lineage_toggle_hit = None;
+    app.layout.lineage_v_overflow = false;
+    app.layout.lineage_h_overflow = false;
+    app.layout.lineage_box_hits.clear();
     app.window_pane_sizes.clear();
     app.terminal_replayed_sessions_this_frame.clear();
     app.layout.dynamic_ui_popover_area = None;
@@ -1577,10 +1584,15 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // Tutorial pane highlight (spec 0077, step 4 "get around"): reuses
     // `pane_border_style`'s focused styling as the highlight rather than
     // inventing new styling.
-    let focused = app.focus == PaneFocus::List || app.tutorial_wants_list_highlight();
+    // Exactly one sidebar region reads as keyboard-focused at a time: the
+    // session rows OR the lineage section (whose header highlights via
+    // `lineage_focused` in `render_lineage_section`).
+    let focused = app.session_rows_focused() || app.tutorial_wants_list_highlight();
     // Collapsed render path: a thin column with a `>` expand glyph
-    // on the top border. Anywhere inside the pane click-expands.
-    let effective_collapsed = app.list_collapsed && !focused;
+    // on the top border. Anywhere inside the pane click-expands. Keyed off
+    // raw list focus so the sidebar stays expanded while the lineage
+    // section is focused too.
+    let effective_collapsed = app.list_collapsed && app.focus != PaneFocus::List;
     if effective_collapsed {
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1709,14 +1721,14 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     let gap_str: String = " ".repeat(gap);
                     // Archived sessions read as muted — they're terminated and
                     // only visible because the "show archived" toggle is on.
-                    let name_style =
-                        if s.archived || (s.forked_from.is_some() && !s.needs_attention) {
-                            Style::default()
-                                .fg(app.theme.dim)
-                                .add_modifier(Modifier::DIM)
-                        } else {
-                            Style::default().fg(app.theme.text)
-                        };
+                    // Forks are ordinary live sessions and style like one.
+                    let name_style = if s.archived {
+                        Style::default()
+                            .fg(app.theme.dim)
+                            .add_modifier(Modifier::DIM)
+                    } else {
+                        Style::default().fg(app.theme.text)
+                    };
                     let mut spans = vec![Span::raw(indent_prefix.to_string())];
                     if let Some(expand_glyph) = expand_glyph {
                         spans.push(Span::styled(
@@ -1799,6 +1811,18 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     // can move the list viewport independently from the current selection.
     let (list_items_area, matrix_area) =
         split_list_pane(inner, app.matrix_rain_hidden, app.matrix_rain_h);
+    // Lineage section (spec 0081): the selected session's fork/subagent
+    // tree, carved from the bottom of the rows region so it sits between
+    // the session rows and the operator/matrix-rain panel.
+    let lineage = app
+        .lineage_section_session()
+        .map(|id| (id.clone(), app.lineage_section_rows(&id)));
+    let (list_items_area, lineage_rect) = split_lineage_section(
+        list_items_area,
+        lineage.as_ref().map(|(_, rows)| rows.len()).unwrap_or(0),
+        app.lineage_collapsed,
+        app.lineage_h,
+    );
     let max_scroll = app_items
         .len()
         .saturating_sub(list_items_area.height as usize);
@@ -1832,7 +1856,379 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_scroll_offset = visible_start + state.offset();
     app.list_scroll_offset = app.layout.list_scroll_offset;
     clear_pane_side_borders(f, area, app);
+    if let (Some(rect), Some((id, mut rows))) = (lineage_rect, lineage) {
+        render_lineage_section(f, rect, app, &id, &mut rows);
+    }
     render_matrix_rain(f, matrix_area, app);
+}
+
+/// Carve the sidebar's lineage section (spec 0081) from the bottom of the
+/// session-rows region: a 1-row header bar plus (when expanded) the diagram
+/// rows with one blank padding row above and below. The section never
+/// squeezes the rows below `SESSION_LIST_H_MIN` and never takes more than
+/// half the region, so a deep tree scrolls instead of crowding the list
+/// out; a user drag-height (`lineage_h`) wins within those same caps.
+/// `content_rows == 0` (no lineage to show) yields no section at all.
+fn split_lineage_section(
+    list: Rect,
+    content_rows: usize,
+    collapsed: bool,
+    override_h: Option<u16>,
+) -> (Rect, Option<Rect>) {
+    if content_rows == 0 {
+        return (list, None);
+    }
+    let avail = list
+        .height
+        .saturating_sub(crate::app::SESSION_LIST_H_MIN)
+        .min(list.height / 2);
+    if avail == 0 {
+        return (list, None);
+    }
+    let h = if collapsed {
+        1
+    } else {
+        // Header + top pad + diagram + bottom pad, unless the user dragged
+        // the header to an explicit height.
+        let content = (content_rows as u16).saturating_add(3);
+        override_h.unwrap_or(content).max(2).min(avail)
+    };
+    let rows = Rect {
+        x: list.x,
+        y: list.y,
+        width: list.width,
+        height: list.height - h,
+    };
+    let section = Rect {
+        x: list.x,
+        y: list.y + list.height - h,
+        width: list.width,
+        height: h,
+    };
+    (rows, Some(section))
+}
+
+/// Render the sidebar's lineage section: a header bar (a `─` rule carrying
+/// the `⑂ lineage` label, the view-mode toggle, and a `−`/`+` collapse
+/// button — the same furniture as the operator panel's title bar below it)
+/// above the selected session's lineage diagram. Reuses
+/// `App::lineage_section_rows` (`crate::lineage::build_tree`/`flatten`
+/// underneath) for the tree and `render_lineage_row` for each row's
+/// formatting.
+///
+/// Highlighting: while the section owns keyboard focus
+/// (`App::lineage_focused`), the highlighted node follows its own row
+/// selection; otherwise it follows the LIST selection, so the section reads
+/// as a detail panel for the selected session. Hovering ANY cell a session
+/// owns — box, lane bar, branch glyph, turn-info text — brightens that
+/// session across the diagram; clicking it jumps there (`click_list`).
+/// Status glyphs animate exactly like the session list's (the shared
+/// spinner while a session is actively working), and a working session's
+/// live turn-info bullet spins along with it.
+fn render_lineage_section(
+    f: &mut Frame,
+    rect: Rect,
+    app: &mut App,
+    session_id: &str,
+    rows: &mut [crate::lineage::LineageRow],
+) {
+    use unicode_width::UnicodeWidthStr;
+    if rect.height == 0 || rect.width == 0 {
+        return;
+    }
+    app.layout.lineage_area = Some(rect);
+    let focused = app.lineage_focused;
+
+    // Header bar: a full-width `─` rule (the operator panel's visual
+    // language), label at the left, mode toggle + collapse button at the
+    // right. The bare bar doubles as the height drag handle.
+    let line_style = Style::default().fg(app.theme.matrix_line);
+    for x in rect.x..rect.x + rect.width {
+        f.buffer_mut().set_string(x, rect.y, "─", line_style);
+    }
+    let header_rect = Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: 1,
+    };
+    app.layout.lineage_header_hit = Some(header_rect);
+    let title = " ⑂ lineage ";
+    let title_style = if focused {
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        session_list_secondary_style(&app.theme)
+    };
+    f.buffer_mut()
+        .set_string(rect.x + 1, rect.y, title, title_style);
+    // Collapse/expand button at the right end, exactly like the operator
+    // panel's (`matrix_rain_close_button_range` geometry).
+    if rect.width >= 8 {
+        let glyph = if app.lineage_collapsed {
+            " + "
+        } else {
+            " − "
+        };
+        // Flush right, matching the operator panel's toggle below.
+        let bx = rect.x + rect.width.saturating_sub(3);
+        let button = Rect {
+            x: bx,
+            y: rect.y,
+            width: 3,
+            height: 1,
+        };
+        let hovered = app
+            .mouse_pos
+            .is_some_and(|(mx, my)| contains_rect(button, mx, my));
+        let style = if hovered {
+            Style::default()
+                .fg(app.theme.matrix_flash_good)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(app.theme.matrix_close)
+                .add_modifier(Modifier::BOLD)
+        };
+        f.buffer_mut().set_string(bx, rect.y, glyph, style);
+        app.layout.lineage_collapse_hit = Some(button);
+        // View-mode toggle just left of the collapse button (expanded only —
+        // a collapsed header has no diagram to re-draw).
+        if !app.lineage_collapsed {
+            let label = format!(" {} ⇄ ", app.lineage_mode.short_label());
+            let w = UnicodeWidthStr::width(label.as_str()) as u16;
+            if bx > rect.x + 1 + w {
+                let tx = bx - w - 1;
+                let toggle = Rect {
+                    x: tx,
+                    y: rect.y,
+                    width: w,
+                    height: 1,
+                };
+                let hovered = app
+                    .mouse_pos
+                    .is_some_and(|(mx, my)| contains_rect(toggle, mx, my));
+                let style = if hovered {
+                    Style::default()
+                        .fg(app.theme.matrix_flash_good)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    session_list_secondary_style(&app.theme)
+                };
+                f.buffer_mut().set_string(tx, rect.y, label, style);
+                app.layout.lineage_toggle_hit = Some(toggle);
+            }
+        }
+    }
+    if rect.height == 1 {
+        return;
+    }
+
+    let body = Rect {
+        x: rect.x,
+        y: rect.y + 1,
+        width: rect.width,
+        height: rect.height - 1,
+    };
+    // One blank padding row above and below the diagram, when there's room.
+    let inner = if body.height >= 3 {
+        Rect {
+            x: body.x,
+            y: body.y + 1,
+            width: body.width,
+            height: body.height - 2,
+        }
+    } else {
+        body
+    };
+
+    let by_id: HashMap<&str, &SessionSummary> =
+        app.sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+
+    // Live animation: node status glyphs use the same spinner the session
+    // list uses while a session is actively working, and a working
+    // session's LIVE turn-info bullet (the last `•` on its lane — earlier
+    // windows are history) spins in phase with it.
+    let mut node_updates: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut animating: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_bullet: HashMap<String, (usize, usize)> = HashMap::new();
+    for (ri, row) in rows.iter().enumerate() {
+        for (si, span) in row.spans.iter().enumerate() {
+            match &span.role {
+                crate::lineage::LineageSpan::NodeStatus { session_id } => {
+                    if let Some(s) = by_id.get(session_id.as_str()) {
+                        let glyph = session_status_glyph(app, s);
+                        if glyph != span.text {
+                            node_updates.push((ri, si, glyph));
+                        }
+                        if glyph != s.state.glyph() {
+                            animating.insert(session_id.clone());
+                        }
+                    }
+                }
+                crate::lineage::LineageSpan::SegmentBullet { session_id } => {
+                    last_bullet.insert(session_id.clone(), (ri, si));
+                }
+                _ => {}
+            }
+        }
+    }
+    let frame_glyph = app.spinner_frame();
+    for (ri, si, glyph) in node_updates {
+        rows[ri].spans[si].text = glyph.to_string();
+    }
+    for (sid, (ri, si)) in last_bullet {
+        if animating.contains(&sid) {
+            rows[ri].spans[si].text = frame_glyph.to_string();
+        }
+    }
+
+    let content_w = rows
+        .iter()
+        .map(|r| UnicodeWidthStr::width(r.text().as_str()))
+        .max()
+        .unwrap_or(0);
+    let visible = (inner.height as usize).max(1);
+    let scroll = if focused {
+        // Keyboard selection drags the viewport; wheel scrolling moved it
+        // too, so reconcile from whichever state is current.
+        let selectable = crate::lineage::selectable_indices(rows);
+        let selected_raw = selectable
+            .get(app.lineage_selected.min(selectable.len().saturating_sub(1)))
+            .copied();
+        lineage_row_scroll(rows.len(), selected_raw, app.lineage_scroll, visible)
+    } else {
+        app.lineage_scroll.min(rows.len().saturating_sub(visible))
+    };
+    app.lineage_scroll = scroll;
+    let max_scroll_x = content_w.saturating_sub(inner.width as usize);
+    let scroll_x = app.lineage_scroll_x.min(max_scroll_x);
+    app.lineage_scroll_x = scroll_x;
+    app.layout.lineage_v_overflow = rows.len() > visible;
+    app.layout.lineage_h_overflow = content_w > inner.width as usize;
+
+    // Hit regions for every cell a session owns — box borders and labels,
+    // lane bars, branch glyphs, turn-info markers and text — in screen
+    // coordinates, clipped to the viewport. Hovering any of them brightens
+    // that session across the diagram; clicking jumps to it.
+    let view_right = scroll_x + inner.width as usize;
+    for (ri, row) in rows.iter().enumerate().skip(scroll).take(visible) {
+        let y = inner.y + (ri - scroll) as u16;
+        let mut x = 0usize;
+        for span in &row.spans {
+            let start = x;
+            let end = start + UnicodeWidthStr::width(span.text.as_str());
+            x = end;
+            let Some(owner) = span.role.owner() else {
+                continue;
+            };
+            let vis_start = start.max(scroll_x);
+            let vis_end = end.min(view_right);
+            if vis_start >= vis_end {
+                continue;
+            }
+            app.layout.lineage_box_hits.push(crate::app::LineageBoxHit {
+                session_id: owner.to_string(),
+                area: Rect {
+                    x: inner.x + (vis_start - scroll_x) as u16,
+                    y,
+                    width: (vis_end - vis_start) as u16,
+                    height: 1,
+                },
+            });
+        }
+    }
+    let hovered_session: Option<String> = app.mouse_pos.and_then(|(mx, my)| {
+        app.layout
+            .lineage_box_hits
+            .iter()
+            .find(|hit| hit.contains(mx, my))
+            .map(|hit| hit.session_id.clone())
+    });
+    let selected_session: Option<String> = if focused {
+        let selectable = crate::lineage::selectable_indices(rows);
+        selectable
+            .get(app.lineage_selected.min(selectable.len().saturating_sub(1)))
+            .and_then(|&idx| rows[idx].session_id().map(str::to_string))
+    } else {
+        // Unfocused, the section is a detail panel of the list selection.
+        Some(session_id.to_string())
+    };
+
+    let lines: Vec<Line<'static>> = rows
+        .iter()
+        .skip(scroll)
+        .take(visible)
+        .map(|row| {
+            clip_line_left(
+                render_lineage_row(
+                    row,
+                    &by_id,
+                    &app.theme,
+                    selected_session.as_deref(),
+                    hovered_session.as_deref(),
+                ),
+                scroll_x,
+            )
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Scrollbars when the diagram overflows the viewport — background
+    // tints only (same opacity approximation as the terminal scrollbar),
+    // preserving the diagram glyphs underneath. Vertical along the right
+    // column, horizontal along the bottom row.
+    let track_color = blend_color(Color::Black, app.theme.text, 0.30);
+    let thumb_color = blend_color(Color::Black, app.theme.text, 0.80);
+    if rows.len() > visible && inner.width > 0 {
+        let track_h = visible;
+        let thumb_h = (track_h * track_h / rows.len().max(1)).clamp(1, track_h);
+        let denom = rows.len() - visible;
+        let max_top = track_h - thumb_h;
+        let top = if denom == 0 {
+            0
+        } else {
+            (scroll * max_top + denom / 2) / denom
+        };
+        let x = inner.x + inner.width - 1;
+        for r in 0..track_h {
+            if let Some(cell) = f.buffer_mut().cell_mut(ratatui::layout::Position {
+                x,
+                y: inner.y + r as u16,
+            }) {
+                cell.set_bg(if r >= top && r < top + thumb_h {
+                    thumb_color
+                } else {
+                    track_color
+                });
+            }
+        }
+    }
+    if content_w > inner.width as usize && inner.height > 0 {
+        let track_w = inner.width as usize;
+        let thumb_w = (track_w * track_w / content_w.max(1)).clamp(1, track_w);
+        let denom = content_w - track_w;
+        let max_left = track_w - thumb_w;
+        let left = if denom == 0 {
+            0
+        } else {
+            (scroll_x * max_left + denom / 2) / denom
+        };
+        let y = inner.y + inner.height - 1;
+        for cidx in 0..track_w {
+            if let Some(cell) = f.buffer_mut().cell_mut(ratatui::layout::Position {
+                x: inner.x + cidx as u16,
+                y,
+            }) {
+                cell.set_bg(if cidx >= left && cidx < left + thumb_w {
+                    thumb_color
+                } else {
+                    track_color
+                });
+            }
+        }
+    }
 }
 
 /// Split the list pane's inner area (the rect inside the borders)
@@ -3221,10 +3617,6 @@ fn apply_pane_title_right_cluster<'a>(
         .as_deref()
         .map(UnicodeWidthStr::width)
         .unwrap_or(0) as u16;
-    let harness_right = harness_label_text.as_ref().map(|text| {
-        Line::from(Span::styled(text.clone(), border_style))
-            .alignment(ratatui::layout::Alignment::Right)
-    });
     // The close / session-actions button is the rightmost right-aligned title.
     // Its on-screen width must be known up front so the widget cluster's
     // hit geometry can account for it — the ☰ glyph is two cells wide, so
@@ -3236,6 +3628,11 @@ fn apply_pane_title_right_cluster<'a>(
     } else {
         0
     };
+    let harness_style = border_style;
+    let harness_right = harness_label_text.as_ref().map(|text| {
+        Line::from(Span::styled(text.clone(), harness_style))
+            .alignment(ratatui::layout::Alignment::Right)
+    });
     let widget_title = summary.and_then(|s| {
         let panels = session_sticky_widget_panels(app, &s.id);
         (!panels.is_empty()).then(|| {
@@ -7701,7 +8098,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x r           rename selected session (clears title on empty submit)
     C-x f           fork selected session instantly (same harness, no prompt)
     C-x F           fork selected session into a different harness (picker)
-    C-x q           fork log: forks of the selected session
+    C-x Tab / Tab   focus lineage section (Tab: list pane only)
     C-x m           merge the selected fork (take result, or discard)
     C-c C-c         interrupt
 
@@ -7774,7 +8171,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
     r               rename selected session (clears title on empty submit)
     f               fork selected session instantly (same harness, no prompt)
     O               fork selected session into a different harness (picker)
-    q               fork log: forks of the selected session
+    C-x Tab / Tab   focus lineage section (Tab: list pane only)
     m               merge the selected fork (take result, or discard)
     C-c             interrupt
 
@@ -9130,6 +9527,208 @@ fn render_tasks_popup(f: &mut Frame, app: &mut App) {
     }
     let para = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+}
+
+/// Keep `selected_raw` on screen within `visible` rows, scrolling the
+/// window just far enough in either direction. Simpler than
+/// `session_picker_scroll` because a lineage tree has no non-selectable
+/// header rows to keep visible above the selection — every row (including
+/// "+N more" markers) is a plain content line. Shared by the lineage
+/// preview's keyboard-focused rendering (the deleted `C-x q` / `q` popup
+/// used this same logic before it was folded into the preview).
+fn lineage_row_scroll(
+    total: usize,
+    selected_raw: Option<usize>,
+    prev_scroll: usize,
+    visible: usize,
+) -> usize {
+    let visible = visible.max(1);
+    let mut scroll = prev_scroll;
+    if let Some(sr) = selected_raw {
+        if sr < scroll {
+            scroll = sr;
+        } else if sr >= scroll + visible {
+            scroll = sr + 1 - visible;
+        }
+    }
+    scroll.min(total.saturating_sub(visible))
+}
+
+/// Style one flattened lineage-diagram row: the layout (boxes, lanes,
+/// arrows, turn info — see `crate::lineage::flatten`) arrives fully
+/// composed as role-tagged text runs; this just maps each role to a theme
+/// style. A node's label is styled by that session's live state — same as
+/// any normal session, never dimmed for being a fork (a discarded fork
+/// adds a strikethrough on top of its state color).
+///
+/// `selected_session`: when the preview is keyboard-focused, the selected
+/// session's box interior takes the highlight BACKGROUND and its border
+/// LINE brightens (fg only — no background behind border glyphs).
+/// `hovered_session`: the box under the mouse gets the same bright border
+/// (border only, no fill) as its click-to-jump affordance.
+fn render_lineage_row(
+    row: &crate::lineage::LineageRow,
+    by_id: &HashMap<&str, &SessionSummary>,
+    theme: &Theme,
+    selected_session: Option<&str>,
+    hovered_session: Option<&str>,
+) -> Line<'static> {
+    let interior_highlight = Style::default()
+        .bg(theme.highlight_bg)
+        .fg(theme.highlight_fg)
+        .add_modifier(Modifier::BOLD);
+    // Matches the preview widget's own border color, so highlighted
+    // lines read as part of the same chrome.
+    let border_highlight = Style::default().fg(theme.text).add_modifier(Modifier::BOLD);
+    let spans: Vec<Span<'static>> = row
+        .spans
+        .iter()
+        .map(|run| {
+            let style = match &run.role {
+                crate::lineage::LineageSpan::Rail => Style::default().fg(theme.dim),
+                crate::lineage::LineageSpan::Border { session_id } => {
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        border_highlight
+                    } else {
+                        Style::default().fg(theme.dim)
+                    }
+                }
+                // Fork and subagent arrow glyphs render at the same
+                // brightness, and light up with their branching session.
+                crate::lineage::LineageSpan::Edge { session_id, .. } => {
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        border_highlight
+                    } else {
+                        Style::default().fg(theme.dim)
+                    }
+                }
+                // Turn info lights up with its owning session when that
+                // session is selected or hovered — the whole timeline of
+                // the picked lane reads as one highlighted unit.
+                crate::lineage::LineageSpan::Segment { session_id, .. }
+                | crate::lineage::LineageSpan::SegmentBullet { session_id } => {
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        border_highlight
+                    } else {
+                        Style::default().fg(theme.dim)
+                    }
+                }
+                // Terminal-outcome glyphs borrow the checklist marks'
+                // palette (`checklist_mark_style`): done glows, failure
+                // warns; highlight adds bold.
+                crate::lineage::LineageSpan::SegmentOutcome { ok, session_id } => {
+                    let base = if *ok {
+                        Style::default().fg(theme.matrix_flash_good)
+                    } else {
+                        Style::default().fg(theme.warning)
+                    };
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        base.add_modifier(Modifier::BOLD)
+                    } else {
+                        base
+                    }
+                }
+                crate::lineage::LineageSpan::More(_) => Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::ITALIC),
+                // Mirrors the session list: only the status glyph carries
+                // the live-state color; the name itself stays the default
+                // text color.
+                crate::lineage::LineageSpan::NodeStatus { session_id } => {
+                    if selected_session == Some(session_id.as_str()) {
+                        interior_highlight
+                    } else {
+                        let mut style = match by_id.get(session_id.as_str()) {
+                            None => Style::default().fg(theme.dim),
+                            Some(summary) => state_style(theme, summary.state),
+                        };
+                        if hovered_session == Some(session_id.as_str()) {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        style
+                    }
+                }
+                crate::lineage::LineageSpan::Node { session_id } => {
+                    if selected_session == Some(session_id.as_str()) {
+                        interior_highlight
+                    } else {
+                        let hovered = hovered_session == Some(session_id.as_str());
+                        let mut style = match by_id.get(session_id.as_str()) {
+                            None => Style::default().fg(theme.dim),
+                            Some(summary) => {
+                                let mut style = Style::default().fg(theme.text);
+                                if hovered {
+                                    style = style.add_modifier(Modifier::BOLD);
+                                } else {
+                                    // Rest state reads slightly recessed so
+                                    // the highlighted session pops.
+                                    style = style.add_modifier(Modifier::DIM);
+                                }
+                                if crate::lineage::ForkStatus::of(summary)
+                                    == crate::lineage::ForkStatus::Discarded
+                                {
+                                    style = style.add_modifier(Modifier::CROSSED_OUT);
+                                }
+                                style
+                            }
+                        };
+                        if hovered {
+                            style = style.add_modifier(Modifier::BOLD);
+                        }
+                        style
+                    }
+                }
+            };
+            Span::styled(run.text.clone(), style)
+        })
+        .collect();
+    Line::from(spans)
+}
+
+/// Drop the first `cols` display columns from a line — the lineage
+/// preview's horizontal scroll. A wide character straddling the cut is
+/// replaced by spaces so downstream widths stay consistent.
+fn clip_line_left(line: Line<'static>, cols: usize) -> Line<'static> {
+    use unicode_width::UnicodeWidthChar;
+    if cols == 0 {
+        return line;
+    }
+    let mut remaining = cols;
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for span in line.spans {
+        if remaining == 0 {
+            out.push(span);
+            continue;
+        }
+        let mut text = String::new();
+        for ch in span.content.chars() {
+            if remaining == 0 {
+                text.push(ch);
+                continue;
+            }
+            let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
+            if remaining >= w {
+                remaining -= w;
+            } else {
+                for _ in remaining..w {
+                    text.push(' ');
+                }
+                remaining = 0;
+            }
+        }
+        if !text.is_empty() {
+            out.push(Span::styled(text, span.style));
+        }
+    }
+    Line::from(out)
 }
 
 struct ProgramPopupHoverOverlay {
@@ -13785,6 +14384,410 @@ mod tests {
             .collect()
     }
 
+    fn lineage_test_summary(id: &str) -> SessionSummary {
+        let json = serde_json::json!({
+            "id": id,
+            "harness": "smith",
+            "cwd": "/tmp",
+            "state": "running",
+            "created_at": "2026-05-20T00:00:00Z",
+            "event_count": 3,
+        });
+        serde_json::from_value(json).expect("valid SessionSummary")
+    }
+
+    /// A root + fork + subagent fixture, flattened into diagram rows.
+    fn lineage_test_rows() -> (Vec<SessionSummary>, Vec<crate::lineage::LineageRow>) {
+        let root = lineage_test_summary("root");
+        let mut fork = lineage_test_summary("f");
+        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+            session_id: "root".into(),
+            transcript_seq: 1,
+            at_ms: 1_000,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+        let mut sub = lineage_test_summary("s");
+        sub.kind = agentd_protocol::SessionKind::Subagent;
+        sub.parent_session_id = Some("root".into());
+        let sessions = vec![root, fork, sub];
+        let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
+        let rows = crate::lineage::flatten(&tree, &sessions, 9_000);
+        (sessions, rows)
+    }
+
+    fn lineage_lines(
+        sessions: &[SessionSummary],
+        rows: &[crate::lineage::LineageRow],
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
+        let by_id: HashMap<&str, &SessionSummary> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+        rows.iter()
+            .map(|r| render_lineage_row(r, &by_id, theme, None, None))
+            .collect()
+    }
+
+    #[test]
+    fn lineage_diagram_renders_labeled_fork_and_subagent_arrows() {
+        let theme = Theme::default();
+        let (sessions, rows) = lineage_test_rows();
+        let lines = lineage_lines(&sessions, &rows, &theme);
+        let all_spans: Vec<&Span<'static>> = lines.iter().flat_map(|l| l.spans.iter()).collect();
+        let fork_span = all_spans
+            .iter()
+            .find(|s| s.content.as_ref() == "⑂")
+            .expect("fork arrow label span");
+        let sub_span = all_spans
+            .iter()
+            .find(|s| s.content.as_ref() == "▸")
+            .expect("subagent arrow label span");
+        assert_eq!(fork_span.style.fg, Some(theme.dim));
+        assert_eq!(
+            sub_span.style.fg, fork_span.style.fg,
+            "fork and subagent arrow labels render at the same brightness — \
+             the word already tells them apart"
+        );
+    }
+
+    #[test]
+    fn lineage_selection_highlights_interior_fill_and_border_line_only() {
+        // The keyboard selection fills exactly the selected box's INTERIOR
+        // with the highlight background, and brightens its border LINE (fg
+        // only — border glyphs never get a background). Nothing outside
+        // the selected box is touched.
+        let theme = Theme::default();
+        let (sessions, rows) = lineage_test_rows();
+        let by_id: HashMap<&str, &SessionSummary> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+        let lines: Vec<Line<'static>> = rows
+            .iter()
+            .map(|r| render_lineage_row(r, &by_id, &theme, Some("f"), None))
+            .collect();
+        let mut saw_interior = false;
+        let mut saw_border = false;
+        for (run, span) in rows
+            .iter()
+            .zip(lines.iter())
+            .flat_map(|(row, line)| row.spans.iter().zip(line.spans.iter()))
+        {
+            let has_bg = span.style.bg == Some(theme.highlight_bg);
+            match &run.role {
+                crate::lineage::LineageSpan::Node { session_id }
+                | crate::lineage::LineageSpan::NodeStatus { session_id }
+                    if session_id == "f" =>
+                {
+                    assert!(has_bg, "selected interior carries the highlight fill");
+                    saw_interior = true;
+                }
+                crate::lineage::LineageSpan::Border { session_id } if session_id == "f" => {
+                    assert!(
+                        !has_bg,
+                        "the border LINE brightens, its background stays clear"
+                    );
+                    // The highlight matches the widget's own border color.
+                    assert_eq!(span.style.fg, Some(theme.text));
+                    assert!(span.style.add_modifier.contains(Modifier::BOLD));
+                    saw_border = true;
+                }
+                _ => {
+                    assert!(!has_bg, "nothing outside the selected box is filled");
+                }
+            }
+        }
+        assert!(saw_interior && saw_border);
+
+        // Hover: border brightens the same way, interior stays unfilled.
+        let hover_lines: Vec<Line<'static>> = rows
+            .iter()
+            .map(|r| render_lineage_row(r, &by_id, &theme, None, Some("f")))
+            .collect();
+        for (run, span) in rows
+            .iter()
+            .zip(hover_lines.iter())
+            .flat_map(|(row, line)| row.spans.iter().zip(line.spans.iter()))
+        {
+            assert_ne!(span.style.bg, Some(theme.highlight_bg));
+            if let crate::lineage::LineageSpan::Border { session_id } = &run.role {
+                if session_id == "f" {
+                    assert_eq!(
+                        span.style.fg,
+                        Some(theme.text),
+                        "hover brightens the hovered box's border"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lineage_row_styles_forks_like_normal_sessions_and_strikes_discarded() {
+        let theme = Theme::default();
+        let (mut sessions, _) = lineage_test_rows();
+        sessions[1].merge = Some(agentd_protocol::ForkMerge {
+            mode: agentd_protocol::ForkMergeMode::Result,
+            at_ms: 2_000,
+            merged_busy_ms: 0,
+            merged_message_count: 0,
+            merged_seq: 2,
+        });
+        let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
+        let rows = crate::lineage::flatten(&tree, &sessions, 9_000);
+        let lines = lineage_lines(&sessions, &rows, &theme);
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(
+            !text.contains("↩ merged"),
+            "a merged fork's box carries no marker — the merge arrow and \
+             its ✓'d final window already say it: {text}"
+        );
+        assert!(text.contains("◂─ ↩"), "merge-back arrow expected: {text}");
+        assert!(
+            text.contains("✓"),
+            "the merged fork's final window leads with ✓: {text}"
+        );
+        let label_style =
+            |rows: &[crate::lineage::LineageRow], lines: &[Line<'static>], id: &str| {
+                rows.iter()
+                    .zip(lines.iter())
+                    .flat_map(|(row, line)| row.spans.iter().zip(line.spans.iter()))
+                    .find_map(|(run, span)| match &run.role {
+                        crate::lineage::LineageSpan::Node { session_id } if session_id == id => {
+                            Some(span.style)
+                        }
+                        _ => None,
+                    })
+                    .expect("label span")
+            };
+        let merged_label = label_style(&rows, &lines, "f");
+        let root_label = label_style(&rows, &lines, "root");
+        assert_eq!(
+            merged_label.fg, root_label.fg,
+            "a fork's label styles exactly like a normal session's — never \
+             dimmed for being a fork"
+        );
+        assert!(
+            !merged_label.add_modifier.contains(Modifier::CROSSED_OUT),
+            "a merged fork must not be struck through — that's reserved for discarded"
+        );
+
+        sessions[1].merge = Some(agentd_protocol::ForkMerge {
+            mode: agentd_protocol::ForkMergeMode::Discard,
+            at_ms: 2_000,
+            merged_busy_ms: 0,
+            merged_message_count: 0,
+            merged_seq: 2,
+        });
+        let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
+        let rows = crate::lineage::flatten(&tree, &sessions, 9_000);
+        let lines = lineage_lines(&sessions, &rows, &theme);
+        let discarded_label = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("✗ discarded"))
+            .expect("discarded fork label span");
+        assert!(
+            discarded_label
+                .style
+                .add_modifier
+                .contains(Modifier::CROSSED_OUT),
+            "a discarded fork must render struck-through, distinct from an open or merged fork"
+        );
+    }
+
+    #[test]
+    fn selecting_or_hovering_a_session_lights_its_rails_and_turn_info() {
+        // Rails mode: every rail glyph and turn-info span is tagged with
+        // its owning session; selection/hover brightens exactly that
+        // session's rails, connectors, and windows — nothing else's.
+        let theme = Theme::default();
+        let root = lineage_test_summary("root");
+        let mut fork = lineage_test_summary("f");
+        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+            session_id: "root".into(),
+            transcript_seq: 1,
+            at_ms: 1_000,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+        let sessions = vec![root, fork];
+        let by_id: HashMap<&str, &SessionSummary> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+        let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
+        let (rows, _) = crate::lineage::flatten_rails(&tree, &sessions, 9_000);
+        let lines: Vec<Line<'static>> = rows
+            .iter()
+            .map(|r| render_lineage_row(r, &by_id, &theme, None, Some("f")))
+            .collect();
+        let mut lit_f = 0usize;
+        for (run, span) in rows
+            .iter()
+            .zip(lines.iter())
+            .flat_map(|(row, line)| row.spans.iter().zip(line.spans.iter()))
+        {
+            let is_lit = span.style.fg == Some(theme.text)
+                && span.style.add_modifier.contains(Modifier::BOLD);
+            match &run.role {
+                crate::lineage::LineageSpan::Border { session_id }
+                | crate::lineage::LineageSpan::SegmentBullet { session_id }
+                | crate::lineage::LineageSpan::Segment { session_id, .. } => {
+                    assert_eq!(
+                        is_lit,
+                        session_id == "f",
+                        "highlight follows ownership: {run:?}"
+                    );
+                    if is_lit {
+                        lit_f += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            lit_f >= 2,
+            "f's rail glyphs and turn info light up (got {lit_f})"
+        );
+    }
+
+    #[test]
+    fn done_sessions_color_only_the_status_glyph_like_the_session_list() {
+        // In the session list a Done session keeps its name in the default
+        // text color and only the check-mark glyph goes state-colored —
+        // the lineage views match that in both modes.
+        let theme = Theme::default();
+        let (mut sessions, _) = lineage_test_rows();
+        sessions[1].state = agentd_protocol::SessionState::Done;
+        let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
+        let by_id: HashMap<&str, &SessionSummary> =
+            sessions.iter().map(|s| (s.id.as_str(), s)).collect();
+        for rows in [
+            crate::lineage::flatten(&tree, &sessions, 9_000),
+            crate::lineage::flatten_rails(&tree, &sessions, 9_000).0,
+        ] {
+            let lines: Vec<Line<'static>> = rows
+                .iter()
+                .map(|r| render_lineage_row(r, &by_id, &theme, None, None))
+                .collect();
+            let span_style = |want_status: bool| {
+                rows.iter()
+                    .zip(lines.iter())
+                    .flat_map(|(row, line)| row.spans.iter().zip(line.spans.iter()))
+                    .find_map(|(run, span)| match &run.role {
+                        crate::lineage::LineageSpan::NodeStatus { session_id }
+                            if want_status && session_id == "f" =>
+                        {
+                            Some(span.style)
+                        }
+                        crate::lineage::LineageSpan::Node { session_id }
+                            if !want_status && session_id == "f" =>
+                        {
+                            Some(span.style)
+                        }
+                        _ => None,
+                    })
+                    .expect("span")
+            };
+            assert_eq!(
+                span_style(true).fg,
+                Some(theme.info),
+                "the Done glyph goes state-colored (blue-ish)"
+            );
+            let name = span_style(false);
+            assert_eq!(
+                name.fg,
+                Some(theme.text),
+                "the name keeps the default text color"
+            );
+            assert!(
+                name.add_modifier.contains(Modifier::DIM),
+                "unhighlighted names read slightly recessed"
+            );
+        }
+    }
+
+    #[test]
+    fn lineage_row_more_marker_shows_count() {
+        let theme = Theme::default();
+        let mut sessions = vec![lineage_test_summary("root")];
+        for i in 0..(crate::lineage::MAX_SIBLINGS + 7) {
+            let mut f = lineage_test_summary(&format!("f{i}"));
+            f.forked_from = Some(agentd_protocol::ForkedFrom {
+                session_id: "root".into(),
+                transcript_seq: 0,
+                at_ms: 0,
+                parent_busy_ms: 0,
+                parent_message_count: 0,
+            });
+            sessions.push(f);
+        }
+        let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
+        let rows = crate::lineage::flatten(&tree, &sessions, 0);
+        let lines = lineage_lines(&sessions, &rows, &theme);
+        let text: String = lines.iter().map(line_text).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("+7 more"), "{text}");
+    }
+
+    #[test]
+    fn lineage_row_no_longer_shows_per_node_stats() {
+        // Stats live on the lanes as turn-info rows — a node's own box
+        // label row is just status glyph + name/harness [+ terminal
+        // marker], never message counts.
+        let theme = Theme::default();
+        let (sessions, rows) = lineage_test_rows();
+        let lines = lineage_lines(&sessions, &rows, &theme);
+        for (row, line) in rows.iter().zip(lines.iter()) {
+            if row.is_selectable() {
+                let text = line_text(line);
+                assert!(
+                    !text.contains("msg"),
+                    "a node's box row must not carry message-count stats: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lineage_row_renders_segment_text_and_style_distinct_from_a_node_row() {
+        let theme = Theme::default();
+        let (sessions, rows) = lineage_test_rows();
+        let lines = lineage_lines(&sessions, &rows, &theme);
+
+        // Some lane row carries turn info ("N msgs · elapsed"), styled dim.
+        let segment_span = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("msgs \u{b7}") || s.content.contains("msg \u{b7}"))
+            .expect("a turn-info span somewhere in the diagram");
+        assert_eq!(segment_span.style.fg, Some(theme.dim));
+
+        // A node's box label is styled by live state — not the dim used for
+        // wiring/turn info.
+        let node_idx = rows
+            .iter()
+            .position(|r| r.is_selectable())
+            .expect("node row");
+        let node_label = lines[node_idx]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("smith"))
+            .expect("node label span");
+        assert_ne!(
+            node_label.style.fg, segment_span.style.fg,
+            "node labels must render visually distinct from turn-info rows"
+        );
+    }
+
+    #[test]
+    fn lineage_row_scroll_keeps_selection_on_screen() {
+        // Selection below the window pulls the window down just enough.
+        assert_eq!(lineage_row_scroll(20, Some(10), 0, 5), 6);
+        // Selection above the window pulls the window up to it.
+        assert_eq!(lineage_row_scroll(20, Some(2), 8, 5), 2);
+        // Already visible: scroll untouched.
+        assert_eq!(lineage_row_scroll(20, Some(4), 2, 5), 2);
+        // Fewer rows than the viewport: no scroll.
+        assert_eq!(lineage_row_scroll(3, Some(1), 0, 5), 0);
+    }
+
     #[test]
     fn view_program_toggle_tooltip_stays_inside_session_view() {
         let view = Rect::new(30, 0, 90, 40);
@@ -13974,6 +14977,9 @@ mod tests {
             parent_session_id: None,
             native_subagent: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
+            message_count: 0,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             archived: false,

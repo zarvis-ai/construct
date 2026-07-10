@@ -459,6 +459,19 @@ impl Client {
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis() as i64,
+                    // The parent's compute time so far — the busy-time
+                    // counterpart to `transcript_seq`, so lineage windows
+                    // can report summed compute time per window.
+                    parent_busy_ms: src.busy_ms_at(
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64,
+                    ),
+                    // The parent's chat-message tally so far — the
+                    // message-only counterpart to `transcript_seq`, so
+                    // lineage windows can count actual messages.
+                    parent_message_count: src.message_count,
                 }),
             })
             .await?;
@@ -1418,7 +1431,9 @@ mod fork_lineage_tests {
                                 "harness": "claude",
                                 "cwd": "/tmp",
                                 "state": "running",
-                                "created_at": "1970-01-01T00:00:00Z"
+                                "created_at": "1970-01-01T00:00:00Z",
+                                "busy_ms": 4200,
+                                "message_count": 3
                             },
                             "events": []
                         }
@@ -1480,6 +1495,26 @@ mod fork_lineage_tests {
                 .and_then(|f| f.get("session_id"))
                 .and_then(|s| s.as_str()),
             Some("src-1")
+        );
+        // The fork boundary snapshots the parent's accumulated compute time
+        // so the lineage view can label windows with busy deltas. The mock
+        // parent reports 4200ms banked and no open Running span, so the
+        // stamp is exactly that.
+        assert_eq!(
+            forked_from
+                .as_ref()
+                .and_then(|f| f.get("parent_busy_ms"))
+                .and_then(|v| v.as_u64()),
+            Some(4200)
+        );
+        // Likewise the parent's chat-message tally, so window counts can be
+        // message-only deltas.
+        assert_eq!(
+            forked_from
+                .as_ref()
+                .and_then(|f| f.get("parent_message_count"))
+                .and_then(|v| v.as_u64()),
+            Some(3)
         );
 
         let _ = std::fs::remove_file(&sock);

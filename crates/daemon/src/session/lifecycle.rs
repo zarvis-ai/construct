@@ -94,6 +94,9 @@ impl SessionManager {
             operator_loop_disabled: params.kind == agentd_protocol::SessionKind::Orchestrator,
             needs_attention: false,
             forked_from: params.forked_from.clone(),
+            busy_ms: 0,
+            busy_running_since_ms: None,
+            message_count: 0,
             merge: None,
         };
         self.storage.save_summary(&summary)?;
@@ -204,7 +207,11 @@ impl SessionManager {
         // Persist so a daemon restart can re-spawn with the same shape.
         let _ = self.storage.save_start_params(&id, &start_params);
         // Reflect Pending → Running on start (the adapter may also emit a status).
-        summary.state = SessionState::Running;
+        crate::session::set_state_tracked(
+            &mut summary,
+            SessionState::Running,
+            Utc::now().timestamp_millis(),
+        );
         self.storage.save_summary(&summary)?;
 
         let entry = Arc::new(SessionEntry {
@@ -384,7 +391,11 @@ impl SessionManager {
                 if let Some(entry) = self.get_entry(&id).await {
                     let snapshot = {
                         let mut s = entry.summary.write().await;
-                        s.state = SessionState::Errored;
+                        crate::session::set_state_tracked(
+                            &mut s,
+                            SessionState::Errored,
+                            Utc::now().timestamp_millis(),
+                        );
                         s.clone()
                     };
                     let _ = self.storage.save_summary(&snapshot);
@@ -480,7 +491,11 @@ impl SessionManager {
                 *entry.adapter.lock().await = Some(adapter);
                 let snapshot = {
                     let mut s = entry.summary.write().await;
-                    s.state = SessionState::Running;
+                    crate::session::set_state_tracked(
+                        &mut s,
+                        SessionState::Running,
+                        Utc::now().timestamp_millis(),
+                    );
                     s.pending_input = false;
                     // Restarting an archived session brings it back to life:
                     // it returns to the active list. Clear the archive-intent
@@ -606,7 +621,11 @@ impl SessionManager {
         // waiting for the adapter's first Status event.
         let snapshot = {
             let mut s = entry.summary.write().await;
-            s.state = SessionState::Running;
+            crate::session::set_state_tracked(
+                &mut s,
+                SessionState::Running,
+                Utc::now().timestamp_millis(),
+            );
             s.pending_input = false;
             // Restarting an archived session brings it back to life: it
             // returns to the active list. Clear the archive-intent flag too so

@@ -1115,6 +1115,28 @@ pub(crate) struct RemoteHandle {
     pub(crate) port: u16,
 }
 
+/// Transition a session's state while maintaining its compute-time
+/// accounting (spec 0080 turn info): entering `Running` opens a busy span
+/// (`busy_running_since_ms`), leaving it banks the elapsed span into
+/// `busy_ms`. Every state write in the daemon must go through here so the
+/// accumulated compute time stays truthful.
+pub(crate) fn set_state_tracked(
+    s: &mut agentd_protocol::SessionSummary,
+    new_state: SessionState,
+    now_ms: i64,
+) {
+    if new_state == SessionState::Running {
+        if s.busy_running_since_ms.is_none() {
+            s.busy_running_since_ms = Some(now_ms);
+        }
+    } else if let Some(since) = s.busy_running_since_ms.take() {
+        s.busy_ms = s
+            .busy_ms
+            .saturating_add(now_ms.saturating_sub(since).max(0) as u64);
+    }
+    s.state = new_state;
+}
+
 impl SessionManager {
     /// Construct the manager along with the receiver side of the
     /// remote-start channel. The caller (`main.rs`) spawns the
@@ -1140,23 +1162,36 @@ impl SessionManager {
             // Preserve the prior state in the entry. `resume_running_sessions`
             // (called from main after construction) tries to respawn each
             // resumable session and falls back to marking Errored on failure.
-            // Recover seq counter from transcript line count.
+            // Recover seq counter from transcript line count, and recount
+            // chat messages while we're at it — `message_count` then
+            // self-heals for summaries saved before the field existed (or
+            // that lagged a crash).
             let path = storage.transcript_path(&s.id);
-            let count = if path.exists() {
+            let (count, message_count) = if path.exists() {
                 let f = std::fs::File::open(&path)?;
                 let reader = std::io::BufReader::new(f);
                 use std::io::BufRead;
                 let mut n = 0u64;
+                let mut msgs = 0u64;
                 for line in reader.lines() {
                     let line = line?;
-                    if !line.trim().is_empty() {
-                        n += 1;
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    n += 1;
+                    if let Ok(ts) = serde_json::from_str::<agentd_protocol::TimestampedEvent>(&line)
+                    {
+                        if matches!(ts.event, SessionEvent::Message { .. }) {
+                            msgs += 1;
+                        }
                     }
                 }
-                n
+                (n, msgs)
             } else {
-                0
+                (0, 0)
             };
+            let mut s = s;
+            s.message_count = message_count;
             // Scrollback survives daemon restarts because `pty_replay`
             // serves it from the on-disk `pty.log` directly; no in-memory
             // rehydration needed.
@@ -2552,11 +2587,16 @@ impl SessionManager {
                     }
                     let mut summary = entry.summary.write().await;
                     if !summary.state.is_terminal() {
-                        summary.state = if exit_code.unwrap_or(0) == 0 {
+                        let terminal = if exit_code.unwrap_or(0) == 0 {
                             SessionState::Done
                         } else {
                             SessionState::Errored
                         };
+                        set_state_tracked(
+                            &mut summary,
+                            terminal,
+                            chrono::Utc::now().timestamp_millis(),
+                        );
                     }
                     // `archive` records its intent on the entry before
                     // terminating the adapter — which is what triggered this
@@ -2887,7 +2927,11 @@ impl SessionManager {
             // A live session we just stopped should read as cleanly terminated,
             // not mid-run; leave an already-terminal state (Done/Errored) as-is.
             if !s.state.is_terminal() {
-                s.state = SessionState::Done;
+                set_state_tracked(
+                    &mut s,
+                    SessionState::Done,
+                    chrono::Utc::now().timestamp_millis(),
+                );
             }
             s.pending_input = false;
             s.clone()
@@ -2951,14 +2995,40 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow::anyhow!("unknown session: {id}"))?;
+        let parent_id = entry
+            .summary
+            .read()
+            .await
+            .forked_from
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("session is not a fork"))?
+            .session_id
+            .clone();
+        // The parent's CURRENT `event_count` at the moment of the merge is
+        // exactly where this fork's result (or discard) lands on the
+        // parent's own timeline — same counter scale as
+        // `ForkedFrom::transcript_seq` (see the doc comment on
+        // `ForkMerge::merged_seq`), so lineage rendering can later carve
+        // that timeline into segments without an extra fetch. A parent that
+        // has since been deleted has no timeline left to mark; fall back to
+        // 0 rather than failing the merge over it.
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (merged_seq, merged_busy_ms, merged_message_count) =
+            match self.get_entry(&parent_id).await {
+                Some(parent) => {
+                    let p = parent.summary().await;
+                    (p.event_count, p.busy_ms_at(now_ms), p.message_count)
+                }
+                None => (0, 0, 0),
+            };
         let snapshot = {
             let mut summary = entry.summary.write().await;
-            if summary.forked_from.is_none() {
-                anyhow::bail!("session is not a fork");
-            }
             summary.merge = Some(agentd_protocol::ForkMerge {
                 mode,
-                at_ms: chrono::Utc::now().timestamp_millis(),
+                at_ms: now_ms,
+                merged_seq,
+                merged_busy_ms,
+                merged_message_count,
             });
             summary.clone()
         };
@@ -3555,7 +3625,11 @@ impl SessionManager {
         }
         let mut s = entry.summary.write().await;
         if !s.state.is_terminal() {
-            s.state = SessionState::Errored;
+            set_state_tracked(
+                &mut s,
+                SessionState::Errored,
+                chrono::Utc::now().timestamp_millis(),
+            );
         }
         let snapshot = s.clone();
         drop(s);
@@ -3818,6 +3892,9 @@ mod tests {
             parent_session_id: None,
             native_subagent: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
+            message_count: 0,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
@@ -3826,6 +3903,41 @@ mod tests {
             forked_from: None,
             merge: None,
         }
+    }
+
+    #[test]
+    fn set_state_tracked_accumulates_running_spans_into_busy_ms() {
+        let mut s = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
+        s.state = SessionState::AwaitingInput;
+
+        // Entering Running opens a span but banks nothing yet.
+        set_state_tracked(&mut s, SessionState::Running, 1_000);
+        assert_eq!(s.state, SessionState::Running);
+        assert_eq!(s.busy_ms, 0);
+        assert_eq!(s.busy_running_since_ms, Some(1_000));
+
+        // Running → Running keeps the ORIGINAL span open — re-asserting the
+        // state (status events repeat it) must not reset the clock.
+        set_state_tracked(&mut s, SessionState::Running, 2_000);
+        assert_eq!(s.busy_running_since_ms, Some(1_000));
+
+        // Leaving Running banks the span into busy_ms.
+        set_state_tracked(&mut s, SessionState::AwaitingInput, 4_000);
+        assert_eq!(s.busy_ms, 3_000);
+        assert_eq!(s.busy_running_since_ms, None);
+
+        // Idle transitions with no open span bank nothing.
+        set_state_tracked(&mut s, SessionState::Done, 9_000);
+        assert_eq!(s.busy_ms, 3_000);
+
+        // A later Running span adds to the running total.
+        set_state_tracked(&mut s, SessionState::Running, 10_000);
+        set_state_tracked(&mut s, SessionState::Errored, 10_500);
+        assert_eq!(s.busy_ms, 3_500);
+
+        // Mid-span, busy_ms_at reports banked time plus the open span.
+        set_state_tracked(&mut s, SessionState::Running, 20_000);
+        assert_eq!(s.busy_ms_at(20_250), 3_750);
     }
 
     #[test]
@@ -4252,6 +4364,9 @@ mod tests {
                 parent_session_id: None,
                 native_subagent: None,
                 last_pty_at_ms: None,
+                busy_ms: 0,
+                busy_running_since_ms: None,
+                message_count: 0,
                 approval_mode: agentd_protocol::ApprovalMode::Manual,
                 kind,
                 archived: false,
@@ -4534,6 +4649,153 @@ mod tests {
         assert!(
             saw_archived_event,
             "archive must broadcast a State event for the session",
+        );
+    }
+
+    /// The TUI's lineage preview carves a node's own timeline into activity
+    /// segments using `ForkedFrom::transcript_seq` and `ForkMerge::
+    /// merged_seq` as matching checkpoints on the SAME counter
+    /// (`SessionSummary::event_count`) — so `merge()` must stamp
+    /// `merged_seq` from the PARENT's event_count at the moment of the
+    /// merge, not the fork's own.
+    #[tokio::test]
+    async fn merge_stamps_merged_seq_from_the_parents_current_event_count() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let parent = synthetic_entry("parent", agentd_protocol::SessionKind::User, 0);
+        {
+            let mut s = parent.summary.write().await;
+            s.event_count = 17;
+            s.busy_ms = 7_500;
+            s.message_count = 6;
+        }
+        mgr.sessions.write().await.insert("parent".into(), parent);
+
+        let fork = synthetic_entry("fork", agentd_protocol::SessionKind::User, 10);
+        fork.summary.write().await.forked_from = Some(agentd_protocol::ForkedFrom {
+            session_id: "parent".into(),
+            transcript_seq: 5,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+        fork.summary.write().await.event_count = 2;
+        mgr.sessions.write().await.insert("fork".into(), fork);
+
+        mgr.merge("fork", agentd_protocol::ForkMergeMode::Result)
+            .await
+            .expect("merge");
+
+        let fork_summary = mgr
+            .get_entry("fork")
+            .await
+            .expect("fork entry")
+            .summary()
+            .await;
+        let merge = fork_summary.merge.expect("merge outcome recorded");
+        assert_eq!(merge.mode, agentd_protocol::ForkMergeMode::Result);
+        assert_eq!(
+            merge.merged_seq, 17,
+            "merged_seq must come from the PARENT's event_count, not the fork's own"
+        );
+        assert_eq!(
+            merge.merged_busy_ms, 7_500,
+            "the merge boundary snapshots the PARENT's accumulated compute time \
+             so lineage turn-info windows can label busy deltas"
+        );
+        assert_eq!(
+            merge.merged_message_count, 6,
+            "the merge boundary snapshots the PARENT's chat-message tally \
+             so lineage turn-info windows can count actual messages"
+        );
+
+        // The parent's own event_count is untouched by merge() itself — the
+        // caller injects the result message through the parent's ordinary
+        // input path first (spec 0078), which is what actually advances it;
+        // merge() only records the outcome/checkpoint.
+        let parent_summary = mgr
+            .get_entry("parent")
+            .await
+            .expect("parent entry")
+            .summary()
+            .await;
+        assert_eq!(parent_summary.event_count, 17);
+    }
+
+    #[tokio::test]
+    async fn merge_with_a_gone_parent_falls_back_to_zero_merged_seq() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // The fork's parent was deleted before the fork got merged/discarded
+        // — merge() must still succeed (there's still a terminal outcome to
+        // record for the fork itself), just with no parent timeline to stamp.
+        let fork = synthetic_entry("orphan-fork", agentd_protocol::SessionKind::User, 0);
+        fork.summary.write().await.forked_from = Some(agentd_protocol::ForkedFrom {
+            session_id: "long-gone".into(),
+            transcript_seq: 3,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+        mgr.sessions
+            .write()
+            .await
+            .insert("orphan-fork".into(), fork);
+
+        mgr.merge("orphan-fork", agentd_protocol::ForkMergeMode::Discard)
+            .await
+            .expect("merge succeeds even with no parent entry left");
+
+        let summary = mgr
+            .get_entry("orphan-fork")
+            .await
+            .expect("entry")
+            .summary()
+            .await;
+        assert_eq!(summary.merge.expect("merge recorded").merged_seq, 0);
+    }
+
+    #[tokio::test]
+    async fn merge_on_a_non_fork_session_fails() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "solo".into(),
+            synthetic_entry("solo", agentd_protocol::SessionKind::User, 0),
+        );
+
+        assert!(
+            mgr.merge("solo", agentd_protocol::ForkMergeMode::Result)
+                .await
+                .is_err(),
+            "an ordinary session with no forked_from must not be mergeable"
         );
     }
 
@@ -5169,6 +5431,9 @@ mod tests {
             parent_session_id: None,
             native_subagent: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
+            message_count: 0,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             forked_from: None,
@@ -5306,6 +5571,9 @@ mod tests {
             parent_session_id: None,
             native_subagent: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
+            message_count: 0,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             archived: false,
@@ -5919,6 +6187,67 @@ mod tests {
         assert_eq!(result.events.len(), 50);
         assert_eq!(result.events.first().unwrap().seq, 1185);
         assert_eq!(result.events.last().unwrap().seq, 1234);
+    }
+
+    /// Loading a session recounts chat messages from its transcript, so
+    /// `message_count` self-heals for summaries saved before the field
+    /// existed (they deserialize as 0) and for summaries that lagged a
+    /// crash. Only `Message` events count — other persisted transcript
+    /// events (reasoning, tool blocks, status rows) must not inflate it.
+    #[tokio::test]
+    async fn load_recounts_chat_messages_from_the_transcript() {
+        use chrono::Utc;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+
+        // Saved summary carries no message tally (a pre-field record)...
+        let summary = placement_summary("recount", 0, None, agentd_protocol::SessionKind::User);
+        storage.save_summary(&summary).expect("save summary");
+        // ...but its transcript holds 2 chat messages among 5 events.
+        let events = [
+            agentd_protocol::SessionEvent::Message {
+                role: agentd_protocol::MessageRole::User,
+                text: "hi".into(),
+            },
+            agentd_protocol::SessionEvent::Reasoning {
+                text: "thinking".into(),
+            },
+            agentd_protocol::SessionEvent::Message {
+                role: agentd_protocol::MessageRole::Assistant,
+                text: "hello".into(),
+            },
+            agentd_protocol::SessionEvent::Reasoning {
+                text: "more thinking".into(),
+            },
+            agentd_protocol::SessionEvent::Reasoning {
+                text: "even more".into(),
+            },
+        ];
+        for (i, event) in events.into_iter().enumerate() {
+            let ts = agentd_protocol::TimestampedEvent {
+                seq: i as u64 + 1,
+                at: Utc::now(),
+                event,
+            };
+            storage.append_event("recount", &ts).expect("append event");
+        }
+
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let loaded = mgr
+            .get_entry("recount")
+            .await
+            .expect("loaded entry")
+            .summary()
+            .await;
+        assert_eq!(loaded.message_count, 2, "only Message events count");
     }
 
     /// `SessionManager::search` must use the live, in-memory session list

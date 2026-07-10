@@ -169,6 +169,48 @@ impl App {
                 }
             }
         }
+        // Lineage section (spec 0081): the header's mode toggle, the header
+        // itself (collapse), a session box (jump), then anywhere else inside
+        // the section (keyboard focus) — all before the generic focus/row
+        // path so a section click never doubles as a row selection.
+        if self
+            .layout
+            .lineage_toggle_hit
+            .is_some_and(|r| Self::rect_contains(r, col, row))
+        {
+            self.lineage_mode = self.lineage_mode.toggled();
+            // The two modes have different geometries — stale scroll
+            // offsets from one would land nowhere in the other.
+            self.lineage_scroll = 0;
+            self.lineage_scroll_x = 0;
+            return;
+        }
+        if self
+            .layout
+            .lineage_collapse_hit
+            .is_some_and(|r| Self::rect_contains(r, col, row))
+        {
+            self.lineage_collapsed = !self.lineage_collapsed;
+            if self.lineage_collapsed {
+                self.lineage_focused = false;
+            }
+            return;
+        }
+        if let Some(hit) = self
+            .layout
+            .lineage_box_hits
+            .iter()
+            .find(|hit| hit.contains(col, row))
+            .cloned()
+        {
+            self.lineage_focused = false;
+            self.jump_to_lineage_session(&hit.session_id);
+            return;
+        }
+        if self.is_over_lineage_section(col, row) {
+            self.activate_lineage_focus();
+            return;
+        }
         // A click anywhere inside the list pane focuses it, even on the
         // border or empty space past the last item — matching the
         // intuitive "click the pane to focus it" UX.
