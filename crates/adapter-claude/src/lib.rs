@@ -409,13 +409,9 @@ fn spawn_interactive_transcript_watcher(
             let mut retained_native_ids = Vec::new();
             for entry in entries.flatten() {
                 let child_path = entry.path();
-                let Some(name) = child_path.file_stem().and_then(|s| s.to_str()) else {
+                let Some(native_id) = claude_subagent_id_from_path(&child_path) else {
                     continue;
                 };
-                if !name.starts_with("agent-") {
-                    continue;
-                }
-                let native_id = normalize_claude_agent_id(name);
                 retained_native_ids.push(native_id.clone());
                 let first_seen = !child_lines.contains_key(&native_id);
                 let next = child_lines.entry(native_id.clone()).or_insert_with(|| {
@@ -589,6 +585,15 @@ fn claude_native_subagent_update(value: &Value) -> Option<(String, SessionState,
 
 fn normalize_claude_agent_id(id: &str) -> String {
     id.trim().strip_prefix("agent-").unwrap_or(id.trim()).to_string()
+}
+
+fn claude_subagent_id_from_path(path: &Path) -> Option<String> {
+    if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let stem = path.file_stem()?.to_str()?;
+    stem.starts_with("agent-")
+        .then(|| normalize_claude_agent_id(stem))
 }
 
 fn agent_id_from_text(raw: &str) -> Option<String> {
@@ -1043,6 +1048,14 @@ mod tests {
         );
         assert_eq!(normalize_claude_agent_id("abc123"), "abc123");
         assert_eq!(normalize_claude_agent_id("agent-abc123"), "abc123");
+        assert_eq!(
+            claude_subagent_id_from_path(Path::new("agent-abc123.jsonl")),
+            Some("abc123".into())
+        );
+        assert_eq!(
+            claude_subagent_id_from_path(Path::new("agent-abc123.meta.json")),
+            None
+        );
 
         let prefixed_complete = serde_json::json!({
             "content": "<task-notification><task-id>agent-abc123</task-id><status>completed</status></task-notification>"
