@@ -3021,15 +3021,21 @@ impl SessionManager {
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
 
         // Find neighbors in `me`'s visible reorder region (same group_id,
-        // user sessions only), sorted by position. The daemon list includes
-        // hidden orchestrator/subagent records so clients can render them in
-        // specialized places, but the TUI's session list filters those out. If
-        // reorder considers hidden records, a visible session surrounded by
-        // subagents can appear stuck or jump unpredictably because it swaps
-        // with rows the user cannot see.
+        // user sessions and archive partition only), sorted by position. The
+        // daemon list includes hidden orchestrator/subagent records so clients
+        // can render them in specialized places, but the TUI's session list
+        // filters those out. It also puts archived sessions behind a disclosure
+        // row. If reordering considers either kind of hidden record, a visible
+        // row can appear stuck because it swaps with a row the user cannot see.
+        //
+        // Keep archived sessions in their own partition as well: when their
+        // disclosure row is expanded, they can still be reordered among
+        // themselves without perturbing the active rows above it.
         let region: Vec<&SessionSummary> = all_sessions
             .iter()
-            .filter(|s| s.group_id == me.group_id && is_user_session_kind(s))
+            .filter(|s| {
+                s.group_id == me.group_id && is_user_session_kind(s) && s.archived == me.archived
+            })
             .collect();
         let pos_in_region = region.iter().position(|s| s.id == id).unwrap();
 
@@ -4232,6 +4238,47 @@ mod tests {
         assert_eq!(b.position, 10);
         assert_eq!(a.position, 30);
         assert_eq!(hidden.position, 20);
+    }
+
+    #[tokio::test]
+    async fn move_session_ignores_hidden_archived_sessions_in_reorder_region() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // The TUI shows active sessions directly but puts archived ones behind
+        // an initially-collapsed disclosure row. Moving `suser-b` up must swap
+        // with the visible `suser-a`, not only with invisible `sarchived`.
+        let active_a = synthetic_entry("suser-a", agentd_protocol::SessionKind::User, 0);
+        let archived = synthetic_entry("sarchived", agentd_protocol::SessionKind::User, 10);
+        archived.summary.write().await.archived = true;
+        let active_b = synthetic_entry("suser-b", agentd_protocol::SessionKind::User, 20);
+        for (id, entry) in [
+            ("suser-a", active_a),
+            ("sarchived", archived),
+            ("suser-b", active_b),
+        ] {
+            mgr.sessions.write().await.insert(id.into(), entry);
+        }
+
+        mgr.move_session("suser-b", agentd_protocol::MoveDirection::Up)
+            .await
+            .expect("move up");
+
+        let sessions = mgr.list().await;
+        let a = sessions.iter().find(|s| s.id == "suser-a").unwrap();
+        let archived = sessions.iter().find(|s| s.id == "sarchived").unwrap();
+        let b = sessions.iter().find(|s| s.id == "suser-b").unwrap();
+        assert_eq!(b.position, 0);
+        assert_eq!(a.position, 20);
+        assert_eq!(archived.position, 10);
     }
 
     /// Spec 0073: with a painted background reported, the daemon strips
