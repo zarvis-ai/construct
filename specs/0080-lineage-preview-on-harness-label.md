@@ -113,12 +113,21 @@ parent's lane with a labeled merge arrow (`│◂─ ↩ merge ──┘`). A su
 branches the same way (`▸ subagent` arrow, same brightness as the fork
 arrow — the word tells them apart) but never merges back.
 
-Rows follow the node's timeline in strict chronological (event) order:
-fork A, then fork B, then merge A renders exactly those three connectors
-top to bottom — a merge arrow is never grouped with its fork's block. A
-fork whose merge comes later keeps its lane column live: the lane runs
-down to its merge arrow, later branches stack to its right, and an arrow
-crossing a live lane breaks around its bar rather than erasing it.
+Rows are allocated from ONE global, time-ordered event queue spanning the
+whole tree: every fork-out, subagent spawn, merge-back, and lane end (a
+session going Done/Errored at its last event, a fork being discarded, or
+"now" for live sessions) gets its rows at its position in global time
+order, regardless of which lane it belongs to. Fork A, then fork B, then
+merge A renders exactly those three connectors top to bottom; a subagent
+that finished before a later fork branched shows its final ✓-marked turn
+info above that fork's arrow. A turn-info window renders at the row where
+its CLOSING event lands, on its own lane — so windows closing at the same
+instant share one row side by side (a merged fork's life next to its
+parent's while-it-was-out window at the merge; all live lanes' trailing
+windows together on the final "now" row). A lane whose end comes later
+stays live: its column keeps running down to its closing arrow or turn
+info, later boxes stack to its right, and an arrow crossing a live lane
+breaks around its bar rather than erasing it.
 
 Keyboard selection lands on the box label rows; boxes are the only
 selectable rows. The selection highlight covers exactly the selected
@@ -137,10 +146,14 @@ doesn't inject anything into the parent's transcript, so it isn't a
 boundary), and "now" (or the node's own terminal point, if it has one).
 Each gap between consecutive markers becomes one turn-info line
 describing exactly that window, emitted at the row where the window's
-CLOSING marker renders. A node's FINAL turn-info line appends a
-terminal-outcome glyph when its session has ended — `✓` for `Done`, `✗`
-for `Errored` (a fork's merged/discarded outcome is not repeated there:
-the merge arrow and the box label's own marker already carry it):
+CLOSING event renders — windows closing at the same instant share one
+row, each on its own lane (a merged fork's life sits next to its
+parent's while-it-was-out window at the merge; all live lanes' trailing
+windows share the final "now" row). A node's FINAL turn-info line
+appends a terminal-outcome glyph when its session has ended — `✓` for
+`Done`, `✗` for `Errored` (a fork's merged/discarded outcome is not
+repeated there: the merge arrow and the box label's own marker already
+carry it):
 
 ```
 ┌───────────────────────────┐
@@ -153,9 +166,7 @@ the merge arrow and the box label's own marker already carry it):
  ├─ ⑂ fork ─────────▸│ ● idea A (claude)  ↩ merged │
  │                   └─────────────────────────────┘
  │                    │
- │                    • 2 msgs · 1m05s
- │                    │
- • 5 msgs · 3m40s     │
+ • 5 msgs · 3m40s     • 2 msgs · 1m05s
  │                    │
  │◂─ ↩ merge ─────────┘
  │
