@@ -125,23 +125,6 @@ impl SessionManager {
                 }
             }
         }
-        // Persist smith/chat PTY bytes in the transcript as lightweight
-        // ordering markers. PTY replay still comes from pty.log, but these
-        // markers let a fresh TUI interleave transcript-only items (tool
-        // blocks) with the raw byte stream at the right point after restart.
-        if let SessionEvent::Pty { .. } = &event {
-            let seq = entry.transcript_count.fetch_add(1, Ordering::Relaxed) + 1;
-            let now = Utc::now();
-            let ts = TimestampedEvent {
-                seq,
-                at: now,
-                event: event.clone(),
-            };
-            if let Err(e) = self.storage.append_event(&entry.id, &ts) {
-                tracing::warn!(session = %entry.id, error = ?e, "append PTY marker failed");
-            }
-        }
-
         // AgentStatus is ephemeral live UI state. The CLI may render
         // inactive statuses as display-only history rows, but they
         // should not enter the structured transcript or PTY log.
@@ -231,12 +214,38 @@ impl SessionManager {
             }
             return;
         }
-        // PTY events take a fast path: append to the on-disk pty.log + a
-        // live broadcast. A copy was also appended to the transcript above
-        // as an ordering marker. Replay reads back from `pty.log` directly
-        // when a TUI attaches, so we no longer keep a parallel in-memory
-        // ring of bytes.
+        // PTY events take a latency-first fast path. Allocate their durable
+        // sequence and enqueue the live broadcast before any synchronous file
+        // writes or summary bookkeeping: focused clients are waiting on this
+        // event to display child echo/redraw after a forwarded keystroke.
+        // Persistence still completes in this handler before it returns.
         if let SessionEvent::Pty { .. } = &event {
+            let seq = entry.transcript_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let now = Utc::now();
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::Event(EventNotificationPayload {
+                    session_id: entry.id.clone(),
+                    at: now,
+                    event: event.clone(),
+                    seq,
+                }));
+
+            // Persist smith/chat PTY bytes in the transcript as lightweight
+            // ordering markers. PTY replay still comes from pty.log, but these
+            // markers let a fresh TUI interleave transcript-only items (tool
+            // blocks) with the raw byte stream at the right point after restart.
+            let ts = TimestampedEvent {
+                seq,
+                at: now,
+                event: event.clone(),
+            };
+            if let Err(e) = self.storage.append_event(&entry.id, &ts) {
+                tracing::warn!(session = %entry.id, error = ?e, "append PTY marker failed");
+            }
+
+            // Replay reads raw terminal bytes from pty.log, so persist the same
+            // filtered event after its live delivery.
             let mut is_active = true;
             if let Some(bytes) = event.pty_bytes() {
                 if !agentd_protocol::is_pty_active_payload(&bytes) {
@@ -250,7 +259,6 @@ impl SessionManager {
                     );
                 }
             }
-            let now = Utc::now();
             let is_focused = self.focused_sessions.lock().unwrap().contains(&entry.id);
             // Track activity for the "session looks busy" signal, and undo a
             // quiescence-driven AwaitingInput when output resumes — so the
@@ -308,16 +316,6 @@ impl SessionManager {
                         session: snapshot,
                     }));
             }
-            // Latest seq for ordering only; not persisted.
-            let seq = entry.transcript_count.load(Ordering::Relaxed);
-            let _ = self
-                .broadcast
-                .send(BroadcastMsg::Event(EventNotificationPayload {
-                    session_id: entry.id.clone(),
-                    at: now,
-                    event,
-                    seq,
-                }));
             return;
         }
 
@@ -706,4 +704,30 @@ fn session_event_is_program_output(event: &SessionEvent) -> bool {
                 ..
             }
     )
+}
+
+#[cfg(test)]
+mod ordering_tests {
+    #[test]
+    fn live_pty_broadcast_precedes_durable_writes() {
+        let source = include_str!("events.rs");
+        let fast_path = source
+            .find("// PTY events take a latency-first fast path.")
+            .expect("PTY fast path should remain identifiable");
+        let body = &source[fast_path..];
+        let broadcast = body
+            .find(".send(BroadcastMsg::Event")
+            .expect("PTY fast path should broadcast");
+        let transcript = body
+            .find("append PTY marker failed")
+            .expect("PTY fast path should persist its transcript marker");
+        let pty_log = body
+            .find("pty_log append failed")
+            .expect("PTY fast path should persist pty.log");
+
+        assert!(
+            broadcast < transcript && broadcast < pty_log,
+            "live PTY delivery must stay ahead of synchronous persistence"
+        );
+    }
 }
