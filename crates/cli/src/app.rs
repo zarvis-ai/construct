@@ -16944,7 +16944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resize_handle_hover_shows_drag_affordance() {
+    async fn resize_handle_hover_shows_directional_drag_glyph() {
         let (mut app, _dir, server) = empty_app().await;
         let backend = ratatui::backend::TestBackend::new(100, 40);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
@@ -16955,16 +16955,21 @@ mod tests {
             .expect("initial render");
         let list = app.layout.list_area.expect("list area");
         app.mouse_pos = Some((list.right().saturating_sub(1), list.y.saturating_add(2)));
-        assert!(app.is_on_resize_handle(
-            list.right().saturating_sub(1),
-            list.y.saturating_add(2)
-        ));
+        assert_eq!(
+            app.resize_handle_glyph_at(list.right().saturating_sub(1), list.y.saturating_add(2)),
+            Some("↔")
+        );
 
         term.draw(|f| crate::ui::render(f, &mut app))
             .expect("hover render");
-        assert!(
-            rendered_text(term.backend().buffer()).contains("Drag to resize"),
-            "a draggable border should advertise its resize behavior"
+        assert_eq!(
+            term.backend()
+                .buffer()
+                .cell((list.right().saturating_sub(1), list.y.saturating_add(2)))
+                .expect("resize cell")
+                .symbol(),
+            "↔",
+            "a vertical divider should advertise horizontal resizing"
         );
         server.abort();
     }

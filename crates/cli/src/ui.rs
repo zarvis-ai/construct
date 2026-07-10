@@ -289,7 +289,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_modeline_theme_tooltip(f, app);
     app.sync_program_popup_with_selection();
     render_program_popup(f, app);
-    render_resize_handle_tooltip(f, app);
+    render_resize_handle_cursor(f, app);
     render_tasks_popup(f, app);
     render_remote_control_popup(f, app);
     if app.help_visible {
@@ -669,15 +669,24 @@ fn render_tooltip_rect(f: &mut Frame, theme: &Theme, label: &str, rect: Rect) {
     f.render_widget(p, rect);
 }
 
-/// Surface every active drag-resize border as a discoverable affordance. The
-/// terminal cannot change the native pointer shape, so this is the only cue
-/// before the user tries dragging a pane/list/popup border.
-fn render_resize_handle_tooltip(f: &mut Frame, app: &App) {
+/// Replace the border cell under the pointer with a directional drag glyph.
+/// Terminals cannot change the native pointer shape, so this keeps the resize
+/// affordance compact and directly under the cursor.
+fn render_resize_handle_cursor(f: &mut Frame, app: &App) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
-    if app.is_on_resize_handle(mx, my) {
-        render_tooltip_at(f, &app.theme, " Drag to resize ", mx, my, 2, -1);
+    if let Some(glyph) = app.resize_handle_glyph_at(mx, my) {
+        let cell = Rect::new(mx, my, 1, 1).intersection(f.area());
+        if cell.width > 0 && cell.height > 0 {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    glyph,
+                    app.theme.text_style().add_modifier(Modifier::BOLD),
+                )),
+                cell,
+            );
+        }
     }
 }
 
