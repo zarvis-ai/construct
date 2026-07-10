@@ -3386,13 +3386,10 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     let program_open = summary
         .as_ref()
         .is_some_and(|s| app.open_program_session_ids().iter().any(|id| id == &s.id));
-    let mode_glyph = summary.as_ref().map(|s| {
-        if program_open {
-            session_mode_glyph(app, s, program_mode_glyph())
-        } else {
-            session_status_glyph(app, s)
-        }
-    });
+    // The exposed session pane remains a session pane even when its Program
+    // is slid aside. Keep its ordinary lifecycle glyph/color; the Program
+    // popup owns the distinct square, program-colored glyph.
+    let mode_glyph = summary.as_ref().map(|s| session_status_glyph(app, s));
     // Label budget = total − 2 corners − right-side blocks − fixed
     // title scaffolding (` <glyph> <label> ` is 3 spaces + glyph
     // width + label).
@@ -3417,7 +3414,7 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
     });
     let title: Line<'static> = match (summary.as_ref(), group.as_ref()) {
         (Some(s), _) => {
-            let glyph_style = session_title_glyph_style(&app.theme, program_open, focused);
+            let glyph_style = session_title_glyph_style(&app.theme, false, focused);
             let (rendered_label, cursor_col, window_start_chars) = match active_rename {
                 Some(rename) => visible_edit_window(&rename.buffer, rename.cursor, label_budget),
                 None => (truncate_to_width(&primary_label(s), label_budget), 0, 0),
