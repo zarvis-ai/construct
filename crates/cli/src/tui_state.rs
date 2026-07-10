@@ -58,6 +58,13 @@ pub struct TuiState {
     /// `[end tour]`.
     #[serde(default)]
     pub tutorial_step: Option<u8>,
+    /// Sessions whose lineage preview (spec 0080) was pinned open when the
+    /// TUI last quit — restored on launch so the widget reopens with them.
+    #[serde(default)]
+    pub lineage_pinned_session_ids: Vec<String>,
+    /// Whether the lineage preview was in the compact (rails) view.
+    #[serde(default)]
+    pub lineage_view_compact: bool,
 }
 
 impl Default for TuiState {
@@ -77,6 +84,8 @@ impl Default for TuiState {
             open_program_session_ids: Vec::new(),
             widgets: HashMap::new(),
             tutorial_step: None,
+            lineage_pinned_session_ids: Vec::new(),
+            lineage_view_compact: false,
         }
     }
 }
@@ -189,6 +198,25 @@ mod tests {
         let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(restored.tutorial_step, Some(4));
+    }
+
+    #[test]
+    fn state_round_trips_lineage_pins_and_view_mode() {
+        let state = TuiState {
+            lineage_pinned_session_ids: vec!["s1".into(), "s2".into()],
+            lineage_view_compact: true,
+            ..TuiState::default()
+        };
+        let json = serde_json::to_string(&state).expect("serialize");
+        let restored: TuiState = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.lineage_pinned_session_ids, vec!["s1", "s2"]);
+        assert!(restored.lineage_view_compact);
+
+        // Legacy blobs default to no pins / boxes view.
+        let legacy: TuiState =
+            serde_json::from_str(r#"{"last_selected_session_id": "s1"}"#).expect("legacy");
+        assert!(legacy.lineage_pinned_session_ids.is_empty());
+        assert!(!legacy.lineage_view_compact);
     }
 
     #[test]

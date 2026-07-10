@@ -214,8 +214,13 @@ pub enum LineageSpan {
     /// rows) when that session is the keyboard selection, without touching
     /// wiring that happens to share those rows.
     Border { session_id: String },
-    /// The glyph + word labeling a branch arrow (`⑂ fork` / `▸ subagent`).
-    Edge(LineageEdge),
+    /// The glyph labeling a branch arrow (`⑂` / `▸`) — tagged with the
+    /// branching session so hover/selection lights it with the rest of
+    /// that session's timeline.
+    Edge {
+        kind: LineageEdge,
+        session_id: String,
+    },
     /// Turn info for one activity window on some node's own timeline —
     /// bounded by that node's creation, a fork child's fork-out /
     /// merge-back points, and "now" (or the node's own terminal point).
@@ -1054,7 +1059,10 @@ fn layout_tree(
                     ay,
                     plane + 3,
                     edge_word,
-                    &LineageSpan::Edge(lanes[i].node.edge),
+                    &LineageSpan::Edge {
+                        kind: lanes[i].node.edge,
+                        session_id: lanes[i].node.session_id.clone(),
+                    },
                 );
                 for dx in (plane + 4 + ew)..x.saturating_sub(1) {
                     c.put_if_empty(ay, dx, '─', &child_border);
@@ -1306,7 +1314,15 @@ pub fn flatten_rails(
     let put_label = |c: &mut Canvas, row: usize, lane: &Lane, edge_prefix: Option<&str>| {
         let mut x = text_x;
         if let Some(glyph) = edge_prefix {
-            c.put(row, x, glyph, &LineageSpan::Edge(lane.node.edge));
+            c.put(
+                row,
+                x,
+                glyph,
+                &LineageSpan::Edge {
+                    kind: lane.node.edge,
+                    session_id: lane.node.session_id.clone(),
+                },
+            );
             x += UnicodeWidthStr::width(glyph) + 1;
         }
         let label = lane.label_lines.join(" ");
@@ -2680,10 +2696,13 @@ mod tests {
         };
         assert!(row_of(9) < row_of(2));
         assert_eq!(row_of(9) + 1, row_of(2), "staggered onto adjacent rows");
-        assert!(rows
-            .iter()
-            .flat_map(|r| r.spans.iter())
-            .any(|s| matches!(s.role, LineageSpan::Edge(LineageEdge::Subagent)) && s.text == "▸"));
+        assert!(rows.iter().flat_map(|r| r.spans.iter()).any(|s| matches!(
+            s.role,
+            LineageSpan::Edge {
+                kind: LineageEdge::Subagent,
+                ..
+            }
+        ) && s.text == "▸"));
     }
 
     #[test]

@@ -3302,6 +3302,17 @@ async fn run_with_socket_initial_selection(
     }
     app.restore_open_program_popups(&persisted.open_program_session_ids)
         .await;
+    // Reopen lineage previews that were pinned when the TUI last quit —
+    // pins for sessions that no longer exist are harmless (the preview
+    // only renders when the session has lineage to show).
+    app.lineage_preview_pinned = persisted
+        .lineage_pinned_session_ids
+        .iter()
+        .cloned()
+        .collect();
+    if persisted.lineage_view_compact {
+        app.lineage_preview_mode = crate::lineage::LineageViewMode::Rails;
+    }
 
     // Subscribe to all session events.
     if let Err(e) = client.subscribe(None).await {
@@ -3410,6 +3421,12 @@ async fn run_with_socket_initial_selection(
             .as_ref()
             .filter(|t| !t.completed)
             .map(|t| t.step),
+        lineage_pinned_session_ids: {
+            let mut ids: Vec<String> = app.lineage_preview_pinned.iter().cloned().collect();
+            ids.sort();
+            ids
+        },
+        lineage_view_compact: app.lineage_preview_mode == crate::lineage::LineageViewMode::Rails,
     });
 
     result

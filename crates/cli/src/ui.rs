@@ -9264,9 +9264,17 @@ fn render_lineage_row(
                         Style::default().fg(theme.dim)
                     }
                 }
-                // Fork and subagent arrow labels render at the same
-                // brightness — the word already tells them apart.
-                crate::lineage::LineageSpan::Edge(_) => Style::default().fg(theme.dim),
+                // Fork and subagent arrow glyphs render at the same
+                // brightness, and light up with their branching session.
+                crate::lineage::LineageSpan::Edge { session_id, .. } => {
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        border_highlight
+                    } else {
+                        Style::default().fg(theme.dim)
+                    }
+                }
                 // Turn info lights up with its owning session when that
                 // session is selected or hovered — the whole timeline of
                 // the picked lane reads as one highlighted unit.
@@ -9321,10 +9329,18 @@ fn render_lineage_row(
                     if selected_session == Some(session_id.as_str()) {
                         interior_highlight
                     } else {
+                        let hovered = hovered_session == Some(session_id.as_str());
                         let mut style = match by_id.get(session_id.as_str()) {
                             None => Style::default().fg(theme.dim),
                             Some(summary) => {
                                 let mut style = Style::default().fg(theme.text);
+                                if hovered {
+                                    style = style.add_modifier(Modifier::BOLD);
+                                } else {
+                                    // Rest state reads slightly recessed so
+                                    // the highlighted session pops.
+                                    style = style.add_modifier(Modifier::DIM);
+                                }
                                 if crate::lineage::ForkStatus::of(summary)
                                     == crate::lineage::ForkStatus::Discarded
                                 {
@@ -9333,7 +9349,7 @@ fn render_lineage_row(
                                 style
                             }
                         };
-                        if hovered_session == Some(session_id.as_str()) {
+                        if hovered {
                             style = style.add_modifier(Modifier::BOLD);
                         }
                         style
@@ -14660,10 +14676,15 @@ mod tests {
                 Some(theme.info),
                 "the Done glyph goes state-colored (blue-ish)"
             );
+            let name = span_style(false);
             assert_eq!(
-                span_style(false).fg,
+                name.fg,
                 Some(theme.text),
                 "the name keeps the default text color"
+            );
+            assert!(
+                name.add_modifier.contains(Modifier::DIM),
+                "unhighlighted names read slightly recessed"
             );
         }
     }
