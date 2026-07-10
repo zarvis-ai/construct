@@ -16944,6 +16944,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resize_handle_hover_shows_drag_affordance() {
+        let (mut app, _dir, server) = empty_app().await;
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+
+        // Render once to establish the live resize hit geometry, then hover
+        // the list's right border — the same cell that starts a list drag.
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("initial render");
+        let list = app.layout.list_area.expect("list area");
+        app.mouse_pos = Some((list.right().saturating_sub(1), list.y.saturating_add(2)));
+        assert!(app.is_on_resize_handle(
+            list.right().saturating_sub(1),
+            list.y.saturating_add(2)
+        ));
+
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("hover render");
+        assert!(
+            rendered_text(term.backend().buffer()).contains("Drag to resize"),
+            "a draggable border should advertise its resize behavior"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_title_uses_left_edge_status_spinner_with_program_color() {
+        use agentd_protocol::AgentStatus;
+
+        let (mut app, _dir, server) = two_session_app().await;
+        app.sessions[0].harness = "smith".into();
+        app.agent_statuses.insert(
+            "s1".into(),
+            AgentStatus {
+                active: true,
+                started_at_ms: 1,
+                status: "working".into(),
+            },
+        );
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program render");
+
+        let popup = app.layout.modal_area.expect("program area");
+        let glyph = term
+            .backend()
+            .buffer()
+            .cell((popup.x + 2, popup.y))
+            .expect("left title glyph");
+        assert!(
+            SPINNER_FRAMES.contains(&glyph.symbol()),
+            "active session should replace the Program rectangle with its status spinner"
+        );
+        assert_eq!(
+            glyph.style().fg,
+            Some(app.theme.accent_alt),
+            "the status spinner should retain the Program border color"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn program_execute_selection_saves_then_runs_selected_text() {
         use agentd_protocol::ipc_method;
         use serde_json::Value;

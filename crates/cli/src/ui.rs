@@ -289,6 +289,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_modeline_theme_tooltip(f, app);
     app.sync_program_popup_with_selection();
     render_program_popup(f, app);
+    render_resize_handle_tooltip(f, app);
     render_tasks_popup(f, app);
     render_remote_control_popup(f, app);
     if app.help_visible {
@@ -666,6 +667,18 @@ fn render_tooltip_rect(f: &mut Frame, theme: &Theme, label: &str, rect: Rect) {
     let p = Paragraph::new(label).block(block).style(theme.text_style());
     f.render_widget(Clear, rect);
     f.render_widget(p, rect);
+}
+
+/// Surface every active drag-resize border as a discoverable affordance. The
+/// terminal cannot change the native pointer shape, so this is the only cue
+/// before the user tries dragging a pane/list/popup border.
+fn render_resize_handle_tooltip(f: &mut Frame, app: &App) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    if app.is_on_resize_handle(mx, my) {
+        render_tooltip_at(f, &app.theme, " Drag to resize ", mx, my, 2, -1);
+    }
 }
 
 fn render_list_title_button_tooltips(f: &mut Frame, app: &App) {
@@ -11118,7 +11131,17 @@ fn program_title_line<'a>(
     left: &ProgramTitleLeft,
 ) -> Line<'a> {
     let dirty = popup.buffer != popup.saved_markdown;
-    let toggle_glyph = program_mode_glyph();
+    // The program's left-edge mode glyph is the same live status indicator as
+    // a session pane: while the owning session is working it becomes the
+    // spinner, otherwise it remains the static Program rectangle. Keeping it
+    // in this left slot makes the two title bars agree, while
+    // `program_toggle_style` preserves the Program frame's accent color.
+    let toggle_glyph = app
+        .sessions
+        .iter()
+        .find(|s| s.id == popup.program.session_id)
+        .map(|s| session_mode_glyph(app, s, program_mode_glyph()))
+        .unwrap_or_else(program_mode_glyph);
     let border_style = program_border_style(&app.theme, focused);
     // Title spans patch onto the border cells already painted underneath, so
     // a bright label over a dimmed frame must explicitly subtract DIM — an
