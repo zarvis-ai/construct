@@ -288,28 +288,24 @@ fn grok_allow_args() -> Vec<String> {
 }
 
 fn spawn_interactive_transcript_watcher(
-    session_id: String,
+    initial_id: Option<String>,
     cwd: PathBuf,
     emit: EventEmitter,
     skip_existing: bool,
 ) {
-    let Some(path) = grok_transcript_path(&cwd, &session_id) else {
+    if grok_home().is_none() {
         emit.log("grok: no GROK_HOME or HOME — cannot watch native transcript");
         return;
-    };
+    }
     tokio::spawn(async move {
-        for _ in 0..50 {
-            if path.exists() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        if !path.exists() {
-            emit.log(format!("grok: transcript file {} never appeared", path.display()));
-            return;
-        }
+        let mut current_id = initial_id;
+        let mut path: Option<PathBuf> = current_id
+            .as_ref()
+            .and_then(|id| grok_transcript_path(&cwd, id));
+        // Only the initial resume attach skips prior history; mid-session
+        // rebinds (after /clear) start at the top of the new transcript.
         let mut next_line = if skip_existing {
-            count_jsonl_lines(&path)
+            path.as_ref().map(|p| count_jsonl_lines(p)).unwrap_or(0)
         } else {
             0
         };
@@ -317,7 +313,36 @@ fn spawn_interactive_transcript_watcher(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            emit_new_grok_transcript_lines(&path, &mut next_line, &emit);
+
+            // Prefer the newest session dir under this cwd. First spawn
+            // discovers the id; after /clear a fresher dir appears and we
+            // rebind. (Same heuristic as first-discovery historically —
+            // concurrent grok sessions in one cwd can race on mtime.)
+            if let Some(id) = find_session_id(&cwd) {
+                if current_id.as_ref() != Some(&id) {
+                    if let Some(new_path) = grok_transcript_path(&cwd, &id) {
+                        if current_id.is_some() {
+                            emit.log(format!(
+                                "grok: native session id changed {:?} -> {id}; \
+                                 rebinding transcript watcher",
+                                current_id
+                            ));
+                        }
+                        write_conv_id(&id);
+                        current_id = Some(id);
+                        path = Some(new_path);
+                        next_line = 0;
+                    }
+                }
+            }
+
+            let Some(p) = path.as_ref() else {
+                continue;
+            };
+            if !p.exists() {
+                continue;
+            }
+            emit_new_grok_transcript_lines(p, &mut next_line, &emit);
         }
     });
 }
@@ -370,23 +395,10 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     };
 
     let cwd = PathBuf::from(&params.cwd);
-    let emit_clone = ctx.emit.clone();
-    tokio::spawn(async move {
-        let mut found_id = grok_session_id;
-        if found_id.is_none() {
-            for _ in 0..50 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                if let Some(id) = find_session_id(&cwd) {
-                    write_conv_id(&id);
-                    found_id = Some(id);
-                    break;
-                }
-            }
-        }
-        if let Some(id) = found_id {
-            spawn_interactive_transcript_watcher(id, cwd, emit_clone, resuming);
-        }
-    });
+    // Continuous discovery: Grok has no originator tag, so we track the
+    // newest session dir under this cwd. That covers first spawn *and*
+    // mid-session /clear (a fresh dir with a newer mtime).
+    spawn_interactive_transcript_watcher(grok_session_id, cwd, ctx.emit.clone(), resuming);
 
     let _ = run_pty(spec, ctx).await;
 }
@@ -501,8 +513,10 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         let _ = stderr_task.await;
         let _ = child.wait().await;
 
-        if session_id.is_none() {
-            if let Some(sid) = captured_sid.lock().unwrap().clone() {
+        // Always adopt the latest native id so a mid-run reset is honored
+        // on subsequent turns (and written for daemon resume).
+        if let Some(sid) = captured_sid.lock().unwrap().clone() {
+            if session_id.as_ref() != Some(&sid) {
                 write_conv_id(&sid);
                 session_id = Some(sid);
             }
@@ -550,9 +564,8 @@ where
                         "end" => {
                             if let Some(sid) = v.get("sessionId").and_then(|s| s.as_str()) {
                                 let mut g = captured_sid.lock().unwrap();
-                                if g.is_none() {
-                                    *g = Some(sid.to_string());
-                                }
+                                // Keep the most recently observed id (not only the first).
+                                *g = Some(sid.to_string());
                             }
                         }
                         "thought" => {
@@ -651,5 +664,33 @@ mod tests {
     fn url_encodes_paths_correctly() {
         let path = Path::new("/Users/moon/agentd");
         assert_eq!(url_encode_path(path), "%2FUsers%2Fmoon%2Fagentd");
+    }
+
+    #[test]
+    fn find_session_id_prefers_newest_mtime() {
+        // Simulate /clear: two UUID session dirs under the same project
+        // path; the newer mtime must win so resume tracks the active id.
+        let home = std::env::temp_dir().join(format!(
+            "agentd-grok-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cwd = Path::new("/tmp/agentd-grok-clear-test");
+        let sessions = home.join("sessions").join(url_encode_path(cwd));
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let old_id = "aaaaaaaa-bbbb-cccc-dddd-000000000001";
+        let new_id = "aaaaaaaa-bbbb-cccc-dddd-000000000002";
+        std::fs::create_dir_all(sessions.join(old_id)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(sessions.join(new_id)).unwrap();
+
+        std::env::set_var("CONSTRUCT_GROK_HOME", &home);
+        assert_eq!(find_session_id(cwd).as_deref(), Some(new_id));
+        std::env::remove_var("CONSTRUCT_GROK_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

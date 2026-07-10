@@ -172,10 +172,13 @@ fn write_conv_id(id: &str) {
 }
 
 /// Parse the `Created conversation <uuid>` line agy writes to its
-/// `--log-file`. Returns the first match. (`Conversation using project
-/// ID: <uuid>` is a *different* id — the project, not the conversation —
-/// so we anchor on the exact "Created conversation" wording.)
+/// `--log-file`. Returns the **last** match so a mid-session clear that
+/// creates a second conversation supersedes the original. (`Conversation
+/// using project ID: <uuid>` is a *different* id — the project, not the
+/// conversation — so we anchor on the exact "Created conversation"
+/// wording.)
 fn parse_conversation_id(log_text: &str) -> Option<String> {
+    let mut last: Option<String> = None;
     for line in log_text.lines() {
         if let Some(idx) = line.find("Created conversation ") {
             let rest = &line[idx + "Created conversation ".len()..];
@@ -185,11 +188,11 @@ fn parse_conversation_id(log_text: &str) -> Option<String> {
                 .take_while(|c| c.is_ascii_hexdigit() || *c == '-')
                 .collect();
             if id.len() == 36 {
-                return Some(id);
+                last = Some(id);
             }
         }
     }
-    None
+    last
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
@@ -263,18 +266,33 @@ fn spawn_interactive_transcript_watcher(
     tokio::spawn(async move {
         let mut conv_id = existing_id;
         let mut last_step = -1;
-        let mut initialized = false;
+        // First attach of a resumed id can skip prior transcript steps;
+        // every later rebind (post-/clear) starts fresh.
+        let mut skip_next_transcript = skip_existing && conv_id.is_some();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
 
-            if conv_id.is_none() {
-                if let Some(lp) = &log_path {
-                    if let Ok(text) = std::fs::read_to_string(lp) {
-                        if let Some(id) = parse_conversation_id(&text) {
+            // Always re-scan the log. Agy appends another
+            // "Created conversation" after /clear; parse returns the last
+            // match so we track the active native id, not the first.
+            if let Some(lp) = &log_path {
+                if let Ok(text) = std::fs::read_to_string(lp) {
+                    if let Some(id) = parse_conversation_id(&text) {
+                        if conv_id.as_ref() != Some(&id) {
+                            if conv_id.is_some() {
+                                emit.log(format!(
+                                    "antigravity: native conversation id changed {:?} -> {id}; \
+                                     rebinding transcript watcher",
+                                    conv_id
+                                ));
+                            }
                             write_conv_id(&id);
                             conv_id = Some(id);
+                            last_step = -1;
+                            // Only the initial resume attach skips history.
+                            skip_next_transcript = false;
                         }
                     }
                 }
@@ -286,11 +304,9 @@ fn spawn_interactive_transcript_watcher(
             let Some(tp) = transcript_path(id) else {
                 continue;
             };
-            if !initialized {
-                if skip_existing {
-                    last_step = max_step_index(&tp);
-                }
-                initialized = true;
+            if skip_next_transcript {
+                last_step = max_step_index(&tp);
+                skip_next_transcript = false;
             }
             last_step = emit_new_transcript_steps(&tp, last_step, &emit);
         }
@@ -423,12 +439,15 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         let outcome = drive_turn(&mut child, &mut inbox, &emit, &mut pending).await;
         let _ = child.wait().await;
 
-        // Learn the conversation id from this turn's log if we didn't
-        // have one yet, then emit the new transcript steps.
-        if conv_id.is_none() {
-            if let Ok(text) = std::fs::read_to_string(&log_path) {
-                if let Some(id) = parse_conversation_id(&text) {
+        // Learn / refresh the conversation id from this turn's log. A
+        // mid-run clear can mint a new id; subsequent turns must resume
+        // that one, not the first we ever saw.
+        if let Ok(text) = std::fs::read_to_string(&log_path) {
+            if let Some(id) = parse_conversation_id(&text) {
+                if conv_id.as_ref() != Some(&id) {
                     write_conv_id(&id);
+                    // New conversation → re-emit from the start of its transcript.
+                    last_step = -1;
                     conv_id = Some(id);
                 }
             }
@@ -612,6 +631,18 @@ mod tests {
         assert_eq!(
             parse_conversation_id(log).as_deref(),
             Some("b6eae99e-b76c-4417-837f-ea8adae0a2ba")
+        );
+    }
+
+    #[test]
+    fn parse_conversation_id_prefers_last_after_clear() {
+        // Agy appends another "Created conversation" when the user clears;
+        // resume must follow the newest id, not the original spawn.
+        let log = "I0522 01:17:15.555 server.go:747] Created conversation b6eae99e-b76c-4417-837f-ea8adae0a2ba\n\
+                   I0522 01:20:00.000 server.go:747] Created conversation aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee\n";
+        assert_eq!(
+            parse_conversation_id(log).as_deref(),
+            Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
         );
     }
 
