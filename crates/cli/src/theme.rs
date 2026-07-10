@@ -644,11 +644,23 @@ fn set_theme_line(text: &str, name: ThemeName) -> String {
 /// a light background, `Some(false)` for dark, or `None` if the terminal didn't
 /// answer within `timeout` (caller falls back). Must run in raw mode, before
 /// the event loop starts consuming stdin.
+///
+/// Do not issue the query over SSH. A terminal reply crosses the network back
+/// to this process, so it can arrive after the bounded synchronous reader has
+/// timed out and the crossterm event loop has taken ownership of stdin. At that
+/// point crossterm decodes the OSC bytes as ordinary key events and may forward
+/// them into the selected child PTY, corrupting its terminal state until its
+/// next repaint. Background-aware themes deliberately use their dark fallback
+/// remotely instead; users who need a fixed light palette can select `light`.
 #[cfg(unix)]
 pub fn detect_terminal_is_light(timeout: std::time::Duration) -> Option<bool> {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     use std::time::Instant;
+
+    if crate::app::is_remote_session() {
+        return None;
+    }
 
     {
         let mut out = std::io::stdout();

@@ -9653,12 +9653,18 @@ fn copy_to_clipboard(text: &str) -> Result<ClipboardCopyOutcome> {
     Ok(ClipboardCopyOutcome::Requested(mode))
 }
 
-/// True when the process appears to be running inside an SSH session, where
-/// local pasteboard tools (`pbcopy`) would target the remote host rather than
-/// the machine the user is sitting at.
-fn is_remote_session() -> bool {
-    std::env::var_os("SSH_TTY").is_some_and(|v| !v.is_empty())
-        || std::env::var_os("SSH_CONNECTION").is_some_and(|v| !v.is_empty())
+/// True when the process appears to be running inside an SSH session. Terminal
+/// behaviors whose request and reply cross that transport must account for its
+/// unbounded latency; host-local integrations such as `pbcopy` also target the
+/// wrong machine remotely.
+pub(crate) fn is_remote_session() -> bool {
+    is_remote_session_with(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+}
+
+fn is_remote_session_with(mut value_is_set: impl FnMut(&str) -> bool) -> bool {
+    ["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"]
+        .into_iter()
+        .any(&mut value_is_set)
 }
 
 fn copy_with_pbcopy(text: &str) -> Result<()> {
@@ -10356,6 +10362,14 @@ mod tests {
             (1_200, t2),
             "an advanced updated_at_ms (a genuine new write) must renew the receipt"
         );
+    }
+
+    #[test]
+    fn remote_session_recognizes_standard_ssh_markers() {
+        for marker in ["SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"] {
+            assert!(is_remote_session_with(|name| name == marker));
+        }
+        assert!(!is_remote_session_with(|_| false));
     }
 
     #[test]

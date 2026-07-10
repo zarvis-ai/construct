@@ -1,7 +1,7 @@
 # 0070-client-ui-themes
 
 Status: accepted
-Date: 2026-07-06
+Date: 2026-07-10
 Area: ux
 Scope: How Construct clients expose and preserve user-selectable color themes.
 
@@ -15,6 +15,13 @@ treatment. Dark and light are neutral palettes for users who want higher
 contrast or a non-Matrix visual treatment, and the TUI paints their full frame
 background so they look the same regardless of the host terminal background
 color.
+
+Background-aware TUI themes may probe a directly attached terminal to choose a
+light or dark palette. They must not emit terminal-reply-producing probes when
+the TUI is running through SSH: a reply can outlive a bounded probe reader,
+become ordinary TUI input, and corrupt an attached child terminal. Matrix and
+Basic use their dark variant as the safe SSH fallback; users can select the
+painted Light theme when they need a fixed light palette remotely.
 
 The TUI must support theme switching from a local slash command and from a
 mouse-clickable affordance in the Operator/minibuffer area. The web UI must
@@ -40,6 +47,10 @@ Matrix-specific visual mechanics, such as the operator rain viewport, may keep
 their behavior across themes, but their colors must adapt to the active palette.
 TUI renderers must not assume the terminal's default background is visible under
 neutral themes; neutral themes own the frame background.
+
+Automatic remote background detection is intentionally less important than
+keeping the terminal input stream unambiguous. Do not replace the SSH fallback
+with a longer fixed timeout: network delay has no reliable upper bound.
 
 ## Non-Goals
 
