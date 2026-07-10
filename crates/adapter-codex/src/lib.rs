@@ -226,10 +226,23 @@ fn spawn_interactive_transcript_watcher(
         let mut selected: Option<(String, PathBuf)> = None;
         let mut selected_mtime: Option<std::time::SystemTime> = None;
         let mut next_line: usize = 0;
+        let mut known: HashMap<String, (PathBuf, SessionMeta)> = HashMap::new();
+        let mut child_lines: HashMap<String, usize> = HashMap::new();
+        let mut child_states: HashMap<String, SessionState> = HashMap::new();
+        let mut initial_scan = true;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+
+            for (name, path) in list_rollouts(&sessions_root) {
+                if known.contains_key(&name) {
+                    continue;
+                }
+                if let Some(meta) = read_session_meta(&path) {
+                    known.insert(name, (path, meta));
+                }
+            }
 
             // Prefer the newest matching rollout. On first attach this
             // picks the live session; after /clear|/new a fresher file
@@ -282,7 +295,7 @@ fn spawn_interactive_transcript_watcher(
                             path.display()
                         ));
                     }
-                    selected = Some((name, path));
+                    selected = Some((name.clone(), path.clone()));
                     selected_mtime = mtime;
                 }
             }
@@ -291,6 +304,97 @@ fn spawn_interactive_transcript_watcher(
                 continue;
             };
             emit_new_codex_rollout_lines(path, &mut next_line, &emit);
+
+            let Some(root_id) = selected
+                .as_ref()
+                .and_then(|(name, _)| known.get(name))
+                .and_then(|(_, meta)| meta.id.clone())
+            else {
+                initial_scan = false;
+                continue;
+            };
+            let mut related = HashSet::from([root_id.clone()]);
+            loop {
+                let before = related.len();
+                for (_, meta) in known.values() {
+                    if meta
+                        .parent_thread_id
+                        .as_ref()
+                        .is_some_and(|parent| related.contains(parent))
+                    {
+                        if let Some(id) = meta.id.as_ref() {
+                            related.insert(id.clone());
+                        }
+                    }
+                }
+                if related.len() == before {
+                    break;
+                }
+            }
+            for (child_path, meta) in known.values() {
+                let (Some(child_id), Some(parent_id)) =
+                    (meta.id.as_ref(), meta.parent_thread_id.as_ref())
+                else {
+                    continue;
+                };
+                if !related.contains(child_id) || !related.contains(parent_id) {
+                    continue;
+                }
+                let first_seen = !child_lines.contains_key(child_id);
+                let line = child_lines.entry(child_id.clone()).or_insert_with(|| {
+                    if skip_existing && initial_scan {
+                        count_jsonl_lines(child_path)
+                    } else {
+                        0
+                    }
+                });
+                let mut state = child_states
+                    .get(child_id)
+                    .copied()
+                    .unwrap_or(SessionState::Running);
+                if first_seen {
+                    emit.emit(SessionEvent::NativeSubagent {
+                        id: child_id.clone(),
+                        parent_id: (parent_id != &root_id).then(|| parent_id.clone()),
+                        title: Some(format!("Codex subagent {}", short_codex_id(child_id))),
+                        state,
+                        event: None,
+                    });
+                }
+                for value in read_new_codex_values(child_path, line, &emit) {
+                    if let Some(next_state) = codex_native_state(&value) {
+                        state = next_state;
+                        child_states.insert(child_id.clone(), state);
+                    }
+                    let events = codex_rollout_events(&value);
+                    if events.is_empty() && codex_native_state(&value).is_some() {
+                        emit.emit(SessionEvent::NativeSubagent {
+                            id: child_id.clone(),
+                            parent_id: (parent_id != &root_id).then(|| parent_id.clone()),
+                            title: None,
+                            state,
+                            event: None,
+                        });
+                    }
+                    for event in events {
+                        let title = match &event {
+                            SessionEvent::Message {
+                                role: MessageRole::User,
+                                text,
+                            } => Some(short_title(text)),
+                            _ => None,
+                        };
+                        emit.emit(SessionEvent::NativeSubagent {
+                            id: child_id.clone(),
+                            parent_id: (parent_id != &root_id).then(|| parent_id.clone()),
+                            title,
+                            state,
+                            event: Some(Box::new(event)),
+                        });
+                    }
+                }
+            }
+            initial_scan = false;
         }
     });
 }
@@ -316,7 +420,8 @@ fn find_best_matching_rollout(
             continue;
         };
         let uuid = meta.id.clone().or_else(|| uuid_from_rollout_name(&name));
-        let originator_matches = meta.originator.as_deref() == Some(expected_originator);
+        let originator_matches = meta.originator.as_deref() == Some(expected_originator)
+            && meta.parent_thread_id.is_none();
         let uuid_matches = expected_uuid
             .is_some_and(|want| uuid.as_deref() == Some(want));
         if !originator_matches && !uuid_matches {
@@ -495,6 +600,7 @@ fn list_rollouts(root: &Path) -> Vec<(String, PathBuf)> {
 struct SessionMeta {
     id: Option<String>,
     originator: Option<String>,
+    parent_thread_id: Option<String>,
 }
 
 /// Read the rollout's first JSONL line and pull `payload.id` and
@@ -511,7 +617,60 @@ fn read_session_meta(path: &Path) -> Option<SessionMeta> {
             .get("originator")
             .and_then(|s| s.as_str())
             .map(String::from),
+        parent_thread_id: payload
+            .get("parent_thread_id")
+            .and_then(|s| s.as_str())
+            .map(String::from),
     })
+}
+
+fn read_new_codex_values(path: &Path, next_line: &mut usize, emit: &EventEmitter) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut seen = 0usize;
+    let mut values = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        seen = idx + 1;
+        if idx < *next_line || line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(value) => values.push(value),
+            Err(error) => emit.log(format!(
+                "codex subagent transcript: failed to parse {} line {}: {error}",
+                path.display(),
+                idx + 1
+            )),
+        }
+    }
+    *next_line = seen;
+    values
+}
+
+fn codex_native_state(value: &Value) -> Option<SessionState> {
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    match value.pointer("/payload/type").and_then(Value::as_str) {
+        Some("task_started") => Some(SessionState::Running),
+        Some("task_complete") => Some(SessionState::Done),
+        Some("task_failed") => Some(SessionState::Errored),
+        _ => None,
+    }
+}
+
+fn short_codex_id(id: &str) -> &str {
+    id.get(..id.len().min(8)).unwrap_or(id)
+}
+
+fn short_title(text: &str) -> String {
+    let title: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.chars().count() <= 72 {
+        title
+    } else {
+        format!("{}…", title.chars().take(71).collect::<String>())
+    }
 }
 
 /// Extract the trailing UUID from a `rollout-<ts>-<uuid>.jsonl` filename.
@@ -899,6 +1058,7 @@ mod tests {
             Some("019e32aa-014a-7ff0-9a3f-7ae773961a37")
         );
         assert_eq!(meta.originator.as_deref(), Some("agentd:sess-abc"));
+        assert_eq!(meta.parent_thread_id, None);
 
         // Default codex originator stays distinct.
         let other = tmp.join("rollout-other.jsonl");
@@ -974,6 +1134,44 @@ mod tests {
         assert_eq!(best.2, "019e32bb-014a-7ff0-9a3f-7ae773961a99");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_session_meta_extracts_native_parent() {
+        let tmp = std::env::temp_dir().join(format!(
+            "construct-codex-native-parent-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let rollout = tmp.join("rollout-child.jsonl");
+        std::fs::write(
+            &rollout,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"child\",\"parent_thread_id\":\"parent\",\"thread_source\":\"subagent\"}}\n",
+        )
+        .unwrap();
+        let meta = read_session_meta(&rollout).unwrap();
+        assert_eq!(meta.id.as_deref(), Some("child"));
+        assert_eq!(meta.parent_thread_id.as_deref(), Some("parent"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn native_state_uses_child_task_lifecycle() {
+        assert_eq!(
+            codex_native_state(&serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_started"}
+            })),
+            Some(SessionState::Running)
+        );
+        assert_eq!(
+            codex_native_state(&serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_complete"}
+            })),
+            Some(SessionState::Done)
+        );
     }
 
     #[test]

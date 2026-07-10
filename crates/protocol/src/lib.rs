@@ -338,6 +338,24 @@ pub struct UiAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
+    /// A child agent created and owned by the wrapped harness (for example a
+    /// Claude Code or Codex native subagent). The daemon projects these as
+    /// read-only virtual sessions; it must not spawn, resume, or directly
+    /// control a second adapter for them.
+    NativeSubagent {
+        /// Stable harness-native child identifier.
+        id: String,
+        /// Harness-native parent identifier. `None` means the Construct
+        /// session receiving this event is the direct parent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        state: SessionState,
+        /// Optional semantic transcript event belonging to the native child.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event: Option<Box<SessionEvent>>,
+    },
     Message {
         role: MessageRole,
         text: String,
@@ -1780,6 +1798,11 @@ pub struct SessionSummary {
     /// ordinary top-level sessions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Provenance for a read-only child session projected from a harness's
+    /// own subagent mechanism. Presence means Construct does not own this
+    /// child's process or lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_subagent: Option<NativeSubagentRef>,
     /// Unix epoch ms of the most recent PTY byte received from the adapter,
     /// or `None` if this session has never produced PTY output. Clients use
     /// `now - last_pty_at_ms < quiescence_window` as a "session looks busy"
@@ -1819,6 +1842,14 @@ pub struct SessionSummary {
     pub forked_from: Option<ForkedFrom>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge: Option<ForkMerge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeSubagentRef {
+    /// Construct session whose adapter owns the native child tree.
+    pub owner_session_id: String,
+    /// Stable identifier assigned by the wrapped harness.
+    pub native_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

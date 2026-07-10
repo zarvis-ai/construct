@@ -27,7 +27,7 @@ use agentd_protocol::{
 };
 use construct_adapter_common::{drive_turn, spawn_stderr_log, TurnOutcome};
 use serde_json::Value;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -345,6 +345,14 @@ fn spawn_interactive_transcript_watcher(
         } else {
             0
         };
+        let mut subagents_dir = path.parent().map(|p| {
+            p.join(path.file_stem().unwrap_or_default())
+                .join("subagents")
+        });
+        let mut child_lines: HashMap<String, usize> = HashMap::new();
+        let mut child_states: HashMap<String, SessionState> = HashMap::new();
+        let mut child_parents: HashMap<String, String> = HashMap::new();
+        let mut initial_scan = true;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -358,9 +366,91 @@ fn spawn_interactive_transcript_watcher(
                     current_id = new_id;
                     path = new_path;
                     next_line = 0;
+                    subagents_dir = path.parent().map(|p| {
+                        p.join(path.file_stem().unwrap_or_default())
+                            .join("subagents")
+                    });
+                    child_lines.clear();
+                    child_states.clear();
+                    child_parents.clear();
+                    initial_scan = true;
                 }
             }
-            emit_new_claude_transcript_lines(&path, &mut next_line, &emit);
+            let root_values = emit_new_claude_transcript_lines(&path, &mut next_line, &emit);
+            for value in root_values {
+                if let Some((id, state, title)) = claude_native_subagent_update(&value) {
+                    child_states.insert(id.clone(), state);
+                    emit.emit(SessionEvent::NativeSubagent {
+                        id,
+                        parent_id: None,
+                        title,
+                        state,
+                        event: None,
+                    });
+                }
+            }
+            let this_is_initial_scan = initial_scan;
+            initial_scan = false;
+            let Some(dir) = subagents_dir.as_ref() else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let child_path = entry.path();
+                let Some(name) = child_path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(native_id) = name.strip_prefix("agent-").map(str::to_string) else {
+                    continue;
+                };
+                let first_seen = !child_lines.contains_key(&native_id);
+                let next = child_lines.entry(native_id.clone()).or_insert_with(|| {
+                    if skip_existing && this_is_initial_scan {
+                        count_jsonl_lines(&child_path)
+                    } else {
+                        0
+                    }
+                });
+                let state = child_states
+                    .get(&native_id)
+                    .copied()
+                    .unwrap_or(SessionState::Running);
+                if first_seen {
+                    emit.emit(SessionEvent::NativeSubagent {
+                        id: native_id.clone(),
+                        parent_id: child_parents.get(&native_id).cloned(),
+                        title: Some(format!("Claude subagent {}", short_native_id(&native_id))),
+                        state,
+                        event: None,
+                    });
+                }
+                for value in read_new_claude_values(&child_path, next, &emit) {
+                    if let Some((nested_id, nested_state, title)) =
+                        claude_native_subagent_update(&value)
+                    {
+                        child_states.insert(nested_id.clone(), nested_state);
+                        child_parents.insert(nested_id.clone(), native_id.clone());
+                        emit.emit(SessionEvent::NativeSubagent {
+                            id: nested_id,
+                            parent_id: Some(native_id.clone()),
+                            title,
+                            state: nested_state,
+                            event: None,
+                        });
+                    }
+                    for event in claude_events_from_json(&value) {
+                        emit.emit(SessionEvent::NativeSubagent {
+                            id: native_id.clone(),
+                            parent_id: child_parents.get(&native_id).cloned(),
+                            title: None,
+                            state,
+                            event: Some(Box::new(event)),
+                        });
+                    }
+                }
+            }
         }
     });
 }
@@ -403,10 +493,15 @@ fn count_jsonl_lines(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-fn emit_new_claude_transcript_lines(path: &Path, next_line: &mut usize, emit: &EventEmitter) {
+fn emit_new_claude_transcript_lines(
+    path: &Path,
+    next_line: &mut usize,
+    emit: &EventEmitter,
+) -> Vec<Value> {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return;
+        return Vec::new();
     };
+    let mut values = Vec::new();
     let mut seen = 0usize;
     for (idx, line) in text.lines().enumerate() {
         seen = idx + 1;
@@ -417,7 +512,10 @@ fn emit_new_claude_transcript_lines(path: &Path, next_line: &mut usize, emit: &E
             continue;
         }
         match serde_json::from_str::<Value>(line) {
-            Ok(v) => emit_event_from_json(emit, v),
+            Ok(v) => {
+                emit_event_from_json(emit, v.clone());
+                values.push(v);
+            }
             Err(e) => emit.log(format!(
                 "claude transcript: failed to parse {} line {}: {e}",
                 path.display(),
@@ -426,6 +524,67 @@ fn emit_new_claude_transcript_lines(path: &Path, next_line: &mut usize, emit: &E
         }
     }
     *next_line = seen;
+    values
+}
+
+fn read_new_claude_values(path: &Path, next_line: &mut usize, emit: &EventEmitter) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut seen = 0usize;
+    let mut values = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        seen = idx + 1;
+        if idx < *next_line || line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => values.push(value),
+            Err(error) => emit.log(format!(
+                "claude subagent transcript: failed to parse {} line {}: {error}",
+                path.display(),
+                idx + 1
+            )),
+        }
+    }
+    *next_line = seen;
+    values
+}
+
+fn claude_native_subagent_update(value: &Value) -> Option<(String, SessionState, Option<String>)> {
+    let raw = serde_json::to_string(value).ok()?;
+    let id = xml_tag(&raw, "task-id").or_else(|| agent_id_from_text(&raw))?;
+    let status = xml_tag(&raw, "status").unwrap_or_else(|| "running".into());
+    let state = match status.as_str() {
+        "completed" => SessionState::Done,
+        "failed" | "errored" => SessionState::Errored,
+        "running" => SessionState::Running,
+        _ => return None,
+    };
+    let title = xml_tag(&raw, "summary");
+    Some((id, state, title))
+}
+
+fn agent_id_from_text(raw: &str) -> Option<String> {
+    let marker = "agentId: ";
+    let start = raw.find(marker)? + marker.len();
+    let id: String = raw[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    (!id.is_empty()).then_some(id)
+}
+
+fn xml_tag(raw: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = raw.find(&start_tag)? + start_tag.len();
+    let end = raw[start..].find(&end_tag)? + start;
+    Some(raw[start..end].replace("\\n", " ").trim().to_string())
+}
+
+fn short_native_id(id: &str) -> &str {
+    id.get(..id.len().min(8)).unwrap_or(id)
 }
 
 /// Seed the headless run queue from the session's initial prompt.
@@ -832,6 +991,31 @@ fn tool_results_from_message(msg: Option<&Value>) -> Vec<SessionEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_subagent_updates_parse_launch_and_completion() {
+        let launch = serde_json::json!({
+            "type": "user",
+            "message": {"content": "Async agent launched successfully.\nagentId: abc123"}
+        });
+        assert_eq!(
+            claude_native_subagent_update(&launch),
+            Some(("abc123".into(), SessionState::Running, None))
+        );
+
+        let complete = serde_json::json!({
+            "type": "queue-operation",
+            "content": "<task-notification><task-id>abc123</task-id><status>completed</status><summary>Inspect parser</summary></task-notification>"
+        });
+        assert_eq!(
+            claude_native_subagent_update(&complete),
+            Some((
+                "abc123".into(),
+                SessionState::Done,
+                Some("Inspect parser".into())
+            ))
+        );
+    }
 
     #[test]
     fn claude_project_slug_matches_project_dir_encoding() {

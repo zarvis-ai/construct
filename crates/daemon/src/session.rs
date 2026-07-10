@@ -8,13 +8,14 @@ use agentd_protocol::dialect;
 use agentd_protocol::{
     agent_context, ahp_method, ClientView, CreateSessionParams, DeletedNotificationPayload,
     EventNotificationPayload, GroupDeletedNotificationPayload, GroupStateNotificationPayload,
-    GroupSummary, HarnessInfo, MessageRole, MoveDirection, ProgramDocument, ProgramEditParams,
-    ProgramExecuteParams, ProgramExecuteResult, ProgramGetResult, ProgramListTemplatesResult,
-    ProgramRunProgress, ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult,
-    PtyReplayResult, PtySize, SearchParams, SearchResult, SessionAttachClipboardParams,
-    SessionAttachClipboardResult, SessionDetail, SessionEmitEventParams, SessionEvent,
-    SessionStartParams, SessionState, SessionSummary, SmithAuthMethodInfo, SmithAuthStatusResult,
-    SmithSetAuthMethodResult, StateNotificationPayload, TimestampedEvent, TranscriptResult,
+    GroupSummary, HarnessInfo, MessageRole, MoveDirection, NativeSubagentRef, ProgramDocument,
+    ProgramEditParams, ProgramExecuteParams, ProgramExecuteResult, ProgramGetResult,
+    ProgramListTemplatesResult, ProgramRunProgress, ProgramStateNotificationPayload,
+    ProgramUpdateParams, ProgramUpdateResult, PtyReplayResult, PtySize, SearchParams, SearchResult,
+    SessionAttachClipboardParams, SessionAttachClipboardResult, SessionDetail,
+    SessionEmitEventParams, SessionEvent, SessionStartParams, SessionState, SessionSummary,
+    SmithAuthMethodInfo, SmithAuthStatusResult, SmithSetAuthMethodResult, StateNotificationPayload,
+    TimestampedEvent, TranscriptResult,
 };
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
@@ -876,6 +877,14 @@ impl SessionEntry {
     pub async fn snapshot_state(&self) -> agentd_protocol::SessionState {
         self.summary.read().await.state
     }
+}
+
+fn native_subagent_session_id(owner_session_id: &str, native_id: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    format!(
+        "{owner_session_id}~native~{}",
+        URL_SAFE_NO_PAD.encode(native_id.as_bytes())
+    )
 }
 
 /// Per-session PTY metadata. Used to hold the last known PTY dimensions
@@ -2791,6 +2800,53 @@ impl SessionManager {
         ids
     }
 
+    async fn archive_native_mirror(&self, id: &str) -> Result<()> {
+        let entry = self
+            .get_entry(id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {id}"))?;
+        let children = self.child_subagent_ids(id).await;
+        let snapshot = {
+            let mut summary = entry.summary.write().await;
+            summary.archived = true;
+            summary.state = SessionState::Done;
+            summary.pending_input = false;
+            summary.clone()
+        };
+        entry.archived.store(true, Ordering::SeqCst);
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        for child in children {
+            Box::pin(self.archive_native_mirror(&child)).await?;
+        }
+        Ok(())
+    }
+
+    async fn delete_native_mirror(&self, id: &str) -> Result<()> {
+        let children = self.child_subagent_ids(id).await;
+        for child in children {
+            Box::pin(self.delete_native_mirror(&child)).await?;
+        }
+        let entry = self
+            .sessions
+            .write()
+            .await
+            .remove(id)
+            .ok_or_else(|| anyhow!("session not found: {id}"))?;
+        entry.deleted.store(true, Ordering::SeqCst);
+        self.storage.remove_session(id)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::Deleted(DeletedNotificationPayload {
+                session_id: id.to_string(),
+            }));
+        Ok(())
+    }
+
     /// Archive a session: terminate its adapter (if any) but keep the
     /// transcript, worktree, and start params on disk so it can be restarted
     /// later. The session is marked `archived` (hidden from the list by
@@ -2806,6 +2862,11 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        if entry.summary.read().await.native_subagent.is_some() {
+            return Err(anyhow!(
+                "native harness subagents are read-only; manage them through their parent harness"
+            ));
+        }
         // Snapshot the child subagents before we start mutating state so a
         // concurrently-finishing subagent can't slip out of the cascade.
         let child_subagents = self.child_subagent_ids(id).await;
@@ -2860,7 +2921,17 @@ impl SessionManager {
         // so nested subagents archive too. A failure on one child is logged but
         // never aborts the rest or the parent archive.
         for sid in &child_subagents {
-            if let Err(e) = Box::pin(self.archive(sid)).await {
+            let native = if let Some(entry) = self.get_entry(sid).await {
+                entry.summary.read().await.native_subagent.is_some()
+            } else {
+                false
+            };
+            let result = if native {
+                Box::pin(self.archive_native_mirror(sid)).await
+            } else {
+                Box::pin(self.archive(sid)).await
+            };
+            if let Err(e) = result {
                 tracing::warn!(
                     parent = %id,
                     subagent = %sid,
@@ -2907,6 +2978,13 @@ impl SessionManager {
     /// child subagents it spawned (recursively), so they don't linger as
     /// orphaned rows once their parent is gone.
     pub async fn delete(&self, id: &str) -> Result<()> {
+        if let Some(entry) = self.get_entry(id).await {
+            if entry.summary.read().await.native_subagent.is_some() {
+                return Err(anyhow!(
+                    "native harness subagents are read-only; manage them through their parent harness"
+                ));
+            }
+        }
         // Pull out the entry so the in-memory map releases the Arc; the
         // entry itself stays alive via our local Arc until the function ends.
         let entry = {
@@ -2980,7 +3058,17 @@ impl SessionManager {
         // so nested subagents are torn down too. A failure on one child is
         // logged but never aborts the rest or the parent delete.
         for sid in &child_subagents {
-            if let Err(e) = Box::pin(self.delete(sid)).await {
+            let native = if let Some(entry) = self.get_entry(sid).await {
+                entry.summary.read().await.native_subagent.is_some()
+            } else {
+                false
+            };
+            let result = if native {
+                Box::pin(self.delete_native_mirror(sid)).await
+            } else {
+                Box::pin(self.delete(sid)).await
+            };
+            if let Err(e) = result {
                 tracing::warn!(
                     parent = %id,
                     subagent = %sid,
@@ -3727,6 +3815,7 @@ mod tests {
             position,
             group_id: group_id.map(str::to_string),
             parent_session_id: None,
+            native_subagent: None,
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
@@ -4160,6 +4249,7 @@ mod tests {
                 position,
                 group_id,
                 parent_session_id: None,
+                native_subagent: None,
                 last_pty_at_ms: None,
                 approval_mode: agentd_protocol::ApprovalMode::Manual,
                 kind,
@@ -5076,6 +5166,7 @@ mod tests {
             position: 0,
             group_id: None,
             parent_session_id: None,
+            native_subagent: None,
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
@@ -5212,6 +5303,7 @@ mod tests {
             position: 0,
             group_id: None,
             parent_session_id: None,
+            native_subagent: None,
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
@@ -8695,5 +8787,65 @@ done
             mgr.program_run_snapshot(&id).is_none(),
             "a terminal state clears a managed run"
         );
+    }
+
+    #[tokio::test]
+    async fn native_subagent_event_projects_read_only_child_and_transcript() {
+        use agentd_protocol::{MessageRole, NativeSubagentRef};
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(Config::default());
+        let (manager, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("manager");
+        let owner = synthetic_entry("owner", agentd_protocol::SessionKind::User, 0);
+        owner.summary.write().await.harness = "codex".into();
+        manager
+            .sessions
+            .write()
+            .await
+            .insert(owner.id.clone(), owner.clone());
+
+        manager
+            .handle_event(
+                &owner,
+                SessionEvent::NativeSubagent {
+                    id: "native-child".into(),
+                    parent_id: None,
+                    title: Some("Inspect parser".into()),
+                    state: SessionState::Running,
+                    event: Some(Box::new(SessionEvent::Message {
+                        role: MessageRole::Assistant,
+                        text: "found it".into(),
+                    })),
+                },
+            )
+            .await;
+
+        let projected_id = native_subagent_session_id("owner", "native-child");
+        let child = manager
+            .detail(&projected_id)
+            .await
+            .expect("projected child");
+        assert_eq!(child.summary.parent_session_id.as_deref(), Some("owner"));
+        assert_eq!(child.summary.title.as_deref(), Some("Inspect parser"));
+        assert_eq!(child.summary.harness, "codex");
+        assert_eq!(
+            child.summary.native_subagent,
+            Some(NativeSubagentRef {
+                owner_session_id: "owner".into(),
+                native_id: "native-child".into(),
+            })
+        );
+        assert!(matches!(
+            child.events.as_slice(),
+            [TimestampedEvent {
+                event: SessionEvent::Message { text, .. },
+                ..
+            }] if text == "found it"
+        ));
     }
 }

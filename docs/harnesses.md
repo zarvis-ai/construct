@@ -82,6 +82,12 @@ always force that behavior from outside the process. In those cases the session
 still gets the shared UI, transcript, lifecycle, and environment, but the
 upstream CLI keeps control of its own internals.
 
+Claude Code and Codex subagents created through their native delegation tools
+appear beneath the owning session as `(native)` child rows. Their live state and
+structured transcript are inspectable like any other session, including nested
+children. These rows are read-only mirrors: use the parent CLI's native
+subagent commands to message, interrupt, resume, or remove them.
+
 ## Interactive and headless sessions
 
 Most harnesses can run in two modes:

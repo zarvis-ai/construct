@@ -86,6 +86,7 @@ impl SessionManager {
                 .parent_session_id
                 .clone()
                 .or_else(|| params.env.get("CONSTRUCT_PARENT_SESSION_ID").cloned()),
+            native_subagent: None,
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: params.kind,
@@ -371,7 +372,7 @@ impl SessionManager {
                 // Archived sessions stay down across daemon restarts — the
                 // user terminated them on purpose and brings them back with an
                 // explicit restart, not auto-resume.
-                if should_resume_on_startup(s.state) && !s.archived {
+                if should_resume_on_startup(s.state) && !s.archived && s.native_subagent.is_none() {
                     v.push(id.clone());
                 }
             }
@@ -691,6 +692,11 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
+        if entry.summary.read().await.native_subagent.is_some() {
+            return Err(anyhow!(
+                "native harness subagents are read-only; resume them through their parent harness"
+            ));
+        }
         if entry.adapter.lock().await.is_some() {
             return Err(anyhow!(
                 "session already has a live adapter (state is not terminal)"

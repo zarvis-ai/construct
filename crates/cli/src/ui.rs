@@ -7836,6 +7836,7 @@ fn chat_event_kind(ev: &SessionEvent) -> ChatEventKind {
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::OperatorLoopChanged { .. }
         | SessionEvent::ModelChanged { .. }
+        | SessionEvent::NativeSubagent { .. }
         | SessionEvent::AgentStatus(_) => ChatEventKind::Hidden,
         SessionEvent::Message { role, text } if should_render_chat_message(*role, text) => {
             if *role == MessageRole::Assistant {
@@ -8022,6 +8023,7 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::OperatorLoopChanged { .. }
         | SessionEvent::ModelChanged { .. }
+        | SessionEvent::NativeSubagent { .. }
         | SessionEvent::AgentStatus(_) => Vec::new(),
         SessionEvent::Message { role, text } => {
             let role_label = match role {
@@ -8803,6 +8805,9 @@ fn shorten(s: &str, max: usize) -> String {
 
 pub fn short_event_label(ev: &SessionEvent) -> String {
     match ev {
+        SessionEvent::NativeSubagent { id, state, .. } => {
+            format!("native-subagent {id} {state:?}")
+        }
         SessionEvent::PtyResize { cols, rows } => format!("pty_resize {cols}x{rows}"),
         SessionEvent::ToolApprovalResolved { call_id } => {
             format!("approval-resolved {call_id}")
@@ -8889,7 +8894,9 @@ pub fn is_headless(s: &agentd_protocol::SessionSummary) -> bool {
 }
 
 fn harness_label(s: &agentd_protocol::SessionSummary) -> String {
-    if is_headless(s) {
+    if s.native_subagent.is_some() {
+        format!("(native) {}", s.harness)
+    } else if is_headless(s) {
         format!("(headless) {}", s.harness)
     } else {
         s.harness.clone()
@@ -13957,6 +13964,7 @@ mod tests {
             position: 0,
             group_id: None,
             parent_session_id: None,
+            native_subagent: None,
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,

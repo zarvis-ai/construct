@@ -3419,7 +3419,7 @@ function orderedItems() {
       const activeChildren = children.filter((c) => !c.archived);
       const archivedChildren = children.filter((c) => c.archived);
       for (const child of activeChildren) {
-        items.push({ kind: "session", session: child, indented: true, isSubagent: true });
+        pushSession(items, child, true);
       }
       if (archivedChildren.length > 0) {
         const archivedExpanded = state.showArchivedSubagents.has(session.id);
@@ -3432,7 +3432,7 @@ function orderedItems() {
         });
         if (archivedExpanded) {
           for (const child of archivedChildren) {
-            items.push({ kind: "session", session: child, indented: true, isSubagent: true });
+            pushSession(items, child, true);
           }
         }
       }
@@ -3667,7 +3667,7 @@ function sessionRowDescriptor(item) {
     className:
       "item" + active +
       (item.indented ? " indent" : "") +
-      (item.isSubagent ? " is-subagent" : "") +
+      (s.kind === "subagent" ? " is-subagent" : "") +
       (s.pinned ? " is-pinned" : "") +
       (s.archived ? " is-archived" : ""),
     inner:
@@ -9979,6 +9979,7 @@ function isStructuredToolSession(s) {
 
 function sessionHarnessLabel(s) {
   const harness = (s && s.harness) || "";
+  if (s && s.native_subagent && harness) return `(native) ${harness}`;
   return isHeadlessSession(s) && harness ? `(headless) ${harness}` : harness;
 }
 

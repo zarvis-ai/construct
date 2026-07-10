@@ -17,6 +17,18 @@ impl SessionManager {
         if self.is_shutting_down.load(Ordering::Acquire) {
             return;
         }
+        if let SessionEvent::NativeSubagent {
+            id,
+            parent_id,
+            title,
+            state,
+            event,
+        } = event
+        {
+            self.handle_native_subagent_event(entry, id, parent_id, title, state, event)
+                .await;
+            return;
+        }
         if matches!(event, SessionEvent::Reset) {
             if let Err(e) = self.storage.truncate_transcript(&entry.id) {
                 tracing::warn!(session = %entry.id, error = ?e, "truncate_transcript on reset failed");
@@ -344,6 +356,7 @@ impl SessionManager {
                     s.pending_input = false;
                 }
                 SessionEvent::Reset
+                | SessionEvent::NativeSubagent { .. }
                 | SessionEvent::Message { .. }
                 | SessionEvent::Reasoning { .. }
                 | SessionEvent::ToolUse { .. }
@@ -469,6 +482,123 @@ impl SessionManager {
             .send(BroadcastMsg::State(StateNotificationPayload {
                 session: summary,
             }));
+    }
+
+    async fn handle_native_subagent_event(
+        &self,
+        owner: &Arc<SessionEntry>,
+        native_id: String,
+        parent_native_id: Option<String>,
+        title: Option<String>,
+        state: SessionState,
+        event: Option<Box<SessionEvent>>,
+    ) {
+        let owner_summary = owner.summary().await;
+        // Native-child events must originate at the root Construct session.
+        // If a projected event is ever accidentally nested, retain the real
+        // owner so stable ids and parent links do not drift.
+        let root_owner_id = owner_summary
+            .native_subagent
+            .as_ref()
+            .map(|n| n.owner_session_id.clone())
+            .unwrap_or_else(|| owner.id.clone());
+        let id = native_subagent_session_id(&root_owner_id, &native_id);
+        let parent_session_id = parent_native_id
+            .as_deref()
+            .map(|parent| native_subagent_session_id(&root_owner_id, parent))
+            .unwrap_or_else(|| root_owner_id.clone());
+
+        let entry = if let Some(existing) = self.get_entry(&id).await {
+            existing
+        } else {
+            let now = Utc::now();
+            let summary = SessionSummary {
+                id: id.clone(),
+                harness: owner_summary.harness.clone(),
+                cwd: owner_summary.cwd.clone(),
+                title: title.clone(),
+                state,
+                created_at: now,
+                last_event_at: None,
+                cost_usd: None,
+                model: owner_summary.model.clone(),
+                worktree: owner_summary.worktree.clone(),
+                pending_input: false,
+                last_prompt: None,
+                event_count: 0,
+                has_pty: false,
+                mode: Some("native-subagent".into()),
+                pinned: false,
+                position: -now.timestamp_millis(),
+                group_id: owner_summary.group_id.clone(),
+                parent_session_id: Some(parent_session_id.clone()),
+                native_subagent: Some(NativeSubagentRef {
+                    owner_session_id: root_owner_id.clone(),
+                    native_id: native_id.clone(),
+                }),
+                last_pty_at_ms: None,
+                approval_mode: owner_summary.approval_mode,
+                kind: agentd_protocol::SessionKind::Subagent,
+                archived: false,
+                operator_loop_disabled: true,
+                needs_attention: false,
+                forked_from: None,
+                merge: None,
+            };
+            let created = Arc::new(SessionEntry {
+                id: id.clone(),
+                summary: RwLock::new(summary.clone()),
+                transcript_count: AtomicU64::new(0),
+                adapter: tokio::sync::Mutex::new(None),
+                pty: tokio::sync::Mutex::new(PtyState::default()),
+                deleted: AtomicBool::new(false),
+                archived: AtomicBool::new(false),
+                title_gen_attempted: AtomicBool::new(true),
+                pending_title_prompts: std::sync::Mutex::new(Vec::new()),
+                pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+                tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+                pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+                unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
+            });
+            if let Err(error) = self.storage.save_summary(&summary) {
+                tracing::warn!(session = %id, ?error, "save native subagent summary failed");
+            }
+            self.sessions
+                .write()
+                .await
+                .insert(id.clone(), created.clone());
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::State(StateNotificationPayload {
+                    session: summary,
+                }));
+            created
+        };
+
+        let snapshot = {
+            let mut summary = entry.summary.write().await;
+            summary.parent_session_id = Some(parent_session_id);
+            summary.state = state;
+            if title.as_ref().is_some_and(|title| !title.trim().is_empty()) {
+                summary.title = title;
+            }
+            summary.clone()
+        };
+        let _ = self.storage.save_summary(&snapshot);
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+
+        if let Some(child_event) = event {
+            // Adapters must not recursively wrap native-child routing events.
+            if !matches!(*child_event, SessionEvent::NativeSubagent { .. }) {
+                Box::pin(self.handle_event(&entry, *child_event)).await;
+            }
+        }
     }
 }
 

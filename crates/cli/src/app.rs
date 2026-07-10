@@ -616,6 +616,7 @@ fn chat_scroll_kind(ev: &SessionEvent) -> ChatScrollKind {
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::OperatorLoopChanged { .. }
         | SessionEvent::ModelChanged { .. }
+        | SessionEvent::NativeSubagent { .. }
         | SessionEvent::AgentStatus(_) => ChatScrollKind::Hidden,
         SessionEvent::Message { role, text }
             if should_render_chat_message_for_scroll(*role, text) =>
@@ -4579,10 +4580,18 @@ impl App {
             forks.sort_by_key(|s| s.position);
         }
 
-        let push_session = |out: &mut Vec<ListItem>, s: &SessionSummary, indented: bool| {
+        fn push_session_tree<'a>(
+            out: &mut Vec<ListItem>,
+            s: &SessionSummary,
+            indented: bool,
+            subagents_by_parent: &HashMap<&'a str, Vec<&'a SessionSummary>>,
+            forks_by_parent: &HashMap<&'a str, Vec<&'a SessionSummary>>,
+            collapsed: &HashSet<String>,
+            show_archived: &HashSet<String>,
+        ) {
             let children = subagents_by_parent.get(s.id.as_str());
             let has_children = children.map(|v| !v.is_empty()).unwrap_or(false);
-            let children_expanded = has_children && !self.subagent_collapsed.contains(&s.id);
+            let children_expanded = has_children && !collapsed.contains(&s.id);
             out.push(ListItem::Session {
                 summary: s.clone(),
                 indented,
@@ -4596,16 +4605,19 @@ impl App {
                         Vec<&SessionSummary>,
                     ) = children.iter().copied().partition(|child| !child.archived);
                     for child in active_children {
-                        out.push(ListItem::Session {
-                            summary: child.clone(),
-                            indented: true,
-                            has_children: false,
-                            children_expanded: false,
-                        });
+                        push_session_tree(
+                            out,
+                            child,
+                            true,
+                            subagents_by_parent,
+                            forks_by_parent,
+                            collapsed,
+                            show_archived,
+                        );
                     }
                     if !archived_children.is_empty() {
                         let section = ArchiveSection::Subagents(s.id.clone());
-                        let expanded = self.show_archived_subagents.contains(&s.id);
+                        let expanded = show_archived.contains(&s.id);
                         out.push(ListItem::ArchivedRow {
                             section,
                             count: archived_children.len(),
@@ -4614,12 +4626,15 @@ impl App {
                         });
                         if expanded {
                             for child in archived_children {
-                                out.push(ListItem::Session {
-                                    summary: child.clone(),
-                                    indented: true,
-                                    has_children: false,
-                                    children_expanded: false,
-                                });
+                                push_session_tree(
+                                    out,
+                                    child,
+                                    true,
+                                    subagents_by_parent,
+                                    forks_by_parent,
+                                    collapsed,
+                                    show_archived,
+                                );
                             }
                         }
                     }
@@ -4635,6 +4650,18 @@ impl App {
                     });
                 }
             }
+        }
+
+        let push_session = |out: &mut Vec<ListItem>, s: &SessionSummary, indented: bool| {
+            push_session_tree(
+                out,
+                s,
+                indented,
+                &subagents_by_parent,
+                &forks_by_parent,
+                &self.subagent_collapsed,
+                &self.show_archived_subagents,
+            );
         };
 
         let mut ungrouped: Vec<&SessionSummary> = self
@@ -10907,6 +10934,7 @@ mod tests {
             position: 0,
             group_id: None,
             parent_session_id: None,
+            native_subagent: None,
             last_pty_at_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
@@ -26789,13 +26817,17 @@ mod tests {
         child.id = "schild".into();
         child.parent_session_id = Some("sparent".into());
         child.position = 1;
+        let mut grandchild = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        grandchild.id = "sgrandchild".into();
+        grandchild.parent_session_id = Some("schild".into());
+        grandchild.position = 2;
         let mut orphan = summary_with_kind(agentd_protocol::SessionKind::Subagent);
         orphan.id = "sorphan".into();
         orphan.position = -1;
 
-        let mut app = test_app(client, vec![orphan, child, parent]);
+        let mut app = test_app(client, vec![orphan, grandchild, child, parent]);
         let items = app.list_items();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         match &items[0] {
             ListItem::Session {
                 summary,
@@ -26819,10 +26851,15 @@ mod tests {
             } => {
                 assert_eq!(summary.id, "schild");
                 assert!(*indented);
-                assert!(!has_children);
+                assert!(*has_children);
             }
             _ => panic!("expected subagent session"),
         }
+        assert!(matches!(
+            &items[2],
+            ListItem::Session { summary, indented: true, has_children: false, .. }
+                if summary.id == "sgrandchild"
+        ));
 
         app.selection = Selection::Session("sparent".into());
         app.focus = PaneFocus::List;
@@ -26830,7 +26867,7 @@ mod tests {
         let collapsed_by_key = app.list_items();
         assert_eq!(collapsed_by_key.len(), 1);
         app.run_action(KeyAction::ExpandGroup).await;
-        assert_eq!(app.list_items().len(), 2);
+        assert_eq!(app.list_items().len(), 3);
 
         app.subagent_collapsed.insert("sparent".into());
         let collapsed = app.list_items();
