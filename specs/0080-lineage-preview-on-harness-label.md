@@ -128,34 +128,38 @@ preview width, and never the wiring or turn info sharing those rows.
 ### Activity stats are per-segment, not per-node
 
 Activity stats (message/turn count, elapsed time) render as turn-info
-lines ON the lanes — outdented two columns from the lane, flowing over
-it — positioned BETWEEN the markers that bound them, never on a node's
-own box label. The markers on a node's own timeline are: its own
-creation, each fork child's fork-out point, each fork child's merge-back
-point (only when it actually merged — a discard doesn't inject anything
-into the parent's transcript, so it isn't a boundary), and "now" (or the
-node's own terminal point, if it has one). Each gap between consecutive
-markers becomes one turn-info line describing exactly that window,
-emitted at the row where the window's CLOSING marker renders:
+lines ON the lanes — a `•` bullet sitting where the lane's bar would be,
+with the text to its right — positioned BETWEEN the markers that bound
+them, never on a node's own box label. The markers on a node's own
+timeline are: its own creation, each fork child's fork-out point, each
+fork child's merge-back point (only when it actually merged — a discard
+doesn't inject anything into the parent's transcript, so it isn't a
+boundary), and "now" (or the node's own terminal point, if it has one).
+Each gap between consecutive markers becomes one turn-info line
+describing exactly that window, emitted at the row where the window's
+CLOSING marker renders. A node's FINAL turn-info line appends a
+terminal-outcome glyph when its session has ended — `✓` for `Done`, `✗`
+for `Errored` (a fork's merged/discarded outcome is not repeated there:
+the merge arrow and the box label's own marker already carry it):
 
 ```
 ┌───────────────────────────┐
 │ ● auth-refactor (claude)  │
 └───────────────────────────┘
  │
-12 msgs · 8m12s
+ • 12 msgs · 8m12s
  │
- │              ┌─────────────────────────────┐
- ├─ ⑂ fork ────▸│ ● idea A (claude)  ↩ merged │
- │              └─────────────────────────────┘
- │               │
- │              2 msgs · 1m05s
+ │                   ┌─────────────────────────────┐
+ ├─ ⑂ fork ─────────▸│ ● idea A (claude)  ↩ merged │
+ │                   └─────────────────────────────┘
+ │                    │
+ │                    • 2 msgs · 1m05s
+ │                    │
+ • 5 msgs · 3m40s     │
+ │                    │
+ │◂─ ↩ merge ─────────┘
  │
-5 msgs · 3m40s   │
- │               │
- │◂─ ↩ merge ────┘
- │
-3 msgs · 2m00s
+ • 3 msgs · 2m00s ✓
 ```
 
 A childless node still gets exactly one window (its whole life, start to

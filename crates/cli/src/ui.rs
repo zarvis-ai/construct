@@ -9258,7 +9258,17 @@ fn render_lineage_row(
                 // Fork and subagent arrow labels render at the same
                 // brightness — the word already tells them apart.
                 crate::lineage::LineageSpan::Edge(_) => Style::default().fg(theme.dim),
-                crate::lineage::LineageSpan::Segment { .. } => Style::default().fg(theme.dim),
+                crate::lineage::LineageSpan::Segment { .. }
+                | crate::lineage::LineageSpan::SegmentBullet => Style::default().fg(theme.dim),
+                // Terminal-outcome glyphs borrow the checklist marks'
+                // palette (`checklist_mark_style`): done glows, failure
+                // warns.
+                crate::lineage::LineageSpan::SegmentOutcome { ok: true } => {
+                    Style::default().fg(theme.matrix_flash_good)
+                }
+                crate::lineage::LineageSpan::SegmentOutcome { ok: false } => {
+                    Style::default().fg(theme.warning)
+                }
                 crate::lineage::LineageSpan::More(_) => Style::default()
                     .fg(theme.muted)
                     .add_modifier(Modifier::ITALIC),

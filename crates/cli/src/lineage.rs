@@ -232,6 +232,14 @@ pub enum LineageSpan {
         /// against `now_ms` at flatten time).
         end_ms: Option<i64>,
     },
+    /// The `•` bullet heading every turn-info line, sitting on the lane.
+    SegmentBullet,
+    /// Terminal-outcome glyph appended after a node's FINAL turn-info
+    /// line: `✓` when the session ended `Done`, `✗` when it `Errored`.
+    /// (A fork's merged/discarded outcome is not repeated here — the merge
+    /// arrow and the box label's `↩ merged` / `✗ discarded` marker already
+    /// carry it.)
+    SegmentOutcome { ok: bool },
     /// A node's box label text (status glyph, name, harness, terminal
     /// marker) — carries the session id so the renderer can style it by
     /// that session's live state.
@@ -395,27 +403,28 @@ pub fn selectable_indices(rows: &[LineageRow]) -> Vec<usize> {
 /// with a labeled arrow into its own box (placed to the right, with its
 /// own lane below it), and — when it merged back (`ForkMergeMode::Result`)
 /// — returns to the parent's lane with a merge arrow. Turn info renders
-/// ON the lanes (outdented two columns from the lane, flowing over it),
-/// between the markers that bound each window:
+/// ON the lanes, a `•` bullet sitting where the bar would be with the
+/// text to its right, between the markers that bound each window; the
+/// FINAL window appends `✓`/`✗` when the session ended Done/Errored:
 ///
 /// ```text
 /// ┌───────────────────────────┐
 /// │ ● auth-refactor (claude)  │
 /// └───────────────────────────┘
 ///  │
-/// 12 msgs · 8m12s
+///  • 12 msgs · 8m12s
 ///  │
-///  │              ┌─────────────────────────────┐
-///  ├─ ⑂ fork ────▸│ ● idea A (claude)  ↩ merged │
-///  │              └─────────────────────────────┘
-///  │               │
-///  │              2 msgs · 1m05s
+///  │                   ┌─────────────────────────────┐
+///  ├─ ⑂ fork ─────────▸│ ● idea A (claude)  ↩ merged │
+///  │                   └─────────────────────────────┘
+///  │                    │
+///  │                    • 2 msgs · 1m05s
+///  │                    │
+///  • 5 msgs · 3m40s     │
+///  │                    │
+///  │◂─ ↩ merge ─────────┘
 ///  │
-/// 5 msgs · 3m40s   │
-///  │               │
-///  │◂─ ↩ merge ────┘
-///  │
-/// 3 msgs · 2m00s
+///  • 3 msgs · 2m00s ✓
 /// ```
 ///
 /// ### Chronological order
@@ -488,22 +497,30 @@ fn node_box_label(summary: Option<&SessionSummary>, session_id: &str) -> String 
     label
 }
 
-/// Paint one turn-info line at `(y, x)` — the window's numbers ride along
-/// on the span role for tests. Zero-message windows are the caller's job
-/// to skip.
+/// Paint one turn-info line: a `•` bullet ON the lane, the info text two
+/// columns right of it, and — when `outcome` is set (a node's final
+/// window, session ended `Done`/`Errored`) — a trailing `✓`/`✗` glyph.
+/// The window's numbers ride along on the Segment span role for tests.
+/// Zero-message windows are the caller's job to skip. Returns one past
+/// the rightmost column painted.
+#[allow(clippy::too_many_arguments)]
 fn put_segment(
     c: &mut Canvas,
     y: usize,
-    x: usize,
+    lane: usize,
     delta_events: u64,
     start_ms: i64,
     end_ms: Option<i64>,
     now_ms: i64,
-) {
+    outcome: Option<bool>,
+) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    c.put(y, lane, "•", &LineageSpan::SegmentBullet);
     let text = segment_label(delta_events, start_ms, end_ms, now_ms);
+    let w = UnicodeWidthStr::width(text.as_str());
     c.put(
         y,
-        x,
+        lane + 2,
         &text,
         &LineageSpan::Segment {
             delta_events,
@@ -511,6 +528,28 @@ fn put_segment(
             end_ms,
         },
     );
+    match outcome {
+        Some(ok) => {
+            c.put(
+                y,
+                lane + 3 + w,
+                if ok { "✓" } else { "✗" },
+                &LineageSpan::SegmentOutcome { ok },
+            );
+            lane + 4 + w
+        }
+        None => lane + 2 + w,
+    }
+}
+
+/// `✓`/`✗` for a node's final turn-info line, from its live session state
+/// — `None` while it's still going (the window is just the latest one).
+fn node_outcome(summary: &SessionSummary) -> Option<bool> {
+    match summary.state {
+        SessionState::Done => Some(true),
+        SessionState::Errored => Some(false),
+        _ => None,
+    }
 }
 
 /// One event on a node's own timeline, used to order the diagram's rows
@@ -561,12 +600,11 @@ struct LiveLane {
     block_bottom: usize,
 }
 
-/// Emit one gap window on the node's own lane: a bar row, the turn-info
-/// line (starting two columns left of the lane, flowing over it — the
-/// concept sketch's "(turn info)" interrupting the line), and a closing
-/// bar row. A zero-message window contributes a single bar row instead,
-/// keeping the lane continuous without a "0 msgs" line. Returns the new
-/// current row.
+/// Emit one gap window on the node's own lane: a bar row, the bulleted
+/// turn-info line (`• N msgs · elapsed`, bullet sitting on the lane), and
+/// a closing bar row. A zero-message window contributes a single bar row
+/// instead, keeping the lane continuous without a "0 msgs" line. Returns
+/// the new current row.
 #[allow(clippy::too_many_arguments)]
 fn emit_gap(
     c: &mut Canvas,
@@ -578,15 +616,12 @@ fn emit_gap(
     now_ms: i64,
     right: &mut usize,
 ) -> usize {
-    use unicode_width::UnicodeWidthStr;
     c.put(cur, lane, "│", &LineageSpan::Rail);
     if delta == 0 {
         return cur + 1;
     }
-    let info_col = lane.saturating_sub(2);
-    put_segment(c, cur + 1, info_col, delta, start_ms, end_ms, now_ms);
-    let w = UnicodeWidthStr::width(segment_label(delta, start_ms, end_ms, now_ms).as_str());
-    *right = (*right).max(info_col + w);
+    let seg_right = put_segment(c, cur + 1, lane, delta, start_ms, end_ms, now_ms, None);
+    *right = (*right).max(seg_right);
     c.put(cur + 2, lane, "│", &LineageSpan::Rail);
     cur + 3
 }
@@ -626,9 +661,9 @@ fn layout_node(
     c.node_rows.push((y + 1, node.session_id.clone()));
 
     // The node's own lane hangs below the box, indented one column from
-    // the box's left edge; turn info outdents two columns from the lane.
+    // the box's left edge; each turn-info line puts its `•` bullet ON the
+    // lane with the text following to the right.
     let lane = x + 1;
-    let info_col = lane.saturating_sub(2);
     let mut cur = y + 3;
     let mut right = x + lw + 4;
     let mut max_child_bottom = cur;
@@ -775,7 +810,8 @@ fn layout_node(
                 let ew = UnicodeWidthStr::width(edge_word);
                 // Column: past the arrow's own minimum, past the widest
                 // turn-info label, and past every still-live sibling lane.
-                let mut child_x = (lane + ew + 6).max(info_col + max_seg_w + 2);
+                // Bullet (1) + gap (1) + widest label + 2 blank columns.
+                let mut child_x = (lane + ew + 6).max(lane + max_seg_w + 4);
                 for lane_state in live.values() {
                     child_x = child_x.max(lane_state.right + 2);
                 }
@@ -868,14 +904,16 @@ fn layout_node(
 
     // Trailing window: last checkpoint → now, or → this node's own
     // terminal point if it has one (it's a fork that has merged/discarded).
+    // Being the node's FINAL window, it carries the terminal-outcome glyph
+    // when the session has ended (`✓` Done / `✗` Errored).
     if let Some(s) = summary {
         let delta = s.event_count.saturating_sub(cp_seq);
         if delta > 0 {
             let end = s.merge.as_ref().map(|m| m.at_ms);
             c.put(cur, lane, "│", &LineageSpan::Rail);
-            put_segment(c, cur + 1, info_col, delta, cp_ms, end, now_ms);
-            let w = UnicodeWidthStr::width(segment_label(delta, cp_ms, end, now_ms).as_str());
-            right = right.max(info_col + w);
+            let seg_right =
+                put_segment(c, cur + 1, lane, delta, cp_ms, end, now_ms, node_outcome(s));
+            right = right.max(seg_right);
             cur += 2;
         }
     }
@@ -1216,19 +1254,19 @@ mod tests {
                 format!(" │ {g} smith │"),
                 " └─────────┘".to_string(),
                 "  │".to_string(),
-                "12 msgs · 5m00s".to_string(),
+                "  • 12 msgs · 5m00s".to_string(),
                 "  │".to_string(),
-                "  │              ┌───────────────────┐".to_string(),
-                format!("  ├─ ⑂ fork ────▸│ {g} smith  ↩ merged │"),
-                "  │              └───────────────────┘".to_string(),
-                "  │               │".to_string(),
-                "  │             2 msgs · 3m20s".to_string(),
-                "  │               │".to_string(),
-                "3 msgs · 3m20s    │".to_string(),
-                "  │               │".to_string(),
-                "  │◂─ ↩ merge ────┘".to_string(),
+                "  │                  ┌───────────────────┐".to_string(),
+                format!("  ├─ ⑂ fork ────────▸│ {g} smith  ↩ merged │"),
+                "  │                  └───────────────────┘".to_string(),
+                "  │                   │".to_string(),
+                "  │                   • 2 msgs · 3m20s".to_string(),
+                "  │                   │".to_string(),
+                "  • 3 msgs · 3m20s    │".to_string(),
+                "  │                   │".to_string(),
+                "  │◂─ ↩ merge ────────┘".to_string(),
                 "  │".to_string(),
-                "5 msgs · 5m00s".to_string(),
+                "  • 5 msgs · 5m00s".to_string(),
             ]
         );
         // The two box label rows are the (only) selectable rows, in
@@ -1238,6 +1276,93 @@ mod tests {
             .map(|i| rows[i].session_id().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["root".to_string(), "f".to_string()]);
+    }
+
+    #[test]
+    fn final_turn_info_carries_the_terminal_outcome_glyph() {
+        // A node's LAST turn-info line appends `✓` when the session ended
+        // Done and `✗` when it Errored; mid-timeline windows and still-live
+        // sessions keep the plain `•` bullet only.
+        let mut done = with_event_count(with_created_at_ms(base("done"), 0), 3);
+        done.state = SessionState::Done;
+        let rows = flatten(
+            &build_tree("done", &[done.clone()]).unwrap(),
+            &[done],
+            9_000,
+        );
+        let text = diagram_text(&rows).join("\n");
+        assert!(text.contains("• 3 msgs"), "{text}");
+        assert!(
+            rows.iter()
+                .flat_map(|r| r.spans.iter())
+                .any(
+                    |s| matches!(s.role, LineageSpan::SegmentOutcome { ok: true }) && s.text == "✓"
+                ),
+            "{text}"
+        );
+
+        let mut errored = with_event_count(with_created_at_ms(base("err"), 0), 3);
+        errored.state = SessionState::Errored;
+        let rows = flatten(
+            &build_tree("err", &[errored.clone()]).unwrap(),
+            &[errored],
+            9_000,
+        );
+        assert!(rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .any(|s| matches!(s.role, LineageSpan::SegmentOutcome { ok: false }) && s.text == "✗"));
+
+        // Still running: no outcome glyph anywhere.
+        let live = with_event_count(with_created_at_ms(base("live"), 0), 3);
+        let rows = flatten(
+            &build_tree("live", &[live.clone()]).unwrap(),
+            &[live],
+            9_000,
+        );
+        assert!(!rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .any(|s| matches!(s.role, LineageSpan::SegmentOutcome { .. })));
+    }
+
+    #[test]
+    fn mid_timeline_windows_never_carry_an_outcome_glyph() {
+        // A Done parent with a fork: only the parent's FINAL window (and
+        // the fork's, if it ended) gets the glyph — the pre-fork window
+        // stays a plain bullet even though the session is Done overall.
+        let mut root = with_event_count(with_created_at_ms(base("root"), 0), 20);
+        root.state = SessionState::Done;
+        let fork = with_event_count(
+            with_created_at_ms(forked_from_at(base("f"), "root", 12, 500), 500),
+            2,
+        );
+        let sessions = vec![root, fork];
+        let tree = build_tree("root", &sessions).unwrap();
+        let rows = flatten(&tree, &sessions, 9_000);
+        let outcome_count = rows
+            .iter()
+            .flat_map(|r| r.spans.iter())
+            .filter(|s| matches!(s.role, LineageSpan::SegmentOutcome { .. }))
+            .count();
+        assert_eq!(
+            outcome_count, 1,
+            "only root's trailing window carries the ✓ — not its pre-fork \
+             window, and not the still-open fork's"
+        );
+        // And it's on the LAST turn-info row.
+        let last_seg_row = rows
+            .iter()
+            .rposition(|r| {
+                r.spans
+                    .iter()
+                    .any(|s| matches!(s.role, LineageSpan::Segment { .. }))
+            })
+            .unwrap();
+        assert!(rows[last_seg_row]
+            .spans
+            .iter()
+            .any(|s| matches!(s.role, LineageSpan::SegmentOutcome { ok: true })));
     }
 
     #[test]
