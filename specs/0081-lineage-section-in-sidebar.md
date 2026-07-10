@@ -10,8 +10,8 @@ Scope: Fork/subagent lineage renders as a collapsible section of the left sideba
 The sidebar stacks three regions top to bottom: the session rows, the
 lineage section, and the operator panel. The lineage section renders the
 SELECTED session's fork/subagent tree — the same tree data, diagram modes
-(boxed-lane and compact rails, toggled from the section header, compact
-being the default for the narrow column), turn-info stats, and row
+(boxed-lane and compact rails, toggled from the section header; the full
+boxed-lane diagram is the default), turn-info stats, and row
 interaction vocabulary the earlier per-pane preview had (spec 0080,
 superseded). It is a master–detail pattern: the section follows the list
 selection like a detail panel, with the selected session's node highlighted
