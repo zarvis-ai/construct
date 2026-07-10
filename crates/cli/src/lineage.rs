@@ -854,10 +854,13 @@ fn collect_lanes<'a>(
         Some((t, Some(m.at_ms), Some(false)))
     } else if let Some(ok) = node_outcome_of(summary) {
         // Session reached a terminal state: the lane ends when its last
-        // event landed, and the final window carries ✓/✗.
+        // event landed, and the final window carries ✓/✗. Without a
+        // recorded last event (native subagents can exit without one),
+        // fall back to the session's own start — a closed session's lane
+        // must never keep running toward "now".
         let t = summary
             .and_then(|s| s.last_event_at.map(|d| d.timestamp_millis()))
-            .unwrap_or(now_ms)
+            .unwrap_or(box_ms)
             .max(box_ms);
         Some((t, Some(t), Some(ok)))
     } else {
@@ -2202,6 +2205,73 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Rows after `idx` must contain nothing owned by `owner` — the lane
+    /// has ended and its rail/bars must not continue below.
+    fn assert_lane_discontinues(rows: &[LineageRow], owner: &str, after: usize) {
+        for (i, row) in rows.iter().enumerate().skip(after + 1) {
+            for span in &row.spans {
+                assert!(
+                    span.role.owner() != Some(owner),
+                    "row {i} still carries a span owned by {owner:?} after its \
+                     lane ended at row {after}: {:?}",
+                    row.text()
+                );
+            }
+        }
+    }
+
+    fn last_owned_row(rows: &[LineageRow], owner: &str) -> usize {
+        rows.iter()
+            .rposition(|r| r.spans.iter().any(|sp| sp.role.owner() == Some(owner)))
+            .expect("owner appears somewhere")
+    }
+
+    #[test]
+    fn exited_subagent_lane_discontinues_instead_of_running_to_now() {
+        // A native subagent can exit (state `Done`, the ✓ icon) without a
+        // recorded `last_event_at`. Its lane must close on the timeline —
+        // final ✓ window, rail stops — while the live parent's lane keeps
+        // running below it, in BOTH layouts. (It used to fall back to
+        // "now", keeping the dead lane visually alive to the bottom.)
+        let mut root = with_event_count(with_created_at_ms(base("root"), 0), 10);
+        root.last_event_at = Some(Utc.timestamp_millis_opt(800_000).unwrap());
+        let mut sub = with_event_count(with_created_at_ms(base("sub"), 100_000), 3);
+        sub.kind = SessionKind::Subagent;
+        sub.parent_session_id = Some("root".to_string());
+        sub.state = SessionState::Done;
+        sub.last_event_at = None;
+        let sessions = vec![root, sub];
+        let tree = build_tree("root", &sessions).unwrap();
+
+        for rows in [
+            flatten(&tree, &sessions, 900_000),
+            flatten_rails(&tree, &sessions, 900_000).0,
+        ] {
+            let text = rows.iter().map(|r| r.text()).collect::<Vec<_>>().join("\n");
+            // The glyph and text sit in separate columns (rails mode), so
+            // assert via the span roles rather than adjacency.
+            let has_outcome = rows.iter().flat_map(|r| r.spans.iter()).any(|sp| {
+                matches!(
+                    &sp.role,
+                    crate::lineage::LineageSpan::SegmentOutcome { ok: true, session_id }
+                        if session_id == "sub"
+                )
+            });
+            assert!(
+                has_outcome && text.contains("3 msgs"),
+                "the exited child's final window carries its ✓ outcome: {text}"
+            );
+            let sub_last = last_owned_row(&rows, "sub");
+            let root_last = last_owned_row(&rows, "root");
+            assert!(
+                sub_last < root_last,
+                "the exited child's lane ends before the live parent's \
+                 trailing window (sub row {sub_last} vs root row {root_last}):\n{text}"
+            );
+            assert_lane_discontinues(&rows, "sub", sub_last);
+        }
     }
 
     #[test]

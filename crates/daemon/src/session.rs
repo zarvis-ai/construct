@@ -9177,6 +9177,37 @@ done
                 ..
             }] if text == "found it"
         ));
+        assert!(
+            child.summary.busy_running_since_ms.is_some(),
+            "a Running native child opens a compute-time span (tracked \
+             transition, not a bare state assignment)"
+        );
+
+        // The child exits: state Done must close the busy span and stamp
+        // last_event_at — the lineage view uses that stamp to end the
+        // child's lane on the timeline instead of letting it run to now.
+        manager
+            .handle_event(
+                &owner,
+                SessionEvent::NativeSubagent {
+                    id: "native-child".into(),
+                    parent_id: None,
+                    title: None,
+                    state: SessionState::Done,
+                    event: None,
+                },
+            )
+            .await;
+        let child = manager.detail(&projected_id).await.expect("exited child");
+        assert_eq!(child.summary.state, SessionState::Done);
+        assert!(
+            child.summary.busy_running_since_ms.is_none(),
+            "exiting banks the open compute-time span"
+        );
+        assert!(
+            child.summary.last_event_at.is_some(),
+            "the exit transition stamps last_event_at"
+        );
 
         manager
             .handle_event(

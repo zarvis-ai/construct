@@ -69,6 +69,14 @@ same gate as the session list's rows, and a working session's LIVE
 turn-info bullet (its last window's marker — earlier windows are history)
 spins in phase with its status glyph.
 
+A session in a terminal state (done/errored — a native subagent that
+exited included) is a CLOSED lane: it ends on the timeline at its last
+recorded activity (falling back to its own start when none was recorded),
+with its ✓/✗ final window there — it never keeps running toward "now".
+Only live sessions' lanes extend to the bottom of the diagram. A state
+transition on a native child counts as recorded activity for this
+purpose.
+
 Relatedly, the session list itself shows lineage structure ambiently: a
 fork renders as an indented child row under its parent (like subagent
 rows) — recursively, so a fork of a fork still appears — never as its own

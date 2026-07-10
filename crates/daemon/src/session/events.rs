@@ -609,9 +609,19 @@ impl SessionManager {
         };
 
         let snapshot = {
+            let now = Utc::now();
             let mut summary = entry.summary.write().await;
             summary.parent_session_id = Some(parent_session_id);
-            summary.state = state;
+            let prev_state = summary.state;
+            // Through the tracked transition (not a bare assignment) so
+            // native children accumulate compute time like any session.
+            crate::session::set_state_tracked(&mut summary, state, now.timestamp_millis());
+            if prev_state != state {
+                // A state transition IS child activity: stamp it so the
+                // lineage view closes an exited child's lane at the right
+                // point on the timeline instead of letting it run on.
+                summary.last_event_at = Some(now);
+            }
             summary.archived = false;
             if title.as_ref().is_some_and(|title| !title.trim().is_empty()) {
                 summary.title = title;
