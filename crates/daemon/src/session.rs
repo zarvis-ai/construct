@@ -2863,9 +2863,10 @@ impl SessionManager {
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
         if entry.summary.read().await.native_subagent.is_some() {
-            return Err(anyhow!(
-                "native harness subagents are read-only; manage them through their parent harness"
-            ));
+            // Archiving is a local visibility/history operation, not control
+            // of the harness-owned child. Keep resume/interrupt restrictions
+            // for native mirrors, but allow users to hide one explicitly.
+            return self.archive_native_mirror(id).await;
         }
         // Snapshot the child subagents before we start mutating state so a
         // concurrently-finishing subagent can't slip out of the cascade.
@@ -8902,14 +8903,7 @@ done
                 .archived
         );
 
-        manager
-            .handle_event(
-                &owner,
-                SessionEvent::NativeSubagentRemoved {
-                    id: "native-child".into(),
-                },
-            )
-            .await;
+        manager.archive(&projected_id).await.expect("archive mirror");
         assert!(
             manager
                 .detail(&projected_id)
