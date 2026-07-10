@@ -2270,6 +2270,8 @@ mod search_tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: ApprovalMode::Manual,
             kind: SessionKind::User,
             archived: false,
@@ -2549,7 +2551,9 @@ mod search_tests {
         // hits, then stop at the budget instead of refilling until the
         // whole giant line has been read.
         let giant = format!("haystack {}", "y".repeat(300 * 1024));
-        storage.append_event("s1", &message_event(1, &giant)).unwrap();
+        storage
+            .append_event("s1", &message_event(1, &giant))
+            .unwrap();
         for seq in 2..=21u64 {
             storage
                 .append_event("s1", &message_event(seq, &format!("needle {seq}")))
@@ -2579,7 +2583,9 @@ mod search_tests {
         // terminate at the budget with no hits rather than reading the
         // whole line.
         let solo = vec![make_summary("s2", None, "shell", 0)];
-        storage.append_event("s2", &message_event(1, &giant)).unwrap();
+        storage
+            .append_event("s2", &message_event(1, &giant))
+            .unwrap();
         let result = storage
             .search_with_budgets(
                 &solo,

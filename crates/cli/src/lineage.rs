@@ -646,6 +646,7 @@ fn put_segment(
     now_ms: i64,
     outcome: Option<bool>,
     owner: &str,
+    busy_ms: Option<u64>,
 ) -> usize {
     use unicode_width::UnicodeWidthStr;
     match outcome {
@@ -667,7 +668,13 @@ fn put_segment(
             },
         ),
     }
-    let text = segment_label(delta_events, start_ms, end_ms, now_ms);
+    // Compute time when the daemon has tracked it (the sum of the turns'
+    // Running spans in this window); wall-clock span as the legacy
+    // fallback for records without busy data.
+    let text = match busy_ms {
+        Some(b) => segment_label_busy(delta_events, b),
+        None => segment_label(delta_events, start_ms, end_ms, now_ms),
+    };
     let w = UnicodeWidthStr::width(text.as_str());
     c.put(
         y,
@@ -712,9 +719,13 @@ struct Lane<'a> {
     box_ms: i64,
     /// `forked_from.transcript_seq` — fork lanes only.
     fork_seq: Option<u64>,
-    /// `(at_ms, merged_seq)` for forks that merged back (`Result`) — such
-    /// a lane ends at its merge arrow instead of an `End` event.
-    merge: Option<(i64, u64)>,
+    /// `forked_from.parent_busy_ms` — the parent's compute time at
+    /// fork-out (0 on records predating the field).
+    fork_busy: u64,
+    /// `(at_ms, merged_seq, merged_busy_ms)` for forks that merged back
+    /// (`Result`) — such a lane ends at its merge arrow instead of an
+    /// `End` event.
+    merge: Option<(i64, u64, u64)>,
     /// `(at_ms, label end, outcome)` for every other lane's end: a
     /// discarded fork (at discard time), a session that went Done/Errored
     /// (at `last_event_at`), or a live session (at "now", open-ended).
@@ -727,9 +738,15 @@ struct Lane<'a> {
     more: Vec<usize>,
     /// Wrapped box label lines (see `wrap_box_label`).
     label_lines: Vec<String>,
+    /// This lane's own total compute time as of "now" (frozen naturally
+    /// for terminal sessions — busy stops accumulating on the terminal
+    /// transition). `0` means no busy data (legacy records): windows fall
+    /// back to wall-clock spans.
+    busy_total: u64,
     // Running state, filled in as the global walk proceeds.
     cp_seq: u64,
     cp_ms: i64,
+    cp_busy: u64,
     x_abs: usize,
     lane_col: usize,
     box_bottom: usize,
@@ -777,7 +794,7 @@ fn collect_lanes<'a>(
     let merge = if forked.is_some() {
         merge_rec
             .filter(|m| m.mode == ForkMergeMode::Result)
-            .map(|m| (m.at_ms.max(box_ms), m.merged_seq))
+            .map(|m| (m.at_ms.max(box_ms), m.merged_seq, m.merged_busy_ms))
     } else {
         None
     };
@@ -805,7 +822,7 @@ fn collect_lanes<'a>(
         Some((now_ms.max(box_ms), label_end, None))
     };
     let close_ms = merge
-        .map(|(at, _)| at)
+        .map(|(at, _, _)| at)
         .or(end.map(|(at, _, _)| at))
         .unwrap();
     let idx = lanes.len();
@@ -815,13 +832,16 @@ fn collect_lanes<'a>(
         parent,
         box_ms,
         fork_seq: forked.map(|f| f.transcript_seq),
+        fork_busy: forked.map(|f| f.parent_busy_ms).unwrap_or(0),
         merge,
         end,
         close_ms,
         more: Vec::new(),
         label_lines: wrap_box_label(&node_box_label(summary, &node.session_id)),
+        busy_total: summary.map(|s| s.busy_ms_at(now_ms)).unwrap_or(0),
         cp_seq: 0,
         cp_ms: box_ms,
+        cp_busy: 0,
         x_abs: 0,
         lane_col: 0,
         box_bottom: 0,
@@ -851,7 +871,7 @@ fn build_events(lanes: &[Lane]) -> Vec<(i64, u8, usize)> {
     let mut events: Vec<(i64, u8, usize)> = Vec::new();
     for (i, lane) in lanes.iter().enumerate() {
         events.push((lane.box_ms, EV_BOX, i));
-        if let Some((at, _)) = lane.merge {
+        if let Some((at, _, _)) = lane.merge {
             events.push((at, EV_MERGE, i));
         }
         if let Some((at, _, _)) = lane.end {
@@ -979,6 +999,8 @@ fn layout_tree(
                     let d = seq.saturating_sub(lanes[p].cp_seq);
                     if d > 0 {
                         cur += 1;
+                        let busy = (lanes[i].fork_busy > 0)
+                            .then(|| lanes[i].fork_busy.saturating_sub(lanes[p].cp_busy));
                         put_segment(
                             c,
                             cur,
@@ -989,11 +1011,13 @@ fn layout_tree(
                             now_ms,
                             None,
                             &lanes[p].node.session_id,
+                            busy,
                         );
                         cur += 1;
                     }
                     lanes[p].cp_seq = seq;
                     lanes[p].cp_ms = lanes[i].box_ms;
+                    lanes[p].cp_busy = lanes[p].cp_busy.max(lanes[i].fork_busy);
                 }
                 // Icon-only arrow label — the glyph alone (⑂ / ▸) marks the
                 // edge kind.
@@ -1114,7 +1138,7 @@ fn layout_tree(
                 gi += 1;
             }
             EV_MERGE => {
-                let (at, mseq) = lanes[i].merge.expect("merge event has merge data");
+                let (at, mseq, mbusy) = lanes[i].merge.expect("merge event has merge data");
                 let p = lanes[i].parent.expect("a merging fork has a parent");
                 let dp = mseq.saturating_sub(lanes[p].cp_seq);
                 let df = lanes[i]
@@ -1133,6 +1157,7 @@ fn layout_tree(
                     // the next row instead of colliding.
                     let mut row = cur;
                     if dp > 0 {
+                        let busy = (mbusy > 0).then(|| mbusy.saturating_sub(lanes[p].cp_busy));
                         let end_x = put_segment(
                             c,
                             row,
@@ -1143,12 +1168,15 @@ fn layout_tree(
                             now_ms,
                             None,
                             &lanes[p].node.session_id,
+                            busy,
                         );
                         if df > 0 && lanes[i].lane_col < end_x + 2 {
                             row += 1;
                         }
                     }
                     if df > 0 {
+                        let busy = (lanes[i].busy_total > 0)
+                            .then(|| lanes[i].busy_total.saturating_sub(lanes[i].cp_busy));
                         put_segment(
                             c,
                             row,
@@ -1159,6 +1187,7 @@ fn layout_tree(
                             now_ms,
                             Some(true),
                             &lanes[i].node.session_id,
+                            busy,
                         );
                     }
                     cur = row + 1;
@@ -1204,6 +1233,7 @@ fn layout_tree(
                 c.put(cur, flane, "┘", &fork_border);
                 lanes[p].cp_seq = mseq;
                 lanes[p].cp_ms = at;
+                lanes[p].cp_busy = lanes[p].cp_busy.max(mbusy);
                 lanes[p].last_row = lanes[p].last_row.max(cur);
                 lanes[i].last_row = cur;
                 lanes[i].ended = true;
@@ -1257,6 +1287,8 @@ fn layout_tree(
                             row_end_x = 0;
                         }
                         let owner = lanes[j].node.session_id.clone();
+                        let busy = (lanes[j].busy_total > 0)
+                            .then(|| lanes[j].busy_total.saturating_sub(lanes[j].cp_busy));
                         row_end_x = put_segment(
                             c,
                             cur,
@@ -1267,6 +1299,7 @@ fn layout_tree(
                             now_ms,
                             outcome,
                             &owner,
+                            busy,
                         );
                         lanes[j].last_row = cur;
                     }
@@ -1404,7 +1437,8 @@ pub fn flatten_rails(
                     start: i64,
                     end: Option<i64>,
                     outcome: Option<bool>,
-                    owner: &str| {
+                    owner: &str,
+                    busy: Option<u64>| {
         match outcome {
             Some(ok) => c.put(
                 row,
@@ -1424,10 +1458,14 @@ pub fn flatten_rails(
                 },
             ),
         }
+        let text = match busy {
+            Some(b) => segment_label_busy(delta, b),
+            None => segment_label(delta, start, end, now_ms),
+        };
         c.put(
             row,
             text_x,
-            &segment_label(delta, start, end, now_ms),
+            &text,
             &LineageSpan::Segment {
                 delta_events: delta,
                 start_ms: start,
@@ -1488,6 +1526,8 @@ pub fn flatten_rails(
                     let d = seq.saturating_sub(lanes[p].cp_seq);
                     if d > 0 {
                         let owner = lanes[p].node.session_id.clone();
+                        let busy = (lanes[i].fork_busy > 0)
+                            .then(|| lanes[i].fork_busy.saturating_sub(lanes[p].cp_busy));
                         put_info(
                             &mut c,
                             cur,
@@ -1497,12 +1537,14 @@ pub fn flatten_rails(
                             Some(lanes[i].box_ms),
                             None,
                             &owner,
+                            busy,
                         );
                         last_row[p] = last_row[p].max(cur);
                         cur += 1;
                     }
                     lanes[p].cp_seq = seq;
                     lanes[p].cp_ms = lanes[i].box_ms;
+                    lanes[p].cp_busy = lanes[p].cp_busy.max(lanes[i].fork_busy);
                 }
                 let (pc, cc) = (col(rail_of[p]), col(rail_of[i]));
                 let child_border = LineageSpan::Border {
@@ -1538,11 +1580,12 @@ pub fn flatten_rails(
                 gi += 1;
             }
             EV_MERGE => {
-                let (at, mseq) = lanes[i].merge.expect("merge event has merge data");
+                let (at, mseq, mbusy) = lanes[i].merge.expect("merge event has merge data");
                 let p = lanes[i].parent.expect("a merging fork has a parent");
                 let dp = mseq.saturating_sub(lanes[p].cp_seq);
                 if dp > 0 {
                     let owner = lanes[p].node.session_id.clone();
+                    let busy = (mbusy > 0).then(|| mbusy.saturating_sub(lanes[p].cp_busy));
                     put_info(
                         &mut c,
                         cur,
@@ -1552,6 +1595,7 @@ pub fn flatten_rails(
                         Some(at),
                         None,
                         &owner,
+                        busy,
                     );
                     last_row[p] = last_row[p].max(cur);
                     cur += 1;
@@ -1562,6 +1606,8 @@ pub fn flatten_rails(
                     .unwrap_or(0);
                 if df > 0 {
                     let owner = lanes[i].node.session_id.clone();
+                    let busy = (lanes[i].busy_total > 0)
+                        .then(|| lanes[i].busy_total.saturating_sub(lanes[i].cp_busy));
                     put_info(
                         &mut c,
                         cur,
@@ -1571,6 +1617,7 @@ pub fn flatten_rails(
                         Some(at),
                         Some(true),
                         &owner,
+                        busy,
                     );
                     last_row[i] = last_row[i].max(cur);
                     cur += 1;
@@ -1591,6 +1638,7 @@ pub fn flatten_rails(
                 c.put(cur, text_x, "↩ merge", &fork_border);
                 lanes[p].cp_seq = mseq;
                 lanes[p].cp_ms = at;
+                lanes[p].cp_busy = lanes[p].cp_busy.max(mbusy);
                 last_row[i] = last_row[i].max(cur);
                 last_row[p] = last_row[p].max(cur);
                 ended[i] = true;
@@ -1620,6 +1668,8 @@ pub fn flatten_rails(
                     if d > 0 {
                         let (_, label_end, outcome) = lanes[j].end.expect("end event has end data");
                         let owner = lanes[j].node.session_id.clone();
+                        let busy = (lanes[j].busy_total > 0)
+                            .then(|| lanes[j].busy_total.saturating_sub(lanes[j].cp_busy));
                         put_info(
                             &mut c,
                             cur,
@@ -1629,6 +1679,7 @@ pub fn flatten_rails(
                             label_end,
                             outcome,
                             &owner,
+                            busy,
                         );
                         last_row[j] = last_row[j].max(cur);
                         cur += 1;
@@ -1670,7 +1721,12 @@ pub fn status_glyph(state: SessionState) -> &'static str {
 /// Compact elapsed-time label (`"3s"`, `"12m34s"`) from `since_ms` (epoch
 /// ms) to `now_ms`.
 pub fn format_elapsed_ms(since_ms: i64, now_ms: i64) -> String {
-    let secs = now_ms.saturating_sub(since_ms).max(0) / 1000;
+    format_duration_ms(now_ms.saturating_sub(since_ms).max(0) as u64)
+}
+
+/// Compact duration label for a millisecond span.
+pub fn format_duration_ms(ms: u64) -> String {
+    let secs = ms / 1000;
     let m = secs / 60;
     let s = secs % 60;
     if m > 0 {
@@ -1678,6 +1734,17 @@ pub fn format_elapsed_ms(since_ms: i64, now_ms: i64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// [`segment_label`]'s compute-time sibling: `"N msg(s) · <summed busy>"` —
+/// the total time the session actually spent computing within the window,
+/// not the wall-clock span between its boundary events.
+pub fn segment_label_busy(delta_events: u64, busy_ms: u64) -> String {
+    let unit = if delta_events == 1 { "msg" } else { "msgs" };
+    format!(
+        "{delta_events} {unit} \u{00b7} {}",
+        format_duration_ms(busy_ms)
+    )
 }
 
 /// Renderable text for one activity-segment row: `"N msg(s) · elapsed"`.
@@ -1722,6 +1789,8 @@ mod tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: SessionKind::User,
             archived: false,
@@ -1737,6 +1806,7 @@ mod tests {
             session_id: parent.to_string(),
             transcript_seq: 0,
             at_ms: 0,
+            parent_busy_ms: 0,
         });
         s
     }
@@ -1760,6 +1830,7 @@ mod tests {
             session_id: parent.to_string(),
             transcript_seq,
             at_ms,
+            parent_busy_ms: 0,
         });
         s
     }
@@ -1773,6 +1844,7 @@ mod tests {
         s.merge = Some(ForkMerge {
             mode,
             at_ms,
+            merged_busy_ms: 0,
             merged_seq,
         });
         s
@@ -1946,6 +2018,7 @@ mod tests {
         open.merge = Some(ForkMerge {
             mode: ForkMergeMode::Result,
             at_ms: 0,
+            merged_busy_ms: 0,
             merged_seq: 0,
         });
         assert_eq!(ForkStatus::of(&open), ForkStatus::Merged);
@@ -1953,6 +2026,7 @@ mod tests {
         open.merge = Some(ForkMerge {
             mode: ForkMergeMode::Discard,
             at_ms: 0,
+            merged_busy_ms: 0,
             merged_seq: 0,
         });
         assert_eq!(ForkStatus::of(&open), ForkStatus::Discarded);
@@ -2016,6 +2090,84 @@ mod tests {
             .map(|i| rows[i].session_id().unwrap().to_string())
             .collect();
         assert_eq!(ids, vec!["root".to_string(), "f".to_string()]);
+    }
+
+    /// Every turn-info window's label text, in on-screen order.
+    fn segment_texts(rows: &[LineageRow]) -> Vec<String> {
+        rows.iter()
+            .flat_map(|r| r.spans.iter())
+            .filter_map(|s| match &s.role {
+                LineageSpan::Segment { .. } => Some(s.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn turn_info_durations_are_summed_compute_time_not_wall_clock() {
+        // Same timeline as the concept-layout test (fork at 300s, merge at
+        // 500s, now at 800s — wall labels would read 5m00s / 3m20s /
+        // 3m20s / 5m00s), but with busy-time stamps that differ from every
+        // wall span. Each window must label the busy DELTA between its
+        // boundary stamps — the time the session actually spent computing —
+        // not the wall-clock gap between its boundary events.
+        let mut root = with_event_count(with_created_at_ms(base("root"), 0), 20);
+        root.busy_ms = 400_000; // lifetime compute: 6m40s
+        let mut fork = merged_at(
+            with_event_count(
+                with_created_at_ms(forked_from_at(base("f"), "root", 12, 300_000), 300_000),
+                2,
+            ),
+            ForkMergeMode::Result,
+            15,
+            500_000,
+        );
+        fork.forked_from.as_mut().unwrap().parent_busy_ms = 250_000; // 4m10s
+        fork.merge.as_mut().unwrap().merged_busy_ms = 310_000; // parent +1m00s
+        fork.busy_ms = 90_000; // fork's own compute: 1m30s
+        let sessions = vec![root, fork];
+        let tree = build_tree("root", &sessions).unwrap();
+        let expect = vec![
+            "12 msgs · 4m10s".to_string(), // 250_000 − 0
+            "3 msgs · 1m00s".to_string(),  // 310_000 − 250_000
+            "2 msgs · 1m30s".to_string(),  // fork: 90_000 − 0
+            "5 msgs · 1m30s".to_string(),  // 400_000 − 310_000
+        ];
+        assert_eq!(segment_texts(&flatten(&tree, &sessions, 800_000)), expect);
+        // The compact layout emits the identical windows.
+        assert_eq!(
+            segment_texts(&flatten_rails(&tree, &sessions, 800_000).0),
+            expect
+        );
+    }
+
+    #[test]
+    fn turn_info_falls_back_to_wall_clock_without_busy_stamps() {
+        // Records written before busy tracking carry zero busy stamps; their
+        // windows keep the legacy wall-clock spans.
+        let root = with_event_count(with_created_at_ms(base("root"), 0), 20);
+        let fork = merged_at(
+            with_event_count(
+                with_created_at_ms(forked_from_at(base("f"), "root", 12, 300_000), 300_000),
+                2,
+            ),
+            ForkMergeMode::Result,
+            15,
+            500_000,
+        );
+        let sessions = vec![root, fork];
+        let tree = build_tree("root", &sessions).unwrap();
+        let expect = vec![
+            "12 msgs · 5m00s".to_string(),
+            "3 msgs · 3m20s".to_string(),
+            "2 msgs · 3m20s".to_string(),
+            "5 msgs · 5m00s".to_string(),
+        ];
+        assert_eq!(segment_texts(&flatten(&tree, &sessions, 800_000)), expect);
+        assert_eq!(
+            segment_texts(&flatten_rails(&tree, &sessions, 800_000).0),
+            expect
+        );
     }
 
     #[test]

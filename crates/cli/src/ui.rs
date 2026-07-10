@@ -14397,6 +14397,7 @@ mod tests {
             session_id: "root".into(),
             transcript_seq: 1,
             at_ms: 1_000,
+            parent_busy_ms: 0,
         });
         let mut sub = lineage_test_summary("s");
         sub.kind = agentd_protocol::SessionKind::Subagent;
@@ -14518,6 +14519,7 @@ mod tests {
         sessions[1].merge = Some(agentd_protocol::ForkMerge {
             mode: agentd_protocol::ForkMergeMode::Result,
             at_ms: 2_000,
+            merged_busy_ms: 0,
             merged_seq: 2,
         });
         let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
@@ -14562,6 +14564,7 @@ mod tests {
         sessions[1].merge = Some(agentd_protocol::ForkMerge {
             mode: agentd_protocol::ForkMergeMode::Discard,
             at_ms: 2_000,
+            merged_busy_ms: 0,
             merged_seq: 2,
         });
         let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
@@ -14593,6 +14596,7 @@ mod tests {
             session_id: "root".into(),
             transcript_seq: 1,
             at_ms: 1_000,
+            parent_busy_ms: 0,
         });
         let sessions = vec![root, fork];
         let by_id: HashMap<&str, &SessionSummary> =
@@ -14699,6 +14703,7 @@ mod tests {
                 session_id: "root".into(),
                 transcript_seq: 0,
                 at_ms: 0,
+                parent_busy_ms: 0,
             });
             sessions.push(f);
         }
@@ -14959,6 +14964,8 @@ mod tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             archived: false,

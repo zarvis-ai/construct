@@ -234,13 +234,24 @@ window's CLOSING event renders:
 
 A childless node still gets exactly one window (its whole life), so
 every node's activity ends up visible somewhere, not just nodes with
-forks. A live lane's final window measures its elapsed only up to the
-session's last activity (`last_event_at`) — execution time for the
-turns, not idle wall-clock ticking toward "now"; only its ROW position
-sits at "now" on the timeline. A window with zero messages
-in it is skipped entirely rather than rendered as a "0 msgs" line —
-leaving just the lane bar. Diagram rows never wrap; a too-wide diagram
-clips at the preview's edge.
+forks. A window's duration is the session's summed COMPUTE time within
+it — the total time the session actually spent in a working state
+across the window's turns — not the wall-clock gap between the
+boundary events (which would count idle sitting-at-a-prompt time). The
+daemon accumulates working time as session-state transitions happen
+and snapshots the running total at each boundary that splits a
+timeline (fork-out stamps the parent's total at fork time; merge-back
+stamps it at merge time), so a window's duration is the difference
+between its two boundary snapshots, and a lane's final window drains
+whatever the lifetime total hasn't yet attributed. Records written
+before compute-time tracking existed carry no snapshots; their windows
+fall back to the wall-clock span between boundary events (such a live
+lane's final window measures only up to the session's last activity,
+not idle ticking toward "now"). Either way, only the window's ROW
+position reflects event time on the timeline. A window with zero
+messages in it is skipped entirely rather than rendered as a "0 msgs"
+line — leaving just the lane bar. Diagram rows never wrap; a too-wide
+diagram clips at the preview's edge.
 
 This is possible without any extra fetch because `SessionSummary::event_count`,
 `ForkedFrom::transcript_seq`, and `ForkMerge::merged_seq` are all the same
@@ -248,9 +259,11 @@ counter (the transcript's own sequence number) — a child's
 `forked_from.transcript_seq` is a precise, already-in-memory snapshot of the
 parent's position at fork time, and `ForkMerge::merged_seq` (stamped by the
 daemon from the parent's own `event_count` at the moment of merge) is the
-same for the merge-back point. Segment math is therefore plain arithmetic
-over data already on `SessionSummary`, computed fresh on every render from
-live session state — never a stored/cached total.
+same for the merge-back point. The compute-time snapshots ride the same two
+records (fork stamp, merge stamp) plus a lifetime total on the summary.
+Segment math is therefore plain arithmetic over data already on
+`SessionSummary`, computed fresh on every render from live session state —
+never a stored/cached total.
 
 Subagent children (spec 0014) don't stamp a parent-timeline position the
 way forks do, so they don't act as boundary markers; they're simply

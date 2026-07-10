@@ -11262,6 +11262,8 @@ mod tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
@@ -26887,6 +26889,7 @@ mod tests {
             session_id: "s1".into(),
             transcript_seq: 0,
             at_ms: 0,
+            parent_busy_ms: 0,
         });
         let mut app = test_app(client, vec![root, fork]);
         // An empty (but present) history takes `render_terminal_for_window`
@@ -27417,6 +27420,7 @@ mod tests {
                 session_id: parent,
                 transcript_seq: 0,
                 at_ms: 0,
+                parent_busy_ms: 0,
             });
             app.sessions.push(nested);
         }
@@ -27440,8 +27444,7 @@ mod tests {
         let area = app.layout.lineage_preview_area.expect("preview area");
         for hit in &app.layout.lineage_preview_box_hits {
             assert!(
-                hit.area.x >= area.x + 1
-                    && hit.area.x + hit.area.width <= area.x + area.width - 1,
+                hit.area.x >= area.x + 1 && hit.area.x + hit.area.width <= area.x + area.width - 1,
                 "hit {hit:?} escapes the preview {area:?}"
             );
         }

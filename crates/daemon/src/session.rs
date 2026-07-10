@@ -1106,6 +1106,28 @@ pub(crate) struct RemoteHandle {
     pub(crate) port: u16,
 }
 
+/// Transition a session's state while maintaining its compute-time
+/// accounting (spec 0080 turn info): entering `Running` opens a busy span
+/// (`busy_running_since_ms`), leaving it banks the elapsed span into
+/// `busy_ms`. Every state write in the daemon must go through here so the
+/// accumulated compute time stays truthful.
+pub(crate) fn set_state_tracked(
+    s: &mut agentd_protocol::SessionSummary,
+    new_state: SessionState,
+    now_ms: i64,
+) {
+    if new_state == SessionState::Running {
+        if s.busy_running_since_ms.is_none() {
+            s.busy_running_since_ms = Some(now_ms);
+        }
+    } else if let Some(since) = s.busy_running_since_ms.take() {
+        s.busy_ms = s
+            .busy_ms
+            .saturating_add(now_ms.saturating_sub(since).max(0) as u64);
+    }
+    s.state = new_state;
+}
+
 impl SessionManager {
     /// Construct the manager along with the receiver side of the
     /// remote-start channel. The caller (`main.rs`) spawns the
@@ -2543,11 +2565,16 @@ impl SessionManager {
                     }
                     let mut summary = entry.summary.write().await;
                     if !summary.state.is_terminal() {
-                        summary.state = if exit_code.unwrap_or(0) == 0 {
+                        let terminal = if exit_code.unwrap_or(0) == 0 {
                             SessionState::Done
                         } else {
                             SessionState::Errored
                         };
+                        set_state_tracked(
+                            &mut summary,
+                            terminal,
+                            chrono::Utc::now().timestamp_millis(),
+                        );
                     }
                     // `archive` records its intent on the entry before
                     // terminating the adapter — which is what triggered this
@@ -2825,7 +2852,11 @@ impl SessionManager {
             // A live session we just stopped should read as cleanly terminated,
             // not mid-run; leave an already-terminal state (Done/Errored) as-is.
             if !s.state.is_terminal() {
-                s.state = SessionState::Done;
+                set_state_tracked(
+                    &mut s,
+                    SessionState::Done,
+                    chrono::Utc::now().timestamp_millis(),
+                );
             }
             s.pending_input = false;
             s.clone()
@@ -2896,16 +2927,21 @@ impl SessionManager {
         // that timeline into segments without an extra fetch. A parent that
         // has since been deleted has no timeline left to mark; fall back to
         // 0 rather than failing the merge over it.
-        let merged_seq = match self.get_entry(&parent_id).await {
-            Some(parent) => parent.summary().await.event_count,
-            None => 0,
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let (merged_seq, merged_busy_ms) = match self.get_entry(&parent_id).await {
+            Some(parent) => {
+                let p = parent.summary().await;
+                (p.event_count, p.busy_ms_at(now_ms))
+            }
+            None => (0, 0),
         };
         let snapshot = {
             let mut summary = entry.summary.write().await;
             summary.merge = Some(agentd_protocol::ForkMerge {
                 mode,
-                at_ms: chrono::Utc::now().timestamp_millis(),
+                at_ms: now_ms,
                 merged_seq,
+                merged_busy_ms,
             });
             summary.clone()
         };
@@ -3479,7 +3515,11 @@ impl SessionManager {
         }
         let mut s = entry.summary.write().await;
         if !s.state.is_terminal() {
-            s.state = SessionState::Errored;
+            set_state_tracked(
+                &mut s,
+                SessionState::Errored,
+                chrono::Utc::now().timestamp_millis(),
+            );
         }
         let snapshot = s.clone();
         drop(s);
@@ -3741,6 +3781,8 @@ mod tests {
             group_id: group_id.map(str::to_string),
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
@@ -3749,6 +3791,41 @@ mod tests {
             forked_from: None,
             merge: None,
         }
+    }
+
+    #[test]
+    fn set_state_tracked_accumulates_running_spans_into_busy_ms() {
+        let mut s = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
+        s.state = SessionState::AwaitingInput;
+
+        // Entering Running opens a span but banks nothing yet.
+        set_state_tracked(&mut s, SessionState::Running, 1_000);
+        assert_eq!(s.state, SessionState::Running);
+        assert_eq!(s.busy_ms, 0);
+        assert_eq!(s.busy_running_since_ms, Some(1_000));
+
+        // Running → Running keeps the ORIGINAL span open — re-asserting the
+        // state (status events repeat it) must not reset the clock.
+        set_state_tracked(&mut s, SessionState::Running, 2_000);
+        assert_eq!(s.busy_running_since_ms, Some(1_000));
+
+        // Leaving Running banks the span into busy_ms.
+        set_state_tracked(&mut s, SessionState::AwaitingInput, 4_000);
+        assert_eq!(s.busy_ms, 3_000);
+        assert_eq!(s.busy_running_since_ms, None);
+
+        // Idle transitions with no open span bank nothing.
+        set_state_tracked(&mut s, SessionState::Done, 9_000);
+        assert_eq!(s.busy_ms, 3_000);
+
+        // A later Running span adds to the running total.
+        set_state_tracked(&mut s, SessionState::Running, 10_000);
+        set_state_tracked(&mut s, SessionState::Errored, 10_500);
+        assert_eq!(s.busy_ms, 3_500);
+
+        // Mid-span, busy_ms_at reports banked time plus the open span.
+        set_state_tracked(&mut s, SessionState::Running, 20_000);
+        assert_eq!(s.busy_ms_at(20_250), 3_750);
     }
 
     #[test]
@@ -4174,6 +4251,8 @@ mod tests {
                 group_id,
                 parent_session_id: None,
                 last_pty_at_ms: None,
+                busy_ms: 0,
+                busy_running_since_ms: None,
                 approval_mode: agentd_protocol::ApprovalMode::Manual,
                 kind,
                 archived: false,
@@ -4438,7 +4517,11 @@ mod tests {
                 .expect("session manager");
 
         let parent = synthetic_entry("parent", agentd_protocol::SessionKind::User, 0);
-        parent.summary.write().await.event_count = 17;
+        {
+            let mut s = parent.summary.write().await;
+            s.event_count = 17;
+            s.busy_ms = 7_500;
+        }
         mgr.sessions.write().await.insert("parent".into(), parent);
 
         let fork = synthetic_entry("fork", agentd_protocol::SessionKind::User, 10);
@@ -4446,6 +4529,7 @@ mod tests {
             session_id: "parent".into(),
             transcript_seq: 5,
             at_ms: 0,
+            parent_busy_ms: 0,
         });
         fork.summary.write().await.event_count = 2;
         mgr.sessions.write().await.insert("fork".into(), fork);
@@ -4465,6 +4549,11 @@ mod tests {
         assert_eq!(
             merge.merged_seq, 17,
             "merged_seq must come from the PARENT's event_count, not the fork's own"
+        );
+        assert_eq!(
+            merge.merged_busy_ms, 7_500,
+            "the merge boundary snapshots the PARENT's accumulated compute time \
+             so lineage turn-info windows can label busy deltas"
         );
 
         // The parent's own event_count is untouched by merge() itself — the
@@ -4501,6 +4590,7 @@ mod tests {
             session_id: "long-gone".into(),
             transcript_seq: 3,
             at_ms: 0,
+            parent_busy_ms: 0,
         });
         mgr.sessions
             .write()
@@ -5177,6 +5267,8 @@ mod tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             forked_from: None,
@@ -5313,6 +5405,8 @@ mod tests {
             group_id: None,
             parent_session_id: None,
             last_pty_at_ms: None,
+            busy_ms: 0,
+            busy_running_since_ms: None,
             approval_mode: agentd_protocol::ApprovalMode::Manual,
             kind: agentd_protocol::SessionKind::User,
             archived: false,

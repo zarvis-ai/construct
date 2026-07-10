@@ -1787,6 +1787,18 @@ pub struct SessionSummary {
     /// avoid sending input while the agent is mid-turn).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_pty_at_ms: Option<i64>,
+    /// Total accumulated COMPUTE time, ms: the sum of every completed span
+    /// this session spent in `SessionState::Running`, maintained by the
+    /// daemon on state transitions. Excludes the in-flight span — combine
+    /// with `busy_running_since_ms` (see [`SessionSummary::busy_ms_at`]).
+    /// `0` for sessions recorded before this field existed.
+    #[serde(default)]
+    pub busy_ms: u64,
+    /// Unix epoch ms when the current `Running` span began, if the session
+    /// is computing right now; `None` while idle. Set/cleared by the daemon
+    /// alongside `busy_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub busy_running_since_ms: Option<i64>,
     /// How adapters that gate tools handle Risky tool calls.
     #[serde(default)]
     pub approval_mode: ApprovalMode,
@@ -1821,11 +1833,29 @@ pub struct SessionSummary {
     pub merge: Option<ForkMerge>,
 }
 
+impl SessionSummary {
+    /// Total compute time as of `now_ms`: every completed `Running` span
+    /// plus the in-flight one, if the session is computing right now.
+    pub fn busy_ms_at(&self, now_ms: i64) -> u64 {
+        let mut busy = self.busy_ms;
+        if let Some(since) = self.busy_running_since_ms {
+            busy = busy.saturating_add(now_ms.saturating_sub(since).max(0) as u64);
+        }
+        busy
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ForkedFrom {
     pub session_id: String,
     pub transcript_seq: u64,
     pub at_ms: i64,
+    /// The parent's accumulated compute time (`busy_ms_at`) at the moment
+    /// this fork branched — the busy-time counterpart to `transcript_seq`,
+    /// letting lineage windows report summed compute time instead of
+    /// wall-clock spans. `#[serde(default)]` for records predating it.
+    #[serde(default)]
+    pub parent_busy_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1841,6 +1871,10 @@ pub struct ForkMerge {
     /// existed still deserialize (as `0`) rather than fail to load.
     #[serde(default)]
     pub merged_seq: u64,
+    /// The parent's accumulated compute time (`busy_ms_at`) at the moment
+    /// this fork merged back — the busy-time counterpart to `merged_seq`.
+    #[serde(default)]
+    pub merged_busy_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
