@@ -6886,6 +6886,26 @@ impl App {
                 }
             }
         }
+        // A focused lineage preview (spec 0080) loses keyboard focus on any
+        // click outside it — same "blur on click away" principle as the
+        // title-rename commit just above, and for the same reason: this must
+        // run before `forward_mouse_to_child` below, not inside
+        // `handle_left_click`. A click on ANOTHER pane (or even THIS pane's
+        // own PTY content) whose session has grabbed the mouse is forwarded
+        // and returns before ever reaching `handle_left_click` — so a check
+        // placed there alone never fires for that case, and a click on a
+        // different split (or the same session's own content, once the
+        // preview isn't over it) silently left the preview looking focused.
+        // A side effect only — the click still proceeds normally afterward,
+        // to `forward_mouse_to_child`, pane-focus switching, or wherever else
+        // it was headed (the `handle_left_click` copy of this check stays too,
+        // as a second layer for whatever reaches it directly).
+        if matches!(ev.kind, MouseEventKind::Down(_))
+            && self.lineage_preview_focused.is_some()
+            && !self.is_over_lineage_preview(ev.column, ev.row)
+        {
+            self.lineage_preview_focused = None;
+        }
         // If the cursor is over a pane whose child has grabbed the mouse
         // (e.g. Claude Code in fullscreen), forward the event into that PTY and
         // stop — construct becomes a transparent mouse pipe for the pane, so
@@ -27048,6 +27068,74 @@ mod tests {
             area_before_slide, area_after_slide,
             "the lineage preview must stay anchored to the pane's own boundary, \
              not slide along with the Program popup"
+        );
+        server.abort();
+    }
+
+    // Regression test for the same class of bug PR #735 fixed for the
+    // tutorial card (see `tutorial_card_click_reaches_card_through_on_mouse_
+    // over_grabbing_child` above): `clicking_elsewhere_clears_lineage_preview_
+    // focus` calls `handle_left_click` directly, which skips the real
+    // dispatch path — `on_mouse` → `forward_mouse_to_child` hands any click
+    // over a mouse-tracking pane's content straight to that child's PTY and
+    // returns *before* `handle_left_click` (and the focus-clearing check
+    // inside it) ever runs. A click on a session's own PTY content (or
+    // another split's), when that session's child has grabbed the mouse
+    // (e.g. Claude Code enabling DECSET mouse tracking — very common), used
+    // to leave a focused lineage preview looking focused forever. Unlike the
+    // tutorial-card fix, this one does NOT consume the click — the preview
+    // just loses focus as a side effect, and the click still forwards to the
+    // child exactly as it would without a preview involved.
+    #[tokio::test]
+    async fn clicking_a_mouse_grabbing_pane_still_clears_lineage_preview_focus() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = test_app_with_lineage().await;
+        app.select_session("s1".to_string());
+        app.view = ViewMode::Terminal;
+
+        // s1's own child enables mouse tracking (DECSET ?1000h) — the
+        // "session underneath" case: clicking its PTY content, not just some
+        // OTHER split, must also clear focus.
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"\x1b[?1000h");
+        let _ = history.replay(120, 40, 0);
+        app.histories.insert("s1".into(), history);
+        assert_ne!(
+            app.histories.get("s1").unwrap().mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "test setup must put the pane's child in a mouse-tracking mode"
+        );
+
+        app.activate_lineage_preview_focus("s1".to_string());
+        assert_eq!(app.lineage_preview_focused.as_deref(), Some("s1"));
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+
+        // Click well away from the preview's own rendered box (top-left
+        // corner of the pane's content, not the label or the preview).
+        let pane = app.layout.main_window_areas[0].inner_area;
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: pane.x,
+            row: pane.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+
+        assert!(
+            app.lineage_preview_focused.is_none(),
+            "clicking the mouse-grabbing pane's own content should clear \
+             lineage preview focus even though the event is forwarded, not \
+             handled by handle_left_click"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "unlike the tutorial-card fix, this one is a side effect only — \
+             the click must still forward to the child PTY as normal"
         );
         server.abort();
     }
