@@ -1971,7 +1971,8 @@ fn render_lineage_section(
         } else {
             " − "
         };
-        let bx = rect.x + rect.width.saturating_sub(4);
+        // Flush right, matching the operator panel's toggle below.
+        let bx = rect.x + rect.width.saturating_sub(3);
         let button = Rect {
             x: bx,
             y: rect.y,
