@@ -8,45 +8,50 @@ Scope: The session/split-pane border's focused vs. unfocused color, across all c
 ## Decision
 
 For every named UI theme (`matrix`, `basic`, `dark`, `light`), a session or
-split pane's focused border color must be a visibly brighter/more-saturated
-variant of the *same hue* as its unfocused border color — never a
-perceptibly different hue. Focus should read as "this border lit up," not
-"this border changed color."
+split pane's focused border must differ from its unfocused border only in
+brightness (lightness) — never by introducing or changing hue. Focus should
+read as "this border lit up," not "this border changed color."
 
-Concretely: the unfocused border must carry enough saturation to be
-recognizable as belonging to the theme's accent hue family (not desaturated
-to near-gray), so that the jump to the focused border's higher
-saturation/lightness reads as a brightness change rather than a hue swap.
+Two concrete implementations satisfy this, depending on the theme:
+
+- **Matrix** keeps a fixed green hue for the session border; only
+  saturation/lightness shift between unfocused and focused.
+- **Basic, Dark UI, and Light UI** use a neutral, fully achromatic grey for
+  the session border (zero saturation) at two lightness levels — a dim grey
+  when unfocused, a lighter grey when focused on dark-background themes
+  (darker when focused on light-background themes, for contrast against a
+  light backdrop). Being achromatic, this border can never carry a hue that
+  might be confused with anything else on screen.
 
 This is a separate rule from [[0083-program-border-fixed-across-themes]],
-which fixes the Program pane's frame to one hue across every theme and
-signals focus with a Bold/Dim modifier instead of a color change. Session
-border focus, by contrast, is themed (its hue follows the active palette) —
-the rule here only constrains the *relationship* between its two states.
+which fixes the Program pane's frame to one hue (cyan) across every theme and
+signals focus with a Bold/Dim modifier instead of a color change.
 
 ## Reason
 
-The Matrix theme's session border already behaved this way: unfocused and
-focused share essentially the same hue, differing mainly in
-saturation/lightness. The other named themes (Basic, Dark UI, Light UI)
-technically preserved hue too, but their unfocused border sat at ~10-22%
-saturation — desaturated enough to read as plain gray — while the focused
-border jumped to ~90-100% saturation. Because the unfocused state carried no
-visible hue, the focus transition perceptually looked like the border
-changing to an unrelated color, even though the numeric hue angle barely
-moved. Raising the unfocused border's saturation (roughly to the ~45-55%
-range) makes the same-hue relationship actually visible, matching the
-already-correct Matrix behavior.
+Matrix's session border already behaved this way: unfocused and focused share
+a hue, differing mainly in saturation/lightness. Basic/Dark UI/Light UI
+originally used a blue accent for the border, at low saturation when
+unfocused and high saturation when focused. Two problems with that: the
+unfocused state was desaturated enough to read as plain gray, so the jump to
+a vivid focused blue looked like a color swap rather than a brightness
+change; and blue sits close enough to the Program pane's fixed cyan frame
+(spec 0083) that a session border and the Program border could be
+misidentified for one another at a glance. Making the session border fully
+achromatic for these three themes fixes both: there is no hue left to drift
+on focus, and zero saturation can never collide with the Program pane's
+chromatic cyan.
 
 ## Consequences
 
-Adding or editing a named theme's `border`/`border_focused` pair must keep
-both at (approximately) the same hue, and the unfocused color must be
-saturated enough to visibly belong to that hue rather than reading as
-neutral gray. A regression test asserts both properties (hue distance within
-a tolerance, and a saturation floor for the themes retuned by this decision)
-so a future edit can't silently reintroduce a gray unfocused border or an
-unrelated-hue focused border.
+Adding or editing a named theme's `border`/`border_focused` pair must either
+(a) keep both at the same hue if the theme wants a colored border (Matrix's
+approach), or (b) make both fully achromatic (zero saturation) if the theme
+wants a neutral border distinct from the Program frame's accent (Basic/Dark
+UI/Light UI's approach). A regression test asserts hue continuity for Matrix
+and zero saturation (plus a chromatic `program_border` for contrast) for the
+other three, so a future edit can't silently reintroduce a colored-but-wrong
+border or a hue collision with the Program frame.
 
 The `[colors]` `theme.toml` escape hatch can still override `border` and
 `border_focused` independently per spec [[0070-client-ui-themes]] — this
@@ -57,6 +62,6 @@ what a user's custom override is allowed to do.
 
 This does not change `program_border` (spec 0083, a distinct fixed-hue
 design) or any other theme slot (`accent`, `accent_alt`, `highlight_bg`,
-etc.). It does not mandate a specific saturation/lightness value, only that
-the unfocused/focused pair stay recognizably the same hue with unfocused
-carrying visible color rather than being desaturated to gray.
+etc.) — those keep following the active theme's own palette. It does not
+mandate specific lightness values, only that unfocused/focused pairs differ
+in brightness and not hue.

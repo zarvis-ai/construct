@@ -350,8 +350,8 @@ impl Theme {
             text: Color::Rgb(229, 231, 235),
             dim: Color::Rgb(107, 114, 128),
             muted: Color::Rgb(156, 163, 175),
-            border: Color::Rgb(40, 78, 130),
-            border_focused: Color::Rgb(96, 165, 250),
+            border: Color::Rgb(90, 90, 90),
+            border_focused: Color::Rgb(190, 190, 190),
             accent: Color::Rgb(96, 165, 250),
             accent_alt: Color::Rgb(192, 132, 252),
             program_border: Color::Rgb(92, 225, 255),
@@ -388,8 +388,8 @@ impl Theme {
             text: Color::Rgb(31, 41, 55),
             dim: Color::Rgb(107, 114, 128),
             muted: Color::Rgb(75, 85, 99),
-            border: Color::Rgb(118, 149, 203),
-            border_focused: Color::Rgb(37, 99, 235),
+            border: Color::Rgb(190, 190, 190),
+            border_focused: Color::Rgb(90, 90, 90),
             accent: Color::Rgb(37, 99, 235),
             accent_alt: Color::Rgb(124, 58, 237),
             program_border: Color::Rgb(22, 110, 150),
@@ -426,8 +426,8 @@ impl Theme {
             text: Color::Rgb(232, 236, 243),
             dim: Color::Rgb(102, 112, 128),
             muted: Color::Rgb(145, 153, 166),
-            border: Color::Rgb(42, 80, 125),
-            border_focused: Color::Rgb(121, 184, 255),
+            border: Color::Rgb(90, 90, 90),
+            border_focused: Color::Rgb(190, 190, 190),
             accent: Color::Rgb(121, 184, 255),
             accent_alt: Color::Rgb(255, 176, 84),
             program_border: Color::Rgb(92, 225, 255),
@@ -464,8 +464,8 @@ impl Theme {
             text: Color::Rgb(34, 40, 49),
             dim: Color::Rgb(125, 135, 148),
             muted: Color::Rgb(92, 103, 118),
-            border: Color::Rgb(181, 201, 227),
-            border_focused: Color::Rgb(34, 115, 195),
+            border: Color::Rgb(190, 190, 190),
+            border_focused: Color::Rgb(90, 90, 90),
             accent: Color::Rgb(34, 115, 195),
             accent_alt: Color::Rgb(174, 96, 28),
             program_border: Color::Rgb(22, 110, 150),
@@ -973,20 +973,12 @@ mod tests {
         d.min(360.0 - d)
     }
 
-    /// Every theme's focused/unfocused border pair must share a hue family,
-    /// so the focus transition reads as "the same border got brighter," not
-    /// "the border changed color" (spec 0084).
+    /// Matrix's session border keeps a fixed green hue across focus states —
+    /// the focus transition is a brightness change, never a hue change
+    /// (spec 0084).
     #[test]
-    fn session_border_focus_stays_same_hue_across_themes() {
-        let themes = [
-            Theme::dark(),
-            Theme::light(),
-            Theme::basic_dark(),
-            Theme::basic_light(),
-            Theme::dark_ui(),
-            Theme::light_ui(),
-        ];
-        for theme in &themes {
+    fn matrix_session_border_focus_stays_same_hue() {
+        for theme in [Theme::dark(), Theme::light()] {
             let (h_unfocused, _, _) = border_hsl(theme.border);
             let (h_focused, _, _) = border_hsl(theme.border_focused);
             let hue_gap = hue_distance(h_unfocused, h_focused);
@@ -1000,14 +992,14 @@ mod tests {
         }
     }
 
-    /// Basic/Dark UI/Light UI's unfocused `border` used to sit at ~10-22%
-    /// saturation — desaturated enough to read as plain gray, so jumping to a
-    /// vivid `border_focused` on focus looked like an unrelated color swap
-    /// rather than "the same border got brighter" (spec 0084). Matrix's own
-    /// light variant is intentionally excluded: it already read correctly at
-    /// its lower, hand-tuned saturation and this fix doesn't touch it.
+    /// Basic/Dark UI/Light UI's session border is neutral grey (no hue at
+    /// all) rather than a dim/vivid version of the theme's blue accent, so it
+    /// reads as clearly distinct from the Program pane's fixed cyan frame
+    /// (spec 0083) and can never collide with it on hue. Focus is signaled by
+    /// lightness alone: dark-background themes get brighter on focus,
+    /// light-background themes get darker (spec 0084).
     #[test]
-    fn retuned_themes_unfocused_border_reads_as_colored_not_gray() {
+    fn non_matrix_themes_session_border_is_achromatic_and_distinct_from_program_accent() {
         let themes = [
             Theme::basic_dark(),
             Theme::basic_light(),
@@ -1015,11 +1007,15 @@ mod tests {
             Theme::light_ui(),
         ];
         for theme in &themes {
-            let (_, s_unfocused, _) = border_hsl(theme.border);
+            for color in [theme.border, theme.border_focused] {
+                let (_, s, _) = border_hsl(color);
+                assert_eq!(s, 0.0, "expected an achromatic border, got {color:?}");
+            }
+            let (_, program_s, _) = border_hsl(theme.program_border);
             assert!(
-                s_unfocused >= 0.40,
-                "unfocused border saturation {s_unfocused} reads as gray (border={:?})",
-                theme.border,
+                program_s > 0.0,
+                "program_border should be chromatic so a zero-saturation \
+                 session border can never collide with it on hue"
             );
         }
     }
