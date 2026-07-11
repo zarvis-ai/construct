@@ -733,14 +733,14 @@ pub enum MinibufferIntent {
     ForkSessionHarness {
         source_session_id: String,
     },
-    MergeMenu {
-        session_id: String,
-    },
     /// Second stage of the new-session wizard when the user typed `group`:
     /// asks for the group's name.
     NewGroupName,
+    /// End-session prompt (`C-x k` / `dd`). When `is_fork` is true the choice
+    /// cluster includes `[m] merge and archive` in addition to delete/archive.
     DeleteConfirm {
         session_id: String,
+        is_fork: bool,
     },
     MenuArchiveConfirm {
         session_id: String,
@@ -949,11 +949,13 @@ pub struct DynamicUiHover {
 pub enum SessionTitleMenuAction {
     Rename,
     Fork,
-    Merge,
     SplitHorizontal,
     SplitVertical,
     CloseSplit,
     Archive,
+    /// Fork-only: merge the fork's result into its parent and archive it.
+    /// Placed directly below Archive so the close-out actions group together.
+    Merge,
     Delete,
 }
 
@@ -961,11 +963,11 @@ impl SessionTitleMenuAction {
     pub const ALL: [Self; 8] = [
         Self::Rename,
         Self::Fork,
-        Self::Merge,
         Self::SplitHorizontal,
         Self::SplitVertical,
         Self::CloseSplit,
         Self::Archive,
+        Self::Merge,
         Self::Delete,
     ];
 
@@ -973,11 +975,11 @@ impl SessionTitleMenuAction {
         match self {
             Self::Rename => "rename",
             Self::Fork => "fork conversation",
-            Self::Merge => "merge result",
             Self::SplitHorizontal => "split horizontal",
             Self::SplitVertical => "split vertical",
             Self::CloseSplit => "close split",
             Self::Archive => "archive",
+            Self::Merge => "merge and archive",
             Self::Delete => "delete",
         }
     }
@@ -8713,13 +8715,10 @@ impl App {
                     .iter()
                     .any(|s| s.id == id && s.forked_from.is_some())
                 {
-                    self.minibuffer = Some(Minibuffer {
-                        prompt: "Merge [result/discard]: ".into(),
-                        input: String::new(),
-                        cursor: 0,
-                        intent: MinibufferIntent::MergeMenu { session_id: id },
-                        error: None,
-                    });
+                    // No intermediate result/discard prompt — "merge and
+                    // archive" is a single action (discard was removed).
+                    self.apply_fork_merge(id, construct_protocol::ForkMergeMode::Result)
+                        .await;
                 } else {
                     self.set_status("merge: select a fork".into());
                 }
@@ -8759,15 +8758,23 @@ impl App {
             },
             OpenDeleteConfirm => match self.selection.clone() {
                 Selection::Session(id) => {
-                    // The `[d]`/`[a]`/`[N]` choice cluster and its
+                    // The `[d]`/`[a]`/`[m]`/`[N]` choice cluster and its
                     // descriptions render as clickable spans (spec 0075,
                     // see `ui::minibuffer_choice_suffix`) — this prompt only
-                    // carries the data-dependent question prefix.
+                    // carries the data-dependent question prefix. Forks get
+                    // an extra `[m] merge and archive` option.
+                    let is_fork = self
+                        .sessions
+                        .iter()
+                        .any(|s| s.id == id && s.forked_from.is_some());
                     self.minibuffer = Some(Minibuffer {
                         prompt: format!("Session {}: ", short_id(&id)),
                         input: String::new(),
                         cursor: 0,
-                        intent: MinibufferIntent::DeleteConfirm { session_id: id },
+                        intent: MinibufferIntent::DeleteConfirm {
+                            session_id: id,
+                            is_fork,
+                        },
                         error: None,
                     });
                 }
@@ -20704,6 +20711,23 @@ mod tests {
                 .iter()
                 .position(|action| *action == SessionTitleMenuAction::Merge)
                 .expect("merge menu row") as u16;
+        let archive_row = area.y
+            + 1
+            + SessionTitleMenuAction::ALL
+                .iter()
+                .position(|action| *action == SessionTitleMenuAction::Archive)
+                .expect("archive menu row") as u16;
+
+        // Merge and archive sits directly under archive in the close-out group.
+        assert_eq!(
+            merge_row,
+            archive_row + 1,
+            "merge and archive should render below archive"
+        );
+        assert_eq!(
+            SessionTitleMenuAction::Merge.label(),
+            "merge and archive"
+        );
 
         let parent_menu = SessionTitleMenu {
             session_id: "parent".into(),
@@ -20713,7 +20737,7 @@ mod tests {
         assert_eq!(
             parent_menu.item_at(area.x + 2, merge_row),
             None,
-            "the parent shows Merge result but cannot activate it"
+            "the parent shows merge and archive but cannot activate it"
         );
 
         let fork_menu = SessionTitleMenu {
@@ -23475,6 +23499,7 @@ mod tests {
             cursor: 0,
             intent: MinibufferIntent::DeleteConfirm {
                 session_id: "s1".into(),
+                is_fork: false,
             },
             error: None,
         });
@@ -23504,6 +23529,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_confirm_fork_render_includes_merge_and_archive_choice() {
+        let (mut app, _dir, server, _calls) =
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
+        app.minibuffer = Some(Minibuffer {
+            prompt: "Session s1: ".into(),
+            input: String::new(),
+            cursor: 0,
+            intent: MinibufferIntent::DeleteConfirm {
+                session_id: "s1".into(),
+                is_fork: true,
+            },
+            error: None,
+        });
+
+        let _mb_area = render_minibuffer_for_test(&mut app);
+        let mut hits = app.layout.minibuffer_choice_hits.clone();
+        hits.sort_by_key(|h| h.x_start);
+        assert_eq!(
+            hits.len(),
+            4,
+            "fork end-prompt should include merge and archive, got {hits:?}"
+        );
+        assert!(matches!(&hits[0].action, MinibufferChoiceAction::Submit(s) if s == "d"));
+        assert!(matches!(&hits[1].action, MinibufferChoiceAction::Submit(s) if s == "a"));
+        assert!(matches!(&hits[2].action, MinibufferChoiceAction::Submit(s) if s == "m"));
+        assert!(matches!(&hits[3].action, MinibufferChoiceAction::Submit(s) if s == "N"));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn delete_confirm_typed_submit_d_deletes_session_baseline() {
         // Baseline for the click-parity test below: typing "d" then Enter
         // goes through `run_minibuffer_submit` (family B's keyboard path).
@@ -23511,6 +23566,7 @@ mod tests {
             choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         let intent = MinibufferIntent::DeleteConfirm {
             session_id: "s1".into(),
+            is_fork: false,
         };
         app.run_minibuffer_submit(intent, "d".to_string()).await;
 
@@ -23535,6 +23591,7 @@ mod tests {
             cursor: 0,
             intent: MinibufferIntent::DeleteConfirm {
                 session_id: "s1".into(),
+                is_fork: false,
             },
             error: None,
         });
@@ -23575,6 +23632,7 @@ mod tests {
             cursor: 0,
             intent: MinibufferIntent::DeleteConfirm {
                 session_id: "s1".into(),
+                is_fork: false,
             },
             error: None,
         });
@@ -30704,6 +30762,10 @@ pub enum SessionEndChoice {
     /// hidden from the list until the "show archived" toggle is on, and can be
     /// restarted later.
     Archive,
+    /// `m` / `merge` / `merge and archive` — take the fork's result into its
+    /// parent and archive the fork. Only meaningful when the selected session
+    /// is a fork; non-fork prompts do not advertise this option.
+    MergeAndArchive,
     /// Anything else (`n`, empty Enter) — do nothing.
     Cancel,
 }
@@ -30712,6 +30774,7 @@ pub fn parse_session_end_choice(input: &str) -> SessionEndChoice {
     match input.trim().to_lowercase().as_str() {
         "d" | "y" | "delete" => SessionEndChoice::Delete,
         "a" | "archive" => SessionEndChoice::Archive,
+        "m" | "merge" | "merge and archive" => SessionEndChoice::MergeAndArchive,
         _ => SessionEndChoice::Cancel,
     }
 }
@@ -30801,6 +30864,26 @@ mod session_end_prompt_tests {
                 parse_session_end_choice(s),
                 SessionEndChoice::Archive,
                 "input {s:?} should archive",
+            );
+        }
+    }
+
+    #[test]
+    fn m_or_merge_merges_and_archives() {
+        for s in [
+            "m",
+            "M",
+            "  m  ",
+            "merge",
+            "MERGE",
+            " merge ",
+            "merge and archive",
+            "Merge and archive",
+        ] {
+            assert_eq!(
+                parse_session_end_choice(s),
+                SessionEndChoice::MergeAndArchive,
+                "input {s:?} should merge and archive",
             );
         }
     }

@@ -71,9 +71,12 @@ Tree construction and `git log --graph`-style layout are a self-contained,
 out) so the same logic can back a future pinnable/dockable panel without a
 rewrite — the popup itself is a thin adapter wiring that module to live
 session data, keyboard navigation, and the existing merge/discard action.
-Merge and discard reuse the exact code path the `C-x m` minibuffer menu
-already uses; the popup's `m`/`d` keys are a direct-key shortcut for it,
-not a second implementation.
+Merge-and-archive reuses the exact code path the session-end prompt
+(`[m] merge and archive` on a fork via `C-x k`) and the title-menu
+"merge and archive" action already use; the popup's `m` key is a
+direct-key shortcut for that path, not a second implementation. There is
+no discard action on these surfaces — archive alone closes a fork without
+merging.
 
 Keys the popup doesn't handle close it and re-dispatch the same keystroke
 through ordinary routing, the same rule the `/configure` dialog follows —
@@ -129,5 +132,5 @@ turn has two subagents and one still-open fork, and pressing `q` opens the
 view rooted at the original ancestor: the ancestor's node shows both the
 subagents (`▸`) and the fork chain (`⑂`) branching off it, with the
 forked-from-a-fork session nested one level deeper. Pressing `m` on the
-open fork merges it exactly as `C-x m` would, and its row immediately
+open fork merges it exactly as the session-end / title-menu merge would, and its row immediately
 renders as closed back into its parent's column.

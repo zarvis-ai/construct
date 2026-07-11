@@ -504,8 +504,9 @@ fn step4_lines() -> Vec<TutorialLine> {
         vec![t("The fork keeps its context but works on an")],
         vec![t("independent path. Create one now.")],
         vec![],
-        vec![t("On the fork, ☰ enables Merge result:")],
-        vec![t("send its result back, or discard the fork.")],
+        vec![t("On the fork, ☰ enables merge and archive:")],
+        vec![t("send its result back and archive the fork.")],
+        vec![t("Or C-x k then m for the same action.")],
     ]
 }
 
@@ -1658,7 +1659,8 @@ mod tests {
             ..Default::default()
         }));
         assert!(text.contains("Fork conversation"));
-        assert!(text.contains("Merge result"));
+        assert!(text.contains("merge and archive"));
+        assert!(text.contains("C-x k"));
         assert!(text.contains("title-bar ☰"));
     }
 

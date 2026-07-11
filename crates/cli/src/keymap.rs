@@ -20,7 +20,11 @@ pub enum KeyAction {
     /// editing or completion selects a different harness. No separate initial
     /// prompt is required. Bound to `C-x f` (emacs) / `f` (vim).
     OpenFork,
-    /// Merge or discard the selected fork.
+    /// Merge the selected fork's result into its parent and archive the fork.
+    /// Unbound from a dedicated chord — folded into `OpenDeleteConfirm` (`C-x k`
+    /// / `dd`) as `[m] merge and archive`, and into the session title menu.
+    /// Kept as a KeyAction so the title-menu / slash-command paths can still
+    /// invoke it without a separate chord.
     OpenMerge,
     /// Zoom: the session view fills the screen (list / pin strip / modeline
     /// all hidden; only the minibuffer stays). Toggling again restores the
@@ -112,8 +116,7 @@ pub enum KeyAction {
     ToggleAutomode,
     /// Toggle terminal mouse capture. When disabled, native terminal
     /// selection works; agentd mouse interactions are suspended. Bound to
-    /// `C-x c` in both profiles (moved off `C-x m`, which now merges the
-    /// selected fork).
+    /// `C-x c` in both profiles.
     ToggleMouseCapture,
     /// Cycle the active UI color theme. Click-only for the minibuffer theme
     /// affordance; `/theme` remains the keyboard-facing command.
@@ -327,7 +330,8 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), ch('r')]), OpenRename),
         // Unified fork picker; Enter accepts the source harness default.
         (Chord(vec![ctrl('x'), ch('f')]), OpenFork),
-        (Chord(vec![ctrl('x'), ch('m')]), OpenMerge),
+        // Merge is no longer a dedicated chord — forked sessions get
+        // `[m] merge and archive` on the `C-x k` end prompt instead.
         // Pin / unpin selected session (or all members of a selected group)
         (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
         (Chord(vec![ch(' ')]), TogglePin),
@@ -400,7 +404,8 @@ fn vim() -> Keymap {
         (Chord(vec![ch('r')]), OpenRename),
         // Unified fork picker; uppercase `O` is intentionally unbound.
         (Chord(vec![ch('f')]), OpenFork),
-        (Chord(vec![ch('m')]), OpenMerge),
+        // Merge has no dedicated vim chord either — forked sessions get
+        // `[m] merge and archive` on the `dd` / `C-x k` end prompt.
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch('z')]), ToggleZoom),
         (Chord(vec![shift('Z'), shift('Z')]), Quit),
@@ -790,7 +795,11 @@ mod tests {
             resolve(&km, vec![shift('O')]),
             KeymapResult::Unhandled
         ));
-        assert_action(&km, vec![ch('m')], KeyAction::OpenMerge);
+        // Bare `m` is unbound — merge is folded into the end-session prompt.
+        assert!(matches!(
+            resolve(&km, vec![ch('m')]),
+            KeymapResult::Unhandled
+        ));
         assert_action(&km, vec![shift('J')], KeyAction::MoveSelectedDown);
         assert_action(&km, vec![shift('K')], KeyAction::MoveSelectedUp);
         assert_action(&km, vec![ch('/')], KeyAction::OpenSwitchSession);
@@ -814,6 +823,22 @@ mod tests {
                 KeymapResult::Unhandled
             ));
         }
+    }
+
+    #[test]
+    fn dedicated_merge_chord_is_removed() {
+        // Merge was folded into the session-end prompt (`C-x k` / `dd`);
+        // the old `C-x m` / bare `m` chords must not resolve.
+        let emacs = default_for(Profile::Emacs);
+        assert!(matches!(
+            resolve(&emacs, vec![ctrl('x'), ch('m')]),
+            KeymapResult::Unhandled
+        ));
+        let vim = default_for(Profile::Vim);
+        assert!(matches!(
+            resolve(&vim, vec![ch('m')]),
+            KeymapResult::Unhandled
+        ));
     }
 
     #[test]

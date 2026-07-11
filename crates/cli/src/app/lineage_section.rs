@@ -6,7 +6,7 @@
 //! pane title bar's harness label (spec 0080, superseded). The tree
 //! construction (`crate::lineage`) and the row-level interaction vocabulary
 //! (`j`/`k`/arrows/`C-n`/`C-p` navigation, `Enter` jumps in, `m`/`d`
-//! merge/discard, `Esc` backs out) carry over unchanged; what changed is
+//! merge-and-archive, `Esc` backs out) carry over unchanged; what changed is
 //! where the surface lives and how it's entered:
 //!
 //! - The section renders whenever the selected session has lineage to show —
@@ -244,12 +244,13 @@ impl App {
         self.focus = PaneFocus::View;
     }
 
-    /// `m` / `d`: merge or discard the focused section's highlighted fork,
-    /// reusing the exact merge/discard path the `C-x m` minibuffer menu uses
+    /// `m`: merge-and-archive the focused section's highlighted fork,
+    /// reusing the exact path the session-end / title-menu uses
     /// ([`App::apply_fork_merge`], spec 0078) — a direct-key shortcut for
     /// it, not a second implementation. A no-op with a status note when the
-    /// highlighted row isn't an open (unmerged, undiscarded) fork.
-    async fn lineage_merge_or_discard(&mut self, mode: construct_protocol::ForkMergeMode) {
+    /// highlighted row isn't an open (unmerged) fork. There is no discard
+    /// key here: archiving a fork without merging is enough.
+    async fn lineage_merge_result(&mut self) {
         let Some(session_id) = self.lineage_section_session() else {
             return;
         };
@@ -264,14 +265,15 @@ impl App {
             self.set_status("merge: select an open fork".to_string());
             return;
         }
-        self.apply_fork_merge(id, mode).await;
+        self.apply_fork_merge(id, construct_protocol::ForkMergeMode::Result)
+            .await;
         // The section stays focused — its rows are rebuilt from live
         // `self.sessions` on the very next render/key, so the merged fork's
         // terminal-state styling appears immediately.
     }
 
     /// Route a key while the lineage section owns keyboard focus.
-    /// Navigation/merge/discard/jump keys return `true` (fully handled; the
+    /// Navigation/merge/jump keys return `true` (fully handled; the
     /// section stays focused unless it was Enter, Esc, or Tab). Anything
     /// else clears focus and returns `false`, telling the caller
     /// (`App::on_key`) to re-dispatch the SAME key through ordinary routing —
@@ -313,13 +315,7 @@ impl App {
                 true
             }
             KeyCode::Char('m') => {
-                self.lineage_merge_or_discard(construct_protocol::ForkMergeMode::Result)
-                    .await;
-                true
-            }
-            KeyCode::Char('d') => {
-                self.lineage_merge_or_discard(construct_protocol::ForkMergeMode::Discard)
-                    .await;
+                self.lineage_merge_result().await;
                 true
             }
             // Preserve every `C-x` chord while the section is focused. The

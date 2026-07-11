@@ -411,18 +411,6 @@ impl App {
                     Err(e) => self.set_status(format!("fork failed: {e}")),
                 }
             }
-            MinibufferIntent::MergeMenu { session_id } => {
-                let choice = input.trim().to_ascii_lowercase();
-                let mode = match choice.as_str() {
-                    "result" | "take result" => construct_protocol::ForkMergeMode::Result,
-                    "discard" | "d" => construct_protocol::ForkMergeMode::Discard,
-                    _ => {
-                        self.set_status("merge: type result or discard".into());
-                        return;
-                    }
-                };
-                self.apply_fork_merge(session_id, mode).await;
-            }
             MinibufferIntent::GroupDeleteConfirm { group_id } => {
                 let choice = parse_group_delete_choice(&input);
                 let delete_members = match choice {
@@ -497,7 +485,10 @@ impl App {
                     Err(e) => self.set_status(format!("rename failed: {e}")),
                 }
             }
-            MinibufferIntent::DeleteConfirm { session_id } => {
+            MinibufferIntent::DeleteConfirm {
+                session_id,
+                is_fork,
+            } => {
                 match parse_session_end_choice(&input) {
                     SessionEndChoice::Delete => match self.client.delete(&session_id).await {
                         Ok(()) => self.set_status(format!("deleted {}", short_id(&session_id))),
@@ -507,6 +498,17 @@ impl App {
                         Ok(()) => self.set_status(format!("archived {}", short_id(&session_id))),
                         Err(e) => self.set_status(format!("archive failed: {e}")),
                     },
+                    SessionEndChoice::MergeAndArchive => {
+                        if !is_fork {
+                            self.set_status("merge: select a fork".into());
+                            return;
+                        }
+                        self.apply_fork_merge(
+                            session_id,
+                            construct_protocol::ForkMergeMode::Result,
+                        )
+                        .await;
+                    }
                     SessionEndChoice::Cancel => {
                         self.set_status("cancelled".to_string());
                     }
@@ -711,9 +713,9 @@ impl App {
     /// summary and injects it into the parent through the parent's ordinary
     /// input path (so it lands as a real transcript/PTY message, not a side
     /// channel — spec 0078), then records the outcome and archives the
-    /// fork. Shared by the `C-x m` / `m` minibuffer prompt (`MergeMenu`
-    /// below) and the lineage view popup's direct `m`/`d` keys (spec 0079)
-    /// so there is exactly one merge/discard code path.
+    /// fork. Shared by the session-end prompt's `[m] merge and archive`, the
+    /// session title menu, and the lineage view popup's direct `m`/`d` keys
+    /// (spec 0079) so there is exactly one merge/discard code path.
     pub(crate) async fn apply_fork_merge(
         &mut self,
         session_id: String,

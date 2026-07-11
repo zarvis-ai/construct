@@ -72,9 +72,10 @@ the same vocabulary the deleted modal used to own exclusively:
   message it injected are the same event — spec 0078). Jumping in also
   clears both focus and the pin for this preview: leaving to go work in
   that session means the preview has served its purpose.
-- `m` / `d`: merge or discard the selected row, via the exact same
-  merge/discard path the `C-x m` minibuffer menu uses — a direct-key
-  shortcut for it, not a second implementation.
+- `m`: merge-and-archive the selected row, via the exact same path the
+  session-end / title-menu merge action uses — a direct-key shortcut for
+  it, not a second implementation. There is no discard key; archive alone
+  is enough when the result is not wanted.
 - `Esc`: clears focus ONLY. It does not un-pin. A preview the user
   explicitly pinned stays visible after they're done navigating it — Esc
   backs out one level (stop owning the keyboard), it doesn't dismiss

@@ -52,12 +52,19 @@ transcript seeding, but it no longer requires separate keybindings or flows.
 - Same-harness adapters may use native fork state for full context fidelity;
   cross-harness forks retain the portable transcript-seed behavior (spec
   0031). Both are lineage-tracked identically.
-- The merge menu (result/discard) and its auto-archive-after-either behavior
-  apply to any fork, regardless of which entry point created it.
+- Merging a fork always takes its result into the parent and archives the
+  fork. There is no separate dedicated merge chord and no discard action:
+  the action lives on the session-end prompt (`C-x k` / `dd` shows
+  `[m] merge and archive` when the selected session is a fork) and on the
+  session title menu. Lineage surfaces keep an `m` direct-key shortcut for
+  the same path; closing a fork without a result is plain archive.
+  Auto-archive-after-merge applies to any fork, regardless of which entry
+  point created it.
 - Every session title actions menu exposes **Fork conversation**, including on
-  a fork. It also exposes **Merge result** as an inactive affordance on a
-  parent and an active action only on a fork, making the branch workflow
-  discoverable without suggesting that a parent can merge into itself.
+  a fork. It also exposes **Merge and archive** (directly below **Archive**)
+  as an inactive affordance on a parent and an active action only on a fork,
+  making the branch workflow discoverable without suggesting that a parent
+  can merge into itself.
 
 ## Non-Goals
 

@@ -1351,27 +1351,40 @@ fn minibuffer_choice_suffix(intent: &MinibufferIntent) -> Option<Vec<PromptPart>
             });
             parts
         }
-        // Typed-then-submit path, three choices with per-choice
-        // descriptions. Canonical letters only (`d`, not the `y` alias) —
-        // typing `y` still works, it just isn't a separate click target.
-        DeleteConfirm { .. } => vec![
-            PromptPart::Text("["),
-            PromptPart::Choice {
-                label: "d",
-                action: Submit("d".to_string()),
-            },
-            PromptPart::Text("] delete (drop transcript + worktree) / ["),
-            PromptPart::Choice {
-                label: "a",
-                action: Submit("a".to_string()),
-            },
-            PromptPart::Text("] archive (terminate, keep, hide) / ["),
-            PromptPart::Choice {
+        // Typed-then-submit path. Canonical letters only (`d`, not the `y`
+        // alias) — typing `y` still works, it just isn't a separate click
+        // target. Forks get an extra `[m] merge and archive` choice; non-forks
+        // keep the classic delete / archive / cancel cluster.
+        DeleteConfirm { is_fork, .. } => {
+            let mut parts = vec![
+                PromptPart::Text("["),
+                PromptPart::Choice {
+                    label: "d",
+                    action: Submit("d".to_string()),
+                },
+                PromptPart::Text("] delete (drop transcript + worktree) / ["),
+                PromptPart::Choice {
+                    label: "a",
+                    action: Submit("a".to_string()),
+                },
+                PromptPart::Text("] archive (terminate, keep, hide)"),
+            ];
+            if *is_fork {
+                parts.push(PromptPart::Text(" / ["));
+                parts.push(PromptPart::Choice {
+                    label: "m",
+                    action: Submit("m".to_string()),
+                });
+                parts.push(PromptPart::Text("] merge and archive"));
+            }
+            parts.push(PromptPart::Text(" / ["));
+            parts.push(PromptPart::Choice {
                 label: "N",
                 action: Submit("N".to_string()),
-            },
-            PromptPart::Text("] cancel: "),
-        ],
+            });
+            parts.push(PromptPart::Text("] cancel: "));
+            parts
+        }
         // Typed-then-submit path, three choices (orphan / cascade-delete /
         // cancel). `all` requires the full word so a stray keystroke can't
         // trigger the cascade — same click target.
@@ -8187,7 +8200,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x r           rename selected session (clears title on empty submit)
     C-x f           fork selected session (harness picker; same is default)
     Tab (on list)   focus lineage section
-    C-x m           merge the selected fork (take result, or discard)
+    C-x k [m]       on a fork: merge result into parent and archive
     C-c C-c         interrupt
 
   scrollback

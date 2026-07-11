@@ -51,7 +51,8 @@ Keyboard focus:
 - While focused, the section owns the row vocabulary carried over from the
   preview: `j`/`k`/arrows/`C-n`/`C-p` move the node selection, `Enter`
   jumps into the selected session (a merged fork jumps to its parent, spec
-  0078), `m`/`d` merge or discard via the same path as `C-x m`, `Esc`
+  0078), `m` merge-and-archives via the same path as the fork
+  session-end / title-menu merge action, `Esc`
   backs out to the session rows. Any other key clears focus and re-enters
   ordinary routing with the same keystroke.
 - Focusing the section counts as sidebar (list-pane) focus; jumping into a
