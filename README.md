@@ -17,7 +17,7 @@ More screenshots and demos: [gallery](gallery.md).
   (new idea, side quest, or a long shot). Supports cross-harness forks and
   merging results back.
 
-  <img src="https://raw.githubusercontent.com/construct-worlds/construct/e569d807e48482a90387ba1d974bfaf4867e5fee/demos/fork-merge.gif" alt="construct fork and merge demo" width="50%">
+  <img src="https://raw.githubusercontent.com/construct-worlds/construct/9de1982e7ec4ae9ad71c32f3f3e3f2f58fbe93ca/demos/fork-merge.gif" alt="construct fork and merge demo" width="50%">
 - **Program** — collaborative, executable Markdown
   ([docs/program.md](docs/program.md)): co-develop workflows, tasks, and ideas
   with the agent, then run them from the same document.
