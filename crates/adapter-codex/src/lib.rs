@@ -124,6 +124,22 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             );
         }
     }
+    let fork_from = (!resuming)
+        .then(|| {
+            std::env::var("CONSTRUCT_CODEX_FORK_FROM")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+        .flatten();
+    if let Some(parent) = fork_from.clone() {
+        // Same-harness fork: `codex fork <parent-uuid>` starts a NEW codex
+        // conversation inheriting the parent's exact context (the daemon
+        // read the parent's captured id — spec 0031/0078). The forked
+        // rollout copies the parent's meta (originator included) and stamps
+        // `forked_from_id`, which is how the watcher below identifies it.
+        args.insert(0, "fork".into());
+        args.insert(1, parent);
+    }
     if let Some(m) = params.model.as_ref() {
         args.push("-m".into());
         args.push(m.clone());
@@ -172,6 +188,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             ctx.emit.clone(),
             resuming_existing,
             captured_id.clone(),
+            fork_from.clone(),
         );
     }
     let label = command.argv_preview();
@@ -213,6 +230,7 @@ fn spawn_interactive_transcript_watcher(
     emit: EventEmitter,
     skip_existing: bool,
     expected_uuid: Option<String>,
+    expected_fork_parent: Option<String>,
 ) {
     let Some(sessions_root) = codex_sessions_root(&session_env) else {
         emit.log("codex: no CODEX_HOME or HOME — cannot watch native transcript");
@@ -251,6 +269,7 @@ fn spawn_interactive_transcript_watcher(
                 &sessions_root,
                 &expected_originator,
                 expected_uuid.as_deref(),
+                expected_fork_parent.as_deref(),
                 &mut not_ours,
             ) {
                 let is_new = selected
@@ -409,6 +428,7 @@ fn find_best_matching_rollout(
     sessions_root: &Path,
     expected_originator: &str,
     expected_uuid: Option<&str>,
+    expected_fork_parent: Option<&str>,
     not_ours: &mut HashSet<String>,
 ) -> Option<(String, PathBuf, String, Option<std::time::SystemTime>)> {
     let mut best: Option<(String, PathBuf, String, Option<std::time::SystemTime>)> = None;
@@ -422,10 +442,23 @@ fn find_best_matching_rollout(
             continue;
         };
         let uuid = meta.id.clone().or_else(|| uuid_from_rollout_name(&name));
+        // A fork child COPIES its parent's originator into its meta
+        // (`codex fork`), so an originator hit alone isn't ours when the
+        // rollout says it was forked from somewhere — otherwise a fork of
+        // this session would read as our own /clear rebind and steal the
+        // parent's identity.
         let originator_matches = meta.originator.as_deref() == Some(expected_originator)
-            && meta.parent_thread_id.is_none();
+            && meta.parent_thread_id.is_none()
+            && meta.forked_from_id.is_none();
         let uuid_matches = expected_uuid.is_some_and(|want| uuid.as_deref() == Some(want));
-        if !originator_matches && !uuid_matches {
+        // A session spawned as `codex fork <parent>` binds to the rollout
+        // that names that parent — its own originator was copied from the
+        // parent, so the tag can't identify it. (Two simultaneous forks of
+        // one parent are ambiguous; newest wins, same as codex's own
+        // `--last`.)
+        let fork_matches = expected_fork_parent
+            .is_some_and(|parent| meta.forked_from_id.as_deref() == Some(parent));
+        if !originator_matches && !uuid_matches && !fork_matches {
             not_ours.insert(name);
             continue;
         }
@@ -600,6 +633,10 @@ struct SessionMeta {
     id: Option<String>,
     originator: Option<String>,
     parent_thread_id: Option<String>,
+    /// `codex fork` stamps the source session's uuid here — the
+    /// discriminator between "my own /clear rebind" and "a fork of me"
+    /// (forks COPY the parent's originator into their meta).
+    forked_from_id: Option<String>,
 }
 
 /// Read the rollout's first JSONL line and pull `payload.id` and
@@ -618,6 +655,10 @@ fn read_session_meta(path: &Path) -> Option<SessionMeta> {
             .map(String::from),
         parent_thread_id: payload
             .get("parent_thread_id")
+            .and_then(|s| s.as_str())
+            .map(String::from),
+        forked_from_id: payload
+            .get("forked_from_id")
             .and_then(|s| s.as_str())
             .map(String::from),
     })
@@ -1119,10 +1160,71 @@ mod tests {
         .unwrap();
 
         let mut not_ours = HashSet::new();
-        let best = find_best_matching_rollout(&tmp, originator, None, &mut not_ours)
+        let best = find_best_matching_rollout(&tmp, originator, None, None, &mut not_ours)
             .expect("should find a match");
         assert_eq!(best.0, new_name);
         assert_eq!(best.2, "019e32bb-014a-7ff0-9a3f-7ae773961a99");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fork_children_never_steal_the_parents_originator_match() {
+        // `codex fork` COPIES the parent's meta — originator included — and
+        // stamps `forked_from_id`. The parent's watcher must not treat the
+        // fork's (newer) rollout as its own /clear rebind, and the fork's
+        // watcher finds its rollout via the parent linkage instead.
+        let tmp = std::env::temp_dir().join(format!(
+            "agentd-codex-fork-match-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let originator = "agentd:parent-sess";
+        let parent_uuid = "019e32aa-014a-7ff0-9a3f-7ae773961a37";
+        let fork_uuid = "019e32bb-014a-7ff0-9a3f-7ae773961a99";
+        std::fs::write(
+            tmp.join("rollout-2026-05-16T14-21-02-019e32aa-014a-7ff0-9a3f-7ae773961a37.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":\
+                 {{\"id\":\"{parent_uuid}\",\"originator\":\"{originator}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        // The fork's rollout: newer, same originator, forked_from_id set.
+        std::fs::write(
+            tmp.join("rollout-2026-05-16T15-00-00-019e32bb-014a-7ff0-9a3f-7ae773961a99.jsonl"),
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":\
+                 {{\"id\":\"{fork_uuid}\",\"originator\":\"{originator}\",\
+                 \"forked_from_id\":\"{parent_uuid}\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        // Parent's view: the fork rollout is newer but must NOT win.
+        let mut not_ours = HashSet::new();
+        let best = find_best_matching_rollout(&tmp, originator, None, None, &mut not_ours)
+            .expect("parent still matches its own rollout");
+        assert_eq!(best.2, parent_uuid);
+
+        // Fork's view: its originator tag was copied from the parent, so it
+        // identifies its rollout by the fork linkage.
+        let mut not_ours = HashSet::new();
+        let best = find_best_matching_rollout(
+            &tmp,
+            "agentd:fork-sess",
+            None,
+            Some(parent_uuid),
+            &mut not_ours,
+        )
+        .expect("fork matches via forked_from_id");
+        assert_eq!(best.2, fork_uuid);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
