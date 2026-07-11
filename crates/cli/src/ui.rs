@@ -529,6 +529,16 @@ fn normalized_points(a: ScreenPoint, b: ScreenPoint) -> (ScreenPoint, ScreenPoin
     }
 }
 
+fn session_list_markers(summary: &SessionSummary) -> (&'static str, &'static str) {
+    let lineage = if summary.forked_from.is_some() {
+        "⑂"
+    } else {
+        " "
+    };
+    let pin = if summary.pinned { "★" } else { " " };
+    (lineage, pin)
+}
+
 /// Hover hit-test: if the mouse cursor is currently sitting on the
 /// pin-diamond cell of a session row, return that row's info. Returns
 /// `None` on terminals that don't forward motion events (Terminal.app),
@@ -557,11 +567,11 @@ fn hovered_diamond(app: &App) -> Option<(u16, u16, &SessionSummary)> {
     };
     let indent = crate::app::list_session_indent_cells(&summary, indented, has_children);
     // Hit zone is the 4-cell gutter to the left of the session name, after
-    // the disclosure column when this row has one:
-    //   [disclosure][diamond][ ][status-circle][ ]   ← then the name starts
+    // the disclosure and lineage columns:
+    //   [disclosure][lineage][diamond][ ][status-circle][ ] ← name
     // Wider than the bare diamond glyph so it's easier to click —
     // the visual overlay still anchors on the diamond cell itself.
-    let zone_start = list_area.x + 1 + indent + u16::from(has_children);
+    let zone_start = list_area.x + 1 + indent + u16::from(has_children) + 1;
     let zone_end = zone_start + 4; // exclusive
     if mx < zone_start || mx >= zone_end {
         return None;
@@ -1667,22 +1677,16 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         None
                     };
-                    let pin_glyph = if s.forked_from.is_some() {
-                        "⑂"
-                    } else if s.pinned {
-                        "★"
-                    } else {
-                        " "
-                    };
+                    let (lineage_glyph, pin_glyph) = session_list_markers(s);
                     let indent_prefix = " ".repeat(crate::app::list_session_indent_cells(
                         s,
                         *indented,
                         *has_children,
                     ) as usize);
                     // Fixed-width left side: indent + optional disclosure (1)
-                    // + pin (1) + " glyph " (3).
+                    // + lineage (1) + pin (1) + " glyph " (3).
                     let prefix_w =
-                        indent_prefix.chars().count() + usize::from(expand_glyph.is_some()) + 1 + 3;
+                        indent_prefix.chars().count() + usize::from(expand_glyph.is_some()) + 2 + 3;
                     let harness = harness_label(s);
                     let harness_w = harness.chars().count();
                     // Reserve room for the trailing unblock marker (" ●") so the
@@ -1739,6 +1743,10 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                         ));
                     }
                     spans.extend([
+                        Span::styled(
+                            lineage_glyph.to_string(),
+                            Style::default().fg(app.theme.info),
+                        ),
                         Span::styled(pin_glyph.to_string(), Style::default().fg(app.theme.info)),
                         Span::styled(
                             format!(" {} ", session_status_glyph(app, s)),
@@ -15063,6 +15071,21 @@ mod tests {
             forked_from: None,
             merge: None,
         }
+    }
+
+    #[test]
+    fn pinned_fork_keeps_separate_lineage_and_pin_markers() {
+        let mut fork = clip_test_session("fork", Some("fork"), "codex", SessionState::Running);
+        fork.pinned = true;
+        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+            session_id: "parent".into(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+
+        assert_eq!(session_list_markers(&fork), ("⑂", "★"));
     }
 
     #[test]
