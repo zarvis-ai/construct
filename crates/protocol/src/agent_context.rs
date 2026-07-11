@@ -27,6 +27,7 @@ pub const MCP_CONTEXT_ENV_VARS: &[&str] = &[
     "CONSTRUCT_STATE_DIR",
     "CONSTRUCT_DATA_DIR",
     "CONSTRUCT_CONFIG_DIR",
+    "CONSTRUCT_HOME",
 ];
 
 pub const TOOL_DESCRIPTION: &str =

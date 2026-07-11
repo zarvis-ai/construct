@@ -1,7 +1,7 @@
 //! XDG-style path conventions shared between daemon and client.
 //!
-//! Each layer respects `CONSTRUCT_*_DIR` env overrides, then `XDG_*_HOME`,
-//! falling back to standard `$HOME/.config|.local/state|.local/share/construct`.
+//! Each layer respects `CONSTRUCT_*_DIR` env overrides, then `CONSTRUCT_HOME`,
+//! then `XDG_*_HOME`, falling back to standard `$HOME/.config|.local/state|.local/share/construct`.
 
 use std::path::PathBuf;
 
@@ -16,25 +16,44 @@ pub struct Paths {
 impl Paths {
     pub fn discover() -> Self {
         let home = home_dir();
+        let construct_home = env_dir("CONSTRUCT_HOME");
 
         let config_dir = env_dir("CONSTRUCT_CONFIG_DIR").unwrap_or_else(|| {
-            env_dir("XDG_CONFIG_HOME")
-                .unwrap_or_else(|| home.join(".config"))
-                .join("construct")
+            if let Some(ref ch) = construct_home {
+                ch.join("config")
+            } else {
+                env_dir("XDG_CONFIG_HOME")
+                    .unwrap_or_else(|| home.join(".config"))
+                    .join("construct")
+            }
         });
         let state_dir = env_dir("CONSTRUCT_STATE_DIR").unwrap_or_else(|| {
-            env_dir("XDG_STATE_HOME")
-                .unwrap_or_else(|| home.join(".local").join("state"))
-                .join("construct")
+            if let Some(ref ch) = construct_home {
+                ch.join("state")
+            } else {
+                env_dir("XDG_STATE_HOME")
+                    .unwrap_or_else(|| home.join(".local").join("state"))
+                    .join("construct")
+            }
         });
         let data_dir = env_dir("CONSTRUCT_DATA_DIR").unwrap_or_else(|| {
-            env_dir("XDG_DATA_HOME")
-                .unwrap_or_else(|| home.join(".local").join("share"))
-                .join("construct")
+            if let Some(ref ch) = construct_home {
+                ch.join("data")
+            } else {
+                env_dir("XDG_DATA_HOME")
+                    .unwrap_or_else(|| home.join(".local").join("share"))
+                    .join("construct")
+            }
         });
-        let runtime_dir = env_dir("CONSTRUCT_RUNTIME_DIR")
-            .or_else(|| env_dir("XDG_RUNTIME_DIR").map(|p| p.join("construct")))
-            .unwrap_or_else(|| state_dir.clone());
+        let runtime_dir = env_dir("CONSTRUCT_RUNTIME_DIR").unwrap_or_else(|| {
+            if let Some(ref ch) = construct_home {
+                ch.join("run")
+            } else {
+                env_dir("XDG_RUNTIME_DIR")
+                    .map(|p| p.join("construct"))
+                    .unwrap_or_else(|| state_dir.clone())
+            }
+        });
 
         Self {
             config_dir,
@@ -171,4 +190,82 @@ fn env_dir(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    // Mutex to ensure env var mutation is serialized
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn lock(vars: &[&'static str]) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap();
+            let mut saved = Vec::new();
+            for var in vars {
+                saved.push((*var, std::env::var_os(var)));
+                std::env::remove_var(var);
+            }
+            Self { _lock: lock, saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (var, val) in &self.saved {
+                if let Some(ref v) = val {
+                    std::env::set_var(var, v);
+                } else {
+                    std::env::remove_var(var);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_construct_home_defaults() {
+        let _guard = EnvGuard::lock(&[
+            "CONSTRUCT_HOME",
+            "CONSTRUCT_CONFIG_DIR",
+            "CONSTRUCT_STATE_DIR",
+            "CONSTRUCT_DATA_DIR",
+            "CONSTRUCT_RUNTIME_DIR",
+        ]);
+
+        std::env::set_var("CONSTRUCT_HOME", "/test/home");
+
+        let paths = Paths::discover();
+        assert_eq!(paths.config_dir, PathBuf::from("/test/home/config"));
+        assert_eq!(paths.state_dir, PathBuf::from("/test/home/state"));
+        assert_eq!(paths.data_dir, PathBuf::from("/test/home/data"));
+        assert_eq!(paths.runtime_dir, PathBuf::from("/test/home/run"));
+    }
+
+    #[test]
+    fn test_construct_home_with_overrides() {
+        let _guard = EnvGuard::lock(&[
+            "CONSTRUCT_HOME",
+            "CONSTRUCT_CONFIG_DIR",
+            "CONSTRUCT_STATE_DIR",
+            "CONSTRUCT_DATA_DIR",
+            "CONSTRUCT_RUNTIME_DIR",
+        ]);
+
+        std::env::set_var("CONSTRUCT_HOME", "/test/home");
+        std::env::set_var("CONSTRUCT_CONFIG_DIR", "/override/config");
+        std::env::set_var("CONSTRUCT_RUNTIME_DIR", "/override/run");
+
+        let paths = Paths::discover();
+        assert_eq!(paths.config_dir, PathBuf::from("/override/config"));
+        assert_eq!(paths.state_dir, PathBuf::from("/test/home/state"));
+        assert_eq!(paths.data_dir, PathBuf::from("/test/home/data"));
+        assert_eq!(paths.runtime_dir, PathBuf::from("/override/run"));
+    }
 }

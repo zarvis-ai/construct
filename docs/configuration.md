@@ -2,14 +2,16 @@
 
 ## Paths
 
-`construct` reads/writes under XDG-style directories, with `CONSTRUCT_*_DIR` overrides:
+`construct` reads/writes under XDG-style directories, with `CONSTRUCT_HOME` or `CONSTRUCT_*_DIR` overrides.
 
-| Use | Default | Override |
-|---|---|---|
-| Config | `~/.config/construct` | `CONSTRUCT_CONFIG_DIR` |
-| State (pid/log) | `~/.local/state/construct` | `CONSTRUCT_STATE_DIR` |
-| Data (sessions, projects, memory) | `~/.local/share/construct` | `CONSTRUCT_DATA_DIR` |
-| Socket | `$XDG_RUNTIME_DIR/construct/construct.sock` (falls back to state) | `CONSTRUCT_RUNTIME_DIR` |
+If `CONSTRUCT_HOME` is set, all other directories default to paths under it, i.e. `$CONSTRUCT_HOME/config`, `$CONSTRUCT_HOME/state`, `$CONSTRUCT_HOME/data`, and `$CONSTRUCT_HOME/run` respectively. Specific `CONSTRUCT_*_DIR` env variables override these defaults.
+
+| Use | Default (without `CONSTRUCT_HOME`) | Override | Default (with `CONSTRUCT_HOME`) |
+|---|---|---|---|
+| Config | `~/.config/construct` | `CONSTRUCT_CONFIG_DIR` | `$CONSTRUCT_HOME/config` |
+| State (pid/log) | `~/.local/state/construct` | `CONSTRUCT_STATE_DIR` | `$CONSTRUCT_HOME/state` |
+| Data (sessions, projects, memory) | `~/.local/share/construct` | `CONSTRUCT_DATA_DIR` | `$CONSTRUCT_HOME/data` |
+| Socket | `$XDG_RUNTIME_DIR/construct/construct.sock` (falls back to state) | `CONSTRUCT_RUNTIME_DIR` | `$CONSTRUCT_HOME/run` |
 
 `construct paths` prints the resolved layout.
 

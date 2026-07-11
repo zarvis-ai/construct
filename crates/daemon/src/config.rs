@@ -199,10 +199,11 @@ enabled = true
 # a systemd unit / launchd plist / wrapper script).
 #
 # Path overrides (XDG-style):
-#   CONSTRUCT_CONFIG_DIR   — config directory  (default: ~/.config/construct)
-#   CONSTRUCT_STATE_DIR    — state directory   (default: ~/.local/state/construct)
-#   CONSTRUCT_DATA_DIR     — data directory    (default: ~/.local/share/construct)
-#   CONSTRUCT_RUNTIME_DIR  — runtime directory (default: same as state dir)
+#   CONSTRUCT_HOME         — base directory for config, state, data, and run path overrides
+#   CONSTRUCT_CONFIG_DIR   — config directory  (default: $CONSTRUCT_HOME/config or ~/.config/construct)
+#   CONSTRUCT_STATE_DIR    — state directory   (default: $CONSTRUCT_HOME/state or ~/.local/state/construct)
+#   CONSTRUCT_DATA_DIR     — data directory    (default: $CONSTRUCT_HOME/data or ~/.local/share/construct)
+#   CONSTRUCT_RUNTIME_DIR  — runtime directory (default: $CONSTRUCT_HOME/run or same as state dir)
 #   XDG_CONFIG_HOME / XDG_STATE_HOME / XDG_DATA_HOME / XDG_RUNTIME_DIR also apply.
 #
 # Daemon:
