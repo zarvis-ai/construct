@@ -3,8 +3,7 @@
 **A terminal-native agentic development environment.**
 
 Create Codex, Claude Code, Antigravity, Grok, and smith sessions all in one
-place — or let an agent coordinate them from a focused TUI. Remote control from
-your phone when you're in motion.
+place — or let an agent coordinate them through MCP tools from a focused TUI.
 
 ![construct lineage and program run](https://raw.githubusercontent.com/construct-worlds/construct/52849f56c902397d6729ec286293064c5b15bcfe/demos/lineage-program-run.gif)
 
