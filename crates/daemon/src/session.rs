@@ -9437,6 +9437,7 @@ done
                     title: None,
                     state: SessionState::Errored,
                     event: None,
+                    seq: None,
                 },
             )
             .await;
