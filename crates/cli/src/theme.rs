@@ -350,7 +350,7 @@ impl Theme {
             text: Color::Rgb(229, 231, 235),
             dim: Color::Rgb(107, 114, 128),
             muted: Color::Rgb(156, 163, 175),
-            border: Color::Rgb(75, 85, 99),
+            border: Color::Rgb(40, 78, 130),
             border_focused: Color::Rgb(96, 165, 250),
             accent: Color::Rgb(96, 165, 250),
             accent_alt: Color::Rgb(192, 132, 252),
@@ -388,7 +388,7 @@ impl Theme {
             text: Color::Rgb(31, 41, 55),
             dim: Color::Rgb(107, 114, 128),
             muted: Color::Rgb(75, 85, 99),
-            border: Color::Rgb(156, 163, 175),
+            border: Color::Rgb(118, 149, 203),
             border_focused: Color::Rgb(37, 99, 235),
             accent: Color::Rgb(37, 99, 235),
             accent_alt: Color::Rgb(124, 58, 237),
@@ -426,7 +426,7 @@ impl Theme {
             text: Color::Rgb(232, 236, 243),
             dim: Color::Rgb(102, 112, 128),
             muted: Color::Rgb(145, 153, 166),
-            border: Color::Rgb(70, 82, 100),
+            border: Color::Rgb(42, 80, 125),
             border_focused: Color::Rgb(121, 184, 255),
             accent: Color::Rgb(121, 184, 255),
             accent_alt: Color::Rgb(255, 176, 84),
@@ -464,7 +464,7 @@ impl Theme {
             text: Color::Rgb(34, 40, 49),
             dim: Color::Rgb(125, 135, 148),
             muted: Color::Rgb(92, 103, 118),
-            border: Color::Rgb(195, 204, 216),
+            border: Color::Rgb(181, 201, 227),
             border_focused: Color::Rgb(34, 115, 195),
             accent: Color::Rgb(34, 115, 195),
             accent_alt: Color::Rgb(174, 96, 28),
@@ -933,6 +933,95 @@ mod tests {
         // test would fail if `program_border` silently aliased it again.
         assert_ne!(Theme::basic_dark().accent_alt, Theme::dark().accent_alt);
         assert_ne!(Theme::dark_ui().accent_alt, Theme::dark().accent_alt);
+    }
+
+    /// RGB (0..=255 per channel) to HSL, returned as (hue degrees 0..360,
+    /// saturation 0..1, lightness 0..1). Test-only: rendering never computes
+    /// this, it just selects between pre-authored `Color::Rgb` constants
+    /// (see `pane_border_style` in ui.rs).
+    fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+        let r = r as f32 / 255.0;
+        let g = g as f32 / 255.0;
+        let b = b as f32 / 255.0;
+        let max = r.max(g).max(b);
+        let min = r.min(g).min(b);
+        let l = (max + min) / 2.0;
+        let delta = max - min;
+        if delta == 0.0 {
+            return (0.0, 0.0, l);
+        }
+        let s = delta / (1.0 - (2.0 * l - 1.0).abs());
+        let h = if max == r {
+            60.0 * ((g - b) / delta).rem_euclid(6.0)
+        } else if max == g {
+            60.0 * (((b - r) / delta) + 2.0)
+        } else {
+            60.0 * (((r - g) / delta) + 4.0)
+        };
+        (h, s, l)
+    }
+
+    fn border_hsl(color: Color) -> (f32, f32, f32) {
+        match color {
+            Color::Rgb(r, g, b) => rgb_to_hsl(r, g, b),
+            other => panic!("expected a Color::Rgb border constant, got {other:?}"),
+        }
+    }
+
+    fn hue_distance(a: f32, b: f32) -> f32 {
+        let d = (a - b).rem_euclid(360.0);
+        d.min(360.0 - d)
+    }
+
+    /// Every theme's focused/unfocused border pair must share a hue family,
+    /// so the focus transition reads as "the same border got brighter," not
+    /// "the border changed color" (spec 0084).
+    #[test]
+    fn session_border_focus_stays_same_hue_across_themes() {
+        let themes = [
+            Theme::dark(),
+            Theme::light(),
+            Theme::basic_dark(),
+            Theme::basic_light(),
+            Theme::dark_ui(),
+            Theme::light_ui(),
+        ];
+        for theme in &themes {
+            let (h_unfocused, _, _) = border_hsl(theme.border);
+            let (h_focused, _, _) = border_hsl(theme.border_focused);
+            let hue_gap = hue_distance(h_unfocused, h_focused);
+            assert!(
+                hue_gap <= 25.0,
+                "focused border hue drifted {hue_gap} degrees from unfocused \
+                 (border={:?}, border_focused={:?})",
+                theme.border,
+                theme.border_focused,
+            );
+        }
+    }
+
+    /// Basic/Dark UI/Light UI's unfocused `border` used to sit at ~10-22%
+    /// saturation — desaturated enough to read as plain gray, so jumping to a
+    /// vivid `border_focused` on focus looked like an unrelated color swap
+    /// rather than "the same border got brighter" (spec 0084). Matrix's own
+    /// light variant is intentionally excluded: it already read correctly at
+    /// its lower, hand-tuned saturation and this fix doesn't touch it.
+    #[test]
+    fn retuned_themes_unfocused_border_reads_as_colored_not_gray() {
+        let themes = [
+            Theme::basic_dark(),
+            Theme::basic_light(),
+            Theme::dark_ui(),
+            Theme::light_ui(),
+        ];
+        for theme in &themes {
+            let (_, s_unfocused, _) = border_hsl(theme.border);
+            assert!(
+                s_unfocused >= 0.40,
+                "unfocused border saturation {s_unfocused} reads as gray (border={:?})",
+                theme.border,
+            );
+        }
     }
 
     #[test]
