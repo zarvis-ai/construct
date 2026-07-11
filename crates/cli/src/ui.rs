@@ -285,6 +285,19 @@ pub fn render(f: &mut Frame, app: &mut App) {
     }
     render_modeline(f, modeline_area, app);
     render_minibuffer(f, minibuffer_area, app);
+    app.sync_program_popup_with_selection();
+    render_program_popup(f, app);
+    render_resize_handle_cursor(f, app);
+    render_tasks_popup(f, app);
+    render_remote_control_popup(f, app);
+    if app.help_visible {
+        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
+    }
+    render_session_title_menu(f, app);
+    render_tutorial_card(f, app);
+
+    // Tooltips (spec 0081): transient hover boxes rendered last so they
+    // sit on top of all base panes, menus, program popups, and task panels.
     render_diamond_tooltip(f, app);
     render_pin_diamond_tooltip(f, app, &pinned_ids);
     render_view_program_toggle_tooltip(f, app);
@@ -296,16 +309,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_modeline_approval_mode_tooltip(f, app);
     render_modeline_version_notice_tooltip(f, app);
     render_modeline_theme_tooltip(f, app);
-    app.sync_program_popup_with_selection();
-    render_program_popup(f, app);
-    render_resize_handle_cursor(f, app);
-    render_tasks_popup(f, app);
-    render_remote_control_popup(f, app);
-    if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
-    }
-    render_session_title_menu(f, app);
-    render_tutorial_card(f, app);
+
     finish_frame(f, app);
 }
 
