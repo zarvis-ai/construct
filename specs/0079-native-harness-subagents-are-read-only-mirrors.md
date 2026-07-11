@@ -22,6 +22,24 @@ Native parent links are recursive. A native subagent created by another native
 subagent appears beneath that native parent rather than being flattened under
 the owning Construct session.
 
+A native child's FULL transcript history is projected, not just lines that
+arrive while a watcher happens to be attached: adapters re-scan child
+transcript files from the top on every (re)start, and each file-derived
+emission carries a deterministic per-child ordinal so Construct can drop
+replays of already-projected history against a persisted per-mirror
+high-water mark. A mirror created after its child already ran (daemon
+restart, session resume, a fork creating a new owning session) therefore
+backfills the child's complete history instead of staying empty. Ordinals
+are deterministic only per parser version; a parser change may drop or
+duplicate a bounded tail once after an upgrade, which is accepted.
+
+Emissions not derived from the child's own file (discovery scans,
+root-transcript lifecycle updates) carry no ordinal and are processed
+unconditionally — except that an untagged state-only emission never flips a
+finished, still-visible mirror back to a live state, since it may be a
+replay from a source the ordinals do not cover. Genuine new activity is
+file-derived and tagged, so it still reactivates the mirror.
+
 When a harness can publish an authoritative retained-child snapshot, Construct
 archives mirrors absent from that snapshot. Retained transcript files do not
 restore an archived mirror; a later native activity event does.

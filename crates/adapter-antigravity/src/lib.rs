@@ -54,7 +54,7 @@ use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
-use construct_adapter_common::{drive_turn, TurnOutcome};
+use construct_adapter_common::{drive_turn, next_native_seq, TurnOutcome};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -270,6 +270,7 @@ fn spawn_interactive_transcript_watcher(
         // every later rebind (post-/clear) starts fresh.
         let mut skip_next_transcript = skip_existing && conv_id.is_some();
         let mut children: HashMap<String, AntigravityNativeChild> = HashMap::new();
+        let mut child_seq: HashMap<String, u64> = HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -314,12 +315,6 @@ fn spawn_interactive_transcript_watcher(
                     &mut children,
                     None,
                 );
-                for (child_id, child) in &mut children {
-                    child.last_step = transcript_path(child_id)
-                        .as_deref()
-                        .map(max_step_index)
-                        .unwrap_or(-1);
-                }
                 skip_next_transcript = false;
             }
             let (next_step, root_values) = read_new_transcript_steps(&tp, last_step);
@@ -342,12 +337,16 @@ fn spawn_interactive_transcript_watcher(
                 child.last_step = next_step;
                 for value in values {
                     for event in antigravity_events_from_step(&value) {
+                        // File-derived: ordinal-tagged so the daemon drops
+                        // replays of already-projected history.
+                        let ord = child_seq.entry(child_id.clone()).or_insert(0);
                         emit.emit(SessionEvent::NativeSubagent {
                             id: child_id.clone(),
                             parent_id: child.parent_id.clone(),
                             title: None,
                             state: child.state,
                             event: Some(Box::new(event)),
+                            seq: Some(next_native_seq(ord)),
                         });
                     }
                     lifecycle_values.push((Some(child_id.clone()), value));
@@ -656,6 +655,7 @@ fn apply_antigravity_native_updates<'a>(
                         title: Some(format!("Antigravity subagent {}", &id[..8])),
                         state: SessionState::Running,
                         event: None,
+                        seq: None,
                     });
                 }
             }
@@ -678,6 +678,7 @@ fn apply_antigravity_native_updates<'a>(
                 title: None,
                 state: SessionState::Done,
                 event: None,
+                seq: None,
             });
         }
     }

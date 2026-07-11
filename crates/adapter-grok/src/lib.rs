@@ -18,7 +18,7 @@ use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
-use construct_adapter_common::{drive_turn, spawn_stderr_log, TurnOutcome};
+use construct_adapter_common::{drive_turn, next_native_seq, spawn_stderr_log, TurnOutcome};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -403,7 +403,6 @@ struct GrokNativeChild {
 
 fn apply_grok_native_update(
     update: GrokNativeSubagentUpdate,
-    cwd: &Path,
     children: &mut HashMap<String, GrokNativeChild>,
     emit: Option<&EventEmitter>,
 ) {
@@ -432,6 +431,7 @@ fn apply_grok_native_update(
                     title,
                     state: SessionState::Running,
                     event: None,
+                    seq: None,
                 });
             }
         }
@@ -441,10 +441,7 @@ fn apply_grok_native_update(
                 .or_insert_with(|| GrokNativeChild {
                     parent_id: None,
                     state,
-                    next_transcript_line: grok_transcript_path(cwd, &id)
-                        .as_deref()
-                        .map(count_jsonl_lines)
-                        .unwrap_or(0),
+                    next_transcript_line: 0,
                 });
             child.state = state;
             if let Some(emit) = emit {
@@ -454,6 +451,7 @@ fn apply_grok_native_update(
                     title: None,
                     state,
                     event: None,
+                    seq: None,
                 });
             }
         }
@@ -504,6 +502,7 @@ fn spawn_interactive_transcript_watcher(
             0
         };
         let mut children = HashMap::new();
+        let mut child_seq: HashMap<String, u64> = HashMap::new();
         if skip_existing {
             if let (Some(root_id), Some(updates_path)) =
                 (current_id.as_deref(), updates_path.as_deref())
@@ -511,15 +510,9 @@ fn spawn_interactive_transcript_watcher(
                 let mut replay_line = 0;
                 for value in read_new_grok_jsonl_lines(updates_path, &mut replay_line, &emit) {
                     if let Some(update) = grok_native_subagent_update(&value, root_id) {
-                        apply_grok_native_update(update, &cwd, &mut children, None);
+                        apply_grok_native_update(update, &mut children, None);
                     }
                 }
-            }
-            for (id, child) in &mut children {
-                child.next_transcript_line = grok_transcript_path(&cwd, id)
-                    .as_deref()
-                    .map(count_jsonl_lines)
-                    .unwrap_or(0);
             }
         }
         let mut tick = tokio::time::interval(Duration::from_millis(500));
@@ -534,7 +527,7 @@ fn spawn_interactive_transcript_watcher(
             {
                 for value in read_new_grok_jsonl_lines(updates_path, &mut next_update_line, &emit) {
                     if let Some(update) = grok_native_subagent_update(&value, root_id) {
-                        apply_grok_native_update(update, &cwd, &mut children, Some(&emit));
+                        apply_grok_native_update(update, &mut children, Some(&emit));
                     }
                 }
             }
@@ -546,12 +539,16 @@ fn spawn_interactive_transcript_watcher(
                     read_new_grok_jsonl_lines(&child_path, &mut child.next_transcript_line, &emit)
                 {
                     for event in grok_events_from_json(&value) {
+                        // File-derived: ordinal-tagged so the daemon drops
+                        // replays of already-projected history.
+                        let ord = child_seq.entry(id.clone()).or_insert(0);
                         emit.emit(SessionEvent::NativeSubagent {
                             id: id.clone(),
                             parent_id: child.parent_id.clone(),
                             title: None,
                             state: child.state,
                             event: Some(Box::new(event)),
+                            seq: Some(next_native_seq(ord)),
                         });
                     }
                 }

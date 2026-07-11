@@ -6189,6 +6189,161 @@ mod tests {
         assert_eq!(result.events.last().unwrap().seq, 1234);
     }
 
+    /// Adapters re-scan native-child transcript files from the top on every
+    /// (re)start, so pre-existing history BACKFILLS into the mirror — and
+    /// the per-child emission ordinals let the daemon drop replays instead
+    /// of duplicating the transcript on each restart.
+    #[tokio::test]
+    async fn native_child_backfill_is_replay_safe() {
+        use agentd_protocol::MessageRole;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(Config::default());
+        let (manager, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("manager");
+        let owner = synthetic_entry("owner", agentd_protocol::SessionKind::User, 0);
+        manager
+            .sessions
+            .write()
+            .await
+            .insert(owner.id.clone(), owner.clone());
+
+        let tagged = |seq: u64, text: &str| SessionEvent::NativeSubagent {
+            id: "child".into(),
+            parent_id: None,
+            title: None,
+            state: SessionState::Running,
+            event: Some(Box::new(SessionEvent::Message {
+                role: MessageRole::Assistant,
+                text: text.into(),
+            })),
+            seq: Some(seq),
+        };
+
+        // Initial backfill: two file-derived emissions project.
+        manager.handle_event(&owner, tagged(0, "one")).await;
+        manager.handle_event(&owner, tagged(1, "two")).await;
+        let projected_id = native_subagent_session_id("owner", "child");
+        let child = manager.detail(&projected_id).await.expect("child");
+        assert_eq!(child.events.len(), 2);
+        assert_eq!(
+            child
+                .summary
+                .native_subagent
+                .as_ref()
+                .map(|n| n.projected_seq),
+            Some(2),
+            "the high-water mark advances past the projected ordinals"
+        );
+
+        // Adapter restart: the same file re-scans from the top and re-emits
+        // ordinals 0 and 1 — both must be dropped, not duplicated.
+        manager.handle_event(&owner, tagged(0, "one")).await;
+        manager.handle_event(&owner, tagged(1, "two")).await;
+        let child = manager.detail(&projected_id).await.expect("child");
+        assert_eq!(
+            child.events.len(),
+            2,
+            "replayed ordinals below the watermark never re-project"
+        );
+
+        // Genuinely new lines continue past the watermark.
+        manager.handle_event(&owner, tagged(2, "three")).await;
+        let child = manager.detail(&projected_id).await.expect("child");
+        assert_eq!(child.events.len(), 3);
+        assert_eq!(
+            child
+                .summary
+                .native_subagent
+                .as_ref()
+                .map(|n| n.projected_seq),
+            Some(3)
+        );
+    }
+
+    /// An untagged state-only emission (discovery/lifecycle scans, which the
+    /// ordinals don't cover) must never flip a finished, still-visible
+    /// mirror back to running — but tagged new activity still does.
+    #[tokio::test]
+    async fn untagged_replay_cannot_resurrect_a_finished_mirror() {
+        use agentd_protocol::MessageRole;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage = Arc::new(Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(Config::default());
+        let (manager, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("manager");
+        let owner = synthetic_entry("owner", agentd_protocol::SessionKind::User, 0);
+        manager
+            .sessions
+            .write()
+            .await
+            .insert(owner.id.clone(), owner.clone());
+
+        manager
+            .handle_event(
+                &owner,
+                SessionEvent::NativeSubagent {
+                    id: "child".into(),
+                    parent_id: None,
+                    title: None,
+                    state: SessionState::Done,
+                    event: None,
+                    seq: None,
+                },
+            )
+            .await;
+        let projected_id = native_subagent_session_id("owner", "child");
+
+        // Replayed lifecycle discovery re-announces the child as Running.
+        manager
+            .handle_event(
+                &owner,
+                SessionEvent::NativeSubagent {
+                    id: "child".into(),
+                    parent_id: None,
+                    title: None,
+                    state: SessionState::Running,
+                    event: None,
+                    seq: None,
+                },
+            )
+            .await;
+        let child = manager.detail(&projected_id).await.expect("child");
+        assert_eq!(
+            child.summary.state,
+            SessionState::Done,
+            "an untagged state-only replay must not resurrect a finished mirror"
+        );
+
+        // Tagged new activity is genuine and does resurrect it.
+        manager
+            .handle_event(
+                &owner,
+                SessionEvent::NativeSubagent {
+                    id: "child".into(),
+                    parent_id: None,
+                    title: None,
+                    state: SessionState::Running,
+                    event: Some(Box::new(SessionEvent::Message {
+                        role: MessageRole::User,
+                        text: "again".into(),
+                    })),
+                    seq: Some(0),
+                },
+            )
+            .await;
+        let child = manager.detail(&projected_id).await.expect("child");
+        assert_eq!(child.summary.state, SessionState::Running);
+    }
+
     /// Loading a session recounts chat messages from its transcript, so
     /// `message_count` self-heals for summaries saved before the field
     /// existed (they deserialize as 0) and for summaries that lagged a
@@ -9151,6 +9306,7 @@ done
                         role: MessageRole::Assistant,
                         text: "found it".into(),
                     })),
+                    seq: None,
                 },
             )
             .await;
@@ -9168,6 +9324,7 @@ done
             Some(NativeSubagentRef {
                 owner_session_id: "owner".into(),
                 native_id: "native-child".into(),
+                projected_seq: 0,
             })
         );
         assert!(matches!(
@@ -9195,6 +9352,7 @@ done
                     title: None,
                     state: SessionState::Done,
                     event: None,
+                    seq: None,
                 },
             )
             .await;
@@ -9251,6 +9409,7 @@ done
                     title: None,
                     state: SessionState::Running,
                     event: None,
+                    seq: None,
                 },
             )
             .await;

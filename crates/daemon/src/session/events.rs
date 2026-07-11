@@ -34,9 +34,10 @@ impl SessionManager {
             title,
             state,
             event,
+            seq,
         } = event
         {
-            self.handle_native_subagent_event(entry, id, parent_id, title, state, event)
+            self.handle_native_subagent_event(entry, id, parent_id, title, state, event, seq)
                 .await;
             return;
         }
@@ -520,6 +521,7 @@ impl SessionManager {
         title: Option<String>,
         state: SessionState,
         event: Option<Box<SessionEvent>>,
+        seq: Option<u64>,
     ) {
         let owner_summary = owner.summary().await;
         // Native-child events must originate at the root Construct session.
@@ -563,6 +565,7 @@ impl SessionManager {
                 native_subagent: Some(NativeSubagentRef {
                     owner_session_id: root_owner_id.clone(),
                     native_id: native_id.clone(),
+                    projected_seq: 0,
                 }),
                 last_pty_at_ms: None,
                 busy_ms: 0,
@@ -611,6 +614,38 @@ impl SessionManager {
         let snapshot = {
             let now = Utc::now();
             let mut summary = entry.summary.write().await;
+            // Adapters re-scan child transcript files from the top on every
+            // (re)start so pre-existing history backfills instead of leaving
+            // empty mirrors. File-derived emissions carry a deterministic
+            // per-child ordinal; anything below the mirror's persisted
+            // high-water mark is a replay of lines it already has — drop it
+            // wholesale (no state flip, no re-projected event).
+            if let Some(seq) = seq {
+                let projected = summary
+                    .native_subagent
+                    .as_ref()
+                    .map(|n| n.projected_seq)
+                    .unwrap_or(0);
+                if seq < projected {
+                    return;
+                }
+                if let Some(native) = summary.native_subagent.as_mut() {
+                    native.projected_seq = seq + 1;
+                }
+            } else if event.is_none()
+                && !summary.archived
+                && summary.state.is_terminal()
+                && !state.is_terminal()
+            {
+                // An untagged state-only emission can be a replay from a
+                // source the ordinals don't cover (discovery/lifecycle
+                // scans). Never flip a finished, still-visible mirror back
+                // to running from one — genuine new activity arrives
+                // seq-tagged (or targets an ARCHIVED mirror, which the
+                // native-view removal already vetted; restoring those is
+                // spec 0079's documented behavior and stays allowed).
+                return;
+            }
             summary.parent_session_id = Some(parent_session_id);
             let prev_state = summary.state;
             // Through the tracked transition (not a bare assignment) so

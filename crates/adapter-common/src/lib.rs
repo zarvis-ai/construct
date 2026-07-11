@@ -71,3 +71,16 @@ where
         }
     })
 }
+
+/// Post-incrementing counter for native-subagent emission ordinals
+/// (`SessionEvent::NativeSubagent::seq`): returns the current ordinal and
+/// advances it. Adapters number every emission derived from a child's own
+/// transcript file with these, per child, starting from 0 at watcher start —
+/// a re-scan from the top regenerates the same ordinals, which is what lets
+/// the daemon drop already-projected replays while adapters always backfill
+/// full child history.
+pub fn next_native_seq(ord: &mut u64) -> u64 {
+    let v = *ord;
+    *ord += 1;
+    v
+}

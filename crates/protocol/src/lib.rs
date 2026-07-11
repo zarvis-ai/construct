@@ -366,6 +366,18 @@ pub enum SessionEvent {
         /// Optional semantic transcript event belonging to the native child.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         event: Option<Box<SessionEvent>>,
+        /// Deterministic per-child ordinal for emissions derived from the
+        /// child's own transcript file, starting at 0 in file order. An
+        /// adapter re-scanning the file from the top regenerates the same
+        /// ordinals, so the daemon can drop already-projected replays by
+        /// comparing against [`NativeSubagentRef::projected_seq`] — which is
+        /// what lets adapters ALWAYS backfill a child's full history instead
+        /// of skipping pre-existing lines (and leaving empty mirrors) on
+        /// resume/restart. `None` for emissions not derived from the child's
+        /// file (discovery, root-transcript state updates): those are
+        /// processed unconditionally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seq: Option<u64>,
     },
     Message {
         role: MessageRole,
@@ -1893,6 +1905,13 @@ pub struct NativeSubagentRef {
     pub owner_session_id: String,
     /// Stable identifier assigned by the wrapped harness.
     pub native_id: String,
+    /// High-water mark over the adapter's deterministic per-child emission
+    /// ordinals (`NativeSubagent::seq`): the count already projected into
+    /// this mirror's transcript. Emissions with `seq < projected_seq` are
+    /// replays of lines the mirror already has and are dropped, so adapters
+    /// can re-scan child files from the top on every (re)start.
+    #[serde(default)]
+    pub projected_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

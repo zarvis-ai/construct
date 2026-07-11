@@ -21,7 +21,7 @@ use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
-use construct_adapter_common::{drive_turn, spawn_stderr_log, TurnOutcome};
+use construct_adapter_common::{drive_turn, next_native_seq, spawn_stderr_log, TurnOutcome};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -228,8 +228,8 @@ fn spawn_interactive_transcript_watcher(
         let mut next_line: usize = 0;
         let mut known: HashMap<String, (PathBuf, SessionMeta)> = HashMap::new();
         let mut child_lines: HashMap<String, usize> = HashMap::new();
+        let mut child_seq: HashMap<String, u64> = HashMap::new();
         let mut child_states: HashMap<String, SessionState> = HashMap::new();
-        let mut initial_scan = true;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -310,7 +310,6 @@ fn spawn_interactive_transcript_watcher(
                 .and_then(|(name, _)| known.get(name))
                 .and_then(|(_, meta)| meta.id.clone())
             else {
-                initial_scan = false;
                 continue;
             };
             let mut related = HashSet::from([root_id.clone()]);
@@ -341,13 +340,14 @@ fn spawn_interactive_transcript_watcher(
                     continue;
                 }
                 let first_seen = !child_lines.contains_key(child_id);
-                let line = child_lines.entry(child_id.clone()).or_insert_with(|| {
-                    if skip_existing && initial_scan {
-                        count_jsonl_lines(child_path)
-                    } else {
-                        0
-                    }
-                });
+                // Child files are ALWAYS read from the top — pre-existing
+                // history backfills into the mirror instead of being skipped
+                // on resume/restart. Every emission derived from the file
+                // carries a deterministic per-child ordinal; the daemon
+                // drops ordinals below the mirror's high-water mark, so
+                // re-scans never duplicate.
+                let line = child_lines.entry(child_id.clone()).or_insert(0);
+                let ord = child_seq.entry(child_id.clone()).or_insert(0);
                 let mut state = child_states
                     .get(child_id)
                     .copied()
@@ -359,6 +359,7 @@ fn spawn_interactive_transcript_watcher(
                         title: Some(format!("Codex subagent {}", short_codex_id(child_id))),
                         state,
                         event: None,
+                        seq: Some(next_native_seq(ord)),
                     });
                 }
                 for value in read_new_codex_values(child_path, line, &emit) {
@@ -374,6 +375,7 @@ fn spawn_interactive_transcript_watcher(
                             title: None,
                             state,
                             event: None,
+                            seq: Some(next_native_seq(ord)),
                         });
                     }
                     for event in events {
@@ -390,11 +392,11 @@ fn spawn_interactive_transcript_watcher(
                             title,
                             state,
                             event: Some(Box::new(event)),
+                            seq: Some(next_native_seq(ord)),
                         });
                     }
                 }
             }
-            initial_scan = false;
         }
     });
 }

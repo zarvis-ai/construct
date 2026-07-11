@@ -25,7 +25,7 @@ use agentd_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
-use construct_adapter_common::{drive_turn, spawn_stderr_log, TurnOutcome};
+use construct_adapter_common::{drive_turn, next_native_seq, spawn_stderr_log, TurnOutcome};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -350,10 +350,10 @@ fn spawn_interactive_transcript_watcher(
                 .join("subagents")
         });
         let mut child_lines: HashMap<String, usize> = HashMap::new();
+        let mut child_seq: HashMap<String, u64> = HashMap::new();
         let mut child_states: HashMap<String, SessionState> = HashMap::new();
         let mut child_parents: HashMap<String, String> = HashMap::new();
         let mut last_snapshot: Option<Vec<String>> = None;
-        let mut initial_scan = true;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -372,9 +372,9 @@ fn spawn_interactive_transcript_watcher(
                             .join("subagents")
                     });
                     child_lines.clear();
+                    child_seq.clear();
                     child_states.clear();
                     child_parents.clear();
-                    initial_scan = true;
                 }
             }
             let root_values = emit_new_claude_transcript_lines(&path, &mut next_line, &emit);
@@ -387,14 +387,13 @@ fn spawn_interactive_transcript_watcher(
                         title,
                         state,
                         event: None,
+                        seq: None,
                     });
                     if matches!(state, SessionState::Done | SessionState::Errored) {
                         emit.emit(SessionEvent::NativeSubagentRemoved { id });
                     }
                 }
             }
-            let this_is_initial_scan = initial_scan;
-            initial_scan = false;
             let Some(dir) = subagents_dir.as_ref() else {
                 continue;
             };
@@ -417,24 +416,26 @@ fn spawn_interactive_transcript_watcher(
                 };
                 retained_native_ids.push(native_id.clone());
                 let first_seen = !child_lines.contains_key(&native_id);
-                let next = child_lines.entry(native_id.clone()).or_insert_with(|| {
-                    if skip_existing && this_is_initial_scan {
-                        count_jsonl_lines(&child_path)
-                    } else {
-                        0
-                    }
-                });
+                // Child files are ALWAYS read from the top — pre-existing
+                // history backfills into the mirror instead of being skipped
+                // on resume/restart. Every emission derived from a file
+                // carries a deterministic ordinal in its TARGET child's
+                // stream; the daemon drops ordinals below the mirror's
+                // high-water mark, so re-scans never duplicate.
+                let next = child_lines.entry(native_id.clone()).or_insert(0);
                 let state = child_states
                     .get(&native_id)
                     .copied()
                     .unwrap_or(SessionState::Running);
                 if first_seen {
+                    let ord = child_seq.entry(native_id.clone()).or_insert(0);
                     emit.emit(SessionEvent::NativeSubagent {
                         id: native_id.clone(),
                         parent_id: child_parents.get(&native_id).cloned(),
                         title: Some(format!("Claude subagent {}", short_native_id(&native_id))),
                         state,
                         event: None,
+                        seq: Some(next_native_seq(ord)),
                     });
                 }
                 for value in read_new_claude_values(&child_path, next, &emit) {
@@ -443,24 +444,28 @@ fn spawn_interactive_transcript_watcher(
                     {
                         child_states.insert(nested_id.clone(), nested_state);
                         child_parents.insert(nested_id.clone(), native_id.clone());
+                        let ord = child_seq.entry(nested_id.clone()).or_insert(0);
                         emit.emit(SessionEvent::NativeSubagent {
                             id: nested_id.clone(),
                             parent_id: Some(native_id.clone()),
                             title,
                             state: nested_state,
                             event: None,
+                            seq: Some(next_native_seq(ord)),
                         });
                         if matches!(nested_state, SessionState::Done | SessionState::Errored) {
                             emit.emit(SessionEvent::NativeSubagentRemoved { id: nested_id });
                         }
                     }
                     for event in claude_events_from_json(&value) {
+                        let ord = child_seq.entry(native_id.clone()).or_insert(0);
                         emit.emit(SessionEvent::NativeSubagent {
                             id: native_id.clone(),
                             parent_id: child_parents.get(&native_id).cloned(),
                             title: None,
                             state,
                             event: Some(Box::new(event)),
+                            seq: Some(next_native_seq(ord)),
                         });
                     }
                 }
