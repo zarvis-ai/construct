@@ -25081,7 +25081,7 @@ mod tests {
             .draw(|f| crate::ui::render(f, &mut app))
             .expect("draw");
         let screen = rendered_text(terminal.backend().buffer());
-        assert!(screen.contains("tour 1/8"), "missing step title:\n{screen}");
+        assert!(screen.contains("tour 1/9"), "missing step title:\n{screen}");
         assert!(
             screen.contains("A chord like C-x C-f"),
             "missing step1 body:\n{screen}"
@@ -25357,7 +25357,7 @@ mod tests {
         app.view = ViewMode::Terminal;
         assert_eq!(app.sessions.len(), 1, "fixture: exactly one session");
         app.tutorial_start();
-        app.tutorial.as_mut().unwrap().step = 4;
+        app.tutorial.as_mut().unwrap().step = 5;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
         app.pty_input_tx = tx;
@@ -25399,8 +25399,8 @@ mod tests {
             .await;
         assert_eq!(
             app.tutorial.as_ref().map(|t| t.step),
-            Some(5),
-            "focus hop + selection move must complete step 4"
+            Some(6),
+            "focus hop + selection move must complete step 5"
         );
         server.abort();
     }
@@ -25555,7 +25555,7 @@ mod tests {
         app.tutorial_start();
         {
             let t = app.tutorial.as_mut().unwrap();
-            t.step = 6;
+            t.step = 7;
             t.degraded = true; // degraded gate = the three user actions
         }
         app.run_action(KeyAction::SplitWindowRight).await;
@@ -25571,8 +25571,8 @@ mod tests {
         app.run_action(KeyAction::DeleteOtherWindows).await;
         assert_eq!(
             app.tutorial.as_ref().map(|t| t.step),
-            Some(7),
-            "C-x 1 must count for the collapse sub-check and complete step 6"
+            Some(8),
+            "C-x 1 must count for the collapse sub-check and complete step 7"
         );
 
         // The other member of each pair works too.
@@ -25580,13 +25580,13 @@ mod tests {
         app2.tutorial_start();
         {
             let t = app2.tutorial.as_mut().unwrap();
-            t.step = 6;
+            t.step = 7;
             t.degraded = true;
         }
         app2.run_action(KeyAction::SplitWindowBelow).await;
         app2.run_action(KeyAction::FocusWindowUp).await;
         app2.run_action(KeyAction::DeleteWindow).await;
-        assert_eq!(app2.tutorial.as_ref().map(|t| t.step), Some(7));
+        assert_eq!(app2.tutorial.as_ref().map(|t| t.step), Some(8));
         server.abort();
         server2.abort();
     }
@@ -25602,7 +25602,7 @@ mod tests {
         app.tutorial_start();
         {
             let t = app.tutorial.as_mut().unwrap();
-            t.step = 6;
+            t.step = 7;
             t.practice_session_id = Some("s1".into());
         }
         // The user's popup still shows the task under Todo (stale view of
@@ -25651,7 +25651,7 @@ mod tests {
     async fn step6_detections_adopt_practice_when_unknown() {
         let (mut app, _dir, server) = captured_app().await;
         app.tutorial_start();
-        app.tutorial.as_mut().unwrap().step = 6;
+        app.tutorial.as_mut().unwrap().step = 7;
         assert!(app.tutorial.as_ref().unwrap().practice_session_id.is_none());
 
         // A subagent spawning during step 6 (kind Subagent, parented to the
@@ -25681,7 +25681,7 @@ mod tests {
         // session ticks and adopts too.
         let (mut app2, _dir2, server2) = captured_app().await;
         app2.tutorial_start();
-        app2.tutorial.as_mut().unwrap().step = 6;
+        app2.tutorial.as_mut().unwrap().step = 7;
         app2.on_notification(Notification {
             jsonrpc: "2.0".into(),
             method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
@@ -25709,7 +25709,7 @@ mod tests {
         // not selected) never ticks an unknown-practice tour.
         let (mut app3, _dir3, server3) = captured_app().await;
         app3.tutorial_start();
-        app3.tutorial.as_mut().unwrap().step = 6;
+        app3.tutorial.as_mut().unwrap().step = 7;
         app3.on_notification(Notification {
             jsonrpc: "2.0".into(),
             method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
@@ -25746,7 +25746,7 @@ mod tests {
         app.tutorial_start();
         {
             let t = app.tutorial.as_mut().unwrap();
-            t.step = 6;
+            t.step = 7;
             t.practice_session_id = Some("s1".into());
         }
         let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
@@ -25851,7 +25851,7 @@ mod tests {
         app.tutorial_start();
         {
             let t = app.tutorial.as_mut().unwrap();
-            t.step = 5;
+            t.step = 6;
             t.practice_session_id = Some("s1".into());
         }
         let board = "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n";
@@ -25895,7 +25895,7 @@ mod tests {
             t.task_line_present,
             "a task line under Todo must tick before any save"
         );
-        assert_eq!(t.step, 5, "non-degraded step 5 still waits for the run");
+        assert_eq!(t.step, 6, "non-degraded step 6 still waits for the run");
 
         // Sticky: wiping the buffer afterwards never unticks.
         app.program_popup.as_mut().unwrap().buffer = String::new();
@@ -25914,7 +25914,7 @@ mod tests {
         app.tutorial_start();
         {
             let t = app.tutorial.as_mut().unwrap();
-            t.step = 5;
+            t.step = 6;
             t.practice_session_id = Some("s1".into());
         }
         // Sections present (template box ticks on content), but the only

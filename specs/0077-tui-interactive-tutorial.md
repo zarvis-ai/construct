@@ -25,12 +25,13 @@ other step is fully clickable: a mouse-only user can complete the whole tour
 without ever pressing a chord.
 
 The tour covers, in order: how to read chord notation and back out with
-`C-g`; creating a practice session; sending it a message; moving focus and
-selection around the list/view; opening the program board, applying the
+`C-g`; creating a practice session; sending it a message; finding the session
+title-bar menu to fork a parallel conversation and then merge or discard its
+result; moving focus and selection around the list/view; opening the program board, applying the
 built-in "Tasks" template, and running it so the board's own rule delegates
 the task to a live subagent; splitting the screen to watch the subagent
-work; the two panic-button keys (help, quit); and cleaning up the practice
-session. Each step's card shows live feedback — a keystroke echo, a
+work; the two panic-button keys (help, quit); and
+cleaning up the practice session. Each step's card shows live feedback — a keystroke echo, a
 wrong-key correction, or a mini-checklist for steps with more than one
 sub-condition — sourced from the same dispatch and event machinery the rest
 of the TUI uses, not a scripted narration.
