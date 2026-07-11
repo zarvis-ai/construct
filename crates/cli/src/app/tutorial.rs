@@ -16,7 +16,7 @@
 use super::*;
 
 /// Number of steps in the tour (spec 0077).
-pub const STEP_COUNT: u8 = 8;
+pub const STEP_COUNT: u8 = 9;
 
 /// How long step 5/6 waits for progress before showing the stall hint.
 const STALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -138,6 +138,8 @@ pub struct TutorialState {
     /// The session created in step 2, remembered as the practice session
     /// for the rest of the tour.
     pub practice_session_id: Option<String>,
+    /// The real fork created in the dedicated fork/merge lesson.
+    pub fork_session_id: Option<String>,
     /// The subagent the Tasks template's rule spawns in step 5/6.
     pub subagent_session_id: Option<String>,
     /// Live feedback line: last keystroke echo, a wrong-key correction, or
@@ -190,6 +192,7 @@ impl TutorialState {
             degraded,
             profile,
             practice_session_id: None,
+            fork_session_id: None,
             subagent_session_id: None,
             feedback: None,
             step1_phase: Step1Phase::AwaitCtrlX,
@@ -211,8 +214,9 @@ impl TutorialState {
     fn target(&self) -> TutorialTarget {
         match self.step {
             2 | 3 => TutorialTarget::View,
-            4 => TutorialTarget::List,
-            5 | 6 => TutorialTarget::Program,
+            4 => TutorialTarget::View,
+            5 => TutorialTarget::List,
+            6 | 7 => TutorialTarget::Program,
             _ => TutorialTarget::None,
         }
     }
@@ -246,18 +250,18 @@ impl TutorialState {
             return;
         }
         match self.step {
-            4 if self.focus_switched && self.selection_moved => self.advance(5),
-            5 => {
+            5 if self.focus_switched && self.selection_moved => self.advance(6),
+            6 => {
                 let ready = if self.degraded {
                     self.program_opened && self.template_applied && self.task_line_present
                 } else {
                     self.run_started
                 };
                 if ready {
-                    self.advance(6);
+                    self.advance(7);
                 }
             }
-            6 => {
+            7 => {
                 // Both modes require the three USER actions (split, hop,
                 // close the split — the checklist rows); non-degraded
                 // additionally waits for the agent's part, the delegated
@@ -269,7 +273,7 @@ impl TutorialState {
                     user_done && self.task_done
                 };
                 if ready {
-                    self.advance(7);
+                    self.advance(8);
                 }
             }
             _ => {}
@@ -290,17 +294,17 @@ impl TutorialState {
         }
         let prev = self.step - 1;
         match prev {
-            4 => {
+            5 => {
                 self.focus_switched = false;
                 self.selection_moved = false;
             }
-            5 => {
+            6 => {
                 self.program_opened = false;
                 self.template_applied = false;
                 self.task_line_present = false;
                 self.run_started = false;
             }
-            6 => {
+            7 => {
                 self.split_done = false;
                 self.hop_done = false;
                 self.task_done = false;
@@ -315,7 +319,7 @@ impl TutorialState {
         if self.completed || self.stalled {
             return;
         }
-        if matches!(self.step, 5 | 6) && now.duration_since(self.last_progress_at) > STALL_TIMEOUT {
+        if matches!(self.step, 6 | 7) && now.duration_since(self.last_progress_at) > STALL_TIMEOUT {
             self.stalled = true;
             self.feedback =
                 Some("the agent is taking a while — you can keep waiting or skip ahead".into());
@@ -348,11 +352,12 @@ impl TutorialState {
             1 => step1_lines(self.step1_phase, self.profile),
             2 => step2_lines(self.degraded),
             3 => step3_lines(),
-            4 => step4_lines(self.profile, ctx.single_session),
-            5 => step5_lines(self.profile, self.degraded),
-            6 => step6_lines(self, ctx),
-            7 => step7_lines(self.profile, ctx.list_focused),
-            8 => step8_lines(self.profile),
+            4 => step4_lines(),
+            5 => step5_lines(self.profile, ctx.single_session),
+            6 => step6_lines(self.profile, self.degraded),
+            7 => step7_lines(self, ctx),
+            8 => step8_lines(self.profile, ctx.list_focused),
+            9 => step9_lines(self.profile),
             _ => Vec::new(),
         }
     }
@@ -360,14 +365,14 @@ impl TutorialState {
     /// Mini-checklist for the multi-part steps (4, 5, 6). Empty elsewhere.
     pub fn checklist(&self) -> Vec<(String, bool)> {
         match self.step {
-            4 => vec![
+            5 => vec![
                 (
                     "switch focus (list <-> view)".to_string(),
                     self.focus_switched,
                 ),
                 ("move the selection".to_string(), self.selection_moved),
             ],
-            5 => {
+            6 => {
                 let mut items = vec![
                     ("open the program".to_string(), self.program_opened),
                     (
@@ -381,7 +386,7 @@ impl TutorialState {
                 }
                 items
             }
-            6 => {
+            7 => {
                 // USER actions only, in the order the user performs them.
                 // The agent's side (subagent spawning, the task reaching
                 // ## Done) is narrated by the card's status line instead —
@@ -492,7 +497,19 @@ fn step3_lines() -> Vec<TutorialLine> {
 // forwarded straight into the child's PTY and never resolves to
 // `NextSession`. The tour never steals keys from the PTY, so the card
 // teaches the working order instead: focus the list first, then move.
-fn step4_lines(profile: Profile, single_session: bool) -> Vec<TutorialLine> {
+fn step4_lines() -> Vec<TutorialLine> {
+    vec![
+        vec![t("Open the practice session's title-bar ☰")],
+        vec![t("menu and choose Fork conversation." )],
+        vec![t("The fork keeps its context but works on an")],
+        vec![t("independent path. Create one now.")],
+        vec![],
+        vec![t("On the fork, ☰ enables Merge result:")],
+        vec![t("send its result back, or discard the fork.")],
+    ]
+}
+
+fn step5_lines(profile: Profile, single_session: bool) -> Vec<TutorialLine> {
     let mut lines = vec![
         vec![
             t("1. "),
@@ -526,7 +543,7 @@ fn step4_lines(profile: Profile, single_session: bool) -> Vec<TutorialLine> {
     lines
 }
 
-fn step5_lines(profile: Profile, degraded: bool) -> Vec<TutorialLine> {
+fn step6_lines(profile: Profile, degraded: bool) -> Vec<TutorialLine> {
     let mut lines = vec![
         vec![
             k(
@@ -557,7 +574,7 @@ fn step5_lines(profile: Profile, degraded: bool) -> Vec<TutorialLine> {
 /// The either-or split line both modes open with: `C-x 2` and `C-x 3` are
 /// equal choices, both clickable, and the split sub-check ticks on either
 /// action firing.
-fn step6_split_line(profile: Profile) -> TutorialLine {
+fn step7_split_line(profile: Profile) -> TutorialLine {
     vec![
         t("Split: "),
         k(
@@ -580,7 +597,7 @@ fn step6_split_line(profile: Profile) -> TutorialLine {
 /// fast model the whole run may already have finished — possibly with the
 /// subagent archived by the board's rule — before the user even splits (the
 /// card acknowledges that instead of pointing at a vanished session).
-fn step6_lines(state: &TutorialState, ctx: TutorialCardCtx) -> Vec<TutorialLine> {
+fn step7_lines(state: &TutorialState, ctx: TutorialCardCtx) -> Vec<TutorialLine> {
     let profile = state.profile;
     // Clickable hop label: dispatches a real pane-hop (and ticks the hop
     // sub-check) so a mouse-only user can complete the row. `C-x <arrow>`
@@ -588,7 +605,7 @@ fn step6_lines(state: &TutorialState, ctx: TutorialCardCtx) -> Vec<TutorialLine>
     let hop = || k("C-x <arrow>", KeyAction::FocusWindowDown);
     if state.degraded {
         return vec![
-            step6_split_line(profile),
+            step7_split_line(profile),
             vec![t("Hop panes with "), hop(), t(", then close")],
             vec![
                 t("the split: "),
@@ -608,7 +625,7 @@ fn step6_lines(state: &TutorialState, ctx: TutorialCardCtx) -> Vec<TutorialLine>
         ];
     }
     let mut lines = vec![
-        step6_split_line(profile),
+        step7_split_line(profile),
         vec![t("Hop panes with "), hop(), t(".")],
         vec![],
     ];
@@ -648,7 +665,7 @@ fn step6_lines(state: &TutorialState, ctx: TutorialCardCtx) -> Vec<TutorialLine>
 // tour never steals the key; the card teaches the order and, while focus
 // is elsewhere, says so explicitly. Clicking the `?` label works from any
 // focus (it dispatches the action directly).
-fn step7_lines(profile: Profile, list_focused: bool) -> Vec<TutorialLine> {
+fn step8_lines(profile: Profile, list_focused: bool) -> Vec<TutorialLine> {
     let mut lines = vec![
         vec![
             t("1. "),
@@ -671,10 +688,6 @@ fn step7_lines(profile: Profile, list_focused: bool) -> Vec<TutorialLine> {
         lines.push(vec![t("(focus is in the view now, so ? would")]);
         lines.push(vec![t("just be typed there — C-x o first)")]);
     }
-    lines.push(vec![t("Need a parallel path? Open the title-bar ☰")]);
-    lines.push(vec![t("menu, then choose Fork conversation.")]);
-    lines.push(vec![t("On a fork, that same menu's Merge result")]);
-    lines.push(vec![t("brings its result back, or discard it.")]);
     lines.push(vec![t(format!(
         "{} quits — don't press it now!",
         chord_label(KeyAction::Quit, profile)
@@ -685,7 +698,7 @@ fn step7_lines(profile: Profile, list_focused: bool) -> Vec<TutorialLine> {
     lines
 }
 
-fn step8_lines(profile: Profile) -> Vec<TutorialLine> {
+fn step9_lines(profile: Profile) -> Vec<TutorialLine> {
     vec![
         vec![
             k(
@@ -866,7 +879,7 @@ impl App {
                     }
                 }
             }
-            4 => match action {
+            5 => match action {
                 KeyAction::SwitchFocus => {
                     t.focus_switched = true;
                     t.touch_progress();
@@ -877,7 +890,7 @@ impl App {
                 }
                 _ => {}
             },
-            5 => match action {
+            6 => match action {
                 KeyAction::OpenProgram => {
                     t.program_opened = true;
                     t.touch_progress();
@@ -888,7 +901,7 @@ impl App {
                 }
                 _ => {}
             },
-            6 => match action {
+            7 => match action {
                 // Either split direction counts — the card offers the two
                 // chords as an explicit either-or choice.
                 KeyAction::SplitWindowBelow | KeyAction::SplitWindowRight => {
@@ -915,9 +928,9 @@ impl App {
                 }
                 _ => {}
             },
-            7 => {
+            8 => {
                 if action == KeyAction::ToggleHelp {
-                    t.advance(8);
+                    t.advance(9);
                 }
             }
             _ => {}
@@ -1037,7 +1050,17 @@ impl App {
                     );
                 }
             }
-            6 => {
+            4 => {
+                if session
+                    .forked_from
+                    .as_ref()
+                    .is_some_and(|fork| Some(fork.session_id.as_str()) == t.practice_session_id.as_deref())
+                {
+                    t.fork_session_id = Some(session.id.clone());
+                    t.advance(5);
+                }
+            }
+            7 => {
                 // `construct_subagent_create` (the MCP tool the practice
                 // agent uses) and the board's direct dispatch both stamp
                 // `parent_session_id` with the creating session and kind
@@ -1076,7 +1099,7 @@ impl App {
         let Some(t) = self.tutorial.as_mut() else {
             return;
         };
-        if t.completed || !matches!(t.step, 5 | 6) {
+        if t.completed || !matches!(t.step, 6 | 7) {
             return;
         }
         // Scope to the practice session when known. When it isn't (tour
@@ -1118,7 +1141,7 @@ impl App {
         let Some(t) = self.tutorial.as_mut() else {
             return;
         };
-        if t.completed || t.step != 8 {
+        if t.completed || t.step != 9 {
             return;
         }
         if t.practice_session_id.as_deref() == Some(session_id) {
@@ -1184,13 +1207,13 @@ impl App {
             return;
         };
         let unticked = match t.step {
-            5 => !(t.template_applied && t.task_line_present),
+            6 => !(t.template_applied && t.task_line_present),
             // Step 6's ## Done gate combines two sources with OR: the
             // daemon's program/state event (the agent's edits — the primary
             // source, see `tutorial_on_program_state`) and this buffer scan
             // (a popup whose view semantics DO refresh, or a user moving
             // the line by hand). Sticky either way.
-            6 => !t.task_done,
+            7 => !t.task_done,
             _ => false,
         };
         if t.completed || !unticked {
@@ -1217,7 +1240,7 @@ impl App {
         };
         let mut progressed = false;
         match t.step {
-            5 => {
+            6 => {
                 if template && !t.template_applied {
                     t.template_applied = true;
                     progressed = true;
@@ -1227,7 +1250,7 @@ impl App {
                     progressed = true;
                 }
             }
-            6 if done && !t.task_done => {
+            7 if done && !t.task_done => {
                 t.task_done = true;
                 progressed = true;
             }
@@ -1300,7 +1323,7 @@ mod tests {
     #[test]
     fn degraded_step5_checklist_has_no_run_row() {
         let mut state = TutorialState::start(true, Profile::Emacs);
-        state.step = 5;
+        state.step = 6;
         let items = state.checklist();
         assert!(!items.iter().any(|(label, _)| label == "run it"));
     }
@@ -1308,7 +1331,7 @@ mod tests {
     #[test]
     fn non_degraded_step5_checklist_has_run_row() {
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 5;
+        state.step = 6;
         let items = state.checklist();
         assert!(items.iter().any(|(label, _)| label == "run it"));
     }
@@ -1316,23 +1339,23 @@ mod tests {
     #[test]
     fn step5_completion_differs_by_degraded_mode() {
         let mut degraded = TutorialState::start(true, Profile::Emacs);
-        degraded.step = 5;
+        degraded.step = 6;
         degraded.program_opened = true;
         degraded.template_applied = true;
         degraded.task_line_present = true;
         degraded.recompute_completion();
-        assert_eq!(degraded.step, 6, "degraded step5 completes without a run");
+        assert_eq!(degraded.step, 7, "degraded step6 completes without a run");
 
         let mut normal = TutorialState::start(false, Profile::Emacs);
-        normal.step = 5;
+        normal.step = 6;
         normal.program_opened = true;
         normal.template_applied = true;
         normal.task_line_present = true;
         normal.recompute_completion();
-        assert_eq!(normal.step, 5, "non-degraded step5 still needs a run");
+        assert_eq!(normal.step, 6, "non-degraded step6 still needs a run");
         normal.run_started = true;
         normal.recompute_completion();
-        assert_eq!(normal.step, 6);
+        assert_eq!(normal.step, 7);
     }
 
     #[test]
@@ -1401,14 +1424,14 @@ mod tests {
     #[test]
     fn step_back_rearms_transient_flags_but_keeps_remembered_facts() {
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 5;
+        state.step = 6;
         state.practice_session_id = Some("practice".into());
         state.focus_switched = true;
         state.selection_moved = true;
         state.feedback = Some("leftover".into());
 
         state.step_back();
-        assert_eq!(state.step, 4);
+        assert_eq!(state.step, 5);
         assert!(!state.focus_switched, "step 4's sub-checks are re-armed");
         assert!(!state.selection_moved);
         assert!(state.feedback.is_none());
@@ -1420,13 +1443,13 @@ mod tests {
 
         // Prev from 7 re-arms all of step 6.
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 7;
+        state.step = 8;
         state.split_done = true;
         state.task_done = true;
         state.collapse_done = true;
         state.subagent_session_id = Some("sub".into());
         state.step_back();
-        assert_eq!(state.step, 6);
+        assert_eq!(state.step, 7);
         assert!(!state.split_done && !state.task_done && !state.collapse_done);
         assert_eq!(
             state.subagent_session_id.as_deref(),
@@ -1461,7 +1484,7 @@ mod tests {
     #[test]
     fn step4_note_shows_only_with_a_single_session() {
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 4;
+        state.step = 5;
         let single = joined_text(&state.lines(TutorialCardCtx {
             single_session: true,
             ..Default::default()
@@ -1487,7 +1510,7 @@ mod tests {
     #[test]
     fn step6_lines_adapt_to_live_run_state() {
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 6;
+        state.step = 7;
 
         // Split offered as an explicit either-or choice, both clickable.
         let waiting_lines = state.lines(TutorialCardCtx::default());
@@ -1546,45 +1569,45 @@ mod tests {
     #[test]
     fn step6_completion_requires_user_actions_in_both_modes() {
         let mut degraded = TutorialState::start(true, Profile::Emacs);
-        degraded.step = 6;
+        degraded.step = 7;
         degraded.split_done = true;
         degraded.collapse_done = true;
         degraded.recompute_completion();
-        assert_eq!(degraded.step, 6, "hop is part of the user gate");
+        assert_eq!(degraded.step, 7, "hop is part of the user gate");
         degraded.hop_done = true;
         degraded.recompute_completion();
-        assert_eq!(degraded.step, 7);
+        assert_eq!(degraded.step, 8);
 
         let mut normal = TutorialState::start(false, Profile::Emacs);
-        normal.step = 6;
+        normal.step = 7;
         normal.task_done = true;
         normal.recompute_completion();
-        assert_eq!(normal.step, 6, "Done alone no longer completes step 6");
+        assert_eq!(normal.step, 7, "Done alone no longer completes step 7");
         normal.split_done = true;
         normal.hop_done = true;
         normal.collapse_done = true;
         normal.recompute_completion();
-        assert_eq!(normal.step, 7);
+        assert_eq!(normal.step, 8);
 
         // Fast-archive inverse: the subagent was observed and already
         // archived; the Done gate (however it was detected) still
         // completes the step — nothing waits on a still-listed subagent.
         let mut fast = TutorialState::start(false, Profile::Emacs);
-        fast.step = 6;
+        fast.step = 7;
         fast.subagent_session_id = Some("sub".into());
         fast.split_done = true;
         fast.hop_done = true;
         fast.collapse_done = true;
         fast.task_done = true;
         fast.recompute_completion();
-        assert_eq!(fast.step, 7);
+        assert_eq!(fast.step, 8);
     }
 
     #[test]
     fn step6_checklist_is_user_actions_only() {
         for degraded in [false, true] {
             let mut state = TutorialState::start(degraded, Profile::Emacs);
-            state.step = 6;
+            state.step = 7;
             // Regardless of what the agent has done so far…
             state.subagent_session_id = Some("sub".into());
             state.task_done = true;
@@ -1606,7 +1629,7 @@ mod tests {
     #[test]
     fn step7_shows_focus_hint_only_when_focus_is_off_the_list() {
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 7;
+        state.step = 8;
         let off_list = joined_text(&state.lines(TutorialCardCtx::default()));
         assert!(
             off_list.contains("focus is in the view now"),
@@ -1627,9 +1650,9 @@ mod tests {
     }
 
     #[test]
-    fn step7_explains_fork_and_merge_from_the_session_menu() {
+    fn step4_explains_fork_and_merge_from_the_session_menu() {
         let mut state = TutorialState::start(false, Profile::Emacs);
-        state.step = 7;
+        state.step = 4;
         let text = joined_text(&state.lines(TutorialCardCtx {
             list_focused: true,
             ..Default::default()
