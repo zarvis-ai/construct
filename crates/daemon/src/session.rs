@@ -3156,6 +3156,12 @@ impl SessionManager {
 
     /// Move a session by one slot in the list view.
     ///
+    /// A forked session renders nested under its fork parent (see
+    /// `forked_from`), independent of `group_id`. Reordering it swaps
+    /// position with a sibling fork of the same immediate parent instead —
+    /// see the early return below. Everything past that handles ordinary
+    /// top-level sessions:
+    ///
     /// Within a single region (ungrouped or one group), this swaps positions
     /// with the neighbor. At a region boundary, the session either *enters*
     /// the adjacent group or *exits* its current group:
@@ -3180,6 +3186,48 @@ impl SessionManager {
             .find(|s| s.id == id)
             .cloned()
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
+
+        if let Some(parent_id) = me.forked_from.as_ref().map(|f| f.session_id.clone()) {
+            // A fork shares `group_id` with its source session (and thus the
+            // flat reorder region below), but the TUI never places it there —
+            // it's rendered nested under its parent, ordered only among
+            // sibling forks of that same parent. Swapping `position` with the
+            // flat-region neighbor (typically the parent itself) doesn't
+            // change the tree layout at all, so the row appears stuck. Scope
+            // the region to siblings instead: other forks whose
+            // `forked_from.session_id` matches this one's, in the same
+            // archive partition, sorted the same way the TUI sorts them.
+            let siblings: Vec<&SessionSummary> = all_sessions
+                .iter()
+                .filter(|s| {
+                    s.forked_from.as_ref().map(|f| f.session_id.as_str())
+                        == Some(parent_id.as_str())
+                        && s.archived == me.archived
+                })
+                .collect();
+            let mut siblings = siblings;
+            siblings.sort_by(|a, b| {
+                a.position
+                    .cmp(&b.position)
+                    .then_with(|| b.created_at.cmp(&a.created_at))
+            });
+            let pos_in_siblings = siblings.iter().position(|s| s.id == id).unwrap();
+            return match dir {
+                MoveDirection::Up if pos_in_siblings > 0 => {
+                    let other = siblings[pos_in_siblings - 1];
+                    self.swap_session_positions(&me.id, &other.id).await
+                }
+                MoveDirection::Down if pos_in_siblings + 1 < siblings.len() => {
+                    let other = siblings[pos_in_siblings + 1];
+                    self.swap_session_positions(&me.id, &other.id).await
+                }
+                // At the edge of the sibling-fork cluster: no-op. Forks don't
+                // cross into neighboring groups/regions the way top-level
+                // sessions do — their nesting is fixed to `forked_from` for
+                // the session's lifetime.
+                _ => Ok(()),
+            };
+        }
 
         // Find neighbors in `me`'s visible reorder region (same group_id,
         // user sessions and archive partition only), sorted by position. The
@@ -4406,6 +4454,31 @@ mod tests {
         entry
     }
 
+    /// A `SessionKind::User` entry with `forked_from` pointing at
+    /// `parent_id`, mirroring how `Client::fork_session` creates a fork as a
+    /// top-level sibling of its source.
+    async fn synthetic_fork_entry(
+        id: &str,
+        parent_id: &str,
+        position: i64,
+        group_id: Option<String>,
+    ) -> Arc<SessionEntry> {
+        let entry = synthetic_entry_with_group(
+            id,
+            construct_protocol::SessionKind::User,
+            position,
+            group_id,
+        );
+        entry.summary.write().await.forked_from = Some(construct_protocol::ForkedFrom {
+            session_id: parent_id.to_string(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+        entry
+    }
+
     #[tokio::test]
     async fn move_session_ignores_hidden_subagents_in_reorder_region() {
         use tempfile::tempdir;
@@ -4446,6 +4519,96 @@ mod tests {
         assert_eq!(b.position, 10);
         assert_eq!(a.position, 30);
         assert_eq!(hidden.position, 20);
+    }
+
+    #[tokio::test]
+    async fn move_session_reorders_fork_among_sibling_forks() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // A fork shares group_id with its parent, so the flat reorder region
+        // (same group_id, user-kind, same archive partition) can put an
+        // unrelated top-level session between two sibling forks by position
+        // — e.g. "other" landed at 12 after some earlier reorder. Swapping by
+        // flat-region neighbor would swap fork-b with "other" (12 <-> 13),
+        // which doesn't cross fork-a and so looks like a no-op in the
+        // fork-nested tree view, while silently perturbing "other"'s
+        // position. Reordering must instead use sibling-fork neighbors.
+        mgr.sessions.write().await.insert(
+            "fparent".into(),
+            synthetic_entry("fparent", construct_protocol::SessionKind::User, 10),
+        );
+        mgr.sessions.write().await.insert(
+            "ffork-a".into(),
+            synthetic_fork_entry("ffork-a", "fparent", 11, None).await,
+        );
+        mgr.sessions.write().await.insert(
+            "fother".into(),
+            synthetic_entry("fother", construct_protocol::SessionKind::User, 12),
+        );
+        mgr.sessions.write().await.insert(
+            "ffork-b".into(),
+            synthetic_fork_entry("ffork-b", "fparent", 13, None).await,
+        );
+
+        mgr.move_session("ffork-b", construct_protocol::MoveDirection::Up)
+            .await
+            .expect("move up");
+
+        let sessions = mgr.list().await;
+        let parent = sessions.iter().find(|s| s.id == "fparent").unwrap();
+        let fork_a = sessions.iter().find(|s| s.id == "ffork-a").unwrap();
+        let fork_b = sessions.iter().find(|s| s.id == "ffork-b").unwrap();
+        let other = sessions.iter().find(|s| s.id == "fother").unwrap();
+        assert_eq!(parent.position, 10, "unrelated parent must not move");
+        assert_eq!(fork_b.position, 11, "fork-b swaps with sibling fork-a");
+        assert_eq!(fork_a.position, 13);
+        assert_eq!(other.position, 12, "unrelated top-level session untouched");
+    }
+
+    #[tokio::test]
+    async fn move_session_fork_is_noop_at_sibling_edge() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // A fork with no sibling forks (only child of its parent) has no
+        // sibling to swap with. It must not fall back to swapping with its
+        // parent's flat-region neighbor — forks don't cross into other
+        // regions the way top-level sessions do.
+        mgr.sessions.write().await.insert(
+            "gparent".into(),
+            synthetic_entry("gparent", construct_protocol::SessionKind::User, 10),
+        );
+        mgr.sessions.write().await.insert(
+            "gfork".into(),
+            synthetic_fork_entry("gfork", "gparent", 11, None).await,
+        );
+
+        mgr.move_session("gfork", construct_protocol::MoveDirection::Up)
+            .await
+            .expect("move up");
+
+        let sessions = mgr.list().await;
+        let parent = sessions.iter().find(|s| s.id == "gparent").unwrap();
+        let fork = sessions.iter().find(|s| s.id == "gfork").unwrap();
+        assert_eq!(parent.position, 10);
+        assert_eq!(fork.position, 11);
     }
 
     #[tokio::test]
