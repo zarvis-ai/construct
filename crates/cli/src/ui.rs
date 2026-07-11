@@ -8140,8 +8140,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x C-o         focus session terminal / refocus Program
     C-x d           show diff
     C-x r           rename selected session (clears title on empty submit)
-    C-x f           fork selected session instantly (same harness, no prompt)
-    C-x F           fork selected session into a different harness (picker)
+    C-x f           fork selected session (harness picker; same is default)
     C-x Tab / Tab   focus lineage section (Tab: list pane only)
     C-x m           merge the selected fork (take result, or discard)
     C-c C-c         interrupt
@@ -8213,8 +8212,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
     C-x C-o         focus session terminal / refocus Program
     g d             show diff
     r               rename selected session (clears title on empty submit)
-    f               fork selected session instantly (same harness, no prompt)
-    O               fork selected session into a different harness (picker)
+    f               fork selected session (harness picker; same is default)
     C-x Tab / Tab   focus lineage section (Tab: list pane only)
     m               merge the selected fork (take result, or discard)
     C-c             interrupt

@@ -1,7 +1,7 @@
 # 0031-sessions-fork-into-new-siblings
 
 Status: accepted
-Date: 2026-06-17
+Date: 2026-07-10
 Area: architecture
 Scope: Changing the harness backing an existing session, and carrying context across harnesses.
 
@@ -23,13 +23,11 @@ harness-agnostic transcript**. A same-harness fork may use that harness's
 native fork/resume facility when available; this is a faithful continuation
 within one harness, never a cross-harness state translation.
 
-Cross-harness forking as described in this spec — the harness picker,
-transcript-seed context — is the **secondary, explicit** fork path (spec
-0078): the user deliberately opts into a different harness. The **primary,
-default** fork is same-harness, favors native context fidelity over the
-transcript seed when the adapter supports it, and always records lineage
-(`forked_from`) the same way a cross-harness fork does — see spec 0078 for
-the unified fork/merge decision and its keybinding split.
+The unified harness picker (spec 0078) defaults to the source harness. Accepting
+that default favors native context fidelity when the adapter supports it;
+editing the selection creates a cross-harness fork using portable transcript
+seeding. Both choices record identical lineage, and neither adds a separate
+initial-prompt step.
 
 ## Reason
 

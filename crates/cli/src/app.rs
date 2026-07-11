@@ -704,11 +704,10 @@ pub enum MinibufferIntent {
         session_id: String,
     },
     NewSessionHarness,
-    /// Harness picker for forking the selected session into a new sibling
-    /// (`OpenForkCrossHarness`). Shares the harness-picker UI/completion with
-    /// `NewSessionHarness`; on submit, calls `client.fork_session`. The
-    /// explicit, cross-harness counterpart to `OpenFork`'s instant
-    /// same-harness path, which never opens a minibuffer.
+    /// Harness picker for forking the selected session into a new sibling.
+    /// Input starts with the source harness so Enter accepts the same-harness
+    /// default; editing or completion selects another harness. Submit calls
+    /// `client.fork_session` directly, with no separate initial-prompt stage.
     ForkSessionHarness {
         source_session_id: String,
     },
@@ -8508,51 +8507,12 @@ impl App {
                 });
             }
             OpenFork => {
-                // Primary path: instant same-harness fork, no minibuffer.
-                // Every fork is lineage-tracked (`forked_from` always set by
-                // `Client::fork_session`), so the branch rail and fork log
-                // apply the same way as the explicit cross-harness path.
                 let Some(id) = self.selected_id() else {
                     self.set_status("fork: no session selected".to_string());
                     return;
                 };
                 let Some(source) = self.sessions.iter().find(|s| s.id == id).cloned() else {
                     self.set_status("fork: source disappeared".to_string());
-                    return;
-                };
-                let (cols, rows) = self.active_pane_size();
-                let opts = agentd_client::ForkOptions {
-                    pty_size: Some(agentd_protocol::PtySize {
-                        cols: cols.max(20),
-                        rows: rows.max(5),
-                    }),
-                    ..Default::default()
-                };
-                match self.client.fork_session(&id, &source.harness, opts).await {
-                    Ok(new_id) => {
-                        self.set_status(format!(
-                            "forked {} → {}",
-                            short_id(&id),
-                            short_id(&new_id),
-                        ));
-                        self.refresh_sessions().await;
-                        // Mirror the new-session path: pre-insert an empty PTY
-                        // parser so the transcript bootstrap short-circuits and
-                        // the live subscription isn't raced into a double banner.
-                        if !self.histories.contains_key(&new_id) {
-                            self.histories
-                                .insert(new_id.clone(), crate::pty_render::ItemHistory::new());
-                        }
-                        self.select_session(new_id);
-                        self.sync_active_window_selection();
-                        self.focus = PaneFocus::View;
-                    }
-                    Err(e) => self.set_status(format!("fork failed: {e}")),
-                }
-            }
-            OpenForkCrossHarness => {
-                let Some(id) = self.selected_id() else {
-                    self.set_status("fork: no session selected".to_string());
                     return;
                 };
                 if self.harnesses.is_empty() {
@@ -8565,10 +8525,12 @@ impl App {
                     .map(|h| h.name.as_str())
                     .collect();
                 let hint = names.join("|");
+                let input = source.harness;
+                let cursor = input.chars().count();
                 self.minibuffer = Some(Minibuffer {
                     prompt: format!("Fork → [{hint}] (Tab completes): "),
-                    input: String::new(),
-                    cursor: 0,
+                    input,
+                    cursor,
                     intent: MinibufferIntent::ForkSessionHarness {
                         source_session_id: id,
                     },
@@ -24670,6 +24632,32 @@ mod tests {
         let (x, y) = click(&app, KeyAction::Quit);
         app.handle_left_click(x, y).await;
         assert!(app.should_quit);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fork_picker_defaults_to_source_harness_without_prompt_stage() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.harnesses = vec![agentd_protocol::HarnessInfo {
+            name: "shell".to_string(),
+            available: true,
+            detail: None,
+            binary: None,
+            description: None,
+            capabilities: Default::default(),
+        }];
+
+        app.run_action(KeyAction::OpenFork).await;
+
+        let minibuffer = app.minibuffer.as_ref().expect("fork harness picker");
+        assert!(matches!(
+            &minibuffer.intent,
+            MinibufferIntent::ForkSessionHarness { source_session_id }
+                if source_session_id == "s1"
+        ));
+        assert_eq!(minibuffer.input, "shell");
+        assert_eq!(minibuffer.cursor, "shell".chars().count());
+        assert!(minibuffer.prompt.starts_with("Fork → [shell]"));
         server.abort();
     }
 

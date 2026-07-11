@@ -1,11 +1,10 @@
 # 0078-forks-carry-lineage-branch-rail-and-merge
 
 Status: accepted
-Date: 2026-07-09
+Date: 2026-07-10
 Area: ux
-Scope: A single, unified fork action — instant same-harness by default,
-explicit cross-harness on request — whose result is always lineage-tracked
-and mergeable back into its parent.
+Scope: A single harness-picker fork action whose same-harness default requires
+no initial prompt and whose result is always lineage-tracked and mergeable.
 
 ## Decision
 
@@ -15,17 +14,11 @@ normal top-level sibling session and always records durable lineage
 time — there is no separate gate that only tracks lineage for some forks and
 not others.
 
-Forking has two entry points, distinguished only by how the target harness is
-chosen, never by whether lineage is tracked:
-
-- **Primary (instant, same-harness).** No prompt of any kind. The session is
-  forked immediately using its own harness, the new session is selected, and
-  keyboard focus lands directly in its live input — continuing work reads the
-  same as jumping into any other session.
-- **Secondary (explicit, cross-harness).** A harness picker lets the user
-  target a different harness than the source. Once a harness is chosen (or
-  the default accepted), it lands the same way as the primary path — no
-  forced prompt, focus moves straight to the new session.
+Forking has one entry point. Its harness picker is pre-filled with the source
+session's harness, so Enter accepts a same-harness fork while completion or an
+edit selects another harness. Harness selection submits the fork immediately:
+there is no second initial-prompt question, including for the same-harness
+default. The new session is selected and focus moves to its live input.
 
 Merge records a durable result-or-discard outcome on the fork and then
 archives it. Taking a result injects a compact transcript rendering into the
@@ -41,10 +34,9 @@ tracked) forced the user to predict, before acting, whether they'd want the
 branch rail and merge menu later — and picking wrong meant losing lineage
 retroactively. Tracking lineage unconditionally removes that up-front
 decision: every fork, however it was created, is available for the branch
-rail, fork log, and merge later. The two-tier keybinding still exists because
-same-harness vs. cross-harness is a real fork-time decision (native context
-fidelity is only possible within one harness) — but it no longer decides
-whether the daemon remembers where the session came from.
+rail, fork log, and merge later. Harness choice remains explicit because
+same-harness native context fidelity differs from portable cross-harness
+transcript seeding, but it no longer requires separate keybindings or flows.
 
 ## Consequences
 

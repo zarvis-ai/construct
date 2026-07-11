@@ -15,22 +15,11 @@ pub enum KeyAction {
     OpenNewSession,
     OpenDeleteConfirm,
     OpenRename,
-    /// Fork the selected session instantly, using its own harness — no
-    /// minibuffer prompt at all. The new sibling session is selected and
-    /// keyboard focus lands directly in its live input, like continuing any
-    /// normal session. Every fork carries lineage (`forked_from`), so the
-    /// branch rail and fork log apply uniformly regardless of which fork
-    /// path created it. Bound to `C-x f` (emacs) / `f` (vim) — distinct from
-    /// "new session" (`C-x C-f` / `n`) and from the explicit cross-harness
-    /// picker (`OpenForkCrossHarness`).
+    /// Open the harness picker for a fork, pre-filled with the selected
+    /// session's current harness. Enter accepts the same-harness default;
+    /// editing or completion selects a different harness. No separate initial
+    /// prompt is required. Bound to `C-x f` (emacs) / `f` (vim).
     OpenFork,
-    /// Fork the selected session into a different harness, via the harness
-    /// picker (`"Fork → [...] (Tab completes): "`). The explicit,
-    /// cross-harness counterpart to `OpenFork`'s instant same-harness path;
-    /// lands the same way once a harness is chosen — no forced prompt,
-    /// focus moves straight to the new session. Bound to `C-x F` (emacs) /
-    /// `O` (vim).
-    OpenForkCrossHarness,
     /// Toggle the sidebar lineage section's (spec 0081) keyboard focus
     /// from anywhere. Within the list pane, bare `Tab` also switches
     /// sessions⇄lineage (an `on_key` intercept, not a keymap binding, so
@@ -331,12 +320,8 @@ fn emacs() -> Keymap {
         // Refresh moved to the command palette (M-x refresh) — it's rarely
         // needed since the daemon pushes state changes automatically.
         (Chord(vec![ctrl('x'), ch('r')]), OpenRename),
-        // `C-x f` forks the selected session instantly, same harness, no
-        // prompt (distinct from `C-x C-f`, which creates a fresh session).
+        // Unified fork picker; Enter accepts the source harness default.
         (Chord(vec![ctrl('x'), ch('f')]), OpenFork),
-        // `C-x F` is the explicit cross-harness fork (harness picker),
-        // mirroring the `C-x A` → ToggleAutomode shifted-letter pattern.
-        (Chord(vec![ctrl('x'), shift('F')]), OpenForkCrossHarness),
         (Chord(vec![ctrl('x'), ch('m')]), OpenMerge),
         // Toggle the sidebar lineage section's keyboard focus. Bare `Tab`
         // stays unbound in the keymap (the list pane's sessions⇄lineage
@@ -416,11 +401,8 @@ fn vim() -> Keymap {
         (Chord(vec![ctrl('c')]), Interrupt),
         // `r` opens the rename minibuffer; refresh moved to M-x refresh.
         (Chord(vec![ch('r')]), OpenRename),
-        // `f` forks the selected session instantly, same harness, no
-        // prompt. `O` is repurposed as the explicit cross-harness picker
-        // (it used to be a redundant alias of bare `f`).
+        // Unified fork picker; uppercase `O` is intentionally unbound.
         (Chord(vec![ch('f')]), OpenFork),
-        (Chord(vec![shift('O')]), OpenForkCrossHarness),
         (Chord(vec![ch('m')]), OpenMerge),
         // Shared with the emacs profile — see its binding for the rationale.
         (
@@ -811,8 +793,11 @@ mod tests {
         assert_action(&km, vec![ch('g'), ch('d')], KeyAction::OpenDiff);
         assert_action(&km, vec![ch('o')], KeyAction::OpenNewSession);
         assert_action(&km, vec![ch('n')], KeyAction::OpenNewSession);
-        assert_action(&km, vec![shift('O')], KeyAction::OpenForkCrossHarness);
         assert_action(&km, vec![ch('f')], KeyAction::OpenFork);
+        assert!(matches!(
+            resolve(&km, vec![shift('O')]),
+            KeymapResult::Unhandled
+        ));
         assert_action(&km, vec![ch('m')], KeyAction::OpenMerge);
         assert_action(&km, vec![shift('J')], KeyAction::MoveSelectedDown);
         assert_action(&km, vec![shift('K')], KeyAction::MoveSelectedUp);
@@ -826,6 +811,17 @@ mod tests {
         assert_action(&km, vec![ctrl('u')], KeyAction::ScrollHalfPageUp);
         assert_action(&km, vec![ctrl('e')], KeyAction::ScrollDown);
         assert_action(&km, vec![ctrl('y')], KeyAction::ScrollUp);
+    }
+
+    #[test]
+    fn shifted_fork_shortcut_is_removed() {
+        for profile in [Profile::Emacs, Profile::Vim] {
+            let km = default_for(profile);
+            assert!(matches!(
+                resolve(&km, vec![ctrl('x'), shift('F')]),
+                KeymapResult::Unhandled
+            ));
+        }
     }
 
     #[test]
