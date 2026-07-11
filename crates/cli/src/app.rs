@@ -8884,7 +8884,11 @@ impl App {
                     .map(|h| h.name.as_str())
                     .collect();
                 let hint = names.join("|");
-                let input = source.harness;
+                let input = if source.harness == "antigravity" {
+                    "agy".to_string()
+                } else {
+                    source.harness
+                };
                 let cursor = input.chars().count();
                 self.minibuffer = Some(Minibuffer {
                     prompt: format!("Fork → [{hint}] (Tab completes): "),

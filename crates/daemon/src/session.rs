@@ -474,7 +474,7 @@ struct PtyInputCapture {
 }
 
 fn should_record_pty_user_message(harness: &str) -> bool {
-    matches!(harness, "claude" | "antigravity" | "grok")
+    matches!(harness, "claude" | "antigravity" | "agy" | "grok")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,7 +491,7 @@ fn program_execution_delivery(
         ProgramExecutionDelivery::AdapterInput
     } else if matches!(
         summary.harness.as_str(),
-        "claude" | "codex" | "antigravity" | "grok"
+        "claude" | "codex" | "antigravity" | "agy" | "grok"
     ) {
         ProgramExecutionDelivery::ExternalPtyTypedSubmit
     } else {
@@ -1805,7 +1805,7 @@ impl SessionManager {
             "shell" => crate::availability::Availability::ready("ready"),
             "claude" => probe_wrapper_cli("CONSTRUCT_CLAUDE_CMD", "CONSTRUCT_CLAUDE_BIN", "claude"),
             "codex" => probe_wrapper_cli("CONSTRUCT_CODEX_CMD", "CONSTRUCT_CODEX_BIN", "codex"),
-            "antigravity" => probe_wrapper_cli(
+            "antigravity" | "agy" => probe_wrapper_cli(
                 "CONSTRUCT_ANTIGRAVITY_CMD",
                 "CONSTRUCT_ANTIGRAVITY_BIN",
                 "agy",
@@ -3745,7 +3745,7 @@ fn harness_uses_quiescence(s: &SessionSummary) -> bool {
     s.has_pty
         && matches!(
             s.harness.as_str(),
-            "claude" | "codex" | "antigravity" | "grok"
+            "claude" | "codex" | "antigravity" | "agy" | "grok"
         )
 }
 
@@ -5517,7 +5517,7 @@ mod tests {
     fn quiescence_targets_tui_llm_harnesses() {
         let mut s = placement_summary("q", 0, None, construct_protocol::SessionKind::User);
         s.has_pty = true;
-        for h in ["claude", "codex", "antigravity", "grok"] {
+        for h in ["claude", "codex", "antigravity", "agy", "grok"] {
             s.harness = h.into();
             assert!(harness_uses_quiescence(&s), "{h} should use quiescence");
         }

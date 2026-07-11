@@ -1601,11 +1601,16 @@ impl App {
             .clone()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| short_id(&session.id).to_string());
+        let harness = if session.harness == "antigravity" {
+            "agy"
+        } else {
+            &session.harness
+        };
         ProgramSmartClipCandidate {
             group: ProgramSmartClipGroup::Session,
             clip: format!("@{{session:{}}}", session.id),
             label: title,
-            detail: format!("{} · {}", session.harness, session.state.label()),
+            detail: format!("{harness} · {}", session.state.label()),
         }
     }
 

@@ -253,7 +253,7 @@ impl SessionManager {
         // prompt, so letting the adapter own that record avoids counting it
         // twice in the lineage view.
         // Auto-title is triggered inside handle_event for any User message.
-        if harness != "antigravity" {
+        if harness != "antigravity" && harness != "agy" {
             if let Some(p) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
                 self.handle_event(
                     &entry,

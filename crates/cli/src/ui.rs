@@ -9437,12 +9437,17 @@ pub fn is_headless(s: &construct_protocol::SessionSummary) -> bool {
 }
 
 fn harness_label(s: &construct_protocol::SessionSummary) -> String {
-    if s.native_subagent.is_some() {
-        format!("(native) {}", s.harness)
-    } else if is_headless(s) {
-        format!("(headless) {}", s.harness)
+    let harness = if s.harness == "antigravity" {
+        "agy"
     } else {
-        s.harness.clone()
+        &s.harness
+    };
+    if s.native_subagent.is_some() {
+        format!("(native) {harness}")
+    } else if is_headless(s) {
+        format!("(headless) {harness}")
+    } else {
+        harness.to_string()
     }
 }
 
@@ -14206,7 +14211,10 @@ pub(crate) fn program_smart_clip_label<'a>(
     app: Option<&App>,
     raw_clip: &'a str,
 ) -> (&'a str, String) {
-    let (kind, id) = program_smart_clip_target(raw_clip);
+    let (kind, mut id) = program_smart_clip_target(raw_clip);
+    if kind == "harness" && id == "antigravity" {
+        id = "agy";
+    }
     let label = match kind {
         "session" => match app {
             // A live App can distinguish "resolves to a session" from

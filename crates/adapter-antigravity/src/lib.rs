@@ -64,7 +64,7 @@ use tokio::process::Command;
 
 pub async fn run() -> anyhow::Result<()> {
     let metadata = InitializeResult {
-        name: "antigravity".into(),
+        name: "agy".into(),
         version: env!("CARGO_PKG_VERSION").into(),
         capabilities: Capabilities {
             supports_input: true,

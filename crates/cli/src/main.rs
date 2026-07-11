@@ -291,6 +291,8 @@ enum AdapterCommand {
     #[command(hide = true)]
     Antigravity,
     #[command(hide = true)]
+    Agy,
+    #[command(hide = true)]
     Grok,
     #[command(hide = true)]
     Smith {
@@ -664,7 +666,7 @@ async fn main() -> Result<()> {
                 construct_adapter_codex::run().await?;
                 Ok(())
             }
-            AdapterCommand::Antigravity => {
+            AdapterCommand::Antigravity | AdapterCommand::Agy => {
                 construct_adapter_antigravity::run().await?;
                 Ok(())
             }

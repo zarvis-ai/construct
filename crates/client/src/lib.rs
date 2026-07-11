@@ -206,8 +206,14 @@ impl Client {
             .await
     }
     pub async fn harnesses(&self) -> Result<Vec<HarnessInfo>> {
-        self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null)
-            .await
+        let mut list: Vec<HarnessInfo> = self.request(ipc_method::HARNESS_LIST, &serde_json::Value::Null)
+            .await?;
+        for h in &mut list {
+            if h.name == "antigravity" {
+                h.name = "agy".to_string();
+            }
+        }
+        Ok(list)
     }
     pub async fn smith_auth_status(&self) -> Result<SmithAuthStatusResult> {
         self.request(ipc_method::SMITH_AUTH_STATUS, &serde_json::Value::Null)
@@ -1723,7 +1729,7 @@ mod fork_lineage_tests {
     /// Antigravity has no native fork primitive, so it keeps the seed.
     #[tokio::test]
     async fn codex_and_grok_forks_skip_the_seed_antigravity_keeps_it() {
-        for (harness, expect_seed) in [("codex", false), ("grok", false), ("antigravity", true)] {
+        for (harness, expect_seed) in [("codex", false), ("grok", false), ("antigravity", true), ("agy", true)] {
             let (sock, captured, _server) = fork_capture_daemon(harness, true).await;
             let client = Client::connect(&sock).await.expect("connect");
             client

@@ -57,9 +57,9 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # args        = ["__adapter", "codex"]
 # description = "OpenAI Codex (wraps the `codex` CLI)"
 
-# [adapters.antigravity]
+# [adapters.agy]
 # binary      = "construct"
-# args        = ["__adapter", "antigravity"]
+# args        = ["__adapter", "agy"]
 # description = "Google Antigravity (wraps the `agy` CLI)"
 
 # [adapters.smith]
@@ -448,9 +448,9 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         description: "OpenAI Codex (wraps the `codex` CLI)",
     },
     BuiltinAdapter {
-        name: "antigravity",
+        name: "agy",
         binary: "construct",
-        args: &["__adapter", "antigravity"],
+        args: &["__adapter", "agy"],
         description: "Google Antigravity (wraps the `agy` CLI)",
     },
     BuiltinAdapter {

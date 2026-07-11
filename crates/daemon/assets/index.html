@@ -4486,7 +4486,10 @@ function programClipTarget(body) {
   const first = (body.trim().split(/\s+/)[0]) || body;
   const colon = first.indexOf(":");
   const kind = colon === -1 ? "clip" : first.slice(0, colon);
-  const id = colon === -1 ? first : first.slice(colon + 1);
+  let id = colon === -1 ? first : first.slice(colon + 1);
+  if (kind === "harness" && id === "antigravity") {
+    id = "agy";
+  }
   return [kind, id];
 }
 
@@ -4499,7 +4502,8 @@ function programClipLabel(body) {
     const s = state.sessions.find((x) => x.id === id);
     if (s) {
       const title = (s.title && s.title.trim()) ? s.title : id.slice(0, 6);
-      return `${sessionStatusGlyph(s)} ${title} · ${s.harness || "session"}`;
+      const harness = s.harness === "antigravity" ? "agy" : (s.harness || "session");
+      return `${sessionStatusGlyph(s)} ${title} · ${harness}`;
     }
     return `⊘ ${id.slice(0, 6)} · missing`;
   }
@@ -6139,11 +6143,12 @@ function programUserSessions() {
 }
 function programSessionClipCandidate(s) {
   const title = (s.title && s.title.trim()) ? s.title : s.id.slice(0, 6);
+  const harness = s.harness === "antigravity" ? "agy" : (s.harness || "");
   return {
     kind: "session",
     clip: `@{session:${s.id}}`,
     label: title,
-    detail: `${s.harness || ""} · ${sessionStatusLabel(s)}`,
+    detail: `${harness} · ${sessionStatusLabel(s)}`,
   };
 }
 function programSessionRecency(s) {
@@ -6159,12 +6164,15 @@ function programSessionCandidates() {
     .map(programSessionClipCandidate);
 }
 function programHarnessCandidates() {
-  return state.harnesses.map((h) => ({
-    kind: "harness",
-    clip: `@{harness:${h.name}}`,
-    label: h.name,
-    detail: h.available === false ? "unavailable" : "",
-  }));
+  return state.harnesses.map((h) => {
+    const name = h.name === "antigravity" ? "agy" : h.name;
+    return {
+      kind: "harness",
+      clip: `@{harness:${name}}`,
+      label: name,
+      detail: h.available === false ? "unavailable" : "",
+    };
+  });
 }
 
 // Top relevance section: up to 5 clips across all types, ranked by the
@@ -9996,6 +10004,7 @@ function hasSemanticChatView(s) {
     harness === "codex" ||
     harness === "claude" ||
     harness === "antigravity" ||
+    harness === "agy" ||
     harness === "grok"
   );
 }
@@ -10011,7 +10020,8 @@ function isStructuredToolSession(s) {
 }
 
 function sessionHarnessLabel(s) {
-  const harness = (s && s.harness) || "";
+  let harness = (s && s.harness) || "";
+  if (harness === "antigravity") harness = "agy";
   if (s && s.native_subagent && harness) return `(native) ${harness}`;
   return isHeadlessSession(s) && harness ? `(headless) ${harness}` : harness;
 }
