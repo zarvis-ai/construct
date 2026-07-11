@@ -1,10 +1,10 @@
 # construct
 
-**Command a fleet of agents, designed for hackers cracking the matrix.**
+**A terminal-native agentic development environment.**
 
-Create Codex, Claude Code, Antigravity, and smith sessions all in one place. Or
-let your agent coordinate them in a terminal crafted for hardcore hackers like
-you. Remote control from your phone when you're in motion.
+Create Codex, Claude Code, Antigravity, Grok, and smith sessions all in one
+place — or let an agent coordinate them from a focused TUI. Remote control from
+your phone when you're in motion.
 
 ![construct lineage and program run](https://raw.githubusercontent.com/construct-worlds/construct/52849f56c902397d6729ec286293064c5b15bcfe/demos/lineage-program-run.gif)
 
@@ -105,11 +105,11 @@ construct daemon restart
 construct daemon restart --sessions
 ```
 
-### 4. Start crack the matrix
+### 4. Start building
 
-Happy hacking. Chase the dream idea from your terminal: ask Codex, Claude Code,
-Antigravity, and [smith](docs/smith.md) to dive into the hard parts, then keep
-steering from your phone when you're in motion.
+Happy hacking. Chase the idea from your terminal: ask Codex, Claude Code,
+Antigravity, Grok, and [smith](docs/smith.md) to dive into the hard parts, then
+keep steering from your phone when you're in motion.
 
 ## Upgrading
 
