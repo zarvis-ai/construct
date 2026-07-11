@@ -736,7 +736,10 @@ impl App {
                         let title = fork.title.as_deref().unwrap_or("fork");
                         if let Err(e) = self
                             .client
-                            .send_input(&parent, format!("⑂ fork result ({title}): {summary}"))
+                            .send_input(
+                                &parent,
+                                fork_result_input(title, &session_id, &summary),
+                            )
                             .await
                         {
                             self.set_status(format!("merge input failed: {e}"));
@@ -765,6 +768,27 @@ impl App {
             agentd_protocol::ForkMergeMode::Discard => "discarded",
         };
         self.set_status(format!("fork {verb}"));
+    }
+}
+
+/// The parent receives a compact fork result as ordinary input, plus a stable
+/// session reference it can use to request or inspect the full fork history.
+fn fork_result_input(title: &str, session_id: &str, summary: &str) -> String {
+    format!(
+        "⑂ fork result ({title}; fork session: {session_id}): {summary}"
+    )
+}
+
+#[cfg(test)]
+mod fork_result_tests {
+    use super::fork_result_input;
+
+    #[test]
+    fn fork_result_includes_a_stable_session_reference() {
+        assert_eq!(
+            fork_result_input("investigate cache", "s_fork123", "cache is cold"),
+            "⑂ fork result (investigate cache; fork session: s_fork123): cache is cold"
+        );
     }
 }
 

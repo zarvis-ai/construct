@@ -21,9 +21,11 @@ there is no second initial-prompt question, including for the same-harness
 default. The new session is selected and focus moves to its live input.
 
 Merge records a durable result-or-discard outcome on the fork and then
-archives it. Taking a result injects a compact transcript rendering into the
-parent through its ordinary input path, so it is a real parent
-transcript/PTY message, not a side channel.
+archives it. Taking a result injects a compact transcript rendering and the
+fork's stable session ID into the parent through its ordinary input path, so
+it is a real parent transcript/PTY message, not a side channel. The reference
+keeps the full fork history discoverable without copying that history into the
+parent's context.
 
 ## Reason
 
