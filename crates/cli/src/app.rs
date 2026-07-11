@@ -3336,12 +3336,33 @@ async fn run_with_socket_initial_selection(
         EnableBracketedPaste
     )
     .context("enter alternate screen / enable mouse")?;
+    // Progressive enhancement: ask the terminal to disambiguate escape
+    // codes (kitty keyboard protocol) so modified keys that legacy
+    // encodings fold onto control characters — Ctrl+digit pane focus
+    // (`C-1`..`C-5`) chief among them — actually arrive as distinct key
+    // events. Terminals without support answer the query negatively and
+    // keep the legacy encoding; the flag is popped at teardown.
+    let keyboard_enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     let result = run_loop(&mut terminal, &mut app, socket).await;
 
     // Teardown — best effort.
+    if keyboard_enhanced {
+        let _ = execute!(
+            terminal.backend_mut(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
@@ -5423,7 +5444,8 @@ impl App {
     /// ordering that `C-x o` cycles through: index 0 is the session list,
     /// index `k >= 1` is the `(k - 1)`th split window. Returns `false`
     /// (a no-op) when the requested pane doesn't exist — e.g. `C-5` with
-    /// only two split windows open. Bound to `C-2`..`C-5` (so `C-2`
+    /// only two split windows open. Bound to `C-1`..`C-5` (`C-1` = the
+    /// session list, so `C-2`
     /// focuses the first split window).
     fn focus_pane_by_index(&mut self, index: usize) -> bool {
         if index == 0 {
@@ -8223,11 +8245,15 @@ impl App {
         // otherwise we fall through and the key keeps its normal meaning
         // (PTY input / list reorder / unbound).
         if self.chord_state.is_empty() {
-            // `C-2`..`C-5` focus a pane directly (pane 1 = list, pane 2 = the
-            // first split window, …). Terminals that don't deliver Ctrl+digit
-            // (some legacy ones fold it onto Ctrl+@) simply never reach here.
+            // `C-1`..`C-5` focus a pane directly: `C-1` jumps to the
+            // session list from anywhere (including any split window),
+            // `C-2`..`C-5` to split windows 1..4. Terminals that don't
+            // deliver Ctrl+digit (legacy encodings fold it onto control
+            // chars) never reach here — which is why startup requests the
+            // kitty keyboard protocol's disambiguation when the terminal
+            // supports it.
             if key.modifiers == KeyModifiers::CONTROL {
-                if let KeyCode::Char(c @ '2'..='5') = key.code {
+                if let KeyCode::Char(c @ '1'..='5') = key.code {
                     let pane_index = c as usize - '1' as usize; // '2' -> 1 … '5' -> 4
                     if self.focus_pane_by_index(pane_index) {
                         self.chord_label.clear();
@@ -22145,6 +22171,23 @@ mod tests {
         // Pane 1 (index 0) is the session list.
         assert!(app.focus_pane_by_index(0));
         assert_eq!(app.focus, PaneFocus::List);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ctrl_1_keystroke_jumps_focus_to_the_session_list() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.main_windows = three_window_tree();
+        app.focus = PaneFocus::View;
+        app.active_window_id = 2;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL))
+            .await;
+        assert_eq!(
+            app.focus,
+            PaneFocus::List,
+            "C-1 jumps straight to the session list from any split window"
+        );
         server.abort();
     }
 
