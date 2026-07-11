@@ -1957,7 +1957,7 @@ fn render_lineage_section(
         return;
     }
     app.layout.lineage_area = Some(rect);
-    let focused = app.lineage_focused;
+    let focused = app.lineage_focused && app.focus == PaneFocus::List;
 
     // Header bar: a full-width `─` rule (the operator panel's visual
     // language), label at the left, mode toggle + collapse button at the

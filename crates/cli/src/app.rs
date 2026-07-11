@@ -3977,7 +3977,7 @@ async fn run_loop(
                     app.harnesses = list;
                 }
             }
-            _ = lineage_refresh.tick(), if app.connected && app.lineage_focused => {
+            _ = lineage_refresh.tick(), if app.connected && app.lineage_focused && app.focus == PaneFocus::List => {
                 app.refresh_sessions().await;
             }
         }
@@ -7002,19 +7002,6 @@ impl App {
                 }
             }
         }
-        // A focused lineage section (spec 0081) loses keyboard focus on any
-        // click outside it — the same "blur on click away" principle as the
-        // title-rename commit just above, and for the same reason: this must
-        // run before `forward_mouse_to_child` below, since a click on a
-        // mouse-grabbing pane is forwarded and never reaches
-        // `handle_left_click`. A side effect only — the click still proceeds
-        // normally afterward.
-        if matches!(ev.kind, MouseEventKind::Down(_))
-            && self.lineage_focused
-            && !self.is_over_lineage_section(ev.column, ev.row)
-        {
-            self.lineage_focused = false;
-        }
         // If the cursor is over a pane whose child has grabbed the mouse
         // (e.g. Claude Code in fullscreen), forward the event into that PTY and
         // stop — construct becomes a transparent mouse pipe for the pane, so
@@ -8135,7 +8122,10 @@ impl App {
         // navigation/merge/discard/jump keys while focused; anything else
         // clears focus and falls through to ordinary routing on the SAME
         // key, exactly like `/configure` above.
-        if self.lineage_focused && self.handle_lineage_focus_key(key).await {
+        if self.focus == PaneFocus::List
+            && self.lineage_focused
+            && self.handle_lineage_focus_key(key).await
+        {
             return;
         }
         if self.tasks_popup.is_some() {
@@ -27867,7 +27857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clicking_outside_the_section_clears_its_focus() {
+    async fn clicking_outside_the_sidebar_dims_the_section_but_keeps_the_memory() {
         use crossterm::event::MouseButton;
         let (mut app, _dir, server) = test_app_with_lineage().await;
         app.select_session("s1".to_string());
@@ -27875,6 +27865,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
         term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
         app.lineage_focused = true;
+        app.focus = PaneFocus::List;
         let view = app.layout.view_area.expect("view area");
         app.on_mouse(crossterm::event::MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -27883,9 +27874,25 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         })
         .await;
+        app.on_mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: view.x + view.width / 2,
+            row: view.y + view.height / 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        })
+        .await;
+        assert_ne!(app.focus, PaneFocus::List, "the pane click took focus");
+        assert!(
+            app.lineage_focused,
+            "the sub-focus memory survives, dormant, for the next C-x l"
+        );
+
+        // Clicking the ROWS region of the sidebar settles sub-focus there.
+        let rows = app.layout.list_items_area.expect("rows area");
+        app.handle_left_click(rows.x + 2, rows.y).await;
         assert!(
             !app.lineage_focused,
-            "a click away blurs the section, before any child-forwarding path"
+            "a rows click hands the sidebar's sub-focus back to the rows"
         );
         server.abort();
     }

@@ -225,7 +225,10 @@ impl App {
         }
         // A click anywhere inside the list pane focuses it, even on the
         // border or empty space past the last item — matching the
-        // intuitive "click the pane to focus it" UX.
+        // intuitive "click the pane to focus it" UX. Clicking the rows
+        // region also settles the sidebar's sub-focus back on the rows
+        // (the lineage-section arms above returned before this point).
+        self.lineage_focused = false;
         self.collapse_orchestrator_panel_on_focus_change();
         // Collapsed list pane: any click in the pane (border or
         // body) just re-expands. Don't try to interpret as a row /

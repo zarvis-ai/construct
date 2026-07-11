@@ -56,6 +56,13 @@ Keyboard focus:
   ordinary routing with the same keystroke.
 - Focusing the section counts as sidebar (list-pane) focus; jumping into a
   session moves focus to the view pane.
+- The sidebar REMEMBERS its sub-focus: leaving it (jumping into a session,
+  cycling or clicking to a pane, a `C-x` chord) keeps the rows-vs-lineage
+  choice as dormant memory, and returning (`C-x l`, `C-1`, `C-x o`
+  cycling) lands back in the region that was focused last. While dormant,
+  the section owns no keys and shows no focus highlight. Only an explicit
+  hand-off inside the sidebar — `Esc`, a bare unhandled key, `Tab`,
+  clicking the rows — resets the memory to the session rows.
 
 Mouse: every cell a session owns — its box, lane bar, branch glyph, or
 turn-info text — is a hover/click target: hovering brightens that session

@@ -105,7 +105,7 @@ impl App {
         // dialog-opening actions do (`open_configure_popup`, ...).
         self.chord_state = ChordState::default();
         self.chord_label.clear();
-        if self.lineage_focused {
+        if self.lineage_focused && self.focus == PaneFocus::List {
             self.lineage_focused = false;
             return;
         }
@@ -217,10 +217,12 @@ impl App {
             self.lineage_focused = false;
             return;
         };
-        self.lineage_focused = false;
         let Some(target_id) = self.lineage_selected_session_id(&session_id) else {
             return;
         };
+        // `lineage_focused` deliberately stays set: pane focus moves to the
+        // view (making it dormant), and returning to the sidebar (`C-x l`,
+        // `C-x o`, `C-1`) lands back in the section you left.
         self.jump_to_lineage_session(&target_id);
     }
 
@@ -347,7 +349,13 @@ impl App {
                 }
             }
             _ => {
-                self.lineage_focused = false;
+                // Mid-chord keys (`C-x o`, `C-x b`, ...) fall through intact
+                // so the chord completes — the section's sub-focus survives
+                // as the sidebar's memory. A bare unhandled key hands
+                // sub-focus back to the session rows.
+                if self.chord_state.is_empty() {
+                    self.lineage_focused = false;
+                }
                 false
             }
         }
@@ -606,7 +614,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enter_jumps_into_the_selected_session_and_clears_focus() {
+    async fn enter_jumps_into_the_selected_session_and_keeps_the_memory() {
         let fork = fork_of(summary("fork"), "root");
         let (mut app, _dir, _server) = test_app_with_sessions(vec![summary("root"), fork]).await;
         app.select_session("root".to_string());
@@ -616,9 +624,59 @@ mod tests {
             .await;
         app.handle_lineage_focus_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await;
-        assert!(!app.lineage_focused);
         assert_eq!(app.selected_id().as_deref(), Some("fork"));
         assert_eq!(app.focus, PaneFocus::View, "jumping in goes to work there");
+        // The sub-focus survives as dormant memory: returning to the
+        // sidebar lands back in the lineage section.
+        assert!(app.lineage_focused, "memory retained while dormant");
+        assert!(
+            !app.session_rows_focused(),
+            "dormant memory must not read as sidebar focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn returning_to_the_sidebar_restores_its_sub_focus() {
+        let fork = fork_of(summary("fork"), "root");
+        let (mut app, _dir, _server) = test_app_with_sessions(vec![summary("root"), fork]).await;
+        app.select_session("root".to_string());
+        app.toggle_lineage_focus();
+        assert!(app.lineage_focused);
+        let selected_before = app.lineage_selected;
+
+        // `C-x o` moves pane focus away; the chord's own keys must not
+        // erase the sidebar's memory on their way through the handler.
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .await;
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE))
+            .await;
+        assert_ne!(app.focus, PaneFocus::List, "focus cycled away");
+        assert!(app.lineage_focused, "memory survives leaving the sidebar");
+
+        // While dormant, the section owns no keys.
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.lineage_selected, selected_before,
+            "a dormant section must not intercept keys meant for the view"
+        );
+
+        // Jumping back to the sidebar restores the lineage sub-focus.
+        app.focus_pane_by_index(0);
+        assert_eq!(app.focus, PaneFocus::List);
+        assert!(
+            app.lineage_focused,
+            "C-x l / C-1 land back in the section that was focused last"
+        );
+
+        // Esc hands sub-focus to the rows; leaving and returning now lands
+        // on the rows instead.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        assert!(!app.lineage_focused);
+        app.focus = PaneFocus::View;
+        app.focus_pane_by_index(0);
+        assert!(app.session_rows_focused(), "rows memory restores as rows");
     }
 
     #[tokio::test]
