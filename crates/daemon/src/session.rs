@@ -6303,6 +6303,12 @@ mod tests {
             )
             .await;
         let projected_id = native_subagent_session_id("owner", "child");
+        // Terminal handling archives native mirrors immediately. This test
+        // specifically covers a finished mirror that is still visible, so
+        // model that state explicitly before replaying discovery output.
+        let projected = manager.get_entry(&projected_id).await.expect("child");
+        projected.summary.write().await.archived = false;
+        projected.archived.store(false, Ordering::SeqCst);
 
         // Replayed lifecycle discovery re-announces the child as Running.
         manager
@@ -9437,6 +9443,7 @@ done
                     title: None,
                     state: SessionState::Errored,
                     event: None,
+                    seq: None,
                 },
             )
             .await;

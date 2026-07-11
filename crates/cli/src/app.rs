@@ -1090,6 +1090,7 @@ pub struct App {
     pub theme_name: crate::theme::ThemeName,
     terminal_background_is_light: Option<bool>,
     pub help_visible: bool,
+    help_dismiss_mouse_button: Option<crossterm::event::MouseButton>,
     pub profile: Profile,
     pub keymap: Keymap,
     pub vim_mode: VimMode,
@@ -3129,6 +3130,7 @@ async fn run_with_socket_initial_selection(
         theme_name: theme_config.active_name(None),
         terminal_background_is_light: None,
         help_visible: false,
+        help_dismiss_mouse_button: None,
         profile,
         keymap,
         vim_mode: VimMode::Normal,
@@ -6930,6 +6932,25 @@ impl App {
             self.mouse_moved_at = Some(Instant::now());
         }
         self.mouse_pos = Some(next_pos);
+        if self.help_dismiss_mouse_button.is_some_and(
+            |button| matches!(ev.kind, MouseEventKind::Up(released) if released == button),
+        ) {
+            self.help_dismiss_mouse_button = None;
+            return;
+        }
+        // Help is painted above every interactive surface, so a click must
+        // dismiss it before program hit-testing or a mouse-grabbing child PTY
+        // can consume the event. The matching button-up is swallowed too, so
+        // the dismissing click cannot activate a control behind the dialog.
+        // Motion and scroll events leave it open.
+        if self.help_visible {
+            let MouseEventKind::Down(button) = ev.kind else {
+                return;
+            };
+            self.help_visible = false;
+            self.help_dismiss_mouse_button = Some(button);
+            return;
+        }
         // The `/configure` dialog (spec 0069) is a topmost modal: a
         // left-click is tested against the tab headers first (dialog stays
         // open); any other left-click closes it — like clicking away from
@@ -8080,6 +8101,13 @@ impl App {
             }
             return;
         }
+        // Help is the topmost keyboard surface. Check it before the program,
+        // minibuffer, and focused child PTY routing so "any key to close"
+        // remains true regardless of which underlying surface has focus.
+        if self.help_visible {
+            self.help_visible = false;
+            return;
+        }
         // An in-progress inline title rename owns every keystroke, same
         // precedence class as the minibuffer/session-picker below — it must
         // come first so a rename started by clicking a pane's name doesn't
@@ -8187,12 +8215,6 @@ impl App {
             self.handle_minibuffer_key(key).await;
             return;
         }
-        if self.help_visible {
-            // Any key closes help.
-            self.help_visible = false;
-            return;
-        }
-
         if self.handle_inline_dynamic_ui_key(key).await {
             return;
         }
@@ -10928,6 +10950,7 @@ mod tests {
             theme_name: crate::theme::ThemeName::Matrix,
             terminal_background_is_light: None,
             help_visible: false,
+            help_dismiss_mouse_button: None,
             profile: Profile::Emacs,
             keymap: keymap::default_for(Profile::Emacs),
             vim_mode: VimMode::Normal,
@@ -25301,12 +25324,29 @@ mod tests {
             app.tutorial.is_some(),
             "the card must not swallow interactions meant for the help modal"
         );
-
-        // And help still closes on any key while the tour is active.
-        app.on_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
-            .await;
-        assert!(!app.help_visible, "any key must still close help");
+        assert!(!app.help_visible, "a click must close help");
         assert!(app.tutorial.is_some(), "closing help leaves the tour alone");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn help_modal_key_closes_before_focused_program_consumes_it() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "draft", 0));
+        app.focus = PaneFocus::View;
+        app.help_visible = true;
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+
+        assert!(!app.help_visible, "any key must close help");
+        assert_eq!(
+            app.program_popup
+                .as_ref()
+                .map(|popup| popup.buffer.as_str()),
+            Some("draft"),
+            "the dismissing key must not leak into the focused program"
+        );
         server.abort();
     }
 
