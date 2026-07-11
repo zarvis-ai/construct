@@ -8163,7 +8163,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   focus + view
     C-x o           other window (list → windows → list)
-    C-x l           toggle session list ⇄ split view (C-1..C-5: direct pane focus)
+    C-x Tab         toggle session list ⇄ split view (C-1..C-5: direct pane focus)
     Shift+arrow     focus the adjacent split window (in a split layout)
     C-x arrow       same — reliable alias where the terminal eats Shift+up/down
     RET (on list)   focus the selected session's view
@@ -8186,7 +8186,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
     C-x d           show diff
     C-x r           rename selected session (clears title on empty submit)
     C-x f           fork selected session (harness picker; same is default)
-    C-x Tab / Tab   focus lineage section (Tab: list pane only)
+    Tab (on list)   focus lineage section
     C-x m           merge the selected fork (take result, or discard)
     C-c C-c         interrupt
 
@@ -8236,7 +8236,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
 
   focus + view
     C-x o / C-w w   other window (list → windows → list)
-    C-x l           toggle session list ⇄ split view (C-1..C-5: direct pane focus)
+    C-x Tab         toggle session list ⇄ split view (C-1..C-5: direct pane focus)
     Shift+arrow     focus adjacent split (C-x arrow is reliable alias)
     C-w h/j/k/l     focus split window left/down/up/right
     i / a / RET     enter INSERT when the selected view is a live terminal
@@ -8258,7 +8258,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
     g d             show diff
     r               rename selected session (clears title on empty submit)
     f               fork selected session (harness picker; same is default)
-    C-x Tab / Tab   focus lineage section (Tab: list pane only)
+    Tab (on list)   focus lineage section
     m               merge the selected fork (take result, or discard)
     C-c             interrupt
 

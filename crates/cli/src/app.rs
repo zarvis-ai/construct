@@ -1372,8 +1372,8 @@ pub struct App {
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
     /// Whether the sidebar's lineage section (spec 0081) currently owns
-    /// keyboard input. Entered via bare `Tab` (with the list pane focused),
-    /// `C-x Tab` (from anywhere), or a click inside the section's body.
+    /// keyboard input. Entered via bare `Tab` (with the list pane focused)
+    /// or a click inside the section's body.
     /// While `true`, `App::on_key` routes navigation/merge/discard/jump keys
     /// to `App::handle_lineage_focus_key` before ordinary dispatch.
     pub lineage_focused: bool,
@@ -8206,7 +8206,7 @@ impl App {
             return;
         }
         // The sidebar's lineage section, keyboard-focused (bare `Tab` from
-        // the list pane, or `C-x Tab` from anywhere — spec 0081): owns
+        // the list pane — spec 0081): owns
         // navigation/merge/discard/jump keys while focused; anything else
         // clears focus and falls through to ordinary routing on the SAME
         // key, exactly like `/configure` above.
@@ -8655,12 +8655,6 @@ impl App {
                 } else {
                     self.set_status("merge: select a fork".into());
                 }
-            }
-            ToggleLineageFocus => {
-                // spec 0081: `C-x Tab` toggles the sidebar lineage section's
-                // keyboard focus from anywhere (bare `Tab` does the same
-                // from within the list pane).
-                self.toggle_lineage_focus();
             }
             OpenRename => match self.selection.clone() {
                 Selection::Session(id) => {
@@ -22294,7 +22288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn c_x_l_toggles_between_the_list_and_the_same_split_pane() {
+    async fn c_x_tab_toggles_between_the_list_and_the_same_split_pane() {
         // The works-in-every-terminal counterpart to C-1: a C-x chord
         // escapes PTY capture and needs no keyboard-protocol support.
         let (mut app, _dir, server) = captured_app().await;
@@ -22304,12 +22298,12 @@ mod tests {
 
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
-        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .await;
         assert_eq!(
             app.focus,
             PaneFocus::List,
-            "C-x l jumps straight to the session list from any split window"
+            "C-x Tab jumps straight to the session list from any split window"
         );
         assert_eq!(
             app.active_window_id, 2,
@@ -22317,15 +22311,15 @@ mod tests {
         );
 
         // Second press returns to the SAME pane — the switch-and-return
-        // loop: C-x l, pick a session, C-x l back.
+        // loop: C-x Tab, pick a session, C-x Tab back.
         app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
             .await;
-        app.on_key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE))
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .await;
         assert_eq!(app.focus, PaneFocus::View);
         assert_eq!(
             app.active_window_id, 2,
-            "C-x l from the list returns to the split pane it came from"
+            "C-x Tab from the list returns to the split pane it came from"
         );
         server.abort();
     }
@@ -28148,7 +28142,7 @@ mod tests {
         assert_ne!(app.focus, PaneFocus::List, "the pane click took focus");
         assert!(
             app.lineage_focused,
-            "the sub-focus memory survives, dormant, for the next C-x l"
+            "the sub-focus memory survives, dormant, for the next list-focus toggle"
         );
 
         // Clicking the ROWS region of the sidebar settles sub-focus there.

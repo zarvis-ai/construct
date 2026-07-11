@@ -14,9 +14,7 @@
 //!   panel (master–detail), and a click on its header collapses it to just
 //!   that header row.
 //! - `Tab`, while the list pane holds focus, moves keyboard focus between
-//!   the session rows and the lineage section; `C-x Tab` toggles the
-//!   section's focus from anywhere (the same chord that used to focus the
-//!   floating preview).
+//!   the session rows and the lineage section.
 
 use super::*;
 use crate::lineage::LineageRow;
@@ -96,13 +94,10 @@ impl App {
         self.focus == PaneFocus::List && !self.lineage_focused
     }
 
-    /// `C-x Tab`: toggle the lineage section's keyboard focus from anywhere —
-    /// the same chord that used to focus the floating preview. A no-op when
-    /// the selected session has no lineage section to focus.
+    /// Test helper for toggling lineage focus; keyboard entry is scoped to
+    /// bare `Tab` in the list pane.
+    #[cfg(test)]
     pub fn toggle_lineage_focus(&mut self) {
-        // The section's own key handler owns subsequent keystrokes directly
-        // (not the chord state machine), so reset it exactly like other
-        // dialog-opening actions do (`open_configure_popup`, ...).
         self.chord_state = ChordState::default();
         self.chord_label.clear();
         if self.lineage_focused && self.focus == PaneFocus::List {
@@ -116,8 +111,8 @@ impl App {
     /// the row selection on the selected session's own node (not the tree's
     /// root), and move pane focus to the list — the section lives in the
     /// sidebar, so focusing it should read as sidebar focus. Shared by the
-    /// `C-x Tab` toggle, the bare-`Tab` sessions⇄lineage switch, and a click
-    /// inside the section's body. Returns `false` (and changes nothing) when
+    /// bare-`Tab` sessions⇄lineage switch and a click inside the section's
+    /// body. Returns `false` (and changes nothing) when
     /// there is no section to focus.
     pub(super) fn activate_lineage_focus(&mut self) -> bool {
         let Some(id) = self.lineage_section_session() else {
@@ -221,7 +216,7 @@ impl App {
             return;
         };
         // `lineage_focused` deliberately stays set: pane focus moves to the
-        // view (making it dormant), and returning to the sidebar (`C-x l`,
+        // view (making it dormant), and returning to the sidebar (`C-x Tab`,
         // `C-x o`, `C-1`) lands back in the section you left.
         self.jump_to_lineage_session(&target_id);
     }
@@ -326,27 +321,10 @@ impl App {
                     .await;
                 true
             }
-            // `C-x Tab` (`ToggleLineageFocus`) is the from-anywhere focus
-            // toggle — but it's a two-key chord, and its own prefix key
-            // (`C-x`) isn't otherwise in this handler's vocabulary. Without
-            // this arm, `C-x` would hit the fallback below, clear focus, and
-            // fall through BEFORE `Tab` ever arrives — so by the time the
-            // chord completes and `App::toggle_lineage_focus` runs, focus
-            // already reads as "not focused" and it re-opens instead of
-            // closing. Let the prefix fall through without touching focus so
-            // the toggle handler sees the true prior state.
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => false,
-            // Bare Tab hands focus back to the session rows (the
-            // sessions⇄lineage switch). Mid-chord (`C-x` pending) it must
-            // fall through instead, so the `C-x Tab` chord completes and the
-            // toggle handler runs with focus still intact.
+            // Bare Tab hands focus back to the session rows.
             KeyCode::Tab => {
-                if self.chord_state.is_empty() {
-                    self.lineage_focused = false;
-                    true
-                } else {
-                    false
-                }
+                self.lineage_focused = false;
+                true
             }
             _ => {
                 // Mid-chord keys (`C-x o`, `C-x b`, ...) fall through intact
@@ -468,37 +446,6 @@ mod tests {
 
         app.toggle_lineage_focus();
         assert!(!app.lineage_focused, "a second press must hand focus back");
-    }
-
-    #[tokio::test]
-    async fn c_x_tab_keystrokes_toggle_open_then_closed() {
-        // Regression test: `C-x` isn't in the section's own key vocabulary,
-        // so on a second press it used to get treated as an "unhandled key"
-        // that cleared focus and fell through BEFORE `Tab` arrived — so by
-        // the time the chord completed, focus already read as "not focused"
-        // and the toggle re-opened instead of closing.
-        let fork = fork_of(summary("fork"), "root");
-        let (mut app, _dir, _server) = test_app_with_sessions(vec![summary("root"), fork]).await;
-        app.select_session("root".to_string());
-
-        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
-            .await;
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .await;
-        assert!(
-            app.lineage_focused,
-            "first C-x Tab should focus the lineage section"
-        );
-
-        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
-            .await;
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .await;
-        assert!(
-            !app.lineage_focused,
-            "second C-x Tab (as real keystrokes through on_key) must close it, \
-             not re-open it"
-        );
     }
 
     #[tokio::test]
@@ -666,7 +613,7 @@ mod tests {
         assert_eq!(app.focus, PaneFocus::List);
         assert!(
             app.lineage_focused,
-            "C-x l / C-1 land back in the section that was focused last"
+            "C-x Tab / C-1 land back in the section that was focused last"
         );
 
         // Esc hands sub-focus to the rows; leaving and returning now lands

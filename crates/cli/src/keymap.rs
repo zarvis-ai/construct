@@ -20,12 +20,6 @@ pub enum KeyAction {
     /// editing or completion selects a different harness. No separate initial
     /// prompt is required. Bound to `C-x f` (emacs) / `f` (vim).
     OpenFork,
-    /// Toggle the sidebar lineage section's (spec 0081) keyboard focus
-    /// from anywhere. Within the list pane, bare `Tab` also switches
-    /// sessions⇄lineage (an `on_key` intercept, not a keymap binding, so
-    /// terminal Tab-completion is untouched). No-op when the selected
-    /// session has no fork/subagent lineage to show.
-    ToggleLineageFocus,
     /// Merge or discard the selected fork.
     OpenMerge,
     /// Zoom: the session view fills the screen (list / pin strip / modeline
@@ -70,8 +64,8 @@ pub enum KeyAction {
     /// split pane — the direct counterpart to `SwitchFocus`'s cycle. From
     /// any pane it jumps to the list; from the list it returns to the SAME
     /// pane it came from (whose session the list selection may have just
-    /// re-pointed), so `C-x l` … pick … `C-x l` is the switch-and-return
-    /// loop. Bound to `C-x l` ("l" = list) in both profiles: a chord, so
+    /// re-pointed), so `C-x Tab` … pick … `C-x Tab` is the switch-and-return
+    /// loop. Bound to `C-x Tab` in both profiles: a chord, so
     /// it works in every terminal — unlike the `C-1` accelerator, which
     /// needs the kitty keyboard protocol (spec 0082) that e.g. macOS
     /// Terminal.app lacks.
@@ -284,7 +278,7 @@ fn emacs() -> Keymap {
         // Enter from the list "drills in" to the session view; Tab is
         // intentionally left unbound for future use (e.g. completion).
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
-        (Chord(vec![ctrl('x'), ch('l')]), FocusList),
+        (Chord(vec![ctrl('x'), key(KeyCode::Tab)]), FocusList),
         // Directional pane focus (emacs `windmove`). `Shift+<arrow>` is the
         // fast path, but terminals reserve `Shift+Up`/`Shift+Down` for
         // scrollback (iTerm2, macOS Terminal.app, GNOME Terminal) and never
@@ -334,14 +328,6 @@ fn emacs() -> Keymap {
         // Unified fork picker; Enter accepts the source harness default.
         (Chord(vec![ctrl('x'), ch('f')]), OpenFork),
         (Chord(vec![ctrl('x'), ch('m')]), OpenMerge),
-        // Toggle the sidebar lineage section's keyboard focus. Bare `Tab`
-        // stays unbound in the keymap (the list pane's sessions⇄lineage
-        // switch is an `on_key` intercept scoped to list focus), so
-        // `C-x Tab` is a fresh compound chord, not a conflict with it.
-        (
-            Chord(vec![ctrl('x'), key(KeyCode::Tab)]),
-            ToggleLineageFocus,
-        ),
         // Pin / unpin selected session (or all members of a selected group)
         (Chord(vec![ctrl('x'), ch('p')]), TogglePin),
         (Chord(vec![ch(' ')]), TogglePin),
@@ -415,11 +401,6 @@ fn vim() -> Keymap {
         // Unified fork picker; uppercase `O` is intentionally unbound.
         (Chord(vec![ch('f')]), OpenFork),
         (Chord(vec![ch('m')]), OpenMerge),
-        // Shared with the emacs profile — see its binding for the rationale.
-        (
-            Chord(vec![ctrl('x'), key(KeyCode::Tab)]),
-            ToggleLineageFocus,
-        ),
         (Chord(vec![ch('v')]), ToggleView),
         (Chord(vec![ch('z')]), ToggleZoom),
         (Chord(vec![shift('Z'), shift('Z')]), Quit),
@@ -443,7 +424,7 @@ fn vim() -> Keymap {
         // PTY-mode escape: C-x is the universal prefix here too, so `C-x o`
         // cycles focus and `C-x C-c` quits even when the PTY is capturing.
         (Chord(vec![ctrl('x'), ch('o')]), SwitchFocus),
-        (Chord(vec![ctrl('x'), ch('l')]), FocusList),
+        (Chord(vec![ctrl('x'), key(KeyCode::Tab)]), FocusList),
         // Directional pane focus, `C-x <arrow>` — reliable alias for
         // `Shift+<arrow>` where the terminal eats `Shift+Up`/`Shift+Down`
         // (see the emacs profile for the rationale).
@@ -783,16 +764,15 @@ mod tests {
     }
 
     #[test]
-    fn c_x_tab_toggles_lineage_section_focus_in_both_profiles() {
+    fn c_x_tab_toggles_session_list_focus_in_both_profiles() {
         for profile in [Profile::Emacs, Profile::Vim] {
             let km = default_for(profile);
             assert!(
                 matches!(
                     resolve(&km, vec![ctrl('x'), key(KeyCode::Tab)]),
-                    KeymapResult::Action(KeyAction::ToggleLineageFocus)
+                    KeymapResult::Action(KeyAction::FocusList)
                 ),
-                "C-x Tab should toggle the lineage section's keyboard focus in {profile:?} \
-                 — the keyboard entry point that replaced the old C-x q / q popup"
+                "C-x Tab should toggle session-list focus in {profile:?}"
             );
         }
     }
