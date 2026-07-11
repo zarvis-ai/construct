@@ -15,9 +15,9 @@ More screenshots and demos: [gallery](gallery.md).
   CLI-only; no desktop app to install.
 
   <img src="https://raw.githubusercontent.com/construct-worlds/construct/f8fae6e5227ccd0b2140c35ce6e2ad16349da848/demos/new-session.gif" alt="construct new session demo" width="50%">
-- **Fork / merge (lineage)** — branch a session into a sibling to try a different
-  approach, keep the shared history, then merge results back when the path is
-  good.
+- **Fork / merge (lineage)** — fork a session when you need a parallel attempt
+  (new idea, side quest, or a long shot). Supports cross-harness forks and
+  merging results back.
 - **Program: a shared board you and the agent run together** — every session
   owns a durable Markdown document ([docs/program.md](docs/program.md)) that
   human and agent co-edit live and execute: select a task, hit Run, and watch
