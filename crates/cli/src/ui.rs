@@ -1826,8 +1826,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     // parent name, matching the child status glyphs above it.
                     let disclosure = if *expanded { "▾" } else { "▸" };
                     let parent_grouped = match section {
-                        crate::app::ArchiveSection::Subagents(parent_id)
-                        | crate::app::ArchiveSection::Forks(parent_id) => app
+                        crate::app::ArchiveSection::Children(parent_id) => app
                             .sessions
                             .iter()
                             .find(|s| s.id == *parent_id)

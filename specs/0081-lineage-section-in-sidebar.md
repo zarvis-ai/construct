@@ -112,10 +112,10 @@ selectable and viewable in the lineage section's tree, ✓/✗ outcome and
 all (jumping to it shows ITS OWN content, not a redirect to the parent —
 the parent only ever received a compact summary message, not the fork's
 full history). The plain session list mirrors that: a parent's archived
-forks — any generation, fork-of-a-fork included — collapse into one "N
-archived" row directly under it, the same disclosure convention archived
-subagents already use, expandable to reveal each one as an ordinary,
-selectable row.
+forks — any generation, fork-of-a-fork included — collapse into its
+existing archived-children disclosure row (spec 0031), the SAME row
+archived subagents collapse behind, not a second row of their own —
+expandable to reveal each one as an ordinary, selectable row.
 
 ## Reason
 

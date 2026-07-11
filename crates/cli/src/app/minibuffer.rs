@@ -325,9 +325,7 @@ impl App {
                     // created "inside" a project stays in it.
                     Selection::ArchivedRow(ArchiveSection::Group(gid)) => Some(gid.clone()),
                     Selection::ArchivedRow(
-                        ArchiveSection::Ungrouped
-                        | ArchiveSection::Subagents(_)
-                        | ArchiveSection::Forks(_),
+                        ArchiveSection::Ungrouped | ArchiveSection::Children(_),
                     )
                     | Selection::None => None,
                 };

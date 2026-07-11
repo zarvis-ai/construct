@@ -152,12 +152,16 @@ pub enum ListItem {
 pub enum ArchiveSection {
     Ungrouped,
     Group(String),
-    Subagents(String),
-    /// A parent session's archived forks — merged or discarded — bundled
-    /// into one row regardless of nesting depth (a fork of a fork sits at
-    /// the same flat indent as a direct fork, mirroring the active-forks
-    /// list; see `push_session_tree`).
-    Forks(String),
+    /// A parent session's archived children — subagents and forks alike
+    /// (merged/discarded) — bundled into ONE row regardless of kind or
+    /// nesting depth (a fork of a fork sits at the same flat indent as a
+    /// direct fork, mirroring the active-forks list; see
+    /// `push_session_tree`). Subagents and forks are different lineage
+    /// relationships but both are "this parent's archived children" from
+    /// the list's point of view, so they share one disclosure — matching
+    /// the original single-final-child-row design (spec 0031) rather than
+    /// splitting into a row per kind.
+    Children(String),
 }
 
 /// Every archived fork DESCENDANT of `parent_id` — direct forks and forks
@@ -213,13 +217,12 @@ fn selection_is_valid_for_sessions(
             ArchiveSection::Group(id) => sessions.iter().any(|s| {
                 is_user_list_session(s) && s.archived && s.group_id.as_deref() == Some(id.as_str())
             }),
-            ArchiveSection::Subagents(parent_id) => sessions.iter().any(|s| {
-                is_subagent_session(s)
-                    && s.archived
-                    && s.parent_session_id.as_deref() == Some(parent_id.as_str())
-            }),
-            ArchiveSection::Forks(parent_id) => {
-                !archived_fork_descendants(sessions, parent_id).is_empty()
+            ArchiveSection::Children(parent_id) => {
+                sessions.iter().any(|s| {
+                    is_subagent_session(s)
+                        && s.archived
+                        && s.parent_session_id.as_deref() == Some(parent_id.as_str())
+                }) || !archived_fork_descendants(sessions, parent_id).is_empty()
             }
         },
     }
@@ -487,7 +490,7 @@ pub(crate) fn list_archive_indent_cells(
         // Align the disclosure triangle with the parent session's name —
         // forks and subagents share the same indent alignment
         // (`list_session_indent_cells` gives both the same formula).
-        ArchiveSection::Subagents(_) | ArchiveSection::Forks(_) => 5 + u16::from(parent_grouped),
+        ArchiveSection::Children(_) => 5 + u16::from(parent_grouped),
         _ if indented => 2,
         _ => 0,
     }
@@ -1614,13 +1617,10 @@ pub struct App {
     /// each project's "N archived" row. Ephemeral, like
     /// [`Self::show_archived_ungrouped`].
     pub show_archived_groups: HashSet<String>,
-    /// Parent session ids whose archived subagents are currently revealed.
-    /// Ephemeral, like the other archived disclosure state.
-    pub show_archived_subagents: HashSet<String>,
-    /// Parent session ids whose archived (merged/discarded) forks are
-    /// currently revealed. Ephemeral, like the other archived disclosure
-    /// state.
-    pub show_archived_forks: HashSet<String>,
+    /// Parent session ids whose archived-children disclosure row (subagents
+    /// and forks combined into one row) is currently revealed. Ephemeral,
+    /// like the other archived disclosure state.
+    pub show_archived_children: HashSet<String>,
     /// Hide left, right, and bottom border lines for list/view/pin panes.
     pub hide_pane_side_borders: bool,
     /// Last rendered frame, one string per terminal row. Mouse drag
@@ -3367,8 +3367,7 @@ async fn run_with_socket_initial_selection(
         matrix_rain_hidden: persisted.matrix_rain_hidden,
         show_archived_ungrouped: false,
         show_archived_groups: HashSet::new(),
-        show_archived_subagents: HashSet::new(),
-        show_archived_forks: HashSet::new(),
+        show_archived_children: HashSet::new(),
         hide_pane_side_borders: persisted.hide_pane_side_borders,
         frame_text: Vec::new(),
         text_selection: None,
@@ -4659,16 +4658,18 @@ impl App {
                 .filter(|s| is_user_list_session(s))
                 .map(|s| s.id.clone())
                 .collect(),
-            ArchiveSection::Subagents(parent_id) => self
-                .sessions
-                .iter()
-                .filter(|s| s.archived)
-                .filter(|s| is_subagent_session(s))
-                .filter(|s| s.parent_session_id.as_deref() == Some(parent_id.as_str()))
-                .map(|s| s.id.clone())
-                .collect(),
-            ArchiveSection::Forks(parent_id) => {
+            ArchiveSection::Children(parent_id) => {
+                let archived_subagents = self
+                    .sessions
+                    .iter()
+                    .filter(|s| s.archived)
+                    .filter(|s| is_subagent_session(s))
+                    .filter(|s| s.parent_session_id.as_deref() == Some(parent_id.as_str()))
+                    .map(|s| s.id.clone());
                 archived_fork_descendants(&self.sessions, parent_id)
+                    .into_iter()
+                    .chain(archived_subagents)
+                    .collect()
             }
         }
     }
@@ -4705,11 +4706,8 @@ impl App {
                 .find(|g| g.id == *group_id)
                 .map(|g| format!("project '{}'", g.name))
                 .unwrap_or_else(|| "project".to_string()),
-            ArchiveSection::Subagents(parent_id) => {
-                format!("subagents of {}", short_id(parent_id))
-            }
-            ArchiveSection::Forks(parent_id) => {
-                format!("forks of {}", short_id(parent_id))
+            ArchiveSection::Children(parent_id) => {
+                format!("children of {}", short_id(parent_id))
             }
         }
     }
@@ -5016,7 +5014,6 @@ impl App {
             forks_by_parent: &HashMap<&'a str, Vec<&'a SessionSummary>>,
             collapsed: &HashSet<String>,
             show_archived: &HashSet<String>,
-            show_archived_forks: &HashSet<String>,
         ) {
             let children = subagents_by_parent.get(s.id.as_str());
             let has_children = children.map(|v| !v.is_empty()).unwrap_or(false);
@@ -5042,7 +5039,6 @@ impl App {
                             forks_by_parent,
                             collapsed,
                             show_archived,
-                            show_archived_forks,
                         );
                     }
                 }
@@ -5080,17 +5076,21 @@ impl App {
                     }
                 }
             }
-            // Archived forks — merged or discarded — bundle into one flat
-            // "N archived" row directly under `s`, same as the active-forks
-            // walk above: every generation (fork of a fork included)
-            // collapses into this single count, not a row per level.
+            // Archived children — subagents and forks alike (merged or
+            // discarded), any generation of fork-of-a-fork included — bundle
+            // into ONE flat "N archived" row directly under `s`: the
+            // parent's final child row, active subagents/forks always
+            // rendering first. Forks stay flat when revealed (mirroring the
+            // active-forks walk above); archived subagents recurse via
+            // `push_session_tree` so their OWN nested lineage still renders.
             let archived_forks = archived_fork_descendants_of(s.id.as_str(), forks_by_parent);
-            if !archived_forks.is_empty() {
-                let section = ArchiveSection::Forks(s.id.clone());
-                let expanded = show_archived_forks.contains(&s.id);
+            let archived_count = archived_forks.len() + archived_children.len();
+            if archived_count > 0 {
+                let section = ArchiveSection::Children(s.id.clone());
+                let expanded = show_archived.contains(&s.id);
                 out.push(ListItem::ArchivedRow {
                     section,
-                    count: archived_forks.len(),
+                    count: archived_count,
                     expanded,
                     indented: true,
                 });
@@ -5103,20 +5103,6 @@ impl App {
                             children_expanded: false,
                         });
                     }
-                }
-            }
-            // The archive disclosure is the parent's final child row: active
-            // subagents first, then forks, then archived subagents.
-            if !archived_children.is_empty() {
-                let section = ArchiveSection::Subagents(s.id.clone());
-                let expanded = show_archived.contains(&s.id);
-                out.push(ListItem::ArchivedRow {
-                    section,
-                    count: archived_children.len(),
-                    expanded,
-                    indented: true,
-                });
-                if expanded {
                     for child in archived_children {
                         push_session_tree(
                             out,
@@ -5126,7 +5112,6 @@ impl App {
                             forks_by_parent,
                             collapsed,
                             show_archived,
-                            show_archived_forks,
                         );
                     }
                 }
@@ -5141,8 +5126,7 @@ impl App {
                 &subagents_by_parent,
                 &forks_by_parent,
                 &self.subagent_collapsed,
-                &self.show_archived_subagents,
-                &self.show_archived_forks,
+                &self.show_archived_children,
             );
         };
 
@@ -5230,8 +5214,7 @@ impl App {
         match section {
             ArchiveSection::Ungrouped => self.show_archived_ungrouped,
             ArchiveSection::Group(id) => self.show_archived_groups.contains(id),
-            ArchiveSection::Subagents(id) => self.show_archived_subagents.contains(id),
-            ArchiveSection::Forks(id) => self.show_archived_forks.contains(id),
+            ArchiveSection::Children(id) => self.show_archived_children.contains(id),
         }
     }
 
@@ -5255,18 +5238,11 @@ impl App {
                     self.show_archived_groups.remove(id)
                 }
             }
-            ArchiveSection::Subagents(id) => {
+            ArchiveSection::Children(id) => {
                 if revealed {
-                    self.show_archived_subagents.insert(id.clone())
+                    self.show_archived_children.insert(id.clone())
                 } else {
-                    self.show_archived_subagents.remove(id)
-                }
-            }
-            ArchiveSection::Forks(id) => {
-                if revealed {
-                    self.show_archived_forks.insert(id.clone())
-                } else {
-                    self.show_archived_forks.remove(id)
+                    self.show_archived_children.remove(id)
                 }
             }
         }
@@ -11458,8 +11434,7 @@ mod tests {
             matrix_rain_hidden: true,
             show_archived_ungrouped: false,
             show_archived_groups: HashSet::new(),
-            show_archived_subagents: HashSet::new(),
-            show_archived_forks: HashSet::new(),
+            show_archived_children: HashSet::new(),
             hide_pane_side_borders: true,
             frame_text: Vec::new(),
             text_selection: None,
@@ -28745,9 +28720,10 @@ mod tests {
     #[tokio::test]
     async fn archived_forks_collapse_behind_an_n_archived_row() {
         // A merged/discarded fork is archived, never deleted — it must not
-        // just vanish from the list: it collapses behind a "N archived" row
-        // (mirroring subagents' own archived disclosure), expandable on
-        // click/Enter to reveal the fork itself.
+        // just vanish from the list: it collapses behind the parent's
+        // shared "N archived" children row (subagents and forks combined
+        // into one disclosure), expandable on click/Enter to reveal the
+        // fork itself.
         let (mut app, _dir, server) = test_app_with_lineage().await;
         if let Some(fork) = app.sessions.iter_mut().find(|s| s.id == "s1-fork") {
             fork.archived = true;
@@ -28772,7 +28748,7 @@ mod tests {
             .iter()
             .find_map(|it| match it {
                 ListItem::ArchivedRow {
-                    section: s @ ArchiveSection::Forks(_),
+                    section: s @ ArchiveSection::Children(_),
                     count,
                     expanded,
                     ..
@@ -28783,8 +28759,8 @@ mod tests {
                 assert!(!e, "starts collapsed");
                 (s, c)
             })
-            .expect("an archived-forks disclosure row exists");
-        assert_eq!(section, ArchiveSection::Forks("s1".into()));
+            .expect("an archived-children disclosure row exists");
+        assert_eq!(section, ArchiveSection::Children("s1".into()));
         assert_eq!(count, 1);
 
         app.toggle_archive_section(&section);
@@ -28795,6 +28771,63 @@ mod tests {
                 ListItem::Session { summary, indented: true, .. } if summary.id == "s1-fork"
             )),
             "expanding the row reveals the fork's own row"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn archived_subagents_and_forks_share_one_disclosure_row() {
+        // A parent with BOTH an archived subagent and an archived fork must
+        // get exactly ONE "N archived" row combining both kinds, not two —
+        // this is the merge this test locks in.
+        let (mut app, _dir, server) = test_app_with_lineage().await;
+        if let Some(fork) = app.sessions.iter_mut().find(|s| s.id == "s1-fork") {
+            fork.archived = true;
+            fork.merge = Some(construct_protocol::ForkMerge {
+                mode: construct_protocol::ForkMergeMode::Result,
+                at_ms: 0,
+                merged_busy_ms: 0,
+                merged_message_count: 0,
+                merged_seq: 0,
+            });
+        }
+        let mut archived_sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
+        archived_sub.id = "s1-sub-archived".into();
+        archived_sub.parent_session_id = Some("s1".into());
+        archived_sub.archived = true;
+        app.sessions.push(archived_sub);
+
+        let items = app.list_items();
+        let archived_rows: Vec<_> = items
+            .iter()
+            .filter(|it| matches!(it, ListItem::ArchivedRow { .. }))
+            .collect();
+        assert_eq!(
+            archived_rows.len(),
+            1,
+            "subagents and forks share ONE disclosure row, not one each: {archived_rows:?}"
+        );
+        let ListItem::ArchivedRow { section, count, .. } = archived_rows[0] else {
+            unreachable!()
+        };
+        assert_eq!(*section, ArchiveSection::Children("s1".into()));
+        assert_eq!(*count, 2, "the row's count covers both kinds combined");
+
+        app.toggle_archive_section(section);
+        let items = app.list_items();
+        assert!(
+            items.iter().any(|it| matches!(
+                it,
+                ListItem::Session { summary, indented: true, .. } if summary.id == "s1-fork"
+            )),
+            "expanding reveals the archived fork"
+        );
+        assert!(
+            items.iter().any(|it| matches!(
+                it,
+                ListItem::Session { summary, indented: true, .. } if summary.id == "s1-sub-archived"
+            )),
+            "expanding reveals the archived subagent"
         );
         server.abort();
     }
@@ -28815,7 +28848,7 @@ mod tests {
                 merged_seq: 0,
             });
         }
-        app.toggle_archive_section(&ArchiveSection::Forks("s1".into()));
+        app.toggle_archive_section(&ArchiveSection::Children("s1".into()));
         let items = app.list_items();
         let row = items
             .iter()
@@ -29111,7 +29144,7 @@ mod tests {
                 expanded,
                 indented,
             } => {
-                assert_eq!(*section, ArchiveSection::Subagents("sparent".into()));
+                assert_eq!(*section, ArchiveSection::Children("sparent".into()));
                 assert_eq!(*count, 1);
                 assert!(!*expanded, "archived subagent row starts collapsed");
                 assert!(*indented, "archived subagent row is nested under parent");
@@ -29120,7 +29153,7 @@ mod tests {
         }
 
         app.focus = PaneFocus::List;
-        app.selection = Selection::ArchivedRow(ArchiveSection::Subagents("sparent".into()));
+        app.selection = Selection::ArchivedRow(ArchiveSection::Children("sparent".into()));
         app.run_action(KeyAction::ExpandGroup).await;
         let expanded = app.list_items();
         assert_eq!(expanded.len(), 5);
@@ -29137,7 +29170,7 @@ mod tests {
         assert_eq!(app.list_items().len(), 4);
         assert_eq!(
             app.selection,
-            Selection::ArchivedRow(ArchiveSection::Subagents("sparent".into()))
+            Selection::ArchivedRow(ArchiveSection::Children("sparent".into()))
         );
     }
 
@@ -29418,11 +29451,11 @@ mod tests {
             vec!["grp_arch".to_string()],
         );
         assert_eq!(
-            app.archived_sessions_in_section(&ArchiveSection::Subagents("ung_active".into())),
+            app.archived_sessions_in_section(&ArchiveSection::Children("ung_active".into())),
             vec!["sub_arch".to_string()],
         );
         assert_eq!(
-            app.archived_delete_targets_in_section(&ArchiveSection::Subagents(
+            app.archived_delete_targets_in_section(&ArchiveSection::Children(
                 "native_owner".into()
             )),
             (Vec::new(), 1),
@@ -29431,7 +29464,7 @@ mod tests {
         // Opening delete on a native-only archive row stops at a safe status
         // instead of issuing requests that the daemon must reject (and that
         // previously wrote warnings over the alternate-screen TUI).
-        app.selection = Selection::ArchivedRow(ArchiveSection::Subagents("native_owner".into()));
+        app.selection = Selection::ArchivedRow(ArchiveSection::Children("native_owner".into()));
         app.run_action(KeyAction::OpenDeleteConfirm).await;
         assert!(app.minibuffer.is_none());
         assert!(
@@ -29450,8 +29483,8 @@ mod tests {
             "ungrouped",
         );
         assert_eq!(
-            app.archive_section_label(&ArchiveSection::Forks("s_abcdef01".into())),
-            format!("forks of {}", short_id("s_abcdef01")),
+            app.archive_section_label(&ArchiveSection::Children("s_abcdef01".into())),
+            format!("children of {}", short_id("s_abcdef01")),
         );
     }
 
@@ -29489,25 +29522,15 @@ mod tests {
             2
         );
         assert_eq!(
-            list_archive_indent_cells(&ArchiveSection::Subagents("parent".into()), true, false),
+            list_archive_indent_cells(&ArchiveSection::Children("parent".into()), true, false),
             5
         );
         assert_eq!(
             list_archive_indent_cells(
-                &ArchiveSection::Subagents("grouped-parent".into()),
+                &ArchiveSection::Children("grouped-parent".into()),
                 true,
                 true
             ),
-            6
-        );
-        // Forks align identically to subagents — both share the same
-        // formula in `list_session_indent_cells` above.
-        assert_eq!(
-            list_archive_indent_cells(&ArchiveSection::Forks("parent".into()), true, false),
-            5
-        );
-        assert_eq!(
-            list_archive_indent_cells(&ArchiveSection::Forks("grouped-parent".into()), true, true),
             6
         );
     }
