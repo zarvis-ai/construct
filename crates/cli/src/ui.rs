@@ -9730,52 +9730,59 @@ fn render_lineage_row(
                         Style::default().fg(theme.muted)
                     }
                 }
+                crate::lineage::LineageSpan::BoxPad { session_id } => {
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        Style::default().bg(theme.highlight_bg)
+                    } else {
+                        Style::default().bg(theme.inactive_highlight_bg)
+                    }
+                }
                 // Mirrors the session list: only the status glyph carries
                 // the live-state color; the name itself stays the default
                 // text color.
                 crate::lineage::LineageSpan::NodeStatus { session_id } => {
-                    if selected_session == Some(session_id.as_str()) {
-                        interior_highlight
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        Style::default()
+                            .bg(theme.highlight_bg)
+                            .fg(theme.highlight_fg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         let mut style = match by_id.get(session_id.as_str()) {
                             None => Style::default().fg(theme.dim),
                             Some(summary) => state_style(theme, summary.state),
                         };
-                        if hovered_session == Some(session_id.as_str()) {
-                            style = style.add_modifier(Modifier::BOLD);
-                        }
-                        style
+                        style.bg(theme.inactive_highlight_bg)
                     }
                 }
                 crate::lineage::LineageSpan::Node { session_id } => {
-                    if selected_session == Some(session_id.as_str()) {
-                        interior_highlight
+                    let mut style = if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        Style::default()
+                            .bg(theme.highlight_bg)
+                            .fg(theme.highlight_fg)
+                            .add_modifier(Modifier::BOLD)
                     } else {
-                        let hovered = hovered_session == Some(session_id.as_str());
-                        let mut style = match by_id.get(session_id.as_str()) {
-                            None => Style::default().fg(theme.dim),
-                            Some(summary) => {
-                                let mut style = Style::default().fg(theme.text);
-                                if hovered {
-                                    style = style.add_modifier(Modifier::BOLD);
-                                } else {
-                                    // Rest state reads slightly recessed so
-                                    // the highlighted session pops.
-                                    style = style.add_modifier(Modifier::DIM);
-                                }
-                                if crate::lineage::ForkStatus::of(summary)
-                                    == crate::lineage::ForkStatus::Discarded
-                                {
-                                    style = style.add_modifier(Modifier::CROSSED_OUT);
-                                }
-                                style
-                            }
+                        let fg = match by_id.get(session_id.as_str()) {
+                            None => theme.dim,
+                            Some(_) => theme.text,
                         };
-                        if hovered {
-                            style = style.add_modifier(Modifier::BOLD);
+                        Style::default()
+                            .bg(theme.inactive_highlight_bg)
+                            .fg(fg)
+                    };
+                    if let Some(summary) = by_id.get(session_id.as_str()) {
+                        if crate::lineage::ForkStatus::of(summary)
+                            == crate::lineage::ForkStatus::Discarded
+                        {
+                            style = style.add_modifier(Modifier::CROSSED_OUT);
                         }
-                        style
                     }
+                    style
                 }
             };
             Span::styled(run.text.clone(), style)
@@ -14583,9 +14590,10 @@ mod tests {
             match &run.role {
                 crate::lineage::LineageSpan::Node { session_id }
                 | crate::lineage::LineageSpan::NodeStatus { session_id }
+                | crate::lineage::LineageSpan::BoxPad { session_id }
                     if session_id == "f" =>
                 {
-                    assert!(has_bg, "selected interior carries the highlight fill");
+                    assert!(has_bg, "selected interior/padding carries the highlight fill");
                     saw_interior = true;
                 }
                 crate::lineage::LineageSpan::Border { session_id } if session_id == "f" => {
@@ -14605,7 +14613,7 @@ mod tests {
         }
         assert!(saw_interior && saw_border);
 
-        // Hover: border brightens the same way, interior stays unfilled.
+        // Hover: box area (interior + padding) gets the highlight background.
         let hover_lines: Vec<Line<'static>> = rows
             .iter()
             .map(|r| render_lineage_row(r, &by_id, &theme, None, Some("f")))
@@ -14615,14 +14623,26 @@ mod tests {
             .zip(hover_lines.iter())
             .flat_map(|(row, line)| row.spans.iter().zip(line.spans.iter()))
         {
-            assert_ne!(span.style.bg, Some(theme.highlight_bg));
-            if let crate::lineage::LineageSpan::Border { session_id } = &run.role {
-                if session_id == "f" {
-                    assert_eq!(
-                        span.style.fg,
-                        Some(theme.text),
-                        "hover brightens the hovered box's border"
-                    );
+            match &run.role {
+                crate::lineage::LineageSpan::Node { session_id }
+                | crate::lineage::LineageSpan::NodeStatus { session_id }
+                | crate::lineage::LineageSpan::BoxPad { session_id }
+                    if session_id == "f" =>
+                {
+                    assert_eq!(span.style.bg, Some(theme.highlight_bg), "hovered box area gets highlight bg");
+                }
+                crate::lineage::LineageSpan::Border { session_id } => {
+                    assert_ne!(span.style.bg, Some(theme.highlight_bg));
+                    if session_id == "f" {
+                        assert_eq!(
+                            span.style.fg,
+                            Some(theme.text),
+                            "hover brightens the hovered box's border"
+                        );
+                    }
+                }
+                _ => {
+                    assert_ne!(span.style.bg, Some(theme.highlight_bg));
                 }
             }
         }
@@ -14805,9 +14825,10 @@ mod tests {
                 Some(theme.text),
                 "the name keeps the default text color"
             );
-            assert!(
-                name.add_modifier.contains(Modifier::DIM),
-                "unhighlighted names read slightly recessed"
+            assert_eq!(
+                name.bg,
+                Some(theme.inactive_highlight_bg),
+                "unhighlighted names have the inactive highlight background"
             );
         }
     }

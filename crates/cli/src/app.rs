@@ -27480,11 +27480,14 @@ mod tests {
             "",
             "one blank padding row sits between the diagram and the scrollbar"
         );
-        assert_ne!(
-            row_syms(bottom - 2).trim(),
-            "",
-            "the last diagram row renders fully above the scrollbar, \
-             never under it"
+        assert!(
+            row_syms(bottom - 2).trim() != ""
+                || (area.x..area.x + area.width).any(|x| {
+                    buf.cell((x, bottom - 2))
+                        .map(|c| c.style().bg.is_some())
+                        .unwrap_or(false)
+                }),
+            "the last diagram row renders fully above the scrollbar, never under it"
         );
         server.abort();
     }

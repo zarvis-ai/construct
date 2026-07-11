@@ -297,6 +297,8 @@ pub enum LineageSpan {
     /// rows) when that session is the keyboard selection, without touching
     /// wiring that happens to share those rows.
     Border { session_id: String },
+    /// Padding and fill area inside the session box.
+    BoxPad { session_id: String },
     /// The glyph labeling a branch arrow (`⑂` / `▸`) — tagged with the
     /// branching session so hover/selection lights it with the rest of
     /// that session's timeline.
@@ -433,6 +435,7 @@ impl LineageSpan {
             // must toggle the group, never jump to the parent session.
             LineageSpan::Rail | LineageSpan::More(_) | LineageSpan::SubagentsToggle { .. } => None,
             LineageSpan::Border { session_id }
+            | LineageSpan::BoxPad { session_id }
             | LineageSpan::Edge { session_id, .. }
             | LineageSpan::Segment { session_id, .. }
             | LineageSpan::SegmentBullet { session_id }
@@ -1097,14 +1100,14 @@ fn box_rows(lane: &Lane) -> usize {
 fn draw_box(c: &mut Canvas, lane: &Lane, x: usize, y: usize) {
     use unicode_width::UnicodeWidthStr;
     let lw = box_content_w(lane);
-    let border = LineageSpan::Border {
+    let pad_span = LineageSpan::BoxPad {
         session_id: lane.node.session_id.clone(),
     };
-    c.put(y, x, &format!("┌{}┐", "─".repeat(lw + 2)), &border);
+    c.put(y, x, &" ".repeat(lw + 4), &pad_span);
     let status = lane.summary.map(|s| status_glyph(s.state));
     for (li, line) in lane.label_lines.iter().enumerate() {
         let pad = lw - UnicodeWidthStr::width(line.as_str());
-        c.put(y + 1 + li, x, "│ ", &border);
+        c.put(y + 1 + li, x, "  ", &pad_span);
         let mut tx = x + 2;
         let mut rest: &str = line;
         // The status glyph opens the first label line — split it into its
@@ -1133,10 +1136,10 @@ fn draw_box(c: &mut Canvas, lane: &Lane, x: usize, y: usize) {
                 session_id: lane.node.session_id.clone(),
             },
         );
-        c.put(y + 1 + li, x + 2 + lw, " │", &border);
+        c.put(y + 1 + li, x + 2 + lw, "  ", &pad_span);
     }
     let h = box_rows(lane);
-    c.put(y + h - 1, x, &format!("└{}┘", "─".repeat(lw + 2)), &border);
+    c.put(y + h - 1, x, &" ".repeat(lw + 4), &pad_span);
     c.node_rows.push((y + 1, lane.node.session_id.clone()));
     c.boxes.push(LineageBoxBounds {
         session_id: lane.node.session_id.clone(),
@@ -2330,18 +2333,18 @@ mod tests {
         assert_eq!(
             diagram_text(&rows),
             vec![
-                " ┌─────────┐".to_string(),
-                format!(" │ {g} smith │"),
-                " └─────────┘".to_string(),
+                "".to_string(),
+                format!("   {g} smith"),
+                "".to_string(),
                 // Every turn-info line gets a lane-bar row above it; the
                 // structural row below (box top, arrow) carries the bar
                 // for mid-timeline windows, and a terminal window gets
                 // nothing below — its lane ends there.
                 "   │".to_string(),
                 "   • 12 msgs · 5m00s".to_string(),
-                "   │      ┌─────────┐".to_string(),
-                format!("   ├─ ⑂ ─▸│ {g} smith │"),
-                "   │      └─────────┘".to_string(),
+                "   │".to_string(),
+                format!("   ├─ ⑂ ─▸  {g} smith"),
+                "   │".to_string(),
                 "   │        │".to_string(),
                 // Labels reserve no columns: the parent's window text runs
                 // underneath the fork's lane (the bar shows a gap on that
@@ -3510,10 +3513,10 @@ mod tests {
             "overflow past the cap ellipsizes: {text}"
         );
         // Every label row shares the same border columns (no shearing).
-        let widths: Vec<usize> = diagram_text(&rows)
+        let widths: Vec<usize> = rows
             .iter()
             .take(b.height)
-            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .map(|r| UnicodeWidthStr::width(r.text().as_str()))
             .collect();
         assert!(widths.windows(2).all(|w| w[0] == w[1]), "{widths:?}");
     }
@@ -3529,12 +3532,19 @@ mod tests {
         let tree = build_tree("root", &sessions).unwrap();
         let (rows, boxes) = flatten_with_boxes(&tree, &sessions, 9_000);
         assert_eq!(boxes.len(), 2);
-        let text = diagram_text(&rows);
         for b in &boxes {
+            let row_top = &rows[b.y];
+            let row_bot = &rows[b.y + b.height - 1];
+            // Check that the top and bottom rows have BoxPad spans for this session.
+            let has_top_pad = row_top.spans.iter().any(|s| {
+                matches!(&s.role, LineageSpan::BoxPad { session_id } if session_id == &b.session_id)
+            });
+            let has_bot_pad = row_bot.spans.iter().any(|s| {
+                matches!(&s.role, LineageSpan::BoxPad { session_id } if session_id == &b.session_id)
+            });
             assert!(
-                text[b.y].contains('┌') && text[b.y + b.height - 1].contains('└'),
-                "bounds frame the border rows for {b:?}:\n{}",
-                text.join("\n")
+                has_top_pad && has_bot_pad,
+                "bounds frame the padding rows for {b:?}"
             );
             assert!(b.width >= 4 && b.height >= 3);
         }
@@ -3544,16 +3554,16 @@ mod tests {
     #[test]
     fn wide_characters_in_titles_keep_box_borders_aligned() {
         // A CJK title occupies two columns per character — the box's right
-        // border and closing corner must land at the same display column on
+        // padding and closing edge must land at the same display column on
         // all three box rows, or the diagram shears.
         let mut root = with_event_count(with_created_at_ms(base("root"), 0), 1);
         root.title = Some("한글 제목".to_string());
         let sessions = vec![root];
         let tree = build_tree("root", &sessions).unwrap();
         let rows = flatten(&tree, &sessions, 0);
-        let text = diagram_text(&rows);
-        let width = |s: &str| {
-            s.chars()
+        let width = |r: &LineageRow| {
+            r.text()
+                .chars()
                 .map(|c| {
                     unicode_width::UnicodeWidthChar::width(c)
                         .unwrap_or(1)
@@ -3561,8 +3571,8 @@ mod tests {
                 })
                 .sum::<usize>()
         };
-        assert_eq!(width(&text[0]), width(&text[1]), "{text:?}");
-        assert_eq!(width(&text[1]), width(&text[2]), "{text:?}");
-        assert!(text[1].contains("한글 제목"), "{text:?}");
+        assert_eq!(width(&rows[0]), width(&rows[1]), "{rows:?}");
+        assert_eq!(width(&rows[1]), width(&rows[2]), "{rows:?}");
+        assert!(rows[1].text().contains("한글 제목"), "{rows:?}");
     }
 }
