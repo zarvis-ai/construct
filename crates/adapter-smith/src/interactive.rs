@@ -2335,7 +2335,7 @@ pub async fn run(
                 &term,
                 &mut approval_mode,
                 &mut pty_width,
-                obs_rx.as_mut(),
+                ambient_loop_enabled.then(|| obs_rx.as_mut()).flatten(),
                 &mut bg_completion_rx,
                 &tasks,
                 ambient_loop_enabled.then(|| ambient_loop.clone()).flatten(),
