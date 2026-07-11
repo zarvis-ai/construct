@@ -150,6 +150,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.lineage_v_overflow = false;
     app.layout.lineage_h_overflow = false;
     app.layout.lineage_hscroll_hit = None;
+    app.layout.lineage_vscrollbar = None;
+    app.layout.lineage_hscrollbar = None;
     app.layout.lineage_box_hits.clear();
     app.layout.lineage_subagent_toggle_hits.clear();
     app.window_pane_sizes.clear();
@@ -2282,6 +2284,22 @@ fn render_lineage_section(
             (scroll * max_top + denom / 2) / denom
         };
         let x = inner.x + inner.width - 1;
+        app.layout.lineage_vscrollbar = Some(crate::app::LineageScrollbarHit {
+            area: Rect {
+                x,
+                y: inner.y,
+                width: 1,
+                height: track_h as u16,
+            },
+            thumb: Rect {
+                x,
+                y: inner.y + top as u16,
+                width: 1,
+                height: thumb_h as u16,
+            },
+            max_scroll: denom,
+            horizontal: false,
+        });
         for r in 0..track_h {
             if let Some(cell) = f.buffer_mut().cell_mut(ratatui::layout::Position {
                 x,
@@ -2312,6 +2330,22 @@ fn render_lineage_section(
             (scroll_x * max_left + denom / 2) / denom
         };
         let y = body.y + body.height - 1;
+        app.layout.lineage_hscrollbar = Some(crate::app::LineageScrollbarHit {
+            area: Rect {
+                x: inner.x,
+                y,
+                width: track_w as u16,
+                height: 1,
+            },
+            thumb: Rect {
+                x: inner.x + left as u16,
+                y,
+                width: thumb_w as u16,
+                height: 1,
+            },
+            max_scroll: denom,
+            horizontal: true,
+        });
         for cidx in 0..track_w {
             if let Some(cell) = f.buffer_mut().cell_mut(ratatui::layout::Position {
                 x: inner.x + cidx as u16,

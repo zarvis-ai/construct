@@ -1285,6 +1285,7 @@ pub struct App {
     /// scrollbar thumb. `thumb_grab_offset` is the row delta from the thumb top
     /// to the cursor at mouse-down, so dragging preserves where the user grabbed.
     pub dragging_terminal_scrollbar: Option<(u16, usize)>,
+    pub dragging_lineage_scrollbar: Option<(bool, u16, usize)>,
     /// Per-session "last PTY byte" timestamp, updated locally from incoming
     /// Pty events. Used to drive the "session looks busy" spinner via a
     /// short quiescence window. Daemon's `SessionSummary.last_pty_at_ms`
@@ -2612,6 +2613,14 @@ pub struct TerminalScrollbarHit {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineageScrollbarHit {
+    pub area: ratatui::layout::Rect,
+    pub thumb: ratatui::layout::Rect,
+    pub max_scroll: usize,
+    pub horizontal: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelineApprovalModeHit {
     pub row: u16,
     pub start_col: u16,
@@ -2783,6 +2792,8 @@ pub struct LayoutSnapshot {
     /// horizontal scrolling a guaranteed mouse path even when both axes
     /// overflow.
     pub lineage_hscroll_hit: Option<ratatui::layout::Rect>,
+    pub lineage_vscrollbar: Option<LineageScrollbarHit>,
+    pub lineage_hscrollbar: Option<LineageScrollbarHit>,
     /// Every session box inside the last-rendered lineage section, in
     /// screen coordinates — hover brightens a box's border, click jumps to
     /// that session. Rebuilt every frame the section renders.
@@ -3238,6 +3249,7 @@ async fn run_with_socket_initial_selection(
         orchestrator_panel_h: persisted.orchestrator_panel_h,
         resizing_orchestrator_panel: None,
         dragging_terminal_scrollbar: None,
+        dragging_lineage_scrollbar: None,
         pty_activity: HashMap::new(),
         start_instant: now,
         layout: LayoutSnapshot::default(),
@@ -7194,6 +7206,7 @@ impl App {
             && self.resizing_program_popup.is_none()
             && self.resizing_lineage.is_none()
             && self.dragging_terminal_scrollbar.is_none()
+            && self.dragging_lineage_scrollbar.is_none()
             && self.text_selection.is_none()
             && self.mouse_over_tutorial_card(ev.column, ev.row);
         if !card_owns_event && self.handle_program_mouse(&ev).await {
@@ -7223,6 +7236,7 @@ impl App {
             && self.resizing_main_window.is_none()
             && self.resizing_lineage.is_none()
             && self.dragging_terminal_scrollbar.is_none()
+            && self.dragging_lineage_scrollbar.is_none()
             && self.text_selection.is_none()
             && !card_owns_event
             && self.forward_mouse_to_child(&ev)
@@ -7418,6 +7432,9 @@ impl App {
                 if self.begin_terminal_scrollbar_drag_or_jump(ev.column, ev.row) {
                     return;
                 }
+                if self.begin_lineage_scrollbar_drag_or_jump(ev.column, ev.row) {
+                    return;
+                }
                 if self.is_over_dynamic_ui_overlay(ev.column, ev.row) {
                     return;
                 }
@@ -7523,6 +7540,9 @@ impl App {
                 } else if let Some((grab_offset, max_scrollback)) = self.dragging_terminal_scrollbar
                 {
                     self.drag_terminal_scrollbar_to_row(ev.row, grab_offset, max_scrollback);
+                } else if let Some((horizontal, grab, max_scroll)) = self.dragging_lineage_scrollbar
+                {
+                    self.drag_lineage_scrollbar_to(ev.column, ev.row, horizontal, grab, max_scroll);
                 } else if self.is_over_dynamic_ui_overlay(ev.column, ev.row)
                     || self.is_over_lineage_section(ev.column, ev.row)
                 {
@@ -7541,6 +7561,7 @@ impl App {
                     || self.resizing_pin_strip.is_some()
                     || self.resizing_orchestrator_panel.is_some()
                     || self.dragging_terminal_scrollbar.is_some()
+                    || self.dragging_lineage_scrollbar.is_some()
                     || self.resizing_matrix_rain.is_some()
                     || self.resizing_main_window.is_some()
                     || self.resizing_lineage.is_some();
@@ -7548,6 +7569,7 @@ impl App {
                 self.resizing_pin_strip = None;
                 self.resizing_orchestrator_panel = None;
                 self.dragging_terminal_scrollbar = None;
+                self.dragging_lineage_scrollbar = None;
                 self.resizing_matrix_rain = None;
                 self.resizing_main_window = None;
                 self.resizing_lineage = None;
@@ -11063,6 +11085,8 @@ mod tests {
             lineage_v_overflow: false,
             lineage_h_overflow: false,
             lineage_hscroll_hit: None,
+            lineage_vscrollbar: None,
+            lineage_hscrollbar: None,
             lineage_box_hits: Vec::new(),
             lineage_subagent_toggle_hits: Vec::new(),
             program_title_run_hit: None,
@@ -11172,6 +11196,7 @@ mod tests {
             orchestrator_panel_h: None,
             resizing_orchestrator_panel: None,
             dragging_terminal_scrollbar: None,
+            dragging_lineage_scrollbar: None,
             pty_activity: HashMap::new(),
             start_instant: now,
             layout: LayoutSnapshot::default(),
@@ -27559,7 +27584,10 @@ mod tests {
         let button = app.layout.lineage_collapse_hit.expect("collapse button");
         app.handle_left_click(button.x + 1, button.y).await;
         assert!(!app.lineage_collapsed, "clicking `+` expands it again");
-        assert_eq!(app.lineage_h, None, "expanding keeps it in fit/auto-adjust mode");
+        assert_eq!(
+            app.lineage_h, None,
+            "expanding keeps it in fit/auto-adjust mode"
+        );
         server.abort();
     }
 

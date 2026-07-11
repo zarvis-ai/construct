@@ -221,6 +221,69 @@ impl App {
         self.show_terminal_scrollbar();
     }
 
+    pub(super) fn begin_lineage_scrollbar_drag_or_jump(&mut self, col: u16, row: u16) -> bool {
+        let hit = [
+            self.layout.lineage_vscrollbar,
+            self.layout.lineage_hscrollbar,
+        ]
+        .into_iter()
+        .flatten()
+        .find(|hit| Self::rect_contains(hit.area, col, row));
+        let Some(hit) = hit else { return false };
+        let cursor = if hit.horizontal { col } else { row };
+        let thumb_start = if hit.horizontal {
+            hit.thumb.x
+        } else {
+            hit.thumb.y
+        };
+        let grab = if Self::rect_contains(hit.thumb, col, row) {
+            cursor.saturating_sub(thumb_start)
+        } else if hit.horizontal {
+            hit.thumb.width / 2
+        } else {
+            hit.thumb.height / 2
+        };
+        self.dragging_lineage_scrollbar = Some((hit.horizontal, grab, hit.max_scroll));
+        self.drag_lineage_scrollbar_to(col, row, hit.horizontal, grab, hit.max_scroll);
+        true
+    }
+
+    pub(super) fn drag_lineage_scrollbar_to(
+        &mut self,
+        col: u16,
+        row: u16,
+        horizontal: bool,
+        grab: u16,
+        max_scroll: usize,
+    ) {
+        let hit = if horizontal {
+            self.layout.lineage_hscrollbar
+        } else {
+            self.layout.lineage_vscrollbar
+        };
+        let Some(hit) = hit else { return };
+        let (start, span, thumb_span, cursor) = if horizontal {
+            (hit.area.x, hit.area.width, hit.thumb.width, col)
+        } else {
+            (hit.area.y, hit.area.height, hit.thumb.height, row)
+        };
+        let max_thumb = span.saturating_sub(thumb_span) as usize;
+        if max_thumb == 0 || max_scroll == 0 {
+            return;
+        }
+        let top = cursor
+            .saturating_sub(grab)
+            .saturating_sub(start)
+            .min(span.saturating_sub(thumb_span)) as usize;
+        let value = (top * max_scroll + max_thumb / 2) / max_thumb;
+        if horizontal {
+            self.lineage_scroll_x = value;
+        } else {
+            self.lineage_scroll = value;
+            self.lineage_follow_selection = false;
+        }
+    }
+
     pub(super) fn adjust_mouse_list_scroll(&mut self, col: u16, row: u16, delta: i32) -> bool {
         let Some(area) = self.layout.list_items_area else {
             return false;
