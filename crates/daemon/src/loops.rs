@@ -30,7 +30,7 @@
 //! When `now > expires_at_ms`, the scheduler removes the loop on
 //! its next pass.
 
-use agentd_protocol::{Loop, LoopSpec};
+use construct_protocol::{Loop, LoopSpec};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashMap;

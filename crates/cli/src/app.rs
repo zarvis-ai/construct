@@ -2,8 +2,8 @@
 
 use crate::keymap::{self, ChordState, KeyAction, Keymap, KeymapResult, Profile};
 use crate::ui;
-use agentd_client::Client;
-use agentd_protocol::{
+use construct_client::Client;
+use construct_protocol::{
     EventNotificationPayload, GroupSummary, HarnessInfo, MessageRole, Notification, Request,
     SessionEvent, SessionSummary, StateNotificationPayload, TimestampedEvent,
 };
@@ -134,11 +134,11 @@ pub enum ArchiveSection {
 }
 
 fn is_user_list_session(s: &SessionSummary) -> bool {
-    matches!(s.kind, agentd_protocol::SessionKind::User)
+    matches!(s.kind, construct_protocol::SessionKind::User)
 }
 
 fn is_subagent_session(s: &SessionSummary) -> bool {
-    matches!(s.kind, agentd_protocol::SessionKind::Subagent)
+    matches!(s.kind, construct_protocol::SessionKind::Subagent)
 }
 
 fn selection_is_valid_for_sessions(
@@ -374,7 +374,7 @@ pub(crate) fn daemon_build_ids_differ(
 /// broken-pipe / connection-reset / EOF / closed error is the *expected*
 /// success path there, not a failure — only some other error is a real one.
 pub(crate) fn daemon_restart_status_message(
-    result: Result<agentd_protocol::DaemonRestartResult>,
+    result: Result<construct_protocol::DaemonRestartResult>,
     verb: &str,
 ) -> String {
     match result {
@@ -802,7 +802,7 @@ pub enum MinibufferIntent {
         call_id: String,
         tool: String,
         args_summary: String,
-        risk: agentd_protocol::ToolRisk,
+        risk: construct_protocol::ToolRisk,
         allow_auto_review: bool,
     },
 }
@@ -884,7 +884,7 @@ pub struct ProgramActionLinkHit {
     pub col_end: u16,
     pub row: u16,
     pub session_id: String,
-    pub action: agentd_protocol::UiAction,
+    pub action: construct_protocol::UiAction,
 }
 
 impl ProgramActionLinkHit {
@@ -1083,7 +1083,7 @@ pub struct App {
     pub client: Arc<Client>,
     /// Last `(session, view)` reported to the daemon via `set_view`, so we only
     /// re-send on change. Drives the AskUserQuestion chat-gate.
-    last_reported_view: Option<(String, agentd_protocol::ClientView)>,
+    last_reported_view: Option<(String, construct_protocol::ClientView)>,
     pub sessions: Vec<SessionSummary>,
     pub groups: Vec<GroupSummary>,
     pub selection: Selection,
@@ -1101,12 +1101,12 @@ pub struct App {
     /// placeholder. Fetched at startup and on reconnect, and refreshed in the
     /// background every time the program pane opens so edits to template files
     /// (or newly dropped files) appear on the next open without a daemon restart.
-    pub program_templates: Vec<agentd_protocol::ProgramTemplate>,
+    pub program_templates: Vec<construct_protocol::ProgramTemplate>,
     /// Background channel for live-reloaded program templates. `open_program_popup`
     /// spawns a non-blocking fetch that delivers the latest list here; the event
     /// loop applies it on the next iteration (no flicker — the placeholder keeps
     /// the cached list until the fresh one lands).
-    pub program_templates_tx: mpsc::UnboundedSender<Vec<agentd_protocol::ProgramTemplate>>,
+    pub program_templates_tx: mpsc::UnboundedSender<Vec<construct_protocol::ProgramTemplate>>,
     /// Latest daemon-side program Markdown per session id, backing widget
     /// `:::clip program` projections (spec 0074: a widget mirrors a program
     /// region by reference, never by copy). Kept fresh by `program/state`
@@ -1454,7 +1454,7 @@ pub struct App {
     /// `PROGRAM_SETTLE_FLASH_MS`.
     pub program_settle_flourishes: HashMap<String, HashMap<String, Instant>>,
     /// Ephemeral Program collaboration cursors, keyed by daemon client id.
-    pub program_collaborators: HashMap<String, agentd_protocol::ProgramCursor>,
+    pub program_collaborators: HashMap<String, construct_protocol::ProgramCursor>,
     /// Local receipt clock for agent-cursor freshness (spec 0065 agent
     /// presence), keyed by daemon client id: the agent cursor's
     /// `updated_at_ms` last observed for that client, alongside the local
@@ -1472,14 +1472,14 @@ pub struct App {
     /// Dismissed with Esc the same way `tasks_popup` is.
     pub remote_control_popup: Option<RemoteControlPopup>,
     pub remote_control_task:
-        Option<tokio::task::JoinHandle<(bool, Result<agentd_protocol::RemoteStartResult>)>>,
+        Option<tokio::task::JoinHandle<(bool, Result<construct_protocol::RemoteStartResult>)>>,
     /// Per-session input editor state, fed by `SessionEvent::EditorState`
     /// from the adapter (currently smith interactive). Drives the
     /// fixed bottom input pane.
     pub editor_states: HashMap<String, EditorState>,
     /// Per-session live agent status, fed by `SessionEvent::AgentStatus`
     /// and rendered above queued input while a turn is active.
-    pub agent_statuses: HashMap<String, agentd_protocol::AgentStatus>,
+    pub agent_statuses: HashMap<String, construct_protocol::AgentStatus>,
     /// Pending tool approvals by session id. Orchestrator approvals stay inline
     /// in the Operator PTY, but this lets the Matrix title bar surface a clear
     /// attention marker while the prompt is waiting.
@@ -1489,7 +1489,7 @@ pub struct App {
     pub browser_previews: HashMap<String, BrowserPreviewState>,
     /// Adapter/file-backed dynamic UI panels, keyed by session id then panel id.
     /// Actions route back as normal session input.
-    pub ui_panels: HashMap<String, HashMap<String, agentd_protocol::UiPanel>>,
+    pub ui_panels: HashMap<String, HashMap<String, construct_protocol::UiPanel>>,
     /// Currently open widget selector dropdown session, if any.
     pub dynamic_ui_popover_open: Option<String>,
     /// Widgets explicitly selected by the user. Default state is hidden.
@@ -1593,8 +1593,8 @@ struct SessionHydration {
     transcript: Vec<TimestampedEvent>,
     history: Option<crate::pty_render::ItemHistory>,
     editor_state: Option<EditorState>,
-    agent_status: Option<agentd_protocol::AgentStatus>,
-    ui_panels: HashMap<String, agentd_protocol::UiPanel>,
+    agent_status: Option<construct_protocol::AgentStatus>,
+    ui_panels: HashMap<String, construct_protocol::UiPanel>,
     status_messages: Vec<String>,
     /// True when the pre-rendered screen was in alt-screen mode (e.g. grok,
     /// interactive codex). Used by `apply_hydration_state` to force a bump
@@ -1711,7 +1711,7 @@ pub struct BrowserPreviewState {
     pub decoded: Option<std::sync::Arc<image::RgbaImage>>,
 }
 
-fn agent_status_history_line(status: &agentd_protocol::AgentStatus) -> Option<Vec<u8>> {
+fn agent_status_history_line(status: &construct_protocol::AgentStatus) -> Option<Vec<u8>> {
     if status.active || status.started_at_ms <= 0 || status.status.trim().is_empty() {
         return None;
     }
@@ -1741,24 +1741,24 @@ fn format_elapsed(started_at_ms: i64) -> String {
 async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionHydration> {
     tokio::task::spawn_blocking(move || {
         let mut status_messages = Vec::new();
-        let detail: agentd_protocol::SessionDetail = blocking_request(
+        let detail: construct_protocol::SessionDetail = blocking_request(
             &req.socket,
-            agentd_protocol::ipc_method::SESSION_GET,
-            &agentd_protocol::SessionIdParams {
+            construct_protocol::ipc_method::SESSION_GET,
+            &construct_protocol::SessionIdParams {
                 session_id: req.session_id.clone(),
             },
         )?;
-        let transcript = agentd_protocol::TranscriptResult {
+        let transcript = construct_protocol::TranscriptResult {
             total: detail.events.len() as u64,
             events: detail.events,
         };
 
         let history = if req.needs_history {
             let mut h = crate::pty_render::ItemHistory::new();
-            let pty: Result<agentd_protocol::PtyReplayResult> = blocking_request(
+            let pty: Result<construct_protocol::PtyReplayResult> = blocking_request(
                 &req.socket,
-                agentd_protocol::ipc_method::SESSION_PTY_REPLAY,
-                &agentd_protocol::SessionIdParams {
+                construct_protocol::ipc_method::SESSION_PTY_REPLAY,
+                &construct_protocol::SessionIdParams {
                     session_id: req.session_id.clone(),
                 },
             );
@@ -1781,7 +1781,7 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
 
             let mut editor_state = None;
             let mut agent_status = None;
-            let mut ui_panels: HashMap<String, agentd_protocol::UiPanel> = detail
+            let mut ui_panels: HashMap<String, construct_protocol::UiPanel> = detail
                 .ui_panels
                 .iter()
                 .cloned()
@@ -1819,7 +1819,7 @@ async fn load_session_hydration(req: SessionHydrationRequest) -> Result<SessionH
                 is_alt_screen,
             )
         } else {
-            let mut ui_panels: HashMap<String, agentd_protocol::UiPanel> = detail
+            let mut ui_panels: HashMap<String, construct_protocol::UiPanel> = detail
                 .ui_panels
                 .iter()
                 .cloned()
@@ -1883,7 +1883,7 @@ where
     if n == 0 {
         return Err(anyhow!("daemon disconnected"));
     }
-    let resp: agentd_protocol::Response = serde_json::from_str(line.trim())?;
+    let resp: construct_protocol::Response = serde_json::from_str(line.trim())?;
     if let Some(err) = resp.error {
         return Err(anyhow!("daemon error: {}", err.message));
     }
@@ -1967,17 +1967,17 @@ fn coalesce_pty_input(
 #[derive(Debug, Clone)]
 pub struct TasksPopup {
     pub session_id: String,
-    pub tasks: Vec<agentd_protocol::TaskInfo>,
+    pub tasks: Vec<construct_protocol::TaskInfo>,
 }
 
 /// In-TUI program surface for the selected session. The renderer treats
 /// Markdown as source and projects smart clips as chips/blocks.
 #[derive(Debug, Clone)]
 pub struct ProgramPopup {
-    pub program: agentd_protocol::ProgramDocument,
+    pub program: construct_protocol::ProgramDocument,
     pub buffer: String,
     pub saved_markdown: String,
-    pub blocks: Vec<agentd_protocol::ProgramBlockView>,
+    pub blocks: Vec<construct_protocol::ProgramBlockView>,
     pub undo_stack: Vec<ProgramUndoState>,
     pub cursor: usize,
     pub preferred_col: Option<usize>,
@@ -2118,7 +2118,7 @@ pub struct ProgramRun {
     pub first_output_seen: bool,
     /// Compact run-pipeline stage derived by the daemon, or Pressed for this
     /// client's optimistic pre-response state.
-    pub stage: agentd_protocol::ProgramRunStage,
+    pub stage: construct_protocol::ProgramRunStage,
     /// True once this run has been observed in a daemon payload. Local
     /// optimistic starts stay false until program.execute or program/state
     /// confirms them.
@@ -2133,7 +2133,7 @@ pub struct ProgramRun {
 }
 
 impl ProgramRun {
-    fn from_progress(mut progress: agentd_protocol::ProgramRunProgress) -> Option<Self> {
+    fn from_progress(mut progress: construct_protocol::ProgramRunProgress) -> Option<Self> {
         progress.refresh_stage();
         let now = Instant::now();
         let now_ms = SystemTime::now()
@@ -2210,7 +2210,7 @@ pub(crate) struct ProgramBlock {
 /// shared protocol parser so the TUI and the daemon agree on block boundaries
 /// and ids. The renderer uses this to decide which source lines shimmer.
 pub(crate) fn program_blocks(markdown: &str) -> Vec<ProgramBlock> {
-    agentd_protocol::program_block_spans(markdown)
+    construct_protocol::program_block_spans(markdown)
         .into_iter()
         .map(|span| ProgramBlock {
             start_line: span.start_line,
@@ -2252,14 +2252,14 @@ pub(crate) fn program_referenced_session_ids(markdown: &str) -> Vec<String> {
 /// Legacy content ids of the blocks contained in `body` — used for local
 /// optimistic/selection shimmer before the daemon returns stable refs.
 pub(crate) fn program_run_pending_ids(body: &str) -> HashSet<String> {
-    agentd_protocol::program_block_spans(body)
+    construct_protocol::program_block_spans(body)
         .into_iter()
         .map(|span| span.id)
         .collect()
 }
 
 fn program_run_progress_pending_ids(
-    progress: &agentd_protocol::ProgramRunProgress,
+    progress: &construct_protocol::ProgramRunProgress,
 ) -> HashSet<String> {
     let mut pending: HashSet<String> = progress.pending_block_refs.iter().cloned().collect();
     pending.extend(progress.pending_block_ids.iter().cloned());
@@ -2292,9 +2292,9 @@ fn program_agent_reveal_receipt_update(
 struct ProgramSaveOutcome {
     /// The document as it now lives on the daemon (our content, possibly
     /// merged with concurrent edits).
-    program: agentd_protocol::ProgramDocument,
+    program: construct_protocol::ProgramDocument,
     /// Echoed per-block projection for stable shimmer refs.
-    blocks: Vec<agentd_protocol::ProgramBlockView>,
+    blocks: Vec<construct_protocol::ProgramBlockView>,
     /// A 3-way merge ran because the document advanced underneath us.
     merged: bool,
     /// The merge could not reconcile overlapping edits, so the saved content
@@ -2508,7 +2508,7 @@ pub struct HintZone {
 pub struct DynamicUiActionHit {
     pub session_id: String,
     pub panel_id: String,
-    pub action: agentd_protocol::UiAction,
+    pub action: construct_protocol::UiAction,
     pub row: u16,
     pub start_col: u16,
     /// Exclusive end column.
@@ -2551,7 +2551,7 @@ impl DynamicUiActionHit {
 /// links by `render_inline_action_spans`; dispatched by
 /// `handle_dynamic_ui_overlay_click` via [`open_url`]. Kept in a parallel
 /// list rather than folded into [`DynamicUiActionHit`] so the action type
-/// (which lives in `agentd_protocol::UiAction`) doesn't have to grow a
+/// (which lives in `construct_protocol::UiAction`) doesn't have to grow a
 /// URL variant — widgets that mix action links and plain http links work
 /// independently.
 #[derive(Debug, Clone)]
@@ -3073,7 +3073,7 @@ async fn run_with_socket_initial_selection(
     let theme = theme_config.resolve(None);
     let initial_orch_id = sessions
         .iter()
-        .find(|s| s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal())
+        .find(|s| s.kind == construct_protocol::SessionKind::Orchestrator && !s.state.is_terminal())
         .map(|s| s.id.clone());
     // Restore the previously-selected session if it still exists,
     // else fall back to the first non-orchestrator session.
@@ -3466,7 +3466,7 @@ async fn run_loop(
     // `open_program_popup` can kick off a background refresh; this loop drains the
     // receiver and applies the freshest list.
     let (program_templates_tx, mut program_templates_rx) =
-        mpsc::unbounded_channel::<Vec<agentd_protocol::ProgramTemplate>>();
+        mpsc::unbounded_channel::<Vec<construct_protocol::ProgramTemplate>>();
     app.program_templates_tx = program_templates_tx;
     // Background channel for widget program projections: `request_program_projection`
     // (kicked off by the widget renderer when a `:::clip program` block has no
@@ -3487,7 +3487,7 @@ async fn run_loop(
     // loop (no key handler needs to reach it directly), so unlike the
     // channels above this one stays local instead of living on `App`.
     let (content_search_tx, mut content_search_rx) =
-        mpsc::unbounded_channel::<(u64, anyhow::Result<agentd_protocol::SearchResult>)>();
+        mpsc::unbounded_channel::<(u64, anyhow::Result<construct_protocol::SearchResult>)>();
     let mut reconnect: Option<ReconnectState> = None;
     // Tick at the spinner frame boundary so each frame gets one redraw.
     let mut tick = tokio::time::interval(Duration::from_millis(SPINNER_FRAME_MS as u64));
@@ -3728,11 +3728,11 @@ async fn run_loop(
                             let result = match Client::connect(&socket).await {
                                 Ok(search_client) => {
                                     search_client
-                                        .search(agentd_protocol::SearchParams {
+                                        .search(construct_protocol::SearchParams {
                                             query,
                                             scopes: Some(vec![
-                                                agentd_protocol::SearchScope::Program,
-                                                agentd_protocol::SearchScope::Transcript,
+                                                construct_protocol::SearchScope::Program,
+                                                construct_protocol::SearchScope::Transcript,
                                             ]),
                                             session_ids: None,
                                             limit: Some(20),
@@ -4070,7 +4070,7 @@ impl App {
             .sessions
             .iter()
             .find(|s| {
-                s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
+                s.kind == construct_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
             })
             .map(|s| s.id.clone());
         self.transcript_session = None;
@@ -4110,7 +4110,7 @@ impl App {
     fn insert_browser_preview(
         &mut self,
         session_id: String,
-        preview: agentd_protocol::BrowserPreview,
+        preview: construct_protocol::BrowserPreview,
     ) {
         let decoded = decode_browser_preview_image(&preview.image);
         let now = Instant::now();
@@ -4370,8 +4370,8 @@ impl App {
             return;
         };
         let view = match self.view {
-            ViewMode::Chat => agentd_protocol::ClientView::Chat,
-            ViewMode::Terminal => agentd_protocol::ClientView::Terminal,
+            ViewMode::Chat => construct_protocol::ClientView::Chat,
+            ViewMode::Terminal => construct_protocol::ClientView::Terminal,
         };
         if self.last_reported_view.as_ref() == Some(&(sid.clone(), view)) {
             return;
@@ -5210,8 +5210,8 @@ impl App {
         // tools to their blocks; `feed_tool_result` matches by
         // call_id and just fills `output` on the existing block.
         let mut replayed_editor_state: Option<EditorState> = None;
-        let mut replayed_agent_status: Option<agentd_protocol::AgentStatus> = None;
-        let mut replayed_ui_panels: HashMap<String, agentd_protocol::UiPanel> = HashMap::new();
+        let mut replayed_agent_status: Option<construct_protocol::AgentStatus> = None;
+        let mut replayed_ui_panels: HashMap<String, construct_protocol::UiPanel> = HashMap::new();
         let is_headless = self
             .sessions
             .iter()
@@ -5332,9 +5332,9 @@ impl App {
 
     async fn move_selected(&mut self, up: bool) {
         let dir = if up {
-            agentd_protocol::MoveDirection::Up
+            construct_protocol::MoveDirection::Up
         } else {
-            agentd_protocol::MoveDirection::Down
+            construct_protocol::MoveDirection::Down
         };
         match self.selection.clone() {
             Selection::Session(id) => {
@@ -5382,7 +5382,7 @@ impl App {
             .sessions
             .iter()
             .find(|s| {
-                s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
+                s.kind == construct_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
             })
             .map(|s| s.id.clone());
     }
@@ -5954,7 +5954,7 @@ impl App {
         self.sessions.iter().any(|s| s.id == id && s.pinned)
     }
 
-    async fn on_notification(&mut self, n: agentd_protocol::Notification) {
+    async fn on_notification(&mut self, n: construct_protocol::Notification) {
         // Tutorial hook (b) — spec 0077: the one place daemon-pushed state
         // changes are applied to app state. Re-parses the payload itself so
         // this stays a single thin call; all step logic lives in
@@ -5965,7 +5965,7 @@ impl App {
         // the `Pty` arm below) — every other event kind keeps it set.
         self.notification_dirtied_view = true;
         match n.method.as_str() {
-            m if m == agentd_protocol::ipc_notif::EVENT => {
+            m if m == construct_protocol::ipc_notif::EVENT => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<EventNotificationPayload>(p) {
                         self.matrix_rain.observe_event(
@@ -6031,7 +6031,7 @@ impl App {
                         // the client. Args shape:
                         //   {"command": "<verb>", "args": "<rest>"}
                         if let SessionEvent::ToolUse { tool, args, .. } = &payload.event {
-                            if tool == agentd_protocol::TUI_DISPATCH_TOOL {
+                            if tool == construct_protocol::TUI_DISPATCH_TOOL {
                                 let cmd =
                                     args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                                 let arg_str =
@@ -6052,7 +6052,7 @@ impl App {
                         // a `CommandId`; reconstruct the canonical verb from the
                         // registry and reuse the same dispatcher as the palette.
                         if let SessionEvent::ClientCommand { id, args } = &payload.event {
-                            let verb = agentd_protocol::slash::SlashCommand::by_id(*id)
+                            let verb = construct_protocol::slash::SlashCommand::by_id(*id)
                                 .name
                                 .trim_start_matches('/');
                             let full = match args {
@@ -6067,7 +6067,7 @@ impl App {
                             let bytes = payload.event.pty_bytes();
                             let mut is_active = true;
                             if let Some(b) = bytes.as_deref() {
-                                if !agentd_protocol::is_pty_active_payload(b) {
+                                if !construct_protocol::is_pty_active_payload(b) {
                                     is_active = false;
                                 }
                                 let history = self
@@ -6119,7 +6119,7 @@ impl App {
                             // slash-command short-circuit, not a real
                             // tool — skip the items-history feed
                             // (it's handled by `run_slash_command`).
-                            if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                            if tool != construct_protocol::TUI_DISPATCH_TOOL {
                                 let history = self
                                     .histories
                                     .entry(payload.session_id.clone())
@@ -6179,7 +6179,7 @@ impl App {
                         let msg = match &payload.event {
                             SessionEvent::Message { role, text } => Some((
                                 match role {
-                                    agentd_protocol::MessageRole::User => {
+                                    construct_protocol::MessageRole::User => {
                                         crate::pty_render::MessageKind::User
                                     }
                                     _ => crate::pty_render::MessageKind::Assistant,
@@ -6248,7 +6248,7 @@ impl App {
                                     .entry(payload.session_id.clone())
                                     .or_default()
                                     .insert(panel.id.clone(), panel.clone());
-                                if panel.placement == agentd_protocol::UiPlacement::Inline {
+                                if panel.placement == construct_protocol::UiPlacement::Inline {
                                     self.dynamic_ui_focused =
                                         Some((payload.session_id.clone(), panel.id.clone()));
                                 } else {
@@ -6364,7 +6364,7 @@ impl App {
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::STATE => {
+            m if m == construct_protocol::ipc_notif::STATE => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<StateNotificationPayload>(p) {
                         let id = payload.session.id.clone();
@@ -6423,77 +6423,77 @@ impl App {
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::DELETED => {
+            m if m == construct_protocol::ipc_notif::DELETED => {
                 if let Some(p) = n.params {
                     if let Ok(payload) =
-                        serde_json::from_value::<agentd_protocol::DeletedNotificationPayload>(p)
+                        serde_json::from_value::<construct_protocol::DeletedNotificationPayload>(p)
                     {
                         self.on_session_deleted(&payload.session_id).await;
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::GROUP_STATE => {
+            m if m == construct_protocol::ipc_notif::GROUP_STATE => {
                 if let Some(p) = n.params {
                     if let Ok(payload) =
-                        serde_json::from_value::<agentd_protocol::GroupStateNotificationPayload>(p)
+                        serde_json::from_value::<construct_protocol::GroupStateNotificationPayload>(p)
                     {
                         self.on_group_state(payload.group).await;
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::PROJECT_STATE => {
+            m if m == construct_protocol::ipc_notif::PROJECT_STATE => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::ProjectStateNotificationPayload,
+                        construct_protocol::ProjectStateNotificationPayload,
                     >(p)
                     {
                         self.on_group_state(payload.project).await;
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::GROUP_DELETED => {
+            m if m == construct_protocol::ipc_notif::GROUP_DELETED => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::GroupDeletedNotificationPayload,
+                        construct_protocol::GroupDeletedNotificationPayload,
                     >(p)
                     {
                         self.on_group_deleted(&payload.group_id).await;
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::PROJECT_DELETED => {
+            m if m == construct_protocol::ipc_notif::PROJECT_DELETED => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::ProjectDeletedNotificationPayload,
+                        construct_protocol::ProjectDeletedNotificationPayload,
                     >(p)
                     {
                         self.on_group_deleted(&payload.project_id).await;
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::REMOTE_STATE => {
+            m if m == construct_protocol::ipc_notif::REMOTE_STATE => {
                 if let Some(p) = n.params {
                     if let Ok(payload) =
-                        serde_json::from_value::<agentd_protocol::RemoteStateNotificationPayload>(p)
+                        serde_json::from_value::<construct_protocol::RemoteStateNotificationPayload>(p)
                     {
                         self.remote_clients = payload.clients;
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::PROGRAM_STATE => {
+            m if m == construct_protocol::ipc_notif::PROGRAM_STATE => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::ProgramStateNotificationPayload,
+                        construct_protocol::ProgramStateNotificationPayload,
                     >(p)
                     {
                         self.on_program_state(payload.program, payload.active_run, payload.blocks);
                     }
                 }
             }
-            m if m == agentd_protocol::ipc_notif::PROGRAM_CURSOR => {
+            m if m == construct_protocol::ipc_notif::PROGRAM_CURSOR => {
                 if let Some(p) = n.params {
                     if let Ok(payload) = serde_json::from_value::<
-                        agentd_protocol::ProgramCursorNotificationPayload,
+                        construct_protocol::ProgramCursorNotificationPayload,
                     >(p)
                     {
                         self.on_program_cursor(payload.cursor);
@@ -6504,7 +6504,7 @@ impl App {
         }
     }
 
-    fn on_program_cursor(&mut self, cursor: agentd_protocol::ProgramCursor) {
+    fn on_program_cursor(&mut self, cursor: construct_protocol::ProgramCursor) {
         let is_own = self.own_program_client_id.as_deref() == Some(cursor.client_id.as_str());
         if cursor.active {
             if cursor.kind == "agent" {
@@ -6544,7 +6544,7 @@ impl App {
             .map(|(_, receipt_at)| now.saturating_duration_since(*receipt_at))
     }
 
-    fn apply_own_program_cursor(&mut self, cursor: &agentd_protocol::ProgramCursor) {
+    fn apply_own_program_cursor(&mut self, cursor: &construct_protocol::ProgramCursor) {
         let updating_session_id = cursor.session_id.clone();
         let popup = if self
             .program_popup
@@ -6598,7 +6598,7 @@ impl App {
     fn adopt_daemon_program_run(
         &mut self,
         session_id: &str,
-        active_run: Option<agentd_protocol::ProgramRunProgress>,
+        active_run: Option<construct_protocol::ProgramRunProgress>,
     ) {
         match active_run.and_then(ProgramRun::from_progress) {
             Some(mut run) => {
@@ -6616,7 +6616,7 @@ impl App {
     fn adopt_program_state_run(
         &mut self,
         session_id: &str,
-        active_run: Option<agentd_protocol::ProgramRunProgress>,
+        active_run: Option<construct_protocol::ProgramRunProgress>,
     ) {
         match active_run {
             Some(progress) => match ProgramRun::from_progress(progress) {
@@ -6662,9 +6662,9 @@ impl App {
     /// merge-on-save path reconciles both sides without losing either.
     fn on_program_state(
         &mut self,
-        program: agentd_protocol::ProgramDocument,
-        active_run: Option<agentd_protocol::ProgramRunProgress>,
-        blocks: Vec<agentd_protocol::ProgramBlockView>,
+        program: construct_protocol::ProgramDocument,
+        active_run: Option<construct_protocol::ProgramRunProgress>,
+        blocks: Vec<construct_protocol::ProgramBlockView>,
     ) {
         // Keep the widget-projection cache fresh for every session, before
         // any open-popup early return below: `:::clip program` projections
@@ -6805,7 +6805,7 @@ impl App {
         call_id: String,
         tool: String,
         args_summary: String,
-        risk: agentd_protocol::ToolRisk,
+        risk: construct_protocol::ToolRisk,
         allow_auto_review: bool,
     ) {
         // Smith approvals are rendered inline in the session PTY
@@ -6828,8 +6828,8 @@ impl App {
             return;
         }
         let risk_label = match risk {
-            agentd_protocol::ToolRisk::Safe => "safe",
-            agentd_protocol::ToolRisk::Risky => "risky",
+            construct_protocol::ToolRisk::Safe => "safe",
+            construct_protocol::ToolRisk::Risky => "risky",
         };
         let short_args: String = args_summary.chars().take(80).collect();
         // The choice cluster (`y=approve  n=deny  a=auto-review  f=unsafe-auto`)
@@ -6879,9 +6879,9 @@ impl App {
         };
         let id = s.id.clone();
         let next = match s.approval_mode {
-            agentd_protocol::ApprovalMode::Manual => agentd_protocol::ApprovalMode::AutoReview,
-            agentd_protocol::ApprovalMode::AutoReview => agentd_protocol::ApprovalMode::UnsafeAuto,
-            agentd_protocol::ApprovalMode::UnsafeAuto => agentd_protocol::ApprovalMode::Manual,
+            construct_protocol::ApprovalMode::Manual => construct_protocol::ApprovalMode::AutoReview,
+            construct_protocol::ApprovalMode::AutoReview => construct_protocol::ApprovalMode::UnsafeAuto,
+            construct_protocol::ApprovalMode::UnsafeAuto => construct_protocol::ApprovalMode::Manual,
         };
         match self.client.set_approval_mode(&id, next).await {
             Ok(()) if show_status => self.set_status(format!(
@@ -8457,7 +8457,7 @@ impl App {
     fn ui_panels_for_test(
         &self,
         session_id: &str,
-    ) -> Option<&HashMap<String, agentd_protocol::UiPanel>> {
+    ) -> Option<&HashMap<String, construct_protocol::UiPanel>> {
         self.ui_panels.get(session_id)
     }
 
@@ -9498,7 +9498,7 @@ impl App {
     fn apply_remote_control_result(
         &mut self,
         local_only: bool,
-        r: agentd_protocol::RemoteStartResult,
+        r: construct_protocol::RemoteStartResult,
         starting: bool,
     ) {
         let ok = RemoteControlOk {
@@ -9586,8 +9586,8 @@ pub fn apply_transcript_to_local_state(
     events: &[TimestampedEvent],
     history: &mut crate::pty_render::ItemHistory,
     editor_state: &mut Option<EditorState>,
-    agent_status: &mut Option<agentd_protocol::AgentStatus>,
-    ui_panels: &mut HashMap<String, agentd_protocol::UiPanel>,
+    agent_status: &mut Option<construct_protocol::AgentStatus>,
+    ui_panels: &mut HashMap<String, construct_protocol::UiPanel>,
     is_headless: bool,
 ) {
     for ev in events {
@@ -9609,7 +9609,7 @@ pub fn apply_transcript_to_local_state(
                 tool,
                 args_summary,
             } => {
-                if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                if tool != construct_protocol::TUI_DISPATCH_TOOL {
                     history.feed_task_start(call_id.clone(), tool.clone(), args_summary.clone());
                 }
             }
@@ -9622,7 +9622,7 @@ pub fn apply_transcript_to_local_state(
                 // The TUI-dispatch tool (`tui`) is a slash-command
                 // short-circuit, not a real tool block — skip it
                 // just like the live notification handler does.
-                if tool != agentd_protocol::TUI_DISPATCH_TOOL {
+                if tool != construct_protocol::TUI_DISPATCH_TOOL {
                     history.feed_tool_use(tool.clone(), summarize_tool_args(args));
                 }
             }
@@ -9695,7 +9695,7 @@ pub fn apply_transcript_to_local_state(
             // their prose in the PTY stream — skip to avoid double-render.
             SessionEvent::Message { role, text } if is_headless => {
                 let kind = match role {
-                    agentd_protocol::MessageRole::User => crate::pty_render::MessageKind::User,
+                    construct_protocol::MessageRole::User => crate::pty_render::MessageKind::User,
                     _ => crate::pty_render::MessageKind::Assistant,
                 };
                 history.feed_message(kind, text);
@@ -10603,8 +10603,8 @@ fn program_smart_clip_ranges(buffer: &str) -> Vec<ProgramSmartClipRange> {
 }
 
 fn program_popup_from_document(
-    program: agentd_protocol::ProgramDocument,
-    blocks: Vec<agentd_protocol::ProgramBlockView>,
+    program: construct_protocol::ProgramDocument,
+    blocks: Vec<construct_protocol::ProgramBlockView>,
     now: Instant,
 ) -> ProgramPopup {
     let markdown = program.markdown.clone();
@@ -11207,8 +11207,8 @@ mod tests {
     async fn app_with_ping_build_response(
         result: serde_json::Value,
     ) -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
-        use agentd_client::Client;
-        use agentd_protocol::ipc_method;
+        use construct_client::Client;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tempfile::tempdir;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11313,13 +11313,13 @@ mod tests {
         );
     }
 
-    fn summary_with_kind(kind: agentd_protocol::SessionKind) -> SessionSummary {
+    fn summary_with_kind(kind: construct_protocol::SessionKind) -> SessionSummary {
         SessionSummary {
             id: "s1".into(),
             harness: "shell".into(),
             cwd: "/tmp".into(),
             title: None,
-            state: agentd_protocol::SessionState::Running,
+            state: construct_protocol::SessionState::Running,
             created_at: chrono::Utc::now(),
             last_event_at: None,
             cost_usd: None,
@@ -11339,7 +11339,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
             operator_loop_disabled: false,
@@ -11352,7 +11352,7 @@ mod tests {
     fn program_popup_for_test(session_id: &str, markdown: &str, cursor: usize) -> ProgramPopup {
         let now = Instant::now();
         ProgramPopup {
-            program: agentd_protocol::ProgramDocument {
+            program: construct_protocol::ProgramDocument {
                 session_id: session_id.to_string(),
                 markdown: markdown.to_string(),
                 version: 1,
@@ -11387,7 +11387,7 @@ mod tests {
     /// fire-and-forget calls whose errors are swallowed by the caller).
     async fn program_flow_mock_daemon(
     ) -> (Arc<Client>, tempfile::TempDir, tokio::task::JoinHandle<()>) {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -11485,7 +11485,7 @@ mod tests {
         smith_methods: Vec<serde_json::Value>,
         smith_current: Option<&str>,
     ) -> (Arc<Client>, tempfile::TempDir, tokio::task::JoinHandle<()>) {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -11856,7 +11856,7 @@ mod tests {
     #[test]
     fn no_agent_harness_available_ignores_shell() {
         assert!(no_agent_harness_available(&[]));
-        let shell_only = vec![agentd_protocol::HarnessInfo {
+        let shell_only = vec![construct_protocol::HarnessInfo {
             name: "shell".to_string(),
             available: true,
             detail: None,
@@ -11867,7 +11867,7 @@ mod tests {
         assert!(no_agent_harness_available(&shell_only));
 
         let one_agent_ready = vec![
-            agentd_protocol::HarnessInfo {
+            construct_protocol::HarnessInfo {
                 name: "shell".to_string(),
                 available: true,
                 detail: None,
@@ -11875,7 +11875,7 @@ mod tests {
                 description: None,
                 capabilities: Default::default(),
             },
-            agentd_protocol::HarnessInfo {
+            construct_protocol::HarnessInfo {
                 name: "claude".to_string(),
                 available: true,
                 detail: None,
@@ -11902,7 +11902,7 @@ mod tests {
     #[tokio::test]
     async fn two_windows_converging_on_one_session_with_program_open() {
         let (client, _dir, _server) = program_flow_mock_daemon().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.created_at = chrono::Utc::now() - chrono::Duration::seconds(10);
         let mut app = test_app(client, vec![s1]);
@@ -11924,7 +11924,7 @@ mod tests {
         // 2. Create session s2, positioned above s1 in the list (newer
         // created_at, matching the reported repro's list ordering), then
         // split and switch the new window to show it.
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         s2.created_at = chrono::Utc::now();
         app.sessions.push(s2);
@@ -12016,7 +12016,7 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(30),
                 first_output_seen: false,
-                stage: agentd_protocol::ProgramRunStage::Delivered,
+                stage: construct_protocol::ProgramRunStage::Delivered,
                 daemon_confirmed: true,
                 daemon_adopted_at: Some(Instant::now()),
                 settled_block_count: 0,
@@ -12034,7 +12034,7 @@ mod tests {
         );
         app.program_collaborators.insert(
             "client-1".into(),
-            agentd_protocol::ProgramCursor {
+            construct_protocol::ProgramCursor {
                 client_id: "client-1".into(),
                 session_id: "s1".into(),
                 label: "Web".into(),
@@ -12235,7 +12235,7 @@ mod tests {
                 .feed_pty(format!("\x1b[33mline {i} of accumulated chat \x1b[0m\r\n").as_bytes());
         }
         let (mut app, _dir, _server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.has_pty = true;
         app.sessions = vec![s1];
@@ -12380,8 +12380,8 @@ mod tests {
     #[tokio::test]
     async fn program_clip_click_resolves_and_focuses_session() {
         let (mut app, _dir, _server) = empty_app().await;
-        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
@@ -12458,12 +12458,12 @@ mod tests {
     async fn program_clip_click_to_subagent_persists_across_refresh() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (mut app, _dir, _server) = empty_app().await;
-        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let s1 = summary_with_kind(construct_protocol::SessionKind::User);
         // The orchestrator (the fleet dispatcher whose program holds the clips)
         // is hidden from the list, so its subagent children never get a row.
-        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        let mut orch = summary_with_kind(construct_protocol::SessionKind::Orchestrator);
         orch.id = "orch".into();
-        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub.id = "sub1".into();
         sub.parent_session_id = Some("orch".into());
         app.sessions = vec![s1, orch, sub];
@@ -12567,8 +12567,8 @@ mod tests {
     #[tokio::test]
     async fn program_open_state_is_preserved_per_session() {
         let (mut app, _dir, server) = empty_app().await;
-        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         app.sessions = vec![s1, s2];
         app.selection = Selection::Session("s1".into());
@@ -12858,9 +12858,9 @@ mod tests {
 
     /// The daemon broadcast that echoes our own cursor publish back at us,
     /// exactly as a live session sees after every keystroke.
-    fn own_program_cursor_echo(app: &App) -> agentd_protocol::ProgramCursor {
+    fn own_program_cursor_echo(app: &App) -> construct_protocol::ProgramCursor {
         let popup = app.program_popup.as_ref().unwrap();
-        agentd_protocol::ProgramCursor {
+        construct_protocol::ProgramCursor {
             session_id: popup.program.session_id.clone(),
             client_id: "c7".into(),
             label: "TUI".into(),
@@ -12978,7 +12978,7 @@ mod tests {
     #[tokio::test]
     async fn program_shift_arrow_selection_wins_over_split_focus_shortcut() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -13599,11 +13599,11 @@ mod tests {
         // "@{" starts at char 6; body "session:stest" is 13 chars; "}" at char 21.
         // Clip char range: [6, 22) = 6..(6+2+13+1)=22.
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "stest".into();
         session.title = Some("my-task".into());
         session.harness = "shell".into();
-        session.state = agentd_protocol::SessionState::Done;
+        session.state = construct_protocol::SessionState::Done;
         app.sessions = vec![session];
         app.program_popup = Some(program_popup_for_test(
             "s1",
@@ -13639,7 +13639,7 @@ mod tests {
         // The raw-buffer match must be found and its start must sit inside the
         // clip range so the rendering overlap check will highlight the chip.
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "stest".into();
         app.sessions = vec![session];
         app.program_popup = Some(program_popup_for_test(
@@ -13788,7 +13788,7 @@ mod tests {
     #[tokio::test]
     async fn program_nested_list_item_renders_more_indented() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -13823,7 +13823,7 @@ mod tests {
     #[tokio::test]
     async fn program_render_registers_run_affordance_hits() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -13867,7 +13867,7 @@ mod tests {
     #[tokio::test]
     async fn program_selection_comment_text_is_underlined_not_highlighted() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -13919,7 +13919,7 @@ mod tests {
     #[tokio::test]
     async fn program_selection_comment_run_button_is_right_aligned_and_contrasting() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -13997,7 +13997,7 @@ mod tests {
     #[tokio::test]
     async fn program_selection_run_button_is_plain_until_menu_focus() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14050,7 +14050,7 @@ mod tests {
     #[tokio::test]
     async fn program_selection_comment_text_wraps_before_right_button() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14122,7 +14122,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_cursor_does_not_replace_underlying_character_and_labels_are_tagged() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14134,7 +14134,7 @@ mod tests {
         }
         app.program_collaborators.insert(
             "peer-1".to_string(),
-            agentd_protocol::ProgramCursor {
+            construct_protocol::ProgramCursor {
                 session_id: "s1".to_string(),
                 client_id: "peer-1".to_string(),
                 label: "Peer".to_string(),
@@ -14207,7 +14207,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_cursor_hides_after_inactivity_timeout() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14219,7 +14219,7 @@ mod tests {
         }
         app.program_collaborators.insert(
             "peer-1".to_string(),
-            agentd_protocol::ProgramCursor {
+            construct_protocol::ProgramCursor {
                 session_id: "s1".to_string(),
                 client_id: "peer-1".to_string(),
                 label: "Peer".to_string(),
@@ -14271,7 +14271,7 @@ mod tests {
     #[tokio::test]
     async fn program_agent_cursor_hides_after_agent_inactivity_timeout() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14283,7 +14283,7 @@ mod tests {
         }
         app.program_collaborators.insert(
             "agent-1".to_string(),
-            agentd_protocol::ProgramCursor {
+            construct_protocol::ProgramCursor {
                 session_id: "s1".to_string(),
                 client_id: "agent-1".to_string(),
                 label: "Agent".to_string(),
@@ -14335,7 +14335,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_cursor_label_truncates_to_capped_highlight_width() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14347,7 +14347,7 @@ mod tests {
         }
         app.program_collaborators.insert(
             "peer-1".to_string(),
-            agentd_protocol::ProgramCursor {
+            construct_protocol::ProgramCursor {
                 session_id: "s1".to_string(),
                 client_id: "peer-1".to_string(),
                 label: "PeerCollaborator".to_string(),
@@ -14416,7 +14416,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_agent_cursor_uses_italic_instead_of_underline() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14428,7 +14428,7 @@ mod tests {
         }
         app.program_collaborators.insert(
             "agent-1".to_string(),
-            agentd_protocol::ProgramCursor {
+            construct_protocol::ProgramCursor {
                 session_id: "s1".to_string(),
                 client_id: "agent-1".to_string(),
                 label: "claude".to_string(),
@@ -14500,7 +14500,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_agent_cursor_reveals_edited_span_briefly() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14515,7 +14515,7 @@ mod tests {
         // insert) so it also records the client-receipt freshness the reveal
         // gate now keys off (GAP D) — the daemon's `updated_at_ms` alone no
         // longer drives it.
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14581,7 +14581,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_agent_cursor_reveal_starts_unswept() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14590,7 +14590,7 @@ mod tests {
             let popup = app.program_popup.as_mut().unwrap();
             popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14638,7 +14638,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_agent_cursor_reveal_is_receipt_not_daemon_stamp_gated() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14653,7 +14653,7 @@ mod tests {
         // reveal anyway.
         let daemon_stamp_age_ms = crate::ui::PROGRAM_AGENT_REVEAL_MS + 100;
         assert!(daemon_stamp_age_ms < PROGRAM_AGENT_COLLAB_CURSOR_TTL_MS);
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14711,7 +14711,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_agent_cursor_rebase_does_not_retrigger_reveal() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14721,7 +14721,7 @@ mod tests {
             popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         }
         let updated_at_ms = chrono::Utc::now().timestamp_millis();
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14741,7 +14741,7 @@ mod tests {
             entry.1 = Instant::now()
                 - Duration::from_millis((crate::ui::PROGRAM_AGENT_REVEAL_MS + 1) as u64);
         }
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14788,7 +14788,7 @@ mod tests {
     #[tokio::test]
     async fn program_remote_agent_cursor_reveal_fades_after_its_window() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14801,7 +14801,7 @@ mod tests {
         // notification path, then backdate the receipt directly — the reveal
         // now fades on the client's own receipt clock, not the daemon's
         // `updated_at_ms`, so that's what must age out here.
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14854,7 +14854,7 @@ mod tests {
     #[tokio::test]
     async fn program_agent_edge_indicator_points_down_for_activity_below_viewport() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14871,7 +14871,7 @@ mod tests {
         }
         // The agent's own edit landed at the very end of a long document; the
         // popup is still scrolled to the top, so it's off the bottom.
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14911,7 +14911,7 @@ mod tests {
     #[tokio::test]
     async fn program_agent_edge_indicator_points_up_for_activity_above_viewport() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -14928,7 +14928,7 @@ mod tests {
         }
         // The agent's edit landed near the very top of the document, off the
         // top of the scrolled-down viewport.
-        app.on_program_cursor(agentd_protocol::ProgramCursor {
+        app.on_program_cursor(construct_protocol::ProgramCursor {
             session_id: "s1".to_string(),
             client_id: "agent-1".to_string(),
             label: "claude".to_string(),
@@ -14987,11 +14987,11 @@ mod tests {
         let ids = App::selected_program_block_ids(&popup).expect("selected block ids");
 
         assert!(
-            ids.contains(&agentd_protocol::program_block_id("- alpha beta")),
+            ids.contains(&construct_protocol::program_block_id("- alpha beta")),
             "a partial text selection should shimmer its enclosing block"
         );
         assert!(
-            !ids.contains(&agentd_protocol::program_block_id("- gamma")),
+            !ids.contains(&construct_protocol::program_block_id("- gamma")),
             "untouched blocks should not shimmer for a selection run"
         );
     }
@@ -15003,7 +15003,7 @@ mod tests {
     #[tokio::test]
     async fn program_widget_icon_dash_matches_program_border_color() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15011,12 +15011,12 @@ mod tests {
             "s1".into(),
             HashMap::from([(
                 "w1".to_string(),
-                agentd_protocol::UiPanel {
+                construct_protocol::UiPanel {
                     id: "w1".into(),
                     source: Some("w1.md".into()),
                     title: Some("widget".into()),
                     created_at_ms: 1,
-                    placement: agentd_protocol::UiPlacement::Sticky,
+                    placement: construct_protocol::UiPlacement::Sticky,
                     markdown: "# widget".into(),
                 },
             )]),
@@ -15063,7 +15063,7 @@ mod tests {
     #[tokio::test]
     async fn program_reveals_pinned_widget_over_program() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15071,12 +15071,12 @@ mod tests {
             "s1".into(),
             HashMap::from([(
                 "w1".to_string(),
-                agentd_protocol::UiPanel {
+                construct_protocol::UiPanel {
                     id: "w1".into(),
                     source: Some("w1.md".into()),
                     title: Some("ZZWIDGET".into()),
                     created_at_ms: 1,
-                    placement: agentd_protocol::UiPlacement::Sticky,
+                    placement: construct_protocol::UiPlacement::Sticky,
                     markdown: "# ZZWIDGET\n\nbody text".into(),
                 },
             )]),
@@ -15106,7 +15106,7 @@ mod tests {
     #[tokio::test]
     async fn program_defaults_to_roll_down_with_terminal_visible() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15360,7 +15360,7 @@ mod tests {
     #[tokio::test]
     async fn program_title_run_button_sits_in_left_cluster() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15415,7 +15415,7 @@ mod tests {
     #[tokio::test]
     async fn program_title_actions_reuse_session_geometry_in_program_border_color() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15454,7 +15454,7 @@ mod tests {
     #[tokio::test]
     async fn program_run_button_spins_while_running() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15491,7 +15491,7 @@ mod tests {
         // button had stopped pulsing) must still restart the pulse for the
         // fresh press rather than staying dark.
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -15510,7 +15510,7 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
-                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                stage: construct_protocol::ProgramRunStage::FirstOutput,
                 daemon_confirmed: true,
                 daemon_adopted_at: Some(Instant::now()),
                 settled_block_count: 0,
@@ -15541,12 +15541,12 @@ mod tests {
     #[tokio::test]
     async fn program_clip_chip_color_reflects_live_session_status() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut running = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut running = summary_with_kind(construct_protocol::SessionKind::User);
         running.id = "s-run".into();
-        running.state = agentd_protocol::SessionState::Running;
-        let mut errored = summary_with_kind(agentd_protocol::SessionKind::User);
+        running.state = construct_protocol::SessionState::Running;
+        let mut errored = summary_with_kind(construct_protocol::SessionKind::User);
         errored.id = "s-err".into();
-        errored.state = agentd_protocol::SessionState::Errored;
+        errored.state = construct_protocol::SessionState::Errored;
         app.sessions = vec![running, errored];
         app.selection = Selection::Session("s-run".into());
         app.program_popup = Some(program_popup_for_test(
@@ -15615,7 +15615,7 @@ mod tests {
     #[tokio::test]
     async fn program_clip_hover_shows_missing_session_tooltip() {
         let (mut app, _dir, server) = empty_app().await;
-        let s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let s1 = summary_with_kind(construct_protocol::SessionKind::User);
         app.sessions = vec![s1];
         app.selection = Selection::Session("s1".into());
         app.program_popup = Some(program_popup_for_test("s1", "talk @{session:ghost}", 0));
@@ -15650,8 +15650,8 @@ mod tests {
         use crate::pty_render::ItemHistory;
 
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s2.id = "s2".into();
         s2.title = Some("Worker".into());
@@ -15704,8 +15704,8 @@ mod tests {
         use crate::pty_render::ItemHistory;
 
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s2.id = "s2".into();
         app.sessions = vec![s1, s2];
@@ -15766,9 +15766,9 @@ mod tests {
         use crate::pty_render::ItemHistory;
 
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s3 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s3 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s2.id = "s2".into();
         s3.id = "s3".into();
@@ -15832,8 +15832,8 @@ mod tests {
     #[tokio::test]
     async fn program_shimmer_tooltip_works_on_unfocused_split_program() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s2.id = "s2".into();
         app.sessions = vec![s1, s2];
@@ -15856,7 +15856,7 @@ mod tests {
         inactive_program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         app.program_popups.insert("s1".into(), inactive_program);
 
-        let block_id = agentd_protocol::program_block_id(markdown);
+        let block_id = construct_protocol::program_block_id(markdown);
         app.program_runs.insert(
             "s1".into(),
             ProgramRun {
@@ -15867,7 +15867,7 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
-                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                stage: construct_protocol::ProgramRunStage::FirstOutput,
                 daemon_confirmed: true,
                 daemon_adopted_at: Some(Instant::now()),
                 settled_block_count: 0,
@@ -15912,9 +15912,9 @@ mod tests {
         // can expose the terminal directly; session previews remain exclusive
         // to explicit session clip chips.
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s3 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s3 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s2.id = "s2".into();
         s3.id = "s3".into();
@@ -15946,7 +15946,7 @@ mod tests {
         worker_history.feed_pty(b"WORKER_TERMINAL_OUTPUT\nsecond line");
         app.histories.insert("s3".into(), worker_history);
 
-        let block_id = agentd_protocol::program_block_spans(markdown)
+        let block_id = construct_protocol::program_block_spans(markdown)
             .into_iter()
             .next()
             .expect("one block")
@@ -15961,7 +15961,7 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
-                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                stage: construct_protocol::ProgramRunStage::FirstOutput,
                 daemon_confirmed: true,
                 daemon_adopted_at: Some(Instant::now()),
                 settled_block_count: 0,
@@ -16013,8 +16013,8 @@ mod tests {
         // over the shimmering block — matching the clip-chip hover — rather than
         // self-dismissing once the pointer has been briefly still.
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut s3 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s3 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s3.id = "s3".into();
         app.sessions = vec![s1, s3];
@@ -16025,7 +16025,7 @@ mod tests {
         program.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         app.program_popup = Some(program);
 
-        let block_id = agentd_protocol::program_block_spans(markdown)
+        let block_id = construct_protocol::program_block_spans(markdown)
             .into_iter()
             .next()
             .expect("one block")
@@ -16040,7 +16040,7 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
-                stage: agentd_protocol::ProgramRunStage::FirstOutput,
+                stage: construct_protocol::ProgramRunStage::FirstOutput,
                 daemon_confirmed: true,
                 daemon_adopted_at: Some(Instant::now()),
                 settled_block_count: 0,
@@ -16086,9 +16086,9 @@ mod tests {
     /// plus a fully-revealed program popup over it. Returns the keep-alive dir
     /// and mock-daemon handle.
     async fn program_with_widget_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
-        use agentd_protocol::{UiPanel, UiPlacement};
+        use construct_protocol::{UiPanel, UiPlacement};
         let (mut app, dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16278,7 +16278,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_title_run_button_click_runs_program() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16338,7 +16338,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16388,7 +16388,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_selection_run_click_clears_menu_and_runs_selection() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16447,7 +16447,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16505,7 +16505,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_selection_run_ctrl_x_ctrl_r_clears_menu_and_runs_selection() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -16563,7 +16563,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16604,7 +16604,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_selection_run_menu_comment_runs_selection_with_comment() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -16662,7 +16662,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16836,7 +16836,7 @@ mod tests {
         let client = Client::connect(&sock).await.expect("client connects");
 
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16847,7 +16847,7 @@ mod tests {
         // "beta" is already shimmering from an earlier, separate run.
         app.start_program_run("s1", "alpha\n\nbeta\n", false, "");
         app.program_runs.get_mut("s1").expect("run").pending =
-            HashSet::from([agentd_protocol::program_block_id("beta")]);
+            HashSet::from([construct_protocol::program_block_id("beta")]);
 
         app.begin_program_selection();
         app.move_program_cursor(5); // selects "alpha"
@@ -16868,11 +16868,11 @@ mod tests {
 
         let pending = &app.program_runs["s1"].pending;
         assert!(
-            pending.contains(&agentd_protocol::program_block_id("beta")),
+            pending.contains(&construct_protocol::program_block_id("beta")),
             "C-x C-r on a new selection must not clear another block's existing shimmer"
         );
         assert!(
-            pending.contains(&agentd_protocol::program_block_id("alpha")),
+            pending.contains(&construct_protocol::program_block_id("alpha")),
             "the freshly-run selection should be optimistically shimmered too"
         );
     }
@@ -16895,7 +16895,7 @@ mod tests {
         let client = Client::connect(&sock).await.expect("client connects");
 
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -16906,7 +16906,7 @@ mod tests {
         // "beta" is already shimmering from an earlier, separate run.
         app.start_program_run("s1", "alpha\n\nbeta\n", false, "");
         app.program_runs.get_mut("s1").expect("run").pending =
-            HashSet::from([agentd_protocol::program_block_id("beta")]);
+            HashSet::from([construct_protocol::program_block_id("beta")]);
 
         app.begin_program_selection();
         app.move_program_cursor(5); // selects "alpha"
@@ -16934,11 +16934,11 @@ mod tests {
 
         let pending = &app.program_runs["s1"].pending;
         assert!(
-            pending.contains(&agentd_protocol::program_block_id("beta")),
+            pending.contains(&construct_protocol::program_block_id("beta")),
             "clicking Run on a new selection must not clear another block's existing shimmer"
         );
         assert!(
-            pending.contains(&agentd_protocol::program_block_id("alpha")),
+            pending.contains(&construct_protocol::program_block_id("alpha")),
             "the freshly-run selection should be optimistically shimmered too"
         );
     }
@@ -16952,7 +16952,7 @@ mod tests {
         // pointer that actually moves onto the block *after* it starts
         // shimmering should reveal it (spec 0057 hover-intent), and even then
         // it must anchor beside the block, never over its own text.
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16966,7 +16966,7 @@ mod tests {
         // the exact "menu adjacent to selection" geometry from the bug report.
         let markdown =
             "Block one line one\nBlock one line two\nBlock one line three\n\nOther block\n";
-        let block_id = agentd_protocol::program_block_spans(markdown)
+        let block_id = construct_protocol::program_block_spans(markdown)
             .into_iter()
             .next()
             .expect("first block")
@@ -17050,7 +17050,7 @@ mod tests {
 
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(client, Vec::new());
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         app.sessions = vec![session];
         app.selection = Selection::Session("s1".into());
@@ -17098,7 +17098,7 @@ mod tests {
             .expect("post-click frame should render");
         let text = rendered_text(term.backend().buffer());
         assert!(
-            !text.contains(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
+            !text.contains(construct_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
             "a stationary pointer under a newly-started shimmer must not reveal the tooltip"
         );
         let clicked_row_text = text
@@ -17131,7 +17131,7 @@ mod tests {
             .expect("hover-after-enter frame should render");
         let text = rendered_text(term.backend().buffer());
         assert!(
-            text.contains(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
+            text.contains(construct_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
             "a pointer that genuinely moves onto the shimmering block should reveal its tooltip"
         );
         for block_row in [inner.y, inner.y + 1, inner.y + 2] {
@@ -17140,7 +17140,7 @@ mod tests {
                 .nth(block_row as usize)
                 .expect("block row exists");
             assert!(
-                !row_text.contains(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
+                !row_text.contains(construct_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP),
                 "the tooltip must anchor on an adjacent row, not over the hovered block's own \
                  row {block_row}, got: {row_text:?}"
             );
@@ -17167,9 +17167,9 @@ mod tests {
         // program run shimmer, and activity on them must not wipe User/Subagent shimmers.
         let (mut app, _dir, server) = empty_app().await;
 
-        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        let mut orch = summary_with_kind(construct_protocol::SessionKind::Orchestrator);
         orch.id = "orch1".into();
-        let mut user = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut user = summary_with_kind(construct_protocol::SessionKind::User);
         user.id = "user1".into();
         app.sessions = vec![orch.clone(), user.clone()];
         app.selection = Selection::Session("orch1".into());
@@ -17203,7 +17203,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_title_program_toggle_opens_program_from_chat_mode() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17262,7 +17262,7 @@ mod tests {
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(
             client,
-            vec![summary_with_kind(agentd_protocol::SessionKind::User)],
+            vec![summary_with_kind(construct_protocol::SessionKind::User)],
         );
 
         let backend = ratatui::backend::TestBackend::new(120, 40);
@@ -17307,7 +17307,7 @@ mod tests {
     // mouse handler intercepts that click earlier).
     #[tokio::test]
     async fn split_below_nontop_toggle_opens_program() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17372,10 +17372,10 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.has_pty = true;
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         s2.has_pty = true;
         let mut app = test_app(client, vec![s1, s2]);
@@ -17486,7 +17486,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_title_uses_left_edge_status_spinner_with_program_color() {
-        use agentd_protocol::AgentStatus;
+        use construct_protocol::AgentStatus;
 
         let (mut app, _dir, server) = two_session_app().await;
         app.sessions[0].harness = "smith".into();
@@ -17527,7 +17527,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_execute_selection_saves_then_runs_selected_text() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tempfile::tempdir;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -17634,13 +17634,13 @@ mod tests {
     // overwrites the correct optimistic state with a phantom).
     #[tokio::test]
     async fn program_execute_partial_line_selection_sends_and_adopts_real_block_id() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
         let markdown = "Some long text here";
-        let real_block_id = agentd_protocol::program_block_spans(markdown)
+        let real_block_id = construct_protocol::program_block_spans(markdown)
             .into_iter()
             .next()
             .expect("one block")
@@ -17782,7 +17782,7 @@ mod tests {
         tokio::task::JoinHandle<()>,
         mpsc::UnboundedReceiver<String>,
     ) {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -17873,7 +17873,7 @@ mod tests {
         // double-clicked Run button) must not dispatch two execute turns to
         // the owning agent — the second is coalesced into the first's
         // dispatch and only sets a status message (spec 0042 consequence).
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
 
         let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
         let mut app = test_app(client, Vec::new());
@@ -17911,7 +17911,7 @@ mod tests {
     async fn program_run_different_body_dispatches_again() {
         // A full re-Run whose body changed (the user edited the program
         // between the two Runs) must not be suppressed by the dedup guard.
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
 
         let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
         let mut app = test_app(client, Vec::new());
@@ -17941,7 +17941,7 @@ mod tests {
         // Once the dedup window has elapsed, an identical Run is a
         // deliberate re-Run (spec 0042 intentionally supports this) and must
         // dispatch again.
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
 
         let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
         let mut app = test_app(client, Vec::new());
@@ -17979,7 +17979,7 @@ mod tests {
         // Spec 0042 lets a selection Run proceed while a full run is in
         // flight elsewhere in the program; the dedup guard must not treat
         // that as a duplicate of the full run that was just dispatched.
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
 
         let (client, _dir, server, mut methods) = program_run_dispatch_mock_daemon("s1").await;
         let mut app = test_app(client, Vec::new());
@@ -18013,7 +18013,7 @@ mod tests {
         app.program_popup = Some(program_popup_for_test("s1", "# Todo\n- a\n", 0));
         // The owning agent edited the program on the daemon.
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "# Todo\n- a\n- agent added\n".into(),
                 version: 2,
@@ -18044,7 +18044,7 @@ mod tests {
             0,
         ));
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "# In progress\n\n# Done\n- task @{session:sub1}\n".into(),
                 version: 2,
@@ -18076,7 +18076,7 @@ mod tests {
         app.program_popup.as_mut().unwrap().buffer =
             "# In progress\n- task @{session:sub1}\n- human typing\n".into();
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "# Done\n- task @{session:sub1}\n".into(),
                 version: 2,
@@ -18104,7 +18104,7 @@ mod tests {
         let (mut app, _dir, server) = empty_app().await;
         app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 10));
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "alpha INSERTED beta".into(),
                 version: 2,
@@ -18127,7 +18127,7 @@ mod tests {
         let (mut app, _dir, server) = empty_app().await;
         app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 5));
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "alpha zzz".into(),
                 version: 2,
@@ -18149,7 +18149,7 @@ mod tests {
         // (5 chars) with "A" (1 char) shifts everything after it by -4.
         app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 8));
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "A beta".into(),
                 version: 2,
@@ -18170,7 +18170,7 @@ mod tests {
         // Caret at 2 sits inside "alpha" (the replaced span itself).
         app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 2));
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "X beta".into(),
                 version: 2,
@@ -18199,7 +18199,7 @@ mod tests {
         });
         app.program_popup = Some(popup);
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "A beta".into(),
                 version: 2,
@@ -18227,7 +18227,7 @@ mod tests {
         });
         app.program_popup = Some(popup);
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "A beta".into(),
                 version: 2,
@@ -18254,7 +18254,7 @@ mod tests {
         let cursor = old_markdown.chars().count();
         app.program_popup = Some(program_popup_for_test("s1", old_markdown, cursor));
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "before @{session:sub1 clip_id=10} after".into(),
                 version: 2,
@@ -18296,7 +18296,7 @@ mod tests {
         );
 
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "zero alpha".into(),
                 version: 2,
@@ -18327,7 +18327,7 @@ mod tests {
             .await;
 
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "tiny".into(),
                 version: 2,
@@ -18358,17 +18358,17 @@ mod tests {
         assert_eq!((blocks[1].start_line, blocks[1].end_line), (1, 2)); // - a
         assert_eq!((blocks[2].start_line, blocks[2].end_line), (2, 3)); // - b
         assert_eq!(blocks[3].start_line, 4); // # Done after blank line
-        let spans = agentd_protocol::program_block_spans(md);
+        let spans = construct_protocol::program_block_spans(md);
         assert_eq!(spans[0].signature, "# Todo");
         assert_eq!(spans[1].signature, "- a");
-        assert_eq!(blocks[3].id, agentd_protocol::program_block_id("# Done"));
+        assert_eq!(blocks[3].id, construct_protocol::program_block_id("# Done"));
     }
 
     #[test]
     fn program_blocks_normalize_indentation_in_signature() {
         // Each item is its own block; signatures trim each line so cosmetic
         // indentation does not change identity (stable shimmer across re-indent).
-        let spans = agentd_protocol::program_block_spans("  - a\n    - b\n");
+        let spans = construct_protocol::program_block_spans("  - a\n    - b\n");
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].signature, "- a");
         assert_eq!(spans[1].signature, "- b");
@@ -18378,9 +18378,9 @@ mod tests {
     fn program_run_pending_ids_cover_each_block() {
         let ids = program_run_pending_ids("# Todo\n- a\n\n# Done\n");
         assert_eq!(ids.len(), 3);
-        assert!(ids.contains(&agentd_protocol::program_block_id("# Todo")));
-        assert!(ids.contains(&agentd_protocol::program_block_id("- a")));
-        assert!(ids.contains(&agentd_protocol::program_block_id("# Done")));
+        assert!(ids.contains(&construct_protocol::program_block_id("# Todo")));
+        assert!(ids.contains(&construct_protocol::program_block_id("- a")));
+        assert!(ids.contains(&construct_protocol::program_block_id("# Done")));
         // An empty body has nothing to shimmer.
         assert!(program_run_pending_ids("   \n").is_empty());
     }
@@ -18389,8 +18389,8 @@ mod tests {
         session_id: &str,
         markdown: &str,
         version: u64,
-    ) -> agentd_protocol::ProgramDocument {
-        agentd_protocol::ProgramDocument {
+    ) -> construct_protocol::ProgramDocument {
+        construct_protocol::ProgramDocument {
             session_id: session_id.into(),
             markdown: markdown.into(),
             version,
@@ -18402,12 +18402,12 @@ mod tests {
     fn program_progress_for_test(
         run_id: &str,
         pending: Vec<String>,
-    ) -> agentd_protocol::ProgramRunProgress {
+    ) -> construct_protocol::ProgramRunProgress {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        agentd_protocol::ProgramRunProgress {
+        construct_protocol::ProgramRunProgress {
             run_id: run_id.into(),
             started_at_ms: now_ms - 1000,
             expires_at_ms: now_ms + 60_000,
@@ -18419,7 +18419,7 @@ mod tests {
             first_output_seen: false,
             queued_behind_current_turn: false,
             agent_managed: false,
-            stage: agentd_protocol::ProgramRunStage::Delivered,
+            stage: construct_protocol::ProgramRunStage::Delivered,
             settled_block_count: 0,
             total_block_count: 1,
         }
@@ -18428,7 +18428,7 @@ mod tests {
     #[tokio::test]
     async fn program_optimistic_run_lights_every_block_immediately() {
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let body = "# Todo\n\n- alpha\n\n- beta\n";
 
         app.start_program_run("s1", body, false, "");
@@ -18446,7 +18446,7 @@ mod tests {
     #[tokio::test]
     async fn program_state_empty_run_keeps_unconfirmed_optimistic_run_then_clears_confirmed_run() {
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let body = "# Todo\n\n- alpha\n";
 
         app.start_program_run("s1", body, false, "");
@@ -18490,7 +18490,7 @@ mod tests {
     #[tokio::test]
     async fn program_state_stale_empty_run_respects_confirmed_adopt_grace() {
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let body = "# Todo\n\n- alpha\n";
 
         app.adopt_daemon_program_run(
@@ -18529,7 +18529,7 @@ mod tests {
         app.start_program_run("s1", "- pending\n", false, "");
         assert!(app.program_runs["s1"]
             .pending
-            .contains(&agentd_protocol::program_block_id("- pending")));
+            .contains(&construct_protocol::program_block_id("- pending")));
 
         app.on_program_state(
             program_doc_for_test("s1", "- pending\n", 42),
@@ -18551,7 +18551,7 @@ mod tests {
     #[tokio::test]
     async fn program_optimistic_rerun_without_edits_preserves_existing_shimmer_only() {
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let body = "# Todo\n\n- settled\n\n- pending\n\n- also settled\n";
 
         app.start_program_run("s1", body, false, "");
@@ -18576,7 +18576,7 @@ mod tests {
         // immediate optimistic feedback for the new request instead of
         // silently going dark.
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let body = "# Todo\n\n- alpha\n\n- beta\n";
 
         app.start_program_run("s1", body, false, "");
@@ -18603,7 +18603,7 @@ mod tests {
     #[tokio::test]
     async fn program_optimistic_rerun_adds_user_edit_to_existing_shimmer() {
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let synced = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
         let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
 
@@ -18624,7 +18624,7 @@ mod tests {
     #[tokio::test]
     async fn program_dirty_run_seeds_optimistic_pending_before_save_response() {
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let saved = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
         let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
 
@@ -18648,7 +18648,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_execute_sends_explicit_shimmer_for_edited_and_pending_blocks() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -18733,10 +18733,10 @@ mod tests {
         });
 
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.id = "s1".into();
         let mut app = test_app(client, vec![summary]);
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let saved = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
         let edited = "# Todo\n\n- settled\n\n- pending\n\n- user changed\n";
         app.program_popup = Some(program_popup_for_test("s1", saved, 0));
@@ -18765,7 +18765,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_dirty_run_survives_empty_save_broadcast_before_execute_response() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
@@ -18801,7 +18801,7 @@ mod tests {
                             .get("markdown")
                             .and_then(Value::as_str)
                             .unwrap_or("# Todo\n\n- settled\n\n- pending\n\n- user changed\n");
-                        let pending_id = agentd_protocol::program_block_id("- user changed");
+                        let pending_id = construct_protocol::program_block_id("- user changed");
                         let now_ms = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
@@ -18862,7 +18862,7 @@ mod tests {
         });
 
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.id = "s1".into();
         let mut app = test_app(client, vec![summary]);
         let saved = "# Todo\n\n- settled\n\n- pending\n\n- untouched\n";
@@ -18886,7 +18886,7 @@ mod tests {
 
         let result = app
             .client
-            .program_execute(agentd_protocol::ProgramExecuteParams {
+            .program_execute(construct_protocol::ProgramExecuteParams {
                 session_id: "s1".into(),
                 selection: None,
                 base_version: Some(2),
@@ -18909,7 +18909,7 @@ mod tests {
         // already declared elsewhere in the program — it optimistically adds
         // its own scope on top of whatever is already pending.
         let (mut app, _dir, server) = empty_app().await;
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let body = "# Todo\n\n- alpha\n\n- beta\n\n- gamma\n";
 
         app.start_program_run("s1", body, false, "");
@@ -18950,7 +18950,7 @@ mod tests {
         async fn feed(app: &mut App, session: &str, event: SessionEvent) {
             app.on_notification(Notification {
                 jsonrpc: "2.0".into(),
-                method: agentd_protocol::ipc_notif::EVENT.into(),
+                method: construct_protocol::ipc_notif::EVENT.into(),
                 params: Some(
                     serde_json::to_value(EventNotificationPayload {
                         session_id: session.into(),
@@ -18969,7 +18969,7 @@ mod tests {
             &mut app,
             "s1",
             SessionEvent::Status {
-                state: agentd_protocol::SessionState::AwaitingInput,
+                state: construct_protocol::SessionState::AwaitingInput,
                 detail: None,
             },
         )
@@ -18991,10 +18991,10 @@ mod tests {
 
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            method: construct_protocol::ipc_notif::PROGRAM_STATE.into(),
             params: Some(
-                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
-                    program: agentd_protocol::ProgramDocument {
+                serde_json::to_value(construct_protocol::ProgramStateNotificationPayload {
+                    program: construct_protocol::ProgramDocument {
                         session_id: "s1".into(),
                         markdown: "# Todo\n- a\n".into(),
                         version: 1,
@@ -19076,7 +19076,7 @@ mod tests {
                 system_status: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 first_output_seen: true,
-                stage: agentd_protocol::ProgramRunStage::default(),
+                stage: construct_protocol::ProgramRunStage::default(),
                 daemon_confirmed: true,
                 daemon_adopted_at: Some(Instant::now()),
                 settled_block_count: 0,
@@ -19085,14 +19085,14 @@ mod tests {
         );
 
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "- a\n- b\n".into(),
                 version: 2,
                 updated_at_ms: 0,
                 template_id: None,
             },
-            Some(agentd_protocol::ProgramRunProgress {
+            Some(construct_protocol::ProgramRunProgress {
                 run_id: "run-1".into(),
                 started_at_ms: now_ms - 1000,
                 expires_at_ms: now_ms + 60_000,
@@ -19104,7 +19104,7 @@ mod tests {
                 first_output_seen: true,
                 queued_behind_current_turn: false,
                 agent_managed: true,
-                stage: agentd_protocol::ProgramRunStage::default(),
+                stage: construct_protocol::ProgramRunStage::default(),
                 settled_block_count: 2,
                 total_block_count: 2,
             }),
@@ -19123,7 +19123,7 @@ mod tests {
         let (mut app, _dir, server) = empty_app().await;
         // Run 1 over a list where each item is its own block (blank-separated):
         // every block shimmers.
-        let id = agentd_protocol::program_block_id;
+        let id = construct_protocol::program_block_id;
         let original = "# Todo\n\n- alpha\n\n- beta\n\n- gamma\n";
         app.start_program_run("s1", original, false, "");
         let pending1 = &app.program_runs["s1"].pending;
@@ -19158,8 +19158,8 @@ mod tests {
         app.start_program_run("s1", "# Todo\n\n- alpha\n", false, "");
         app.start_program_run("s1", "- alpha\n\n- beta\n", true, "- alpha\n");
         let pending = &app.program_runs["s1"].pending;
-        assert!(pending.contains(&agentd_protocol::program_block_id("- alpha")));
-        assert!(pending.contains(&agentd_protocol::program_block_id("- beta")));
+        assert!(pending.contains(&construct_protocol::program_block_id("- alpha")));
+        assert!(pending.contains(&construct_protocol::program_block_id("- beta")));
         server.abort();
     }
 
@@ -19170,7 +19170,7 @@ mod tests {
         // The user is mid-edit (buffer diverges from the saved content).
         app.program_popup.as_mut().unwrap().buffer = "# Todo\n- a\n- human typing\n".into();
         app.on_program_state(
-            agentd_protocol::ProgramDocument {
+            construct_protocol::ProgramDocument {
                 session_id: "s1".into(),
                 markdown: "# Todo\n- a\n- agent added\n".into(),
                 version: 2,
@@ -19190,7 +19190,7 @@ mod tests {
 
     #[tokio::test]
     async fn program_save_merges_disjoint_edits_on_conflict() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tempfile::tempdir;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -19327,7 +19327,7 @@ mod tests {
     #[tokio::test]
     async fn program_at_trigger_filters_and_accepts_harness_smart_clip() {
         let (mut app, _dir, server) = empty_app().await;
-        app.harnesses = vec![agentd_protocol::HarnessInfo {
+        app.harnesses = vec![construct_protocol::HarnessInfo {
             name: "codex".to_string(),
             available: true,
             detail: None,
@@ -19359,7 +19359,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_program_smart_clips_get_unique_instance_ids() {
         let (mut app, _dir, server) = empty_app().await;
-        app.harnesses = vec![agentd_protocol::HarnessInfo {
+        app.harnesses = vec![construct_protocol::HarnessInfo {
             name: "codex".to_string(),
             available: true,
             detail: None,
@@ -19388,10 +19388,10 @@ mod tests {
     #[tokio::test]
     async fn program_smart_clip_candidates_are_grouped_by_type() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("issue 132".to_string());
         app.sessions = vec![session];
-        app.harnesses = vec![agentd_protocol::HarnessInfo {
+        app.harnesses = vec![construct_protocol::HarnessInfo {
             name: "codex".to_string(),
             available: true,
             detail: None,
@@ -19430,8 +19430,8 @@ mod tests {
         server.abort();
     }
 
-    fn harness_info(name: &str, available: bool) -> agentd_protocol::HarnessInfo {
-        agentd_protocol::HarnessInfo {
+    fn harness_info(name: &str, available: bool) -> construct_protocol::HarnessInfo {
+        construct_protocol::HarnessInfo {
             name: name.to_string(),
             available,
             detail: None,
@@ -19444,7 +19444,7 @@ mod tests {
     #[tokio::test]
     async fn program_smart_clip_root_shows_top_then_separator_then_categories() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("issue 132".to_string());
         app.sessions = vec![session];
         app.harnesses = vec![harness_info("codex", true)];
@@ -19477,7 +19477,7 @@ mod tests {
     #[tokio::test]
     async fn program_smart_clip_top_section_ranks_across_types_by_query() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("codex helper".to_string());
         app.sessions = vec![session];
         app.harnesses = vec![harness_info("codex", true)];
@@ -19495,11 +19495,11 @@ mod tests {
     #[tokio::test]
     async fn program_smart_clip_session_category_opens_picker_dialog() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut alpha = summary_with_kind(construct_protocol::SessionKind::User);
         alpha.id = "a".into();
         alpha.title = Some("alpha".into());
         alpha.position = 0;
-        let mut beta = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut beta = summary_with_kind(construct_protocol::SessionKind::User);
         beta.id = "b".into();
         beta.title = Some("beta".into());
         beta.position = 1;
@@ -19549,11 +19549,11 @@ mod tests {
     #[tokio::test]
     async fn session_picker_left_returns_to_program_menu() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut alpha = summary_with_kind(construct_protocol::SessionKind::User);
         alpha.id = "a".into();
         alpha.title = Some("alpha".into());
         alpha.position = 0;
-        let mut beta = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut beta = summary_with_kind(construct_protocol::SessionKind::User);
         beta.id = "b".into();
         beta.title = Some("beta".into());
         beta.position = 1;
@@ -19606,11 +19606,11 @@ mod tests {
     #[tokio::test]
     async fn session_picker_clip_variant_filters_from_buffer_typeahead() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut alpha = summary_with_kind(construct_protocol::SessionKind::User);
         alpha.id = "a".into();
         alpha.title = Some("alpha".into());
         alpha.position = 0;
-        let mut beta = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut beta = summary_with_kind(construct_protocol::SessionKind::User);
         beta.id = "b".into();
         beta.title = Some("beta".into());
         beta.position = 1;
@@ -19673,7 +19673,7 @@ mod tests {
     #[tokio::test]
     async fn session_picker_clip_variant_schedules_content_search_from_typeahead() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut alpha = summary_with_kind(construct_protocol::SessionKind::User);
         alpha.id = "a".into();
         alpha.title = Some("alpha".into());
         app.sessions = vec![alpha];
@@ -19714,11 +19714,11 @@ mod tests {
         if let Some(dialog) = app.session_picker.as_mut() {
             dialog.content_search_deadline = None;
             dialog.content_search_in_flight = false;
-            dialog.content_matches = vec![agentd_protocol::SearchHit {
+            dialog.content_matches = vec![construct_protocol::SearchHit {
                 session_id: "a".into(),
                 title: "alpha".into(),
                 harness: "shell".into(),
-                scope: agentd_protocol::SearchScope::Transcript,
+                scope: construct_protocol::SearchScope::Transcript,
                 seq: Some(4),
                 at: None,
                 snippet: "alpine detour".into(),
@@ -19742,11 +19742,11 @@ mod tests {
     #[tokio::test]
     async fn session_picker_clip_variant_confirms_content_match_as_clip_insert() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut alpha = summary_with_kind(construct_protocol::SessionKind::User);
         alpha.id = "a".into();
         alpha.title = Some("alpha".into());
         alpha.position = 0;
-        let mut target = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut target = summary_with_kind(construct_protocol::SessionKind::User);
         target.id = "target".into();
         target.title = Some("needle notes".into());
         target.position = 1;
@@ -19768,11 +19768,11 @@ mod tests {
         if let Some(dialog) = app.session_picker.as_mut() {
             dialog.content_search_deadline = None;
             dialog.content_search_in_flight = false;
-            dialog.content_matches = vec![agentd_protocol::SearchHit {
+            dialog.content_matches = vec![construct_protocol::SearchHit {
                 session_id: "target".into(),
                 title: "needle notes".into(),
                 harness: "shell".into(),
-                scope: agentd_protocol::SearchScope::Transcript,
+                scope: construct_protocol::SearchScope::Transcript,
                 seq: Some(9),
                 at: None,
                 snippet: "found the needle here".into(),
@@ -19809,17 +19809,17 @@ mod tests {
     #[tokio::test]
     async fn program_smart_clip_session_submenu_groups_and_dims() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut alpha = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut alpha = summary_with_kind(construct_protocol::SessionKind::User);
         alpha.id = "a".into();
         alpha.title = Some("alpha".into());
         alpha.position = 0;
-        let mut beta = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut beta = summary_with_kind(construct_protocol::SessionKind::User);
         beta.id = "b".into();
         beta.title = Some("beta".into());
         beta.position = 0;
         beta.group_id = Some("g1".into());
         app.sessions = vec![alpha, beta];
-        app.groups = vec![agentd_protocol::GroupSummary {
+        app.groups = vec![construct_protocol::GroupSummary {
             id: "g1".into(),
             name: "Proj".into(),
             created_at: chrono::Utc::now(),
@@ -19864,7 +19864,7 @@ mod tests {
     #[tokio::test]
     async fn program_smart_clip_collapse_returns_to_root_on_category() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("alpha".into());
         app.sessions = vec![session];
         app.harnesses = vec![harness_info("codex", true)];
@@ -20375,7 +20375,7 @@ mod tests {
 
     #[test]
     fn prune_window_tree_replaces_stale_sessions_and_preserves_splits() {
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         let tree = MainWindowTree::Split {
             direction: WindowSplitDirection::Right,
@@ -20417,7 +20417,7 @@ mod tests {
     #[tokio::test]
     async fn main_window_sessions_needing_hydration_includes_inactive_splits() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.has_pty = true;
         app.sessions.push(second);
@@ -20461,15 +20461,15 @@ mod tests {
         // must be hydrated so the program hover preview (spec 0060) can paint a
         // live terminal tail instead of degrading to the bare text tooltip.
         let (mut app, _dir, server) = empty_app().await;
-        let mut owner = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut owner = summary_with_kind(construct_protocol::SessionKind::User);
         owner.id = "s1".into();
         owner.has_pty = true;
-        let mut worker = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut worker = summary_with_kind(construct_protocol::SessionKind::User);
         worker.id = "s3".into();
         worker.has_pty = true;
         // A second referenced session with no PTY can't be previewed, so it must
         // not be queued for hydration.
-        let mut no_pty = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut no_pty = summary_with_kind(construct_protocol::SessionKind::User);
         no_pty.id = "s4".into();
         no_pty.has_pty = false;
         app.sessions = vec![owner, worker, no_pty];
@@ -20807,7 +20807,7 @@ mod tests {
     #[tokio::test]
     async fn session_title_rename_enter_commits_via_set_title() {
         let (client, _dir, server) = program_flow_mock_daemon().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("old-name".into());
         let mut app = test_app(client, vec![session]);
         app.selection = Selection::Session("s1".into());
@@ -20833,7 +20833,7 @@ mod tests {
     #[tokio::test]
     async fn session_title_rename_enter_with_empty_buffer_clears_title() {
         let (client, _dir, server) = program_flow_mock_daemon().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("old-name".into());
         let mut app = test_app(client, vec![session]);
         app.selection = Selection::Session("s1".into());
@@ -20927,7 +20927,7 @@ mod tests {
     async fn program_popup_title_name_click_starts_inline_rename() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (mut app, _dir, server) = empty_app().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.id = "s1".into();
         session.title = Some("old-name".into());
         app.sessions = vec![session];
@@ -20997,7 +20997,7 @@ mod tests {
     async fn title_rename_click_outside_commits_like_enter() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (client, _dir, server) = program_flow_mock_daemon().await;
-        let mut session = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
         session.title = Some("old-name".into());
         let mut app = test_app(client, vec![session]);
         app.selection = Selection::Session("s1".into());
@@ -21195,7 +21195,7 @@ mod tests {
     #[tokio::test]
     async fn split_windows_track_individual_pty_sizes() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         app.sessions.push(second);
         app.main_windows = MainWindowTree::Split {
@@ -21239,7 +21239,7 @@ mod tests {
     async fn transcript_toggle_is_scoped_to_focused_split() {
         let (mut app, _dir, server) = captured_app().await;
         // Two PTY-backed sessions side by side; both default to Terminal.
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.has_pty = true;
         app.sessions.push(second);
@@ -21669,7 +21669,7 @@ mod tests {
     #[tokio::test]
     async fn mouse_scrollback_targets_only_hovered_split() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.has_pty = true;
         app.sessions.push(second);
@@ -21726,7 +21726,7 @@ mod tests {
     #[tokio::test]
     async fn program_open_state_survives_split_focus_changes() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.has_pty = true;
         app.sessions.push(second);
@@ -21817,7 +21817,7 @@ mod tests {
     #[tokio::test]
     async fn mouse_list_click_updates_active_split_selection() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.position = 1;
         app.sessions.push(second);
@@ -21855,10 +21855,10 @@ mod tests {
     #[tokio::test]
     async fn program_stays_open_when_clicking_selected_session_in_list() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.position = 0;
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         s2.position = 1;
         app.sessions = vec![s1, s2];
@@ -21890,10 +21890,10 @@ mod tests {
     #[tokio::test]
     async fn clicking_another_session_in_list_stashes_program_not_closes() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.position = 0;
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         s2.position = 1;
         app.sessions = vec![s1, s2];
@@ -21935,10 +21935,10 @@ mod tests {
     async fn on_mouse_list_click_switches_session_with_program_open() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let (mut app, _dir, server) = empty_app().await;
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.position = 0;
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         s2.position = 1;
         app.sessions = vec![s1, s2];
@@ -21993,7 +21993,7 @@ mod tests {
     #[tokio::test]
     async fn mouse_list_click_swaps_session_already_visible_in_another_split() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.position = 1;
         app.sessions.push(second);
@@ -22034,7 +22034,7 @@ mod tests {
     #[tokio::test]
     async fn switch_session_swaps_session_already_visible_in_another_split() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.position = 1;
         app.sessions.push(second);
@@ -22071,7 +22071,7 @@ mod tests {
     #[tokio::test]
     async fn focus_neighbor_updates_split_leaf_when_selected_session_disappears() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.position = 1;
         second.has_pty = false;
@@ -22120,7 +22120,7 @@ mod tests {
     #[tokio::test]
     async fn focus_neighbor_replaces_inactive_split_without_stealing_focus() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.position = 1;
         app.sessions.push(second);
@@ -22157,7 +22157,7 @@ mod tests {
     async fn mouse_pin_strip_click_focuses_tile_without_changing_main_window_or_glitching() {
         let (mut app, _dir, server) = captured_app().await;
         app.sessions[0].pinned = true;
-        let mut second = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut second = summary_with_kind(construct_protocol::SessionKind::User);
         second.id = "s2".into();
         second.position = 1;
         second.pinned = true;
@@ -22677,11 +22677,11 @@ mod tests {
         // `Some` score means "matches" (rendered bright / selectable), `None`
         // means "no match" (dimmed). Covers title, id, harness, and a loose
         // fuzzy subsequence — and confirms non-matches return `None`.
-        let mut shell = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut shell = summary_with_kind(construct_protocol::SessionKind::User);
         shell.id = "shell-session-abcdef".into();
         shell.harness = "shell".into();
         shell.title = Some("Build logs".into());
-        let mut codex = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut codex = summary_with_kind(construct_protocol::SessionKind::User);
         codex.id = "codex-session-abcdef".into();
         codex.harness = "codex".into();
         codex.title = Some("Review PR".into());
@@ -22709,7 +22709,7 @@ mod tests {
     async fn session_picker_app() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
         let (mut app, dir, server) = empty_app().await;
         let mk = |id: &str, title: &str, harness: &str, pos: i64| {
-            let mut s = summary_with_kind(agentd_protocol::SessionKind::User);
+            let mut s = summary_with_kind(construct_protocol::SessionKind::User);
             s.id = id.into();
             s.title = Some(title.into());
             s.harness = harness.into();
@@ -23086,7 +23086,7 @@ mod tests {
             "call-1".into(),
             "shell".into(),
             "echo hi".into(),
-            agentd_protocol::ToolRisk::Risky,
+            construct_protocol::ToolRisk::Risky,
             true,
         );
 
@@ -23113,7 +23113,7 @@ mod tests {
             "call-1".into(),
             "shell".into(),
             "echo hi".into(),
-            agentd_protocol::ToolRisk::Risky,
+            construct_protocol::ToolRisk::Risky,
             true,
         );
 
@@ -23134,7 +23134,7 @@ mod tests {
             "call-1".into(),
             "shell".into(),
             "echo hi".into(),
-            agentd_protocol::ToolRisk::Risky,
+            construct_protocol::ToolRisk::Risky,
             true,
         );
 
@@ -23154,7 +23154,7 @@ mod tests {
             "call-1".into(),
             "shell".into(),
             "echo hi".into(),
-            agentd_protocol::ToolRisk::Risky,
+            construct_protocol::ToolRisk::Risky,
             false,
         );
 
@@ -23171,7 +23171,7 @@ mod tests {
     #[tokio::test]
     async fn approval_prompt_ignores_unselected_session() {
         let (mut app, _dir, server) = captured_app().await;
-        let mut background = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut background = summary_with_kind(construct_protocol::SessionKind::User);
         background.id = "background".into();
         app.sessions.push(background);
         app.selection = Selection::Session("s1".into());
@@ -23181,7 +23181,7 @@ mod tests {
             "call-1".into(),
             "shell".into(),
             "echo hi".into(),
-            agentd_protocol::ToolRisk::Risky,
+            construct_protocol::ToolRisk::Risky,
             true,
         );
 
@@ -23292,7 +23292,7 @@ mod tests {
         // Baseline for the click-parity test below: `y` through the
         // single-keypress fast path restarts and closes the prompt.
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Restart session s1? ".into(),
             input: String::new(),
@@ -23314,7 +23314,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_RESTART
+                .any(|(m, p)| m == construct_protocol::ipc_method::SESSION_RESTART
                     && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "restart RPC should fire for s1, got {calls:?}"
         );
@@ -23324,7 +23324,7 @@ mod tests {
     #[tokio::test]
     async fn restart_confirm_click_y_matches_keypress_outcome() {
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Restart session s1? ".into(),
             input: String::new(),
@@ -23355,7 +23355,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_RESTART
+                .any(|(m, p)| m == construct_protocol::ipc_method::SESSION_RESTART
                     && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "clicking y should fire the same restart RPC the keypress does, got {calls:?}"
         );
@@ -23365,7 +23365,7 @@ mod tests {
     #[tokio::test]
     async fn restart_confirm_click_n_cancels_without_restart() {
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Restart session s1? ".into(),
             input: String::new(),
@@ -23405,7 +23405,7 @@ mod tests {
     #[tokio::test]
     async fn delete_confirm_render_has_three_non_overlapping_choice_hits() {
         let (mut app, _dir, server, _calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Session s1: ".into(),
             input: String::new(),
@@ -23445,7 +23445,7 @@ mod tests {
         // Baseline for the click-parity test below: typing "d" then Enter
         // goes through `run_minibuffer_submit` (family B's keyboard path).
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         let intent = MinibufferIntent::DeleteConfirm {
             session_id: "s1".into(),
         };
@@ -23455,7 +23455,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_DELETE
+                .any(|(m, p)| m == construct_protocol::ipc_method::SESSION_DELETE
                     && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "typing d then Enter should delete the session, got {calls:?}"
         );
@@ -23465,7 +23465,7 @@ mod tests {
     #[tokio::test]
     async fn delete_confirm_click_d_matches_typed_submit_outcome() {
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Session s1: ".into(),
             input: String::new(),
@@ -23495,7 +23495,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_DELETE
+                .any(|(m, p)| m == construct_protocol::ipc_method::SESSION_DELETE
                     && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "clicking d should fire the same delete RPC the typed-submit path does, got {calls:?}"
         );
@@ -23505,7 +23505,7 @@ mod tests {
     #[tokio::test]
     async fn delete_confirm_click_n_cancels_without_delete() {
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Session s1: ".into(),
             input: String::new(),
@@ -23552,7 +23552,7 @@ mod tests {
                 call_id: "call-1".into(),
                 tool: "shell".into(),
                 args_summary: "echo hi".into(),
-                risk: agentd_protocol::ToolRisk::Risky,
+                risk: construct_protocol::ToolRisk::Risky,
                 allow_auto_review,
             },
             error: None,
@@ -23562,7 +23562,7 @@ mod tests {
     #[tokio::test]
     async fn approve_tool_render_shows_all_choices_when_auto_review_allowed() {
         let (mut app, _dir, server, _calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(approve_tool_minibuffer(true));
 
         let mb_area = render_minibuffer_for_test(&mut app);
@@ -23584,7 +23584,7 @@ mod tests {
     #[tokio::test]
     async fn approve_tool_hides_auto_review_choice_when_disallowed() {
         let (mut app, _dir, server, _calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(approve_tool_minibuffer(false));
 
         render_minibuffer_for_test(&mut app);
@@ -23606,7 +23606,7 @@ mod tests {
         // click while an `ApproveTool` prompt was open. Regression guard:
         // clicking "n=deny" must now actually deny the call.
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(approve_tool_minibuffer(true));
 
         let mb_area = render_minibuffer_for_test(&mut app);
@@ -23627,7 +23627,7 @@ mod tests {
         let calls = drain_calls(&mut calls);
         assert!(
             calls.iter().any(|(m, p)| {
-                m == agentd_protocol::ipc_method::SESSION_TOOL_DECISION
+                m == construct_protocol::ipc_method::SESSION_TOOL_DECISION
                     && p.get("call_id").and_then(|v| v.as_str()) == Some("call-1")
                     && p.get("decision").and_then(|v| v.as_str()) == Some("deny")
             }),
@@ -23641,7 +23641,7 @@ mod tests {
         // Covers the third distinct choice-cluster shape (3 choices, none
         // of them plain y/N: `y`/`all`/`N`).
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Delete project 'demo'? ".into(),
             input: String::new(),
@@ -23670,7 +23670,7 @@ mod tests {
         let calls = drain_calls(&mut calls);
         assert!(
             calls.iter().any(|(m, p)| {
-                m == agentd_protocol::ipc_method::PROJECT_DELETE
+                m == construct_protocol::ipc_method::PROJECT_DELETE
                     && p.get("project_id").and_then(|v| v.as_str()) == Some("g1")
                     && p.get("delete_members").and_then(|v| v.as_bool()) == Some(true)
             }),
@@ -23685,7 +23685,7 @@ mod tests {
         // `ArchivedDeleteConfirm` / `MenuArchiveConfirm` /
         // `MenuUnarchiveConfirm` / `MenuDeleteConfirm`.
         let (mut app, _dir, server, mut calls) =
-            choice_click_app(vec![summary_with_kind(agentd_protocol::SessionKind::User)]).await;
+            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Archive session s1? ".into(),
             input: String::new(),
@@ -23715,7 +23715,7 @@ mod tests {
         assert!(
             calls
                 .iter()
-                .any(|(m, p)| m == agentd_protocol::ipc_method::SESSION_ARCHIVE
+                .any(|(m, p)| m == construct_protocol::ipc_method::SESSION_ARCHIVE
                     && p.get("session_id").and_then(|v| v.as_str()) == Some("s1")),
             "clicking y should archive the session, got {calls:?}"
         );
@@ -23793,7 +23793,7 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.has_pty = true;
         let app = test_app(client, vec![summary]);
         (app, dir, server)
@@ -23832,9 +23832,9 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         let app = test_app(client, vec![s1, s2]);
         (app, dir, server)
@@ -23848,7 +23848,7 @@ mod tests {
         let (app, _dir, _server) = two_session_app().await;
         assert_eq!(
             app.sessions[0].state,
-            agentd_protocol::SessionState::Running
+            construct_protocol::SessionState::Running
         );
         let theme = app.theme.clone();
         let mut wanted = Vec::new();
@@ -24149,10 +24149,10 @@ mod tests {
         // PTY -> dirties; off-screen session PTY -> does not; structural events
         // and pinned/orchestrator sessions -> always dirty.
         let (mut app, _dir, server) = empty_app().await;
-        let mut vis = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut vis = summary_with_kind(construct_protocol::SessionKind::User);
         vis.id = "vis".into();
         vis.has_pty = true;
-        let mut bg = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut bg = summary_with_kind(construct_protocol::SessionKind::User);
         bg.id = "bg".into();
         bg.has_pty = true;
         app.sessions = vec![vis, bg];
@@ -24163,7 +24163,7 @@ mod tests {
         async fn feed(app: &mut App, session: &str, event: SessionEvent) {
             app.on_notification(Notification {
                 jsonrpc: "2.0".into(),
-                method: agentd_protocol::ipc_notif::EVENT.into(),
+                method: construct_protocol::ipc_notif::EVENT.into(),
                 params: Some(
                     serde_json::to_value(EventNotificationPayload {
                         session_id: session.into(),
@@ -24198,7 +24198,7 @@ mod tests {
             &mut app,
             "bg",
             SessionEvent::Status {
-                state: agentd_protocol::SessionState::Done,
+                state: construct_protocol::SessionState::Done,
                 detail: None,
             },
         )
@@ -24261,7 +24261,7 @@ mod tests {
         async fn feed(app: &mut App, event: SessionEvent, seq: u64) {
             let n = Notification {
                 jsonrpc: "2.0".into(),
-                method: agentd_protocol::ipc_notif::EVENT.into(),
+                method: construct_protocol::ipc_notif::EVENT.into(),
                 params: Some(
                     serde_json::to_value(EventNotificationPayload {
                         session_id: "op".into(),
@@ -24275,14 +24275,14 @@ mod tests {
             app.on_notification(n).await;
         }
         fn working() -> SessionEvent {
-            SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
+            SessionEvent::AgentStatus(construct_protocol::AgentStatus {
                 active: true,
                 started_at_ms: 1,
                 status: "Working".into(),
             })
         }
         fn worked() -> SessionEvent {
-            SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
+            SessionEvent::AgentStatus(construct_protocol::AgentStatus {
                 active: false,
                 started_at_ms: 1,
                 status: "Worked".into(),
@@ -24802,7 +24802,7 @@ mod tests {
     #[tokio::test]
     async fn empty_state_shortcut_clicks_dispatch_actions() {
         let (mut app, _dir, server) = empty_app().await;
-        app.harnesses = vec![agentd_protocol::HarnessInfo {
+        app.harnesses = vec![construct_protocol::HarnessInfo {
             name: "shell".to_string(),
             available: true,
             detail: None,
@@ -24858,7 +24858,7 @@ mod tests {
     #[tokio::test]
     async fn fork_picker_defaults_to_source_harness_without_prompt_stage() {
         let (mut app, _dir, server) = captured_app().await;
-        app.harnesses = vec![agentd_protocol::HarnessInfo {
+        app.harnesses = vec![construct_protocol::HarnessInfo {
             name: "shell".to_string(),
             available: true,
             detail: None,
@@ -25615,10 +25615,10 @@ mod tests {
 
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            method: construct_protocol::ipc_notif::PROGRAM_STATE.into(),
             params: Some(
-                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
-                    program: agentd_protocol::ProgramDocument {
+                serde_json::to_value(construct_protocol::ProgramStateNotificationPayload {
+                    program: construct_protocol::ProgramDocument {
                         session_id: "s1".into(),
                         markdown: "# Rule\n\n## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n"
                             .into(),
@@ -25656,12 +25656,12 @@ mod tests {
 
         // A subagent spawning during step 6 (kind Subagent, parented to the
         // session the agent runs in) is accepted and its parent adopted.
-        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub.id = "sub-1".into();
         sub.parent_session_id = Some("s1".into());
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::STATE.into(),
+            method: construct_protocol::ipc_notif::STATE.into(),
             params: Some(serde_json::to_value(StateNotificationPayload { session: sub }).unwrap()),
         })
         .await;
@@ -25684,10 +25684,10 @@ mod tests {
         app2.tutorial.as_mut().unwrap().step = 6;
         app2.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            method: construct_protocol::ipc_notif::PROGRAM_STATE.into(),
             params: Some(
-                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
-                    program: agentd_protocol::ProgramDocument {
+                serde_json::to_value(construct_protocol::ProgramStateNotificationPayload {
+                    program: construct_protocol::ProgramDocument {
                         session_id: "s1".into(), // selected in captured_app
                         markdown: "## Todo\n\n## In Progress\n\n## Done\n\n- Test task\n".into(),
                         version: 1,
@@ -25712,10 +25712,10 @@ mod tests {
         app3.tutorial.as_mut().unwrap().step = 6;
         app3.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::PROGRAM_STATE.into(),
+            method: construct_protocol::ipc_notif::PROGRAM_STATE.into(),
             params: Some(
-                serde_json::to_value(agentd_protocol::ProgramStateNotificationPayload {
-                    program: agentd_protocol::ProgramDocument {
+                serde_json::to_value(construct_protocol::ProgramStateNotificationPayload {
+                    program: construct_protocol::ProgramDocument {
                         session_id: "unrelated".into(),
                         markdown: "## Done\n\n- Test task\n".into(),
                         version: 1,
@@ -25749,12 +25749,12 @@ mod tests {
             t.step = 6;
             t.practice_session_id = Some("s1".into());
         }
-        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub.id = "sub-9".into();
         sub.parent_session_id = Some("s1".into());
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::STATE.into(),
+            method: construct_protocol::ipc_notif::STATE.into(),
             params: Some(serde_json::to_value(StateNotificationPayload { session: sub }).unwrap()),
         })
         .await;
@@ -25768,12 +25768,12 @@ mod tests {
         );
 
         // A child of some OTHER session is ignored when practice is known.
-        let mut other = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut other = summary_with_kind(construct_protocol::SessionKind::Subagent);
         other.id = "sub-other".into();
         other.parent_session_id = Some("someone-else".into());
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::STATE.into(),
+            method: construct_protocol::ipc_notif::STATE.into(),
             params: Some(
                 serde_json::to_value(StateNotificationPayload { session: other }).unwrap(),
             ),
@@ -25823,7 +25823,7 @@ mod tests {
         updated.position = 5;
         app.on_notification(Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::STATE.into(),
+            method: construct_protocol::ipc_notif::STATE.into(),
             params: Some(
                 serde_json::to_value(StateNotificationPayload { session: updated }).unwrap(),
             ),
@@ -26179,7 +26179,7 @@ mod tests {
     #[tokio::test]
     async fn vim_i_opens_send_input_when_selected_session_has_no_live_pty() {
         let (mut app, _dir, server) = empty_app().await;
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.has_pty = false;
         app.sessions = vec![summary];
         app.selection = Selection::Session("s1".into());
@@ -26513,7 +26513,7 @@ mod tests {
         });
 
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.has_pty = true;
         let mut app = test_app(client, vec![summary]);
         app.connected = false;
@@ -26543,9 +26543,9 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         let mut app = test_app(client, vec![s1, s2]);
         assert_eq!(app.selection.session_id(), Some("s1"));
@@ -26594,7 +26594,7 @@ mod tests {
     // self-heal whenever the Terminal view has no history.
     #[tokio::test]
     async fn terminal_view_rehydrates_after_history_dropped() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -26606,7 +26606,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.has_pty = true;
         let mut app = test_app(client, vec![summary]);
         app.view = ViewMode::Terminal;
@@ -26623,14 +26623,14 @@ mod tests {
         // A Reset event drops the history while the session stays selected
         // (transcript_session stays == "s1", so the old transcript-only
         // trigger would never re-fire).
-        let reset = agentd_protocol::Notification {
+        let reset = construct_protocol::Notification {
             jsonrpc: "2.0".into(),
-            method: agentd_protocol::ipc_notif::EVENT.into(),
+            method: construct_protocol::ipc_notif::EVENT.into(),
             params: Some(
-                serde_json::to_value(agentd_protocol::EventNotificationPayload {
+                serde_json::to_value(construct_protocol::EventNotificationPayload {
                     session_id: "s1".into(),
                     at: chrono::Utc::now(),
-                    event: agentd_protocol::SessionEvent::Reset,
+                    event: construct_protocol::SessionEvent::Reset,
                     seq: 1,
                 })
                 .unwrap(),
@@ -26663,7 +26663,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_selected_hydration_warms_history_without_replacing_transcript() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use serde_json::Value;
         use tempfile::tempdir;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26711,10 +26711,10 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         s1.has_pty = true;
-        let mut s2 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
         s2.id = "s2".into();
         s2.has_pty = true;
         let mut app = test_app(client, vec![s1, s2]);
@@ -26728,7 +26728,7 @@ mod tests {
                 seq: 1,
                 at: chrono::Utc::now(),
                 event: SessionEvent::Message {
-                    role: agentd_protocol::MessageRole::Assistant,
+                    role: construct_protocol::MessageRole::Assistant,
                     text: "old selected transcript".into(),
                 },
             }],
@@ -26760,10 +26760,10 @@ mod tests {
 
     #[tokio::test]
     async fn orchestrator_hydration_loads_existing_sticky_widgets() {
-        use agentd_protocol::{UiPanel, UiPlacement};
+        use construct_protocol::{UiPanel, UiPlacement};
 
         let (mut app, _dir, server) = captured_app().await;
-        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        let mut orch = summary_with_kind(construct_protocol::SessionKind::Orchestrator);
         orch.id = "orch".into();
         orch.has_pty = true;
         app.sessions.push(orch);
@@ -26808,10 +26808,10 @@ mod tests {
     // the preview is gone — in lock-step with the terminal-view overlay.
     #[tokio::test]
     async fn operator_matrix_widgets_render_without_unbounded_padding() {
-        use agentd_protocol::{UiPanel, UiPlacement};
+        use construct_protocol::{UiPanel, UiPlacement};
 
         let (mut app, _dir, server) = captured_app().await;
-        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        let mut orch = summary_with_kind(construct_protocol::SessionKind::Orchestrator);
         orch.id = "orch".into();
         app.sessions.push(orch);
         app.refresh_orchestrator_id();
@@ -26876,11 +26876,11 @@ mod tests {
 
     #[tokio::test]
     async fn matrix_widget_hover_previews_over_pin_then_reverts() {
-        use agentd_protocol::{UiPanel, UiPlacement};
+        use construct_protocol::{UiPanel, UiPlacement};
         use std::time::{Duration, Instant};
 
         let (mut app, _dir, server) = captured_app().await;
-        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        let mut orch = summary_with_kind(construct_protocol::SessionKind::Orchestrator);
         orch.id = "orch".into();
         app.sessions.push(orch);
         app.refresh_orchestrator_id();
@@ -26934,10 +26934,10 @@ mod tests {
 
     #[tokio::test]
     async fn matrix_widget_hover_keeps_title_icon_outline_until_pinned() {
-        use agentd_protocol::{UiPanel, UiPlacement};
+        use construct_protocol::{UiPanel, UiPlacement};
 
         let (mut app, _dir, server) = captured_app().await;
-        let mut orch = summary_with_kind(agentd_protocol::SessionKind::Orchestrator);
+        let mut orch = summary_with_kind(construct_protocol::SessionKind::Orchestrator);
         orch.id = "orch".into();
         app.sessions.push(orch);
         app.refresh_orchestrator_id();
@@ -27083,7 +27083,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_title_marks_pending_approval_and_toggles_panel_on_click() {
-        use agentd_protocol::SessionKind;
+        use construct_protocol::SessionKind;
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 
         let (mut app, _dir, server) = captured_app().await;
@@ -27206,7 +27206,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_widgets_render_as_title_bar_indicators_by_creation_time() {
-        use agentd_protocol::{UiPanel, UiPlacement};
+        use construct_protocol::{UiPanel, UiPlacement};
 
         let (mut app, _dir, server) = captured_app().await;
         app.dynamic_ui_selected
@@ -27271,7 +27271,7 @@ mod tests {
     /// the sidebar's lineage section (spec 0081) to render while `s1` (or
     /// the fork) is selected.
     async fn test_app_with_lineage() -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("construct.sock");
@@ -27284,11 +27284,11 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut root = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut root = summary_with_kind(construct_protocol::SessionKind::User);
         root.has_pty = true;
-        let mut fork = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
         fork.id = "s1-fork".into();
-        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "s1".into(),
             transcript_seq: 0,
             at_ms: 0,
@@ -27547,12 +27547,12 @@ mod tests {
     ) -> (App, tempfile::TempDir, tokio::task::JoinHandle<()>) {
         let (mut app, dir, server) = test_app_with_lineage().await;
         for i in 0..4 {
-            let mut fork = summary_with_kind(agentd_protocol::SessionKind::User);
+            let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
             fork.id = format!("wide-{i}");
             fork.title = Some(format!(
                 "a rather long fork title that overflows the sidebar {i}"
             ));
-            fork.forked_from = Some(agentd_protocol::ForkedFrom {
+            fork.forked_from = Some(construct_protocol::ForkedFrom {
                 session_id: "s1".into(),
                 transcript_seq: 0,
                 at_ms: 0,
@@ -27697,7 +27697,7 @@ mod tests {
 
     #[tokio::test]
     async fn selecting_a_subagent_keeps_the_lineage_section() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("construct.sock");
@@ -27710,8 +27710,8 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let root = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let root = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub.id = "s1-sub".into();
         sub.parent_session_id = Some("s1".into());
         let mut app = test_app(client, vec![root, sub]);
@@ -27827,7 +27827,7 @@ mod tests {
 
     #[tokio::test]
     async fn clicking_the_subagents_marker_expands_and_recollapses_the_group() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("construct.sock");
@@ -27840,8 +27840,8 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let root = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let root = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub.id = "s1-sub".into();
         sub.parent_session_id = Some("s1".into());
         let mut app = test_app(client, vec![root, sub]);
@@ -27910,7 +27910,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_subagents_marker_highlights_with_hover_and_selection() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use ratatui::style::Modifier;
         use tokio::net::UnixListener;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -27924,8 +27924,8 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let root = summary_with_kind(agentd_protocol::SessionKind::User);
-        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let root = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub.id = "s1-sub".into();
         sub.parent_session_id = Some("s1".into());
         let mut app = test_app(client, vec![root, sub]);
@@ -28202,7 +28202,7 @@ mod tests {
         // Regression test: a box starting right of the viewport used to
         // subtract with overflow when clipping hit rects. A 4-level fork
         // nest in the boxed-lane mode overflows the narrow sidebar.
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("construct.sock");
@@ -28215,13 +28215,13 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut sessions = vec![summary_with_kind(agentd_protocol::SessionKind::User)];
+        let mut sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
         let mut parent = "s1".to_string();
         for i in 0..4 {
-            let mut nested = summary_with_kind(agentd_protocol::SessionKind::User);
+            let mut nested = summary_with_kind(construct_protocol::SessionKind::User);
             nested.id = format!("nested-{i}");
             nested.title = Some(format!("a rather long fork title {i}"));
-            nested.forked_from = Some(agentd_protocol::ForkedFrom {
+            nested.forked_from = Some(construct_protocol::ForkedFrom {
                 session_id: parent.clone(),
                 transcript_seq: 0,
                 at_ms: 0,
@@ -28254,9 +28254,9 @@ mod tests {
         // A fork of the fork must also appear (recursive nesting) — it used
         // to vanish from the list entirely: excluded from the top level for
         // having `forked_from`, but never pushed under its parent either.
-        let mut nested = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut nested = summary_with_kind(construct_protocol::SessionKind::User);
         nested.id = "s1-fork-fork".into();
-        nested.forked_from = Some(agentd_protocol::ForkedFrom {
+        nested.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "s1-fork".into(),
             transcript_seq: 0,
             at_ms: 0,
@@ -28289,7 +28289,7 @@ mod tests {
 
     #[tokio::test]
     async fn matrix_rain_paints_browser_preview_wallpaper() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28301,7 +28301,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut s1 = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
         s1.id = "s1".into();
         let mut app = test_app(client, vec![s1]);
         app.matrix_rain_hidden = false;
@@ -28408,13 +28408,13 @@ mod tests {
     #[test]
     fn only_user_sessions_are_visible_list_items() {
         assert!(is_user_list_session(&summary_with_kind(
-            agentd_protocol::SessionKind::User
+            construct_protocol::SessionKind::User
         )));
         assert!(!is_user_list_session(&summary_with_kind(
-            agentd_protocol::SessionKind::Orchestrator
+            construct_protocol::SessionKind::Orchestrator
         )));
         assert!(!is_user_list_session(&summary_with_kind(
-            agentd_protocol::SessionKind::Subagent
+            construct_protocol::SessionKind::Subagent
         )));
     }
 
@@ -28432,18 +28432,18 @@ mod tests {
             }
         });
         let client = Client::connect(&sock).await.expect("client connects");
-        let mut parent = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut parent = summary_with_kind(construct_protocol::SessionKind::User);
         parent.id = "sparent".into();
         parent.position = 0;
-        let mut child = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut child = summary_with_kind(construct_protocol::SessionKind::Subagent);
         child.id = "schild".into();
         child.parent_session_id = Some("sparent".into());
         child.position = 1;
-        let mut grandchild = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut grandchild = summary_with_kind(construct_protocol::SessionKind::Subagent);
         grandchild.id = "sgrandchild".into();
         grandchild.parent_session_id = Some("schild".into());
         grandchild.position = 2;
-        let mut orphan = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut orphan = summary_with_kind(construct_protocol::SessionKind::Subagent);
         orphan.id = "sorphan".into();
         orphan.position = -1;
 
@@ -28524,21 +28524,21 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut parent = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut parent = summary_with_kind(construct_protocol::SessionKind::User);
         parent.id = "sparent".into();
         parent.position = 0;
-        let mut active_child = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut active_child = summary_with_kind(construct_protocol::SessionKind::Subagent);
         active_child.id = "sactive-child".into();
         active_child.parent_session_id = Some("sparent".into());
         active_child.position = 0;
-        let mut archived_child = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut archived_child = summary_with_kind(construct_protocol::SessionKind::Subagent);
         archived_child.id = "sarchived-child".into();
         archived_child.parent_session_id = Some("sparent".into());
         archived_child.position = 1;
         archived_child.archived = true;
-        let mut fork = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
         fork.id = "sfork".into();
-        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "sparent".into(),
             transcript_seq: 0,
             at_ms: 0,
@@ -28599,7 +28599,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_items_hides_archived_behind_expandable_row() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28614,14 +28614,14 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut active = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut active = summary_with_kind(construct_protocol::SessionKind::User);
         active.id = "active".into();
         active.position = 0;
-        let mut archived = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut archived = summary_with_kind(construct_protocol::SessionKind::User);
         archived.id = "archived".into();
         archived.position = 1;
         archived.archived = true;
-        let mut subagent = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut subagent = summary_with_kind(construct_protocol::SessionKind::Subagent);
         subagent.id = "subagent".into();
         subagent.parent_session_id = Some("active".into());
 
@@ -28674,7 +28674,7 @@ mod tests {
 
     #[tokio::test]
     async fn archived_row_is_navigable_and_arrows_expand_collapse_it() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28689,10 +28689,10 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut active = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut active = summary_with_kind(construct_protocol::SessionKind::User);
         active.id = "active".into();
         active.position = 0;
-        let mut archived = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut archived = summary_with_kind(construct_protocol::SessionKind::User);
         archived.id = "arch".into();
         archived.position = 1;
         archived.archived = true;
@@ -28729,7 +28729,7 @@ mod tests {
 
     #[tokio::test]
     async fn next_session_skips_collapsed_top_level_archived_row_before_project() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28744,14 +28744,14 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut top_level = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut top_level = summary_with_kind(construct_protocol::SessionKind::User);
         top_level.id = "top-level".into();
         top_level.position = 0;
-        let mut archived = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut archived = summary_with_kind(construct_protocol::SessionKind::User);
         archived.id = "archived".into();
         archived.position = 1;
         archived.archived = true;
-        let mut project_member = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut project_member = summary_with_kind(construct_protocol::SessionKind::User);
         project_member.id = "project-member".into();
         project_member.group_id = Some("project".into());
 
@@ -28791,7 +28791,7 @@ mod tests {
 
     #[tokio::test]
     async fn archived_section_resolves_only_its_archived_members() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -28807,37 +28807,37 @@ mod tests {
         let client = Client::connect(&sock).await.expect("client connects");
 
         // Ungrouped: one active + one archived.
-        let mut ung_active = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut ung_active = summary_with_kind(construct_protocol::SessionKind::User);
         ung_active.id = "ung_active".into();
-        let mut ung_arch = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut ung_arch = summary_with_kind(construct_protocol::SessionKind::User);
         ung_arch.id = "ung_arch".into();
         ung_arch.archived = true;
 
         // Project "p1": one active + one archived member.
-        let mut grp_active = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut grp_active = summary_with_kind(construct_protocol::SessionKind::User);
         grp_active.id = "grp_active".into();
         grp_active.group_id = Some("p1".into());
-        let mut grp_arch = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut grp_arch = summary_with_kind(construct_protocol::SessionKind::User);
         grp_arch.id = "grp_arch".into();
         grp_arch.group_id = Some("p1".into());
         grp_arch.archived = true;
 
         // Subagents of "ung_active": one active + one archived.
-        let mut sub_active = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut sub_active = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub_active.id = "sub_active".into();
         sub_active.parent_session_id = Some("ung_active".into());
-        let mut sub_arch = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut sub_arch = summary_with_kind(construct_protocol::SessionKind::Subagent);
         sub_arch.id = "sub_arch".into();
         sub_arch.parent_session_id = Some("ung_active".into());
         sub_arch.archived = true;
 
         // Archived native mirrors remain visible in their disclosure row but
         // are not valid lifecycle targets for Construct.
-        let mut native_arch = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        let mut native_arch = summary_with_kind(construct_protocol::SessionKind::Subagent);
         native_arch.id = "native_arch".into();
         native_arch.parent_session_id = Some("native_owner".into());
         native_arch.archived = true;
-        native_arch.native_subagent = Some(agentd_protocol::NativeSubagentRef {
+        native_arch.native_subagent = Some(construct_protocol::NativeSubagentRef {
             owner_session_id: "native_owner".into(),
             native_id: "child-1".into(),
             projected_seq: 0,
@@ -28909,10 +28909,10 @@ mod tests {
 
     #[test]
     fn list_session_indent_policy_distinguishes_subagents_and_grouped_parents() {
-        let user = summary_with_kind(agentd_protocol::SessionKind::User);
-        let subagent = summary_with_kind(agentd_protocol::SessionKind::Subagent);
-        let mut fork = summary_with_kind(agentd_protocol::SessionKind::User);
-        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+        let user = summary_with_kind(construct_protocol::SessionKind::User);
+        let subagent = summary_with_kind(construct_protocol::SessionKind::Subagent);
+        let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "parent".into(),
             transcript_seq: 0,
             at_ms: 0,
@@ -28956,8 +28956,8 @@ mod tests {
 
     #[tokio::test]
     async fn pty_typing_does_not_wait_for_input_rpc_response() {
-        use agentd_client::Client;
-        use agentd_protocol::ipc_method;
+        use construct_client::Client;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use std::sync::Arc;
         use tempfile::tempdir;
@@ -29011,7 +29011,7 @@ mod tests {
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(
             client,
-            vec![summary_with_kind(agentd_protocol::SessionKind::User)],
+            vec![summary_with_kind(construct_protocol::SessionKind::User)],
         );
         app.sessions[0].has_pty = true;
 
@@ -29035,8 +29035,8 @@ mod tests {
 
     #[tokio::test]
     async fn large_tui_paste_uploads_attachment_and_inserts_reference() {
-        use agentd_client::Client;
-        use agentd_protocol::ipc_method;
+        use construct_client::Client;
+        use construct_protocol::ipc_method;
         use base64::Engine as _;
         use serde_json::Value;
         use tempfile::tempdir;
@@ -29082,7 +29082,7 @@ mod tests {
         let client = Client::connect(&sock).await.expect("client connects");
         let mut app = test_app(
             client,
-            vec![summary_with_kind(agentd_protocol::SessionKind::User)],
+            vec![summary_with_kind(construct_protocol::SessionKind::User)],
         );
         app.minibuffer = Some(Minibuffer {
             prompt: "Input: ".into(),
@@ -29154,7 +29154,7 @@ mod tests {
     // rebuild-per-keystroke was the typing lag. Structural, timing-free.
     #[tokio::test]
     async fn smith_editor_growth_does_not_resize_chat_parser() {
-        use agentd_client::Client;
+        use construct_client::Client;
         use tokio::net::UnixListener;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -29166,7 +29166,7 @@ mod tests {
         });
         let client = Client::connect(&sock).await.expect("client connects");
 
-        let mut summary = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut summary = summary_with_kind(construct_protocol::SessionKind::User);
         summary.harness = "smith".into();
         summary.has_pty = true;
         let mut app = test_app(client, vec![summary]);
@@ -29254,8 +29254,8 @@ mod tests {
 
     #[tokio::test]
     async fn background_hydration_does_not_block_primary_client_rpc() {
-        use agentd_client::Client;
-        use agentd_protocol::ipc_method;
+        use construct_client::Client;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use std::sync::Arc;
         use tempfile::tempdir;
@@ -29387,7 +29387,7 @@ mod tests {
     /// a mock daemon serving a PTY-less transcript.
     #[tokio::test]
     async fn headless_session_history_reconstructed_on_hydration() {
-        use agentd_protocol::ipc_method;
+        use construct_protocol::ipc_method;
         use serde_json::Value;
         use tempfile::tempdir;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -29548,7 +29548,7 @@ mod tests {
     /// raw chat with no synthesized blocks at any scroll position.
     #[test]
     fn task_start_in_transcript_creates_tool_block() {
-        use agentd_protocol::{AgentStatus, SessionEvent, TimestampedEvent};
+        use construct_protocol::{AgentStatus, SessionEvent, TimestampedEvent};
         use chrono::Utc;
         fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
             TimestampedEvent {
@@ -29622,7 +29622,7 @@ mod tests {
     /// it's PTY-backed (the prose is already in the PTY stream there).
     #[test]
     fn transcript_replay_renders_messages_only_when_headless() {
-        use agentd_protocol::{MessageRole, SessionEvent, TimestampedEvent};
+        use construct_protocol::{MessageRole, SessionEvent, TimestampedEvent};
         use chrono::Utc;
         fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
             TimestampedEvent {
@@ -29650,7 +29650,7 @@ mod tests {
         let render = |is_headless: bool| {
             let mut history = crate::pty_render::ItemHistory::new();
             let mut editor: Option<EditorState> = None;
-            let mut status: Option<agentd_protocol::AgentStatus> = None;
+            let mut status: Option<construct_protocol::AgentStatus> = None;
             apply_transcript_to_local_state(
                 &events,
                 &mut history,
@@ -29693,7 +29693,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_preserves_answer_after_tool_order() {
-        use agentd_protocol::{SessionEvent, TimestampedEvent};
+        use construct_protocol::{SessionEvent, TimestampedEvent};
         use chrono::Utc;
 
         fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
@@ -29769,7 +29769,7 @@ mod tests {
 
     #[test]
     fn transcript_replay_restores_completed_turn_status_line() {
-        use agentd_protocol::{AgentStatus, SessionEvent, TimestampedEvent};
+        use construct_protocol::{AgentStatus, SessionEvent, TimestampedEvent};
         use chrono::Utc;
 
         let started_at_ms = SystemTime::now()
@@ -29832,7 +29832,7 @@ mod tests {
 
     #[test]
     fn ui_panel_replay_tracks_create_patch_delete() {
-        use agentd_protocol::{SessionEvent, TimestampedEvent, UiPanel, UiPlacement};
+        use construct_protocol::{SessionEvent, TimestampedEvent, UiPanel, UiPlacement};
         use chrono::Utc;
         fn ev(seq: u64, event: SessionEvent) -> TimestampedEvent {
             TimestampedEvent {
@@ -29955,7 +29955,7 @@ mod tests {
     /// `AgentStatus`) from the transcript fixes it.
     #[test]
     fn apply_transcript_replays_latest_editor_state_for_bootstrap() {
-        use agentd_protocol::SessionEvent;
+        use construct_protocol::SessionEvent;
         use chrono::TimeZone;
 
         fn ev(seq: u64, e: SessionEvent) -> TimestampedEvent {
@@ -30000,7 +30000,7 @@ mod tests {
 
         let mut history = crate::pty_render::ItemHistory::new();
         let mut editor_state: Option<EditorState> = None;
-        let mut agent_status: Option<agentd_protocol::AgentStatus> = None;
+        let mut agent_status: Option<construct_protocol::AgentStatus> = None;
         let mut ui_panels = HashMap::new();
         apply_transcript_to_local_state(
             &events,
@@ -30101,7 +30101,7 @@ fn parse_markdown_action_target(target: &str) -> (String, Option<String>, bool) 
     (id.to_string(), key, close)
 }
 
-fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
+fn markdown_actions(markdown: &str) -> Vec<construct_protocol::UiAction> {
     let mut out = Vec::new();
     let mut rest = markdown;
     while let Some(label_start) = rest.find('[') {
@@ -30120,7 +30120,7 @@ fn markdown_actions(markdown: &str) -> Vec<agentd_protocol::UiAction> {
         };
         let (id, key, close) = parse_markdown_action_target(&after_open[..id_end]);
         if !label.is_empty() && !id.is_empty() {
-            out.push(agentd_protocol::UiAction {
+            out.push(construct_protocol::UiAction {
                 id,
                 label: label.to_string(),
                 key,

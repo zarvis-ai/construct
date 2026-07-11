@@ -12,9 +12,9 @@
 //! `CONSTRUCT_GROK_MODE=interactive|headless`. Honors `CONSTRUCT_GROK_CMD` for a
 //! full command prefix, falling back to `CONSTRUCT_GROK_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
-use agentd_protocol::{
+use construct_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use construct_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use construct_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
@@ -70,8 +70,8 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
     }
 }
 
-fn command_override() -> agentd_protocol::adapter::CommandOverride {
-    agentd_protocol::adapter::resolve_command_override(
+fn command_override() -> construct_protocol::adapter::CommandOverride {
+    construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_GROK_CMD",
         "CONSTRUCT_GROK_BIN",
         "grok",
@@ -459,7 +459,7 @@ fn apply_grok_native_update(
 }
 
 fn grok_allow_args() -> Vec<String> {
-    let policy = agentd_protocol::adapter::policy::AutoApprovePolicy::from_env();
+    let policy = construct_protocol::adapter::policy::AutoApprovePolicy::from_env();
     let mut out = Vec::new();
     for root in policy.allow_paths() {
         let glob = format!("{}/**", root.display());
@@ -728,7 +728,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(
+                    message: construct_protocol::adapter::missing_bin_hint(
                         &command_override.argv_preview(),
                         &e,
                     ),

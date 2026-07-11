@@ -12,7 +12,7 @@ use crate::app::{
 use crate::keymap::{KeyAction, Profile};
 use crate::text_util::wrap_to_width;
 use crate::theme::Theme;
-use agentd_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
+use construct_protocol::{MessageRole, SessionEvent, SessionState, SessionSummary, TimestampedEvent};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -884,13 +884,13 @@ pub fn dynamic_ui_trigger_range(
     (x_end.saturating_sub(label_width), x_end, view_area.y)
 }
 
-fn session_sticky_widget_panels(app: &App, session_id: &str) -> Vec<agentd_protocol::UiPanel> {
+fn session_sticky_widget_panels(app: &App, session_id: &str) -> Vec<construct_protocol::UiPanel> {
     let Some(panels) = app.ui_panels.get(session_id) else {
         return Vec::new();
     };
     let mut panels: Vec<_> = panels
         .values()
-        .filter(|panel| panel.placement != agentd_protocol::UiPlacement::Inline)
+        .filter(|panel| panel.placement != construct_protocol::UiPlacement::Inline)
         .cloned()
         .collect();
     panels.sort_by(|a, b| {
@@ -905,7 +905,7 @@ fn render_session_widget_title(
     app: &mut App,
     view_area: Rect,
     session_id: String,
-    panels: Vec<agentd_protocol::UiPanel>,
+    panels: Vec<construct_protocol::UiPanel>,
     close_width: u16,
     reserved_right_width: u16,
     border_style: Style,
@@ -3174,7 +3174,7 @@ fn fleet_activity_target(app: &App, now: Instant) -> f32 {
     for s in app
         .sessions
         .iter()
-        .filter(|s| s.kind == agentd_protocol::SessionKind::User)
+        .filter(|s| s.kind == construct_protocol::SessionKind::User)
     {
         let active_agent = app
             .agent_statuses
@@ -3683,7 +3683,7 @@ fn render_main_windows(f: &mut Frame, area: Rect, app: &mut App) {
 fn apply_pane_title_right_cluster<'a>(
     app: &mut App,
     area: Rect,
-    summary: Option<&agentd_protocol::SessionSummary>,
+    summary: Option<&construct_protocol::SessionSummary>,
     border_style: Style,
     show_close: bool,
     session_actions: bool,
@@ -4338,9 +4338,9 @@ fn render_group_overview(
     f: &mut Frame,
     area: Rect,
     app: &App,
-    group: &agentd_protocol::GroupSummary,
+    group: &construct_protocol::GroupSummary,
 ) {
-    let members: Vec<&agentd_protocol::SessionSummary> = app
+    let members: Vec<&construct_protocol::SessionSummary> = app
         .sessions
         .iter()
         .filter(|s| s.group_id.as_deref() == Some(group.id.as_str()))
@@ -4386,7 +4386,7 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     let Some(id) = app.selected_id() else {
         return;
     };
-    let panels: Vec<agentd_protocol::UiPanel> = app
+    let panels: Vec<construct_protocol::UiPanel> = app
         .ui_panels
         .get(&id)
         .map(|m| {
@@ -4400,7 +4400,7 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     let inline_panel = latest_inline_panel(&panels);
     let sticky_panels: Vec<_> = panels
         .iter()
-        .filter(|panel| panel.placement != agentd_protocol::UiPlacement::Inline)
+        .filter(|panel| panel.placement != construct_protocol::UiPlacement::Inline)
         .cloned()
         .collect();
     if let Some(panel) = inline_panel.as_ref() {
@@ -4650,10 +4650,10 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
     }
 }
 
-fn latest_inline_panel(panels: &[agentd_protocol::UiPanel]) -> Option<agentd_protocol::UiPanel> {
+fn latest_inline_panel(panels: &[construct_protocol::UiPanel]) -> Option<construct_protocol::UiPanel> {
     panels
         .iter()
-        .filter(|panel| panel.placement == agentd_protocol::UiPlacement::Inline)
+        .filter(|panel| panel.placement == construct_protocol::UiPlacement::Inline)
         .max_by(|a, b| a.id.cmp(&b.id))
         .cloned()
 }
@@ -4670,7 +4670,7 @@ fn latest_inline_panel(panels: &[agentd_protocol::UiPanel]) -> Option<agentd_pro
 /// `app.layout.dynamic_ui_action_hits`.
 fn inline_widget_rows(
     app: Option<&App>,
-    panel: &agentd_protocol::UiPanel,
+    panel: &construct_protocol::UiPanel,
     session_id: Option<&str>,
     width: u16,
     available_height: u16,
@@ -4721,7 +4721,7 @@ fn render_inline_dynamic_ui_panel(
     area: Rect,
     app: &mut App,
     session_id: &str,
-    panel: &agentd_protocol::UiPanel,
+    panel: &construct_protocol::UiPanel,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -4823,7 +4823,7 @@ fn render_dynamic_ui_dropdown(
     f: &mut Frame,
     session_area: Rect,
     app: &mut App,
-    panels: &[agentd_protocol::UiPanel],
+    panels: &[construct_protocol::UiPanel],
 ) {
     let width = panels
         .iter()
@@ -4892,7 +4892,7 @@ fn render_visible_dynamic_ui_panels(
     session_area: Rect,
     app: &mut App,
     session_id: &str,
-    panels: &[agentd_protocol::UiPanel],
+    panels: &[construct_protocol::UiPanel],
 ) {
     let now = std::time::Instant::now();
     app.dynamic_ui_temporary_until
@@ -5035,7 +5035,7 @@ fn render_dynamic_ui_stack_lines(
     area: Rect,
     app: &mut App,
     session_id: &str,
-    panels: &[agentd_protocol::UiPanel],
+    panels: &[construct_protocol::UiPanel],
 ) -> Vec<Line<'static>> {
     let hover = app.mouse_pos;
     let mut rows = Vec::new();
@@ -5148,7 +5148,7 @@ fn contains_rect(area: Rect, col: u16, row: u16) -> bool {
     col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
 }
 
-fn dynamic_ui_panel_title(panel: &agentd_protocol::UiPanel) -> Option<String> {
+fn dynamic_ui_panel_title(panel: &construct_protocol::UiPanel) -> Option<String> {
     first_markdown_heading(&panel.markdown)
         .or_else(|| {
             panel
@@ -5206,10 +5206,10 @@ fn parse_markdown_heading(line: &str) -> Option<String> {
 /// Whether the construct Markdown dialect registry (spec 0074) enables the
 /// extension `name` on `surface`. Renderers consult the shared registry
 /// instead of ad-hoc per-surface booleans, so adding or restricting an
-/// extension in `agentd_protocol::dialect` changes every client surface at
+/// extension in `construct_protocol::dialect` changes every client surface at
 /// once.
 fn surface_allows_extension(surface: &str, name: &str) -> bool {
-    agentd_protocol::dialect::extensions_for_surface(surface).any(|ext| ext.name == name)
+    construct_protocol::dialect::extensions_for_surface(surface).any(|ext| ext.name == name)
 }
 
 /// Render widget-surface construct Markdown (spec 0074: one shared dialect).
@@ -5350,7 +5350,7 @@ fn render_agentd_markdown_lines_at_depth(
             let project_program = clip_type == "program"
                 && depth == 0
                 && surface_allows_extension(
-                    agentd_protocol::dialect::SURFACE_WIDGET,
+                    construct_protocol::dialect::SURFACE_WIDGET,
                     "program-section",
                 );
             if project_program {
@@ -5476,7 +5476,7 @@ fn render_agentd_markdown_lines_at_depth(
                     hits.push(crate::app::DynamicUiActionHit {
                         session_id: session_id.to_string(),
                         panel_id: panel_id.to_string(),
-                        action: agentd_protocol::UiAction {
+                        action: construct_protocol::UiAction {
                             id,
                             label,
                             key,
@@ -6332,7 +6332,7 @@ fn render_inline_action_spans(
                 hits.push(crate::app::DynamicUiActionHit {
                     session_id: session_id.to_string(),
                     panel_id: panel_id.to_string(),
-                    action: agentd_protocol::UiAction {
+                    action: construct_protocol::UiAction {
                         id: action_id,
                         label: label.to_string(),
                         key,
@@ -6858,7 +6858,7 @@ const SMITH_READY_HINT: &str = "type your prompt and press Enter";
 
 fn editor_ready_hint(
     state: Option<&crate::app::EditorState>,
-    agent_status: Option<&agentd_protocol::AgentStatus>,
+    agent_status: Option<&construct_protocol::AgentStatus>,
 ) -> Option<&'static str> {
     if let Some(agent_status) = agent_status.filter(|s| s.active) {
         if agent_status.active {
@@ -6879,7 +6879,7 @@ fn render_editor_pane(
     f: &mut Frame,
     area: Rect,
     state: Option<&crate::app::EditorState>,
-    agent_status: Option<&agentd_protocol::AgentStatus>,
+    agent_status: Option<&construct_protocol::AgentStatus>,
     theme: &Theme,
     set_cursor: bool,
 ) {
@@ -7131,7 +7131,7 @@ fn program_collab_cursor_color(theme: &Theme, color_index: u8) -> Color {
 
 fn editor_pane_rows(
     state: Option<&crate::app::EditorState>,
-    agent_status: Option<&agentd_protocol::AgentStatus>,
+    agent_status: Option<&construct_protocol::AgentStatus>,
     width: u16,
 ) -> usize {
     let text_width = width.saturating_sub(2).max(1) as usize;
@@ -8602,8 +8602,8 @@ fn format_chat_event_body(theme: &Theme, ev: &SessionEvent) -> Vec<Span<'static>
             ..
         } => {
             let risk_label = match risk {
-                agentd_protocol::ToolRisk::Safe => "safe",
-                agentd_protocol::ToolRisk::Risky => "risky",
+                construct_protocol::ToolRisk::Safe => "safe",
+                construct_protocol::ToolRisk::Risky => "risky",
             };
             vec![Span::styled(
                 format!(
@@ -9381,11 +9381,11 @@ fn short_id(id: &str) -> &str {
     &id[..n]
 }
 
-pub fn is_headless(s: &agentd_protocol::SessionSummary) -> bool {
+pub fn is_headless(s: &construct_protocol::SessionSummary) -> bool {
     matches!(s.mode.as_deref(), Some("headless"))
 }
 
-fn harness_label(s: &agentd_protocol::SessionSummary) -> String {
+fn harness_label(s: &construct_protocol::SessionSummary) -> String {
     if s.native_subagent.is_some() {
         format!("(native) {}", s.harness)
     } else if is_headless(s) {
@@ -9397,7 +9397,7 @@ fn harness_label(s: &agentd_protocol::SessionSummary) -> String {
 
 /// User-facing primary label for a session: the user-set title when present,
 /// otherwise the short id (the hash). Trimmed/empty titles count as unset.
-fn primary_label(s: &agentd_protocol::SessionSummary) -> String {
+fn primary_label(s: &construct_protocol::SessionSummary) -> String {
     match s.title.as_deref() {
         Some(t) if !t.trim().is_empty() => t.trim().to_string(),
         _ => short_id(&s.id).to_string(),
@@ -9592,11 +9592,11 @@ fn render_tasks_popup(f: &mut Frame, app: &mut App) {
     let mut lines: Vec<Line> = Vec::new();
     for (_idx, t) in visible {
         let (state_glyph, state_color) = match t.state {
-            agentd_protocol::TaskState::Running => ("◐", app.theme.warning),
-            agentd_protocol::TaskState::Backgrounded => ("↻", app.theme.info),
-            agentd_protocol::TaskState::Completed => ("✓", app.theme.success),
-            agentd_protocol::TaskState::Failed => ("✗", app.theme.danger),
-            agentd_protocol::TaskState::Cancelled => ("⊘", app.theme.dim),
+            construct_protocol::TaskState::Running => ("◐", app.theme.warning),
+            construct_protocol::TaskState::Backgrounded => ("↻", app.theme.info),
+            construct_protocol::TaskState::Completed => ("✓", app.theme.success),
+            construct_protocol::TaskState::Failed => ("✗", app.theme.danger),
+            construct_protocol::TaskState::Cancelled => ("⊘", app.theme.dim),
         };
         let elapsed_ms = t.ended_at_ms.unwrap_or(now_ms) - t.started_at_ms;
         let elapsed = format!("{:.1}s", (elapsed_ms.max(0)) as f64 / 1000.0);
@@ -10332,7 +10332,7 @@ fn apply_program_settle_flourish(
 /// row or no templates are available.
 fn program_empty_placeholder(
     theme: &crate::theme::Theme,
-    templates: &[agentd_protocol::ProgramTemplate],
+    templates: &[construct_protocol::ProgramTemplate],
     mouse_pos: Option<(u16, u16)>,
     inner: Rect,
 ) -> (Vec<Line<'static>>, Vec<crate::app::ProgramTemplateHit>) {
@@ -10373,7 +10373,7 @@ fn program_empty_placeholder(
 
     // Every non-blank template becomes a list row — "blank" *is* the empty state,
     // so offering it would be a no-op. Order by name (case-insensitive).
-    let mut ordered: Vec<&agentd_protocol::ProgramTemplate> =
+    let mut ordered: Vec<&construct_protocol::ProgramTemplate> =
         templates.iter().filter(|t| t.id != "blank").collect();
     ordered.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     let total = ordered.len();
@@ -11450,10 +11450,10 @@ fn render_program_shimmer_hover(
                 system_tooltip = program_system_status_tooltip(run, now);
                 system_tooltip
                     .as_deref()
-                    .unwrap_or(agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP)
+                    .unwrap_or(construct_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP)
             }
         },
-        None => agentd_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP,
+        None => construct_protocol::PROGRAM_SHIMMER_FALLBACK_TOOLTIP,
     };
     let (row_first, row_last) = program_block_visual_rows(
         Some(app),
@@ -11587,7 +11587,7 @@ fn program_block_visual_rows(
 fn program_shimmer_block_at(
     app: Option<&App>,
     markdown: &str,
-    blocks: Option<&[agentd_protocol::ProgramBlockView]>,
+    blocks: Option<&[construct_protocol::ProgramBlockView]>,
     active_lines: &[bool],
     scroll_offset: usize,
     area: Rect,
@@ -11734,7 +11734,7 @@ struct ProgramTitleLeft {
 }
 
 fn program_title_left_layout(
-    summary: Option<&agentd_protocol::SessionSummary>,
+    summary: Option<&construct_protocol::SessionSummary>,
     fallback_label: &str,
     rect: Rect,
     dirty: bool,
@@ -11848,11 +11848,11 @@ fn program_run_stage_label(
         .get(&popup.program.session_id)
         .filter(|run| now < run.deadline)?;
     let label = match run.stage {
-        agentd_protocol::ProgramRunStage::Pressed => "pressed".to_string(),
-        agentd_protocol::ProgramRunStage::Delivered => "delivered".to_string(),
-        agentd_protocol::ProgramRunStage::FirstOutput => "first output".to_string(),
-        agentd_protocol::ProgramRunStage::PlanningPassDone => "planning pass done".to_string(),
-        agentd_protocol::ProgramRunStage::Settling => {
+        construct_protocol::ProgramRunStage::Pressed => "pressed".to_string(),
+        construct_protocol::ProgramRunStage::Delivered => "delivered".to_string(),
+        construct_protocol::ProgramRunStage::FirstOutput => "first output".to_string(),
+        construct_protocol::ProgramRunStage::PlanningPassDone => "planning pass done".to_string(),
+        construct_protocol::ProgramRunStage::Settling => {
             format!(
                 "{}/{} settled",
                 run.settled_block_count, run.total_block_count
@@ -11983,7 +11983,7 @@ fn program_toggle_style(app: &App, popup: &crate::app::ProgramPopup, active: boo
 }
 
 fn program_title_toggle_button_range(
-    summary: Option<&agentd_protocol::SessionSummary>,
+    summary: Option<&construct_protocol::SessionSummary>,
     rect: Rect,
 ) -> Option<(u16, u16, u16)> {
     let toggle_w = UnicodeWidthStr::width(program_mode_glyph()) as u16;
@@ -12010,7 +12010,7 @@ fn render_program_title_tooltip(
     f: &mut Frame,
     app: &App,
     popup: &crate::app::ProgramPopup,
-    summary: Option<&agentd_protocol::SessionSummary>,
+    summary: Option<&construct_protocol::SessionSummary>,
     rect: Rect,
 ) {
     let Some((mx, my)) = app.mouse_pos else {
@@ -12787,9 +12787,9 @@ fn render_session_picker_row(
         SessionPickerRow::ContentMatch { hit } => {
             let prefix = if selected { ">" } else { " " };
             let scope_tag = match hit.scope {
-                agentd_protocol::SearchScope::Name => "name",
-                agentd_protocol::SearchScope::Program => "program",
-                agentd_protocol::SearchScope::Transcript => "history",
+                construct_protocol::SearchScope::Name => "name",
+                construct_protocol::SearchScope::Program => "program",
+                construct_protocol::SearchScope::Transcript => "history",
             };
             let base_style = if selected {
                 Style::default()
@@ -13461,7 +13461,7 @@ pub(crate) fn program_action_link_hits(
     if area.width == 0 || area.height == 0 {
         return hits;
     }
-    if !surface_allows_extension(agentd_protocol::dialect::SURFACE_PROGRAM, "action-link") {
+    if !surface_allows_extension(construct_protocol::dialect::SURFACE_PROGRAM, "action-link") {
         return hits;
     }
     let width = area.width as usize;
@@ -13491,7 +13491,7 @@ pub(crate) fn program_action_link_hits(
                     col_end,
                     row,
                     session_id: session_id.to_string(),
-                    action: agentd_protocol::UiAction {
+                    action: construct_protocol::UiAction {
                         id: link.id.clone(),
                         label: link.label.clone(),
                         key: link.key.clone(),
@@ -13606,7 +13606,7 @@ fn render_program_markdown_lines<'a>(
     // (spec 0074); consult the registry rather than hardcoding it, so a
     // future restriction lands here without a code change.
     let action_links_enabled =
-        surface_allows_extension(agentd_protocol::dialect::SURFACE_PROGRAM, "action-link");
+        surface_allows_extension(construct_protocol::dialect::SURFACE_PROGRAM, "action-link");
     let mut out = Vec::new();
     let mut line_start = 0usize;
     for raw in markdown.lines() {
@@ -14134,7 +14134,7 @@ fn program_smart_clip_target(raw_clip: &str) -> (&str, &str) {
 /// caller decides static vs. animated (via `session_status_glyph`'s shared
 /// `session_should_animate_status` gate) so this formatter can't fork that
 /// logic.
-fn program_session_clip_label(glyph: &str, s: &agentd_protocol::SessionSummary) -> String {
+fn program_session_clip_label(glyph: &str, s: &construct_protocol::SessionSummary) -> String {
     format!("{} {} · {}", glyph, primary_label(s), harness_label(s))
 }
 
@@ -14146,7 +14146,7 @@ fn program_missing_session_clip_label(id: &str) -> String {
     format!("⊘ {} · missing", short_id(id))
 }
 
-fn program_harness_clip_label(h: &agentd_protocol::HarnessInfo) -> String {
+fn program_harness_clip_label(h: &construct_protocol::HarnessInfo) -> String {
     let status_icon = if h.available { "✓" } else { "✗" };
     format!("{status_icon} {}", h.name)
 }
@@ -14518,7 +14518,7 @@ mod tests {
     fn lineage_test_rows() -> (Vec<SessionSummary>, Vec<crate::lineage::LineageRow>) {
         let root = lineage_test_summary("root");
         let mut fork = lineage_test_summary("f");
-        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "root".into(),
             transcript_seq: 1,
             at_ms: 1_000,
@@ -14526,7 +14526,7 @@ mod tests {
             parent_message_count: 0,
         });
         let mut sub = lineage_test_summary("s");
-        sub.kind = agentd_protocol::SessionKind::Subagent;
+        sub.kind = construct_protocol::SessionKind::Subagent;
         sub.parent_session_id = Some("root".into());
         let sessions = vec![root, fork, sub];
         let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
@@ -14642,8 +14642,8 @@ mod tests {
     fn lineage_row_styles_forks_like_normal_sessions_and_strikes_discarded() {
         let theme = Theme::default();
         let (mut sessions, _) = lineage_test_rows();
-        sessions[1].merge = Some(agentd_protocol::ForkMerge {
-            mode: agentd_protocol::ForkMergeMode::Result,
+        sessions[1].merge = Some(construct_protocol::ForkMerge {
+            mode: construct_protocol::ForkMergeMode::Result,
             at_ms: 2_000,
             merged_busy_ms: 0,
             merged_message_count: 0,
@@ -14688,8 +14688,8 @@ mod tests {
             "a merged fork must not be struck through — that's reserved for discarded"
         );
 
-        sessions[1].merge = Some(agentd_protocol::ForkMerge {
-            mode: agentd_protocol::ForkMergeMode::Discard,
+        sessions[1].merge = Some(construct_protocol::ForkMerge {
+            mode: construct_protocol::ForkMergeMode::Discard,
             at_ms: 2_000,
             merged_busy_ms: 0,
             merged_message_count: 0,
@@ -14720,7 +14720,7 @@ mod tests {
         let theme = Theme::default();
         let root = lineage_test_summary("root");
         let mut fork = lineage_test_summary("f");
-        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "root".into(),
             transcript_seq: 1,
             at_ms: 1_000,
@@ -14773,7 +14773,7 @@ mod tests {
         // the lineage views match that in both modes.
         let theme = Theme::default();
         let (mut sessions, _) = lineage_test_rows();
-        sessions[1].state = agentd_protocol::SessionState::Done;
+        sessions[1].state = construct_protocol::SessionState::Done;
         let tree = crate::lineage::build_tree("root", &sessions).expect("tree");
         let by_id: HashMap<&str, &SessionSummary> =
             sessions.iter().map(|s| (s.id.as_str(), s)).collect();
@@ -14828,7 +14828,7 @@ mod tests {
         let mut sessions = vec![lineage_test_summary("root")];
         for i in 0..(crate::lineage::MAX_SIBLINGS + 7) {
             let mut f = lineage_test_summary(&format!("f{i}"));
-            f.forked_from = Some(agentd_protocol::ForkedFrom {
+            f.forked_from = Some(construct_protocol::ForkedFrom {
                 session_id: "root".into(),
                 transcript_seq: 0,
                 at_ms: 0,
@@ -15098,8 +15098,8 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
-            kind: agentd_protocol::SessionKind::User,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
+            kind: construct_protocol::SessionKind::User,
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
@@ -15112,7 +15112,7 @@ mod tests {
     fn pinned_fork_keeps_separate_lineage_and_pin_markers() {
         let mut fork = clip_test_session("fork", Some("fork"), "codex", SessionState::Running);
         fork.pinned = true;
-        fork.forked_from = Some(agentd_protocol::ForkedFrom {
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "parent".into(),
             transcript_seq: 0,
             at_ms: 0,
@@ -15181,7 +15181,7 @@ mod tests {
 
     #[test]
     fn program_harness_clip_label_shows_status_icon_and_name() {
-        let available = agentd_protocol::HarnessInfo {
+        let available = construct_protocol::HarnessInfo {
             name: "codex".into(),
             available: true,
             detail: None,
@@ -15189,7 +15189,7 @@ mod tests {
             description: None,
             capabilities: Default::default(),
         };
-        let missing = agentd_protocol::HarnessInfo {
+        let missing = construct_protocol::HarnessInfo {
             name: "claude".into(),
             available: false,
             detail: None,
@@ -15370,8 +15370,8 @@ mod tests {
         assert!(program_session_clip_hits(None, "just prose, no clips", 0, area).is_empty());
     }
 
-    fn placeholder_template(id: &str, name: &str) -> agentd_protocol::ProgramTemplate {
-        agentd_protocol::ProgramTemplate {
+    fn placeholder_template(id: &str, name: &str) -> construct_protocol::ProgramTemplate {
+        construct_protocol::ProgramTemplate {
             id: id.to_string(),
             name: name.to_string(),
             description: None,
@@ -17590,7 +17590,7 @@ mod tests {
         );
     }
 
-    fn summary_with_mode(harness: &str, mode: Option<&str>) -> agentd_protocol::SessionSummary {
+    fn summary_with_mode(harness: &str, mode: Option<&str>) -> construct_protocol::SessionSummary {
         let mut json = serde_json::json!({
             "id": "s1",
             "harness": harness,
@@ -17647,7 +17647,7 @@ mod tests {
     #[test]
     fn approval_mode_modeline_label_uses_non_manual_badge() {
         let mut s = summary_with_mode("smith", Some("interactive"));
-        s.approval_mode = agentd_protocol::ApprovalMode::UnsafeAuto;
+        s.approval_mode = construct_protocol::ApprovalMode::UnsafeAuto;
         assert_eq!(approval_mode_modeline_label(&s), Some("unsafe-auto"));
     }
 
@@ -17735,13 +17735,13 @@ mod tests {
         assert!(!crate::app::SPINNER_FRAMES.contains(&program_mode_glyph()));
     }
 
-    fn widget(markdown: &str) -> agentd_protocol::UiPanel {
-        agentd_protocol::UiPanel {
+    fn widget(markdown: &str) -> construct_protocol::UiPanel {
+        construct_protocol::UiPanel {
             id: "w".into(),
             source: None,
             title: None,
             created_at_ms: 0,
-            placement: agentd_protocol::UiPlacement::Inline,
+            placement: construct_protocol::UiPlacement::Inline,
             markdown: markdown.into(),
         }
     }

@@ -15,9 +15,9 @@
 //! `CONSTRUCT_CODEX_MODE=interactive|headless`. Honors `CONSTRUCT_CODEX_CMD` for a
 //! full command prefix, falling back to `CONSTRUCT_CODEX_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
-use agentd_protocol::{
+use construct_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use construct_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use construct_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
@@ -74,7 +74,7 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
-    let command = agentd_protocol::adapter::resolve_command_override(
+    let command = construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_CODEX_CMD",
         "CONSTRUCT_CODEX_BIN",
         "codex",
@@ -82,7 +82,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     let mut args = command.args.clone();
     args.extend(params.args.clone());
     // The daemon's auto-approval policy (`CONSTRUCT_AUTO_APPROVE_PATHS`, see
-    // `agentd_protocol::adapter::policy`) is set, but the upstream codex CLI
+    // `construct_protocol::adapter::policy`) is set, but the upstream codex CLI
     // does not currently expose a path-scoped allow-list flag, so there's no
     // native translation to apply here. Either upstream gains the knob or we
     // wrap codex's IO to intercept tool calls.
@@ -131,7 +131,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // Auto-inject agentd MCP server via codex's `-c` override (codex has no
     // `--mcp-config` flag — MCP servers live in `[mcp_servers.<name>]`).
     // Opt out with CONSTRUCT_INJECT_MCP=0.
-    for a in agentd_protocol::adapter::maybe_inject_codex_mcp_args(&ctx.session_id) {
+    for a in construct_protocol::adapter::maybe_inject_codex_mcp_args(&ctx.session_id) {
         args.push(a);
     }
     // Skip the initial prompt only when we're actually resuming an
@@ -154,7 +154,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // from this internal env var (found by string-grep on the binary; not
     // a public flag but stable across recent codex releases). Without the
     // tag we'd have to guess which of several concurrent codex rollouts
-    // in the same cwd belongs to which agentd session.
+    // in the same cwd belongs to which construct session.
     let originator_tag = format!("agentd:{}", ctx.session_id);
     env.push((
         "CODEX_INTERNAL_ORIGINATOR_OVERRIDE".into(),
@@ -701,7 +701,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         mut inbox,
     } = ctx;
 
-    let command_override = agentd_protocol::adapter::resolve_command_override(
+    let command_override = construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_CODEX_CMD",
         "CONSTRUCT_CODEX_BIN",
         "codex",
@@ -760,7 +760,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             child_args.push("-m".into());
             child_args.push(m.clone());
         }
-        for a in agentd_protocol::adapter::maybe_inject_codex_mcp_args(&agentd_session_id) {
+        for a in construct_protocol::adapter::maybe_inject_codex_mcp_args(&agentd_session_id) {
             child_args.push(a);
         }
         for a in &extra_args {
@@ -786,7 +786,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(
+                    message: construct_protocol::adapter::missing_bin_hint(
                         &command_override.argv_preview(),
                         &e,
                     ),

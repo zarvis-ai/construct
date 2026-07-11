@@ -1,7 +1,7 @@
 //! Config loading. Looks at `~/.config/construct/config.toml`, merging built-in
 //! adapter defaults underneath.
 
-use agentd_protocol::paths::Paths;
+use construct_protocol::paths::Paths;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};

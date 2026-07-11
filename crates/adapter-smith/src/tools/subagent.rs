@@ -1,14 +1,14 @@
 //! Smith subagent tools.
 //!
-//! A subagent is backed by an agentd session so every harness can run
+//! A subagent is backed by an construct session so every harness can run
 //! unchanged, but it is marked `SessionKind::Subagent` and tracked in
 //! the parent Smith session's data dir. The parent sees task-like
 //! create/list/peek/enqueue/cancel/delete operations; the main TUI list
 //! does not show the backing sessions.
 
-use super::agentd::client;
+use super::construct_daemon::client;
 use super::{Tool, ToolCtx, ToolOutcome};
-use agentd_protocol::{CreateSessionParams, PtySize, SessionDetail, ToolRisk};
+use construct_protocol::{CreateSessionParams, PtySize, SessionDetail, ToolRisk};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -52,7 +52,7 @@ fn now_ms() -> i64 {
 
 fn registry_path() -> Result<PathBuf> {
     let dir = std::env::var("CONSTRUCT_SESSION_DATA_DIR")
-        .context("CONSTRUCT_SESSION_DATA_DIR is not set; subagents require an agentd session")?;
+        .context("CONSTRUCT_SESSION_DATA_DIR is not set; subagents require an construct session")?;
     Ok(PathBuf::from(dir).join("smith-subagents.json"))
 }
 
@@ -205,7 +205,7 @@ impl Tool for Create {
             forked_from: None,
             env,
             args: Vec::new(),
-            kind: agentd_protocol::SessionKind::Subagent,
+            kind: construct_protocol::SessionKind::Subagent,
             parent_session_id: Some(ctx.session_id.clone()),
             group_id: None,
             position_after_session_id: None,

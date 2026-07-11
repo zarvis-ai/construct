@@ -10,9 +10,9 @@
 //! Honors `CONSTRUCT_SHELL_CMD` for a full command prefix, falling back to
 //! `CONSTRUCT_SHELL_BIN`, then `$SHELL`, then `/bin/bash`.
 
-use agentd_protocol::adapter::pty::{run_session, PtySpec};
-use agentd_protocol::adapter::run as adapter_run;
-use agentd_protocol::{Capabilities, InitializeResult, PtySize, SessionState};
+use construct_protocol::adapter::pty::{run_session, PtySpec};
+use construct_protocol::adapter::run as adapter_run;
+use construct_protocol::{Capabilities, InitializeResult, PtySize, SessionState};
 use std::path::PathBuf;
 
 pub async fn run() -> anyhow::Result<()> {
@@ -28,7 +28,7 @@ pub async fn run() -> anyhow::Result<()> {
     };
     adapter_run(metadata, |params, ctx| async move {
         let default_shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let command = agentd_protocol::adapter::resolve_command_override(
+        let command = construct_protocol::adapter::resolve_command_override(
             "CONSTRUCT_SHELL_CMD",
             "CONSTRUCT_SHELL_BIN",
             &default_shell,

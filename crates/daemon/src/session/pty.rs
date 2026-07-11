@@ -43,7 +43,7 @@ impl SessionManager {
             .await
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionPtyInputParams::from_bytes(
+        let params = serde_json::to_value(&construct_protocol::SessionPtyInputParams::from_bytes(
             id, &bytes,
         ))?;
         adapter
@@ -207,7 +207,7 @@ impl SessionManager {
             .await
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionPtyResizeParams {
+        let params = serde_json::to_value(&construct_protocol::SessionPtyResizeParams {
             session_id: id.to_string(),
             cols,
             rows,
@@ -275,8 +275,8 @@ impl SessionManager {
 }
 
 #[cfg(test)]
-pub(super) fn pty_caps() -> agentd_protocol::Capabilities {
-    agentd_protocol::Capabilities {
+pub(super) fn pty_caps() -> construct_protocol::Capabilities {
+    construct_protocol::Capabilities {
         supports_pty: true,
         supports_silent_resume: false,
         ..Default::default()

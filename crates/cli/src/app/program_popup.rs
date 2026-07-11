@@ -241,11 +241,11 @@ impl App {
         // Retry to absorb further updates that land between our re-read and
         // our write.
         for _ in 0..5 {
-            let params = agentd_protocol::ProgramUpdateParams {
+            let params = construct_protocol::ProgramUpdateParams {
                 session_id: popup.program.session_id.clone(),
                 markdown: ours.clone(),
                 base_version: Some(base),
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 template_id: popup.program.template_id.clone(),
                 note: None,
                 // Human co-edit save: no shimmer declaration — the daemon
@@ -517,7 +517,7 @@ impl App {
         } else {
             Self::program_run_shimmer_for_body(&run_body, &pending)
         };
-        let params = agentd_protocol::ProgramExecuteParams {
+        let params = construct_protocol::ProgramExecuteParams {
             session_id: session_id.clone(),
             selection,
             base_version,
@@ -615,7 +615,7 @@ impl App {
         body: &str,
         pending: &HashSet<String>,
     ) -> Option<Vec<bool>> {
-        let shimmer: Vec<bool> = agentd_protocol::program_block_spans(body)
+        let shimmer: Vec<bool> = construct_protocol::program_block_spans(body)
             .into_iter()
             .map(|span| pending.contains(&span.id))
             .collect();
@@ -623,7 +623,7 @@ impl App {
     }
 
     fn program_run_all_shimmer_for_body(body: &str) -> Option<Vec<bool>> {
-        let len = agentd_protocol::program_block_spans(body).len();
+        let len = construct_protocol::program_block_spans(body).len();
         (len > 0).then(|| vec![true; len])
     }
 
@@ -663,7 +663,7 @@ impl App {
                 system_status: None,
                 deadline: now + Duration::from_millis(PROGRAM_RUN_MAX_MS),
                 first_output_seen: false,
-                stage: agentd_protocol::ProgramRunStage::Pressed,
+                stage: construct_protocol::ProgramRunStage::Pressed,
                 daemon_confirmed: false,
                 daemon_adopted_at: None,
                 settled_block_count: 0,
@@ -731,7 +731,7 @@ impl App {
         {
             let _ = self
                 .client
-                .program_cursor(agentd_protocol::ProgramCursorParams {
+                .program_cursor(construct_protocol::ProgramCursorParams {
                     session_id,
                     cursor: 0,
                     selection_anchor: None,

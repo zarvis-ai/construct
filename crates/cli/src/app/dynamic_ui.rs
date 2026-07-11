@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use agentd_protocol;
+use construct_protocol;
 use crossterm::event::{KeyCode, KeyEvent};
 
 use super::App;
@@ -317,7 +317,7 @@ impl App {
         &mut self,
         session_id: String,
         panel_id: Option<String>,
-        action: agentd_protocol::UiAction,
+        action: construct_protocol::UiAction,
     ) {
         let label = action.label.clone();
         let action_id = action.id.clone();
@@ -417,7 +417,7 @@ impl App {
         &self,
         session_id: &str,
         key: char,
-    ) -> Option<agentd_protocol::UiAction> {
+    ) -> Option<construct_protocol::UiAction> {
         let panels = self.ui_panels.get(session_id)?;
         let focused_panel = self
             .dynamic_ui_focused
@@ -441,7 +441,7 @@ impl App {
         None
     }
 
-    pub fn orchestrator_widget_panels(&self) -> Vec<agentd_protocol::UiPanel> {
+    pub fn orchestrator_widget_panels(&self) -> Vec<construct_protocol::UiPanel> {
         let Some(orchestrator_id) = self.orchestrator_id.as_deref() else {
             return Vec::new();
         };
@@ -450,7 +450,7 @@ impl App {
         };
         let mut panels: Vec<_> = panels
             .values()
-            .filter(|panel| panel.placement == agentd_protocol::UiPlacement::Sticky)
+            .filter(|panel| panel.placement == construct_protocol::UiPlacement::Sticky)
             .cloned()
             .collect();
         panels.sort_by(|a, b| {

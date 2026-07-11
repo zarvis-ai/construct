@@ -28,7 +28,7 @@ pub struct ConfigurePopup {
     pub tab: ConfigureTab,
     pub harness_selected: usize,
     pub smith_selected: usize,
-    pub smith_methods: Vec<agentd_protocol::SmithAuthMethodInfo>,
+    pub smith_methods: Vec<construct_protocol::SmithAuthMethodInfo>,
     /// Which `smith_methods` entry the daemon's config currently pins, if
     /// any recognized one — see `SmithAuthStatusResult::current`.
     pub smith_current: Option<String>,
@@ -177,7 +177,7 @@ impl App {
 
     async fn fetch_smith_auth_status(
         &self,
-    ) -> (Vec<agentd_protocol::SmithAuthMethodInfo>, Option<String>) {
+    ) -> (Vec<construct_protocol::SmithAuthMethodInfo>, Option<String>) {
         match self.client.smith_auth_status().await {
             Ok(r) => (r.methods, r.current),
             Err(_) => (Vec::new(), None),

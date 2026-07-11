@@ -88,10 +88,10 @@ impl SessionManager {
                 .or_else(|| params.env.get("CONSTRUCT_PARENT_SESSION_ID").cloned()),
             native_subagent: None,
             last_pty_at_ms: None,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: params.kind,
             archived: false,
-            operator_loop_disabled: params.kind == agentd_protocol::SessionKind::Orchestrator,
+            operator_loop_disabled: params.kind == construct_protocol::SessionKind::Orchestrator,
             needs_attention: false,
             forked_from: params.forked_from.clone(),
             busy_ms: 0,
@@ -160,18 +160,18 @@ impl SessionManager {
         );
         // Single auto-approval policy the daemon defines once; each adapter
         // translates it into its harness's native permission mechanism. See
-        // `agentd_protocol::adapter::policy`.
+        // `construct_protocol::adapter::policy`.
         env_with_meta.insert(
-            agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
+            construct_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
         self.install_program_run_context_env(&mut env_with_meta, &id);
         env_with_meta.insert(
             "CONSTRUCT_SESSION_KIND".to_string(),
             match params.kind {
-                agentd_protocol::SessionKind::User => "user",
-                agentd_protocol::SessionKind::Orchestrator => "orchestrator",
-                agentd_protocol::SessionKind::Subagent => "subagent",
+                construct_protocol::SessionKind::User => "user",
+                construct_protocol::SessionKind::Orchestrator => "orchestrator",
+                construct_protocol::SessionKind::Subagent => "subagent",
             }
             .to_string(),
         );
@@ -318,7 +318,7 @@ impl SessionManager {
             let guard = self.sessions.read().await;
             for entry in guard.values() {
                 let s = entry.summary.read().await;
-                if s.kind == agentd_protocol::SessionKind::Orchestrator && !s.state.is_terminal() {
+                if s.kind == construct_protocol::SessionKind::Orchestrator && !s.state.is_terminal() {
                     tracing::info!(
                         id = %s.id,
                         harness = %s.harness,
@@ -340,18 +340,18 @@ impl SessionManager {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| "/".to_string());
-        let params = agentd_protocol::CreateSessionParams {
+        let params = construct_protocol::CreateSessionParams {
             harness: harness.clone(),
             cwd,
             prompt: None,
             model: None,
             title: Some("orchestrator".to_string()),
             mode: Some("interactive".to_string()),
-            pty_size: Some(agentd_protocol::PtySize { cols: 80, rows: 10 }),
+            pty_size: Some(construct_protocol::PtySize { cols: 80, rows: 10 }),
             worktree: false,
             env: Default::default(),
             args: Vec::new(),
-            kind: agentd_protocol::SessionKind::Orchestrator,
+            kind: construct_protocol::SessionKind::Orchestrator,
             parent_session_id: None,
             group_id: None,
             position_after_session_id: None,
@@ -474,7 +474,7 @@ impl SessionManager {
             widgets_dir.to_string_lossy().to_string(),
         );
         start_params.env.insert(
-            agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
+            construct_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS.to_string(),
             widgets_dir.to_string_lossy().to_string(),
         );
         self.install_program_run_context_env(&mut start_params.env, id);
@@ -807,9 +807,9 @@ pub(super) fn should_resume_on_startup(state: SessionState) -> bool {
 //   * no cached pty_size to restore to (fresh creates skip this);
 //   * the adapter doesn't expose a PTY at all.
 pub(super) fn force_redraw_size_on_resume(
-    caps: &agentd_protocol::Capabilities,
-    cached: Option<agentd_protocol::PtySize>,
-) -> Option<agentd_protocol::PtySize> {
+    caps: &construct_protocol::Capabilities,
+    cached: Option<construct_protocol::PtySize>,
+) -> Option<construct_protocol::PtySize> {
     if caps.supports_silent_resume {
         return None;
     }

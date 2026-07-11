@@ -4,7 +4,7 @@
 //! codex-style minimal surface (`shell` + `edit_file` + `write_stdin`).
 
 use super::{Tool, ToolCtx, ToolOutcome};
-use agentd_protocol::ToolRisk;
+use construct_protocol::ToolRisk;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};

@@ -59,7 +59,7 @@ impl SandboxPolicy {
         roots.push(canon(Path::new("/tmp")));
         // Paths the gate already auto-approves writes to (widgets dir, …) must
         // be writable, or those Safe writes would be blocked once confined.
-        for p in agentd_protocol::adapter::policy::AutoApprovePolicy::from_env().allow_paths() {
+        for p in construct_protocol::adapter::policy::AutoApprovePolicy::from_env().allow_paths() {
             roots.push(canon(p));
         }
         roots.sort();

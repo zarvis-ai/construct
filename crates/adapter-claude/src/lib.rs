@@ -19,9 +19,9 @@
 //! Honors `CONSTRUCT_CLAUDE_CMD` for a full command prefix, falling back to
 //! `CONSTRUCT_CLAUDE_BIN` for a binary path.
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
-use agentd_protocol::{
+use construct_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use construct_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use construct_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
@@ -117,7 +117,7 @@ fn adapter_settings_path() -> Option<PathBuf> {
     );
 
     if std::env::var("CONSTRUCT_CLAUDE_ASKGATE").as_deref() != Ok("0") {
-        if let Some(client) = agentd_protocol::paths::locate_sibling_binary("construct") {
+        if let Some(client) = construct_protocol::paths::locate_sibling_binary("construct") {
             hooks.insert(
                 "PreToolUse".into(),
                 serde_json::json!([{
@@ -169,7 +169,7 @@ fi
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
-    let command = agentd_protocol::adapter::resolve_command_override(
+    let command = construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_CLAUDE_CMD",
         "CONSTRUCT_CLAUDE_BIN",
         "claude",
@@ -183,7 +183,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // Auto-inject the agentd MCP server so the agent inside this session
     // can drive the daemon (list other sessions, send input, spawn helpers,
     // etc.). Opt out with CONSTRUCT_INJECT_MCP=0.
-    if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&ctx.session_id) {
+    if let Some(cfg) = construct_protocol::adapter::maybe_inject_mcp_config(&ctx.session_id) {
         args.push("--mcp-config".into());
         args.push(cfg.to_string_lossy().to_string());
     }
@@ -198,7 +198,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // `--allowed-tools` patterns. Single policy in agentd; each adapter
     // applies it in its harness's native mechanism.
     args.extend(
-        agentd_protocol::adapter::policy::AutoApprovePolicy::from_env().claude_allowed_tools_args(),
+        construct_protocol::adapter::policy::AutoApprovePolicy::from_env().claude_allowed_tools_args(),
     );
     // Resume support: stash our own UUID under
     // $CONSTRUCT_SESSION_DATA_DIR/claude_session_id.txt at first spawn (passed
@@ -666,7 +666,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         mut inbox,
     } = ctx;
 
-    let command_override = agentd_protocol::adapter::resolve_command_override(
+    let command_override = construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_CLAUDE_CMD",
         "CONSTRUCT_CLAUDE_BIN",
         "claude",
@@ -718,7 +718,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
         child_args.push("--output-format".into());
         child_args.push("stream-json".into());
         child_args.push("--verbose".into());
-        if let Some(cfg) = agentd_protocol::adapter::maybe_inject_mcp_config(&agentd_session_id) {
+        if let Some(cfg) = construct_protocol::adapter::maybe_inject_mcp_config(&agentd_session_id) {
             child_args.push("--mcp-config".into());
             child_args.push(cfg.to_string_lossy().to_string());
         }
@@ -727,7 +727,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             child_args.push(p.to_string_lossy().to_string());
         }
         child_args.extend(
-            agentd_protocol::adapter::policy::AutoApprovePolicy::from_env()
+            construct_protocol::adapter::policy::AutoApprovePolicy::from_env()
                 .claude_allowed_tools_args(),
         );
         if let Some(sid) = &session_id {
@@ -760,7 +760,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(
+                    message: construct_protocol::adapter::missing_bin_hint(
                         &command_override.argv_preview(),
                         &e,
                     ),

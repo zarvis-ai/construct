@@ -7,7 +7,7 @@
 //! usable smith credential) is actually present. This module probes the
 //! thing that actually determines whether a session can start.
 
-use agentd_protocol::adapter::resolve_command_override;
+use construct_protocol::adapter::resolve_command_override;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -59,7 +59,7 @@ fn cached(slot: Option<(Instant, bool)>) -> Option<bool> {
 /// Probe a wrapper adapter that shells out to a named CLI. Honors the same
 /// `CONSTRUCT_<H>_CMD` / `CONSTRUCT_<H>_BIN` overrides the adapter itself
 /// resolves against at spawn time (see
-/// `agentd_protocol::adapter::resolve_command_override`), so the picker
+/// `construct_protocol::adapter::resolve_command_override`), so the picker
 /// never disagrees with what a new session would actually try to run.
 pub fn probe_wrapper_cli(command_env: &str, binary_env: &str, default_bin: &str) -> Availability {
     let cmd = resolve_command_override(command_env, binary_env, default_bin);

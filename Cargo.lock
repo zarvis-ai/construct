@@ -9,125 +9,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "agentd"
-version = "0.13.3"
-dependencies = [
- "agentd-protocol",
- "anyhow",
- "base64",
- "chrono",
- "clap",
- "futures",
- "httparse",
- "libc",
- "nix 0.29.0",
- "qrcode",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "toml",
- "toml_edit",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "which",
-]
-
-[[package]]
-name = "agentd-cli"
-version = "0.13.3"
-dependencies = [
- "agentd",
- "agentd-client",
- "agentd-protocol",
- "anyhow",
- "async-trait",
- "base64",
- "bytes",
- "chrono",
- "clap",
- "construct-adapter-antigravity",
- "construct-adapter-claude",
- "construct-adapter-codex",
- "construct-adapter-grok",
- "construct-adapter-shell",
- "construct-adapter-smith",
- "construct-mcp",
- "crossterm 0.28.1",
- "diffy",
- "eventsource-stream",
- "futures",
- "image",
- "libc",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "tui-term",
- "unicode-width",
- "vt100",
-]
-
-[[package]]
-name = "agentd-client"
-version = "0.13.3"
-dependencies = [
- "agentd-protocol",
- "anyhow",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "agentd-e2e"
-version = "0.13.3"
-dependencies = [
- "agentd-client",
- "agentd-protocol",
- "anyhow",
- "base64",
- "chromiumoxide",
- "futures",
- "portable-pty",
- "reqwest",
- "serde_json",
- "tempfile",
- "tokio",
- "vt100",
-]
-
-[[package]]
-name = "agentd-protocol"
-version = "0.13.3"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "futures",
- "portable-pty",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -512,9 +393,9 @@ dependencies = [
 name = "construct-adapter-antigravity"
 version = "0.13.3"
 dependencies = [
- "agentd-protocol",
  "anyhow",
  "construct-adapter-common",
+ "construct-protocol",
  "serde_json",
  "tokio",
  "tracing",
@@ -525,9 +406,9 @@ dependencies = [
 name = "construct-adapter-claude"
 version = "0.13.3"
 dependencies = [
- "agentd-protocol",
  "anyhow",
  "construct-adapter-common",
+ "construct-protocol",
  "serde_json",
  "tokio",
  "tracing",
@@ -538,9 +419,9 @@ dependencies = [
 name = "construct-adapter-codex"
 version = "0.13.3"
 dependencies = [
- "agentd-protocol",
  "anyhow",
  "construct-adapter-common",
+ "construct-protocol",
  "serde_json",
  "tokio",
  "tracing",
@@ -550,7 +431,7 @@ dependencies = [
 name = "construct-adapter-common"
 version = "0.13.3"
 dependencies = [
- "agentd-protocol",
+ "construct-protocol",
  "tokio",
 ]
 
@@ -558,9 +439,9 @@ dependencies = [
 name = "construct-adapter-grok"
 version = "0.13.3"
 dependencies = [
- "agentd-protocol",
  "anyhow",
  "construct-adapter-common",
+ "construct-protocol",
  "serde_json",
  "tokio",
  "tracing",
@@ -571,8 +452,8 @@ dependencies = [
 name = "construct-adapter-shell"
 version = "0.13.3"
 dependencies = [
- "agentd-protocol",
  "anyhow",
+ "construct-protocol",
  "serde_json",
  "tokio",
  "tracing",
@@ -582,13 +463,13 @@ dependencies = [
 name = "construct-adapter-smith"
 version = "0.13.3"
 dependencies = [
- "agentd-client",
- "agentd-protocol",
  "anyhow",
  "async-trait",
  "base64",
  "bytes",
  "chrono",
+ "construct-client",
+ "construct-protocol",
  "eventsource-stream",
  "futures",
  "image",
@@ -606,13 +487,114 @@ dependencies = [
 ]
 
 [[package]]
+name = "construct-cli"
+version = "0.13.3"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "clap",
+ "construct-adapter-antigravity",
+ "construct-adapter-claude",
+ "construct-adapter-codex",
+ "construct-adapter-grok",
+ "construct-adapter-shell",
+ "construct-adapter-smith",
+ "construct-client",
+ "construct-daemon",
+ "construct-mcp",
+ "construct-protocol",
+ "crossterm 0.28.1",
+ "diffy",
+ "eventsource-stream",
+ "futures",
+ "image",
+ "libc",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "tui-term",
+ "unicode-width",
+ "vt100",
+]
+
+[[package]]
+name = "construct-client"
+version = "0.13.3"
+dependencies = [
+ "anyhow",
+ "construct-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "construct-daemon"
+version = "0.13.3"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "clap",
+ "construct-protocol",
+ "futures",
+ "httparse",
+ "libc",
+ "nix 0.29.0",
+ "qrcode",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "which",
+]
+
+[[package]]
+name = "construct-e2e"
+version = "0.13.3"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chromiumoxide",
+ "construct-client",
+ "construct-protocol",
+ "futures",
+ "portable-pty",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "vt100",
+]
+
+[[package]]
 name = "construct-mcp"
 version = "0.13.3"
 dependencies = [
- "agentd-client",
- "agentd-protocol",
  "anyhow",
  "base64",
+ "construct-client",
+ "construct-protocol",
  "futures",
  "image",
  "reqwest",
@@ -623,6 +605,24 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "construct-protocol"
+version = "0.13.3"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "futures",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

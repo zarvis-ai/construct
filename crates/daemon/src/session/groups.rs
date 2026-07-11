@@ -5,12 +5,12 @@ impl SessionManager {
         &self,
         session_id: &str,
         new_group_id: Option<String>,
-        position: agentd_protocol::SessionGroupPosition,
+        position: construct_protocol::SessionGroupPosition,
     ) -> Result<()> {
         let all_sessions = self.list().await;
         let edge = match position {
-            agentd_protocol::SessionGroupPosition::Top => RegionEdge::Top,
-            agentd_protocol::SessionGroupPosition::Bottom => RegionEdge::Bottom,
+            construct_protocol::SessionGroupPosition::Top => RegionEdge::Top,
+            construct_protocol::SessionGroupPosition::Bottom => RegionEdge::Bottom,
         };
         self.move_session_into_region(session_id, &new_group_id, edge, &all_sessions)
             .await

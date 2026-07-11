@@ -6,15 +6,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "MCP stdio server for agentd: lets an agent inside an agentd session control the daemon"
+description = "MCP stdio server for construct: lets an agent inside an construct session control the daemon"
 
 [lib]
 name = "construct_mcp"
 path = "src/lib.rs"
 
 [dependencies]
-agentd-protocol = { workspace = true }
-agentd-client = { workspace = true }
+construct-protocol = { workspace = true }
+construct-client = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

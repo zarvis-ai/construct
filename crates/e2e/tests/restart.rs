@@ -14,7 +14,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use agentd_e2e::{Daemon, Tui};
+use construct_e2e::{Daemon, Tui};
 
 // ---------------------------------------------------------------------------
 // 1. Binary reload
@@ -147,7 +147,7 @@ async fn tui_auto_reconnects_after_restart() {
 /// call, so no provider/API key is needed.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tui_reconnects_after_orchestrator_typed_construct_restart() {
-    use agentd_protocol::CreateSessionParams;
+    use construct_protocol::CreateSessionParams;
 
     let d = Daemon::spawn().await.expect("spawn daemon");
 
@@ -161,14 +161,14 @@ async fn tui_reconnects_after_orchestrator_typed_construct_restart() {
         model: None,
         title: Some("orchestrator".to_string()),
         mode: Some("interactive".to_string()),
-        pty_size: Some(agentd_protocol::PtySize {
+        pty_size: Some(construct_protocol::PtySize {
             cols: 100,
             rows: 20,
         }),
         worktree: false,
         env: Default::default(),
         args: Vec::new(),
-        kind: agentd_protocol::SessionKind::Orchestrator,
+        kind: construct_protocol::SessionKind::Orchestrator,
         parent_session_id: None,
         group_id: None,
         position_after_session_id: None,

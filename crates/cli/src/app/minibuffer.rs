@@ -329,21 +329,21 @@ impl App {
                     )
                     | Selection::None => None,
                 };
-                let params = agentd_protocol::CreateSessionParams {
+                let params = construct_protocol::CreateSessionParams {
                     harness: harness.clone(),
                     cwd,
                     prompt: None,
                     model: None,
                     title: None,
                     mode: None,
-                    pty_size: Some(agentd_protocol::PtySize {
+                    pty_size: Some(construct_protocol::PtySize {
                         cols: self.active_pane_size().0.max(20),
                         rows: self.active_pane_size().1.max(5),
                     }),
                     worktree: false,
                     env: HashMap::new(),
                     args: Vec::new(),
-                    kind: agentd_protocol::SessionKind::User,
+                    kind: construct_protocol::SessionKind::User,
                     parent_session_id: None,
                     group_id,
                     position_after_session_id: None,
@@ -379,9 +379,9 @@ impl App {
                 }
                 // Default options: seed the fork with the full source
                 // transcript (skipped for `shell` inside the client).
-                let mut opts = agentd_client::ForkOptions::default();
+                let mut opts = construct_client::ForkOptions::default();
                 let (cols, rows) = self.active_pane_size();
-                opts.pty_size = Some(agentd_protocol::PtySize {
+                opts.pty_size = Some(construct_protocol::PtySize {
                     cols: cols.max(20),
                     rows: rows.max(5),
                 });
@@ -414,8 +414,8 @@ impl App {
             MinibufferIntent::MergeMenu { session_id } => {
                 let choice = input.trim().to_ascii_lowercase();
                 let mode = match choice.as_str() {
-                    "result" | "take result" => agentd_protocol::ForkMergeMode::Result,
-                    "discard" | "d" => agentd_protocol::ForkMergeMode::Discard,
+                    "result" | "take result" => construct_protocol::ForkMergeMode::Result,
+                    "discard" | "d" => construct_protocol::ForkMergeMode::Discard,
                     _ => {
                         self.set_status("merge: type result or discard".into());
                         return;
@@ -717,7 +717,7 @@ impl App {
     pub(crate) async fn apply_fork_merge(
         &mut self,
         session_id: String,
-        mode: agentd_protocol::ForkMergeMode,
+        mode: construct_protocol::ForkMergeMode,
     ) {
         let Some(fork) = self.sessions.iter().find(|s| s.id == session_id).cloned() else {
             self.set_status("merge: fork no longer exists".into());
@@ -727,11 +727,11 @@ impl App {
             self.set_status("merge: not a fork".into());
             return;
         };
-        if mode == agentd_protocol::ForkMergeMode::Result {
+        if mode == construct_protocol::ForkMergeMode::Result {
             match self.client.transcript(&session_id, 0, None).await {
                 Ok(tr) => {
                     if let Some(summary) =
-                        agentd_client::render_fork_seed_for_merge(&tr.events, 6000)
+                        construct_client::render_fork_seed_for_merge(&tr.events, 6000)
                     {
                         let title = fork.title.as_deref().unwrap_or("fork");
                         if let Err(e) = self
@@ -764,8 +764,8 @@ impl App {
         self.refresh_sessions().await;
         self.select_session(parent);
         let verb = match mode {
-            agentd_protocol::ForkMergeMode::Result => "merged",
-            agentd_protocol::ForkMergeMode::Discard => "discarded",
+            construct_protocol::ForkMergeMode::Result => "merged",
+            construct_protocol::ForkMergeMode::Discard => "discarded",
         };
         self.set_status(format!("fork {verb}"));
     }

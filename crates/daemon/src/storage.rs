@@ -14,7 +14,7 @@
 //!     memory.md          # project-specific memory
 //! ```
 
-use agentd_protocol::{
+use construct_protocol::{
     GroupSummary, ProgramBlockView, ProgramDocument, ProgramEdit, ProgramRevision, ProgramTemplate,
     ProgramUpdateActor, SearchHit, SearchParams, SearchResult, SearchScope, SessionSummary,
     TimestampedEvent, TranscriptResult, UiPanel, UiPlacement,
@@ -662,7 +662,7 @@ impl Storage {
     /// prior record an edited block's continuity is attributed to. A leftover
     /// span beyond the leftover records' count is a brand-new block.
     fn reconcile_program_block_identities(&self, meta: &mut ProgramMeta, markdown: &str) -> bool {
-        let spans = agentd_protocol::program_block_spans(markdown);
+        let spans = construct_protocol::program_block_spans(markdown);
         let old = meta.blocks.clone();
         let mut used = vec![false; old.len()];
         let mut next: Vec<Option<ProgramBlockIdentity>> = vec![None; spans.len()];
@@ -714,7 +714,7 @@ impl Storage {
         meta: &ProgramMeta,
         markdown: &str,
     ) -> Vec<ProgramBlockView> {
-        agentd_protocol::program_block_spans(markdown)
+        construct_protocol::program_block_spans(markdown)
             .into_iter()
             .zip(meta.blocks.iter())
             .map(|(span, rec)| {
@@ -846,7 +846,7 @@ impl Storage {
     pub fn save_start_params(
         &self,
         id: &str,
-        params: &agentd_protocol::SessionStartParams,
+        params: &construct_protocol::SessionStartParams,
     ) -> Result<()> {
         self.ensure_session_dir(id)?;
         let path = self.start_params_path(id);
@@ -857,10 +857,10 @@ impl Storage {
         Ok(())
     }
 
-    pub fn load_start_params(&self, id: &str) -> Result<agentd_protocol::SessionStartParams> {
+    pub fn load_start_params(&self, id: &str) -> Result<construct_protocol::SessionStartParams> {
         let path = self.start_params_path(id);
         let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let p: agentd_protocol::SessionStartParams =
+        let p: construct_protocol::SessionStartParams =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         Ok(p)
     }
@@ -876,7 +876,7 @@ impl Storage {
         self.session_dir(id).join("pty_size.json")
     }
 
-    pub fn save_pty_size(&self, id: &str, size: agentd_protocol::PtySize) -> Result<()> {
+    pub fn save_pty_size(&self, id: &str, size: construct_protocol::PtySize) -> Result<()> {
         self.ensure_session_dir(id)?;
         let path = self.pty_size_path(id);
         let tmp = path.with_extension("json.tmp");
@@ -886,7 +886,7 @@ impl Storage {
         Ok(())
     }
 
-    pub fn load_pty_size(&self, id: &str) -> Option<agentd_protocol::PtySize> {
+    pub fn load_pty_size(&self, id: &str) -> Option<construct_protocol::PtySize> {
         let path = self.pty_size_path(id);
         let bytes = std::fs::read(&path).ok()?;
         serde_json::from_slice(&bytes).ok()
@@ -1245,7 +1245,7 @@ impl Storage {
                     continue;
                 }
             };
-            if agentd_protocol::slash::is_model_hidden(&ev.event) {
+            if construct_protocol::slash::is_model_hidden(&ev.event) {
                 continue;
             }
             let Some(text) = searchable_event_text(&ev.event) else {
@@ -1423,8 +1423,8 @@ fn search_name(summary: &SessionSummary, query_lower: &str) -> Option<SearchHit>
 /// approval/lifecycle plumbing) is noise for this purpose. Callers are
 /// expected to have already filtered out `is_model_hidden` events (which
 /// would otherwise let the legacy `tui` dispatch `ToolUse` leak in).
-fn searchable_event_text(ev: &agentd_protocol::SessionEvent) -> Option<String> {
-    use agentd_protocol::SessionEvent;
+fn searchable_event_text(ev: &construct_protocol::SessionEvent) -> Option<String> {
+    use construct_protocol::SessionEvent;
     match ev {
         SessionEvent::Message { text, .. } => Some(text.clone()),
         SessionEvent::Reasoning { text } => Some(text.clone()),
@@ -1792,7 +1792,7 @@ mod widget_tests {
 #[cfg(test)]
 mod transcript_tail_tests {
     use super::*;
-    use agentd_protocol::SessionEvent;
+    use construct_protocol::SessionEvent;
     use chrono::Utc;
 
     fn make_event(seq: u64) -> TimestampedEvent {
@@ -1800,7 +1800,7 @@ mod transcript_tail_tests {
             seq,
             at: Utc::now(),
             event: SessionEvent::Message {
-                role: agentd_protocol::MessageRole::Assistant,
+                role: construct_protocol::MessageRole::Assistant,
                 text: format!("msg #{seq}"),
             },
         }
@@ -1835,7 +1835,7 @@ mod transcript_tail_tests {
                 seq,
                 at: Utc::now(),
                 event: SessionEvent::Message {
-                    role: agentd_protocol::MessageRole::Assistant,
+                    role: construct_protocol::MessageRole::Assistant,
                     text: format!("{big_text} #{seq}"),
                 },
             };
@@ -1931,7 +1931,7 @@ mod program_tests {
             .update_program(
                 "s1",
                 "# Todo\n".into(),
-                agentd_protocol::ProgramUpdateActor::Human,
+                construct_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -1943,7 +1943,7 @@ mod program_tests {
             .update_program(
                 "s1",
                 "# Changed\n".into(),
-                agentd_protocol::ProgramUpdateActor::Agent,
+                construct_protocol::ProgramUpdateActor::Agent,
                 Some(0),
                 None,
                 None,
@@ -2031,7 +2031,7 @@ mod program_tests {
             .update_program(
                 "s1",
                 "# Todo\n- a\n# Done\n".into(),
-                agentd_protocol::ProgramUpdateActor::Human,
+                construct_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -2044,7 +2044,7 @@ mod program_tests {
             .edit_program(
                 "s1",
                 &[edit("- a", "- a (done)")],
-                agentd_protocol::ProgramUpdateActor::Agent,
+                construct_protocol::ProgramUpdateActor::Agent,
                 None,
             )
             .unwrap();
@@ -2063,7 +2063,7 @@ mod program_tests {
             .update_program(
                 "s1",
                 "# Todo\n- a\n".into(),
-                agentd_protocol::ProgramUpdateActor::Human,
+                construct_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -2074,7 +2074,7 @@ mod program_tests {
             .edit_program(
                 "s1",
                 &[edit("- a", "- a")],
-                agentd_protocol::ProgramUpdateActor::Agent,
+                construct_protocol::ProgramUpdateActor::Agent,
                 None,
             )
             .unwrap();
@@ -2089,7 +2089,7 @@ mod program_tests {
             .update_program(
                 "s1",
                 "# Todo\n- a\n".into(),
-                agentd_protocol::ProgramUpdateActor::Human,
+                construct_protocol::ProgramUpdateActor::Human,
                 Some(0),
                 None,
                 None,
@@ -2099,7 +2099,7 @@ mod program_tests {
             .edit_program(
                 "s1",
                 &[edit("- vanished", "x")],
-                agentd_protocol::ProgramUpdateActor::Agent,
+                construct_protocol::ProgramUpdateActor::Agent,
                 None,
             )
             .unwrap_err();
@@ -2241,7 +2241,7 @@ mod memory_tests {
 #[cfg(test)]
 mod search_tests {
     use super::*;
-    use agentd_protocol::{ApprovalMode, MessageRole, SessionEvent, SessionKind, SessionState};
+    use construct_protocol::{ApprovalMode, MessageRole, SessionEvent, SessionKind, SessionState};
     use chrono::{Duration as ChronoDuration, Utc};
 
     /// A minimal `SessionSummary` for search tests. `age_secs` controls
@@ -2673,7 +2673,7 @@ mod search_tests {
                     seq: 2,
                     at: Utc::now(),
                     event: SessionEvent::ToolUse {
-                        tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
+                        tool: construct_protocol::TUI_DISPATCH_TOOL.to_string(),
                         args: serde_json::json!({ "cmd": "needle" }),
                         call_id: None,
                     },

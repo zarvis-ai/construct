@@ -21,8 +21,8 @@
 
 use std::time::{Duration, Instant};
 
-use agentd_e2e::{Daemon, Tui};
-use agentd_protocol::CreateSessionParams;
+use construct_e2e::{Daemon, Tui};
+use construct_protocol::CreateSessionParams;
 
 const MARKER_LEN: usize = 40;
 

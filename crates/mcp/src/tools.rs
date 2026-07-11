@@ -1,8 +1,8 @@
 //! MCP tool catalog and dispatchers. Each tool wraps one or more methods
 //! on the daemon IPC client.
 
-use agentd_client::Client;
-use agentd_protocol::{agent_context, CreateSessionParams, PtySize};
+use construct_client::Client;
+use construct_protocol::{agent_context, CreateSessionParams, PtySize};
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde_json::{json, Value};
@@ -477,7 +477,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             // shared slash registry, not a hardcoded tool-name check — this is
             // the principled fix for the old `tui` ToolUse transcript leak.
             tr.events
-                .retain(|ev| !agentd_protocol::slash::is_model_hidden(&ev.event));
+                .retain(|ev| !construct_protocol::slash::is_model_hidden(&ev.event));
             serde_json::to_value(tr)?
         }
         "construct_get_output" => {
@@ -505,7 +505,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             let limit = arg_usize(&args, "limit");
             serde_json::to_value(
                 client
-                    .search(agentd_protocol::SearchParams {
+                    .search(construct_protocol::SearchParams {
                         query,
                         scopes,
                         session_ids,
@@ -552,11 +552,11 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                     ));
                 }
             }
-            let params = agentd_protocol::ProgramUpdateParams {
+            let params = construct_protocol::ProgramUpdateParams {
                 session_id: sid,
                 markdown: arg_str(&args, "markdown")?,
                 base_version: args.get("base_version").and_then(|v| v.as_u64()),
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 template_id: arg_str(&args, "template_id").ok(),
                 note: arg_str(&args, "note").ok(),
                 shimmer: Some(shimmer),
@@ -566,7 +566,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
         }
         "construct_program_edit" => {
             let sid = optional_session_arg(&args, session_id)?;
-            let edits: Vec<agentd_protocol::ProgramEdit> = serde_json::from_value(
+            let edits: Vec<construct_protocol::ProgramEdit> = serde_json::from_value(
                 args.get("edits")
                     .cloned()
                     .ok_or_else(|| anyhow!("missing or non-array `edits`"))?,
@@ -575,7 +575,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             if edits.is_empty() {
                 return Err(anyhow!("`edits` must contain at least one edit"));
             }
-            let shimmer: Vec<agentd_protocol::ProgramShimmerDecl> = match args.get("shimmer") {
+            let shimmer: Vec<construct_protocol::ProgramShimmerDecl> = match args.get("shimmer") {
                 Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
                     anyhow!("invalid `shimmer` (expected an array of {{id, shimmer}}): {e}")
                 })?,
@@ -598,10 +598,10 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                     ));
                 }
             }
-            let params = agentd_protocol::ProgramEditParams {
+            let params = construct_protocol::ProgramEditParams {
                 session_id: sid,
                 edits,
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: arg_str(&args, "note").ok(),
                 shimmer,
             };
@@ -615,7 +615,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 })?),
                 None => None,
             };
-            let params = agentd_protocol::ProgramExecuteParams {
+            let params = construct_protocol::ProgramExecuteParams {
                 session_id: sid,
                 selection: arg_str(&args, "selection").ok(),
                 base_version: args.get("base_version").and_then(|v| v.as_u64()),
@@ -649,7 +649,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                     .unwrap_or(false),
                 env: Default::default(),
                 args: Vec::new(),
-                kind: agentd_protocol::SessionKind::User,
+                kind: construct_protocol::SessionKind::User,
                 parent_session_id: None,
                 group_id: arg_str(&args, "group_id").ok(),
                 position_after_session_id: None,
@@ -661,7 +661,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
         "construct_fork_session" => {
             let source = arg_str(&args, "source_session_id")?;
             let harness = arg_str(&args, "harness")?;
-            let opts = agentd_client::ForkOptions {
+            let opts = construct_client::ForkOptions {
                 model: arg_str(&args, "model").ok(),
                 prompt: arg_str(&args, "prompt").ok(),
                 seed: args.get("seed").and_then(|v| v.as_bool()).unwrap_or(true),
@@ -733,8 +733,8 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 .and_then(|v| v.as_str())
                 .unwrap_or("bottom")
             {
-                "top" => agentd_protocol::SessionGroupPosition::Top,
-                "bottom" => agentd_protocol::SessionGroupPosition::Bottom,
+                "top" => construct_protocol::SessionGroupPosition::Top,
+                "bottom" => construct_protocol::SessionGroupPosition::Bottom,
                 other => {
                     return Err(anyhow!(
                         "`position` must be \"top\" or \"bottom\", got {other:?}"
@@ -747,8 +747,8 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
         "construct_move_session" => {
             let sid = arg_str(&args, "session_id")?;
             let direction = match arg_str(&args, "direction")?.as_str() {
-                "up" => agentd_protocol::MoveDirection::Up,
-                "down" => agentd_protocol::MoveDirection::Down,
+                "up" => construct_protocol::MoveDirection::Up,
+                "down" => construct_protocol::MoveDirection::Down,
                 other => {
                     return Err(anyhow!(
                         "`direction` must be \"up\" or \"down\", got {other:?}"
@@ -787,7 +787,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                     .unwrap_or(false),
                 env,
                 args: Vec::new(),
-                kind: agentd_protocol::SessionKind::Subagent,
+                kind: construct_protocol::SessionKind::Subagent,
                 parent_session_id: Some(parent_id),
                 group_id: None,
                 position_after_session_id: None,
@@ -803,7 +803,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 .await?
                 .into_iter()
                 .filter(|s| {
-                    s.kind == agentd_protocol::SessionKind::Subagent
+                    s.kind == construct_protocol::SessionKind::Subagent
                         && s.parent_session_id.as_deref() == Some(parent_id.as_str())
                 })
                 .collect();
@@ -890,19 +890,19 @@ fn arg_usize(args: &Value, name: &str) -> Option<usize> {
     args.get(name).and_then(|v| v.as_u64()).map(|n| n as usize)
 }
 
-/// Parse an optional array-of-strings arg into [`agentd_protocol::SearchScope`]s.
+/// Parse an optional array-of-strings arg into [`construct_protocol::SearchScope`]s.
 /// Unrecognized entries are ignored rather than erroring, so a caller passing
 /// e.g. a stray plural ("names") degrades to "search everything" instead of
 /// failing the whole call.
-fn arg_scopes(args: &Value, name: &str) -> Option<Vec<agentd_protocol::SearchScope>> {
+fn arg_scopes(args: &Value, name: &str) -> Option<Vec<construct_protocol::SearchScope>> {
     let arr = args.get(name).and_then(|v| v.as_array())?;
-    let scopes: Vec<agentd_protocol::SearchScope> = arr
+    let scopes: Vec<construct_protocol::SearchScope> = arr
         .iter()
         .filter_map(|v| v.as_str())
         .filter_map(|s| match s {
-            "name" => Some(agentd_protocol::SearchScope::Name),
-            "program" => Some(agentd_protocol::SearchScope::Program),
-            "transcript" => Some(agentd_protocol::SearchScope::Transcript),
+            "name" => Some(construct_protocol::SearchScope::Name),
+            "program" => Some(construct_protocol::SearchScope::Program),
+            "transcript" => Some(construct_protocol::SearchScope::Transcript),
             _ => None,
         })
         .collect();
@@ -927,10 +927,10 @@ async fn owned_subagent_detail(
     client: &Arc<Client>,
     session_id: Option<&str>,
     subagent_id: &str,
-) -> Result<agentd_protocol::SessionDetail> {
+) -> Result<construct_protocol::SessionDetail> {
     let parent_id = require_session_id(session_id)?;
     let detail = client.get(subagent_id).await?;
-    if detail.summary.kind != agentd_protocol::SessionKind::Subagent {
+    if detail.summary.kind != construct_protocol::SessionKind::Subagent {
         return Err(anyhow!("{subagent_id} is not a subagent"));
     }
     if detail.summary.parent_session_id.as_deref() != Some(parent_id.as_str()) {
@@ -942,7 +942,7 @@ async fn owned_subagent_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentd_protocol::{ipc_method, SessionKind, SessionState};
+    use construct_protocol::{ipc_method, SessionKind, SessionState};
     use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -1119,7 +1119,7 @@ mod tests {
             let mut reader = BufReader::new(reader);
             let mut created = subagent_summary("ssub", "sparent", false);
             loop {
-                let raw = match agentd_protocol::transport::read_message(&mut reader).await {
+                let raw = match construct_protocol::transport::read_message(&mut reader).await {
                     Ok(Some(raw)) => raw,
                     _ => break,
                 };
@@ -1344,8 +1344,8 @@ mod tests {
         serde_json::from_str(text).expect("json tool result")
     }
 
-    fn subagent_summary(id: &str, parent: &str, has_pty: bool) -> agentd_protocol::SessionSummary {
-        agentd_protocol::SessionSummary {
+    fn subagent_summary(id: &str, parent: &str, has_pty: bool) -> construct_protocol::SessionSummary {
+        construct_protocol::SessionSummary {
             id: id.to_string(),
             harness: "codex".to_string(),
             cwd: "/tmp".to_string(),
@@ -1370,7 +1370,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: SessionKind::Subagent,
             archived: false,
             operator_loop_disabled: false,

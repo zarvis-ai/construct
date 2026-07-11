@@ -13,6 +13,6 @@ name = "construct_adapter_common"
 path = "src/lib.rs"
 
 [dependencies]
-agentd-protocol = { workspace = true }
+construct-protocol = { workspace = true }
 tokio.workspace = true
 

@@ -16,7 +16,7 @@
 
 use std::time::Duration;
 
-use agentd_e2e::{Daemon, Tui};
+use construct_e2e::{Daemon, Tui};
 
 /// Minimal smoke: TUI starts, draws the modeline (IPC + render
 /// path), and quits cleanly on `q`. Keeps the bar low for the

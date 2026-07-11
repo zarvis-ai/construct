@@ -1,12 +1,12 @@
 [package]
-name = "agentd-protocol"
+name = "construct-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Wire protocol types for agentd: AHP (daemon-adapter) and IPC (client-daemon)"
+description = "Wire protocol types for construct: AHP (daemon-adapter) and IPC (client-daemon)"
 
 [dependencies]
 serde.workspace = true

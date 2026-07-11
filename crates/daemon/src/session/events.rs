@@ -95,10 +95,10 @@ impl SessionManager {
                 let bytes = event.pty_bytes().unwrap_or_default();
                 let (passthrough, count) = {
                     let mut tail = entry.osc11_tail.lock().expect("osc11_tail mutex poisoned");
-                    agentd_protocol::osc11::scan_and_strip_queries(&mut tail, &bytes)
+                    construct_protocol::osc11::scan_and_strip_queries(&mut tail, &bytes)
                 };
                 if count > 0 {
-                    let response = agentd_protocol::osc11::response_bytes((rgb[0], rgb[1], rgb[2]));
+                    let response = construct_protocol::osc11::response_bytes((rgb[0], rgb[1], rgb[2]));
                     // Boxed: pty_input can re-enter handle_event (captured
                     // input echo), which would otherwise make this future's
                     // type infinitely recursive.
@@ -249,7 +249,7 @@ impl SessionManager {
             // filtered event after its live delivery.
             let mut is_active = true;
             if let Some(bytes) = event.pty_bytes() {
-                if !agentd_protocol::is_pty_active_payload(&bytes) {
+                if !construct_protocol::is_pty_active_payload(&bytes) {
                     is_active = false;
                 }
                 if let Err(e) = self.storage.append_pty_bytes(&entry.id, &bytes) {
@@ -579,7 +579,7 @@ impl SessionManager {
                     .then_some(now.timestamp_millis()),
                 message_count: 0,
                 approval_mode: owner_summary.approval_mode,
-                kind: agentd_protocol::SessionKind::Subagent,
+                kind: construct_protocol::SessionKind::Subagent,
                 archived: false,
                 operator_loop_disabled: true,
                 needs_attention: false,

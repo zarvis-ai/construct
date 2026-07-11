@@ -61,7 +61,7 @@ pub struct SessionPickerDialog {
     /// purposes participate; the query searched is the dialog's *effective*
     /// query (the switcher's own line, or the program buffer's live
     /// `@<typeahead>` token for the clip variant).
-    pub content_matches: Vec<agentd_protocol::SearchHit>,
+    pub content_matches: Vec<construct_protocol::SearchHit>,
     /// Bumped on every query edit. The async search task echoes the
     /// generation it was fired for back with its result, so a response for
     /// a query the user has since edited away from is dropped instead of
@@ -126,7 +126,7 @@ pub enum SessionPickerRow {
     /// `hit.session_id`'s own session row: switch to it (`Switch`) or
     /// insert its clip (`InsertProgramClip`). Jump-to-match positioning
     /// within the transcript/program view is out of scope.
-    ContentMatch { hit: agentd_protocol::SearchHit },
+    ContentMatch { hit: construct_protocol::SearchHit },
 }
 
 impl SessionPickerRow {
@@ -811,7 +811,7 @@ mod tests {
             harness: "shell".into(),
             cwd: "/tmp".into(),
             title: None,
-            state: agentd_protocol::SessionState::Running,
+            state: construct_protocol::SessionState::Running,
             created_at: chrono::Utc::now(),
             last_event_at: None,
             cost_usd: None,
@@ -831,8 +831,8 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
-            kind: agentd_protocol::SessionKind::User,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
+            kind: construct_protocol::SessionKind::User,
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
@@ -944,7 +944,7 @@ mod tests {
                 };
             }
         });
-        let client = agentd_client::Client::connect(&sock)
+        let client = construct_client::Client::connect(&sock)
             .await
             .expect("client connects");
         let app = crate::app::tests::test_app(client, sessions);
@@ -1004,11 +1004,11 @@ mod tests {
             .content_search_generation;
         // Simulate a completed search landing before the next keystroke.
         if let Some(dialog) = app.session_picker.as_mut() {
-            dialog.content_matches = vec![agentd_protocol::SearchHit {
+            dialog.content_matches = vec![construct_protocol::SearchHit {
                 session_id: "s".into(),
                 title: "s".into(),
                 harness: "shell".into(),
-                scope: agentd_protocol::SearchScope::Program,
+                scope: construct_protocol::SearchScope::Program,
                 seq: None,
                 at: None,
                 snippet: "abc found".into(),
@@ -1036,11 +1036,11 @@ mod tests {
         }
         if let Some(dialog) = app.session_picker.as_mut() {
             dialog.content_search_in_flight = false;
-            dialog.content_matches = vec![agentd_protocol::SearchHit {
+            dialog.content_matches = vec![construct_protocol::SearchHit {
                 session_id: "s".into(),
                 title: "s".into(),
                 harness: "shell".into(),
-                scope: agentd_protocol::SearchScope::Transcript,
+                scope: construct_protocol::SearchScope::Transcript,
                 seq: Some(7),
                 at: None,
                 snippet: "found the needle here".into(),
@@ -1071,11 +1071,11 @@ mod tests {
         }
         if let Some(dialog) = app.session_picker.as_mut() {
             dialog.content_search_in_flight = false;
-            dialog.content_matches = vec![agentd_protocol::SearchHit {
+            dialog.content_matches = vec![construct_protocol::SearchHit {
                 session_id: "target".into(),
                 title: "target".into(),
                 harness: "shell".into(),
-                scope: agentd_protocol::SearchScope::Program,
+                scope: construct_protocol::SearchScope::Program,
                 seq: None,
                 at: None,
                 snippet: "needle in a haystack".into(),

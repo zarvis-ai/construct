@@ -1,6 +1,6 @@
 use super::*;
 
-fn block_ref_or_id(block: &agentd_protocol::ProgramBlockView) -> String {
+fn block_ref_or_id(block: &construct_protocol::ProgramBlockView) -> String {
     if !block.block_ref.is_empty() {
         block.block_ref.clone()
     } else {
@@ -9,7 +9,7 @@ fn block_ref_or_id(block: &agentd_protocol::ProgramBlockView) -> String {
 }
 
 fn program_block_ids(
-    blocks: &[agentd_protocol::ProgramBlockView],
+    blocks: &[construct_protocol::ProgramBlockView],
 ) -> std::collections::HashSet<String> {
     blocks
         .iter()
@@ -28,8 +28,8 @@ fn program_block_ids(
 /// callers rely on for an explicit initial pending declaration.
 fn program_run_blocks_from_ids(
     ids: &[String],
-    saved_blocks: &[agentd_protocol::ProgramBlockView],
-) -> Vec<agentd_protocol::ProgramBlockView> {
+    saved_blocks: &[construct_protocol::ProgramBlockView],
+) -> Vec<construct_protocol::ProgramBlockView> {
     let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
     saved_blocks
         .iter()
@@ -56,9 +56,9 @@ fn program_run_blocks_from_ids(
 /// a known limitation of running without `selection_block_ids`.
 fn program_run_blocks_from_spans(
     body: &str,
-    saved_blocks: &[agentd_protocol::ProgramBlockView],
-) -> Vec<agentd_protocol::ProgramBlockView> {
-    let mut by_content: std::collections::HashMap<String, Vec<&agentd_protocol::ProgramBlockView>> =
+    saved_blocks: &[construct_protocol::ProgramBlockView],
+) -> Vec<construct_protocol::ProgramBlockView> {
+    let mut by_content: std::collections::HashMap<String, Vec<&construct_protocol::ProgramBlockView>> =
         std::collections::HashMap::new();
     for block in saved_blocks {
         if !block.content_id.is_empty() {
@@ -69,7 +69,7 @@ fn program_run_blocks_from_spans(
         }
     }
 
-    agentd_protocol::program_block_spans(body)
+    construct_protocol::program_block_spans(body)
         .into_iter()
         .map(|span| {
             if let Some(matches) = by_content.get(&span.id) {
@@ -79,7 +79,7 @@ fn program_run_blocks_from_spans(
             }
             let trimmed = span.text.trim();
             if !trimmed.is_empty() {
-                let containing: Vec<&agentd_protocol::ProgramBlockView> = saved_blocks
+                let containing: Vec<&construct_protocol::ProgramBlockView> = saved_blocks
                     .iter()
                     .filter(|block| block.text.contains(trimmed))
                     .collect();
@@ -87,7 +87,7 @@ fn program_run_blocks_from_spans(
                     return (*block).clone();
                 }
             }
-            agentd_protocol::ProgramBlockView {
+            construct_protocol::ProgramBlockView {
                 id: span.id.clone(),
                 block_id: String::new(),
                 content_epoch: 0,
@@ -105,11 +105,11 @@ fn program_run_blocks_from_spans(
 
 fn program_run_system_status(run: &ProgramRunProgress) -> &'static str {
     if run.queued_behind_current_turn && !run.seen_running {
-        agentd_protocol::PROGRAM_SHIMMER_STATUS_QUEUED
+        construct_protocol::PROGRAM_SHIMMER_STATUS_QUEUED
     } else if run.first_output_seen {
-        agentd_protocol::PROGRAM_SHIMMER_STATUS_AGENT_WORKING
+        construct_protocol::PROGRAM_SHIMMER_STATUS_AGENT_WORKING
     } else {
-        agentd_protocol::PROGRAM_SHIMMER_STATUS_DELIVERED
+        construct_protocol::PROGRAM_SHIMMER_STATUS_DELIVERED
     }
 }
 
@@ -169,7 +169,7 @@ impl SessionManager {
         &self,
         session_id: &str,
         markdown: &str,
-    ) -> Vec<agentd_protocol::ProgramBlockView> {
+    ) -> Vec<construct_protocol::ProgramBlockView> {
         let run = self
             .program_runs
             .lock()
@@ -193,9 +193,9 @@ impl SessionManager {
             .read_program_with_blocks(session_id)
             .map(|(_, blocks)| blocks)
             .unwrap_or_else(|_| {
-                agentd_protocol::program_block_spans(markdown)
+                construct_protocol::program_block_spans(markdown)
                     .into_iter()
-                    .map(|span| agentd_protocol::ProgramBlockView {
+                    .map(|span| construct_protocol::ProgramBlockView {
                         id: span.id.clone(),
                         block_id: String::new(),
                         content_epoch: 0,
@@ -364,7 +364,7 @@ impl SessionManager {
             // Until then it is the optimistic full-program shimmer and stays
             // subject to the owning-session idle stop signal.
             agent_managed: false,
-            stage: agentd_protocol::ProgramRunStage::Delivered,
+            stage: construct_protocol::ProgramRunStage::Delivered,
             settled_block_count: 0,
             total_block_count,
         }
@@ -383,7 +383,7 @@ impl SessionManager {
         &self,
         session_id: &str,
         markdown: &str,
-        decls: &[agentd_protocol::ProgramShimmerDecl],
+        decls: &[construct_protocol::ProgramShimmerDecl],
     ) {
         let now_ms = Utc::now().timestamp_millis();
         let blocks = self.program_blocks_projection(session_id, markdown);
@@ -421,7 +421,7 @@ impl SessionManager {
                     if let Some(tip) = decl
                         .tooltip
                         .as_deref()
-                        .and_then(agentd_protocol::normalize_program_tooltip)
+                        .and_then(construct_protocol::normalize_program_tooltip)
                     {
                         run.pending_block_tooltips.insert(key, tip);
                     }
@@ -490,7 +490,7 @@ impl SessionManager {
                 .iter()
                 .filter_map(|(id, tip)| {
                     tip.as_deref()
-                        .and_then(agentd_protocol::normalize_program_tooltip)
+                        .and_then(construct_protocol::normalize_program_tooltip)
                         .map(|t| (id.clone(), t))
                 })
                 .collect();
@@ -524,9 +524,9 @@ impl SessionManager {
     pub(super) fn note_session_state_for_program_run(
         &self,
         session_id: &str,
-        state: agentd_protocol::SessionState,
+        state: construct_protocol::SessionState,
     ) {
-        use agentd_protocol::SessionState;
+        use construct_protocol::SessionState;
         let mut clear = false;
         let mut updated = false;
         if let Ok(mut runs) = self.program_runs.lock() {

@@ -10,14 +10,14 @@
 //! actually accepted.
 //!
 //! The table lives in `state_dir/smith-model-limits.json` so every
-//! agentd session on the same machine shares the learning. The file
+//! construct session on the same machine shares the learning. The file
 //! is JSON to stay forgiving: extra keys are ignored, a corrupt file
 //! falls back to defaults instead of failing the launch.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agentd_protocol::paths::Paths;
+use construct_protocol::paths::Paths;
 use serde::{Deserialize, Serialize};
 
 /// Number of seconds between probe attempts for the same model.

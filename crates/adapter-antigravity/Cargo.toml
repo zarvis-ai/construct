@@ -6,14 +6,14 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Google Antigravity CLI adapter for agentd (wraps the `agy` CLI)"
+description = "Google Antigravity CLI adapter for construct (wraps the `agy` CLI)"
 
 [lib]
 name = "construct_adapter_antigravity"
 path = "src/lib.rs"
 
 [dependencies]
-agentd-protocol = { workspace = true, features = ["pty"] }
+construct-protocol = { workspace = true, features = ["pty"] }
 construct-adapter-common.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

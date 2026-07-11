@@ -20,8 +20,8 @@ members = [
 version = "0.13.3"
 edition = "2021"
 license = "MIT"
-authors = ["agentd contributors"]
-repository = "https://github.com/zarvis-ai/agentd"
+authors = ["construct contributors"]
+repository = "https://github.com/zarvis-ai/construct"
 description = "Cross-harness agent fleet TUI and daemon"
 rust-version = "1.75"
 
@@ -61,8 +61,8 @@ chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 diffy = "0.4"
 
-agentd-protocol = { path = "crates/protocol" }
-agentd-client = { path = "crates/client" }
+construct-protocol = { path = "crates/protocol" }
+construct-client = { path = "crates/client" }
 construct-adapter-common = { path = "crates/adapter-common" }
 
 [profile.release]

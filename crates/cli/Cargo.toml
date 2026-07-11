@@ -1,5 +1,5 @@
 [package]
-name = "agentd-cli"
+name = "construct-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,11 +14,11 @@ path = "src/main.rs"
 
 [dependencies]
 tempfile = "3"
-agentd-protocol = { workspace = true }
-agentd-client = { workspace = true }
+construct-protocol = { workspace = true }
+construct-client = { workspace = true }
 # The daemon, as a library, so the `construct` binary can run it directly via
 # the `daemon` subcommand. The daemon has no standalone binary of its own.
-agentd = { path = "../daemon" }
+construct-daemon = { path = "../daemon" }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

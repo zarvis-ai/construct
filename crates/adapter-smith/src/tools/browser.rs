@@ -6,7 +6,7 @@
 //! full browser-automation dependency.
 
 use super::{Tool, ToolCtx, ToolOutcome};
-use agentd_protocol::{BrowserPreview, SessionEvent, ToolRisk};
+use construct_protocol::{BrowserPreview, SessionEvent, ToolRisk};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use base64::Engine;

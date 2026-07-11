@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use agentd_e2e::Daemon;
+use construct_e2e::Daemon;
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use futures::StreamExt;
 

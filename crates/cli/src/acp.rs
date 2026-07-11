@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use agentd_client::Client;
-use agentd_protocol::{
+use construct_client::Client;
+use construct_protocol::{
     jsonrpc::{self, ErrorObject, Response},
     transport, EventNotificationPayload, MessageRole, SessionEvent, SessionKind, TimestampedEvent,
 };
@@ -212,7 +212,7 @@ async fn handle_request(
             let prompt = extract_prompt_text(req.prompt.as_ref());
 
             let sid = client
-                .create(agentd_protocol::CreateSessionParams {
+                .create(construct_protocol::CreateSessionParams {
                     harness,
                     cwd,
                     prompt,

@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use agentd_protocol::paths::Paths;
+use construct_protocol::paths::Paths;
 use serde::{Deserialize, Serialize};
 
 fn default_hide_pane_side_borders() -> bool {

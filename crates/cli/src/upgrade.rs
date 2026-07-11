@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use agentd_client::Client;
-use agentd_protocol::paths::Paths;
+use construct_client::Client;
+use construct_protocol::paths::Paths;
 
 /// GitHub `owner/repo` the release assets and installer come from.
 const REPO: &str = "zarvis-ai/construct";

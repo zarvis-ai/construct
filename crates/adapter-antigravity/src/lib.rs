@@ -48,9 +48,9 @@
 //! `CONSTRUCT_ANTIGRAVITY_BIN` (binary, default `agy`),
 //! `CONSTRUCT_ANTIGRAVITY_MODE` (`interactive`|`headless`).
 
-use agentd_protocol::adapter::pty::{run_session as run_pty, PtySpec};
-use agentd_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
-use agentd_protocol::{
+use construct_protocol::adapter::pty::{run_session as run_pty, PtySpec};
+use construct_protocol::adapter::{run as adapter_run, AdapterContext, AdapterInboxMsg, EventEmitter};
+use construct_protocol::{
     Capabilities, InitializeResult, MessageRole, PtySize, SessionEvent, SessionStartParams,
     SessionState,
 };
@@ -106,8 +106,8 @@ fn resolve_mode(params: &SessionStartParams) -> Mode {
     }
 }
 
-fn command_override() -> agentd_protocol::adapter::CommandOverride {
-    agentd_protocol::adapter::resolve_command_override(
+fn command_override() -> construct_protocol::adapter::CommandOverride {
+    construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_ANTIGRAVITY_CMD",
         "CONSTRUCT_ANTIGRAVITY_BIN",
         "agy",
@@ -115,12 +115,12 @@ fn command_override() -> agentd_protocol::adapter::CommandOverride {
 }
 
 // The daemon's auto-approval policy (`CONSTRUCT_AUTO_APPROVE_PATHS`, see
-// `agentd_protocol::adapter::policy`) is set, but `agy` only exposes a
+// `construct_protocol::adapter::policy`) is set, but `agy` only exposes a
 // global `--dangerously-skip-permissions` and no path-scoped allow-list, so
 // there's no native translation to apply in interactive mode. Headless mode
 // already auto-approves via that global flag, which is why widget writes
 // don't prompt there. A finer-grained translation would need an upstream
-// agy feature or for agentd to intercept its tool calls.
+// agy feature or for construct to intercept its tool calls.
 
 fn session_data_dir() -> Option<PathBuf> {
     std::env::var("CONSTRUCT_SESSION_DATA_DIR")
@@ -465,7 +465,7 @@ async fn run_session(params: SessionStartParams, ctx: AdapterContext) {
             Ok(c) => c,
             Err(e) => {
                 emit.emit(SessionEvent::Error {
-                    message: agentd_protocol::adapter::missing_bin_hint(
+                    message: construct_protocol::adapter::missing_bin_hint(
                         &command_override.argv_preview(),
                         &e,
                     ),

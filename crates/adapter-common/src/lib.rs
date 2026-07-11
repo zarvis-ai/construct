@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use agentd_protocol::adapter::{AdapterInboxMsg, EventEmitter};
+use construct_protocol::adapter::{AdapterInboxMsg, EventEmitter};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::sync::mpsc;
 

@@ -238,7 +238,7 @@ impl App {
             return;
         };
         let target = match (&summary.forked_from, &summary.merge) {
-            (Some(f), Some(m)) if m.mode == agentd_protocol::ForkMergeMode::Result => {
+            (Some(f), Some(m)) if m.mode == construct_protocol::ForkMergeMode::Result => {
                 f.session_id.clone()
             }
             _ => target_id.to_string(),
@@ -253,7 +253,7 @@ impl App {
     /// ([`App::apply_fork_merge`], spec 0078) — a direct-key shortcut for
     /// it, not a second implementation. A no-op with a status note when the
     /// highlighted row isn't an open (unmerged, undiscarded) fork.
-    async fn lineage_merge_or_discard(&mut self, mode: agentd_protocol::ForkMergeMode) {
+    async fn lineage_merge_or_discard(&mut self, mode: construct_protocol::ForkMergeMode) {
         let Some(session_id) = self.lineage_section_session() else {
             return;
         };
@@ -317,12 +317,12 @@ impl App {
                 true
             }
             KeyCode::Char('m') => {
-                self.lineage_merge_or_discard(agentd_protocol::ForkMergeMode::Result)
+                self.lineage_merge_or_discard(construct_protocol::ForkMergeMode::Result)
                     .await;
                 true
             }
             KeyCode::Char('d') => {
-                self.lineage_merge_or_discard(agentd_protocol::ForkMergeMode::Discard)
+                self.lineage_merge_or_discard(construct_protocol::ForkMergeMode::Discard)
                     .await;
                 true
             }
@@ -372,7 +372,7 @@ mod tests {
             harness: "smith".into(),
             cwd: "/tmp".into(),
             title: None,
-            state: agentd_protocol::SessionState::Running,
+            state: construct_protocol::SessionState::Running,
             created_at: chrono::Utc::now(),
             last_event_at: None,
             cost_usd: None,
@@ -392,8 +392,8 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
-            kind: agentd_protocol::SessionKind::User,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
+            kind: construct_protocol::SessionKind::User,
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
@@ -416,7 +416,7 @@ mod tests {
                 };
             }
         });
-        let client = agentd_client::Client::connect(&sock)
+        let client = construct_client::Client::connect(&sock)
             .await
             .expect("client connects");
         let app = crate::app::tests::test_app(client, sessions);
@@ -424,7 +424,7 @@ mod tests {
     }
 
     fn fork_of(mut s: SessionSummary, parent: &str) -> SessionSummary {
-        s.forked_from = Some(agentd_protocol::ForkedFrom {
+        s.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: parent.to_string(),
             transcript_seq: 0,
             at_ms: 0,
@@ -682,8 +682,8 @@ mod tests {
     #[tokio::test]
     async fn enter_on_a_merged_fork_jumps_to_the_parent_instead() {
         let mut fork = fork_of(summary("fork"), "root");
-        fork.merge = Some(agentd_protocol::ForkMerge {
-            mode: agentd_protocol::ForkMergeMode::Result,
+        fork.merge = Some(construct_protocol::ForkMerge {
+            mode: construct_protocol::ForkMergeMode::Result,
             at_ms: 0,
             merged_busy_ms: 0,
             merged_message_count: 0,
@@ -704,7 +704,7 @@ mod tests {
     async fn merge_on_a_non_fork_row_is_a_status_only_no_op() {
         let (mut app, _dir, _server) = test_app_with_sessions(vec![summary("root"), {
             let mut sub = summary("sub");
-            sub.kind = agentd_protocol::SessionKind::Subagent;
+            sub.kind = construct_protocol::SessionKind::Subagent;
             sub.parent_session_id = Some("root".to_string());
             sub
         }])

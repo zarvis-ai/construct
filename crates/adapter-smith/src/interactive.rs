@@ -15,8 +15,8 @@ use crate::context;
 use crate::persist::{self, Persist};
 use crate::provider::{self, Content, Message, Role, StopReason, TextSink, ToolCall};
 use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
-use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
-use agentd_protocol::{ApprovalMode, SessionEvent, SessionStartParams, SessionState, ToolRisk};
+use construct_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
+use construct_protocol::{ApprovalMode, SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::Result;
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
@@ -245,7 +245,7 @@ fn now_ms() -> i64 {
 }
 
 fn emit_agent_status(emit: &EventEmitter, started_at_ms: i64, status: &str) {
-    emit.emit(SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
+    emit.emit(SessionEvent::AgentStatus(construct_protocol::AgentStatus {
         active: true,
         started_at_ms,
         status: status.to_string(),
@@ -253,7 +253,7 @@ fn emit_agent_status(emit: &EventEmitter, started_at_ms: i64, status: &str) {
 }
 
 fn finish_agent_status(emit: &EventEmitter, started_at_ms: i64, status: &str) {
-    emit.emit(SessionEvent::AgentStatus(agentd_protocol::AgentStatus {
+    emit.emit(SessionEvent::AgentStatus(construct_protocol::AgentStatus {
         active: false,
         started_at_ms,
         status: status.to_string(),
@@ -574,7 +574,7 @@ impl<'a> TextSink for PtySink<'a> {
         if self.emit_messages {
             // Transcript copy stays raw (unpadded).
             self.emit.emit(SessionEvent::Message {
-                role: agentd_protocol::MessageRole::Assistant,
+                role: construct_protocol::MessageRole::Assistant,
                 text: text.to_string(),
             });
         }
@@ -784,9 +784,9 @@ impl LineEditor {
         if !self.buf.starts_with('/') {
             return Vec::new();
         }
-        let mut matches = agentd_protocol::slash::model_completion_matches(&self.buf);
+        let mut matches = construct_protocol::slash::model_completion_matches(&self.buf);
         if matches.is_empty() {
-            matches = agentd_protocol::slash::popup_names()
+            matches = construct_protocol::slash::popup_names()
                 .filter(|c| c.starts_with(self.buf.as_str()))
                 .map(str::to_string)
                 .collect();
@@ -1404,7 +1404,7 @@ mod tests {
             id: &str,
             state: &str,
             last_pty_ms: Option<i64>,
-        ) -> agentd_protocol::SessionSummary {
+        ) -> construct_protocol::SessionSummary {
             let mut v = serde_json::json!({
                 "id": id, "harness": "claude", "cwd": "/x",
                 "state": state, "created_at": "2026-06-06T00:00:00Z"
@@ -1533,7 +1533,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_approval_maps_prompt_keys_to_new_modes() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(agentd_protocol::adapter::AdapterInboxMsg::PtyInput(vec![
+        tx.send(construct_protocol::adapter::AdapterInboxMsg::PtyInput(vec![
             b'a',
         ]))
         .await
@@ -1547,7 +1547,7 @@ mod tests {
         assert_eq!(mode, ApprovalMode::AutoReview);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(agentd_protocol::adapter::AdapterInboxMsg::PtyInput(vec![
+        tx.send(construct_protocol::adapter::AdapterInboxMsg::PtyInput(vec![
             b'f',
         ]))
         .await
@@ -1563,7 +1563,7 @@ mod tests {
     #[tokio::test]
     async fn wait_for_approval_maps_decisions_to_new_modes() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(agentd_protocol::adapter::AdapterInboxMsg::ToolDecision {
+        tx.send(construct_protocol::adapter::AdapterInboxMsg::ToolDecision {
             call_id: "call-1".into(),
             decision: "auto_review".into(),
         })
@@ -1578,7 +1578,7 @@ mod tests {
         assert_eq!(mode, ApprovalMode::AutoReview);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        tx.send(agentd_protocol::adapter::AdapterInboxMsg::ToolDecision {
+        tx.send(construct_protocol::adapter::AdapterInboxMsg::ToolDecision {
             call_id: "call-1".into(),
             decision: "unsafe_auto".into(),
         })
@@ -2265,7 +2265,7 @@ pub async fn run(
     // Operator's own id (to exclude from the ambient fleet snapshot) and the
     // prior-tick session states (for the per-tick delta).
     let self_id_for_ambient = session_id.clone();
-    let mut prev_fleet: HashMap<String, agentd_protocol::SessionState> = HashMap::new();
+    let mut prev_fleet: HashMap<String, construct_protocol::SessionState> = HashMap::new();
     // Ambient monitor model: the fleet scan + triage runs as a one-shot
     // completion off the operator's own conversation, so the bulky snapshot /
     // previews never accumulate in the operator's context and only escalations
@@ -2449,7 +2449,7 @@ pub async fn run(
         //   * Client   → hand off to the attached client as a ClientCommand
         let trimmed = user_text.trim();
         if let Some((verb, args)) = parse_slash_command(trimmed) {
-            use agentd_protocol::slash::{CommandId, Routing, SlashCommand};
+            use construct_protocol::slash::{CommandId, Routing, SlashCommand};
             match SlashCommand::resolve(&verb) {
                 Some(cmd) => match cmd.routing {
                     Routing::Client => {
@@ -2648,12 +2648,12 @@ pub async fn run(
                             .unwrap_or(0)
                     );
                     emit.emit(SessionEvent::ToolUse {
-                        tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
+                        tool: construct_protocol::TUI_DISPATCH_TOOL.to_string(),
                         args: tool_args,
                         call_id: Some(call_id.clone()),
                     });
                     emit.emit(SessionEvent::ToolResult {
-                        tool: agentd_protocol::TUI_DISPATCH_TOOL.to_string(),
+                        tool: construct_protocol::TUI_DISPATCH_TOOL.to_string(),
                         ok: true,
                         output: pretty,
                         call_id: Some(call_id),
@@ -2749,7 +2749,7 @@ pub async fn run(
             emit.emit(SessionEvent::pty(&echo));
         }
         emit.emit(SessionEvent::Message {
-            role: agentd_protocol::MessageRole::User,
+            role: construct_protocol::MessageRole::User,
             text: user_text,
         });
         emit.emit(SessionEvent::Status {
@@ -3281,7 +3281,7 @@ pub async fn run(
                     }
                 );
                 emit.emit(SessionEvent::Message {
-                    role: agentd_protocol::MessageRole::User,
+                    role: construct_protocol::MessageRole::User,
                     text: steer,
                 });
             }
@@ -3408,8 +3408,8 @@ struct AmbientSnapshot {
 }
 
 async fn operator_fleet_has_active_session(self_id: &str) -> bool {
-    let socket = agentd_protocol::paths::Paths::discover().socket();
-    let Ok(client) = agentd_client::Client::connect(&socket).await else {
+    let socket = construct_protocol::paths::Paths::discover().socket();
+    let Ok(client) = construct_client::Client::connect(&socket).await else {
         return false;
     };
     let Ok(sessions) = client.list().await else {
@@ -3423,7 +3423,7 @@ async fn operator_fleet_has_active_session(self_id: &str) -> bool {
 }
 
 fn ambient_session_is_active(
-    session: &agentd_protocol::SessionSummary,
+    session: &construct_protocol::SessionSummary,
     self_id: &str,
     now: chrono::DateTime<chrono::Utc>,
     window: Duration,
@@ -3441,7 +3441,7 @@ fn ambient_session_is_active(
         .is_some_and(|last| (now - last).num_milliseconds().max(0) <= window_ms);
     recent_pty
         || recent_event
-        || session.state == agentd_protocol::SessionState::Running
+        || session.state == construct_protocol::SessionState::Running
             && session.last_pty_at_ms.is_none()
             && session.last_event_at.is_none()
 }
@@ -3453,10 +3453,10 @@ fn ambient_session_is_active(
 /// Falls back to [`AMBIENT_TICK_FALLBACK`] if the daemon can't be reached.
 async fn build_ambient_observation(
     self_id: &str,
-    prev: &mut HashMap<String, agentd_protocol::SessionState>,
+    prev: &mut HashMap<String, construct_protocol::SessionState>,
 ) -> String {
-    let socket = agentd_protocol::paths::Paths::discover().socket();
-    let Ok(client) = agentd_client::Client::connect(&socket).await else {
+    let socket = construct_protocol::paths::Paths::discover().socket();
+    let Ok(client) = construct_client::Client::connect(&socket).await else {
         return AMBIENT_TICK_FALLBACK.to_string();
     };
     let Ok(sessions) = client.list().await else {
@@ -3597,7 +3597,7 @@ fn parse_triage_finding(reply: &str) -> Option<String> {
 /// `Pty` markers — and falls back to recent transcript messages for headless /
 /// no-PTY sessions.
 async fn fetch_session_preview(
-    client: &agentd_client::Client,
+    client: &construct_client::Client,
     sid: &str,
     max_bytes: usize,
 ) -> Option<String> {
@@ -3607,7 +3607,7 @@ async fn fetch_session_preview(
     let tr = client.transcript_tail(sid, 40).await.ok()?;
     let mut msgs: Vec<String> = Vec::new();
     for ev in tr.events.iter().rev() {
-        if let agentd_protocol::SessionEvent::Message { role, text } = &ev.event {
+        if let construct_protocol::SessionEvent::Message { role, text } = &ev.event {
             let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
             if collapsed.is_empty() {
                 continue;
@@ -3631,7 +3631,7 @@ async fn fetch_session_preview(
 /// Render the recent PTY-log tail through a `vt100` parser and return the
 /// screen's non-blank lines (byte-bounded). `None` for sessions with no PTY.
 async fn pty_screen_preview(
-    client: &agentd_client::Client,
+    client: &construct_client::Client,
     sid: &str,
     max_bytes: usize,
 ) -> Option<String> {
@@ -3670,27 +3670,27 @@ async fn pty_screen_preview(
 /// tick, flags what needs attention, and returns the notable sessions to
 /// preview. Split from the daemon round-trip so it's testable. Updates `prev`.
 fn compute_ambient_snapshot(
-    sessions: &[agentd_protocol::SessionSummary],
+    sessions: &[construct_protocol::SessionSummary],
     self_id: &str,
-    prev: &mut HashMap<String, agentd_protocol::SessionState>,
+    prev: &mut HashMap<String, construct_protocol::SessionState>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> AmbientSnapshot {
-    use agentd_protocol::SessionState;
+    use construct_protocol::SessionState;
     let now_ms = now.timestamp_millis();
     let first_tick = prev.is_empty();
-    let label = |s: &agentd_protocol::SessionSummary| -> String {
+    let label = |s: &construct_protocol::SessionSummary| -> String {
         let title = s.title.clone().unwrap_or_else(|| s.harness.clone());
         let short: String = s.id.chars().take(8).collect();
         format!("{short} \"{}\"", title.chars().take(32).collect::<String>())
     };
-    let event_idle_min = |s: &agentd_protocol::SessionSummary| -> i64 {
+    let event_idle_min = |s: &construct_protocol::SessionSummary| -> i64 {
         s.last_event_at
             .map(|t| (now - t).num_minutes().max(0))
             .unwrap_or(0)
     };
     // Minutes since last PTY byte — the "actually quiet?" signal. `None` (no
     // PTY, e.g. headless) yields a negative value so it never counts as idle.
-    let pty_idle_min = |s: &agentd_protocol::SessionSummary| -> i64 {
+    let pty_idle_min = |s: &construct_protocol::SessionSummary| -> i64 {
         match s.last_pty_at_ms {
             Some(ms) => (now_ms - ms).max(0) / 60_000,
             None => -1,
@@ -4639,7 +4639,7 @@ where
 fn parse_slash_loop_spec(
     input: &str,
     now_ms: i64,
-) -> Option<(agentd_protocol::LoopSpec, Option<i64>, String)> {
+) -> Option<(construct_protocol::LoopSpec, Option<i64>, String)> {
     let mut tokens = input.split_whitespace().peekable();
     if matches!(tokens.peek().copied(), Some("every")) {
         tokens.next();
@@ -4660,7 +4660,7 @@ fn parse_slash_loop_spec(
     let rest: Vec<&str> = tokens.collect();
     let prompt = rest.join(" ");
     Some((
-        agentd_protocol::LoopSpec::Interval { seconds: secs },
+        construct_protocol::LoopSpec::Interval { seconds: secs },
         expires_at_ms,
         prompt,
     ))
@@ -4697,7 +4697,7 @@ async fn handle_slash_loop(
     model: &str,
     tool_ctx: &ToolCtx,
 ) {
-    use agentd_protocol::{LoopCreateParams, LoopSpec};
+    use construct_protocol::{LoopCreateParams, LoopSpec};
     let rest = rest.trim();
     if rest.is_empty() {
         term.note("(usage: /loop [interval] [for <duration>] <prompt>)");
@@ -4739,7 +4739,7 @@ async fn handle_slash_loop(
         return;
     }
 
-    let client = match crate::tools::agentd::client(tool_ctx).await {
+    let client = match crate::tools::construct_daemon::client(tool_ctx).await {
         Ok(c) => c,
         Err(e) => {
             term.note(&format!("(daemon connect failed: {e})"));

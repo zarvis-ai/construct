@@ -4,7 +4,7 @@
 //! `target/debug/` against a fresh tempdir for every test (so
 //! the test never touches the developer's actual `$CONSTRUCT_*_DIR`
 //! state), waits for the IPC socket to come up, and returns a
-//! connected `agentd_client::Client` plus the path to the
+//! connected `construct_client::Client` plus the path to the
 //! socket. Drop kills the daemon and cleans the tempdir.
 //!
 //! There's a sibling [`Tui`] helper that spawns the `construct` TUI
@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::process::{Child, Command};
 
-use agentd_client::Client;
+use construct_client::Client;
 
 /// One isolated daemon instance + a connected IPC client.
 /// `Drop` kills the daemon (via tokio's `kill_on_drop`) and

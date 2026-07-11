@@ -66,7 +66,7 @@ Notifications the adapter emits:
 Adapters that own a PTY can opt into a shared runtime helper:
 
 ```rust
-use agentd_protocol::adapter::pty::{run_session, PtySpec};
+use construct_protocol::adapter::pty::{run_session, PtySpec};
 
 // in your run(metadata, |params, ctx| async move { ... }) closure:
 let spec = PtySpec {
@@ -85,8 +85,8 @@ let _ = run_session(spec, ctx).await;
 Writing an adapter in Rust is roughly:
 
 ```rust
-use agentd_protocol::adapter::run;
-use agentd_protocol::{Capabilities, InitializeResult, MessageRole, SessionEvent, SessionState};
+use construct_protocol::adapter::run;
+use construct_protocol::{Capabilities, InitializeResult, MessageRole, SessionEvent, SessionState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

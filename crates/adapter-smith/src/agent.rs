@@ -7,8 +7,8 @@ use crate::context;
 use crate::persist::{self, Persist};
 use crate::provider::{self, Content, LlmProvider, Message, Role, StopReason, TextSink, ToolCall};
 use crate::tools::{truncate_for_model, ToolCtx, ToolOutcome, ToolRegistry};
-use agentd_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
-use agentd_protocol::{MessageRole, SessionEvent, SessionStartParams, SessionState, ToolRisk};
+use construct_protocol::adapter::{AdapterContext, AdapterInboxMsg, EventEmitter};
+use construct_protocol::{MessageRole, SessionEvent, SessionStartParams, SessionState, ToolRisk};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
@@ -129,7 +129,7 @@ pub async fn auto_review_for_adapter(
     // auto-approved deterministically via the auto-approve policy; this covers
     // the residual cases that still reach the reviewer (e.g. shell reads or
     // removals of widget files).
-    let widgets_hint = match std::env::var(agentd_protocol::agent_context::ENV_SESSION_WIDGETS_DIR)
+    let widgets_hint = match std::env::var(construct_protocol::agent_context::ENV_SESSION_WIDGETS_DIR)
     {
         Ok(dir) if !dir.is_empty() => format!("\n\nSession widget directory:\n{dir}"),
         _ => String::new(),
@@ -317,7 +317,7 @@ pub(crate) const SYSTEM_PROMPT_USER: &str = r#"You are smith, an AI agent embedd
 
 You have access to:
 - Local tools: shell (run any command — read files with `cat`/`sed -n`, search with `rg`/`grep`, list with `ls`, run tests, git), edit_file (apply one or many find/replace hunks across files; also creates files), write_stdin (drive an interactive process started by `shell interactive:true`).
-- Agentd-control tools (prefix `agentd_`) for inspecting and steering other agentd sessions running on this host.
+- Agentd-control tools (prefix `agentd_`) for inspecting and steering other construct sessions running on this host.
 - Subagent tools (`agentd_subagent_*`) for delegating bounded work to child agents nested under the current session when the user asks you to split or parallelize work.
 
 When the user says "subagent", default to `agentd_subagent_create`: a child agent parented to the current session and shown nested under it. Use `agentd_create_session` only when the user asks for a "new session", a top-level/visible session, or otherwise wants an independent fleet session.
@@ -579,7 +579,7 @@ pub async fn run(
     let provider = spec.provider;
     // Per-model learned token limits — adapts on overflow errors
     // and bumps upward on successful probe calls. Shared across
-    // all agentd sessions on this machine via state_dir.
+    // all construct sessions on this machine via state_dir.
     let mut limits = crate::model_limits::ModelLimits::load();
     // Initial status — tells the user which provider/model the session
     // actually resolved to.
@@ -604,9 +604,9 @@ pub async fn run(
 
     // Per-session approval mode. Defaults to unsafe-auto when the legacy env override is set.
     let mut approval_mode = if std::env::var("CONSTRUCT_SMITH_AUTOMODE").as_deref() == Ok("1") {
-        agentd_protocol::ApprovalMode::UnsafeAuto
+        construct_protocol::ApprovalMode::UnsafeAuto
     } else {
-        agentd_protocol::ApprovalMode::Manual
+        construct_protocol::ApprovalMode::Manual
     };
 
     let tool_ctx = ToolCtx {
@@ -1181,7 +1181,7 @@ async fn run_one_tool(
     tool_ctx: &ToolCtx,
     emit: &EventEmitter,
     inbox: &mut tokio::sync::mpsc::Receiver<AdapterInboxMsg>,
-    approval_mode: &mut agentd_protocol::ApprovalMode,
+    approval_mode: &mut construct_protocol::ApprovalMode,
     provider: &dyn LlmProvider,
     model: &str,
     review_ctx: &AutoReviewContext,
@@ -1210,9 +1210,9 @@ async fn run_one_tool(
         ToolRisk::Risky
     );
     let mut needs_approval =
-        is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::Manual);
+        is_risky && matches!(*approval_mode, construct_protocol::ApprovalMode::Manual);
     let mut allow_auto_review = true;
-    if is_risky && matches!(*approval_mode, agentd_protocol::ApprovalMode::AutoReview) {
+    if is_risky && matches!(*approval_mode, construct_protocol::ApprovalMode::AutoReview) {
         match auto_review_for_adapter(
             provider,
             model,
@@ -1292,7 +1292,7 @@ async fn run_one_tool(
                 }
                 Some(AdapterInboxMsg::SetApprovalMode(mode)) => {
                     *approval_mode = mode;
-                    if matches!(mode, agentd_protocol::ApprovalMode::UnsafeAuto) {
+                    if matches!(mode, construct_protocol::ApprovalMode::UnsafeAuto) {
                         break;
                     }
                 }
@@ -1308,7 +1308,7 @@ async fn run_one_tool(
                             break;
                         }
                         "auto_review" => {
-                            *approval_mode = agentd_protocol::ApprovalMode::AutoReview;
+                            *approval_mode = construct_protocol::ApprovalMode::AutoReview;
                             match auto_review_for_adapter(
                                 provider,
                                 model,
@@ -1333,7 +1333,7 @@ async fn run_one_tool(
                             }
                         }
                         "unsafe_auto" => {
-                            *approval_mode = agentd_protocol::ApprovalMode::UnsafeAuto;
+                            *approval_mode = construct_protocol::ApprovalMode::UnsafeAuto;
                             record_approval_history(
                                 approval_history,
                                 "user:unsafe_auto",
@@ -1434,7 +1434,7 @@ async fn run_with_interrupt(
     let procs = ctx.procs.clone();
     let sandbox = ctx.sandbox.clone();
     let sandbox_policy = ctx.sandbox_policy.clone();
-    let client_cell = std::sync::Mutex::new(None::<Arc<agentd_client::Client>>);
+    let client_cell = std::sync::Mutex::new(None::<Arc<construct_client::Client>>);
     if let Some(c) = ctx.client.get() {
         *client_cell.lock().unwrap() = Some(c.clone());
     }

@@ -23,8 +23,8 @@ mod tasks;
 mod title_mode;
 mod tools;
 
-use agentd_protocol::adapter::run as adapter_run;
-use agentd_protocol::{Capabilities, InitializeResult, SessionEvent, SessionStartParams};
+use construct_protocol::adapter::run as adapter_run;
+use construct_protocol::{Capabilities, InitializeResult, SessionEvent, SessionStartParams};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {

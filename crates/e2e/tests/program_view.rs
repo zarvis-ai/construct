@@ -10,7 +10,7 @@
 
 use std::time::{Duration, Instant};
 
-use agentd_e2e::{artifact_dir, Daemon};
+use construct_e2e::{artifact_dir, Daemon};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::page::{Page, ScreenshotParams};
 use futures::StreamExt;
@@ -1246,11 +1246,11 @@ async fn program_instant_dispatch_fast_path() {
     let md = "# Todo\n\n- Print hello @{harness:shell}\n";
     let updated = d
         .client
-        .program_update(agentd_protocol::ProgramUpdateParams {
+        .program_update(construct_protocol::ProgramUpdateParams {
             session_id: owner.clone(),
             markdown: md.to_string(),
             base_version: None,
-            actor: agentd_protocol::ProgramUpdateActor::Human,
+            actor: construct_protocol::ProgramUpdateActor::Human,
             template_id: None,
             note: None,
             shimmer: None,
@@ -1262,7 +1262,7 @@ async fn program_instant_dispatch_fast_path() {
     let item_text = "- Print hello @{harness:shell}";
     let result = d
         .client
-        .program_execute(agentd_protocol::ProgramExecuteParams {
+        .program_execute(construct_protocol::ProgramExecuteParams {
             session_id: owner.clone(),
             selection: Some(item_text.to_string()),
             base_version: Some(updated.program.version),
@@ -1282,7 +1282,7 @@ async fn program_instant_dispatch_fast_path() {
     let subagents: Vec<_> = sessions
         .iter()
         .filter(|s| {
-            s.kind == agentd_protocol::SessionKind::Subagent
+            s.kind == construct_protocol::SessionKind::Subagent
                 && s.parent_session_id.as_deref() == Some(owner.as_str())
         })
         .collect();
@@ -1353,11 +1353,11 @@ async fn program_instant_dispatch_mixed_selection_falls_through() {
 
     let md = "- Fix the bug @{harness:shell}\n- Investigate the timeout\n";
     d.client
-        .program_update(agentd_protocol::ProgramUpdateParams {
+        .program_update(construct_protocol::ProgramUpdateParams {
             session_id: owner.clone(),
             markdown: md.to_string(),
             base_version: None,
-            actor: agentd_protocol::ProgramUpdateActor::Human,
+            actor: construct_protocol::ProgramUpdateActor::Human,
             template_id: None,
             note: None,
             shimmer: None,
@@ -1369,7 +1369,7 @@ async fn program_instant_dispatch_mixed_selection_falls_through() {
     let selection = "- Fix the bug @{harness:shell}\n- Investigate the timeout";
     let result = d
         .client
-        .program_execute(agentd_protocol::ProgramExecuteParams {
+        .program_execute(construct_protocol::ProgramExecuteParams {
             session_id: owner.clone(),
             selection: Some(selection.to_string()),
             base_version: None,
@@ -1389,7 +1389,7 @@ async fn program_instant_dispatch_mixed_selection_falls_through() {
     let sessions = d.client.list().await.expect("list");
     let subagents = sessions
         .iter()
-        .filter(|s| s.kind == agentd_protocol::SessionKind::Subagent)
+        .filter(|s| s.kind == construct_protocol::SessionKind::Subagent)
         .count();
     assert_eq!(
         subagents, 0,
@@ -1415,11 +1415,11 @@ async fn program_instant_dispatch_preserves_nested_indentation() {
 
     let md = "- Parent\n  - Fix nested bug @{harness:shell}\n";
     d.client
-        .program_update(agentd_protocol::ProgramUpdateParams {
+        .program_update(construct_protocol::ProgramUpdateParams {
             session_id: owner.clone(),
             markdown: md.to_string(),
             base_version: None,
-            actor: agentd_protocol::ProgramUpdateActor::Human,
+            actor: construct_protocol::ProgramUpdateActor::Human,
             template_id: None,
             note: None,
             shimmer: None,
@@ -1432,7 +1432,7 @@ async fn program_instant_dispatch_preserves_nested_indentation() {
     let selection = "  - Fix nested bug @{harness:shell}";
     let result = d
         .client
-        .program_execute(agentd_protocol::ProgramExecuteParams {
+        .program_execute(construct_protocol::ProgramExecuteParams {
             session_id: owner.clone(),
             selection: Some(selection.to_string()),
             base_version: None,
@@ -1454,8 +1454,8 @@ async fn program_instant_dispatch_preserves_nested_indentation() {
     );
 }
 
-fn shell_session_params(cwd: &str, title: &str) -> agentd_protocol::CreateSessionParams {
-    agentd_protocol::CreateSessionParams {
+fn shell_session_params(cwd: &str, title: &str) -> construct_protocol::CreateSessionParams {
+    construct_protocol::CreateSessionParams {
         harness: "shell".to_string(),
         cwd: cwd.to_string(),
         prompt: None,

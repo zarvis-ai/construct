@@ -1,8 +1,8 @@
 //! Daemon-side adapter handle. Spawns the adapter binary and exchanges
 //! JSON-RPC over its stdio.
 
-use agentd_protocol::jsonrpc::{self, MessageKind, Response};
-use agentd_protocol::{
+use construct_protocol::jsonrpc::{self, MessageKind, Response};
+use construct_protocol::{
     ahp_method, ahp_notif, transport, ErrorObject, EventEnvelope, InitializeParams,
     InitializeResult, Notification, Request, AHP_VERSION,
 };
@@ -209,7 +209,7 @@ impl Adapter {
                     let mut pending = pending.lock().unwrap();
                     for (_, waiter) in pending.drain() {
                         let _ = waiter.send(Err(ErrorObject::new(
-                            agentd_protocol::jsonrpc::error_codes::ADAPTER_FAILED,
+                            construct_protocol::jsonrpc::error_codes::ADAPTER_FAILED,
                             "adapter exited before responding",
                         )));
                     }
@@ -231,7 +231,7 @@ impl Adapter {
         // Initialize handshake.
         let init_params = serde_json::to_value(&InitializeParams {
             protocol_version: AHP_VERSION.to_string(),
-            client_info: agentd_protocol::ClientInfo {
+            client_info: construct_protocol::ClientInfo {
                 name: "agentd".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
@@ -385,7 +385,7 @@ impl Adapter {
     async fn initialize(&self) -> Result<InitializeResult> {
         let init_params = serde_json::to_value(&InitializeParams {
             protocol_version: AHP_VERSION.to_string(),
-            client_info: agentd_protocol::ClientInfo {
+            client_info: construct_protocol::ClientInfo {
                 name: "agentd".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
@@ -497,7 +497,7 @@ fn fail_pending(
     let mut pending = pending.lock().unwrap();
     for (_, waiter) in pending.drain() {
         let _ = waiter.send(Err(ErrorObject::new(
-            agentd_protocol::jsonrpc::error_codes::ADAPTER_FAILED,
+            construct_protocol::jsonrpc::error_codes::ADAPTER_FAILED,
             message,
         )));
     }

@@ -84,7 +84,7 @@ fn parse(toml_str: &str) -> Result<BTreeMap<String, ModelProfile>> {
 /// any). A malformed file surfaces an error so a typo isn't silently
 /// swallowed into "no profiles".
 pub fn load_all() -> Result<BTreeMap<String, ModelProfile>> {
-    let path = agentd_protocol::paths::Paths::discover().config_file();
+    let path = construct_protocol::paths::Paths::discover().config_file();
     if !path.exists() {
         return Ok(BTreeMap::new());
     }

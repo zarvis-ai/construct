@@ -6,14 +6,14 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Grok CLI adapter for agentd (wraps the `grok` CLI)"
+description = "Grok CLI adapter for construct (wraps the `grok` CLI)"
 
 [lib]
 name = "construct_adapter_grok"
 path = "src/lib.rs"
 
 [dependencies]
-agentd-protocol = { workspace = true, features = ["pty"] }
+construct-protocol = { workspace = true, features = ["pty"] }
 construct-adapter-common.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

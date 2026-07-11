@@ -3,14 +3,14 @@
 //! context vs what the user sees in the transcript.
 
 use crate::provider::ToolSpec;
-use agentd_client::Client;
-use agentd_protocol::{adapter::EventEmitter, ToolRisk};
+use construct_client::Client;
+use construct_protocol::{adapter::EventEmitter, ToolRisk};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
-pub mod agentd;
+pub mod construct_daemon;
 pub mod browser;
 pub mod execution;
 pub mod fs;
@@ -50,7 +50,7 @@ pub trait Tool: Send + Sync {
 /// auto-approval policy. A tool whose intrinsic risk is [`ToolRisk::Risky`]
 /// is downgraded to [`ToolRisk::Safe`] when:
 ///   - its target path is covered by
-///     [`agentd_protocol::adapter::policy::AutoApprovePolicy`] — that's how the
+///     [`construct_protocol::adapter::policy::AutoApprovePolicy`] — that's how the
 ///     "agentd defines the policy once, harnesses honor it" abstraction lands
 ///     on smith; or
 ///   - it is a `shell` call the model explicitly flagged `read_only: true`
@@ -107,7 +107,7 @@ fn auto_approve_covers(tool_name: &str, input: &Value, cwd: &std::path::Path) ->
     if tool_name != "edit_file" {
         return false;
     }
-    let policy = agentd_protocol::adapter::policy::AutoApprovePolicy::from_env();
+    let policy = construct_protocol::adapter::policy::AutoApprovePolicy::from_env();
     if policy.is_empty() {
         return false;
     }
@@ -200,30 +200,30 @@ impl ToolRegistry {
             Box::new(browser::BrowserScreenshot),
             Box::new(browser::BrowserEval),
             // agentd-control tools
-            Box::new(agentd::Context),
-            Box::new(agentd::Whoami),
-            Box::new(agentd::ListSessions),
-            Box::new(agentd::GetSession),
-            Box::new(agentd::GetTranscript),
-            Box::new(agentd::GetOutput),
-            Box::new(agentd::GetDiff),
-            Box::new(agentd::ListHarnesses),
-            Box::new(agentd::CreateSession),
-            Box::new(agentd::SendInput),
-            Box::new(agentd::SendKeys),
-            Box::new(agentd::InterruptSession),
-            Box::new(agentd::StopSession),
-            Box::new(agentd::KillSession),
-            Box::new(agentd::DeleteSession),
-            Box::new(agentd::PinSession),
-            Box::new(agentd::RenameSession),
-            Box::new(agentd::SetSessionGroup),
-            Box::new(agentd::MoveSession),
+            Box::new(construct_daemon::Context),
+            Box::new(construct_daemon::Whoami),
+            Box::new(construct_daemon::ListSessions),
+            Box::new(construct_daemon::GetSession),
+            Box::new(construct_daemon::GetTranscript),
+            Box::new(construct_daemon::GetOutput),
+            Box::new(construct_daemon::GetDiff),
+            Box::new(construct_daemon::ListHarnesses),
+            Box::new(construct_daemon::CreateSession),
+            Box::new(construct_daemon::SendInput),
+            Box::new(construct_daemon::SendKeys),
+            Box::new(construct_daemon::InterruptSession),
+            Box::new(construct_daemon::StopSession),
+            Box::new(construct_daemon::KillSession),
+            Box::new(construct_daemon::DeleteSession),
+            Box::new(construct_daemon::PinSession),
+            Box::new(construct_daemon::RenameSession),
+            Box::new(construct_daemon::SetSessionGroup),
+            Box::new(construct_daemon::MoveSession),
             // Recurring-prompt loops (daemon scheduler).
-            Box::new(agentd::LoopCreate),
-            Box::new(agentd::LoopList),
-            Box::new(agentd::LoopUpdate),
-            Box::new(agentd::LoopRemove),
+            Box::new(construct_daemon::LoopCreate),
+            Box::new(construct_daemon::LoopList),
+            Box::new(construct_daemon::LoopUpdate),
+            Box::new(construct_daemon::LoopRemove),
             // Smith-owned subagents: hidden backing sessions exposed as
             // task-like child agents to this parent session.
             Box::new(subagent::Create),
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn effective_risk_downgrades_widget_dir_writes() {
-        use agentd_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS;
+        use construct_protocol::adapter::policy::ENV_AUTO_APPROVE_PATHS;
         use serde_json::json;
 
         let widgets = std::env::temp_dir().join("agentd-policy-test-widgets");

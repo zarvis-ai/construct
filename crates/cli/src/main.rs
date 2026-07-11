@@ -17,8 +17,8 @@ mod tui_state;
 mod ui;
 mod upgrade;
 
-use agentd_client::Client;
-use agentd_protocol::paths::Paths;
+use construct_client::Client;
+use construct_protocol::paths::Paths;
 
 pub(crate) const BUILD_ID: &str = env!("CONSTRUCT_BUILD_ID");
 
@@ -261,7 +261,7 @@ enum ProgramCommand {
     Templates,
 }
 
-/// CLI-facing mirror of `agentd_protocol::SearchScope` so `--scope` gets a
+/// CLI-facing mirror of `construct_protocol::SearchScope` so `--scope` gets a
 /// clap-validated enum instead of a free-form string.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum SearchScopeArg {
@@ -270,12 +270,12 @@ enum SearchScopeArg {
     Transcript,
 }
 
-impl From<SearchScopeArg> for agentd_protocol::SearchScope {
+impl From<SearchScopeArg> for construct_protocol::SearchScope {
     fn from(v: SearchScopeArg) -> Self {
         match v {
-            SearchScopeArg::Name => agentd_protocol::SearchScope::Name,
-            SearchScopeArg::Program => agentd_protocol::SearchScope::Program,
-            SearchScopeArg::Transcript => agentd_protocol::SearchScope::Transcript,
+            SearchScopeArg::Name => construct_protocol::SearchScope::Name,
+            SearchScopeArg::Program => construct_protocol::SearchScope::Program,
+            SearchScopeArg::Transcript => construct_protocol::SearchScope::Transcript,
         }
     }
 }
@@ -324,19 +324,19 @@ async fn main() -> Result<()> {
         command: daemon_cmd,
     } = command
     {
-        agentd::init_tracing();
-        agentd::set_build_id(BUILD_ID);
+        construct_daemon::init_tracing();
+        construct_daemon::set_build_id(BUILD_ID);
         return match daemon_cmd.unwrap_or(DaemonCommand::Run) {
-            DaemonCommand::Run => agentd::run(cli.socket).await,
+            DaemonCommand::Run => construct_daemon::run(cli.socket).await,
             DaemonCommand::Start => daemon_start(cli.socket).await,
             DaemonCommand::Stop { sessions } => daemon_stop(cli.socket, sessions).await,
             DaemonCommand::Restart { sessions } => daemon_restart_cmd(cli.socket, sessions).await,
             DaemonCommand::Paths => {
-                agentd::print_paths();
+                construct_daemon::print_paths();
                 Ok(())
             }
             DaemonCommand::DefaultConfig => {
-                println!("{}", agentd::DEFAULT_CONFIG_TOML);
+                println!("{}", construct_daemon::DEFAULT_CONFIG_TOML);
                 Ok(())
             }
         };
@@ -362,7 +362,7 @@ async fn main() -> Result<()> {
             println!("data:    {}", p.data_dir.display());
             println!("runtime: {}", p.runtime_dir.display());
             println!("socket:  {}", p.socket().display());
-            println!("webui:   {}", agentd_protocol::paths::local_webui_url());
+            println!("webui:   {}", construct_protocol::paths::local_webui_url());
             Ok(())
         }
         Command::Ping => {
@@ -427,7 +427,7 @@ async fn main() -> Result<()> {
         } => {
             let c = connect(&socket).await?;
             let result = c
-                .search(agentd_protocol::SearchParams {
+                .search(construct_protocol::SearchParams {
                     query,
                     scopes: (!scopes.is_empty())
                         .then(|| scopes.into_iter().map(Into::into).collect()),
@@ -441,9 +441,9 @@ async fn main() -> Result<()> {
             }
             for hit in &result.hits {
                 let scope = match hit.scope {
-                    agentd_protocol::SearchScope::Name => "name",
-                    agentd_protocol::SearchScope::Program => "program",
-                    agentd_protocol::SearchScope::Transcript => "transcript",
+                    construct_protocol::SearchScope::Name => "name",
+                    construct_protocol::SearchScope::Program => "program",
+                    construct_protocol::SearchScope::Transcript => "transcript",
                 };
                 let seq = hit.seq.map(|s| format!(" seq={s}")).unwrap_or_default();
                 println!(
@@ -480,7 +480,7 @@ async fn main() -> Result<()> {
                 .to_string_lossy()
                 .to_string();
             let id = c
-                .create(agentd_protocol::CreateSessionParams {
+                .create(construct_protocol::CreateSessionParams {
                     harness,
                     cwd,
                     prompt: if prompt.trim().is_empty() {
@@ -495,7 +495,7 @@ async fn main() -> Result<()> {
                     worktree,
                     env: Default::default(),
                     args: Vec::new(),
-                    kind: agentd_protocol::SessionKind::User,
+                    kind: construct_protocol::SessionKind::User,
                     parent_session_id: None,
                     group_id: None,
                     position_after_session_id: None,
@@ -522,7 +522,7 @@ async fn main() -> Result<()> {
                 .fork_session(
                     &session_id,
                     &harness,
-                    agentd_client::ForkOptions {
+                    construct_client::ForkOptions {
                         model,
                         prompt,
                         seed: !no_seed,
@@ -742,11 +742,11 @@ async fn run_program_command(client: &Client, command: ProgramCommand) -> Result
                 (found.markdown, Some(found.id))
             };
             let result = client
-                .program_update(agentd_protocol::ProgramUpdateParams {
+                .program_update(construct_protocol::ProgramUpdateParams {
                     session_id,
                     markdown,
                     base_version,
-                    actor: agentd_protocol::ProgramUpdateActor::Human,
+                    actor: construct_protocol::ProgramUpdateActor::Human,
                     template_id,
                     note: None,
                     shimmer: None,
@@ -772,11 +772,11 @@ async fn run_program_command(client: &Client, command: ProgramCommand) -> Result
                 return Ok(());
             }
             let result = client
-                .program_update(agentd_protocol::ProgramUpdateParams {
+                .program_update(construct_protocol::ProgramUpdateParams {
                     session_id,
                     markdown,
                     base_version: Some(current.version),
-                    actor: agentd_protocol::ProgramUpdateActor::Human,
+                    actor: construct_protocol::ProgramUpdateActor::Human,
                     template_id: current.template_id,
                     note: None,
                     shimmer: None,
@@ -792,7 +792,7 @@ async fn run_program_command(client: &Client, command: ProgramCommand) -> Result
             base_version,
         } => {
             let result = client
-                .program_execute(agentd_protocol::ProgramExecuteParams {
+                .program_execute(construct_protocol::ProgramExecuteParams {
                     session_id,
                     selection,
                     base_version,
@@ -874,7 +874,7 @@ async fn ensure_daemon_running(socket: &std::path::Path) {
     if std::env::var("CONSTRUCT_NO_AUTOSTART").as_deref() == Ok("1") {
         return;
     }
-    if let Err(e) = agentd::spawn_detached_daemon(Some(socket)) {
+    if let Err(e) = construct_daemon::spawn_detached_daemon(Some(socket)) {
         tracing::warn!(error = %e, "failed to auto-start construct daemon");
         return;
     }
@@ -928,7 +928,7 @@ async fn daemon_start(socket_override: Option<PathBuf>) -> Result<()> {
         println!("construct daemon already running ({})", socket.display());
         return Ok(());
     }
-    agentd::spawn_detached_daemon(Some(&socket))
+    construct_daemon::spawn_detached_daemon(Some(&socket))
         .with_context(|| format!("spawn detached daemon for {}", socket.display()))?;
     // The daemon binds the socket early in startup; poll for readiness (~5s).
     if poll_socket(&socket, true, 50).await {

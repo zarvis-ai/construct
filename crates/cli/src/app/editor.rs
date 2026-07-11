@@ -854,7 +854,7 @@ impl App {
         let Some(popup) = self.program_popup.as_ref() else {
             return;
         };
-        let params = agentd_protocol::ProgramCursorParams {
+        let params = construct_protocol::ProgramCursorParams {
             session_id: popup.program.session_id.clone(),
             cursor: popup.cursor,
             selection_anchor: popup.selection.as_ref().map(|s| s.anchor),
@@ -879,10 +879,10 @@ impl App {
             return;
         };
         let session_id = popup.program.session_id.clone();
-        let params = agentd_protocol::ProgramEditParams {
+        let params = construct_protocol::ProgramEditParams {
             session_id: session_id.clone(),
             edits: vec![edit],
-            actor: agentd_protocol::ProgramUpdateActor::Human,
+            actor: construct_protocol::ProgramUpdateActor::Human,
             note: None,
             shimmer: Vec::new(),
         };
@@ -2186,7 +2186,7 @@ impl App {
     }
 }
 
-fn program_anchored_live_edit(before: &str, after: &str) -> Option<agentd_protocol::ProgramEdit> {
+fn program_anchored_live_edit(before: &str, after: &str) -> Option<construct_protocol::ProgramEdit> {
     if before == after {
         return None;
     }
@@ -2223,14 +2223,14 @@ fn program_anchored_live_edit(before: &str, after: &str) -> Option<agentd_protoc
         new_string.extend(before_chars[a..start].iter());
         new_string.extend(after_chars[start..new_end].iter());
         new_string.extend(before_chars[old_end..b].iter());
-        return Some(agentd_protocol::ProgramEdit {
+        return Some(construct_protocol::ProgramEdit {
             old_string,
             new_string,
             replace_all: false,
             keep_pending: false,
         });
     }
-    Some(agentd_protocol::ProgramEdit {
+    Some(construct_protocol::ProgramEdit {
         old_string: before.to_string(),
         new_string: after.to_string(),
         replace_all: false,

@@ -4,7 +4,7 @@
 //! semantic part small: incoming session events enqueue words that the TUI
 //! renderer reveals by pinning letters when rain columns pass their target row.
 
-use agentd_protocol::{SessionEvent, SessionState};
+use construct_protocol::{SessionEvent, SessionState};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -585,7 +585,7 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
 }
 
 fn word_for_tool(tool: &str) -> Option<(&'static str, FlashTone, u8)> {
-    if tool == agentd_protocol::TUI_DISPATCH_TOOL {
+    if tool == construct_protocol::TUI_DISPATCH_TOOL {
         return Some(("command", FlashTone::Work, 30));
     }
     match tool {
@@ -640,7 +640,7 @@ fn word_for_status(status: &str) -> Option<(&'static str, FlashTone, u8)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentd_protocol::{MessageRole, ToolRisk};
+    use construct_protocol::{MessageRole, ToolRisk};
 
     #[test]
     fn maps_tool_events_to_words() {

@@ -1,18 +1,18 @@
 [package]
-name = "agentd-client"
+name = "construct-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Async IPC client for the agentd daemon (Unix socket, JSON-RPC)"
+description = "Async IPC client for the construct daemon (Unix socket, JSON-RPC)"
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-agentd-protocol = { workspace = true }
+construct-protocol = { workspace = true }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

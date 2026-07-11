@@ -5,7 +5,7 @@ use chrono::Utc;
 
 use super::SessionManager;
 use crate::storage::Storage;
-use agentd_protocol::{SessionEvent, SessionWidgetDeleteParams, UiPanel};
+use construct_protocol::{SessionEvent, SessionWidgetDeleteParams, UiPanel};
 
 #[derive(Debug, Clone)]
 pub(super) struct WidgetSnapshot {
@@ -92,7 +92,7 @@ impl SessionManager {
 
     pub(super) fn broadcast_widget_event(&self, session_id: &str, event: SessionEvent) {
         let _ = self.broadcast.send(super::BroadcastMsg::Event(
-            agentd_protocol::EventNotificationPayload {
+            construct_protocol::EventNotificationPayload {
                 session_id: session_id.to_string(),
                 at: Utc::now(),
                 event,

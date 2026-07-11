@@ -1,11 +1,11 @@
-//! Agentd-control tools: thin wrappers over `agentd_client::Client`.
+//! Agentd-control tools: thin wrappers over `construct_client::Client`.
 //! Lets a smith session drive the daemon (list/spawn/send-input to
 //! other sessions) using natural-language tool calls — the same surface
 //! the MCP server exposes.
 
 use super::{Tool, ToolCtx, ToolOutcome};
-use agentd_client::Client;
-use agentd_protocol::{agent_context, paths::Paths, CreateSessionParams, PtySize, ToolRisk};
+use construct_client::Client;
+use construct_protocol::{agent_context, paths::Paths, CreateSessionParams, PtySize, ToolRisk};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use base64::Engine;
@@ -63,7 +63,7 @@ impl Tool for Whoami {
         "agentd_whoami"
     }
     fn description(&self) -> &str {
-        "Returns the session id of the agentd session this agent is running inside, \
+        "Returns the session id of the construct session this agent is running inside, \
          or null if not inside one. Use this to avoid acting on yourself."
     }
     fn schema(&self) -> Value {
@@ -87,7 +87,7 @@ impl Tool for ListSessions {
         "agentd_list_sessions"
     }
     fn description(&self) -> &str {
-        "List every agentd session (running and finished). Each entry includes the \
+        "List every construct session (running and finished). Each entry includes the \
          session id, harness, state, cwd, pinned flag, approval mode, last_pty_at_ms \
          (use `now - last_pty_at_ms < 600ms` as a 'is the agent currently busy?' \
          signal), and group info when applicable."
@@ -333,7 +333,7 @@ impl Tool for CreateSession {
             args: Vec::new(),
             // Sessions created via the agentd-control tool are always
             // user sessions — the orchestrator is daemon-internal only.
-            kind: agentd_protocol::SessionKind::User,
+            kind: construct_protocol::SessionKind::User,
             parent_session_id: None,
             group_id: input
                 .get("group_id")
@@ -545,8 +545,8 @@ simple_write_tool!(
             .and_then(|v| v.as_str())
             .unwrap_or("bottom")
         {
-            "top" => agentd_protocol::SessionGroupPosition::Top,
-            _ => agentd_protocol::SessionGroupPosition::Bottom,
+            "top" => construct_protocol::SessionGroupPosition::Top,
+            _ => construct_protocol::SessionGroupPosition::Bottom,
         };
         let c = c.clone();
         let sid = sid.to_string();
@@ -572,8 +572,8 @@ simple_write_tool!(
             .and_then(|v| v.as_str())
             .unwrap_or("down")
         {
-            "up" => agentd_protocol::MoveDirection::Up,
-            _ => agentd_protocol::MoveDirection::Down,
+            "up" => construct_protocol::MoveDirection::Up,
+            _ => construct_protocol::MoveDirection::Down,
         };
         let c = c.clone();
         let sid = sid.to_string();
@@ -646,9 +646,9 @@ impl Tool for LoopCreate {
             expires_in.map(|d| chrono::Utc::now().timestamp_millis() + (d as i64) * 1000);
         let c = client(ctx).await?;
         let l = c
-            .loop_create(agentd_protocol::LoopCreateParams {
+            .loop_create(construct_protocol::LoopCreateParams {
                 session_id: sid,
-                spec: agentd_protocol::LoopSpec::Interval { seconds: secs },
+                spec: construct_protocol::LoopSpec::Interval { seconds: secs },
                 prompt,
                 expires_at_ms,
             })
@@ -722,7 +722,7 @@ impl Tool for LoopUpdate {
         let spec = input
             .get("interval_seconds")
             .and_then(|v| v.as_u64())
-            .map(|s| agentd_protocol::LoopSpec::Interval { seconds: s });
+            .map(|s| construct_protocol::LoopSpec::Interval { seconds: s });
         let prompt = input
             .get("prompt")
             .and_then(|v| v.as_str())
@@ -730,7 +730,7 @@ impl Tool for LoopUpdate {
         let expires_at_ms = input.get("expires_at_ms").and_then(|v| v.as_i64());
         let c = client(ctx).await?;
         let l = c
-            .loop_update(agentd_protocol::LoopUpdateParams {
+            .loop_update(construct_protocol::LoopUpdateParams {
                 loop_id,
                 spec,
                 prompt,

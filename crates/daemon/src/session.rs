@@ -4,8 +4,8 @@ use crate::adapter::{locate_binary, Adapter, AdapterMessage};
 use crate::config::Config;
 use crate::storage::Storage;
 use crate::worktree;
-use agentd_protocol::dialect;
-use agentd_protocol::{
+use construct_protocol::dialect;
+use construct_protocol::{
     agent_context, ahp_method, ClientView, CreateSessionParams, DeletedNotificationPayload,
     EventNotificationPayload, GroupDeletedNotificationPayload, GroupStateNotificationPayload,
     GroupSummary, HarnessInfo, MessageRole, MoveDirection, NativeSubagentRef, ProgramDocument,
@@ -173,7 +173,7 @@ fn sanitize_extension(ext: &str) -> String {
 }
 
 fn is_user_session_kind(s: &SessionSummary) -> bool {
-    matches!(s.kind, agentd_protocol::SessionKind::User)
+    matches!(s.kind, construct_protocol::SessionKind::User)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +242,7 @@ pub enum BroadcastMsg {
     GroupDeleted(GroupDeletedNotificationPayload),
     ProgramState(ProgramStateNotificationPayload),
     ProgramCursor {
-        payload: agentd_protocol::ProgramCursorNotificationPayload,
+        payload: construct_protocol::ProgramCursorNotificationPayload,
         /// The connection whose own plain cursor publish produced this
         /// broadcast, if any. The per-connection forwarder skips delivering
         /// it back to that connection: a plain publish is an echo of state
@@ -258,7 +258,7 @@ pub enum BroadcastMsg {
     /// Aggregate state for the remote WS transport. Emitted by
     /// `server::handle_ws_connection` on every accept/drop so the
     /// local TUI can show a "remote attached" badge.
-    RemoteState(agentd_protocol::RemoteStateNotificationPayload),
+    RemoteState(construct_protocol::RemoteStateNotificationPayload),
 }
 
 pub struct SessionEntry {
@@ -358,7 +358,7 @@ pub struct PtyClientPolicy {
 pub struct TaskRegistry {
     /// Newest-first list. Capped at [`TASK_REGISTRY_CAP`] entries;
     /// terminal-state oldest are evicted when over.
-    entries: Vec<agentd_protocol::TaskInfo>,
+    entries: Vec<construct_protocol::TaskInfo>,
 }
 
 /// How many tasks (running + recent terminal) we keep per session.
@@ -383,7 +383,7 @@ impl TaskRegistry {
             // as a fresh entry by resetting state.
             e.tool = tool;
             e.args_summary = args_summary;
-            e.state = agentd_protocol::TaskState::Running;
+            e.state = construct_protocol::TaskState::Running;
             e.started_at_ms = started_at_ms;
             e.backgrounded_at_ms = None;
             e.ended_at_ms = None;
@@ -391,11 +391,11 @@ impl TaskRegistry {
             e.ok = false;
             return;
         }
-        self.entries.push(agentd_protocol::TaskInfo {
+        self.entries.push(construct_protocol::TaskInfo {
             call_id,
             tool,
             args_summary,
-            state: agentd_protocol::TaskState::Running,
+            state: construct_protocol::TaskState::Running,
             started_at_ms,
             backgrounded_at_ms: None,
             ended_at_ms: None,
@@ -407,7 +407,7 @@ impl TaskRegistry {
 
     pub fn mark_backgrounded(&mut self, call_id: &str, at_ms: i64) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.call_id == call_id) {
-            e.state = agentd_protocol::TaskState::Backgrounded;
+            e.state = construct_protocol::TaskState::Backgrounded;
             e.backgrounded_at_ms = Some(at_ms);
         }
     }
@@ -415,9 +415,9 @@ impl TaskRegistry {
     pub fn mark_end(&mut self, call_id: &str, ok: bool, output_preview: String, at_ms: i64) {
         if let Some(e) = self.entries.iter_mut().find(|e| e.call_id == call_id) {
             e.state = if ok {
-                agentd_protocol::TaskState::Completed
+                construct_protocol::TaskState::Completed
             } else {
-                agentd_protocol::TaskState::Failed
+                construct_protocol::TaskState::Failed
             };
             e.ended_at_ms = Some(at_ms);
             e.output_preview = Some(output_preview);
@@ -425,7 +425,7 @@ impl TaskRegistry {
         }
     }
 
-    pub fn snapshot(&self) -> Vec<agentd_protocol::TaskInfo> {
+    pub fn snapshot(&self) -> Vec<construct_protocol::TaskInfo> {
         self.entries.clone()
     }
 
@@ -441,9 +441,9 @@ impl TaskRegistry {
             .filter(|(_, e)| {
                 matches!(
                     e.state,
-                    agentd_protocol::TaskState::Completed
-                        | agentd_protocol::TaskState::Failed
-                        | agentd_protocol::TaskState::Cancelled
+                    construct_protocol::TaskState::Completed
+                        | construct_protocol::TaskState::Failed
+                        | construct_protocol::TaskState::Cancelled
                 )
             })
             .map(|(i, _)| i)
@@ -485,7 +485,7 @@ enum ProgramExecutionDelivery {
 }
 
 fn program_execution_delivery(
-    summary: &agentd_protocol::SessionSummary,
+    summary: &construct_protocol::SessionSummary,
 ) -> ProgramExecutionDelivery {
     if !summary.has_pty {
         ProgramExecutionDelivery::AdapterInput
@@ -608,7 +608,7 @@ struct ProgramDispatchItem {
 /// the *whole* selection through to the normal execute path rather than
 /// fast-pathing part of a mixed selection (spec 0066).
 fn program_dispatch_plan(
-    blocks: &[agentd_protocol::ProgramBlockSpan],
+    blocks: &[construct_protocol::ProgramBlockSpan],
 ) -> Option<Vec<ProgramDispatchItem>> {
     if blocks.is_empty() {
         return None;
@@ -616,10 +616,10 @@ fn program_dispatch_plan(
     let mut items = Vec::with_capacity(blocks.len());
     for block in blocks {
         let first_line = block.text.lines().next().unwrap_or("").trim();
-        if !agentd_protocol::program_is_list_item(first_line) {
+        if !construct_protocol::program_is_list_item(first_line) {
             return None;
         }
-        let clips = agentd_protocol::program_scan_smart_clips(&block.text);
+        let clips = construct_protocol::program_scan_smart_clips(&block.text);
         if clips.len() != 1 {
             return None;
         }
@@ -632,7 +632,7 @@ fn program_dispatch_plan(
         without_clip.push_str(&block.text[..clip.start]);
         without_clip.push_str(&block.text[clip.end..]);
         let trimmed = without_clip.trim();
-        let body = agentd_protocol::program_list_item_text(trimmed).unwrap_or(trimmed);
+        let body = construct_protocol::program_list_item_text(trimmed).unwrap_or(trimmed);
         let prompt = body.split_whitespace().collect::<Vec<_>>().join(" ");
         if prompt.is_empty() {
             return None;
@@ -657,12 +657,12 @@ fn program_dispatch_plan(
 /// re-add exactly the new/changed blocks in the same narrowing call that drops
 /// the old ones — the pending set never transiently empties.
 fn program_edit_keep_ids(
-    edits: &[agentd_protocol::ProgramEdit],
+    edits: &[construct_protocol::ProgramEdit],
 ) -> std::collections::HashSet<String> {
     edits
         .iter()
         .filter(|e| e.keep_pending)
-        .flat_map(|e| agentd_protocol::program_block_spans(&e.new_string))
+        .flat_map(|e| construct_protocol::program_block_spans(&e.new_string))
         .map(|span| span.id)
         .collect()
 }
@@ -676,7 +676,7 @@ fn program_default_cursor_label(kind: &str) -> String {
 }
 
 fn program_unique_cursor_label(
-    cursors: &HashMap<u64, agentd_protocol::ProgramCursor>,
+    cursors: &HashMap<u64, construct_protocol::ProgramCursor>,
     conn_id: u64,
     requested: &str,
     kind: &str,
@@ -715,7 +715,7 @@ struct ProgramCursorReplacement {
 
 fn program_cursor_replacements(
     base: &str,
-    edits: &[agentd_protocol::ProgramEdit],
+    edits: &[construct_protocol::ProgramEdit],
 ) -> Result<Vec<ProgramCursorReplacement>> {
     let mut working = base.to_string();
     let mut replacements = Vec::new();
@@ -874,7 +874,7 @@ impl SessionEntry {
     /// Cheap async read of the session's current SessionState —
     /// used by the loop scheduler to skip firing into a terminal
     /// session.
-    pub async fn snapshot_state(&self) -> agentd_protocol::SessionState {
+    pub async fn snapshot_state(&self) -> construct_protocol::SessionState {
         self.summary.read().await.state
     }
 }
@@ -976,7 +976,7 @@ pub struct SessionManager {
     dev_assets: std::sync::Mutex<Option<PathBuf>>,
     widget_snapshots: tokio::sync::Mutex<HashMap<String, WidgetSnapshot>>,
     program_runs: std::sync::Mutex<HashMap<String, ProgramRunProgress>>,
-    program_cursors: std::sync::Mutex<HashMap<u64, agentd_protocol::ProgramCursor>>,
+    program_cursors: std::sync::Mutex<HashMap<u64, construct_protocol::ProgramCursor>>,
     /// Reserved pseudo-connection id for each session's agent-authored
     /// Program cursor (spec 0065 agent presence), keyed by session id and
     /// lazily allocated from the same `next_conn_id` counter as real client
@@ -1121,7 +1121,7 @@ pub(crate) struct RemoteHandle {
 /// `busy_ms`. Every state write in the daemon must go through here so the
 /// accumulated compute time stays truthful.
 pub(crate) fn set_state_tracked(
-    s: &mut agentd_protocol::SessionSummary,
+    s: &mut construct_protocol::SessionSummary,
     new_state: SessionState,
     now_ms: i64,
 ) {
@@ -1179,7 +1179,7 @@ impl SessionManager {
                         continue;
                     }
                     n += 1;
-                    if let Ok(ts) = serde_json::from_str::<agentd_protocol::TimestampedEvent>(&line)
+                    if let Ok(ts) = serde_json::from_str::<construct_protocol::TimestampedEvent>(&line)
                     {
                         if matches!(ts.event, SessionEvent::Message { .. }) {
                             msgs += 1;
@@ -1342,14 +1342,14 @@ impl SessionManager {
                 cursor.active = false;
                 cursor.updated_at_ms = chrono::Utc::now().timestamp_millis();
                 let _ = self.broadcast.send(BroadcastMsg::ProgramCursor {
-                    payload: agentd_protocol::ProgramCursorNotificationPayload { cursor },
+                    payload: construct_protocol::ProgramCursorNotificationPayload { cursor },
                     skip_conn_id: None,
                 });
             }
         }
     }
 
-    pub fn program_collaborators(&self, session_id: &str) -> Vec<agentd_protocol::ProgramCursor> {
+    pub fn program_collaborators(&self, session_id: &str) -> Vec<construct_protocol::ProgramCursor> {
         let now_ms = chrono::Utc::now().timestamp_millis();
         self.program_cursors
             .lock()
@@ -1367,15 +1367,15 @@ impl SessionManager {
         &self,
         conn_id: u64,
         kind: &str,
-        params: agentd_protocol::ProgramCursorParams,
-    ) -> Result<agentd_protocol::ProgramCursorResult> {
+        params: construct_protocol::ProgramCursorParams,
+    ) -> Result<construct_protocol::ProgramCursorResult> {
         self.get_entry(&params.session_id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
         let requested_label = params
             .label
             .unwrap_or_else(|| program_default_cursor_label(kind));
-        let mut cursor = agentd_protocol::ProgramCursor {
+        let mut cursor = construct_protocol::ProgramCursor {
             session_id: params.session_id,
             client_id: format!("c{conn_id}"),
             label: requested_label.clone(),
@@ -1410,12 +1410,12 @@ impl SessionManager {
         // (the receiver can't tell "stale echo" from "real daemon rebase").
         // Every other connection still needs it to render this cursor.
         let _ = self.broadcast.send(BroadcastMsg::ProgramCursor {
-            payload: agentd_protocol::ProgramCursorNotificationPayload {
+            payload: construct_protocol::ProgramCursorNotificationPayload {
                 cursor: cursor.clone(),
             },
             skip_conn_id: Some(conn_id),
         });
-        Ok(agentd_protocol::ProgramCursorResult { cursor })
+        Ok(construct_protocol::ProgramCursorResult { cursor })
     }
 
     /// Whether any live connection is currently watching `session_id` in the
@@ -1537,7 +1537,7 @@ impl SessionManager {
     /// notifications flow through).
     pub fn broadcast_remote_state(&self, clients: u32) {
         let _ = self.broadcast.send(BroadcastMsg::RemoteState(
-            agentd_protocol::RemoteStateNotificationPayload { clients },
+            construct_protocol::RemoteStateNotificationPayload { clients },
         ));
     }
 
@@ -1559,8 +1559,8 @@ impl SessionManager {
     pub async fn start_remote(
         self: Arc<Self>,
         port_hint: Option<u16>,
-        params: agentd_protocol::RemoteStartParams,
-    ) -> anyhow::Result<agentd_protocol::RemoteStartResult> {
+        params: construct_protocol::RemoteStartParams,
+    ) -> anyhow::Result<construct_protocol::RemoteStartResult> {
         use anyhow::Context as _;
 
         // Always-on bind path: ask the supervisor to ensure the
@@ -1601,7 +1601,7 @@ impl SessionManager {
     /// is not an error; the result's `was_running` field tells the
     /// caller whether anything was actually torn down. Token
     /// rotates on the next `start_remote` so the old QR is dead.
-    pub async fn stop_remote(self: Arc<Self>) -> anyhow::Result<agentd_protocol::RemoteStopResult> {
+    pub async fn stop_remote(self: Arc<Self>) -> anyhow::Result<construct_protocol::RemoteStopResult> {
         use anyhow::Context as _;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.remote_starter
@@ -1612,7 +1612,7 @@ impl SessionManager {
         let outcome = rx
             .await
             .context("remote supervisor dropped reply channel")??;
-        Ok(agentd_protocol::RemoteStopResult {
+        Ok(construct_protocol::RemoteStopResult {
             was_running: outcome.was_running,
         })
     }
@@ -1632,7 +1632,7 @@ impl SessionManager {
         port: u16,
         local_only: bool,
         wait_for_tunnel: bool,
-    ) -> anyhow::Result<agentd_protocol::RemoteStartResult> {
+    ) -> anyhow::Result<construct_protocol::RemoteStartResult> {
         use std::time::Duration;
 
         if local_only {
@@ -1645,7 +1645,7 @@ impl SessionManager {
             // point.
             let url = format!("http://127.0.0.1:{port}/");
             let qr = crate::remote::render_qr_dense1x2(&url).unwrap_or_default();
-            return Ok(agentd_protocol::RemoteStartResult {
+            return Ok(construct_protocol::RemoteStartResult {
                 url,
                 qr,
                 tunnel_ready: false,
@@ -1657,7 +1657,7 @@ impl SessionManager {
         if !wait_for_tunnel {
             let url = format!("http://127.0.0.1:{port}/");
             let qr = crate::remote::render_qr_dense1x2(&url).unwrap_or_default();
-            return Ok(agentd_protocol::RemoteStartResult {
+            return Ok(construct_protocol::RemoteStartResult {
                 url,
                 qr,
                 tunnel_ready: false,
@@ -1678,7 +1678,7 @@ impl SessionManager {
         loop {
             if let Some(u) = state.tunnel_url().await {
                 let qr = crate::remote::render_qr_dense1x2(&u).unwrap_or_default();
-                return Ok(agentd_protocol::RemoteStartResult {
+                return Ok(construct_protocol::RemoteStartResult {
                     url: u,
                     qr,
                     tunnel_ready: true,
@@ -1779,7 +1779,7 @@ impl SessionManager {
                 .ok_or_else(|| anyhow!("unknown smith auth method `{method}`"))?;
             Some(format!("{}:{}", m.model_prefix, m.default_model))
         };
-        let paths = agentd_protocol::paths::Paths::discover();
+        let paths = construct_protocol::paths::Paths::discover();
         crate::config::set_smith_model_pin(&paths, model_spec.as_deref())?;
         Ok(SmithSetAuthMethodResult {
             model_spec,
@@ -1935,7 +1935,7 @@ impl SessionManager {
         // document, in order (spec 0053). Validate before writing so a miscount
         // fails the call rather than persisting a doc with a stale shimmer set.
         if let Some(decl) = &params.shimmer {
-            let block_count = agentd_protocol::program_block_spans(&params.markdown).len();
+            let block_count = construct_protocol::program_block_spans(&params.markdown).len();
             if decl.len() != block_count {
                 anyhow::bail!(
                     "shimmer declaration has {} entries but the program has {} blocks",
@@ -2086,7 +2086,7 @@ impl SessionManager {
             // keep_pending re-adds the produced block's new id with no
             // agent tooltip (spec 0057); it renders the fallback until the
             // agent declares the new id with a tooltip.
-            decls.push(agentd_protocol::ProgramShimmerDecl {
+            decls.push(construct_protocol::ProgramShimmerDecl {
                 id: block.id.clone(),
                 shimmer: true,
                 tooltip: None,
@@ -2101,7 +2101,7 @@ impl SessionManager {
             // owner needs this broadcast just as much as every peer does, so
             // nothing is excluded.
             let _ = self.broadcast.send(BroadcastMsg::ProgramCursor {
-                payload: agentd_protocol::ProgramCursorNotificationPayload { cursor },
+                payload: construct_protocol::ProgramCursorNotificationPayload { cursor },
                 skip_conn_id: None,
             });
         }
@@ -2189,7 +2189,7 @@ impl SessionManager {
             if let Some(raw_selection) =
                 params.selection.as_deref().filter(|s| !s.trim().is_empty())
             {
-                let selection_blocks = agentd_protocol::program_block_spans(raw_selection);
+                let selection_blocks = construct_protocol::program_block_spans(raw_selection);
                 if let Some(items) = program_dispatch_plan(&selection_blocks) {
                     let owner_cwd = entry.summary.read().await.cwd.clone();
                     return self
@@ -2216,7 +2216,7 @@ impl SessionManager {
             let summary = entry.summary.read().await;
             (
                 program_execution_delivery(&*summary),
-                summary.state == agentd_protocol::SessionState::Running,
+                summary.state == construct_protocol::SessionState::Running,
             )
         };
         match delivery {
@@ -2286,7 +2286,7 @@ impl SessionManager {
                     worktree: false,
                     env,
                     args: Vec::new(),
-                    kind: agentd_protocol::SessionKind::Subagent,
+                    kind: construct_protocol::SessionKind::Subagent,
                     parent_session_id: Some(session_id.to_string()),
                     group_id: None,
                     position_after_session_id: None,
@@ -2294,18 +2294,18 @@ impl SessionManager {
                 })
                 .await?;
             let new_string = format!("{} @{{session:{}}}", item.text, subagent_id);
-            let content_id = agentd_protocol::program_block_spans(&new_string)
+            let content_id = construct_protocol::program_block_spans(&new_string)
                 .into_iter()
                 .next()
                 .map(|span| span.id)
                 .unwrap_or_default();
-            edits.push(agentd_protocol::ProgramEdit {
+            edits.push(construct_protocol::ProgramEdit {
                 old_string: item.text.clone(),
                 new_string,
                 replace_all: false,
                 keep_pending: true,
             });
-            shimmer.push(agentd_protocol::ProgramShimmerDecl {
+            shimmer.push(construct_protocol::ProgramShimmerDecl {
                 id: content_id,
                 shimmer: true,
                 tooltip: Some("Dispatched".to_string()),
@@ -2337,7 +2337,7 @@ impl SessionManager {
                 ProgramEditParams {
                     session_id: session_id.to_string(),
                     edits,
-                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
                     note: Some("instant dispatch".to_string()),
                     shimmer,
                 },
@@ -2383,11 +2383,11 @@ impl SessionManager {
         &self,
         session_id: &str,
         before_markdown: &str,
-        edits: &[agentd_protocol::ProgramEdit],
+        edits: &[construct_protocol::ProgramEdit],
         version: u64,
         source_conn_id: Option<u64>,
         exclude_conn_id: Option<u64>,
-    ) -> Vec<agentd_protocol::ProgramCursor> {
+    ) -> Vec<construct_protocol::ProgramCursor> {
         let Ok(replacements) = program_cursor_replacements(before_markdown, edits) else {
             return Vec::new();
         };
@@ -2481,7 +2481,7 @@ impl SessionManager {
             .program_cursor(
                 conn_id,
                 "agent",
-                agentd_protocol::ProgramCursorParams {
+                construct_protocol::ProgramCursorParams {
                     session_id: session_id.to_string(),
                     cursor: span.1,
                     selection_anchor: Some(span.0),
@@ -2709,7 +2709,7 @@ impl SessionManager {
             },
         )
         .await;
-        let params = serde_json::to_value(&agentd_protocol::SessionInputParams {
+        let params = serde_json::to_value(&construct_protocol::SessionInputParams {
             session_id: id.to_string(),
             text,
         })?;
@@ -2790,7 +2790,7 @@ impl SessionManager {
             .await
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
+        let params = serde_json::to_value(&construct_protocol::SessionIdParams {
             session_id: id.to_string(),
         })?;
         adapter
@@ -2810,7 +2810,7 @@ impl SessionManager {
             .await
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
+        let params = serde_json::to_value(&construct_protocol::SessionIdParams {
             session_id: id.to_string(),
         })?;
         let _ = tokio::time::timeout(
@@ -2832,7 +2832,7 @@ impl SessionManager {
         for (sid, entry) in sessions.iter() {
             let s = entry.summary.read().await;
             if s.parent_session_id.as_deref() == Some(parent_id)
-                && matches!(s.kind, agentd_protocol::SessionKind::Subagent)
+                && matches!(s.kind, construct_protocol::SessionKind::Subagent)
             {
                 ids.push(sid.clone());
             }
@@ -2952,7 +2952,7 @@ impl SessionManager {
         // (TUI / CLI) returns immediately after the state flip + broadcast.
         // This prevents archive from hanging the UI for up to ~13s.
         if let Some(adapter) = entry.adapter.lock().await.take() {
-            let params = serde_json::to_value(&agentd_protocol::SessionIdParams {
+            let params = serde_json::to_value(&construct_protocol::SessionIdParams {
                 session_id: id.to_string(),
             })?;
             tokio::spawn(async move {
@@ -2992,7 +2992,7 @@ impl SessionManager {
 
     /// Persist the terminal outcome of a fork. Archiving remains a
     /// separate primitive so callers can inject a result before retiring it.
-    pub async fn merge(&self, id: &str, mode: agentd_protocol::ForkMergeMode) -> Result<()> {
+    pub async fn merge(&self, id: &str, mode: construct_protocol::ForkMergeMode) -> Result<()> {
         let entry = self
             .get_entry(id)
             .await
@@ -3025,7 +3025,7 @@ impl SessionManager {
             };
         let snapshot = {
             let mut summary = entry.summary.write().await;
-            summary.merge = Some(agentd_protocol::ForkMerge {
+            summary.merge = Some(construct_protocol::ForkMerge {
                 mode,
                 at_ms: now_ms,
                 merged_seq,
@@ -3118,7 +3118,7 @@ impl SessionManager {
             }
 
             // Best-effort: remove the per-session MCP config.
-            let mcp_path = agentd_protocol::paths::Paths::discover()
+            let mcp_path = construct_protocol::paths::Paths::discover()
                 .state_dir
                 .join("mcp")
                 .join(format!("{}.json", id_owned));
@@ -3420,7 +3420,7 @@ impl SessionManager {
     async fn persist_approval_mode(
         &self,
         entry: &Arc<SessionEntry>,
-        mode: agentd_protocol::ApprovalMode,
+        mode: construct_protocol::ApprovalMode,
     ) -> Result<()> {
         let snapshot = {
             let mut s = entry.summary.write().await;
@@ -3476,7 +3476,7 @@ impl SessionManager {
     pub async fn set_approval_mode(
         &self,
         id: &str,
-        mode: agentd_protocol::ApprovalMode,
+        mode: construct_protocol::ApprovalMode,
     ) -> Result<()> {
         let entry = self
             .get_entry(id)
@@ -3486,7 +3486,7 @@ impl SessionManager {
         // Forward to the adapter so it picks up the change for the next tool
         // classification. If the adapter is gone (session ended), skip.
         if let Some(adapter) = entry.adapter.lock().await.clone() {
-            let params = serde_json::to_value(&agentd_protocol::SessionSetApprovalModeParams {
+            let params = serde_json::to_value(&construct_protocol::SessionSetApprovalModeParams {
                 session_id: id.to_string(),
                 mode,
             })?;
@@ -3511,14 +3511,14 @@ impl SessionManager {
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
         let mode = match decision.as_str() {
-            "auto_review" => Some(agentd_protocol::ApprovalMode::AutoReview),
-            "unsafe_auto" => Some(agentd_protocol::ApprovalMode::UnsafeAuto),
+            "auto_review" => Some(construct_protocol::ApprovalMode::AutoReview),
+            "unsafe_auto" => Some(construct_protocol::ApprovalMode::UnsafeAuto),
             _ => None,
         };
         if let Some(mode) = mode {
             self.persist_approval_mode(&entry, mode).await?;
         }
-        let params = serde_json::to_value(&agentd_protocol::SessionToolDecisionParams {
+        let params = serde_json::to_value(&construct_protocol::SessionToolDecisionParams {
             session_id: id.to_string(),
             call_id,
             decision,
@@ -3535,8 +3535,8 @@ impl SessionManager {
     /// (claude / codex / shell today) simply never populate it.
     pub async fn loop_create(
         &self,
-        params: agentd_protocol::LoopCreateParams,
-    ) -> Result<agentd_protocol::Loop> {
+        params: construct_protocol::LoopCreateParams,
+    ) -> Result<construct_protocol::Loop> {
         // Reject on unknown session — the daemon's source of truth
         // for "is this session real" is sessions map.
         if self.get_entry(&params.session_id).await.is_none() {
@@ -3544,7 +3544,7 @@ impl SessionManager {
         }
         let now_ms = chrono::Utc::now().timestamp_millis();
         let next = crate::loops::next_fire_after_ms(&params.spec, now_ms);
-        let l = agentd_protocol::Loop {
+        let l = construct_protocol::Loop {
             id: String::new(), // assigned in registry
             session_id: params.session_id,
             spec: params.spec,
@@ -3558,14 +3558,14 @@ impl SessionManager {
         self.loops.create(l).await
     }
 
-    pub async fn loop_list(&self, session_id: Option<&str>) -> Vec<agentd_protocol::Loop> {
+    pub async fn loop_list(&self, session_id: Option<&str>) -> Vec<construct_protocol::Loop> {
         self.loops.list(session_id).await
     }
 
     pub async fn loop_update(
         &self,
-        params: agentd_protocol::LoopUpdateParams,
-    ) -> Result<agentd_protocol::Loop> {
+        params: construct_protocol::LoopUpdateParams,
+    ) -> Result<construct_protocol::Loop> {
         self.loops
             .update(
                 &params.loop_id,
@@ -3580,7 +3580,7 @@ impl SessionManager {
         self.loops.remove(loop_id).await
     }
 
-    pub async fn list_tasks(&self, id: &str) -> Result<Vec<agentd_protocol::TaskInfo>> {
+    pub async fn list_tasks(&self, id: &str) -> Result<Vec<construct_protocol::TaskInfo>> {
         let entry = self
             .get_entry(id)
             .await
@@ -3605,7 +3605,7 @@ impl SessionManager {
             .await
             .clone()
             .ok_or_else(|| anyhow!("session has no live adapter"))?;
-        let params = serde_json::to_value(&agentd_protocol::SessionToolActionParams {
+        let params = serde_json::to_value(&construct_protocol::SessionToolActionParams {
             session_id: id.to_string(),
             call_id,
             action,
@@ -3646,7 +3646,7 @@ impl SessionManager {
 }
 
 fn program_cursor_is_visible(
-    cursor: &agentd_protocol::ProgramCursor,
+    cursor: &construct_protocol::ProgramCursor,
     session_id: &str,
     now_ms: i64,
 ) -> bool {
@@ -3773,9 +3773,9 @@ fn effective_mode(params: &CreateSessionParams) -> String {
     }
 }
 
-fn builtin_harness_capabilities(name: &str) -> agentd_protocol::Capabilities {
+fn builtin_harness_capabilities(name: &str) -> construct_protocol::Capabilities {
     match name {
-        "shell" | "claude" | "codex" | "smith" => agentd_protocol::Capabilities {
+        "shell" | "claude" | "codex" | "smith" => construct_protocol::Capabilities {
             supports_pty: true,
             ..Default::default()
         },
@@ -3786,7 +3786,7 @@ fn builtin_harness_capabilities(name: &str) -> agentd_protocol::Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentd_protocol::{Capabilities, PtySize};
+    use construct_protocol::{Capabilities, PtySize};
 
     #[test]
     fn validate_restart_exe_accepts_executable_rejects_bad_paths() {
@@ -3870,7 +3870,7 @@ mod tests {
         id: &str,
         position: i64,
         group_id: Option<&str>,
-        kind: agentd_protocol::SessionKind,
+        kind: construct_protocol::SessionKind,
     ) -> SessionSummary {
         SessionSummary {
             id: id.to_string(),
@@ -3897,7 +3897,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
             kind,
             archived: false,
             operator_loop_disabled: false,
@@ -3909,7 +3909,7 @@ mod tests {
 
     #[test]
     fn set_state_tracked_accumulates_running_spans_into_busy_ms() {
-        let mut s = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
+        let mut s = placement_summary("s1", 0, None, construct_protocol::SessionKind::User);
         s.state = SessionState::AwaitingInput;
 
         // Entering Running opens a span but banks nothing yet.
@@ -3944,7 +3944,7 @@ mod tests {
 
     #[test]
     fn program_execution_submits_to_pty_backed_sessions() {
-        let summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
+        let summary = placement_summary("s1", 0, None, construct_protocol::SessionKind::User);
 
         assert_eq!(
             program_execution_delivery(&summary),
@@ -4003,7 +4003,7 @@ mod tests {
 
     #[test]
     fn program_execution_typed_submit_for_external_agent_pty_sessions() {
-        let mut summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
+        let mut summary = placement_summary("s1", 0, None, construct_protocol::SessionKind::User);
         summary.harness = "claude".to_string();
 
         assert_eq!(
@@ -4118,7 +4118,7 @@ mod tests {
 
     #[test]
     fn program_execution_uses_adapter_input_for_headless_sessions() {
-        let mut summary = placement_summary("s1", 0, None, agentd_protocol::SessionKind::User);
+        let mut summary = placement_summary("s1", 0, None, construct_protocol::SessionKind::User);
         summary.has_pty = false;
 
         assert_eq!(
@@ -4128,7 +4128,7 @@ mod tests {
     }
 
     fn dispatch_plan(markdown: &str) -> Option<Vec<ProgramDispatchItem>> {
-        program_dispatch_plan(&agentd_protocol::program_block_spans(markdown))
+        program_dispatch_plan(&construct_protocol::program_block_spans(markdown))
     }
 
     #[test]
@@ -4179,8 +4179,8 @@ mod tests {
     #[test]
     fn position_after_visible_session_uses_gap_below_source() {
         let sessions = vec![
-            placement_summary("a", 10, None, agentd_protocol::SessionKind::User),
-            placement_summary("b", 30, None, agentd_protocol::SessionKind::User),
+            placement_summary("a", 10, None, construct_protocol::SessionKind::User),
+            placement_summary("b", 30, None, construct_protocol::SessionKind::User),
         ];
 
         let placement = position_after_visible_session("a", &None, &sessions).expect("placement");
@@ -4192,14 +4192,14 @@ mod tests {
     #[test]
     fn position_after_visible_session_renumbers_dense_region() {
         let sessions = vec![
-            placement_summary("a", 10, Some("g1"), agentd_protocol::SessionKind::User),
-            placement_summary("b", 11, Some("g1"), agentd_protocol::SessionKind::User),
-            placement_summary("c", 12, Some("g1"), agentd_protocol::SessionKind::User),
+            placement_summary("a", 10, Some("g1"), construct_protocol::SessionKind::User),
+            placement_summary("b", 11, Some("g1"), construct_protocol::SessionKind::User),
+            placement_summary("c", 12, Some("g1"), construct_protocol::SessionKind::User),
             placement_summary(
                 "hidden",
                 13,
                 Some("g1"),
-                agentd_protocol::SessionKind::Subagent,
+                construct_protocol::SessionKind::Subagent,
             ),
         ];
         let group = Some("g1".to_string());
@@ -4326,7 +4326,7 @@ mod tests {
 
     fn synthetic_entry(
         id: &str,
-        kind: agentd_protocol::SessionKind,
+        kind: construct_protocol::SessionKind,
         position: i64,
     ) -> Arc<SessionEntry> {
         synthetic_entry_with_group(id, kind, position, None)
@@ -4334,7 +4334,7 @@ mod tests {
 
     fn synthetic_entry_with_group(
         id: &str,
-        kind: agentd_protocol::SessionKind,
+        kind: construct_protocol::SessionKind,
         position: i64,
         group_id: Option<String>,
     ) -> Arc<SessionEntry> {
@@ -4344,7 +4344,7 @@ mod tests {
 
         Arc::new(SessionEntry {
             id: id.to_string(),
-            summary: RwLock::new(agentd_protocol::SessionSummary {
+            summary: RwLock::new(construct_protocol::SessionSummary {
                 id: id.to_string(),
                 harness: "shell".into(),
                 cwd: "/tmp".into(),
@@ -4369,7 +4369,7 @@ mod tests {
                 busy_ms: 0,
                 busy_running_since_ms: None,
                 message_count: 0,
-                approval_mode: agentd_protocol::ApprovalMode::Manual,
+                approval_mode: construct_protocol::ApprovalMode::Manual,
                 kind,
                 archived: false,
                 operator_loop_disabled: false,
@@ -4401,7 +4401,7 @@ mod tests {
         parent_id: &str,
         position: i64,
     ) -> Arc<SessionEntry> {
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::Subagent, position);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::Subagent, position);
         entry.summary.write().await.parent_session_id = Some(parent_id.to_string());
         entry
     }
@@ -4423,11 +4423,11 @@ mod tests {
         // user sessions. Reordering must use visible user-session neighbors,
         // not these hidden records, otherwise a TUI row can appear not to move.
         for (id, kind, position) in [
-            ("ssub-before", agentd_protocol::SessionKind::Subagent, 0),
-            ("suser-a", agentd_protocol::SessionKind::User, 10),
-            ("ssub-between", agentd_protocol::SessionKind::Subagent, 20),
-            ("suser-b", agentd_protocol::SessionKind::User, 30),
-            ("ssub-after", agentd_protocol::SessionKind::Subagent, 40),
+            ("ssub-before", construct_protocol::SessionKind::Subagent, 0),
+            ("suser-a", construct_protocol::SessionKind::User, 10),
+            ("ssub-between", construct_protocol::SessionKind::Subagent, 20),
+            ("suser-b", construct_protocol::SessionKind::User, 30),
+            ("ssub-after", construct_protocol::SessionKind::Subagent, 40),
         ] {
             mgr.sessions
                 .write()
@@ -4435,7 +4435,7 @@ mod tests {
                 .insert(id.into(), synthetic_entry(id, kind, position));
         }
 
-        mgr.move_session("suser-b", agentd_protocol::MoveDirection::Up)
+        mgr.move_session("suser-b", construct_protocol::MoveDirection::Up)
             .await
             .expect("move up");
 
@@ -4464,10 +4464,10 @@ mod tests {
         // The TUI shows active sessions directly but puts archived ones behind
         // an initially-collapsed disclosure row. Moving `suser-b` up must swap
         // with the visible `suser-a`, not only with invisible `sarchived`.
-        let active_a = synthetic_entry("suser-a", agentd_protocol::SessionKind::User, 0);
-        let archived = synthetic_entry("sarchived", agentd_protocol::SessionKind::User, 10);
+        let active_a = synthetic_entry("suser-a", construct_protocol::SessionKind::User, 0);
+        let archived = synthetic_entry("sarchived", construct_protocol::SessionKind::User, 10);
         archived.summary.write().await.archived = true;
-        let active_b = synthetic_entry("suser-b", agentd_protocol::SessionKind::User, 20);
+        let active_b = synthetic_entry("suser-b", construct_protocol::SessionKind::User, 20);
         for (id, entry) in [
             ("suser-a", active_a),
             ("sarchived", archived),
@@ -4476,7 +4476,7 @@ mod tests {
             mgr.sessions.write().await.insert(id.into(), entry);
         }
 
-        mgr.move_session("suser-b", agentd_protocol::MoveDirection::Up)
+        mgr.move_session("suser-b", construct_protocol::MoveDirection::Up)
             .await
             .expect("move up");
 
@@ -4507,7 +4507,7 @@ mod tests {
                 .expect("session manager");
         mgr.sessions.write().await.insert(
             "s1".into(),
-            synthetic_entry("s1", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("s1", construct_protocol::SessionKind::User, 0),
         );
         let entry = mgr.get_entry("s1").await.expect("entry");
 
@@ -4600,7 +4600,7 @@ mod tests {
 
         mgr.sessions.write().await.insert(
             "s1".into(),
-            synthetic_entry("s1", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("s1", construct_protocol::SessionKind::User, 0),
         );
 
         // Clients reflect archived state from the broadcast `State` event, so
@@ -4673,7 +4673,7 @@ mod tests {
                 .await
                 .expect("session manager");
 
-        let parent = synthetic_entry("parent", agentd_protocol::SessionKind::User, 0);
+        let parent = synthetic_entry("parent", construct_protocol::SessionKind::User, 0);
         {
             let mut s = parent.summary.write().await;
             s.event_count = 17;
@@ -4682,8 +4682,8 @@ mod tests {
         }
         mgr.sessions.write().await.insert("parent".into(), parent);
 
-        let fork = synthetic_entry("fork", agentd_protocol::SessionKind::User, 10);
-        fork.summary.write().await.forked_from = Some(agentd_protocol::ForkedFrom {
+        let fork = synthetic_entry("fork", construct_protocol::SessionKind::User, 10);
+        fork.summary.write().await.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "parent".into(),
             transcript_seq: 5,
             at_ms: 0,
@@ -4693,7 +4693,7 @@ mod tests {
         fork.summary.write().await.event_count = 2;
         mgr.sessions.write().await.insert("fork".into(), fork);
 
-        mgr.merge("fork", agentd_protocol::ForkMergeMode::Result)
+        mgr.merge("fork", construct_protocol::ForkMergeMode::Result)
             .await
             .expect("merge");
 
@@ -4704,7 +4704,7 @@ mod tests {
             .summary()
             .await;
         let merge = fork_summary.merge.expect("merge outcome recorded");
-        assert_eq!(merge.mode, agentd_protocol::ForkMergeMode::Result);
+        assert_eq!(merge.mode, construct_protocol::ForkMergeMode::Result);
         assert_eq!(
             merge.merged_seq, 17,
             "merged_seq must come from the PARENT's event_count, not the fork's own"
@@ -4749,8 +4749,8 @@ mod tests {
         // The fork's parent was deleted before the fork got merged/discarded
         // — merge() must still succeed (there's still a terminal outcome to
         // record for the fork itself), just with no parent timeline to stamp.
-        let fork = synthetic_entry("orphan-fork", agentd_protocol::SessionKind::User, 0);
-        fork.summary.write().await.forked_from = Some(agentd_protocol::ForkedFrom {
+        let fork = synthetic_entry("orphan-fork", construct_protocol::SessionKind::User, 0);
+        fork.summary.write().await.forked_from = Some(construct_protocol::ForkedFrom {
             session_id: "long-gone".into(),
             transcript_seq: 3,
             at_ms: 0,
@@ -4762,7 +4762,7 @@ mod tests {
             .await
             .insert("orphan-fork".into(), fork);
 
-        mgr.merge("orphan-fork", agentd_protocol::ForkMergeMode::Discard)
+        mgr.merge("orphan-fork", construct_protocol::ForkMergeMode::Discard)
             .await
             .expect("merge succeeds even with no parent entry left");
 
@@ -4790,11 +4790,11 @@ mod tests {
 
         mgr.sessions.write().await.insert(
             "solo".into(),
-            synthetic_entry("solo", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("solo", construct_protocol::SessionKind::User, 0),
         );
 
         assert!(
-            mgr.merge("solo", agentd_protocol::ForkMergeMode::Result)
+            mgr.merge("solo", construct_protocol::ForkMergeMode::Result)
                 .await
                 .is_err(),
             "an ordinary session with no forked_from must not be mergeable"
@@ -4830,7 +4830,7 @@ mod tests {
         // A still-running session whose summary has NOT yet been flipped to
         // archived — modelling the Closed handler observing the summary before
         // `archive` writes `archived = true` to it.
-        let entry = synthetic_entry("s_race", agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry("s_race", construct_protocol::SessionKind::User, 0);
         {
             let mut s = entry.summary.write().await;
             s.state = SessionState::Running;
@@ -4907,7 +4907,7 @@ mod tests {
 
     #[tokio::test]
     async fn move_session_jumps_over_collapsed_project() {
-        use agentd_protocol::{MoveDirection, SessionKind};
+        use construct_protocol::{MoveDirection, SessionKind};
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -5112,7 +5112,7 @@ mod tests {
                 .expect("session manager");
         mgr.sessions.write().await.insert(
             "spaste".into(),
-            synthetic_entry("spaste", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("spaste", construct_protocol::SessionKind::User, 0),
         );
 
         let result = mgr
@@ -5152,21 +5152,21 @@ mod tests {
 
         mgr.sessions.write().await.insert(
             "suser".into(),
-            synthetic_entry("suser", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("suser", construct_protocol::SessionKind::User, 0),
         );
         mgr.sessions.write().await.insert(
             "ssub".into(),
-            synthetic_entry("ssub", agentd_protocol::SessionKind::Subagent, -1),
+            synthetic_entry("ssub", construct_protocol::SessionKind::Subagent, -1),
         );
 
         let sessions = mgr.list().await;
         assert_eq!(sessions.len(), 2);
         assert!(sessions
             .iter()
-            .any(|s| s.id == "suser" && s.kind == agentd_protocol::SessionKind::User));
+            .any(|s| s.id == "suser" && s.kind == construct_protocol::SessionKind::User));
         assert!(sessions
             .iter()
-            .any(|s| s.id == "ssub" && s.kind == agentd_protocol::SessionKind::Subagent));
+            .any(|s| s.id == "ssub" && s.kind == construct_protocol::SessionKind::Subagent));
     }
 
     /// Browser previews are ephemeral, live-only UI (a base64 PNG shown as
@@ -5189,14 +5189,14 @@ mod tests {
                 .expect("session manager");
 
         let id = "sbrowser";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
         // Control: a normal structured event MUST be persisted.
         mgr.handle_event(
             &entry,
             SessionEvent::Message {
-                role: agentd_protocol::MessageRole::Assistant,
+                role: construct_protocol::MessageRole::Assistant,
                 text: "hi".into(),
             },
         )
@@ -5205,7 +5205,7 @@ mod tests {
         // The browser preview (with a stand-in base64 image) MUST NOT be.
         mgr.handle_event(
             &entry,
-            SessionEvent::BrowserPreview(agentd_protocol::BrowserPreview {
+            SessionEvent::BrowserPreview(construct_protocol::BrowserPreview {
                 url: "https://example.test".into(),
                 title: Some("Example".into()),
                 image: "QUJD".into(), // base64("ABC")
@@ -5252,14 +5252,14 @@ mod tests {
                 .expect("session manager");
 
         let id = "sresolved";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
         // Control: a normal structured event MUST be persisted.
         mgr.handle_event(
             &entry,
             SessionEvent::Message {
-                role: agentd_protocol::MessageRole::Assistant,
+                role: construct_protocol::MessageRole::Assistant,
                 text: "hi".into(),
             },
         )
@@ -5312,13 +5312,13 @@ mod tests {
                 .expect("session manager");
 
         let id = "sapprovalmode";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
         mgr.handle_event(
             &entry,
             SessionEvent::ApprovalModeChanged {
-                mode: agentd_protocol::ApprovalMode::UnsafeAuto,
+                mode: construct_protocol::ApprovalMode::UnsafeAuto,
             },
         )
         .await;
@@ -5326,7 +5326,7 @@ mod tests {
         let summary = storage.load_summary(id).expect("summary");
         assert_eq!(
             summary.approval_mode,
-            agentd_protocol::ApprovalMode::UnsafeAuto
+            construct_protocol::ApprovalMode::UnsafeAuto
         );
         let transcript = storage
             .read_transcript(id, 0, None)
@@ -5358,7 +5358,7 @@ mod tests {
                 .expect("session manager");
 
         let id = "smodelchange";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
         mgr.handle_event(
@@ -5411,7 +5411,7 @@ mod tests {
         // session looks like just before the user hits Ctrl-C on the
         // daemon).
         let id = "stest_shutdown".to_string();
-        let summary = agentd_protocol::SessionSummary {
+        let summary = construct_protocol::SessionSummary {
             id: id.clone(),
             harness: "shell".into(),
             cwd: "/tmp".into(),
@@ -5436,8 +5436,8 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
-            kind: agentd_protocol::SessionKind::User,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
+            kind: construct_protocol::SessionKind::User,
             forked_from: None,
             merge: None,
             archived: false,
@@ -5515,7 +5515,7 @@ mod tests {
     /// harnesses; shells (foreground-pgroup) and headless sessions are excluded.
     #[test]
     fn quiescence_targets_tui_llm_harnesses() {
-        let mut s = placement_summary("q", 0, None, agentd_protocol::SessionKind::User);
+        let mut s = placement_summary("q", 0, None, construct_protocol::SessionKind::User);
         s.has_pty = true;
         for h in ["claude", "codex", "antigravity", "grok"] {
             s.harness = h.into();
@@ -5551,7 +5551,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let id = "stest_pty_activity".to_string();
-        let summary = agentd_protocol::SessionSummary {
+        let summary = construct_protocol::SessionSummary {
             id: id.clone(),
             harness: "grok".into(),
             cwd: "/tmp".into(),
@@ -5576,8 +5576,8 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
-            kind: agentd_protocol::SessionKind::User,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
+            kind: construct_protocol::SessionKind::User,
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
@@ -5738,7 +5738,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let build = |id: &str, state: SessionState| {
-            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, construct_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = state;
@@ -5826,7 +5826,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let make_entry = |id: &str| {
-            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, construct_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = SessionState::Running;
@@ -5868,7 +5868,7 @@ mod tests {
         // Genuine agent output — what the marker requires before a stop counts
         // as "needs you".
         let content = || SessionEvent::Message {
-            role: agentd_protocol::MessageRole::Assistant,
+            role: construct_protocol::MessageRole::Assistant,
             text: "out".into(),
         };
 
@@ -5937,7 +5937,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let build = |id: &str, state: SessionState| {
-            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, construct_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = state;
@@ -6021,7 +6021,7 @@ mod tests {
         let manager = Arc::new(mgr);
 
         let build = |id: &str, state: SessionState| {
-            let mut summary = placement_summary(id, 0, None, agentd_protocol::SessionKind::User);
+            let mut summary = placement_summary(id, 0, None, construct_protocol::SessionKind::User);
             summary.harness = "claude".into();
             summary.has_pty = true;
             summary.state = state;
@@ -6093,7 +6093,7 @@ mod tests {
             worktree: false,
             env: Default::default(),
             args: Vec::new(),
-            kind: agentd_protocol::SessionKind::User,
+            kind: construct_protocol::SessionKind::User,
             parent_session_id: None,
             group_id: None,
             position_after_session_id: None,
@@ -6158,7 +6158,7 @@ mod tests {
                 .expect("session manager");
 
         let id = "stail";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
         // Simulate 1234 persisted events. The live transcript_count is what
@@ -6166,11 +6166,11 @@ mod tests {
         // signal the webui uses to decide whether to background-load older
         // pages above the tail.
         for seq in 1..=1234u64 {
-            let ev = agentd_protocol::TimestampedEvent {
+            let ev = construct_protocol::TimestampedEvent {
                 seq,
                 at: Utc::now(),
-                event: agentd_protocol::SessionEvent::Message {
-                    role: agentd_protocol::MessageRole::Assistant,
+                event: construct_protocol::SessionEvent::Message {
+                    role: construct_protocol::MessageRole::Assistant,
                     text: format!("e{seq}"),
                 },
             };
@@ -6197,7 +6197,7 @@ mod tests {
     /// of duplicating the transcript on each restart.
     #[tokio::test]
     async fn native_child_backfill_is_replay_safe() {
-        use agentd_protocol::MessageRole;
+        use construct_protocol::MessageRole;
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -6207,7 +6207,7 @@ mod tests {
             SessionManager::new(storage, config, tmp.path().join("run"))
                 .await
                 .expect("manager");
-        let owner = synthetic_entry("owner", agentd_protocol::SessionKind::User, 0);
+        let owner = synthetic_entry("owner", construct_protocol::SessionKind::User, 0);
         manager
             .sessions
             .write()
@@ -6272,7 +6272,7 @@ mod tests {
     /// mirror back to running — but tagged new activity still does.
     #[tokio::test]
     async fn untagged_replay_cannot_resurrect_a_finished_mirror() {
-        use agentd_protocol::MessageRole;
+        use construct_protocol::MessageRole;
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -6282,7 +6282,7 @@ mod tests {
             SessionManager::new(storage, config, tmp.path().join("run"))
                 .await
                 .expect("manager");
-        let owner = synthetic_entry("owner", agentd_protocol::SessionKind::User, 0);
+        let owner = synthetic_entry("owner", construct_protocol::SessionKind::User, 0);
         manager
             .sessions
             .write()
@@ -6367,30 +6367,30 @@ mod tests {
             Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
 
         // Saved summary carries no message tally (a pre-field record)...
-        let summary = placement_summary("recount", 0, None, agentd_protocol::SessionKind::User);
+        let summary = placement_summary("recount", 0, None, construct_protocol::SessionKind::User);
         storage.save_summary(&summary).expect("save summary");
         // ...but its transcript holds 2 chat messages among 5 events.
         let events = [
-            agentd_protocol::SessionEvent::Message {
-                role: agentd_protocol::MessageRole::User,
+            construct_protocol::SessionEvent::Message {
+                role: construct_protocol::MessageRole::User,
                 text: "hi".into(),
             },
-            agentd_protocol::SessionEvent::Reasoning {
+            construct_protocol::SessionEvent::Reasoning {
                 text: "thinking".into(),
             },
-            agentd_protocol::SessionEvent::Message {
-                role: agentd_protocol::MessageRole::Assistant,
+            construct_protocol::SessionEvent::Message {
+                role: construct_protocol::MessageRole::Assistant,
                 text: "hello".into(),
             },
-            agentd_protocol::SessionEvent::Reasoning {
+            construct_protocol::SessionEvent::Reasoning {
                 text: "more thinking".into(),
             },
-            agentd_protocol::SessionEvent::Reasoning {
+            construct_protocol::SessionEvent::Reasoning {
                 text: "even more".into(),
             },
         ];
         for (i, event) in events.into_iter().enumerate() {
-            let ts = agentd_protocol::TimestampedEvent {
+            let ts = construct_protocol::TimestampedEvent {
                 seq: i as u64 + 1,
                 at: Utc::now(),
                 event,
@@ -6432,7 +6432,7 @@ mod tests {
                 .expect("session manager");
 
         let id = "ssearch";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         entry.summary.write().await.title = Some("Investigate flaky needle test".to_string());
         mgr.sessions.write().await.insert(id.into(), entry.clone());
         // Never written to disk — proves `search` isn't relying on
@@ -6442,11 +6442,11 @@ mod tests {
         storage_handle
             .append_event(
                 id,
-                &agentd_protocol::TimestampedEvent {
+                &construct_protocol::TimestampedEvent {
                     seq: 1,
                     at: chrono::Utc::now(),
-                    event: agentd_protocol::SessionEvent::Message {
-                        role: agentd_protocol::MessageRole::Assistant,
+                    event: construct_protocol::SessionEvent::Message {
+                        role: construct_protocol::MessageRole::Assistant,
                         text: "found the needle in the haystack".to_string(),
                     },
                 },
@@ -6454,7 +6454,7 @@ mod tests {
             .expect("append event");
 
         let result = mgr
-            .search(agentd_protocol::SearchParams {
+            .search(construct_protocol::SearchParams {
                 query: "needle".to_string(),
                 scopes: None,
                 session_ids: None,
@@ -6465,8 +6465,8 @@ mod tests {
             .expect("search");
 
         let scopes: std::collections::HashSet<_> = result.hits.iter().map(|h| h.scope).collect();
-        assert!(scopes.contains(&agentd_protocol::SearchScope::Name));
-        assert!(scopes.contains(&agentd_protocol::SearchScope::Transcript));
+        assert!(scopes.contains(&construct_protocol::SearchScope::Name));
+        assert!(scopes.contains(&construct_protocol::SearchScope::Transcript));
         assert!(result.hits.iter().all(|h| h.session_id == id));
     }
 
@@ -6488,7 +6488,7 @@ mod tests {
         let id = "sreplay";
         mgr.sessions.write().await.insert(
             id.into(),
-            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+            synthetic_entry(id, construct_protocol::SessionKind::User, 0),
         );
 
         // Write 1 MiB to pty.log — that's 4× the size of the old in-memory
@@ -6529,7 +6529,7 @@ mod tests {
         let id = "snopty";
         mgr.sessions.write().await.insert(
             id.into(),
-            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+            synthetic_entry(id, construct_protocol::SessionKind::User, 0),
         );
 
         let result = mgr.pty_replay(id).await.expect("pty_replay");
@@ -6560,7 +6560,7 @@ mod tests {
                 .expect("session manager");
 
         let id = "ssize";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
         entry.pty.lock().await.size = Some(PtySize {
             cols: 132,
@@ -6594,7 +6594,7 @@ mod tests {
         // nested subagent. Deleting the owner must take all three with it.
         mgr.sessions.write().await.insert(
             "parent".into(),
-            synthetic_entry("parent", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("parent", construct_protocol::SessionKind::User, 0),
         );
         for (id, parent) in [("subA", "parent"), ("subB", "parent"), ("subA1", "subA")] {
             let e = synthetic_subagent_entry(id, parent, 0).await;
@@ -6603,7 +6603,7 @@ mod tests {
         // An unrelated user session must survive the cascade untouched.
         mgr.sessions.write().await.insert(
             "other".into(),
-            synthetic_entry("other", agentd_protocol::SessionKind::User, 10),
+            synthetic_entry("other", construct_protocol::SessionKind::User, 10),
         );
 
         mgr.delete("parent").await.expect("delete parent");
@@ -6646,7 +6646,7 @@ mod tests {
 
         mgr.sessions.write().await.insert(
             "parent".into(),
-            synthetic_entry("parent", agentd_protocol::SessionKind::User, 0),
+            synthetic_entry("parent", construct_protocol::SessionKind::User, 0),
         );
         for (id, parent) in [("subA", "parent"), ("subA1", "subA")] {
             let e = synthetic_subagent_entry(id, parent, 0).await;
@@ -6695,7 +6695,7 @@ mod tests {
         let id = "s-fast-archive";
         mgr.sessions.write().await.insert(
             id.into(),
-            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+            synthetic_entry(id, construct_protocol::SessionKind::User, 0),
         );
 
         let start = std::time::Instant::now();
@@ -6711,7 +6711,7 @@ mod tests {
         let id2 = "s-fast-delete";
         mgr.sessions.write().await.insert(
             id2.into(),
-            synthetic_entry(id2, agentd_protocol::SessionKind::User, 0),
+            synthetic_entry(id2, construct_protocol::SessionKind::User, 0),
         );
         let start2 = std::time::Instant::now();
         mgr.delete(id2).await.expect("delete fast");
@@ -6740,7 +6740,7 @@ mod tests {
         let id = "sreplaybig";
         mgr.sessions.write().await.insert(
             id.into(),
-            synthetic_entry(id, agentd_protocol::SessionKind::User, 0),
+            synthetic_entry(id, construct_protocol::SessionKind::User, 0),
         );
 
         // Write PTY_REPLAY_CAP + 1 MiB. Replay must return at most
@@ -6784,7 +6784,7 @@ mod tests {
                 .expect("session manager");
 
         let id = "sprogramrun";
-        let entry = synthetic_entry(id, agentd_protocol::SessionKind::User, 0);
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
         mgr.sessions.write().await.insert(id.into(), entry.clone());
 
         // Start a program run
@@ -6854,13 +6854,13 @@ mod tests {
         let id = "sprog".to_string();
         mgr.sessions.write().await.insert(
             id.clone(),
-            synthetic_entry(&id, agentd_protocol::SessionKind::User, 0),
+            synthetic_entry(&id, construct_protocol::SessionKind::User, 0),
         );
         storage
             .update_program(
                 &id,
                 markdown.to_string(),
-                agentd_protocol::ProgramUpdateActor::Human,
+                construct_protocol::ProgramUpdateActor::Human,
                 None,
                 None,
                 None,
@@ -6878,7 +6878,7 @@ mod tests {
             .program_cursor(
                 7,
                 "tui",
-                agentd_protocol::ProgramCursorParams {
+                construct_protocol::ProgramCursorParams {
                     session_id: id.clone(),
                     cursor: 3,
                     selection_anchor: Some(1),
@@ -6961,11 +6961,11 @@ mod tests {
         conn_id: u64,
         kind: &str,
         cursor: usize,
-    ) -> agentd_protocol::ProgramCursor {
+    ) -> construct_protocol::ProgramCursor {
         mgr.program_cursor(
             conn_id,
             kind,
-            agentd_protocol::ProgramCursorParams {
+            construct_protocol::ProgramCursorParams {
                 session_id: session_id.to_string(),
                 cursor,
                 selection_anchor: None,
@@ -6988,7 +6988,7 @@ mod tests {
         mgr: &SessionManager,
         session_id: &str,
         client_id: &str,
-    ) -> agentd_protocol::ProgramCursor {
+    ) -> construct_protocol::ProgramCursor {
         mgr.program_collaborators(session_id)
             .into_iter()
             .find(|cursor| cursor.client_id == client_id)
@@ -7000,7 +7000,7 @@ mod tests {
     fn agent_collaborator(
         mgr: &SessionManager,
         session_id: &str,
-    ) -> agentd_protocol::ProgramCursor {
+    ) -> construct_protocol::ProgramCursor {
         mgr.program_collaborators(session_id)
             .into_iter()
             .find(|cursor| cursor.kind == "agent")
@@ -7018,7 +7018,7 @@ mod tests {
             .program_cursor(
                 4,
                 "tui",
-                agentd_protocol::ProgramCursorParams {
+                construct_protocol::ProgramCursorParams {
                     session_id: id.clone(),
                     cursor: 3,
                     selection_anchor: None,
@@ -7035,7 +7035,7 @@ mod tests {
             .program_cursor(
                 5,
                 "tui",
-                agentd_protocol::ProgramCursorParams {
+                construct_protocol::ProgramCursorParams {
                     session_id: id.clone(),
                     cursor: 4,
                     selection_anchor: None,
@@ -7064,15 +7064,15 @@ mod tests {
 
         let result = mgr
             .program_edit_from_conn(
-                agentd_protocol::ProgramEditParams {
+                construct_protocol::ProgramEditParams {
                     session_id: id.clone(),
-                    edits: vec![agentd_protocol::ProgramEdit {
+                    edits: vec![construct_protocol::ProgramEdit {
                         old_string: "123456".to_string(),
                         new_string: "123X456".to_string(),
                         replace_all: false,
                         keep_pending: false,
                     }],
-                    actor: agentd_protocol::ProgramUpdateActor::Human,
+                    actor: construct_protocol::ProgramUpdateActor::Human,
                     note: None,
                     shimmer: Vec::new(),
                 },
@@ -7098,7 +7098,7 @@ mod tests {
         mgr.program_cursor(
             2,
             "web",
-            agentd_protocol::ProgramCursorParams {
+            construct_protocol::ProgramCursorParams {
                 session_id: id.clone(),
                 cursor: 6,
                 selection_anchor: Some(4),
@@ -7112,15 +7112,15 @@ mod tests {
         .expect("peer cursor");
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "123456".to_string(),
                     new_string: "12356".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7141,15 +7141,15 @@ mod tests {
         put_program_cursor(&mgr, &id, 2, "web", 4).await;
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "3456".to_string(),
                     new_string: "".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7168,15 +7168,15 @@ mod tests {
         put_program_cursor(&mgr, &id, 3, "web", 3).await; // after second `a`
         put_program_cursor(&mgr, &id, 4, "web", 5).await; // after third `a`
 
-        mgr.program_edit(agentd_protocol::ProgramEditParams {
+        mgr.program_edit(construct_protocol::ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "a".to_string(),
                 new_string: "ab".to_string(),
                 replace_all: true,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: Vec::new(),
         })
@@ -7194,15 +7194,15 @@ mod tests {
 
         let result = mgr
             .program_edit_from_conn(
-                agentd_protocol::ProgramEditParams {
+                construct_protocol::ProgramEditParams {
                     session_id: id.clone(),
-                    edits: vec![agentd_protocol::ProgramEdit {
+                    edits: vec![construct_protocol::ProgramEdit {
                         old_string: "456".to_string(),
                         new_string: "XYZ".to_string(),
                         replace_all: false,
                         keep_pending: false,
                     }],
-                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
                     note: None,
                     shimmer: Vec::new(),
                 },
@@ -7237,15 +7237,15 @@ mod tests {
         }
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "hello".to_string(),
                     new_string: "hello world".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7266,15 +7266,15 @@ mod tests {
         let (mgr, _storage, id) = program_test_mgr("abc def\n").await;
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "abc".to_string(),
                     new_string: "abcd".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7285,15 +7285,15 @@ mod tests {
         let first_client_id = agent_collaborator(&mgr, &id).client_id.clone();
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "def".to_string(),
                     new_string: "defg".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7318,15 +7318,15 @@ mod tests {
         put_program_cursor(&mgr, &id, 1, "tui", 0).await;
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "abc".to_string(),
                     new_string: "abcd".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7353,15 +7353,15 @@ mod tests {
 
         let result = mgr
             .program_edit_from_conn(
-                agentd_protocol::ProgramEditParams {
+                construct_protocol::ProgramEditParams {
                     session_id: id.clone(),
-                    edits: vec![agentd_protocol::ProgramEdit {
+                    edits: vec![construct_protocol::ProgramEdit {
                         old_string: "456".to_string(),
                         new_string: "XY".to_string(),
                         replace_all: false,
                         keep_pending: false,
                     }],
-                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
                     note: None,
                     shimmer: Vec::new(),
                 },
@@ -7388,15 +7388,15 @@ mod tests {
         // Edit 1 lands near the end and grows the document, so the agent's
         // stored presence cursor sits at (6, 10) afterward.
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "789".to_string(),
                     new_string: "XYZW".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7411,15 +7411,15 @@ mod tests {
         // different, still-wrong (4, 8) and get broadcast before the correct
         // publish overwrites it.
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "123".to_string(),
                     new_string: "Q".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7458,15 +7458,15 @@ mod tests {
         let (mgr, _storage, id) = program_test_mgr("abc\n").await;
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "abc".to_string(),
                     new_string: "abc".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7494,23 +7494,23 @@ mod tests {
         // cursor must land at the real edit, not the degenerate trailing one.
         let result = mgr
             .program_edit_from_conn(
-                agentd_protocol::ProgramEditParams {
+                construct_protocol::ProgramEditParams {
                     session_id: id.clone(),
                     edits: vec![
-                        agentd_protocol::ProgramEdit {
+                        construct_protocol::ProgramEdit {
                             old_string: "456".to_string(),
                             new_string: "XYZ".to_string(),
                             replace_all: false,
                             keep_pending: false,
                         },
-                        agentd_protocol::ProgramEdit {
+                        construct_protocol::ProgramEdit {
                             old_string: "789".to_string(),
                             new_string: "789".to_string(),
                             replace_all: false,
                             keep_pending: false,
                         },
                     ],
-                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
                     note: None,
                     shimmer: Vec::new(),
                 },
@@ -7541,29 +7541,29 @@ mod tests {
         // that the last individual replacement happens to reference.
         let result = mgr
             .program_edit_from_conn(
-                agentd_protocol::ProgramEditParams {
+                construct_protocol::ProgramEditParams {
                     session_id: id.clone(),
                     edits: vec![
-                        agentd_protocol::ProgramEdit {
+                        construct_protocol::ProgramEdit {
                             old_string: "123".to_string(),
                             new_string: "abc".to_string(),
                             replace_all: false,
                             keep_pending: false,
                         },
-                        agentd_protocol::ProgramEdit {
+                        construct_protocol::ProgramEdit {
                             old_string: "789".to_string(),
                             new_string: "XYZ".to_string(),
                             replace_all: false,
                             keep_pending: false,
                         },
-                        agentd_protocol::ProgramEdit {
+                        construct_protocol::ProgramEdit {
                             old_string: "XYZ".to_string(),
                             new_string: "789".to_string(),
                             replace_all: false,
                             keep_pending: false,
                         },
                     ],
-                    actor: agentd_protocol::ProgramUpdateActor::Agent,
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
                     note: None,
                     shimmer: Vec::new(),
                 },
@@ -7589,15 +7589,15 @@ mod tests {
 
         // The agent writes near the end; its presence cursor is now fresh.
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "789".to_string(),
                     new_string: "XYZ".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7625,15 +7625,15 @@ mod tests {
         let backdated_at = stamped_at - 500;
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "123".to_string(),
                     new_string: "Q".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7660,15 +7660,15 @@ mod tests {
         let (mgr, _storage, id) = program_test_mgr("abc\n").await;
 
         mgr.program_edit_from_conn(
-            agentd_protocol::ProgramEditParams {
+            construct_protocol::ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "abc".to_string(),
                     new_string: "abcd".to_string(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: Vec::new(),
             },
@@ -7741,31 +7741,31 @@ mod tests {
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "# Rule".into(),
                     new_string: "# Rule".into(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: vec![
-                    agentd_protocol::ProgramShimmerDecl {
+                    construct_protocol::ProgramShimmerDecl {
                         id: id_of("# Rule"),
                         shimmer: false,
                         tooltip: None,
                     },
-                    agentd_protocol::ProgramShimmerDecl {
+                    construct_protocol::ProgramShimmerDecl {
                         id: id_of("## TODO"),
                         shimmer: false,
                         tooltip: None,
                     },
-                    agentd_protocol::ProgramShimmerDecl {
+                    construct_protocol::ProgramShimmerDecl {
                         id: id_of("## Done"),
                         shimmer: false,
                         tooltip: None,
                     },
-                    agentd_protocol::ProgramShimmerDecl {
+                    construct_protocol::ProgramShimmerDecl {
                         id: id_of("item one"),
                         shimmer: true,
                         tooltip: Some("Running item one".into()),
@@ -7818,7 +7818,7 @@ mod tests {
                 session_id: id.clone(),
                 markdown: md.to_string(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 template_id: None,
                 note: None,
                 shimmer: Some(vec![true, false]),
@@ -7834,7 +7834,7 @@ mod tests {
                 session_id: id.clone(),
                 markdown: md.to_string(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 template_id: None,
                 note: None,
                 shimmer: Some(vec![false, true, false]),
@@ -7916,7 +7916,7 @@ done
                 session_id: id.clone(),
                 markdown: "# New\n".to_string(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 template_id: None,
                 note: None,
                 shimmer: None,
@@ -7966,7 +7966,7 @@ done
     // the owning session is idle.
     #[tokio::test]
     async fn program_selection_run_unions_with_managed_inflight_run() {
-        use agentd_protocol::SessionState;
+        use construct_protocol::SessionState;
 
         let md = "# A\n\n# B\n";
         let (mgr, _storage, id) = program_test_mgr(md).await;
@@ -7990,12 +7990,12 @@ done
             &id,
             "# A",
             vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: a_ref.clone(),
                     shimmer: true,
                     tooltip: Some("Working A".into()),
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: b_ref.clone(),
                     shimmer: false,
                     tooltip: None,
@@ -8180,7 +8180,7 @@ done
 
     #[tokio::test]
     async fn program_full_rerun_with_explicit_shimmer_includes_user_edited_block() {
-        use agentd_protocol::SessionState;
+        use construct_protocol::SessionState;
 
         let md = "# A\n\n# B\n";
         let edited = "# A\n\n# B edited\n";
@@ -8205,12 +8205,12 @@ done
             &id,
             "# A",
             vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: a_ref.clone(),
                     shimmer: true,
                     tooltip: Some("Working A".into()),
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: b_ref,
                     shimmer: false,
                     tooltip: None,
@@ -8229,7 +8229,7 @@ done
             .update_program(
                 &id,
                 edited.to_string(),
-                agentd_protocol::ProgramUpdateActor::Human,
+                construct_protocol::ProgramUpdateActor::Human,
                 None,
                 None,
                 None,
@@ -8274,25 +8274,25 @@ done
         let (mgr, _storage, id) = program_test_mgr(md).await;
         mgr.start_program_run(&id, md, false, None)
             .expect("start run");
-        let a = agentd_protocol::program_block_id("# A");
+        let a = construct_protocol::program_block_id("# A");
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "# A".into(),
                     new_string: "# A".into(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: vec![
-                    agentd_protocol::ProgramShimmerDecl {
+                    construct_protocol::ProgramShimmerDecl {
                         id: "deadbeefdeadbeef".into(),
                         shimmer: false,
                         tooltip: None,
                     },
-                    agentd_protocol::ProgramShimmerDecl {
+                    construct_protocol::ProgramShimmerDecl {
                         id: a,
                         shimmer: false,
                         tooltip: None,
@@ -8319,17 +8319,17 @@ done
         mgr: &SessionManager,
         id: &str,
         anchor: &str,
-        decls: Vec<agentd_protocol::ProgramShimmerDecl>,
+        decls: Vec<construct_protocol::ProgramShimmerDecl>,
     ) -> ProgramUpdateResult {
         mgr.program_edit(ProgramEditParams {
             session_id: id.to_string(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: anchor.to_string(),
                 new_string: anchor.to_string(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: decls,
         })
@@ -8362,12 +8362,12 @@ done
             &id,
             "# Tasks",
             vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("# Tasks"),
                     shimmer: false,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("do the thing"),
                     shimmer: true,
                     tooltip: Some("Doing the thing".into()),
@@ -8380,13 +8380,13 @@ done
         // its old id drops and the pending set transiently empties.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "* do the thing".into(),
                 new_string: "* do the thing — @{session:sub1}".into(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![],
         })
@@ -8411,7 +8411,7 @@ done
             &mgr,
             &id,
             "# Tasks",
-            vec![agentd_protocol::ProgramShimmerDecl {
+            vec![construct_protocol::ProgramShimmerDecl {
                 id: new_id,
                 shimmer: true,
                 tooltip: Some("Reviving moved task".into()),
@@ -8451,12 +8451,12 @@ done
             &id,
             "# Tasks",
             vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("# Tasks"),
                     shimmer: false,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("do the thing"),
                     shimmer: true,
                     tooltip: Some("Doing the thing".into()),
@@ -8470,13 +8470,13 @@ done
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "* do the thing".into(),
                     new_string: "* do the thing — @{session:sub1}".into(),
                     replace_all: false,
                     keep_pending: true,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: vec![],
             })
@@ -8530,26 +8530,26 @@ done
         // Planning pass: settle headings, keep the todo task pending.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "# Todo".into(),
                 new_string: "# Todo".into(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("# Todo"),
                     shimmer: false,
                     tooltip: Some("Task list settled".into()),
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("# In progress"),
                     shimmer: false,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("ship X"),
                     shimmer: true,
                     tooltip: Some("Shipping X".into()),
@@ -8562,13 +8562,13 @@ done
         // heading-anchored edit whose new_string spans heading + new item.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "* ship X\n".into(),
                 new_string: "".into(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![],
         })
@@ -8577,13 +8577,13 @@ done
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "# In progress\n".into(),
                     new_string: "# In progress\n\n* ship X — @{session:s9}\n".into(),
                     replace_all: false,
                     keep_pending: true,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: vec![],
             })
@@ -8632,21 +8632,21 @@ done
         };
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "# In progress".into(),
                 new_string: "# In progress".into(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("# In progress"),
                     shimmer: false,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("task"),
                     shimmer: true,
                     tooltip: Some("Still working".into()),
@@ -8661,7 +8661,7 @@ done
                 session_id: id.clone(),
                 markdown: normalized.to_string(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 template_id: None,
                 note: Some("Normalize smart clip ids".into()),
                 shimmer: None,
@@ -8704,15 +8704,15 @@ done
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: md.into(),
                     new_string: md.into(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
-                shimmer: vec![agentd_protocol::ProgramShimmerDecl {
+                shimmer: vec![construct_protocol::ProgramShimmerDecl {
                     id: first_ref,
                     shimmer: false,
                     tooltip: None,
@@ -8743,7 +8743,7 @@ done
                 session_id: id.clone(),
                 markdown: "* task changed\n".into(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 template_id: None,
                 note: None,
                 shimmer: None,
@@ -8778,13 +8778,13 @@ done
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "* task".into(),
                     new_string: "* task @{session:s1}".into(),
                     replace_all: false,
                     keep_pending: true,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: vec![],
             })
@@ -8819,20 +8819,20 @@ done
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
                 edits: vec![
-                    agentd_protocol::ProgramEdit {
+                    construct_protocol::ProgramEdit {
                         old_string: "* task\n\n".into(),
                         new_string: "".into(),
                         replace_all: false,
                         keep_pending: false,
                     },
-                    agentd_protocol::ProgramEdit {
+                    construct_protocol::ProgramEdit {
                         old_string: "# Doing\n".into(),
                         new_string: "# Doing\n\n* task\n".into(),
                         replace_all: false,
                         keep_pending: false,
                     },
                 ],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
                 shimmer: vec![],
             })
@@ -8863,7 +8863,7 @@ done
         let (mgr, _storage, id) = program_test_mgr(md).await;
         mgr.start_program_run(&id, md, false, None).expect("start");
         let g = mgr.program_get(&id).await.expect("get");
-        let id_of = |blocks: &[agentd_protocol::ProgramBlockView], n: &str| {
+        let id_of = |blocks: &[construct_protocol::ProgramBlockView], n: &str| {
             blocks.iter().find(|b| b.text.contains(n)).unwrap().clone()
         };
         // Settle "alpha" (as a planning pass / prior turn would) so only beta
@@ -8871,15 +8871,15 @@ done
         // some work already settled before the human edits the document.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "* alpha".into(),
                 new_string: "* alpha".into(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
-            shimmer: vec![agentd_protocol::ProgramShimmerDecl {
+            shimmer: vec![construct_protocol::ProgramShimmerDecl {
                 id: id_of(&g.blocks, "alpha").id,
                 shimmer: false,
                 tooltip: None,
@@ -8898,7 +8898,7 @@ done
                 session_id: id.clone(),
                 markdown: edited.to_string(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 template_id: None,
                 note: None,
                 shimmer: None,
@@ -8955,7 +8955,7 @@ done
                 session_id: id.clone(),
                 markdown: edited.to_string(),
                 base_version: None,
-                actor: agentd_protocol::ProgramUpdateActor::Human,
+                actor: construct_protocol::ProgramUpdateActor::Human,
                 template_id: None,
                 note: None,
                 shimmer: None,
@@ -9007,31 +9007,31 @@ done
         // Planning pass: settle the heading, keep all three items pending.
         mgr.program_edit(ProgramEditParams {
             session_id: id.clone(),
-            edits: vec![agentd_protocol::ProgramEdit {
+            edits: vec![construct_protocol::ProgramEdit {
                 old_string: "# In progress".into(),
                 new_string: "# In progress".into(),
                 replace_all: false,
                 keep_pending: false,
             }],
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             note: None,
             shimmer: vec![
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("# In progress"),
                     shimmer: false,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("task A"),
                     shimmer: true,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("task B"),
                     shimmer: true,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: id_of("task C"),
                     shimmer: true,
                     tooltip: None,
@@ -9044,15 +9044,15 @@ done
         let res = mgr
             .program_edit(ProgramEditParams {
                 session_id: id.clone(),
-                edits: vec![agentd_protocol::ProgramEdit {
+                edits: vec![construct_protocol::ProgramEdit {
                     old_string: "# In progress".into(),
                     new_string: "# In progress".into(),
                     replace_all: false,
                     keep_pending: false,
                 }],
-                actor: agentd_protocol::ProgramUpdateActor::Agent,
+                actor: construct_protocol::ProgramUpdateActor::Agent,
                 note: None,
-                shimmer: vec![agentd_protocol::ProgramShimmerDecl {
+                shimmer: vec![construct_protocol::ProgramShimmerDecl {
                     id: id_of("task B"),
                     shimmer: false,
                     tooltip: None,
@@ -9078,23 +9078,23 @@ done
     // longer revives it (contrast with the mid-turn survival above).
     #[tokio::test]
     async fn program_run_empty_clears_when_owning_session_idle() {
-        use agentd_protocol::SessionState;
+        use construct_protocol::SessionState;
         let md = "# A\n\n# B\n";
         let (mgr, _storage, id) = program_test_mgr(md).await;
         mgr.start_program_run(&id, md, false, None).expect("start");
         mgr.note_session_state_for_program_run(&id, SessionState::Running);
-        let b = agentd_protocol::program_block_id("# B");
+        let b = construct_protocol::program_block_id("# B");
         // Settle every block → pending empties; the record survives mid-turn.
         mgr.narrow_program_run(
             &id,
             md,
             &[
-                agentd_protocol::ProgramShimmerDecl {
-                    id: agentd_protocol::program_block_id("# A"),
+                construct_protocol::ProgramShimmerDecl {
+                    id: construct_protocol::program_block_id("# A"),
                     shimmer: false,
                     tooltip: None,
                 },
-                agentd_protocol::ProgramShimmerDecl {
+                construct_protocol::ProgramShimmerDecl {
                     id: b.clone(),
                     shimmer: false,
                     tooltip: None,
@@ -9111,7 +9111,7 @@ done
         mgr.narrow_program_run(
             &id,
             md,
-            &[agentd_protocol::ProgramShimmerDecl {
+            &[construct_protocol::ProgramShimmerDecl {
                 id: b,
                 shimmer: true,
                 tooltip: None,
@@ -9129,7 +9129,7 @@ done
     // pending. It clears only when its pending set empties (spec 0042).
     #[tokio::test]
     async fn program_run_managed_survives_idle_and_clears_on_settle() {
-        use agentd_protocol::SessionState;
+        use construct_protocol::SessionState;
         let body = "# Alpha\n\n# Beta\n";
         let (mgr, _storage, id) = program_test_mgr(body).await;
 
@@ -9177,7 +9177,7 @@ done
             session_id: id.clone(),
             markdown: "# Alpha done\n\n# Beta\n".into(),
             base_version: None,
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             template_id: None,
             note: None,
             shimmer: None,
@@ -9189,7 +9189,7 @@ done
             mgr.program_run_snapshot(&id)
                 .expect("one block still pending")
                 .pending_block_ids,
-            vec![agentd_protocol::program_block_id("# Beta")]
+            vec![construct_protocol::program_block_id("# Beta")]
         );
 
         // Settling the last block empties the pending set → the run clears.
@@ -9197,7 +9197,7 @@ done
             session_id: id.clone(),
             markdown: "# Alpha done\n\n# Beta done\n".into(),
             base_version: None,
-            actor: agentd_protocol::ProgramUpdateActor::Agent,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
             template_id: None,
             note: None,
             shimmer: None,
@@ -9213,7 +9213,7 @@ done
 
     #[tokio::test]
     async fn program_run_system_status_tracks_dispatch_and_output_state() {
-        use agentd_protocol::{
+        use construct_protocol::{
             SessionState, PROGRAM_SHIMMER_STATUS_AGENT_WORKING, PROGRAM_SHIMMER_STATUS_DELIVERED,
             PROGRAM_SHIMMER_STATUS_QUEUED,
         };
@@ -9260,7 +9260,7 @@ done
     // blocks: the agent is gone and can never settle them (spec 0042).
     #[tokio::test]
     async fn program_run_managed_clears_on_terminal_state() {
-        use agentd_protocol::SessionState;
+        use construct_protocol::SessionState;
         let body = "# Alpha\n\n# Beta\n";
         let (mgr, _storage, id) = program_test_mgr(body).await;
         mgr.start_program_run(&id, body, false, None)
@@ -9284,7 +9284,7 @@ done
 
     #[tokio::test]
     async fn native_subagent_event_projects_read_only_child_and_transcript() {
-        use agentd_protocol::{MessageRole, NativeSubagentRef};
+        use construct_protocol::{MessageRole, NativeSubagentRef};
         use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
@@ -9294,7 +9294,7 @@ done
             SessionManager::new(storage, config, tmp.path().join("run"))
                 .await
                 .expect("manager");
-        let owner = synthetic_entry("owner", agentd_protocol::SessionKind::User, 0);
+        let owner = synthetic_entry("owner", construct_protocol::SessionKind::User, 0);
         owner.summary.write().await.harness = "codex".into();
         manager
             .sessions

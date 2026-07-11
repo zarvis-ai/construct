@@ -23,8 +23,8 @@
 //! ([`RateLimiter`]) so an unexpected burst doesn't fire a turn per
 //! event.
 
-use agentd_client::Client;
-use agentd_protocol::{
+use construct_client::Client;
+use construct_protocol::{
     ipc_notif, paths::Paths, EventNotificationPayload, SessionEvent, SessionState,
 };
 use std::collections::VecDeque;
@@ -213,7 +213,7 @@ mod tests {
     fn high_volume_events_drop() {
         for ev in [
             SessionEvent::Message {
-                role: agentd_protocol::MessageRole::User,
+                role: construct_protocol::MessageRole::User,
                 text: "hi".into(),
             },
             SessionEvent::ToolUse {
@@ -232,7 +232,7 @@ mod tests {
                 call_id: "call-1".into(),
                 tool: "shell".into(),
                 args_summary: "echo hi".into(),
-                risk: agentd_protocol::ToolRisk::Risky,
+                risk: construct_protocol::ToolRisk::Risky,
                 allow_auto_review: true,
             },
         ] {

@@ -792,7 +792,7 @@ impl App {
         let selectable = self
             .sessions
             .iter()
-            .filter(|s| s.kind != agentd_protocol::SessionKind::Orchestrator && !s.archived)
+            .filter(|s| s.kind != construct_protocol::SessionKind::Orchestrator && !s.archived)
             .count();
         let subagent_listed = self
             .tutorial
@@ -990,22 +990,22 @@ impl App {
         let Some(params) = n.params.clone() else {
             return;
         };
-        if n.method == agentd_protocol::ipc_notif::STATE {
+        if n.method == construct_protocol::ipc_notif::STATE {
             if let Ok(payload) = serde_json::from_value::<StateNotificationPayload>(params) {
                 let is_new = !self.sessions.iter().any(|s| s.id == payload.session.id);
                 if is_new {
                     self.tutorial_on_session_created(&payload.session);
                 }
             }
-        } else if n.method == agentd_protocol::ipc_notif::PROGRAM_STATE {
+        } else if n.method == construct_protocol::ipc_notif::PROGRAM_STATE {
             if let Ok(payload) =
-                serde_json::from_value::<agentd_protocol::ProgramStateNotificationPayload>(params)
+                serde_json::from_value::<construct_protocol::ProgramStateNotificationPayload>(params)
             {
                 self.tutorial_on_program_state(&payload.program);
             }
-        } else if n.method == agentd_protocol::ipc_notif::DELETED {
+        } else if n.method == construct_protocol::ipc_notif::DELETED {
             if let Ok(payload) =
-                serde_json::from_value::<agentd_protocol::DeletedNotificationPayload>(params)
+                serde_json::from_value::<construct_protocol::DeletedNotificationPayload>(params)
             {
                 self.tutorial_on_session_deleted(&payload.session_id);
             }
@@ -1047,7 +1047,7 @@ impl App {
                 // scoped observers (Done detection, step 8's delete gate).
                 let is_tour_subagent = match t.practice_session_id.as_deref() {
                     Some(practice) => session.parent_session_id.as_deref() == Some(practice),
-                    None => session.kind == agentd_protocol::SessionKind::Subagent,
+                    None => session.kind == construct_protocol::SessionKind::Subagent,
                 };
                 if is_tour_subagent {
                     if t.practice_session_id.is_none() {
@@ -1061,7 +1061,7 @@ impl App {
         }
     }
 
-    fn tutorial_on_program_state(&mut self, program: &agentd_protocol::ProgramDocument) {
+    fn tutorial_on_program_state(&mut self, program: &construct_protocol::ProgramDocument) {
         // Computed before borrowing the tour state mutably: is this program
         // the one the user is actually looking at / working with?
         let displayed = self

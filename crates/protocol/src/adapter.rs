@@ -3,8 +3,8 @@
 //! An adapter binary's `main()` reduces to:
 //!
 //! ```no_run
-//! use agentd_protocol::adapter::{run, AdapterContext, AdapterInboxMsg};
-//! use agentd_protocol::{Capabilities, InitializeResult, MessageRole, SessionEvent, SessionState};
+//! use construct_protocol::adapter::{run, AdapterContext, AdapterInboxMsg};
+//! use construct_protocol::{Capabilities, InitializeResult, MessageRole, SessionEvent, SessionState};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {

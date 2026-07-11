@@ -17,8 +17,8 @@
 
 use std::time::{Duration, Instant};
 
-use agentd_e2e::{Daemon, Tui};
-use agentd_protocol::CreateSessionParams;
+use construct_e2e::{Daemon, Tui};
+use construct_protocol::CreateSessionParams;
 
 /// Lines of scrollback history to build before measuring. Well
 /// past SCROLLBACK_MAX (5000) so the "re-feed the whole history"

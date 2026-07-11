@@ -6,14 +6,14 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Generic shell command adapter for agentd"
+description = "Generic shell command adapter for construct"
 
 [lib]
 name = "construct_adapter_shell"
 path = "src/lib.rs"
 
 [dependencies]
-agentd-protocol = { workspace = true, features = ["pty"] }
+construct-protocol = { workspace = true, features = ["pty"] }
 tokio.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

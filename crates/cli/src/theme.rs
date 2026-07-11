@@ -16,7 +16,7 @@
 //! danger = "red"
 //! ```
 
-use agentd_protocol::paths::Paths;
+use construct_protocol::paths::Paths;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders};

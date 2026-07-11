@@ -27,7 +27,7 @@
 
 use std::time::Duration;
 
-use agentd_e2e::Daemon;
+use construct_e2e::Daemon;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn remote_control_security_and_lifecycle() {

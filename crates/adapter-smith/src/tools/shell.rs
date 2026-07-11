@@ -2,7 +2,7 @@
 //! stdout/stderr/exit. Runs in the session's cwd by default.
 
 use super::{Tool, ToolCtx, ToolOutcome};
-use agentd_protocol::ToolRisk;
+use construct_protocol::ToolRisk;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};

@@ -3,8 +3,8 @@
 
 use crate::remote::RemoteState;
 use crate::session::{BroadcastMsg, SessionManager};
-use agentd_protocol::jsonrpc::{self, MessageKind};
-use agentd_protocol::{
+use construct_protocol::jsonrpc::{self, MessageKind};
+use construct_protocol::{
     ipc_method, ipc_notif, transport, ChatViewerActiveResult, CreateSessionParams, ErrorObject,
     GroupCreateParams, GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, Notification, PingResult, ProgramCursorParams, ProgramEditParams,
@@ -1266,14 +1266,14 @@ async fn dispatch(
         }
     });
     dispatch_entry!(ipc_method::SESSION_MERGE, {
-        let p = params!(req, agentd_protocol::SessionMergeParams);
+        let p = params!(req, construct_protocol::SessionMergeParams);
         match manager.merge(&p.session_id, p.mode).await {
             Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
     });
     dispatch_entry!(ipc_method::SESSION_WIDGET_DELETE, {
-        let p = params!(req, agentd_protocol::SessionWidgetDeleteParams);
+        let p = params!(req, construct_protocol::SessionWidgetDeleteParams);
         match manager.delete_widget(p).await {
             Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
@@ -1342,25 +1342,25 @@ async fn dispatch(
         }
     });
     dispatch_entry!(ipc_method::SESSION_LIST_TASKS, {
-        let p = params!(req, agentd_protocol::ListTasksParams);
+        let p = params!(req, construct_protocol::ListTasksParams);
         match manager.list_tasks(&p.session_id).await {
             Ok(tasks) => Response::ok(
                 req.id.clone(),
-                serde_json::to_value(agentd_protocol::ListTasksResult { tasks })
+                serde_json::to_value(construct_protocol::ListTasksResult { tasks })
                     .unwrap_or(serde_json::Value::Null),
             ),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
     });
     dispatch_entry!(ipc_method::SESSION_EMIT_EVENT, {
-        let p = params!(req, agentd_protocol::SessionEmitEventParams);
+        let p = params!(req, construct_protocol::SessionEmitEventParams);
         match manager.emit_session_event(p).await {
             Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
     });
     dispatch_entry!(ipc_method::LOOP_CREATE, {
-        let p = params!(req, agentd_protocol::LoopCreateParams);
+        let p = params!(req, construct_protocol::LoopCreateParams);
         match manager.loop_create(p).await {
             Ok(l) => Response::ok(
                 req.id.clone(),
@@ -1370,16 +1370,16 @@ async fn dispatch(
         }
     });
     dispatch_entry!(ipc_method::LOOP_LIST, {
-        let p = params!(req, agentd_protocol::LoopListParams);
+        let p = params!(req, construct_protocol::LoopListParams);
         let loops = manager.loop_list(p.session_id.as_deref()).await;
         Response::ok(
             req.id.clone(),
-            serde_json::to_value(agentd_protocol::LoopListResult { loops })
+            serde_json::to_value(construct_protocol::LoopListResult { loops })
                 .unwrap_or(serde_json::Value::Null),
         )
     });
     dispatch_entry!(ipc_method::LOOP_UPDATE, {
-        let p = params!(req, agentd_protocol::LoopUpdateParams);
+        let p = params!(req, construct_protocol::LoopUpdateParams);
         match manager.loop_update(p).await {
             Ok(l) => Response::ok(
                 req.id.clone(),
@@ -1389,7 +1389,7 @@ async fn dispatch(
         }
     });
     dispatch_entry!(ipc_method::LOOP_REMOVE, {
-        let p = params!(req, agentd_protocol::LoopRemoveParams);
+        let p = params!(req, construct_protocol::LoopRemoveParams);
         match manager.loop_remove(&p.loop_id).await {
             Ok(()) => Response::ok(req.id.clone(), serde_json::Value::Null),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
@@ -1535,7 +1535,7 @@ async fn dispatch(
         Response::ok(req.id.clone(), serde_json::Value::Null)
     });
     dispatch_entry!(ipc_method::REMOTE_START, {
-        let params: agentd_protocol::RemoteStartParams = match parse_params(req.params.clone()) {
+        let params: construct_protocol::RemoteStartParams = match parse_params(req.params.clone()) {
             Ok(p) => p,
             Err(e) => return Response::err(req.id.clone(), e),
         };
@@ -1551,7 +1551,7 @@ async fn dispatch(
         }
     });
     dispatch_entry!(ipc_method::DAEMON_RESTART, {
-        let params = parse_params::<agentd_protocol::DaemonRestartParams>(req.params.clone())
+        let params = parse_params::<construct_protocol::DaemonRestartParams>(req.params.clone())
             .unwrap_or_default();
         let action = if params.restart_sessions {
             crate::session::RestartAction::RestartSessions
@@ -1566,7 +1566,7 @@ async fn dispatch(
                     .and_then(|g| g.as_ref().map(|h| h.state.tunnel_pid()))
                     .map(|pid| pid != 0)
                     .unwrap_or(false);
-                let r = agentd_protocol::DaemonRestartResult {
+                let r = construct_protocol::DaemonRestartResult {
                     exe: cmd.exe.display().to_string(),
                     pid: std::process::id(),
                     tunnel_preserved,
@@ -1580,7 +1580,7 @@ async fn dispatch(
         match manager.request_daemon_restart(None, crate::session::RestartAction::Stop) {
             Ok(_) => ok!(
                 req,
-                &agentd_protocol::DaemonShutdownResult {
+                &construct_protocol::DaemonShutdownResult {
                     pid: std::process::id(),
                 }
             ),
@@ -1588,11 +1588,11 @@ async fn dispatch(
         }
     });
     dispatch_entry!(ipc_method::DEV_SET_ASSETS, {
-        let p = params!(req, agentd_protocol::DevSetAssetsParams);
+        let p = params!(req, construct_protocol::DevSetAssetsParams);
         manager.set_dev_assets(p.dir.map(std::path::PathBuf::from));
         ok!(
             req,
-            &agentd_protocol::DevAssetsResult {
+            &construct_protocol::DevAssetsResult {
                 dir: manager.dev_assets().map(|d| d.display().to_string()),
             }
         )
@@ -1608,8 +1608,8 @@ async fn dispatch(
 mod tests {
     use super::*;
 
-    fn test_program_cursor(session_id: &str, client_id: &str) -> agentd_protocol::ProgramCursor {
-        agentd_protocol::ProgramCursor {
+    fn test_program_cursor(session_id: &str, client_id: &str) -> construct_protocol::ProgramCursor {
+        construct_protocol::ProgramCursor {
             session_id: session_id.to_string(),
             client_id: client_id.to_string(),
             label: "TUI".to_string(),
@@ -1627,7 +1627,7 @@ mod tests {
     #[test]
     fn forward_broadcast_skips_program_cursor_for_its_own_publisher() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let payload = agentd_protocol::ProgramCursorNotificationPayload {
+        let payload = construct_protocol::ProgramCursorNotificationPayload {
             cursor: test_program_cursor("s1", "c7"),
         };
         forward_broadcast(
@@ -1648,7 +1648,7 @@ mod tests {
     #[test]
     fn forward_broadcast_still_delivers_program_cursor_to_other_connections() {
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let payload = agentd_protocol::ProgramCursorNotificationPayload {
+        let payload = construct_protocol::ProgramCursorNotificationPayload {
             cursor: test_program_cursor("s1", "c7"),
         };
         forward_broadcast(
@@ -1671,7 +1671,7 @@ mod tests {
         // skip_conn_id: None is what genuine rebases (and disconnect
         // tombstones) use — the cursor's own owner must still receive it.
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let payload = agentd_protocol::ProgramCursorNotificationPayload {
+        let payload = construct_protocol::ProgramCursorNotificationPayload {
             cursor: test_program_cursor("s1", "c7"),
         };
         forward_broadcast(

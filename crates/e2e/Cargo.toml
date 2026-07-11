@@ -1,20 +1,20 @@
 [package]
-name = "agentd-e2e"
+name = "construct-e2e"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "End-to-end test harness for agentd — spawns the real daemon binary against a temp $CONSTRUCT_*_DIR and drives it via the IPC client (and optionally the TUI in a pseudo-terminal)."
+description = "End-to-end test harness for construct — spawns the real daemon binary against a temp $CONSTRUCT_*_DIR and drives it via the IPC client (and optionally the TUI in a pseudo-terminal)."
 publish = false
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-agentd-client = { workspace = true }
-agentd-protocol = { workspace = true }
+construct-client = { workspace = true }
+construct-protocol = { workspace = true }
 anyhow.workspace = true
 tokio.workspace = true
 portable-pty.workspace = true

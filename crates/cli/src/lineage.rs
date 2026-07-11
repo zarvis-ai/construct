@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use agentd_protocol::{ForkMergeMode, SessionKind, SessionState, SessionSummary};
+use construct_protocol::{ForkMergeMode, SessionKind, SessionState, SessionSummary};
 
 /// Levels rendered below the tree's root before a subtree collapses into a
 /// "+N more" marker (spec: "depth/breadth cap").
@@ -2030,7 +2030,7 @@ pub fn segment_label(delta_events: u64, start_ms: i64, end_ms: Option<i64>, now_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentd_protocol::{ForkMerge, ForkedFrom};
+    use construct_protocol::{ForkMerge, ForkedFrom};
     use chrono::{TimeZone, Utc};
 
     fn base(id: &str) -> SessionSummary {
@@ -2059,7 +2059,7 @@ mod tests {
             busy_ms: 0,
             busy_running_since_ms: None,
             message_count: 0,
-            approval_mode: agentd_protocol::ApprovalMode::Manual,
+            approval_mode: construct_protocol::ApprovalMode::Manual,
             kind: SessionKind::User,
             archived: false,
             operator_loop_disabled: false,

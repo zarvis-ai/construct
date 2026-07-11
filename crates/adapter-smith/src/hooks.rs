@@ -4,7 +4,7 @@
 //! the project tree, because they execute local commands with the user's
 //! permissions.
 
-use agentd_protocol::adapter::EventEmitter;
+use construct_protocol::adapter::EventEmitter;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};

@@ -1,5 +1,5 @@
-use agentd_client::Client;
-use agentd_protocol::ipc_method;
+use construct_client::Client;
+use construct_protocol::ipc_method;
 use serde_json::Value;
 use std::time::Instant;
 use tempfile::tempdir;

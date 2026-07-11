@@ -27,7 +27,7 @@ mod storage;
 mod tunnel;
 mod worktree;
 
-use agentd_protocol::paths::Paths;
+use construct_protocol::paths::Paths;
 
 static BUILD_ID: OnceLock<&'static str> = OnceLock::new();
 
@@ -44,13 +44,13 @@ pub(crate) fn build_id() -> &'static str {
 pub use config::DEFAULT_CONFIG_TOML;
 
 /// Install the daemon's tracing subscriber. Defaults to a verbose
-/// daemon-oriented filter (`info,agentd=debug,agentd_protocol=info`) so daemon
+/// daemon-oriented filter (`info,agentd=debug,construct_protocol=info`) so daemon
 /// logs are useful out of the box; `RUST_LOG` overrides it. Idempotent —
 /// safe to call once from whichever binary owns the process.
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new("info,agentd=debug,agentd_protocol=info"))
+        .or_else(|_| EnvFilter::try_new("info,agentd=debug,construct_protocol=info"))
         .unwrap();
     let _ = fmt().with_env_filter(filter).with_target(false).try_init();
 }
@@ -64,7 +64,7 @@ pub fn print_paths() {
     println!("data:    {}", p.data_dir.display());
     println!("runtime: {}", p.runtime_dir.display());
     println!("socket:  {}", p.socket().display());
-    println!("webui:   {}", agentd_protocol::paths::local_webui_url());
+    println!("webui:   {}", construct_protocol::paths::local_webui_url());
 }
 
 /// Run the daemon in the foreground until a shutdown signal, a fatal server
@@ -193,7 +193,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     // credentials. This is intentionally local-only: `/remote-control`
     // remains the opt-in public tunnel path and still layers token +
     // Basic auth on top.
-    let local_webui_port = agentd_protocol::paths::local_webui_port();
+    let local_webui_port = construct_protocol::paths::local_webui_port();
     {
         let mgr = manager.clone();
         tokio::spawn(async move {
@@ -234,7 +234,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
                     // password; nobody is at the TUI to type one.
                     // The password lands in the info log so it's
                     // visible to the operator running the daemon.
-                    let params = agentd_protocol::RemoteStartParams {
+                    let params = construct_protocol::RemoteStartParams {
                         local_only: false,
                         password: None,
                         wait_for_tunnel: true,
@@ -266,7 +266,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
         if crate::remote_supervisor::snapshot_restorable(&snapshot_path) {
             let mgr = manager.clone();
             tokio::spawn(async move {
-                let params = agentd_protocol::RemoteStartParams {
+                let params = construct_protocol::RemoteStartParams {
                     local_only: false,
                     password: None,
                     wait_for_tunnel: true,

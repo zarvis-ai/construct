@@ -1,7 +1,7 @@
 //! IPC client. JSON-RPC over a Unix socket to `agentd`.
 
-use agentd_protocol::jsonrpc::{self, MessageKind};
-use agentd_protocol::{
+use construct_protocol::jsonrpc::{self, MessageKind};
+use construct_protocol::{
     ipc_method, transport, ChatViewerActiveResult, ClientView, CreateSessionParams, DiffResult,
     ErrorObject, GroupCreateParams, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, GroupSummary, HarnessInfo, MoveDirection, Notification, PingResult,
@@ -267,7 +267,7 @@ impl Client {
         &self,
         local_only: bool,
         password: Option<String>,
-    ) -> Result<agentd_protocol::RemoteStartResult> {
+    ) -> Result<construct_protocol::RemoteStartResult> {
         self.remote_start_with_wait(local_only, password, true)
             .await
     }
@@ -276,8 +276,8 @@ impl Client {
         local_only: bool,
         password: Option<String>,
         wait_for_tunnel: bool,
-    ) -> Result<agentd_protocol::RemoteStartResult> {
-        let params = agentd_protocol::RemoteStartParams {
+    ) -> Result<construct_protocol::RemoteStartResult> {
+        let params = construct_protocol::RemoteStartParams {
             local_only,
             password,
             wait_for_tunnel,
@@ -287,7 +287,7 @@ impl Client {
     /// Tear down the remote WS listener + cloudflared tunnel.
     /// Idempotent — `was_running: false` is the natural state when
     /// stop is called without an active listener.
-    pub async fn remote_stop(&self) -> Result<agentd_protocol::RemoteStopResult> {
+    pub async fn remote_stop(&self) -> Result<construct_protocol::RemoteStopResult> {
         self.request(ipc_method::REMOTE_STOP, &serde_json::Value::Null)
             .await
     }
@@ -306,10 +306,10 @@ impl Client {
         &self,
         exe: Option<String>,
         restart_sessions: bool,
-    ) -> Result<agentd_protocol::DaemonRestartResult> {
+    ) -> Result<construct_protocol::DaemonRestartResult> {
         self.request(
             ipc_method::DAEMON_RESTART,
-            &agentd_protocol::DaemonRestartParams {
+            &construct_protocol::DaemonRestartParams {
                 exe,
                 restart_sessions,
             },
@@ -321,10 +321,10 @@ impl Client {
     /// [`Self::daemon_restart`], the IPC connection closes as the
     /// process exits, so callers should treat a `BrokenPipe`-style
     /// error as "shutdown in flight".
-    pub async fn daemon_shutdown(&self) -> Result<agentd_protocol::DaemonShutdownResult> {
+    pub async fn daemon_shutdown(&self) -> Result<construct_protocol::DaemonShutdownResult> {
         self.request(
             ipc_method::DAEMON_SHUTDOWN,
-            &agentd_protocol::DaemonShutdownParams {},
+            &construct_protocol::DaemonShutdownParams {},
         )
         .await
     }
@@ -333,10 +333,10 @@ impl Client {
     pub async fn dev_set_assets(
         &self,
         dir: Option<String>,
-    ) -> Result<agentd_protocol::DevAssetsResult> {
+    ) -> Result<construct_protocol::DevAssetsResult> {
         self.request(
             ipc_method::DEV_SET_ASSETS,
-            &agentd_protocol::DevSetAssetsParams { dir },
+            &construct_protocol::DevSetAssetsParams { dir },
         )
         .await
     }
@@ -454,7 +454,7 @@ impl Client {
                 worktree: false,
                 env: HashMap::new(),
                 args: Vec::new(),
-                kind: agentd_protocol::SessionKind::User,
+                kind: construct_protocol::SessionKind::User,
                 parent_session_id: None,        // sibling, not a subagent
                 group_id: src.group_id.clone(), // same group → rendered alongside the source
                 position_after_session_id: Some(src.id.clone()),
@@ -462,7 +462,7 @@ impl Client {
                 // and merge eligibility all key off `forked_from` being
                 // present, uniformly, whether the fork was the instant
                 // same-harness primary path or the cross-harness picker.
-                forked_from: Some(agentd_protocol::ForkedFrom {
+                forked_from: Some(construct_protocol::ForkedFrom {
                     session_id: src.id.clone(),
                     transcript_seq: transcript_seq.as_ref().map(|t| t.total).unwrap_or(0),
                     at_ms: SystemTime::now()
@@ -595,7 +595,7 @@ impl Client {
     pub async fn pty_replay_tail(&self, id: &str, max_bytes: usize) -> Result<PtyReplayResult> {
         self.request(
             ipc_method::SESSION_PTY_REPLAY,
-            &agentd_protocol::PtyReplayParams {
+            &construct_protocol::PtyReplayParams {
                 session_id: id.to_string(),
                 max_bytes: Some(max_bytes),
                 before_offset: None,
@@ -660,11 +660,11 @@ impl Client {
             .await?;
         Ok(())
     }
-    pub async fn merge(&self, id: &str, mode: agentd_protocol::ForkMergeMode) -> Result<()> {
+    pub async fn merge(&self, id: &str, mode: construct_protocol::ForkMergeMode) -> Result<()> {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_MERGE,
-                &agentd_protocol::SessionMergeParams {
+                &construct_protocol::SessionMergeParams {
                     session_id: id.to_string(),
                     mode,
                 },
@@ -676,7 +676,7 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_WIDGET_DELETE,
-                &agentd_protocol::SessionWidgetDeleteParams {
+                &construct_protocol::SessionWidgetDeleteParams {
                     session_id: session_id.to_string(),
                     panel_id: panel_id.to_string(),
                 },
@@ -761,7 +761,7 @@ impl Client {
     pub async fn set_approval_mode(
         &self,
         id: &str,
-        mode: agentd_protocol::ApprovalMode,
+        mode: construct_protocol::ApprovalMode,
     ) -> Result<()> {
         let _: serde_json::Value = self
             .request(
@@ -774,7 +774,7 @@ impl Client {
             .await?;
         Ok(())
     }
-    pub async fn emit_event(&self, id: &str, event: agentd_protocol::SessionEvent) -> Result<()> {
+    pub async fn emit_event(&self, id: &str, event: construct_protocol::SessionEvent) -> Result<()> {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_EMIT_EVENT,
@@ -806,15 +806,15 @@ impl Client {
     }
     pub async fn loop_create(
         &self,
-        params: agentd_protocol::LoopCreateParams,
-    ) -> Result<agentd_protocol::Loop> {
+        params: construct_protocol::LoopCreateParams,
+    ) -> Result<construct_protocol::Loop> {
         self.request(ipc_method::LOOP_CREATE, &params).await
     }
-    pub async fn loop_list(&self, session_id: Option<&str>) -> Result<Vec<agentd_protocol::Loop>> {
-        let r: agentd_protocol::LoopListResult = self
+    pub async fn loop_list(&self, session_id: Option<&str>) -> Result<Vec<construct_protocol::Loop>> {
+        let r: construct_protocol::LoopListResult = self
             .request(
                 ipc_method::LOOP_LIST,
-                &agentd_protocol::LoopListParams {
+                &construct_protocol::LoopListParams {
                     session_id: session_id.map(|s| s.to_string()),
                 },
             )
@@ -823,15 +823,15 @@ impl Client {
     }
     pub async fn loop_update(
         &self,
-        params: agentd_protocol::LoopUpdateParams,
-    ) -> Result<agentd_protocol::Loop> {
+        params: construct_protocol::LoopUpdateParams,
+    ) -> Result<construct_protocol::Loop> {
         self.request(ipc_method::LOOP_UPDATE, &params).await
     }
     pub async fn loop_remove(&self, loop_id: &str) -> Result<()> {
         let _: serde_json::Value = self
             .request(
                 ipc_method::LOOP_REMOVE,
-                &agentd_protocol::LoopRemoveParams {
+                &construct_protocol::LoopRemoveParams {
                     loop_id: loop_id.to_string(),
                 },
             )
@@ -843,11 +843,11 @@ impl Client {
     /// + recent terminal entries. Empty for sessions whose adapter
     /// doesn't emit `TaskStart` lifecycle events (claude / codex /
     /// shell today).
-    pub async fn list_tasks(&self, id: &str) -> Result<Vec<agentd_protocol::TaskInfo>> {
-        let r: agentd_protocol::ListTasksResult = self
+    pub async fn list_tasks(&self, id: &str) -> Result<Vec<construct_protocol::TaskInfo>> {
+        let r: construct_protocol::ListTasksResult = self
             .request(
                 ipc_method::SESSION_LIST_TASKS,
-                &agentd_protocol::ListTasksParams {
+                &construct_protocol::ListTasksParams {
                     session_id: id.to_string(),
                 },
             )
@@ -868,7 +868,7 @@ impl Client {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_TOOL_ACTION,
-                &agentd_protocol::SessionToolActionParams {
+                &construct_protocol::SessionToolActionParams {
                     session_id: id.to_string(),
                     call_id: call_id.into(),
                     action: action.into(),
@@ -896,12 +896,12 @@ impl Client {
         &self,
         id: &str,
         group_id: Option<String>,
-        position: agentd_protocol::SessionGroupPosition,
+        position: construct_protocol::SessionGroupPosition,
     ) -> Result<()> {
         let _: serde_json::Value = self
             .request(
                 ipc_method::SESSION_SET_GROUP,
-                &agentd_protocol::SessionSetGroupParams {
+                &construct_protocol::SessionSetGroupParams {
                     session_id: id.to_string(),
                     group_id,
                     position,
@@ -915,7 +915,7 @@ impl Client {
         &self,
         id: &str,
         project_id: Option<String>,
-        position: agentd_protocol::SessionGroupPosition,
+        position: construct_protocol::SessionGroupPosition,
     ) -> Result<()> {
         let _: serde_json::Value = self
             .request(
@@ -1180,10 +1180,10 @@ fn harness_forks_natively(harness: &str) -> bool {
 }
 
 fn render_fork_seed(
-    events: &[agentd_protocol::TimestampedEvent],
+    events: &[construct_protocol::TimestampedEvent],
     max_bytes: usize,
 ) -> Option<String> {
-    use agentd_protocol::{MessageRole, SessionEvent};
+    use construct_protocol::{MessageRole, SessionEvent};
     let mut lines: Vec<String> = Vec::new();
     for ev in events {
         match &ev.event {
@@ -1232,7 +1232,7 @@ fn render_fork_seed(
 
 /// Compact portable transcript rendering for a fork-merge result.
 pub fn render_fork_seed_for_merge(
-    events: &[agentd_protocol::TimestampedEvent],
+    events: &[construct_protocol::TimestampedEvent],
     max_bytes: usize,
 ) -> Option<String> {
     render_fork_seed(events, max_bytes)
@@ -1278,7 +1278,7 @@ fn short_id(id: &str) -> String {
 #[cfg(test)]
 mod fork_tests {
     use super::*;
-    use agentd_protocol::{MessageRole, SessionEvent, TimestampedEvent};
+    use construct_protocol::{MessageRole, SessionEvent, TimestampedEvent};
 
     // Build via serde so the test doesn't need a direct `chrono` dep just to
     // stamp `at` (render_fork_seed only reads `.event`).

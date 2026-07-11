@@ -3,8 +3,8 @@
 use crate::hooks::Hooks;
 use crate::provider::ToolCall;
 use crate::tools::{ToolCtx, ToolOutcome, ToolRegistry};
-use agentd_protocol::adapter::EventEmitter;
-use agentd_protocol::SessionEvent;
+use construct_protocol::adapter::EventEmitter;
+use construct_protocol::SessionEvent;
 use serde_json::json;
 
 pub struct PreparedToolCall {
