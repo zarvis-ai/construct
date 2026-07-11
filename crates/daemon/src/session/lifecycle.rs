@@ -128,19 +128,26 @@ impl SessionManager {
         for (k, v) in &params.env {
             env_with_meta.insert(k.clone(), v.clone());
         }
-        // A same-harness Claude fork can continue byte-for-byte using Claude's
-        // native fork operation. The native id is deliberately adapter-private;
-        // only the daemon reads it from the source session directory.
-        if harness == "claude" {
+        // A same-harness fork can continue byte-for-byte using the
+        // harness's native fork operation (claude: `--resume <id>
+        // --fork-session`; codex: `codex fork <id>`; grok: `-r <id>
+        // --fork-session`). The native id is deliberately adapter-private;
+        // only the daemon reads it from the source session directory. The
+        // env var name mirrors the harness so each adapter only sees its
+        // own.
+        let native_fork = match harness {
+            "claude" => Some(("claude_session_id.txt", "CONSTRUCT_CLAUDE_FORK_FROM")),
+            "codex" => Some(("codex_session_id.txt", "CONSTRUCT_CODEX_FORK_FROM")),
+            "grok" => Some(("grok_session_id.txt", "CONSTRUCT_GROK_FORK_FROM")),
+            _ => None,
+        };
+        if let Some((id_file, env_key)) = native_fork {
             if let Some(parent) = params.forked_from.as_ref().map(|f| &f.session_id) {
-                let native_id = self
-                    .storage
-                    .session_dir(parent)
-                    .join("claude_session_id.txt");
+                let native_id = self.storage.session_dir(parent).join(id_file);
                 if let Ok(id) = std::fs::read_to_string(native_id) {
                     let id = id.trim();
                     if !id.is_empty() {
-                        env_with_meta.insert("CONSTRUCT_CLAUDE_FORK_FROM".into(), id.into());
+                        env_with_meta.insert(env_key.into(), id.into());
                     }
                 }
             }

@@ -392,7 +392,11 @@ impl Client {
 
         let mut prompt_parts: Vec<String> = Vec::new();
         let transcript_seq = self.transcript(source_id, 0, None).await.ok();
-        let native_fork = harness == src.harness && harness_forks_natively(harness);
+        let source_is_terminal = src.has_pty && src.mode.as_deref() != Some("headless");
+        // Native continuation only happens on the adapters' interactive
+        // paths, so a headless fork keeps the portable seed.
+        let native_fork =
+            harness == src.harness && harness_forks_natively(harness) && source_is_terminal;
         if opts.seed && !native_fork && harness != "shell" {
             // Full transcript from the start (seq 0) so the original objective
             // — usually stated in the opening message — is carried, not just
@@ -426,7 +430,6 @@ impl Client {
             Some(t) => format!("⑂ {t}"),
             None => format!("⑂ fork of {}", short_id(&src.id)),
         });
-        let source_is_terminal = src.has_pty && src.mode.as_deref() != Some("headless");
         let pty_size = source_is_terminal.then(|| {
             opts.pty_size.unwrap_or(PtySize {
                 cols: 100,
@@ -1169,11 +1172,14 @@ impl Default for ForkOptions {
 /// conversation natively instead of via the portable transcript seed
 /// (spec 0078): the daemon hands the adapter the source's native session
 /// id and the harness forks it byte-for-byte (claude: `--resume <id>
-/// --fork-session`, wired through the daemon's session lifecycle). For
+/// --fork-session`; codex: `codex fork <id>`; grok: `-r <id>
+/// --fork-session` — wired through the daemon's session lifecycle). For
 /// these, `fork_session` skips the rendered seed — the harness already
-/// holds the full context with better fidelity.
+/// holds the full context with better fidelity. Antigravity has no native
+/// fork primitive (only in-place `--conversation` resume, backed by an
+/// indexed store a state-copy would desync), so it keeps the seed.
 fn harness_forks_natively(harness: &str) -> bool {
-    harness == "claude"
+    matches!(harness, "claude" | "codex" | "grok")
 }
 
 fn render_fork_seed(
@@ -1543,18 +1549,23 @@ mod fork_lineage_tests {
     /// closes and captures every `session.create`'s params.
     async fn fork_capture_daemon(
         harness: &'static str,
+        source_has_pty: bool,
     ) -> (
         std::path::PathBuf,
         Arc<StdMutex<Vec<serde_json::Value>>>,
         tokio::task::JoinHandle<()>,
     ) {
+        // A per-process atomic counter, not just nanos: several of these
+        // tests run concurrently within the same test binary (same pid)
+        // and can land in the same microsecond, colliding on path.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .subsec_nanos()
-            % 1_000_000;
+            .subsec_nanos();
         let sock =
-            std::path::PathBuf::from(format!("/tmp/afc{}{}.sock", std::process::id(), nanos));
+            std::path::PathBuf::from(format!("/tmp/afc{}{}{}.sock", std::process::id(), nanos, n));
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).expect("bind mock daemon socket");
         let captured = Arc::new(StdMutex::new(Vec::<serde_json::Value>::new()));
@@ -1583,7 +1594,8 @@ mod fork_lineage_tests {
                                 "harness": harness,
                                 "cwd": "/tmp",
                                 "state": "running",
-                                "created_at": "1970-01-01T00:00:00Z"
+                                "created_at": "1970-01-01T00:00:00Z",
+                                "has_pty": source_has_pty
                             },
                             "events": []
                         }
@@ -1633,7 +1645,7 @@ mod fork_lineage_tests {
     /// cross-harness forks keep the portable seed.
     #[tokio::test]
     async fn same_harness_claude_fork_skips_the_transcript_seed() {
-        let (sock, captured, _server) = fork_capture_daemon("claude").await;
+        let (sock, captured, _server) = fork_capture_daemon("claude", true).await;
         let client = Client::connect(&sock).await.expect("connect");
 
         client
@@ -1679,7 +1691,7 @@ mod fork_lineage_tests {
     /// keep the seed — it is the only context carrier there.
     #[tokio::test]
     async fn same_harness_smith_fork_keeps_the_transcript_seed() {
-        let (sock, captured, _server) = fork_capture_daemon("smith").await;
+        let (sock, captured, _server) = fork_capture_daemon("smith", true).await;
         let client = Client::connect(&sock).await.expect("connect");
         client
             .fork_session("src-1", "smith", ForkOptions::default())
@@ -1693,6 +1705,55 @@ mod fork_lineage_tests {
         assert!(
             prompt.contains("SEED_MARKER"),
             "smith has no native fork; the seed is the only context: {prompt:?}"
+        );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// codex (`codex fork <id>`) and grok (`-r <id> --fork-session`) fork
+    /// natively like claude — same-harness terminal forks skip the seed.
+    /// Antigravity has no native fork primitive, so it keeps the seed.
+    #[tokio::test]
+    async fn codex_and_grok_forks_skip_the_seed_antigravity_keeps_it() {
+        for (harness, expect_seed) in [("codex", false), ("grok", false), ("antigravity", true)] {
+            let (sock, captured, _server) = fork_capture_daemon(harness, true).await;
+            let client = Client::connect(&sock).await.expect("connect");
+            client
+                .fork_session("src-1", harness, ForkOptions::default())
+                .await
+                .expect("same-harness fork");
+            let calls = captured.lock().unwrap().clone();
+            let has_seed = calls[0]
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .map(|p| p.contains("SEED_MARKER"))
+                .unwrap_or(false);
+            assert_eq!(
+                has_seed, expect_seed,
+                "{harness}: seed presence should be {expect_seed}"
+            );
+            let _ = std::fs::remove_file(&sock);
+        }
+    }
+
+    /// Native continuation only happens on the adapters' interactive
+    /// paths — a fork of a HEADLESS source keeps the portable seed even
+    /// for a natively-forking harness.
+    #[tokio::test]
+    async fn headless_same_harness_claude_fork_keeps_the_seed() {
+        let (sock, captured, _server) = fork_capture_daemon("claude", false).await;
+        let client = Client::connect(&sock).await.expect("connect");
+        client
+            .fork_session("src-1", "claude", ForkOptions::default())
+            .await
+            .expect("headless same-harness fork");
+        let calls = captured.lock().unwrap().clone();
+        let prompt = calls[0]
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .unwrap_or_default();
+        assert!(
+            prompt.contains("SEED_MARKER"),
+            "headless forks never native-fork; the seed must stay: {prompt:?}"
         );
         let _ = std::fs::remove_file(&sock);
     }

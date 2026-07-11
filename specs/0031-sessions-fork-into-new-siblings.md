@@ -70,7 +70,16 @@ can and cannot cross the boundary.
   byte ceiling; when hit, the opening (objective) and the most-recent activity
   are preserved and the middle is elided, so the goal is never dropped.
 - Cross-harness forks are fresh agent runs primed with context. Same-harness
-  forks may be native continuations when the adapter supports it.
+  forks may be native continuations when the adapter supports it — currently
+  `claude` (`--resume <id> --fork-session`), `codex` (`codex fork <id>`), and
+  `grok` (`-r <id> --fork-session --session-id <new>`), each via that
+  harness's own documented fork/resume flag, never a guessed workaround.
+  Native continuation only applies to a TERMINAL source (the adapters'
+  interactive paths, where the harness's own resumable session state
+  exists) — forking a headless session always keeps the portable seed,
+  even into one of these harnesses. `antigravity` has no native fork
+  primitive (only in-place `--conversation` resume, which continues rather
+  than branches), so it always keeps the seed too.
 
 ## Non-Goals
 
@@ -83,4 +92,9 @@ state into another's.
 From a stuck `claude` session, fork into `smith` to continue with a different
 model, seeded with the recent conversation; the original `claude` session stays
 exactly as it was. Forking a `shell` session just opens a new shell in the same
-directory and group, with no conversational seed.
+directory and group, with no conversational seed. Forking a terminal `codex`
+session into `codex` again opens directly on the inherited conversation — no
+seed, no prompt file, no "read the initial prompt" turn — via `codex fork
+<id>`; the same holds for `claude` and `grok`. Forking a `codex` session
+into `smith` (or any different harness) keeps the transcript seed, since
+there is no cross-harness native fork.

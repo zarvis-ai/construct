@@ -145,12 +145,15 @@ fn find_session_id_excluding(cwd: &Path, excluded: &HashSet<String>) -> Option<S
         return None;
     }
     let mut best: Option<(std::time::SystemTime, String)> = None;
-    if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+    if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             if let Ok(file_type) = entry.file_type() {
                 if file_type.is_dir() {
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.len() == 36 && !excluded.contains(&name) {
+                    if name.len() == 36
+                        && !excluded.contains(&name)
+                        && !grok_session_is_fork(&sessions_dir.join(&name))
+                    {
                         if let Ok(metadata) = entry.metadata() {
                             if let Ok(modified) = metadata.modified() {
                                 if best.is_none() || modified > best.as_ref().unwrap().0 {
@@ -164,6 +167,25 @@ fn find_session_id_excluding(cwd: &Path, excluded: &HashSet<String>) -> Option<S
         }
     }
     best.map(|(_, name)| name)
+}
+
+/// Whether a grok session dir was created by `--fork-session`
+/// (`summary.json` stamps `session_kind: "fork"` plus the source's
+/// `parent_session_id`). Forks are named up front and bound directly by
+/// their own watcher — newest-dir DISCOVERY must never rebind another
+/// session (typically the fork's parent, sharing this cwd) onto them.
+fn grok_session_is_fork(session_dir: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(session_dir.join("summary.json")) else {
+        return false;
+    };
+    serde_json::from_str::<Value>(&text)
+        .ok()
+        .and_then(|v| {
+            v.get("session_kind")
+                .and_then(|k| k.as_str())
+                .map(|k| k == "fork")
+        })
+        .unwrap_or(false)
 }
 
 fn grok_session_dir(cwd: &Path, session_id: &str) -> Option<PathBuf> {
@@ -476,6 +498,7 @@ fn spawn_interactive_transcript_watcher(
     cwd: PathBuf,
     emit: EventEmitter,
     skip_existing: bool,
+    never_rebind_onto: HashSet<String>,
 ) {
     if grok_home().is_none() {
         emit.log("grok: no GROK_HOME or HOME — cannot watch native transcript");
@@ -557,8 +580,9 @@ fn spawn_interactive_transcript_watcher(
             // Prefer the newest non-child session dir under this cwd. First
             // spawn discovers the id; after /clear a fresher root dir appears
             // and we rebind both transcript streams.
-            let child_ids: HashSet<String> = children.keys().cloned().collect();
-            if let Some(id) = find_session_id_excluding(&cwd, &child_ids) {
+            let mut excluded: HashSet<String> = children.keys().cloned().collect();
+            excluded.extend(never_rebind_onto.iter().cloned());
+            if let Some(id) = find_session_id_excluding(&cwd, &excluded) {
                 if current_id.as_ref() != Some(&id) {
                     if let (Some(new_path), Some(new_updates_path)) = (
                         grok_transcript_path(&cwd, &id),
@@ -597,12 +621,31 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     args.extend(grok_allow_args());
 
     let resuming = std::env::var("CONSTRUCT_RESUME").as_deref() == Ok("1");
-    let grok_session_id = if resuming { read_conv_id() } else { None };
+    let mut grok_session_id = if resuming { read_conv_id() } else { None };
+    let mut fork_parent_id: Option<String> = None;
 
     if let Some(sid) = &grok_session_id {
         args.push("-r".into());
         args.push(sid.clone());
     } else if !resuming {
+        if let Some(parent) = std::env::var("CONSTRUCT_GROK_FORK_FROM")
+            .ok()
+            .filter(|s| !s.is_empty())
+        {
+            // Same-harness fork: resume the parent's native session AS A
+            // NEW one (`--fork-session`), named up front (`--session-id`)
+            // so this session's own id file is correct immediately (the
+            // daemon read the parent's id — spec 0031/0078).
+            let new_id = uuid::Uuid::new_v4().to_string();
+            args.push("-r".into());
+            args.push(parent.clone());
+            args.push("--fork-session".into());
+            args.push("--session-id".into());
+            args.push(new_id.clone());
+            write_conv_id(&new_id);
+            grok_session_id = Some(new_id);
+            fork_parent_id = Some(parent);
+        }
         if let Some(prompt) = params.prompt.as_ref().filter(|s| !s.trim().is_empty()) {
             args.push(prompt.clone());
         }
@@ -635,7 +678,15 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // Continuous discovery: Grok has no originator tag, so we track the
     // newest session dir under this cwd. That covers first spawn *and*
     // mid-session /clear (a fresh dir with a newer mtime).
-    spawn_interactive_transcript_watcher(grok_session_id, cwd, ctx.emit.clone(), resuming);
+    let attached_to_existing = grok_session_id.is_some();
+    let never_rebind_onto: HashSet<String> = fork_parent_id.into_iter().collect();
+    spawn_interactive_transcript_watcher(
+        grok_session_id,
+        cwd,
+        ctx.emit.clone(),
+        attached_to_existing,
+        never_rebind_onto,
+    );
 
     let _ = run_pty(spec, ctx).await;
 }
@@ -826,6 +877,90 @@ where
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn newest_dir_discovery_skips_fork_sessions() {
+        // A fork (`--fork-session`) creates a NEW session dir in the same
+        // cwd, stamped `session_kind: "fork"` in its summary. The
+        // newest-dir discovery another session's watcher runs (typically
+        // the fork's parent) must never rebind onto it — forks are named
+        // up front and bound directly by their own watcher.
+        let home = std::env::temp_dir().join(format!(
+            "agentd-grok-fork-skip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cwd = std::path::Path::new("/tmp/proj");
+        let sessions = home.join("sessions").join(url_encode_path(cwd));
+        let parent = "019e32aa-014a-7ff0-9a3f-7ae773961a37";
+        let fork = "019e32bb-014a-7ff0-9a3f-7ae773961a99";
+        std::fs::create_dir_all(sessions.join(parent)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(sessions.join(fork)).unwrap();
+        std::fs::write(
+            sessions.join(fork).join("summary.json"),
+            format!(
+                "{{\"info\":{{\"id\":\"{fork}\"}},\
+                 \"session_kind\":\"fork\",\
+                 \"parent_session_id\":\"{parent}\"}}"
+            ),
+        )
+        .unwrap();
+
+        std::env::set_var("CONSTRUCT_GROK_HOME", &home);
+        let found = find_session_id_excluding(cwd, &HashSet::new());
+        std::env::remove_var("CONSTRUCT_GROK_HOME");
+        assert_eq!(
+            found.as_deref(),
+            Some(parent),
+            "the newer fork dir must be invisible to discovery"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The other direction of the same race: a FORK's own watcher, in the
+    /// window before grok has created the fork's own session dir, must
+    /// never rebind onto its PARENT's dir just because the parent's is
+    /// the only (and therefore "newest") one present. Passing the parent's
+    /// id in the exclusion set — as `run_interactive` now does whenever
+    /// `CONSTRUCT_GROK_FORK_FROM` is set — closes this regardless of
+    /// timing, rather than relying on the fork's own dir winning a race.
+    #[test]
+    fn newest_dir_discovery_excludes_the_forks_own_parent() {
+        let home = std::env::temp_dir().join(format!(
+            "agentd-grok-fork-parent-exclude-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cwd = std::path::Path::new("/tmp/proj");
+        let sessions = home.join("sessions").join(url_encode_path(cwd));
+        let parent = "019e32aa-014a-7ff0-9a3f-7ae773961a37";
+        // Only the parent's dir exists — simulating the window right after
+        // the fork process is spawned but before grok has created its own
+        // session directory.
+        std::fs::create_dir_all(sessions.join(parent)).unwrap();
+
+        std::env::set_var("CONSTRUCT_GROK_HOME", &home);
+        let mut excluded = HashSet::new();
+        excluded.insert(parent.to_string());
+        let found = find_session_id_excluding(cwd, &excluded);
+        std::env::remove_var("CONSTRUCT_GROK_HOME");
+        assert_eq!(
+            found, None,
+            "with the parent excluded, discovery must find nothing rather \
+             than silently rebinding the fork's persisted id onto its \
+             parent's conversation"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     use super::*;
 
     #[test]
