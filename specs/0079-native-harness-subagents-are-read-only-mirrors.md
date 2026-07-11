@@ -28,8 +28,9 @@ restore an archived mirror; a later native activity event does.
 Harness-native identifiers are canonicalized across transcript filenames and
 lifecycle notifications before they become mirror identities.
 
-For Claude Code, a terminal status in the parent transcript is the native-view
-removal signal. Construct archives the mirror at that point because Claude can
+A terminal native-child status archives the mirror for every harness while
+preserving the terminal outcome. For Claude Code, a terminal status in the
+parent transcript is also the native-view removal signal because Claude can
 retain the child's transcript files after dropping it from the active-agent
 view.
 
@@ -53,6 +54,8 @@ child that is already owned by its parent.
 - Virtual children are excluded from daemon startup auto-resume.
 - Removed native children become archived mirrors rather than stale active
   rows, preserving their transcripts without implying they still exist.
+- Native children are archived when they reach any terminal state, regardless
+  of whether the harness also publishes an explicit removal signal.
 - Clients visibly label native children and must support recursive child
   traversal.
 - Harness transcript formats are discovery inputs, not a lifecycle ownership

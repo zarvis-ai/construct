@@ -88,7 +88,8 @@ Their live state and structured transcript are inspectable like any other
 session, including nested children. These rows are read-only mirrors: use the
 parent CLI's native subagent commands to message, interrupt, resume, or remove
 them. Removing a Claude child archives its mirror while retaining the
-transcript.
+transcript. A native child from any harness is archived automatically when it
+reaches a terminal state, preserving both its transcript and terminal outcome.
 
 ## Interactive and headless sessions
 

@@ -521,6 +521,7 @@ impl SessionManager {
         state: SessionState,
         event: Option<Box<SessionEvent>>,
     ) {
+        let terminal = state.is_terminal();
         let owner_summary = owner.summary().await;
         // Native-child events must originate at the root Construct session.
         // If a projected event is ever accidentally nested, retain the real
@@ -645,6 +646,18 @@ impl SessionManager {
                     | SessionEvent::NativeSubagentRemoved { .. }
             ) {
                 Box::pin(self.handle_event(&entry, *child_event)).await;
+            }
+        }
+
+        if terminal {
+            if let Err(error) = self.archive_native_mirror(&id).await {
+                tracing::warn!(
+                    owner = %owner.id,
+                    native_id,
+                    session = %id,
+                    ?error,
+                    "archive terminal native subagent mirror failed"
+                );
             }
         }
     }

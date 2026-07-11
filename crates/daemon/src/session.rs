@@ -2849,7 +2849,9 @@ impl SessionManager {
         let snapshot = {
             let mut summary = entry.summary.write().await;
             summary.archived = true;
-            summary.state = SessionState::Done;
+            if !summary.state.is_terminal() {
+                summary.state = SessionState::Done;
+            }
             summary.pending_input = false;
             summary.clone()
         };
@@ -9201,6 +9203,10 @@ done
         let child = manager.detail(&projected_id).await.expect("exited child");
         assert_eq!(child.summary.state, SessionState::Done);
         assert!(
+            child.summary.archived,
+            "a terminal native child is archived immediately"
+        );
+        assert!(
             child.summary.busy_running_since_ms.is_none(),
             "exiting banks the open compute-time span"
         );
@@ -9262,6 +9268,22 @@ done
                 .summary
                 .archived
         );
+
+        manager
+            .handle_event(
+                &owner,
+                SessionEvent::NativeSubagent {
+                    id: "native-child".into(),
+                    parent_id: None,
+                    title: None,
+                    state: SessionState::Errored,
+                    event: None,
+                },
+            )
+            .await;
+        let errored = manager.detail(&projected_id).await.expect("errored mirror");
+        assert!(errored.summary.archived);
+        assert_eq!(errored.summary.state, SessionState::Errored);
 
         manager
             .archive(&projected_id)
