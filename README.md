@@ -11,9 +11,8 @@ More screenshots and demos: [gallery](gallery.md).
 
 ## Why construct?
 
-- **A terminal multiplexor for coding agents** — like tmux, but for agent
-  sessions: run Claude Code, Codex, Antigravity, Grok, smith, and shells side by
-  side in one terminal. No separate app to install — just a CLI.
+- **tmux for agent fleets** — multiple coding harnesses in one terminal session.
+  CLI-only; no desktop app to install.
 
   <img src="https://raw.githubusercontent.com/construct-worlds/construct/f8fae6e5227ccd0b2140c35ce6e2ad16349da848/demos/new-session.gif" alt="construct new session demo" width="50%">
 - **A delightful way to manage multiple Claude Code and Codex sessions** —
