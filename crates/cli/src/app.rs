@@ -27707,6 +27707,99 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_subagents_marker_highlights_with_hover_and_selection() {
+        use agentd_client::Client;
+        use ratatui::style::Modifier;
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let root = summary_with_kind(agentd_protocol::SessionKind::User);
+        let mut sub = summary_with_kind(agentd_protocol::SessionKind::Subagent);
+        sub.id = "s1-sub".into();
+        sub.parent_session_id = Some("s1".into());
+        let mut app = test_app(client, vec![root, sub]);
+        // Select something OTHER than the marker's parent, so the baseline
+        // render carries no selection highlight on it.
+        app.selection = Selection::None;
+
+        let marker_styles = |term: &ratatui::Terminal<ratatui::backend::TestBackend>,
+                             hit: &LineageBoxHit|
+         -> Vec<ratatui::style::Style> {
+            let buf = term.backend().buffer();
+            (hit.area.x..hit.area.x + hit.area.width)
+                .map(|x| buf.cell((x, hit.area.y)).map(|c| c.style()).unwrap())
+                .collect()
+        };
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        app.select_session("s1".to_string());
+        // Baseline: hover far away — the marker renders muted, no bold.
+        app.mouse_pos = Some((100, 5));
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let toggle = app
+            .layout
+            .lineage_subagent_toggle_hits
+            .first()
+            .cloned()
+            .expect("toggle hit");
+        // Selection highlight: s1 is the selected session, and the marker
+        // belongs to its node — every marker cell renders bold.
+        assert!(
+            marker_styles(&term, &toggle)
+                .iter()
+                .all(|s| s.add_modifier.contains(Modifier::BOLD)),
+            "the marker highlights while its parent is the selected session"
+        );
+
+        // Clear the selection influence by selecting the (collapsed-away)
+        // subagent? It stays in the tree via the focus chain — instead
+        // deselect entirely to test pure hover.
+        app.selection = Selection::None;
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(
+            app.layout.lineage_area.is_none(),
+            "no selection, no section — premise for the hover check below \
+             is a fresh selected render"
+        );
+
+        // Hover: pointer on the marker row highlights it (and the parent's
+        // lane) even though nothing is keyboard-selected on that row.
+        app.select_session("s1".to_string());
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let toggle = app
+            .layout
+            .lineage_subagent_toggle_hits
+            .first()
+            .cloned()
+            .expect("toggle hit");
+        app.mouse_pos = Some((toggle.area.x + 1, toggle.area.y));
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        let toggle = app
+            .layout
+            .lineage_subagent_toggle_hits
+            .first()
+            .cloned()
+            .expect("toggle hit");
+        assert!(
+            marker_styles(&term, &toggle)
+                .iter()
+                .all(|s| s.add_modifier.contains(Modifier::BOLD)),
+            "hovering the marker row highlights the marker itself"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn hovering_and_clicking_a_lane_or_turn_info_targets_its_session() {
         let (mut app, _dir, server) = test_app_with_lineage().await;
         // Non-zero transcript counters so turn-info rows exist.

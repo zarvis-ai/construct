@@ -1030,7 +1030,15 @@ fn put_subagent_marker_box(c: &mut Canvas, y: usize, lane: &mut Lane) -> usize {
     let Some((count, running, expanded)) = lane.subagent_marker else {
         return y;
     };
-    c.put(y, lane.lane_col, "├─ ", &LineageSpan::Rail);
+    // The connector is part of the parent's lane — it lights up with it.
+    c.put(
+        y,
+        lane.lane_col,
+        "├─ ",
+        &LineageSpan::Border {
+            session_id: lane.node.session_id.clone(),
+        },
+    );
     c.put(
         y,
         lane.lane_col + 3,

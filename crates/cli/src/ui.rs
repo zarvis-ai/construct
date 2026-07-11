@@ -2181,6 +2181,10 @@ fn render_lineage_section(
         app.layout
             .lineage_box_hits
             .iter()
+            // The subagent-group toggle hover highlights its parent's lane
+            // (the group hangs off that node), though clicking it toggles
+            // rather than jumps.
+            .chain(app.layout.lineage_subagent_toggle_hits.iter())
             .find(|hit| hit.contains(mx, my))
             .map(|hit| hit.session_id.clone())
     });
@@ -9683,9 +9687,17 @@ fn render_lineage_row(
                     .add_modifier(Modifier::ITALIC),
                 // The subagent-group toggle reads as an affordance, not
                 // content: muted like the +N more marker, un-italic so its
-                // ▸/▾ disclosure matches the list's collapse rows.
-                crate::lineage::LineageSpan::SubagentsToggle { .. } => {
-                    Style::default().fg(theme.muted)
+                // ▸/▾ disclosure matches the list's collapse rows. It
+                // belongs to its parent's node, so it lights up with it —
+                // on hovering the marker itself included.
+                crate::lineage::LineageSpan::SubagentsToggle { session_id, .. } => {
+                    if selected_session == Some(session_id.as_str())
+                        || hovered_session == Some(session_id.as_str())
+                    {
+                        border_highlight
+                    } else {
+                        Style::default().fg(theme.muted)
+                    }
                 }
                 // Mirrors the session list: only the status glyph carries
                 // the live-state color; the name itself stays the default
