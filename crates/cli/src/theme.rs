@@ -36,6 +36,11 @@ pub struct Theme {
     pub border_focused: Color,
     pub accent: Color,
     pub accent_alt: Color,
+    /// The Program pane's frame color. Fixed to the Matrix palette's cyan
+    /// (dark- or light-background variant) in every theme, so the Program
+    /// frame reads as the same distinct accent no matter which theme is
+    /// active — unlike `accent_alt`, which follows the active theme.
+    pub program_border: Color,
     pub highlight_fg: Color,
     pub highlight_bg: Color,
     pub inactive_highlight_bg: Color,
@@ -72,6 +77,7 @@ impl Default for Theme {
             border_focused: Color::Rgb(75, 255, 130),
             accent: Color::Rgb(57, 255, 136),
             accent_alt: Color::Rgb(92, 225, 255),
+            program_border: Color::Rgb(92, 225, 255),
             highlight_fg: Color::Rgb(6, 22, 12),
             highlight_bg: Color::Rgb(78, 255, 130),
             inactive_highlight_bg: Color::Rgb(28, 78, 42),
@@ -309,6 +315,7 @@ impl Theme {
             border_focused: Color::Rgb(20, 140, 78),
             accent: Color::Rgb(16, 138, 74),
             accent_alt: Color::Rgb(22, 110, 150),
+            program_border: Color::Rgb(22, 110, 150),
             highlight_fg: Color::Rgb(248, 255, 250),
             highlight_bg: Color::Rgb(32, 158, 92),
             inactive_highlight_bg: Color::Rgb(206, 232, 214),
@@ -347,6 +354,7 @@ impl Theme {
             border_focused: Color::Rgb(96, 165, 250),
             accent: Color::Rgb(96, 165, 250),
             accent_alt: Color::Rgb(192, 132, 252),
+            program_border: Color::Rgb(92, 225, 255),
             highlight_fg: Color::Rgb(17, 24, 39),
             highlight_bg: Color::Rgb(147, 197, 253),
             inactive_highlight_bg: Color::Rgb(55, 65, 81),
@@ -384,6 +392,7 @@ impl Theme {
             border_focused: Color::Rgb(37, 99, 235),
             accent: Color::Rgb(37, 99, 235),
             accent_alt: Color::Rgb(124, 58, 237),
+            program_border: Color::Rgb(22, 110, 150),
             highlight_fg: Color::Rgb(255, 255, 255),
             highlight_bg: Color::Rgb(37, 99, 235),
             inactive_highlight_bg: Color::Rgb(229, 231, 235),
@@ -421,6 +430,7 @@ impl Theme {
             border_focused: Color::Rgb(121, 184, 255),
             accent: Color::Rgb(121, 184, 255),
             accent_alt: Color::Rgb(255, 176, 84),
+            program_border: Color::Rgb(92, 225, 255),
             highlight_fg: Color::Rgb(12, 18, 28),
             highlight_bg: Color::Rgb(121, 184, 255),
             inactive_highlight_bg: Color::Rgb(43, 52, 66),
@@ -458,6 +468,7 @@ impl Theme {
             border_focused: Color::Rgb(34, 115, 195),
             accent: Color::Rgb(34, 115, 195),
             accent_alt: Color::Rgb(174, 96, 28),
+            program_border: Color::Rgb(22, 110, 150),
             highlight_fg: Color::Rgb(255, 255, 255),
             highlight_bg: Color::Rgb(34, 115, 195),
             inactive_highlight_bg: Color::Rgb(226, 232, 240),
@@ -738,6 +749,11 @@ fn parse_theme_onto(base: Theme, text: &str) -> Result<Theme, String> {
     )?;
     apply(&mut theme.accent, colors.accent, "accent")?;
     apply(&mut theme.accent_alt, colors.accent_alt, "accent_alt")?;
+    apply(
+        &mut theme.program_border,
+        colors.program_border,
+        "program_border",
+    )?;
     apply(&mut theme.highlight_fg, colors.highlight_fg, "highlight_fg")?;
     apply(&mut theme.highlight_bg, colors.highlight_bg, "highlight_bg")?;
     apply(
@@ -865,6 +881,7 @@ struct RawColors {
     border_focused: Option<String>,
     accent: Option<String>,
     accent_alt: Option<String>,
+    program_border: Option<String>,
     highlight_fg: Option<String>,
     highlight_bg: Option<String>,
     inactive_highlight_bg: Option<String>,
@@ -897,6 +914,25 @@ mod tests {
     #[test]
     fn parses_hex_color() {
         assert_eq!(parse_color("#39ff88"), Ok(Color::Rgb(57, 255, 136)));
+    }
+
+    /// The Program pane's frame must read as the same accent no matter which
+    /// named theme is active (spec 0083) — unlike `accent_alt`, which is
+    /// themed and differs across palettes (cyan/purple/orange here).
+    #[test]
+    fn program_border_is_fixed_to_matrix_accent_across_themes() {
+        let dark_themes = [Theme::dark(), Theme::basic_dark(), Theme::dark_ui()];
+        for theme in &dark_themes {
+            assert_eq!(theme.program_border, Theme::dark().accent_alt);
+        }
+        let light_themes = [Theme::light(), Theme::basic_light(), Theme::light_ui()];
+        for theme in &light_themes {
+            assert_eq!(theme.program_border, Theme::light().accent_alt);
+        }
+        // Sanity: these themes really do disagree on `accent_alt`, so this
+        // test would fail if `program_border` silently aliased it again.
+        assert_ne!(Theme::basic_dark().accent_alt, Theme::dark().accent_alt);
+        assert_ne!(Theme::dark_ui().accent_alt, Theme::dark().accent_alt);
     }
 
     #[test]

@@ -10653,7 +10653,7 @@ fn render_program_popup_at(
     // session-view close color. Focus dimming + hover still compose via
     // `session_menu_icon_style` (focused → border hue, unfocused → dimmed, hover
     // wins).
-    let menu_icon_color = border_style.fg.unwrap_or(app.theme.accent_alt);
+    let menu_icon_color = border_style.fg.unwrap_or(app.theme.program_border);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
@@ -11751,11 +11751,11 @@ fn render_program_scroll_indicator(
 fn program_border_style(theme: &Theme, active: bool) -> Style {
     if active {
         Style::default()
-            .fg(theme.accent_alt)
+            .fg(theme.program_border)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
-            .fg(theme.accent_alt)
+            .fg(theme.program_border)
             .add_modifier(Modifier::DIM)
     }
 }
@@ -12025,10 +12025,10 @@ fn program_toggle_style(app: &App, popup: &crate::app::ProgramPopup, active: boo
     let style = if popup.closing {
         Style::default().fg(app.theme.muted)
     } else if active {
-        Style::default().fg(app.theme.accent_alt)
+        Style::default().fg(app.theme.program_border)
     } else {
         Style::default()
-            .fg(app.theme.accent_alt)
+            .fg(app.theme.program_border)
             .add_modifier(Modifier::DIM)
     };
     style.add_modifier(Modifier::BOLD)
@@ -15979,7 +15979,7 @@ mod tests {
             pane_border_style(&theme, true).fg,
             Some(theme.border_focused)
         );
-        assert_eq!(active_program.fg, Some(theme.accent_alt));
+        assert_eq!(active_program.fg, Some(theme.program_border));
         assert_eq!(inactive_program.fg, active_program.fg);
         assert_ne!(inactive_program.fg, Some(theme.border));
         assert!(active_program.add_modifier.contains(Modifier::BOLD));
@@ -16295,7 +16295,7 @@ mod tests {
         // icon can't drift from the border color it's meant to match.
         let focused_border = program_border_style(&theme, true);
         let unfocused_border = program_border_style(&theme, false);
-        let base = focused_border.fg.unwrap_or(theme.accent_alt);
+        let base = focused_border.fg.unwrap_or(theme.program_border);
 
         // The base IS the program border color, and it's distinct from the
         // session-view default (matrix_close) — otherwise this would be a no-op.
@@ -17756,8 +17756,8 @@ mod tests {
         let theme = Theme::default();
         let focused = session_title_glyph_style(&theme, true, true);
         let unfocused = session_title_glyph_style(&theme, true, false);
-        assert_eq!(focused.fg, Some(theme.accent_alt));
-        assert_eq!(unfocused.fg, Some(theme.accent_alt));
+        assert_eq!(focused.fg, Some(theme.program_border));
+        assert_eq!(unfocused.fg, Some(theme.program_border));
         assert!(!focused.add_modifier.contains(Modifier::DIM));
         assert!(unfocused.add_modifier.contains(Modifier::DIM));
     }

@@ -41,7 +41,8 @@ change presentation without affecting session state.
 Future client UI colors should route through the active theme palette instead
 of hardcoding Matrix colors. New embedded terminal surfaces should use the same
 theme registry as the rest of their client so switching themes does not leave a
-mixed palette behind.
+mixed palette behind. The Program pane's frame is a deliberate, narrow
+exception to this rule — see [[0083-program-border-fixed-across-themes]].
 
 Matrix-specific visual mechanics, such as the operator rain viewport, may keep
 their behavior across themes, but their colors must adapt to the active palette.

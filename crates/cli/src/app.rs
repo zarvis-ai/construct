@@ -12395,7 +12395,7 @@ mod tests {
         let buffer = term.backend().buffer().clone();
 
         let base = app.layout.program_base_area.expect("program base area");
-        let accent = app.theme.accent_alt;
+        let accent = app.theme.program_border;
         let corner = buffer
             .cell((base.x, base.y))
             .expect("program corner cell")
@@ -15226,9 +15226,9 @@ mod tests {
     }
 
     /// The widget indicator's leading "─" stitches the square into the title
-    /// bar's top border, so it must carry the *program* border color (accent_alt),
-    /// not the session view's green `pane_border_style`. Regression: it painted
-    /// a green dash on the program's accent border.
+    /// bar's top border, so it must carry the *program* border color
+    /// (`program_border`), not the session view's green `pane_border_style`.
+    /// Regression: it painted a green dash on the program's accent border.
     #[tokio::test]
     async fn program_widget_icon_dash_matches_program_border_color() {
         let (mut app, _dir, server) = empty_app().await;
@@ -15268,7 +15268,7 @@ mod tests {
         );
 
         let modal = app.layout.modal_area.expect("program modal area");
-        let accent = app.theme.accent_alt;
+        let accent = app.theme.program_border;
         let buf = term.backend().buffer();
         let y = modal.y;
         // Every "─" on the program's top border — including the indicator's
@@ -15639,8 +15639,9 @@ mod tests {
 
     /// The program session-actions button reuses the session chat view's
     /// geometry — the same `view_close_button_range` slot — but as of #556 it
-    /// paints in the program border color (`accent_alt`) so the ☰ reads as part
-    /// of the program frame, not in the shared session-view `matrix_close` hue.
+    /// paints in the program border color (`program_border`) so the ☰ reads as
+    /// part of the program frame, not in the shared session-view `matrix_close`
+    /// hue.
     #[tokio::test]
     async fn program_title_actions_reuse_session_geometry_in_program_border_color() {
         let (mut app, _dir, server) = empty_app().await;
@@ -15652,8 +15653,8 @@ mod tests {
         app.program_popup.as_mut().unwrap().revealed_at =
             Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
         // Program border color (#556): `program_border_style` paints the frame in
-        // `accent_alt`, and the render path passes that hue through to the ☰.
-        let program_border_color = app.theme.accent_alt;
+        // `program_border`, and the render path passes that hue through to the ☰.
+        let program_border_color = app.theme.program_border;
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut term = ratatui::Terminal::new(backend).expect("terminal");
@@ -17748,7 +17749,7 @@ mod tests {
         );
         assert_eq!(
             glyph.style().fg,
-            Some(app.theme.accent_alt),
+            Some(app.theme.program_border),
             "the status spinner should retain the Program border color"
         );
         server.abort();
