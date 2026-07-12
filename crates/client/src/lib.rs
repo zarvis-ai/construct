@@ -491,6 +491,7 @@ impl Client {
                     // message-only counterpart to `transcript_seq`, so
                     // lineage windows can count actual messages.
                     parent_message_count: src.message_count,
+                    reset_native_id: opts.reset_native_id.clone(),
                 }),
             })
             .await?;
@@ -1161,6 +1162,12 @@ pub struct ForkOptions {
     /// Initial PTY size for forks of terminal sessions. When omitted, the
     /// client uses a standard terminal default.
     pub pty_size: Option<PtySize>,
+    /// Fork from an archived reset segment (spec 0085) instead of the
+    /// source session's current native conversation: the specific
+    /// harness-native id (`ContextReset::prior_native_id`) to resume from.
+    /// `None` for an ordinary fork, which resumes whatever native id the
+    /// source is currently on.
+    pub reset_native_id: Option<String>,
 }
 
 impl Default for ForkOptions {
@@ -1171,6 +1178,7 @@ impl Default for ForkOptions {
             seed: true,
             max_seed_bytes: 0,
             pty_size: None,
+            reset_native_id: None,
         }
     }
 }

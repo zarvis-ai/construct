@@ -283,10 +283,10 @@ fn spawn_interactive_transcript_watcher(
                 };
                 if is_new && (selected.is_none() || is_newer) {
                     let first_select = selected.is_none();
-                    let should_write = std::fs::read_to_string(&sid_file)
+                    let existing_sid = std::fs::read_to_string(&sid_file)
                         .ok()
-                        .map(|s| s.trim() != uuid)
-                        .unwrap_or(true);
+                        .map(|s| s.trim().to_string());
+                    let should_write = existing_sid.as_deref() != Some(uuid.as_str());
                     if should_write {
                         if let Err(e) = std::fs::write(&sid_file, &uuid) {
                             emit.log(format!(
@@ -313,6 +313,12 @@ fn spawn_interactive_transcript_watcher(
                             "codex: native session id rebinding to {uuid} (from {})",
                             path.display()
                         ));
+                        if let Some(prior) = existing_sid.filter(|s| !s.is_empty()) {
+                            emit.emit(SessionEvent::NativeIdChanged {
+                                prior_native_id: prior,
+                                new_native_id: uuid.clone(),
+                            });
+                        }
                     }
                     selected = Some((name.clone(), path.clone()));
                     selected_mtime = mtime;

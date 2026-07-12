@@ -204,11 +204,31 @@ impl App {
         };
     }
 
+    /// The highlighted row's `ResetSegment` (spec 0085), if it's a reset
+    /// node rather than an ordinary session. Re-resolves through the tree
+    /// because `lineage_selected_session_id` only yields a session-id
+    /// string — a reset segment's is synthetic, and telling it apart from a
+    /// genuinely deleted session requires the actual node, not just "not in
+    /// `self.sessions`".
+    pub(super) fn lineage_reset_segment_at(
+        &self,
+        session_id: &str,
+        target_id: &str,
+    ) -> Option<crate::lineage::ResetSegment> {
+        let tree = crate::lineage::build_tree_with_expansions(
+            session_id,
+            &self.sessions,
+            Some(&self.lineage_subagents_expanded),
+        )?;
+        crate::lineage::find_node(&tree, target_id)?.reset.clone()
+    }
+
     /// Enter: jump into the highlighted session and hand keyboard focus back
     /// (leaving the section to go work in that session means it stops owning
     /// the keyboard; the section itself stays visible, tracking the new
-    /// selection).
-    fn confirm_lineage_selection(&mut self) {
+    /// selection) — or, for a reset segment (spec 0085), open its read-only
+    /// popup instead, since it has no session of its own to select.
+    async fn confirm_lineage_selection(&mut self) {
         let Some(session_id) = self.lineage_section_session() else {
             self.lineage_focused = false;
             return;
@@ -216,6 +236,10 @@ impl App {
         let Some(target_id) = self.lineage_selected_session_id(&session_id) else {
             return;
         };
+        if let Some(reset) = self.lineage_reset_segment_at(&session_id, &target_id) {
+            self.open_reset_segment_popup(&reset).await;
+            return;
+        }
         // `lineage_focused` deliberately stays set: pane focus moves to the
         // view (making it dormant), and returning to the sidebar (`C-x Tab`,
         // `C-x o`, `C-1`) lands back in the section you left.
@@ -307,7 +331,7 @@ impl App {
                 true
             }
             KeyCode::Enter => {
-                self.confirm_lineage_selection();
+                self.confirm_lineage_selection().await;
                 true
             }
             KeyCode::Char('m') => {
@@ -375,6 +399,7 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
         }
     }
 
@@ -406,6 +431,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         s
     }

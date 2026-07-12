@@ -3533,6 +3533,46 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Record a harness-native context reset (`/clear` and equivalents,
+    /// spec 0079) detected by an adapter. Snapshots this session's own
+    /// current `event_count`/`busy_ms`/`message_count` as the reset's
+    /// transcript-position marker — same "snapshot now, carve into
+    /// segments later" trick `merge()` uses for `ForkMerge` — and appends
+    /// it to `resets` so the pre-reset conversation stays addressable
+    /// (spec 0085). Not a transcript row: like `persist_model`, this is
+    /// durable per-session metadata, not something written to the
+    /// transcript.
+    async fn persist_context_reset(
+        &self,
+        entry: &Arc<SessionEntry>,
+        prior_native_id: String,
+        new_native_id: String,
+    ) -> Result<()> {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let snapshot = {
+            let mut s = entry.summary.write().await;
+            let busy_ms = s.busy_ms_at(now_ms);
+            let transcript_seq = s.event_count;
+            let message_count = s.message_count;
+            s.resets.push(construct_protocol::ContextReset {
+                at_ms: now_ms,
+                transcript_seq,
+                busy_ms,
+                message_count,
+                prior_native_id,
+                new_native_id,
+            });
+            s.clone()
+        };
+        self.storage.save_summary(&snapshot)?;
+        let _ = self
+            .broadcast
+            .send(BroadcastMsg::State(StateNotificationPayload {
+                session: snapshot,
+            }));
+        Ok(())
+    }
+
     pub async fn set_approval_mode(
         &self,
         id: &str,
@@ -3964,6 +4004,7 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
         }
     }
 
@@ -4436,6 +4477,7 @@ mod tests {
                 needs_attention: false,
                 forked_from: None,
                 merge: None,
+                resets: Vec::new(),
             }),
             transcript_count: AtomicU64::new(0),
             adapter: tokio::sync::Mutex::new(None),
@@ -4487,6 +4529,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         entry
     }
@@ -4868,6 +4911,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         fork.summary.write().await.event_count = 2;
         mgr.sessions.write().await.insert("fork".into(), fork);
@@ -4935,6 +4979,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         mgr.sessions
             .write()
@@ -5562,6 +5607,77 @@ mod tests {
         );
     }
 
+    /// spec 0085: a native-id-change event appends a `ContextReset` snapshot
+    /// (not a transcript row, like `ModelChanged` above), and a second reset
+    /// appends a SECOND entry rather than overwriting the first — the
+    /// session's whole reset history survives, not just the latest clear.
+    #[tokio::test]
+    async fn native_id_changed_appends_context_reset_snapshots() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        let id = "snativeidchange";
+        let entry = synthetic_entry(id, construct_protocol::SessionKind::User, 0);
+        {
+            let mut s = entry.summary.write().await;
+            s.event_count = 10;
+            s.message_count = 5;
+        }
+        mgr.sessions.write().await.insert(id.into(), entry.clone());
+
+        mgr.handle_event(
+            &entry,
+            SessionEvent::NativeIdChanged {
+                prior_native_id: "native-a".into(),
+                new_native_id: "native-b".into(),
+            },
+        )
+        .await;
+        {
+            let mut s = entry.summary.write().await;
+            s.event_count = 25;
+            s.message_count = 12;
+        }
+        mgr.handle_event(
+            &entry,
+            SessionEvent::NativeIdChanged {
+                prior_native_id: "native-b".into(),
+                new_native_id: "native-c".into(),
+            },
+        )
+        .await;
+
+        let summary = storage.load_summary(id).expect("summary");
+        assert_eq!(summary.resets.len(), 2, "both resets must be retained");
+        assert_eq!(summary.resets[0].prior_native_id, "native-a");
+        assert_eq!(summary.resets[0].new_native_id, "native-b");
+        assert_eq!(summary.resets[0].transcript_seq, 10);
+        assert_eq!(summary.resets[0].message_count, 5);
+        assert_eq!(summary.resets[1].prior_native_id, "native-b");
+        assert_eq!(summary.resets[1].new_native_id, "native-c");
+        assert_eq!(summary.resets[1].transcript_seq, 25);
+        assert_eq!(summary.resets[1].message_count, 12);
+
+        let transcript = storage
+            .read_transcript(id, 0, None)
+            .expect("read transcript");
+        assert!(
+            !transcript
+                .events
+                .iter()
+                .any(|e| matches!(e.event, SessionEvent::NativeIdChanged { .. })),
+            "NativeIdChanged must not be written to the transcript"
+        );
+    }
+
     /// Regression for the post-#69 "all sessions go to `done` after
     /// graceful daemon restart" bug: when `shutdown_adapters` is in
     /// flight, any `SessionEvent::Done` or `AdapterMessage::Closed`
@@ -5619,6 +5735,7 @@ mod tests {
             kind: construct_protocol::SessionKind::User,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
             archived: false,
             operator_loop_disabled: false,
             needs_attention: false,
@@ -5762,6 +5879,7 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
         };
         let entry = Arc::new(SessionEntry {
             id: id.clone(),

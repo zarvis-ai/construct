@@ -560,6 +560,7 @@ fn word_for_event(event: &SessionEvent) -> Option<(&'static str, FlashTone, u8)>
         SessionEvent::AwaitingInput { .. } => Some(("waiting", FlashTone::Warn, 35)),
         SessionEvent::AgentStatus(status) if status.active => word_for_status(&status.status),
         SessionEvent::Reset => Some(("reset", FlashTone::Warn, 50)),
+        SessionEvent::NativeIdChanged { .. } => Some(("cleared", FlashTone::Warn, 50)),
         // Mirrors the old `tui` ToolUse rain word (see `word_for_tool`).
         SessionEvent::ClientCommand { .. } => Some(("command", FlashTone::Work, 30)),
         SessionEvent::ContextCompacted { .. } => Some(("compact", FlashTone::Work, 50)),

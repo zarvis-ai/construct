@@ -838,6 +838,7 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
         }
     }
 

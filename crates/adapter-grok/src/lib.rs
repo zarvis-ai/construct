@@ -588,12 +588,16 @@ fn spawn_interactive_transcript_watcher(
                         grok_transcript_path(&cwd, &id),
                         grok_updates_path(&cwd, &id),
                     ) {
-                        if current_id.is_some() {
+                        if let Some(prior) = current_id.as_ref() {
                             emit.log(format!(
                                 "grok: native session id changed {:?} -> {id}; \
                                  rebinding transcript watcher",
                                 current_id
                             ));
+                            emit.emit(SessionEvent::NativeIdChanged {
+                                prior_native_id: prior.clone(),
+                                new_native_id: id.clone(),
+                            });
                         }
                         write_conv_id(&id);
                         current_id = Some(id);

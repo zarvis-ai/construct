@@ -700,6 +700,7 @@ fn chat_scroll_kind(ev: &SessionEvent) -> ChatScrollKind {
         | SessionEvent::ApprovalModeChanged { .. }
         | SessionEvent::OperatorLoopChanged { .. }
         | SessionEvent::ModelChanged { .. }
+        | SessionEvent::NativeIdChanged { .. }
         | SessionEvent::NativeSubagentSnapshot { .. }
         | SessionEvent::NativeSubagentRemoved { .. }
         | SessionEvent::NativeSubagent { .. }
@@ -1453,6 +1454,9 @@ pub struct App {
     /// /tasks popup state: `None` = closed, `Some(...)` = open with
     /// a snapshot of the session's task registry.
     pub tasks_popup: Option<TasksPopup>,
+    /// Reset-segment popup state (spec 0085): `None` = closed, `Some(...)` =
+    /// open with a snapshot of one archived reset segment's transcript.
+    pub reset_segment_popup: Option<ResetSegmentPopup>,
     /// Whether the sidebar's lineage section (spec 0081) currently owns
     /// keyboard input. Entered via bare `Tab` (with the list pane focused)
     /// or a click inside the section's body.
@@ -2056,6 +2060,21 @@ fn coalesce_pty_input(
 pub struct TasksPopup {
     pub session_id: String,
     pub tasks: Vec<construct_protocol::TaskInfo>,
+}
+
+/// Read-only popup showing one archived context-reset segment's transcript
+/// (spec 0085) — opened by selecting a `LineageEdge::Reset` node in the
+/// lineage view. Same shape as `TasksPopup`: a snapshot, not a live view;
+/// Up/Down/PageUp/PageDown scroll, any other key closes it (mirroring the
+/// help dialog), except `f` which forks a new session resuming from
+/// `prior_native_id` instead of closing.
+#[derive(Debug, Clone)]
+pub struct ResetSegmentPopup {
+    pub owner_session_id: String,
+    pub prior_native_id: String,
+    pub at_ms: i64,
+    pub events: Vec<construct_protocol::TimestampedEvent>,
+    pub scroll: usize,
 }
 
 /// In-TUI program surface for the selected session. The renderer treats
@@ -3293,6 +3312,7 @@ async fn run_with_socket_initial_selection(
         matrix_reveal_hits: Vec::new(),
         orchestrator_desired_size: None,
         tasks_popup: None,
+        reset_segment_popup: None,
         lineage_focused: false,
         lineage_collapsed: false,
         lineage_selected: 0,
@@ -8156,6 +8176,9 @@ impl App {
         if self.tasks_popup.take().is_some() {
             return;
         }
+        if self.reset_segment_popup.take().is_some() {
+            return;
+        }
         if self.remote_control_popup.take().is_some() {
             if matches!(
                 self.minibuffer.as_ref().map(|m| &m.intent),
@@ -8523,6 +8546,41 @@ impl App {
                     self.help_scroll_offset = self.help_scroll_offset.saturating_add(10);
                 }
                 _ => self.help_visible = false,
+            }
+            return;
+        }
+        // The reset-segment popup (spec 0085) is a topmost modal for the
+        // same reason help is: opened from the lineage section, which
+        // stays keyboard-focused underneath it, so it must intercept keys
+        // BEFORE the lineage-focus block below — otherwise j/k/Esc would
+        // move the lineage selection instead of scrolling/closing this
+        // popup. Same "any key closes" shape as help, plus `f` to fork.
+        if self.reset_segment_popup.is_some() {
+            match key.code {
+                KeyCode::Up => {
+                    if let Some(p) = self.reset_segment_popup.as_mut() {
+                        p.scroll = p.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(p) = self.reset_segment_popup.as_mut() {
+                        p.scroll = p.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(p) = self.reset_segment_popup.as_mut() {
+                        p.scroll = p.scroll.saturating_sub(10);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(p) = self.reset_segment_popup.as_mut() {
+                        p.scroll = p.scroll.saturating_add(10);
+                    }
+                }
+                KeyCode::Char('f') => {
+                    self.fork_from_reset_segment_popup().await;
+                }
+                _ => self.reset_segment_popup = None,
             }
             return;
         }
@@ -9796,6 +9854,72 @@ impl App {
                 });
             }
             Err(e) => self.set_status(format!("list_tasks failed: {e}")),
+        }
+    }
+
+    /// Open the read-only reset-segment popup for `reset` (spec 0085):
+    /// fetches exactly that window of the owner session's own transcript —
+    /// `from_seq`/`to_seq` are 0-based-exclusive boundaries, so `from_seq`
+    /// converts to `Client::transcript`'s 1-based inclusive `from` by +1 —
+    /// and reuses the existing offset+count transcript RPC (no new backend
+    /// surface needed for this).
+    pub async fn open_reset_segment_popup(&mut self, reset: &crate::lineage::ResetSegment) {
+        let limit = reset.to_seq.saturating_sub(reset.from_seq) as usize;
+        match self
+            .client
+            .transcript(&reset.owner_session_id, reset.from_seq + 1, Some(limit))
+            .await
+        {
+            Ok(result) => {
+                self.reset_segment_popup = Some(ResetSegmentPopup {
+                    owner_session_id: reset.owner_session_id.clone(),
+                    prior_native_id: reset.prior_native_id.clone(),
+                    at_ms: reset.at_ms,
+                    events: result.events,
+                    scroll: 0,
+                });
+            }
+            Err(e) => self.set_status(format!("transcript failed: {e}")),
+        }
+    }
+
+    /// `f` inside the reset-segment popup: fork a new session resuming from
+    /// this segment's archived native id (spec 0085), reusing the same
+    /// same-harness-fork-resume path an ordinary fork uses, just pointed at
+    /// `reset_native_id` instead of the parent's current native id.
+    pub async fn fork_from_reset_segment_popup(&mut self) {
+        let Some(popup) = self.reset_segment_popup.clone() else {
+            return;
+        };
+        let Some(owner) = self
+            .sessions
+            .iter()
+            .find(|s| s.id == popup.owner_session_id)
+            .cloned()
+        else {
+            self.set_status("fork: owner session no longer exists".into());
+            return;
+        };
+        let harness = owner.harness.clone();
+        match self
+            .client
+            .fork_session(
+                &popup.owner_session_id,
+                &harness,
+                construct_client::ForkOptions {
+                    reset_native_id: Some(popup.prior_native_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(new_id) => {
+                self.reset_segment_popup = None;
+                self.select_session(new_id);
+                self.sync_active_window_selection();
+                self.focus = PaneFocus::View;
+            }
+            Err(e) => self.set_status(format!("fork failed: {e}")),
         }
     }
 
@@ -11487,6 +11611,7 @@ mod tests {
             resizing_program_popup: None,
             list_collapsed: false,
             tasks_popup: None,
+            reset_segment_popup: None,
             lineage_focused: false,
             lineage_collapsed: false,
             lineage_selected: 0,
@@ -11712,6 +11837,7 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
         }
     }
 
@@ -22526,6 +22652,7 @@ mod tests {
             parent_busy_ms: 0,
             at_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         app.sessions.push(second);
 
@@ -28062,6 +28189,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         let mut app = test_app(client, vec![root, fork]);
         app.histories
@@ -28082,6 +28210,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         app.sessions.extend([other_root, other_fork]);
 
@@ -28374,6 +28503,7 @@ mod tests {
                 at_ms: 0,
                 parent_busy_ms: 0,
                 parent_message_count: 0,
+                reset_native_id: None,
             });
             app.sessions.push(fork);
         }
@@ -29043,6 +29173,7 @@ mod tests {
                 at_ms: 0,
                 parent_busy_ms: 0,
                 parent_message_count: 0,
+                reset_native_id: None,
             });
             parent = nested.id.clone();
             sessions.push(nested);
@@ -29078,6 +29209,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         app.sessions.push(nested);
         let items = app.list_items();
@@ -29501,6 +29633,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
 
         let mut app = test_app(client, vec![fork, sub, parent]);
@@ -29556,6 +29689,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
 
         // A session with ONLY a fork (no subagents) still gets `has_children`
@@ -29610,6 +29744,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
 
         let mut app = test_app(client, vec![archived_child, fork, active_child, parent]);
@@ -29988,6 +30123,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
 
         assert_eq!(list_session_indent_cells(&user, false, false), 0);

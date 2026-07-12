@@ -283,12 +283,16 @@ fn spawn_interactive_transcript_watcher(
                 if let Ok(text) = std::fs::read_to_string(lp) {
                     if let Some(id) = parse_conversation_id(&text) {
                         if conv_id.as_ref() != Some(&id) {
-                            if conv_id.is_some() {
+                            if let Some(prior) = conv_id.as_ref() {
                                 emit.log(format!(
                                     "antigravity: native conversation id changed {:?} -> {id}; \
                                      rebinding transcript watcher",
                                     conv_id
                                 ));
+                                emit.emit(SessionEvent::NativeIdChanged {
+                                    prior_native_id: prior.clone(),
+                                    new_native_id: id.clone(),
+                                });
                             }
                             write_conv_id(&id);
                             conv_id = Some(id);

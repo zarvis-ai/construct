@@ -215,6 +215,26 @@ impl SessionManager {
             }
             return;
         }
+        // NativeIdChanged records a harness-native context reset (spec
+        // 0085). Like ApprovalModeChanged/ModelChanged, this is durable
+        // per-session metadata, not a transcript row.
+        if let SessionEvent::NativeIdChanged {
+            prior_native_id,
+            new_native_id,
+        } = &event
+        {
+            if let Err(e) = self
+                .persist_context_reset(entry, prior_native_id.clone(), new_native_id.clone())
+                .await
+            {
+                tracing::warn!(
+                    session = %entry.id,
+                    error = ?e,
+                    "persist context reset from adapter event failed"
+                );
+            }
+            return;
+        }
         // PTY events take a latency-first fast path. Allocate their durable
         // sequence and enqueue the live broadcast before any synchronous file
         // writes or summary bookkeeping: focused clients are waiting on this
@@ -399,6 +419,7 @@ impl SessionManager {
                 | SessionEvent::ApprovalModeChanged { .. }
                 | SessionEvent::OperatorLoopChanged { .. }
                 | SessionEvent::ModelChanged { .. }
+                | SessionEvent::NativeIdChanged { .. }
                 | SessionEvent::TaskStart { .. }
                 | SessionEvent::TaskBackgrounded { .. }
                 | SessionEvent::TaskEnd { .. }
@@ -585,6 +606,7 @@ impl SessionManager {
                 needs_attention: false,
                 forked_from: None,
                 merge: None,
+                resets: Vec::new(),
             };
             let created = Arc::new(SessionEntry {
                 id: id.clone(),

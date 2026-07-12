@@ -219,6 +219,14 @@ impl App {
             .cloned()
         {
             self.lineage_focused = false;
+            // A reset segment (spec 0085) has no session of its own to
+            // select — open its read-only popup instead of jumping.
+            if let Some(root_id) = self.lineage_section_session() {
+                if let Some(reset) = self.lineage_reset_segment_at(&root_id, &hit.session_id) {
+                    self.open_reset_segment_popup(&reset).await;
+                    return;
+                }
+            }
             self.jump_to_lineage_session(&hit.session_id);
             return;
         }

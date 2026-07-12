@@ -11,6 +11,16 @@
 //! the full lineage graph is a strict tree, never a general DAG, which is
 //! what makes a plain recursive walk (no cycle-breaking beyond a defensive
 //! guard) sufficient.
+//!
+//! A `Reset` edge (spec 0085) is a different kind of thing from `Fork`/
+//! `Subagent`: it doesn't connect two `SessionSummary` rows, it connects a
+//! session to a bounded window of its OWN transcript (`SessionSummary::
+//! resets`, one entry per harness-native `/clear`). [`splice_reset_segments`]
+//! runs as a separate pass AFTER the fork/subagent tree is built, inserting
+//! synthetic ancestor nodes (session id `"{owner}#reset{n}"`, never a real
+//! `SessionSummary` row) in front of any node whose session has reset
+//! history — additive plumbing, not part of the `forked_from`/
+//! `parent_session_id` walk above.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,8 +32,20 @@ pub const MAX_DEPTH: usize = 6;
 /// Children rendered per node before the rest collapse into a "+N more"
 /// marker.
 pub const MAX_SIBLINGS: usize = 12;
+/// Reset segments rendered adjacent to a session's live node before older
+/// ones collapse into a "+N earlier" note on the oldest one shown (spec
+/// 0085) — a separate cap from `MAX_DEPTH`/`MAX_SIBLINGS`, applied by
+/// [`splice_reset_segments`] after the fork/subagent tree is already built,
+/// so a long `/clear` history never competes with that tree's depth budget.
+pub const MAX_RESET_SEGMENTS: usize = 4;
 
-/// What kind of edge connects a node to its parent.
+/// What kind of edge connects a node to its parent — i.e. how a node relates
+/// to the node immediately before it, not to the tree's root. A node with
+/// `resets` ahead of it (spec 0085) carries whatever edge originally
+/// connected it to ITS parent on the first spliced segment; every later
+/// segment (including the live node itself once splicing runs) connects via
+/// `Reset`, since that's how each is reached from its own immediate
+/// predecessor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineageEdge {
     /// The tree's root — no incoming edge.
@@ -32,6 +54,10 @@ pub enum LineageEdge {
     Fork,
     /// True parent/child helper via `parent_session_id` (spec 0014).
     Subagent,
+    /// A harness-native context reset (spec 0085): the predecessor node is
+    /// an archived window of THIS SAME session's own transcript, not a
+    /// different session.
+    Reset,
 }
 
 /// Fork-specific terminal state, derived from [`SessionSummary::merge`].
@@ -85,9 +111,53 @@ pub enum LineageChild {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineageNode {
+    /// For an ordinary node, the real `SessionSummary::id` it represents.
+    /// For a `LineageEdge::Reset` node, a synthetic `"{owner}#reset{n}"` —
+    /// distinct per segment so hover/selection/hit-testing (keyed on this
+    /// string throughout `ui.rs`/`app.rs`) never conflates two segments, or
+    /// a segment with the live session (spec 0085).
     pub session_id: String,
     pub edge: LineageEdge,
     pub children: Vec<LineageChild>,
+    /// The archived transcript window this node represents. `Some` iff
+    /// `edge == LineageEdge::Reset`; `None` for every ordinary node.
+    pub reset: Option<ResetSegment>,
+}
+
+/// One archived, read-only window of a session's own transcript, bounded by
+/// two harness-native context resets (or session start / the reset itself
+/// at the ends). Carries everything a `Reset` lane needs to render as a
+/// closed, bounded segment instead of falling through the ordinary
+/// whole-lifetime `by_id` summary lookup (spec 0085).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetSegment {
+    /// The real session this is a transcript window into.
+    pub owner_session_id: String,
+    /// 0-based position in `owner_session_id`'s `SessionSummary::resets`.
+    pub index: usize,
+    /// Inclusive start of this window, in the owner's transcript-seq space.
+    pub from_seq: u64,
+    /// Exclusive end of this window — `resets[index].transcript_seq`.
+    pub to_seq: u64,
+    /// When this window opened: the previous reset's `at_ms`, or `None` for
+    /// the owner's own creation time (segment 0).
+    pub from_at_ms: Option<i64>,
+    /// When this window closed — `resets[index].at_ms`.
+    pub at_ms: i64,
+    /// The harness-native id this window's conversation resumes from —
+    /// what a "fork from here" action passes as `ForkedFrom::
+    /// reset_native_id`.
+    pub prior_native_id: String,
+    /// This window's own compute time — `resets[index].busy_ms` minus the
+    /// previous boundary's (0 for segment 0), same snapshot-difference
+    /// trick a `ForkMerge` window already uses relative to `ForkedFrom`.
+    pub busy_delta: u64,
+    /// This window's own chat-message count, computed the same way.
+    pub message_delta: u64,
+    /// Set only on the oldest segment actually rendered, when
+    /// [`MAX_RESET_SEGMENTS`] hid older ones: how many earlier resets were
+    /// collapsed (not silently — the count is rendered on this node's box).
+    pub collapsed_before: usize,
 }
 
 /// Whether `session_id` has any lineage relationship worth showing: it was
@@ -121,6 +191,22 @@ pub fn has_lineage(session_id: &str, sessions: &[SessionSummary]) -> bool {
 /// popup was open).
 pub fn build_tree(focus_id: &str, sessions: &[SessionSummary]) -> Option<LineageNode> {
     build_tree_with_expansions(focus_id, sessions, None)
+}
+
+/// Find the node with `session_id` anywhere in `root`'s tree — real session
+/// or synthetic reset-segment id alike (spec 0085). Selecting a lineage row
+/// only yields a session id string; callers that need the row's full
+/// `LineageEdge`/`ResetSegment` (to tell a reset segment apart from an
+/// ordinary session before deciding whether to jump to it or open its
+/// read-only popup) re-resolve it through this walk.
+pub fn find_node<'a>(root: &'a LineageNode, session_id: &str) -> Option<&'a LineageNode> {
+    if root.session_id == session_id {
+        return Some(root);
+    }
+    root.children.iter().find_map(|child| match child {
+        LineageChild::Node(n) => find_node(n, session_id),
+        _ => None,
+    })
 }
 
 /// Like [`build_tree`], but with subagent-group expansion tracking
@@ -161,14 +247,91 @@ pub fn build_tree_with_expansions(
         e
     });
     let mut visited = HashSet::new();
-    build_subtree(
+    let root = build_subtree(
         &root_id,
         &by_id,
         LineageEdge::Root,
         0,
         &mut visited,
         effective.as_ref(),
-    )
+    )?;
+    Some(splice_reset_segments(root, &by_id))
+}
+
+/// Post-order pass over an already-built fork/subagent tree (spec 0085):
+/// for every node whose session has `resets`, replace it with a linear
+/// chain of synthetic [`ResetSegment`] ancestor nodes ending in that same
+/// node. Not woven into [`build_subtree`]'s recursion — that walk only
+/// knows how to follow `forked_from`/`parent_session_id`, and a reset isn't
+/// backed by either, so this has to be additive. A session that was never
+/// cleared (`resets` empty) is untouched — this must be, and is, a
+/// byte-for-byte no-op for every tree that predates this feature.
+fn splice_reset_segments(mut node: LineageNode, by_id: &HashMap<&str, &SessionSummary>) -> LineageNode {
+    node.children = node
+        .children
+        .into_iter()
+        .map(|child| match child {
+            LineageChild::Node(n) => LineageChild::Node(splice_reset_segments(n, by_id)),
+            other => other,
+        })
+        .collect();
+
+    let Some(summary) = by_id.get(node.session_id.as_str()) else {
+        return node;
+    };
+    if summary.resets.is_empty() {
+        return node;
+    }
+
+    let owner_id = node.session_id.clone();
+    let original_edge = node.edge;
+    let total = summary.resets.len();
+    let start = total.saturating_sub(MAX_RESET_SEGMENTS);
+    let collapsed_before = start;
+
+    // Build the chain from the live node backward to the oldest visible
+    // segment: each segment becomes the new parent, with the previous tail
+    // (initially the live node) as its sole child. The live node's own edge
+    // becomes Reset — it now connects via the reset chain, not via whatever
+    // connected it to its real parent before splicing.
+    node.edge = LineageEdge::Reset;
+    let mut tail = node;
+    for i in (start..total).rev() {
+        let r = &summary.resets[i];
+        let prev = if i == 0 { None } else { Some(&summary.resets[i - 1]) };
+        let seg = ResetSegment {
+            owner_session_id: owner_id.clone(),
+            index: i,
+            from_seq: prev.map(|p| p.transcript_seq).unwrap_or(0),
+            to_seq: r.transcript_seq,
+            from_at_ms: prev.map(|p| p.at_ms),
+            at_ms: r.at_ms,
+            prior_native_id: r.prior_native_id.clone(),
+            busy_delta: r.busy_ms.saturating_sub(prev.map(|p| p.busy_ms).unwrap_or(0)),
+            message_delta: r
+                .message_count
+                .saturating_sub(prev.map(|p| p.message_count).unwrap_or(0)),
+            collapsed_before: if i == start { collapsed_before } else { 0 },
+        };
+        // The oldest VISIBLE segment inherits the original node's incoming
+        // edge (Root/Fork/Subagent) — it's still "the thing forked from P" /
+        // "the topmost root", just now also the start of a reset chain.
+        // Every other segment connects via Reset, matching how Fork/
+        // Subagent edges already describe "connection to immediate
+        // predecessor", not "connection to the tree's root".
+        let edge = if i == start {
+            original_edge
+        } else {
+            LineageEdge::Reset
+        };
+        tail = LineageNode {
+            session_id: format!("{owner_id}#reset{i}"),
+            edge,
+            children: vec![LineageChild::Node(tail)],
+            reset: Some(seg),
+        };
+    }
+    tail
 }
 
 fn parent_of(s: &SessionSummary) -> Option<&str> {
@@ -282,6 +445,7 @@ fn build_subtree(
         session_id: id.to_string(),
         edge,
         children,
+        reset: None,
     })
 }
 
@@ -684,6 +848,23 @@ fn node_box_label(summary: Option<&SessionSummary>, session_id: &str) -> String 
     label
 }
 
+/// `"↺ cleared (harness)"` box text for a reset segment (spec 0085) —
+/// deliberately NOT [`node_box_label`]'s generic form, which reads
+/// `"(gone)"` for a missing summary: a reset segment isn't a deleted
+/// session, it's an intact, archived window of a session that's very much
+/// still alive. Collapsed older resets ([`MAX_RESET_SEGMENTS`]) surface as
+/// a suffix on the oldest segment actually shown, never silently.
+fn reset_box_label(owner: Option<&SessionSummary>, reset: &ResetSegment) -> String {
+    let mut label = match owner {
+        Some(s) => format!("↺ cleared ({})", s.harness),
+        None => "↺ cleared".to_string(),
+    };
+    if reset.collapsed_before > 0 {
+        label.push_str(&format!("  +{} earlier", reset.collapsed_before));
+    }
+    label
+}
+
 /// Greedy word-wrap of a box label to [`MAX_BOX_CONTENT_W`] columns and at
 /// most [`MAX_BOX_LINES`] lines; content past the last line is ellipsized.
 /// A word wider than a whole line hard-breaks.
@@ -903,6 +1084,9 @@ fn collect_lanes<'a>(
     now_ms: i64,
     lanes: &mut Vec<Lane<'a>>,
 ) -> usize {
+    if let Some(reset) = &node.reset {
+        return collect_reset_lane(node, reset, by_id, parent, now_ms, lanes);
+    }
     let summary = by_id.get(node.session_id.as_str()).copied();
     let parent_box_ms = parent.map(|p| lanes[p].box_ms).unwrap_or(i64::MIN);
     let forked = if node.edge == LineageEdge::Fork {
@@ -982,6 +1166,89 @@ fn collect_lanes<'a>(
         busy_total: summary.map(|s| s.busy_ms_at(now_ms)).unwrap_or(0),
         msgs_total: summary.map(|s| s.message_count).unwrap_or(0),
         cp_seq: 0,
+        cp_ms: box_ms,
+        cp_busy: 0,
+        cp_msgs: 0,
+        x_abs: 0,
+        lane_col: 0,
+        box_bottom: 0,
+        last_row: 0,
+        placed: false,
+        ended: false,
+    });
+    for child in &node.children {
+        match child {
+            LineageChild::More(n) => lanes[idx].more.push(*n),
+            LineageChild::Subagents {
+                count,
+                running,
+                expanded,
+            } => {
+                lanes[idx].subagent_marker = Some((*count, *running, *expanded));
+            }
+            LineageChild::Node(cn) => {
+                collect_lanes(cn, by_id, Some(idx), now_ms, lanes);
+            }
+        }
+    }
+    idx
+}
+
+/// [`collect_lanes`] for a `LineageEdge::Reset` node (spec 0085): built
+/// directly from `reset`'s own bounded window instead of the generic
+/// `by_id`-summary derivation above, which assumes one node = one
+/// whole-lifetime `SessionSummary` — not true here, since this node is a
+/// window into the OWNER session's own transcript, not a session of its
+/// own. `fork_seq`/`merge` stay unset so the generic checkpoint-advance
+/// (`EV_BOX`'s fork branch) and `EV_MERGE` handling never fire for this
+/// lane — a reset segment is never itself a fork-out point and never
+/// merges. `busy_total`/`msgs_total` are this segment's own delta (not a
+/// lifetime total), and `cp_busy`/`cp_msgs` start at 0 and are never
+/// advanced by a child (a reset segment's only child is the next segment
+/// or the live node, neither of which is a `Fork` edge), so the `EV_END`
+/// delta math already available for any live lane
+/// (`busy_total.saturating_sub(cp_busy)`) naturally yields exactly the
+/// segment's own delta with no further branching there — only the
+/// event-count delta `d` needs a `node.reset`-aware branch, since that one
+/// reads `summary.event_count` (the owner's CURRENT/live count, unbounded)
+/// rather than a lane-local total.
+fn collect_reset_lane<'a>(
+    node: &'a LineageNode,
+    reset: &ResetSegment,
+    by_id: &HashMap<&str, &'a SessionSummary>,
+    parent: Option<usize>,
+    now_ms: i64,
+    lanes: &mut Vec<Lane<'a>>,
+) -> usize {
+    let owner = by_id.get(reset.owner_session_id.as_str()).copied();
+    let parent_box_ms = parent.map(|p| lanes[p].box_ms).unwrap_or(i64::MIN);
+    let box_ms = reset
+        .from_at_ms
+        .unwrap_or_else(|| owner.map(|s| s.created_at.timestamp_millis()).unwrap_or(0))
+        .max(parent_box_ms);
+    // Always closed at `at_ms` — never "runs to now" like a live lane, and
+    // outcome stays None (bullet, not ✓/✗): a reset is a boundary, neither
+    // a success nor a failure, so it must not borrow the discarded-fork
+    // visual language.
+    let close_ms = reset.at_ms.max(box_ms);
+    let idx = lanes.len();
+    lanes.push(Lane {
+        node,
+        summary: owner,
+        parent,
+        box_ms,
+        fork_seq: None,
+        fork_busy: 0,
+        fork_msgs: 0,
+        merge: None,
+        end: Some((close_ms, Some(close_ms), None)),
+        close_ms,
+        more: Vec::new(),
+        subagent_marker: None,
+        label_lines: wrap_box_label(&reset_box_label(owner, reset)),
+        busy_total: reset.busy_delta,
+        msgs_total: reset.message_delta,
+        cp_seq: reset.from_seq,
         cp_ms: box_ms,
         cp_busy: 0,
         cp_msgs: 0,
@@ -1223,6 +1490,7 @@ fn layout_tree(
                 let edge_word = match lanes[i].node.edge {
                     LineageEdge::Fork => "⑂",
                     LineageEdge::Subagent => "▸",
+                    LineageEdge::Reset => "↺",
                     LineageEdge::Root => "",
                 };
                 let ew = UnicodeWidthStr::width(edge_word);
@@ -1475,10 +1743,20 @@ fn layout_tree(
                 let closing: Vec<(usize, u64)> = group
                     .iter()
                     .filter_map(|&j| {
-                        let d = lanes[j]
-                            .summary
-                            .map(|s| s.event_count.saturating_sub(lanes[j].cp_seq))
-                            .unwrap_or(0);
+                        // A reset segment's event-count delta is a fixed
+                        // window (to_seq - from_seq), never derived from the
+                        // owner's CURRENT/live event_count — that keeps
+                        // growing after the segment closed, and reading it
+                        // here would make an old, already-closed segment's
+                        // turn-info line grow every time the lineage view
+                        // reopens.
+                        let d = match &lanes[j].node.reset {
+                            Some(reset) => reset.to_seq.saturating_sub(reset.from_seq),
+                            None => lanes[j]
+                                .summary
+                                .map(|s| s.event_count.saturating_sub(lanes[j].cp_seq))
+                                .unwrap_or(0),
+                        };
                         (d > 0).then_some((j, d))
                     })
                     .collect();
@@ -1805,6 +2083,7 @@ pub fn flatten_rails(
                 let glyph = match lanes[i].node.edge {
                     LineageEdge::Fork => "⑂",
                     LineageEdge::Subagent => "▸",
+                    LineageEdge::Reset => "↺",
                     LineageEdge::Root => "",
                 };
                 put_label(&mut c, cur, &lanes[i], Some(glyph));
@@ -1922,10 +2201,16 @@ pub fn flatten_rails(
                         last_row[j] = last_row[j].max(cur);
                         cur += 1;
                     }
-                    let d = lanes[j]
-                        .summary
-                        .map(|s| s.event_count.saturating_sub(lanes[j].cp_seq))
-                        .unwrap_or(0);
+                    // See the Boxes-mode EV_END comment: a reset segment's
+                    // delta is its own fixed window, never the owner's
+                    // current/live event_count.
+                    let d = match &lanes[j].node.reset {
+                        Some(reset) => reset.to_seq.saturating_sub(reset.from_seq),
+                        None => lanes[j]
+                            .summary
+                            .map(|s| s.event_count.saturating_sub(lanes[j].cp_seq))
+                            .unwrap_or(0),
+                    };
                     if d > 0 {
                         let (_, label_end, outcome) = lanes[j].end.expect("end event has end data");
                         let owner = lanes[j].node.session_id.clone();
@@ -2066,6 +2351,7 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+            resets: Vec::new(),
         }
     }
 
@@ -2076,6 +2362,7 @@ mod tests {
             at_ms: 0,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         s
     }
@@ -2101,6 +2388,7 @@ mod tests {
             at_ms,
             parent_busy_ms: 0,
             parent_message_count: 0,
+            reset_native_id: None,
         });
         s
     }
@@ -2128,6 +2416,29 @@ mod tests {
 
     fn with_event_count(mut s: SessionSummary, n: u64) -> SessionSummary {
         s.event_count = n;
+        s
+    }
+
+    /// Appends a `ContextReset` at `(transcript_seq, at_ms)` with the given
+    /// cumulative `busy_ms`/`message_count` snapshots (spec 0085) —
+    /// deliberately takes the raw cumulative values, like the daemon
+    /// persists them, not deltas, so tests read the same shape production
+    /// code does.
+    fn with_reset(
+        mut s: SessionSummary,
+        transcript_seq: u64,
+        at_ms: i64,
+        busy_ms: u64,
+        message_count: u64,
+    ) -> SessionSummary {
+        s.resets.push(construct_protocol::ContextReset {
+            at_ms,
+            transcript_seq,
+            busy_ms,
+            message_count,
+            prior_native_id: format!("native-{}", s.resets.len()),
+            new_native_id: format!("native-{}", s.resets.len() + 1),
+        });
         s
     }
 
@@ -2174,6 +2485,158 @@ mod tests {
         assert_eq!(tree.session_id, "a");
         assert_eq!(tree.edge, LineageEdge::Root);
         assert!(tree.children.is_empty());
+    }
+
+    // -- spec 0085: reset lineage edge --------------------------------
+
+    #[test]
+    fn session_with_no_resets_is_untouched() {
+        // A session that was never cleared must splice to a byte-for-byte
+        // identical tree — every pre-0085 test above already exercises this
+        // implicitly (none of their fixtures set `resets`), but this makes
+        // the invariant explicit and named.
+        let sessions = vec![base("a"), forked_from(base("b"), "a")];
+        let tree = build_tree("a", &sessions).expect("tree");
+        assert_eq!(tree.session_id, "a");
+        assert_eq!(tree.edge, LineageEdge::Root);
+        assert_eq!(tree.children.len(), 1);
+        let LineageChild::Node(child) = &tree.children[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(child.session_id, "b");
+        assert_eq!(child.edge, LineageEdge::Fork);
+        assert!(child.reset.is_none());
+    }
+
+    #[test]
+    fn reset_history_splices_a_chain_in_front_of_the_live_node() {
+        let mut a = base("a");
+        a = with_reset(a, 10, 1_000, 100, 5);
+        a = with_reset(a, 25, 2_000, 300, 12);
+        let sessions = vec![a];
+
+        let tree = build_tree("a", &sessions).expect("tree");
+        assert_eq!(tree.session_id, "a#reset0");
+        assert_eq!(tree.edge, LineageEdge::Root);
+        let seg0 = tree.reset.as_ref().expect("segment 0");
+        assert_eq!(seg0.owner_session_id, "a");
+        assert_eq!(seg0.index, 0);
+        assert_eq!((seg0.from_seq, seg0.to_seq), (0, 10));
+        assert_eq!((seg0.busy_delta, seg0.message_delta), (100, 5));
+        assert_eq!(seg0.collapsed_before, 0);
+
+        assert_eq!(tree.children.len(), 1);
+        let LineageChild::Node(seg1) = &tree.children[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(seg1.session_id, "a#reset1");
+        assert_eq!(seg1.edge, LineageEdge::Reset);
+        let r1 = seg1.reset.as_ref().expect("segment 1");
+        assert_eq!((r1.from_seq, r1.to_seq), (10, 25));
+        // Deltas, not cumulative totals: segment 1's own window is
+        // 300-100 busy / 12-5 messages, not the raw 300/12 snapshot.
+        assert_eq!((r1.busy_delta, r1.message_delta), (200, 7));
+
+        assert_eq!(seg1.children.len(), 1);
+        let LineageChild::Node(live) = &seg1.children[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(live.session_id, "a");
+        assert_eq!(live.edge, LineageEdge::Reset);
+        assert!(live.reset.is_none());
+        assert!(live.children.is_empty());
+    }
+
+    #[test]
+    fn forked_session_with_its_own_resets_keeps_fork_edge_on_first_segment() {
+        // "b" was forked from "a", then cleared once itself. Splicing must
+        // put a-originated Fork edge on the OLDEST segment (still "the
+        // thing forked from a"), and demote b's own live node to Reset
+        // (its immediate predecessor is now the reset segment, not "a").
+        let a = base("a");
+        let mut b = forked_from(base("b"), "a");
+        b = with_reset(b, 5, 500, 50, 2);
+        let sessions = vec![a, b];
+
+        let tree = build_tree("a", &sessions).expect("tree");
+        assert_eq!(tree.session_id, "a");
+        assert_eq!(tree.children.len(), 1);
+        let LineageChild::Node(seg0) = &tree.children[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(seg0.session_id, "b#reset0");
+        assert_eq!(seg0.edge, LineageEdge::Fork);
+        assert_eq!(seg0.children.len(), 1);
+        let LineageChild::Node(live_b) = &seg0.children[0] else {
+            panic!("expected node");
+        };
+        assert_eq!(live_b.session_id, "b");
+        assert_eq!(live_b.edge, LineageEdge::Reset);
+    }
+
+    #[test]
+    fn excess_reset_segments_collapse_with_a_visible_earlier_count() {
+        let mut a = base("a");
+        for i in 0..(MAX_RESET_SEGMENTS as u64 + 2) {
+            a = with_reset(a, i * 10 + 10, i as i64 * 1000 + 1000, 0, 0);
+        }
+        let sessions = vec![a];
+        let tree = build_tree("a", &sessions).expect("tree");
+
+        // Oldest VISIBLE segment carries the collapsed-count note; walk the
+        // chain and count materialized Reset-edge nodes.
+        let mut node = &tree;
+        let mut reset_nodes = 0usize;
+        loop {
+            if let Some(r) = &node.reset {
+                reset_nodes += 1;
+                if reset_nodes == 1 {
+                    assert_eq!(
+                        r.collapsed_before, 2,
+                        "oldest visible segment should note the 2 collapsed ones"
+                    );
+                } else {
+                    assert_eq!(r.collapsed_before, 0);
+                }
+            }
+            match node.children.first() {
+                Some(LineageChild::Node(n)) => node = n,
+                _ => break,
+            }
+        }
+        assert_eq!(
+            reset_nodes, MAX_RESET_SEGMENTS,
+            "only the most recent MAX_RESET_SEGMENTS should materialize"
+        );
+    }
+
+    #[test]
+    fn reset_segment_renders_its_own_glyph_and_label_not_the_live_state() {
+        let mut a = base("a");
+        a.state = SessionState::Running;
+        a = with_reset(a, 10, 1_000, 100, 5);
+        let sessions = vec![a];
+        let tree = build_tree("a", &sessions).expect("tree");
+
+        let rows = flatten(&tree, &sessions, 5_000);
+        let text = diagram_text(&rows).join("\n");
+        assert!(
+            text.contains('↺'),
+            "expected the reset edge glyph in:\n{text}"
+        );
+        assert!(
+            text.contains("cleared"),
+            "expected the reset box label in:\n{text}"
+        );
+        // Boxes and Rails share the same edge-glyph match; confirm Rails
+        // mode renders the same glyph rather than panicking on the new
+        // LineageEdge variant.
+        let (rail_rows, _) = flatten_rails(&tree, &sessions, 5_000);
+        let rail_text = diagram_text(&rail_rows).join("\n");
+        assert!(
+            rail_text.contains('↺'),
+            "expected the reset edge glyph in rails mode:\n{rail_text}"
+        );
     }
 
     #[test]

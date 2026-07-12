@@ -364,6 +364,10 @@ fn spawn_interactive_transcript_watcher(
                         "claude: native session id changed {current_id} -> {new_id}; \
                          rebinding transcript watcher"
                     ));
+                    emit.emit(SessionEvent::NativeIdChanged {
+                        prior_native_id: current_id.clone(),
+                        new_native_id: new_id.clone(),
+                    });
                     current_id = new_id;
                     path = new_path;
                     next_line = 0;

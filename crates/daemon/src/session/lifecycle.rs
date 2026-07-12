@@ -98,6 +98,7 @@ impl SessionManager {
             busy_running_since_ms: None,
             message_count: 0,
             merge: None,
+            resets: Vec::new(),
         };
         self.storage.save_summary(&summary)?;
 
@@ -142,12 +143,24 @@ impl SessionManager {
             _ => None,
         };
         if let Some((id_file, env_key)) = native_fork {
-            if let Some(parent) = params.forked_from.as_ref().map(|f| &f.session_id) {
-                let native_id = self.storage.session_dir(parent).join(id_file);
-                if let Ok(id) = std::fs::read_to_string(native_id) {
-                    let id = id.trim();
-                    if !id.is_empty() {
-                        env_with_meta.insert(env_key.into(), id.into());
+            if let Some(forked_from) = params.forked_from.as_ref() {
+                // A fork spawned from an archived reset segment (spec 0085)
+                // carries the exact native id to resume; skip the file read
+                // entirely so it can't be raced by the parent moving on to a
+                // newer native id in the meantime. Ordinary forks fall
+                // through to reading the parent's CURRENT native id file, as
+                // before.
+                if let Some(reset_native_id) = forked_from.reset_native_id.as_ref() {
+                    if !reset_native_id.is_empty() {
+                        env_with_meta.insert(env_key.into(), reset_native_id.clone());
+                    }
+                } else {
+                    let native_id = self.storage.session_dir(&forked_from.session_id).join(id_file);
+                    if let Ok(id) = std::fs::read_to_string(native_id) {
+                        let id = id.trim();
+                        if !id.is_empty() {
+                            env_with_meta.insert(env_key.into(), id.into());
+                        }
                     }
                 }
             }
