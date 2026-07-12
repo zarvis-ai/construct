@@ -625,6 +625,13 @@ const PROGRAM_VERB_INLINE_DOC_MAX_CHARS: usize = 100_000;
 /// comment, spec 0076), and the structured-return contract — including that
 /// the session has no Program-editing tool and must not attempt to act like
 /// it does.
+///
+/// The verb body may place any of these itself with `{{ program.content }}`,
+/// `{{ program.selected_text }}`, and `{{ program.additional_instruction }}`
+/// template placeholders (spec 0089): a referenced variable is substituted
+/// in place and its default framing section below is suppressed, so an
+/// author who positions a value never gets it twice. The structured-return
+/// contract is not templatable — it always applies.
 fn program_verb_prompt(
     verb: &construct_protocol::ProgramVerb,
     owner_session_id: &str,
@@ -632,44 +639,78 @@ fn program_verb_prompt(
     selection: &str,
     comment: Option<&str>,
 ) -> String {
+    use crate::program_verbs::{
+        prompt_references_var, render_verb_prompt, TEMPLATE_VAR_ADDITIONAL_INSTRUCTION,
+        TEMPLATE_VAR_CONTENT, TEMPLATE_VAR_SELECTED_TEXT,
+    };
     use construct_protocol::{ProgramVerbEffect, ProgramVerbInteraction};
-    let mut prompt = String::new();
-    prompt.push_str(verb.prompt.trim());
+
     let doc_char_count = full_document.chars().count();
     let doc_truncated = doc_char_count > PROGRAM_VERB_INLINE_DOC_MAX_CHARS;
-    prompt.push_str("\n\n---\n\nFor context, here is the full Program (orchestration) document this selection is part of");
-    if doc_truncated {
-        prompt.push_str(&format!(
-            " (truncated to its first {PROGRAM_VERB_INLINE_DOC_MAX_CHARS} characters — call \
-             agentd_program_get, or construct_program_get if you are using MCP, with \
-             session_id \"{owner_session_id}\" for the rest, or for a fresh read if the \
-             document may have changed since)"
-        ));
-    }
-    prompt.push_str(":\n\n");
     let doc_excerpt: String = full_document
         .chars()
         .take(PROGRAM_VERB_INLINE_DOC_MAX_CHARS)
         .collect();
-    prompt.push_str(&doc_excerpt);
-    if doc_truncated {
-        prompt.push_str("\n\n[... truncated ...]");
-    }
-    prompt.push_str(
-        "\n\n---\n\nYour jurisdiction is exactly the following selected Markdown — a substring \
-         of the document above. Use the rest of the document only as context: do not describe, \
-         reference, or act on anything outside this selection; your result applies to this \
-         selection alone.\n\n",
+    // The template substitution carries its own truncation pointer, since a
+    // template author controls the surrounding text and gets no framing
+    // header to explain the cut.
+    let doc_for_template = if doc_truncated {
+        format!(
+            "{doc_excerpt}\n\n[... truncated to the first {PROGRAM_VERB_INLINE_DOC_MAX_CHARS} \
+             characters — call agentd_program_get, or construct_program_get if you are using \
+             MCP, with session_id \"{owner_session_id}\" for the rest, or for a fresh read if \
+             the document may have changed since]"
+        )
+    } else {
+        doc_excerpt.clone()
+    };
+    let one_line_instruction = comment
+        .map(|c| c.split_whitespace().collect::<Vec<_>>().join(" "))
+        .unwrap_or_default();
+
+    let mut prompt = render_verb_prompt(
+        verb.prompt.trim(),
+        &[
+            (TEMPLATE_VAR_CONTENT, doc_for_template.as_str()),
+            (TEMPLATE_VAR_SELECTED_TEXT, selection),
+            (
+                TEMPLATE_VAR_ADDITIONAL_INSTRUCTION,
+                one_line_instruction.as_str(),
+            ),
+        ],
     );
-    prompt.push_str(selection);
-    prompt.push_str("\n\n---\n\n");
-    if let Some(comment) = comment {
-        let one_line = comment.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !one_line.is_empty() {
-            prompt.push_str("Additional user instruction for this verb: ");
-            prompt.push_str(&one_line);
-            prompt.push_str("\n\n");
+    if !prompt_references_var(&verb.prompt, TEMPLATE_VAR_CONTENT) {
+        prompt.push_str("\n\n---\n\nFor context, here is the full Program (orchestration) document this selection is part of");
+        if doc_truncated {
+            prompt.push_str(&format!(
+                " (truncated to its first {PROGRAM_VERB_INLINE_DOC_MAX_CHARS} characters — call \
+                 agentd_program_get, or construct_program_get if you are using MCP, with \
+                 session_id \"{owner_session_id}\" for the rest, or for a fresh read if the \
+                 document may have changed since)"
+            ));
         }
+        prompt.push_str(":\n\n");
+        prompt.push_str(&doc_excerpt);
+        if doc_truncated {
+            prompt.push_str("\n\n[... truncated ...]");
+        }
+    }
+    if !prompt_references_var(&verb.prompt, TEMPLATE_VAR_SELECTED_TEXT) {
+        prompt.push_str(
+            "\n\n---\n\nYour jurisdiction is exactly the following selected Markdown — a substring \
+             of the document above. Use the rest of the document only as context: do not describe, \
+             reference, or act on anything outside this selection; your result applies to this \
+             selection alone.\n\n",
+        );
+        prompt.push_str(selection);
+    }
+    prompt.push_str("\n\n---\n\n");
+    if !prompt_references_var(&verb.prompt, TEMPLATE_VAR_ADDITIONAL_INSTRUCTION)
+        && !one_line_instruction.is_empty()
+    {
+        prompt.push_str("Additional user instruction for this verb: ");
+        prompt.push_str(&one_line_instruction);
+        prompt.push_str("\n\n");
     }
     match verb.interaction {
         ProgramVerbInteraction::Interactive => prompt.push_str(
@@ -4663,6 +4704,52 @@ mod tests {
         assert!(
             !prompt.contains("is not shown to you"),
             "prompt must not claim the rest of the document is hidden now that it's included: {prompt}"
+        );
+    }
+
+    /// spec 0089: a verb body may place the document, selection, and
+    /// instruction itself with `{{ ... }}` template variables — each
+    /// referenced variable substitutes in place and suppresses its default
+    /// framing section, so nothing appears twice.
+    #[test]
+    fn program_verb_prompt_substitutes_template_variables() {
+        let mut verb = test_verb_for_prompt(construct_protocol::ProgramVerbEffect::Rewrite);
+        verb.prompt = "Given this document:\n{{ program.content }}\nfocus on:\n{{ program.selected_text }}\nwith guidance: {{ program.additional_instruction }}".to_string();
+        let doc = "# Plan\n\nSection B: do the thing.\n";
+        let prompt = program_verb_prompt(
+            &verb,
+            "owner7",
+            doc,
+            "Section B: do the thing.",
+            Some("keep it short"),
+        );
+        assert!(
+            prompt.contains("Given this document:\n# Plan"),
+            "content substitutes in place: {prompt}"
+        );
+        assert!(
+            prompt.contains("focus on:\nSection B: do the thing."),
+            "selection substitutes in place: {prompt}"
+        );
+        assert!(
+            prompt.contains("with guidance: keep it short"),
+            "instruction substitutes in place: {prompt}"
+        );
+        assert!(
+            !prompt.contains("For context, here is the full Program"),
+            "referencing program.content suppresses the default document framing: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Your jurisdiction is exactly the following"),
+            "referencing program.selected_text suppresses the default jurisdiction block: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Additional user instruction for this verb:"),
+            "referencing program.additional_instruction suppresses the default framing: {prompt}"
+        );
+        assert!(
+            prompt.contains("verb-result.json"),
+            "the structured-return contract always applies: {prompt}"
         );
     }
 

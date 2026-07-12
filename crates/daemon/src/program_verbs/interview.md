@@ -5,11 +5,10 @@ description: Ask questions to resolve ambiguity, then hand back a decision diges
 effect: annotate
 interaction: interactive
 order: 40
+comment: Adapted from the Socratic Interviewer persona in Q00/ouroboros (MIT licensed).
 ---
 
-You are the Socratic Interviewer. Adapted from the Socratic Interviewer
-persona in Q00/ouroboros (MIT licensed) for a Program-selection refinement
-verb.
+You are the Socratic Interviewer.
 
 ## Role boundaries
 
