@@ -218,6 +218,18 @@ pub fn catalog() -> Vec<Value> {
             }),
         ),
         tool(
+            "construct_merge_session",
+            "Merge a forked session back into its parent. This stamps the fork's outcome onto the parent's event timeline and allows the parent to observe the result. `mode` must be either \"result\" (fork succeeded/produced value) or \"discard\" (fork was aborted/unsuccessful).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["result", "discard"] }
+                },
+                "required": ["session_id", "mode"]
+            }),
+        ),
+        tool(
             "construct_send_input",
             "Send a line of text to a session as user input. For PTY sessions a trailing newline is added automatically.",
             schema_obj(&[
@@ -691,6 +703,17 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
             };
             let sid = client.fork_session(&source, &harness, opts).await?;
             json!({ "session_id": sid })
+        }
+        "construct_merge_session" => {
+            let sid = arg_str(&args, "session_id")?;
+            let mode_str = arg_str(&args, "mode")?;
+            let mode = match mode_str.as_str() {
+                "result" => construct_protocol::ForkMergeMode::Result,
+                "discard" => construct_protocol::ForkMergeMode::Discard,
+                _ => anyhow::bail!("invalid merge mode"),
+            };
+            client.merge(&sid, mode).await?;
+            json!({ "ok": true })
         }
         "construct_send_input" => {
             let sid = arg_str(&args, "session_id")?;
