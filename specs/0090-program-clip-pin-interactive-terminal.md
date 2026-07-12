@@ -14,6 +14,8 @@ Clicking a Program `@{session:…}` smart-clip chip has two distinct gestures, d
 
 A pinned card renders anchored to the clip's on-screen position (not the pointer), and continues to do so as long as the clip is visible; scrolling it off-screen hides the card without clearing the pin, so scrolling back re-shows it. It does not own its own terminal size: like the plain hover card, it crops the session's existing cached viewport rather than replaying at its own dimensions, so it never fights the main/split view over the shared parser's size (see Consequences).
 
+Because the card is a fixed-size **crop** of the session's viewport, content can extend beyond the window on both axes. The mouse wheel over the pinned card therefore **pans the crop** rather than scrolling the Program doc: vertical wheel steps the window back from (and forward toward) the live tail it is anchored to, clamping at the content's top; horizontal wheel events — or Shift+vertical-wheel, for terminals that never synthesize them — pan across the screen's width, clamping at its right edge. The pan is card-local state: it is never forwarded to the pinned session as input, it never resizes the shared parser (the crop window moves; the parser doesn't), and it resets whenever the pin changes or clears so one pin's pan never bleeds into the next. Wheel events outside the card keep scrolling the Program doc and leave the pin and its pan untouched.
+
 Dismissal follows floating-overlay convention: a left click that lands **neither on the pinned card nor on a session clip dismisses the pin**, and then proceeds with the effect that click always had (placing the caret, activating a control, focusing another pane) — whether it lands in the Program body, on Program chrome, or outside the Program modal entirely. A click *on* the pinned card is consumed by the card: it never forwards into the pinned session (keyboard-only scope, see Reason), never leaks through to the Program text beneath the card, and does not dismiss the pin; it does reclaim keyboard focus for the card, so a user who clicked away into another pane can click the card to resume typing into the pinned session. Clicks on clips stay the pin's own toggle/switch gestures described above.
 
 ## Reason
@@ -37,7 +39,7 @@ Cropping the session's existing cached viewport rather than replaying at the car
 
 ## Non-Goals
 
-- Forwarding mouse events (clicks, drags, scroll) into a pinned session — keyboard only, see Reason.
+- Forwarding mouse events (clicks, drags, scroll) into a pinned session — keyboard only, see Reason. Wheel over the card pans the card's own crop window; it is not delivered to the session.
 - Web UI parity — this is TUI-only for now; the web Program view's clip hover is unaffected.
 - Giving the pinned card its own, larger, or resizable terminal size independent of the session's existing cached viewport.
 - Changing the shimmer-text hover card (spec `0060`) in any way; it remains a transient, unpinnable preview of the dispatching session.

@@ -4916,6 +4916,7 @@ fn render_terminal_for_window(f: &mut Frame, area: Rect, app: &mut App, window_i
         &app.theme,
         editor_area.is_none(),
         paint_row_offset,
+            0,
     );
     app.block_hits.insert(
         id.clone(),
@@ -9570,9 +9571,11 @@ fn render_pty_screen(
     theme: &Theme,
     show_cursor: bool,
     row_offset: u16,
+    col_offset: u16,
 ) {
-    // Paint a slice of the vt100 screen into `area`, starting at `row_offset`.
-    // Caller is responsible for clearing the target area if needed.
+    // Paint a slice of the vt100 screen into `area`, starting at
+    // (`row_offset`, `col_offset`). Caller is responsible for clearing the
+    // target area if needed.
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -9581,7 +9584,7 @@ fn render_pty_screen(
     let buf = f.buffer_mut();
     for row in 0..visible_h {
         for col in 0..visible_w {
-            let Some(cell) = screen.cell(row_offset + row, col) else {
+            let Some(cell) = screen.cell(row_offset + row, col_offset + col) else {
                 continue;
             };
             let x = area.x + col;
@@ -9596,8 +9599,8 @@ fn render_pty_screen(
         let row = row
             .saturating_add(u16::try_from(screen.scrollback()).unwrap_or(u16::MAX))
             .saturating_sub(row_offset);
-        if row < area.height && col < area.width {
-            let x = area.x + col;
+        if row < area.height && col >= col_offset && col - col_offset < area.width {
+            let x = area.x + (col - col_offset);
             let y = area.y + row;
             if let Some(buf_cell) = f.buffer_mut().cell_mut(Position { x, y }) {
                 if screen
@@ -10160,6 +10163,7 @@ fn render_orchestrator_panel(f: &mut Frame, area: Rect, app: &mut App) {
         &app.theme,
         editor_area.is_none(),
         paint_row_offset,
+            0,
     );
     app.block_hits.insert(
         id,
@@ -10576,6 +10580,10 @@ fn render_program_hover_overlays(
             overlay.clip_bounds,
             &overlay.clip_hits,
             overlay.popup.pinned_clip.as_deref(),
+            (
+                overlay.popup.pinned_scroll_cols,
+                overlay.popup.pinned_scroll_rows,
+            ),
         );
         render_program_shimmer_hover(
             f,
@@ -11876,6 +11884,7 @@ fn render_program_clip_hover(
     modal: Rect,
     hits: &[crate::app::ProgramClipHit],
     pinned_session_id: Option<&str>,
+    pinned_pan: (u16, u16),
 ) {
     if let Some(pinned_session_id) = pinned_session_id {
         // Anchored to the clip's own position, not the mouse — a pinned card
@@ -11884,8 +11893,8 @@ fn render_program_clip_hover(
         // the pin itself is untouched, so scrolling back re-shows it.
         if let Some(hit) = hits.iter().find(|hit| hit.session_id == pinned_session_id) {
             // Remember the painted bounds for mouse routing: clicks inside
-            // the card are consumed; clicks landing neither here nor on a
-            // clip dismiss the pin (spec 0090).
+            // the card are consumed, wheel over it pans the crop; clicks
+            // landing neither here nor on a clip dismiss the pin (spec 0090).
             app.layout.program_pinned_card_rect = render_session_hover_card(
                 f,
                 app,
@@ -11893,8 +11902,9 @@ fn render_program_clip_hover(
                 pinned_session_id,
                 hit.col_start,
                 hit.row,
-                Some("pinned — type to send, Esc to unpin"),
+                Some("pinned — type to send, scroll to pan, Esc to unpin"),
                 true,
+                pinned_pan,
             );
         }
         return;
@@ -11909,7 +11919,8 @@ fn render_program_clip_hover(
     else {
         return;
     };
-    if render_session_hover_card(f, app, modal, &session_id, mx, my, None, false).is_some() {
+    if render_session_hover_card(f, app, modal, &session_id, mx, my, None, false, (0, 0)).is_some()
+    {
         return;
     }
     // No live preview (unknown session, or no captured output yet, per spec
@@ -11985,6 +11996,11 @@ fn session_hover_card_rect(
 /// a plain text tooltip.
 /// Returns the card's painted bounds, or `None` when nothing was painted
 /// (unknown session, no captured output yet, or no room to anchor it).
+/// `pan` is the pinned card's crop pan as `(cols, rows)` — columns right
+/// from the screen's left edge, rows back from the tail-anchored bottom
+/// (spec 0090); the plain hover card always passes `(0, 0)`. Both axes are
+/// clamped here against the actual content, so stale or over-scrolled
+/// offsets can never pan the crop past the screen into blank space.
 fn render_session_hover_card(
     f: &mut Frame,
     app: &mut App,
@@ -11994,6 +12010,7 @@ fn render_session_hover_card(
     anchor_row: u16,
     title: Option<&str>,
     focused: bool,
+    pan: (u16, u16),
 ) -> Option<Rect> {
     let Some(_s) = app.sessions.iter().find(|s| s.id == session_id) else {
         return None;
@@ -12067,15 +12084,17 @@ fn render_session_hover_card(
     // bottom of the *content* rather than the screen: for fullscreen harness
     // output (status bar on the last row) this is identical to the screen
     // tail, while a sparse session whose few lines sit at the top of a tall
-    // parser still shows them instead of a blank window.
-    render_pty_screen(
-        f,
-        inner,
-        out.screen,
-        &app.theme,
-        focused,
-        content_rows.saturating_sub(inner.height),
-    );
+    // parser still shows them instead of a blank window. The pan offsets
+    // shift that crop window — never the parser: rows step back from the
+    // tail, stopping at the content's top; columns pan right, stopping where
+    // the crop reaches the screen's right edge.
+    let (pan_cols, pan_rows) = pan;
+    let top = content_rows
+        .saturating_sub(inner.height)
+        .saturating_sub(pan_rows);
+    let screen_cols = out.screen.size().1;
+    let left = pan_cols.min(screen_cols.saturating_sub(inner.width));
+    render_pty_screen(f, inner, out.screen, &app.theme, focused, top, left);
     Some(area)
 }
 

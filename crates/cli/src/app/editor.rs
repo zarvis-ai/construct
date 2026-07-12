@@ -69,34 +69,53 @@ impl App {
                 self.session_title_menu = None;
             }
         }
-        // A pinned clip card (spec 0090) dismisses on any left click that
-        // lands neither on the card itself nor on a session clip: a click on
-        // the card is consumed here (mouse never forwards into the pinned
-        // session — spec 0090 keyboard-only scope — but the card reclaims
-        // keyboard focus, so a List-focused click resumes typing into the
-        // pin); a click on a clip is the pin toggle/switch affordance handled
-        // below; any other click — in the program body, on its chrome, or
-        // outside the modal entirely — unpins, then proceeds with the effect
-        // it always had.
-        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left))
-            && self
-                .program_popup
-                .as_ref()
-                .is_some_and(|popup| popup.pinned_clip.is_some())
+        // A pinned clip card (spec 0090) owns the mouse over its own bounds
+        // and dismisses on clicks elsewhere:
+        // - A left click on the card is consumed here (mouse never forwards
+        //   into the pinned session — keyboard-only scope — but the card
+        //   reclaims keyboard focus, so a List-focused click resumes typing
+        //   into the pin).
+        // - Wheel over the card pans its cropped viewport instead of
+        //   scrolling the doc: vertical steps back from the live tail the
+        //   card is anchored to; ScrollLeft/ScrollRight — or Shift+wheel for
+        //   terminals that never synthesize horizontal events — pans across
+        //   the screen width. Card-local: nothing forwards to the session.
+        // - A left click landing neither on the card nor on a session clip
+        //   (the pin's own toggle/switch affordance, handled below) — in the
+        //   program body, on its chrome, or outside the modal entirely —
+        //   unpins, then proceeds with the effect it always had.
+        if self
+            .program_popup
+            .as_ref()
+            .is_some_and(|popup| popup.pinned_clip.is_some())
         {
-            if self
+            let on_card = self
                 .layout
                 .program_pinned_card_rect
-                .is_some_and(|card| Self::rect_contains(card, ev.column, ev.row))
-            {
-                self.focus = PaneFocus::View;
-                self.set_program_terminal_focus(false);
-                return true;
-            }
-            if self.program_clip_session_at(ev.column, ev.row).is_none() {
-                if let Some(popup) = self.program_popup.as_mut() {
-                    popup.pinned_clip = None;
+                .is_some_and(|card| Self::rect_contains(card, ev.column, ev.row));
+            match ev.kind {
+                MouseEventKind::Down(MouseButton::Left) if on_card => {
+                    self.focus = PaneFocus::View;
+                    self.set_program_terminal_focus(false);
+                    return true;
                 }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if self.program_clip_session_at(ev.column, ev.row).is_none() {
+                        if let Some(popup) = self.program_popup.as_mut() {
+                            popup.set_pinned_clip(None);
+                        }
+                    }
+                }
+                MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+                    if on_card =>
+                {
+                    self.pan_pinned_clip_card(ev);
+                    return true;
+                }
+                _ => {}
             }
         }
         let contains = ev.column >= modal.x
@@ -305,7 +324,7 @@ impl App {
                 if is_double_click {
                     self.last_program_clip_click = None;
                     if let Some(popup) = self.program_popup.as_mut() {
-                        popup.pinned_clip = None;
+                        popup.set_pinned_clip(None);
                     }
                     if self.sessions.iter().any(|s| s.id == session_id) {
                         self.focus = PaneFocus::List;
@@ -321,12 +340,12 @@ impl App {
                 } else {
                     self.last_program_clip_click = Some((session_id.clone(), now));
                     if let Some(popup) = self.program_popup.as_mut() {
-                        popup.pinned_clip =
-                            if popup.pinned_clip.as_deref() == Some(session_id.as_str()) {
-                                None
-                            } else {
-                                Some(session_id)
-                            };
+                        let pinned = if popup.pinned_clip.as_deref() == Some(session_id.as_str()) {
+                            None
+                        } else {
+                            Some(session_id)
+                        };
+                        popup.set_pinned_clip(pinned);
                     }
                 }
                 return true;
@@ -637,6 +656,52 @@ impl App {
         }
     }
 
+    /// Pan the pinned clip card's cropped viewport by one wheel step (spec
+    /// 0090). Vertical steps back/forward through the tail-anchored content;
+    /// ScrollLeft/ScrollRight — or Shift+vertical-wheel, since not every
+    /// terminal synthesizes horizontal wheel events — pans across the screen
+    /// width. Offsets clamp loosely to the session's cached screen here; the
+    /// renderer clamps precisely against the visible content every frame, so
+    /// a pan can never scroll past the content into blank space for long.
+    fn pan_pinned_clip_card(&mut self, ev: &MouseEvent) {
+        let step = PROGRAM_WHEEL_SCROLL_ROWS as u16;
+        let dims = self
+            .program_popup
+            .as_ref()
+            .and_then(|popup| popup.pinned_clip.as_deref())
+            .and_then(|id| self.histories.get(id))
+            .and_then(|history| history.cached_dims());
+        let Some(popup) = self.program_popup.as_mut() else {
+            return;
+        };
+        let (max_cols, max_rows) = dims.unwrap_or((u16::MAX, u16::MAX));
+        let horizontal = ev.modifiers.contains(KeyModifiers::SHIFT);
+        match ev.kind {
+            MouseEventKind::ScrollUp if horizontal => {
+                popup.pinned_scroll_cols = popup.pinned_scroll_cols.saturating_sub(step);
+            }
+            MouseEventKind::ScrollDown if horizontal => {
+                popup.pinned_scroll_cols =
+                    popup.pinned_scroll_cols.saturating_add(step).min(max_cols);
+            }
+            MouseEventKind::ScrollUp => {
+                popup.pinned_scroll_rows =
+                    popup.pinned_scroll_rows.saturating_add(step).min(max_rows);
+            }
+            MouseEventKind::ScrollDown => {
+                popup.pinned_scroll_rows = popup.pinned_scroll_rows.saturating_sub(step);
+            }
+            MouseEventKind::ScrollLeft => {
+                popup.pinned_scroll_cols = popup.pinned_scroll_cols.saturating_sub(step);
+            }
+            MouseEventKind::ScrollRight => {
+                popup.pinned_scroll_cols =
+                    popup.pinned_scroll_cols.saturating_add(step).min(max_cols);
+            }
+            _ => {}
+        }
+    }
+
     /// Route a keypress to the Program popup's pinned clip, if one is
     /// pinned. `Esc` unpins; every other key encodes to raw PTY bytes and
     /// forwards to that clip's session — not `self.selected_id()`, since a
@@ -652,7 +717,7 @@ impl App {
         };
         if matches!(key.code, KeyCode::Esc) {
             if let Some(popup) = self.program_popup.as_mut() {
-                popup.pinned_clip = None;
+                popup.set_pinned_clip(None);
             }
             return true;
         }

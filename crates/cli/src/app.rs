@@ -2204,9 +2204,26 @@ pub struct ProgramPopup {
     /// of editing Program Markdown — see `App::handle_pinned_clip_key`.
     /// Per-popup, not on `App`, for the same reason as `terminal_focus`.
     pub pinned_clip: Option<String>,
+    /// Pinned-card crop pan (spec 0090): rows scrolled back from the live
+    /// tail the card is anchored to. Mouse wheel over the card adjusts it;
+    /// clamped precisely against the session's content at render time.
+    pub pinned_scroll_rows: u16,
+    /// Pinned-card crop pan (spec 0090): columns scrolled right from the
+    /// screen's left edge (ScrollLeft/ScrollRight or Shift+wheel).
+    pub pinned_scroll_cols: u16,
 }
 
 impl ProgramPopup {
+    /// Set, switch, or clear the pinned clip, resetting the card's crop pan:
+    /// a fresh pin (or unpin) always starts back at the live tail,
+    /// left-aligned. Every `pinned_clip` change goes through here so a pan
+    /// from a previous pin never bleeds into the next one.
+    pub(crate) fn set_pinned_clip(&mut self, pinned: Option<String>) {
+        self.pinned_clip = pinned;
+        self.pinned_scroll_rows = 0;
+        self.pinned_scroll_cols = 0;
+    }
+
     /// Flip keyboard focus between this rolled-down Program and the terminal
     /// it exposes. Every flip goes through here so the popup's terminal-focus
     /// slide animates instead of snapping: the current in-flight fraction is
@@ -11266,6 +11283,8 @@ fn program_popup_from_document(
         slide_from: 0.0,
         slide_changed_at: None,
         pinned_clip: None,
+        pinned_scroll_rows: 0,
+        pinned_scroll_cols: 0,
     }
 }
 
@@ -12106,6 +12125,8 @@ mod tests {
             slide_from: 0.0,
             slide_changed_at: None,
             pinned_clip: None,
+            pinned_scroll_rows: 0,
+            pinned_scroll_cols: 0,
         }
     }
 
@@ -13501,6 +13522,146 @@ mod tests {
             app.program_popup.as_ref().unwrap().pinned_clip,
             None,
             "the pin is dismissed on the way through"
+        );
+    }
+
+    /// Wheel over the pinned card pans its cropped viewport (spec 0090):
+    /// vertical steps back from the live tail; Shift+wheel and horizontal
+    /// wheel events pan across the screen width. Card-local — the pin
+    /// survives, and nothing forwards to the session. Unpinning resets the
+    /// pan so it never bleeds into the next pin.
+    #[tokio::test]
+    async fn program_wheel_over_pinned_card_pans_crop() {
+        use crate::pty_render::ItemHistory;
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
+        popup.pinned_clip = Some("worker1".to_string());
+        app.program_popup = Some(popup);
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_clip_hits = vec![program_clip_click_fixture("worker1")];
+        app.layout.program_pinned_card_rect = Some(ratatui::layout::Rect::new(15, 5, 20, 4));
+        let mut history = ItemHistory::new();
+        history.feed_pty(b"content");
+        let _ = history.replay(140, 40, 0);
+        app.histories.insert("worker1".into(), history);
+        let wheel = |kind, modifiers| MouseEvent {
+            kind,
+            column: 20,
+            row: 6,
+            modifiers,
+        };
+
+        let consumed = app
+            .handle_program_mouse(&wheel(
+                MouseEventKind::ScrollUp,
+                crossterm::event::KeyModifiers::empty(),
+            ))
+            .await;
+        assert!(consumed, "wheel over the card is consumed by the card");
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.pinned_scroll_rows, PROGRAM_WHEEL_SCROLL_ROWS as u16,
+            "wheel-up pans one step back from the tail"
+        );
+        assert_eq!(popup.pinned_clip.as_deref(), Some("worker1"), "pin survives");
+
+        app.handle_program_mouse(&wheel(
+            MouseEventKind::ScrollDown,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+        .await;
+        app.handle_program_mouse(&wheel(
+            MouseEventKind::ScrollDown,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_scroll_rows,
+            0,
+            "wheel-down returns toward the live tail and saturates at it"
+        );
+
+        app.handle_program_mouse(&wheel(
+            MouseEventKind::ScrollDown,
+            crossterm::event::KeyModifiers::SHIFT,
+        ))
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_scroll_cols,
+            PROGRAM_WHEEL_SCROLL_ROWS as u16,
+            "Shift+wheel pans horizontally"
+        );
+        app.handle_program_mouse(&wheel(
+            MouseEventKind::ScrollRight,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_scroll_cols,
+            2 * PROGRAM_WHEEL_SCROLL_ROWS as u16,
+            "a horizontal wheel event pans right"
+        );
+        app.handle_program_mouse(&wheel(
+            MouseEventKind::ScrollLeft,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_scroll_cols,
+            PROGRAM_WHEEL_SCROLL_ROWS as u16,
+            "a horizontal wheel event pans back left"
+        );
+
+        // Unpinning resets the pan; the next pin starts at the live tail.
+        app.handle_pinned_clip_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.pinned_clip, None);
+        assert_eq!(
+            (popup.pinned_scroll_rows, popup.pinned_scroll_cols),
+            (0, 0),
+            "unpin resets the crop pan"
+        );
+    }
+
+    /// Wheel outside the pinned card keeps scrolling the Program doc and
+    /// leaves both the pin and its pan untouched — only left clicks dismiss.
+    #[tokio::test]
+    async fn program_wheel_outside_pinned_card_scrolls_doc_and_keeps_pin() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
+        popup.pinned_clip = Some("worker1".to_string());
+        popup.pinned_scroll_rows = 7;
+        app.program_popup = Some(popup);
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_clip_hits = vec![program_clip_click_fixture("worker1")];
+        app.layout.program_pinned_card_rect = Some(ratatui::layout::Rect::new(15, 5, 20, 4));
+
+        let consumed = app
+            .handle_program_mouse(&MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: 1,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+            .await;
+
+        assert!(consumed, "the doc still consumes its own wheel events");
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.pinned_clip.as_deref(),
+            Some("worker1"),
+            "wheel off the card never dismisses the pin"
+        );
+        assert_eq!(
+            popup.pinned_scroll_rows, 7,
+            "wheel off the card does not pan the card"
         );
     }
 
@@ -16930,6 +17091,87 @@ mod tests {
                 .expect("parser cached after replay"),
             (140, 40),
             "pinned card must crop the session's existing viewport, not resize the shared parser"
+        );
+        server.abort();
+    }
+
+    /// The pinned card's pan offsets shift the crop window across the
+    /// session's cached screen (spec 0090): rows pan back from the
+    /// tail-anchored bottom (over-scroll clamps at the content top), columns
+    /// pan right (clamping at the screen's right edge). The parser is still
+    /// never resized.
+    #[tokio::test]
+    async fn program_pinned_clip_card_pans_crop_with_scroll_offsets() {
+        use crate::pty_render::ItemHistory;
+
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s2.id = "s2".into();
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "talk @{session:s2}", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.program_popup.as_mut().unwrap().pinned_clip = Some("s2".to_string());
+        app.mouse_pos = Some((0, 0));
+
+        // 30 content rows in a 140x40 parser: the 22-row card crops the tail,
+        // so TOP_MARKER (row 1) is above the default window. FAR_RIGHT sits
+        // past column 80, beyond the 64-col card window.
+        let mut feed = String::from("TOP_MARKER\r\n");
+        for n in 0..27 {
+            feed.push_str(&format!("filler {n:02}\r\n"));
+        }
+        feed.push_str(&format!("{}FAR_RIGHT\r\n", " ".repeat(80)));
+        feed.push_str("BOTTOM_MARKER");
+        let mut history = ItemHistory::new();
+        history.feed_pty(feed.as_bytes());
+        let _ = history.replay(140, 40, 0);
+        app.histories.insert("s2".into(), history);
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("BOTTOM_MARKER") && !text.contains("TOP_MARKER"),
+            "default crop is tail-anchored, top of content off-window: {text}"
+        );
+        assert!(
+            !text.contains("FAR_RIGHT"),
+            "default crop is left-aligned, far-right content off-window: {text}"
+        );
+
+        // Over-scrolled vertical pan clamps at the content's top.
+        app.program_popup.as_mut().unwrap().pinned_scroll_rows = 200;
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("TOP_MARKER"),
+            "panning back reveals the top of the content, clamped: {text}"
+        );
+
+        // Horizontal pan reveals content beyond the card's right edge,
+        // clamped so the crop never runs past the screen's width.
+        let popup = app.program_popup.as_mut().unwrap();
+        popup.pinned_scroll_rows = 0;
+        popup.pinned_scroll_cols = 500;
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("FAR_RIGHT"),
+            "panning right reveals far-right content, clamped at the screen edge: {text}"
+        );
+        assert_eq!(
+            app.histories
+                .get("s2")
+                .expect("history")
+                .cached_dims()
+                .expect("parser cached after replay"),
+            (140, 40),
+            "panning must never resize the shared parser"
         );
         server.abort();
     }
