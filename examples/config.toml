@@ -2,7 +2,7 @@
 #
 # Drop this at $CONSTRUCT_CONFIG_DIR/config.toml (default
 # ~/.config/construct/config.toml). All built-in adapters (shell, claude,
-# codex, antigravity, smith) are registered automatically — no config needed.
+# codex, antigravity, grok, smith) are registered automatically — no config needed.
 
 # Override the child command a built-in adapter launches without writing a
 # wrapper script. `CONSTRUCT_*_CMD` is split shell-style (quotes/backslashes
@@ -12,8 +12,8 @@
 # [adapters.codex]
 # env = { CONSTRUCT_CODEX_CMD = "exec codex" }
 #
-# Other built-ins use CONSTRUCT_CLAUDE_CMD, CONSTRUCT_ANTIGRAVITY_CMD, and
-# CONSTRUCT_SHELL_CMD.
+# Other built-ins use CONSTRUCT_CLAUDE_CMD, CONSTRUCT_ANTIGRAVITY_CMD,
+# CONSTRUCT_GROK_CMD, and CONSTRUCT_SHELL_CMD.
 
 # Add a custom adapter — just point to any binary that speaks the AHP
 # protocol. See `crates/protocol/src/adapter.rs` for the SDK helper.

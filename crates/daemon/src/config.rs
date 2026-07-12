@@ -25,7 +25,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # Active config:  ~/.config/construct/config.toml  (or $CONSTRUCT_CONFIG_DIR/config.toml)
 # This template:  ~/.config/construct/config.toml.template
 #
-# All built-in adapters (shell, claude, codex, antigravity, smith) are
+# All built-in adapters (shell, claude, codex, antigravity, grok, smith) are
 # registered automatically — you do not need to declare them unless you want
 # to change a field.
 
@@ -40,6 +40,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #   claude      — Claude Code (wraps the `claude` CLI)
 #   codex       — OpenAI Codex (wraps the `codex` CLI)
 #   antigravity — Google Antigravity (wraps the `agy` CLI)
+#   grok        — Grok CLI (wraps the `grok` CLI)
 #   smith       — native multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)
 
 # [adapters.shell]
@@ -61,6 +62,11 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # binary      = "construct"
 # args        = ["__adapter", "agy"]
 # description = "Google Antigravity (wraps the `agy` CLI)"
+
+# [adapters.grok]
+# binary      = "construct"
+# args        = ["__adapter", "grok"]
+# description = "Grok CLI (wraps the `grok` CLI)"
 
 # [adapters.smith]
 # binary      = "construct"
@@ -99,7 +105,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # the adapter's generated arguments. Wins over the binary-only CONSTRUCT_*_BIN.
 #
 # [adapters.codex.env]
-# CONSTRUCT_CODEX_CMD = "exec codex"        # also: CONSTRUCT_CLAUDE_CMD, CONSTRUCT_SHELL_CMD, CONSTRUCT_ANTIGRAVITY_CMD
+# CONSTRUCT_CODEX_CMD = "exec codex"        # also: CONSTRUCT_CLAUDE_CMD, CONSTRUCT_SHELL_CMD, CONSTRUCT_ANTIGRAVITY_CMD, CONSTRUCT_GROK_CMD
 
 # Usage-probe command ────────────────────────────────────────────────────────
 #
@@ -211,6 +217,12 @@ enabled = true
 # api_key_env = "GEMINI_API_KEY"
 # model       = "gemini-2.5-pro"
 
+# Grok / xAI direct API:
+# [smith.models.grok]
+# provider    = "grok"
+# api_key_env = "GROK_API_KEY"   # or XAI_API_KEY
+# model       = "grok-4.3"
+
 # ── Environment variable reference ────────────────────────────────────────────
 #
 # These env vars are read by the daemon or adapters at runtime. They are NOT
@@ -251,9 +263,12 @@ enabled = true
 #   CONSTRUCT_CLAUDE_CMD      — command prefix for the claude adapter
 #   CONSTRUCT_CODEX_CMD       — command prefix for the codex adapter
 #   CONSTRUCT_ANTIGRAVITY_CMD — command prefix for the antigravity adapter
+#   CONSTRUCT_GROK_CMD        — command prefix for the grok adapter
 #   CONSTRUCT_SHELL_CMD       — command prefix for the shell adapter
 #   CONSTRUCT_CLAUDE_BIN      — binary path fallback for the claude adapter
 #   CONSTRUCT_CODEX_BIN       — binary path fallback for the codex adapter
+#   CONSTRUCT_ANTIGRAVITY_BIN — binary path fallback for the antigravity adapter
+#   CONSTRUCT_GROK_BIN        — binary path fallback for the grok adapter
 "#;
 
 /// Kept for backwards-compat: `construct daemon default-config` and any
