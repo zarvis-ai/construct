@@ -864,12 +864,15 @@ impl App {
     }
 
     /// Route a keypress to the Program popup's pinned clip, if one is
-    /// pinned. `Esc` unpins and `Shift+arrows` pan the card's crop (spec
-    /// 0090) — the two deliberate key carve-outs that never reach the
-    /// session; every other key encodes to raw PTY bytes and forwards to
-    /// that clip's session — not `self.selected_id()`, since a pinned clip
-    /// is usually a different session than the one selected in the sidebar.
-    /// Returns `false` (nothing to do) when no clip is pinned.
+    /// pinned. `Shift+arrows` pan the card's crop (spec 0090) — the single
+    /// deliberate key carve-out that never reaches the session; every other
+    /// key, `Esc` included (sessions need Esc, e.g. to interrupt a harness
+    /// mid-turn), encodes to raw PTY bytes and forwards to that clip's
+    /// session — not `self.selected_id()`, since a pinned clip is usually a
+    /// different session than the one selected in the sidebar. Unpinning is
+    /// strictly a mouse gesture: click the pinned clip again, or click
+    /// anywhere outside the card. Returns `false` (nothing to do) when no
+    /// clip is pinned.
     pub(super) async fn handle_pinned_clip_key(&mut self, key: KeyEvent) -> bool {
         let Some(pinned_session_id) = self
             .program_popup
@@ -878,10 +881,6 @@ impl App {
         else {
             return false;
         };
-        if matches!(key.code, KeyCode::Esc) {
-            self.set_program_pinned_clip(None).await;
-            return true;
-        }
         // Keyboard pan: the guaranteed path on terminals that report neither
         // horizontal wheel events nor Shift/Alt-modified wheels (many
         // reserve Shift+wheel for native selection/scrollback and never send

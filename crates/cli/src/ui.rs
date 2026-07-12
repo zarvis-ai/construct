@@ -11899,9 +11899,9 @@ fn render_program_clip_hover(
             // A size-owning pin renders full-fidelity, so the pan hint only
             // applies to crop mode.
             let hint = if view.owned.is_some() {
-                "pinned — type to send, drag borders, Esc unpins"
+                "pinned — type to send, drag borders, click outside unpins"
             } else {
-                "pinned — type to send, scroll/Shift+arrows pan, Esc unpins"
+                "pinned — type to send, scroll/Shift+arrows pan, click outside unpins"
             };
             app.layout.program_pinned_card_rect = render_session_hover_card(
                 f,

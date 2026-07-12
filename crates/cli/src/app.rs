@@ -13687,8 +13687,7 @@ mod tests {
         );
 
         // Unpinning resets the pan; the next pin starts at the live tail.
-        app.handle_pinned_clip_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
-            .await;
+        app.set_program_pinned_clip(None).await;
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(popup.pinned_clip, None);
         assert_eq!(
@@ -14027,10 +14026,14 @@ mod tests {
         server.abort();
     }
 
-    /// Esc unpins the clip without forwarding any bytes to its session.
+    /// Esc is NOT an unpin key (spec 0090): sessions need it — interrupting
+    /// a harness mid-turn, dismissing its menus — so it forwards to the
+    /// pinned session's PTY like any other keystroke and the pin stays.
+    /// Unpinning is strictly a mouse gesture.
     #[tokio::test]
-    async fn pinned_clip_esc_unpins_without_forwarding() {
+    async fn pinned_clip_esc_forwards_to_session_and_keeps_pin() {
         let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
         let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
         popup.pinned_clip = Some("worker1".to_string());
         app.program_popup = Some(popup);
@@ -14042,11 +14045,14 @@ mod tests {
             .await;
 
         assert!(handled);
-        assert_eq!(app.program_popup.as_ref().unwrap().pinned_clip, None);
-        assert!(
-            rx.try_recv().is_err(),
-            "Esc must not forward any bytes to the (now former) pinned session"
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_clip.as_deref(),
+            Some("worker1"),
+            "Esc must not unpin"
         );
+        let job = rx.try_recv().expect("Esc forwards to the pinned session");
+        assert_eq!(job.session_id, "worker1");
+        assert_eq!(job.bytes, b"\x1b", "Esc reaches the session as a raw escape byte");
     }
 
     /// No clip pinned: the handler is a no-op that reports "not handled" so
