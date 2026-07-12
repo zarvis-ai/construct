@@ -35,7 +35,7 @@ Captioning the preview with the tooltip preserves the concise agent-authored sta
 ## Non-Goals
 
 - It does not change how shimmer or its tooltip is declared, addressed, or cleared (`0042`, `0048`, `0053`, `0057`); it only enriches how the tooltip is surfaced on hover in a surface that can render a session preview.
-- It does not make the preview persistent, pinned, or interactive; it is a transient hover affordance.
+- It does not make the preview persistent, pinned, or interactive; it is a transient hover affordance. (Superseded for the clip-chip hover card specifically by `0088`, which lets a click pin *that* card into a live, keyboard-focused terminal; the shimmer-text hover card described in this spec is unaffected and remains transient.)
 - It does not require the web program view to render the preview; cross-client parity (`0059`) may adopt or omit it.
 
 ## Examples

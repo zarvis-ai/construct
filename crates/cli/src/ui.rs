@@ -10452,7 +10452,13 @@ fn render_program_hover_overlays(
     now: Instant,
 ) {
     for overlay in hover_overlays {
-        render_program_clip_hover(f, app, overlay.clip_bounds, &overlay.clip_hits);
+        render_program_clip_hover(
+            f,
+            app,
+            overlay.clip_bounds,
+            &overlay.clip_hits,
+            overlay.popup.pinned_clip.as_deref(),
+        );
         render_program_shimmer_hover(
             f,
             app,
@@ -11739,15 +11745,39 @@ fn program_agent_edge_indicator_line(
 }
 
 /// Mini session-preview popover shown while the mouse hovers a `@{session:id}`
-/// smart-clip in the program body. Reads the freshly captured clip hitboxes,
-/// resolves the hovered session, and paints the shared session card anchored to
-/// the hovered chip. Persists for as long as the chip is hovered.
+/// smart-clip in the program body, OR — when a clip is pinned — a live,
+/// keyboard-focused terminal anchored to that clip regardless of the mouse
+/// (single-click pins a clip; see `App::handle_pinned_clip_key`). A pin takes
+/// priority: while one is active, no other clip's hover preview shows, to
+/// avoid two floating cards at once. Reads the freshly captured clip
+/// hitboxes, resolves the relevant session, and paints the shared session
+/// card anchored to the chip.
 fn render_program_clip_hover(
     f: &mut Frame,
     app: &mut App,
     modal: Rect,
     hits: &[crate::app::ProgramClipHit],
+    pinned_session_id: Option<&str>,
 ) {
+    if let Some(pinned_session_id) = pinned_session_id {
+        // Anchored to the clip's own position, not the mouse — a pinned card
+        // must stay put as the pointer moves. If the clip isn't among this
+        // frame's hits (scrolled out of view), simply don't paint anything;
+        // the pin itself is untouched, so scrolling back re-shows it.
+        if let Some(hit) = hits.iter().find(|hit| hit.session_id == pinned_session_id) {
+            render_session_hover_card(
+                f,
+                app,
+                modal,
+                pinned_session_id,
+                hit.col_start,
+                hit.row,
+                Some("pinned — type to send, Esc to unpin"),
+                true,
+            );
+        }
+        return;
+    }
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
@@ -11758,7 +11788,7 @@ fn render_program_clip_hover(
     else {
         return;
     };
-    if render_session_hover_card(f, app, modal, &session_id, mx, my, None) {
+    if render_session_hover_card(f, app, modal, &session_id, mx, my, None, false) {
         return;
     }
     // No live preview (unknown session, or no captured output yet, per spec
@@ -11826,9 +11856,12 @@ fn session_hover_card_rect(
 /// the program body without disturbing it. Used by the clip-chip hover, which
 /// previews the referenced session's terminal; always laid out wider than it
 /// is tall. When `title` is `Some`, it captions the card's top border
-/// (truncated to fit). Returns `true` when the card actually painted, `false`
-/// when there was nothing to show (unknown session, no captured output yet, or
-/// no room) so a caller can fall back to a plain text tooltip.
+/// (truncated to fit). `focused` marks a *pinned* card — accent border and a
+/// visible cursor, since it's live and keyboard-typeable, versus the plain
+/// muted-border read-only hover preview. Returns `true` when the card
+/// actually painted, `false` when there was nothing to show (unknown
+/// session, no captured output yet, or no room) so a caller can fall back to
+/// a plain text tooltip.
 fn render_session_hover_card(
     f: &mut Frame,
     app: &mut App,
@@ -11837,6 +11870,7 @@ fn render_session_hover_card(
     anchor_col: u16,
     anchor_row: u16,
     title: Option<&str>,
+    focused: bool,
 ) -> bool {
     let Some(_s) = app.sessions.iter().find(|s| s.id == session_id) else {
         return false;
@@ -11880,9 +11914,16 @@ fn render_session_hover_card(
     };
 
     f.render_widget(Clear, area);
+    let border_style = if focused {
+        Style::default()
+            .fg(app.theme.accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.theme.accent_alt)
+    };
     let mut card = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.accent_alt));
+        .border_style(border_style);
     if let Some(label) = title.map(str::trim).filter(|t| !t.is_empty()) {
         let label = format!(" {label} ");
         card = card.title(Span::styled(
@@ -11909,7 +11950,7 @@ fn render_session_hover_card(
         inner,
         out.screen,
         &app.theme,
-        false,
+        focused,
         content_rows.saturating_sub(inner.height),
     );
     true

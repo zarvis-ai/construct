@@ -107,6 +107,12 @@ pub(crate) const PROGRAM_RUN_DEDUP_WINDOW_MS: u64 = 1500;
 /// Grace window for ignoring a stale `program/state` clear that was queued
 /// before a just-adopted `program.execute` response run became visible.
 pub(crate) const PROGRAM_RUN_ADOPT_CLEAR_GRACE_MS: u64 = 1500;
+/// Max gap between two clicks on the same Program `@{session:…}` clip for the
+/// second to count as a double-click (navigate to the full session) rather
+/// than an independent single click (toggle the clip's pinned inline
+/// terminal). Matches common desktop double-click intervals; crossterm gives
+/// only raw mouse-down events, so this timing is owned here.
+pub(crate) const PROGRAM_CLIP_DOUBLE_CLICK_MS: u64 = 400;
 /// One-shot flourish shown when an authoritative program Run pending block
 /// settles. Presentation-only and client-local.
 pub(crate) const PROGRAM_SETTLE_FLASH_MS: u64 = 300;
@@ -1454,6 +1460,14 @@ pub struct App {
     /// stops receiving mouse events so the user's terminal can perform
     /// native drag selection/copy.
     pub mouse_capture_enabled: bool,
+    /// `(session_id, click_instant)` of the last click on a Program
+    /// `@{session:…}` clip chip, used to detect a double-click within
+    /// `PROGRAM_CLIP_DOUBLE_CLICK_MS` on the *same* clip — crossterm only
+    /// reports raw mouse-down events, so double-click detection is timing
+    /// state we own. A single click pins/unpins the clip's inline terminal
+    /// (`ProgramPopup::pinned_clip`); a double-click navigates to the full
+    /// session view, same as every click did before pinning existed.
+    pub last_program_clip_click: Option<(String, Instant)>,
     /// ID of the daemon-owned orchestrator session, if one is present
     /// in the sessions list. The orchestrator runs as a smith
     /// interactive (PTY) session; the TUI renders its PTY in the
@@ -2179,6 +2193,14 @@ pub struct ProgramPopup {
     /// focus via [`ProgramPopup::set_terminal_focus`].
     pub slide_from: f32,
     pub slide_changed_at: Option<Instant>,
+    /// Session id of the `@{session:…}` clip currently pinned open as a live,
+    /// keyboard-focused inline terminal, or `None`. Single-clicking a clip
+    /// pins it (clicking the same pinned clip again unpins); double-clicking
+    /// navigates to the full session view instead, same as before this
+    /// existed. While pinned, keystrokes route to this session's PTY instead
+    /// of editing Program Markdown — see `App::handle_pinned_clip_key`.
+    /// Per-popup, not on `App`, for the same reason as `terminal_focus`.
+    pub pinned_clip: Option<String>,
 }
 
 impl ProgramPopup {
@@ -3487,6 +3509,7 @@ async fn run_with_socket_initial_selection(
         mouse_pos: None,
         mouse_moved_at: None,
         mouse_capture_enabled: true,
+        last_program_clip_click: None,
         orchestrator_id: initial_orch_id,
         list_panel_w: persisted.list_panel_w.unwrap_or(LIST_PANEL_W_DEFAULT),
         resizing_list: None,
@@ -8807,6 +8830,17 @@ impl App {
                 return;
             }
         }
+        // A pinned clip's inline terminal owns keyboard focus while pinned
+        // (same tier as the program popup itself, checked first so the pinned
+        // terminal — not the Program markdown editor — receives keystrokes).
+        // Esc unpins and falls through to nothing further this keypress,
+        // mirroring `/configure`'s "close and stop" for Esc specifically;
+        // every other key forwards to the pinned session's PTY and is always
+        // considered handled, since there is no sensible fallback routing for
+        // a keystroke the user typed while looking at a live terminal.
+        if self.focus == PaneFocus::View && self.handle_pinned_clip_key(key).await {
+            return;
+        }
         // The program captures keystrokes only while it is the topmost input
         // surface *and* the view pane holds focus. If a minibuffer/palette
         // overlay is open over it (e.g. `C-x x` opened the command palette or
@@ -11223,6 +11257,7 @@ fn program_popup_from_document(
         terminal_focus: false,
         slide_from: 0.0,
         slide_changed_at: None,
+        pinned_clip: None,
     }
 }
 
@@ -11761,6 +11796,7 @@ mod tests {
             mouse_pos: None,
             mouse_moved_at: None,
             mouse_capture_enabled: true,
+            last_program_clip_click: None,
             orchestrator_id: None,
             list_panel_w: LIST_PANEL_W_DEFAULT,
             resizing_list: None,
@@ -12059,6 +12095,7 @@ mod tests {
             terminal_focus: false,
             slide_from: 0.0,
             slide_changed_at: None,
+            pinned_clip: None,
         }
     }
 
@@ -13173,15 +13210,18 @@ mod tests {
             session_id: "sub1".into(),
         }];
 
-        // Click the clip.
-        let consumed = app
-            .handle_program_mouse(&MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 10,
-                row: 3,
-                modifiers: crossterm::event::KeyModifiers::empty(),
-            })
-            .await;
+        // Double-click the clip — a single click now pins its inline
+        // terminal instead of navigating (spec: pinned clip terminal); a
+        // second click on the same clip within the double-click window is
+        // still the navigate gesture this test exercises.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        app.handle_program_mouse(&click).await;
+        let consumed = app.handle_program_mouse(&click).await;
         assert!(
             consumed,
             "clip click is handled by the program mouse router"
@@ -13204,6 +13244,208 @@ mod tests {
             Some("sub1"),
             "subagent clip selection must persist across a session refresh"
         );
+    }
+
+    fn program_clip_click_fixture(session_id: &str) -> ProgramClipHit {
+        ProgramClipHit {
+            col_start: 4,
+            col_end: 16,
+            row: 3,
+            session_id: session_id.to_string(),
+        }
+    }
+
+    /// A single click on a clip pins its inline terminal instead of
+    /// navigating away — the user stays on the Program doc.
+    #[tokio::test]
+    async fn program_clip_single_click_pins_without_navigating() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "see @{session:worker1}", 0));
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_clip_hits = vec![program_clip_click_fixture("worker1")];
+
+        let consumed = app
+            .handle_program_mouse(&MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 10,
+                row: 3,
+                modifiers: crossterm::event::KeyModifiers::empty(),
+            })
+            .await;
+
+        assert!(consumed, "clip click is handled");
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_clip.as_deref(),
+            Some("worker1"),
+            "single click pins the clip"
+        );
+        assert_eq!(
+            app.selection.session_id(),
+            Some("s1"),
+            "single click must not navigate away from the Program doc"
+        );
+    }
+
+    /// A second click on the same clip, well outside the double-click
+    /// window, is an independent click — it toggles the pin off rather than
+    /// counting as a double-click navigate.
+    #[tokio::test]
+    async fn program_clip_slow_second_click_unpins_instead_of_navigating() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "see @{session:worker1}", 0));
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_clip_hits = vec![program_clip_click_fixture("worker1")];
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+
+        app.handle_program_mouse(&click).await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_clip.as_deref(),
+            Some("worker1")
+        );
+        // Simulate enough elapsed time that the next click falls outside the
+        // double-click window, without an actual sleep.
+        app.last_program_clip_click = app.last_program_clip_click.take().map(|(id, _)| {
+            (
+                id,
+                Instant::now() - Duration::from_millis(PROGRAM_CLIP_DOUBLE_CLICK_MS + 50),
+            )
+        });
+
+        app.handle_program_mouse(&click).await;
+
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_clip,
+            None,
+            "a slow second click unpins rather than navigating"
+        );
+        assert_eq!(app.selection.session_id(), Some("s1"), "still no navigation");
+    }
+
+    /// Clicking a different clip while one is pinned switches the pin to it
+    /// rather than requiring an explicit unpin first.
+    #[tokio::test]
+    async fn program_clip_click_different_clip_switches_pin() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test(
+            "s1",
+            "see @{session:worker1} and @{session:worker2}",
+            0,
+        ));
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_clip_hits = vec![
+            program_clip_click_fixture("worker1"),
+            ProgramClipHit {
+                col_start: 20,
+                col_end: 32,
+                row: 3,
+                session_id: "worker2".into(),
+            },
+        ];
+
+        app.handle_program_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_clip.as_deref(),
+            Some("worker1")
+        );
+
+        app.handle_program_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 25,
+            row: 3,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_clip.as_deref(),
+            Some("worker2"),
+            "clicking a different clip switches the pin rather than requiring an unpin first"
+        );
+    }
+
+    /// While a clip is pinned, keystrokes forward to *that* session's PTY —
+    /// not `self.selected_id()`, which is usually a different session (the
+    /// Program-owning session, not the worker the clip names).
+    #[tokio::test]
+    async fn pinned_clip_key_forwards_to_pinned_session_not_selected_session() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
+        popup.pinned_clip = Some("worker1".to_string());
+        app.program_popup = Some(popup);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        let handled = app
+            .handle_pinned_clip_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        assert!(handled);
+        let job = rx.try_recv().expect("keystroke should reach the pinned session's PTY");
+        assert_eq!(job.session_id, "worker1", "forwards to the pinned clip, not the selected session");
+        assert_eq!(job.bytes, b"y");
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().buffer,
+            "see @{session:worker1}",
+            "the Program buffer itself is untouched while a clip is pinned"
+        );
+        server.abort();
+    }
+
+    /// Esc unpins the clip without forwarding any bytes to its session.
+    #[tokio::test]
+    async fn pinned_clip_esc_unpins_without_forwarding() {
+        let (mut app, _dir, _server) = empty_app().await;
+        let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
+        popup.pinned_clip = Some("worker1".to_string());
+        app.program_popup = Some(popup);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+
+        let handled = app
+            .handle_pinned_clip_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        assert!(handled);
+        assert_eq!(app.program_popup.as_ref().unwrap().pinned_clip, None);
+        assert!(
+            rx.try_recv().is_err(),
+            "Esc must not forward any bytes to the (now former) pinned session"
+        );
+    }
+
+    /// No clip pinned: the handler is a no-op that reports "not handled" so
+    /// the key falls through to ordinary Program-editor routing.
+    #[tokio::test]
+    async fn pinned_clip_key_handler_is_noop_when_nothing_pinned() {
+        let (mut app, _dir, _server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "plain text", 0));
+
+        let handled = app
+            .handle_pinned_clip_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .await;
+
+        assert!(!handled);
     }
 
     #[tokio::test]
@@ -16512,6 +16754,61 @@ mod tests {
             .expect("history")
             .replay(140, 40, 0);
         assert_eq!(out.screen.size(), (40, 140));
+        server.abort();
+    }
+
+    /// A pinned clip's card renders regardless of the mouse position (unlike
+    /// the plain hover card, which only shows under the pointer), stays
+    /// anchored to the clip's own position, and — like the hover card —
+    /// crops the session's existing viewport rather than resizing the shared
+    /// parser to its own preview size.
+    #[tokio::test]
+    async fn program_pinned_clip_card_renders_regardless_of_mouse_and_crops_shared_parser() {
+        use crate::pty_render::ItemHistory;
+
+        let (mut app, _dir, server) = empty_app().await;
+        let mut s1 = summary_with_kind(construct_protocol::SessionKind::User);
+        let mut s2 = summary_with_kind(construct_protocol::SessionKind::User);
+        s1.id = "s1".into();
+        s2.id = "s2".into();
+        app.sessions = vec![s1, s2];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "talk @{session:s2}", 0));
+        app.program_popup.as_mut().unwrap().revealed_at =
+            Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        app.program_popup.as_mut().unwrap().pinned_clip = Some("s2".to_string());
+
+        let mut history = ItemHistory::new();
+        history.feed_pty(b"PINNED_CARD_MARKER\nsecond line");
+        let _ = history.replay(140, 40, 0);
+        app.histories.insert("s2".into(), history);
+
+        // Mouse is nowhere near the clip — a plain hover card would show
+        // nothing here, but a pinned card must render anyway.
+        app.mouse_pos = Some((0, 0));
+
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("pinned card should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("PINNED_CARD_"),
+            "pinned card should show the session's live output even with the mouse elsewhere: {text}"
+        );
+        assert!(
+            text.contains("pinned"),
+            "pinned card should visually indicate it's pinned/typeable: {text}"
+        );
+        assert_eq!(
+            app.histories
+                .get("s2")
+                .expect("history")
+                .cached_dims()
+                .expect("parser cached after replay"),
+            (140, 40),
+            "pinned card must crop the session's existing viewport, not resize the shared parser"
+        );
         server.abort();
     }
 

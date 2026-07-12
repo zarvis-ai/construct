@@ -253,21 +253,51 @@ impl App {
                 return true;
             }
         }
-        // Clicking a session smart-clip focuses that session, just like clicking
-        // its row in the session list. The program follows selection, so the
-        // clicked session's program reveals in place.
+        // Clicking a session smart-clip: a double-click (within
+        // PROGRAM_CLIP_DOUBLE_CLICK_MS, same clip) navigates to the full
+        // session view, just like every click did before pinning existed. A
+        // single click instead toggles the clip's inline terminal pinned
+        // open — clicking the same pinned clip again unpins it; clicking a
+        // different clip switches the pin to it. Pinning lets the user
+        // answer a verb session's questions (e.g. `interview`) without
+        // leaving the Program doc.
         if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
             if let Some(session_id) = self.program_clip_session_at(ev.column, ev.row) {
-                if self.sessions.iter().any(|s| s.id == session_id) {
-                    self.focus = PaneFocus::List;
-                    self.select_session(session_id);
-                    // Point the active window pane at the target too — the main
-                    // view renders from the pane's selection, not `self.selection`
-                    // directly (see `render_main_windows`). The list-row click and
-                    // the switch/new/fork paths all do this; without it the clip
-                    // updates the selection but the pane keeps rendering the old
-                    // session, so the switch never visibly lands.
-                    self.sync_active_window_selection();
+                let now = Instant::now();
+                let is_double_click =
+                    self.last_program_clip_click
+                        .as_ref()
+                        .is_some_and(|(id, at)| {
+                            id == &session_id
+                                && now.saturating_duration_since(*at)
+                                    < Duration::from_millis(PROGRAM_CLIP_DOUBLE_CLICK_MS)
+                        });
+                if is_double_click {
+                    self.last_program_clip_click = None;
+                    if let Some(popup) = self.program_popup.as_mut() {
+                        popup.pinned_clip = None;
+                    }
+                    if self.sessions.iter().any(|s| s.id == session_id) {
+                        self.focus = PaneFocus::List;
+                        self.select_session(session_id);
+                        // Point the active window pane at the target too — the main
+                        // view renders from the pane's selection, not `self.selection`
+                        // directly (see `render_main_windows`). The list-row click and
+                        // the switch/new/fork paths all do this; without it the clip
+                        // updates the selection but the pane keeps rendering the old
+                        // session, so the switch never visibly lands.
+                        self.sync_active_window_selection();
+                    }
+                } else {
+                    self.last_program_clip_click = Some((session_id.clone(), now));
+                    if let Some(popup) = self.program_popup.as_mut() {
+                        popup.pinned_clip =
+                            if popup.pinned_clip.as_deref() == Some(session_id.as_str()) {
+                                None
+                            } else {
+                                Some(session_id)
+                            };
+                    }
                 }
                 return true;
             }
@@ -575,6 +605,31 @@ impl App {
         if let Some(before) = before {
             self.flush_program_live_edit(before).await;
         }
+    }
+
+    /// Route a keypress to the Program popup's pinned clip, if one is
+    /// pinned. `Esc` unpins; every other key encodes to raw PTY bytes and
+    /// forwards to that clip's session — not `self.selected_id()`, since a
+    /// pinned clip is usually a different session than the one selected in
+    /// the sidebar. Returns `false` (nothing to do) when no clip is pinned.
+    pub(super) async fn handle_pinned_clip_key(&mut self, key: KeyEvent) -> bool {
+        let Some(pinned_session_id) = self
+            .program_popup
+            .as_ref()
+            .and_then(|popup| popup.pinned_clip.clone())
+        else {
+            return false;
+        };
+        if matches!(key.code, KeyCode::Esc) {
+            if let Some(popup) = self.program_popup.as_mut() {
+                popup.pinned_clip = None;
+            }
+            return true;
+        }
+        if let Some(bytes) = encode_key_to_bytes(key) {
+            self.queue_pty_input(pinned_session_id, bytes, "pinned_clip_pty_input");
+        }
+        true
     }
 
     async fn handle_program_selection_menu_key(&mut self, key: KeyEvent) -> bool {
