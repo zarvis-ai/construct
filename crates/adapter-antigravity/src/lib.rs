@@ -55,6 +55,7 @@ use construct_protocol::{
     SessionState,
 };
 use construct_adapter_common::{drive_turn, next_native_seq, TurnOutcome};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -149,6 +150,158 @@ fn transcript_path(conversation_id: &str) -> Option<PathBuf> {
             .join("logs")
             .join("transcript.jsonl"),
     )
+}
+
+/// Agy's own per-conversation sqlite database. Unlike `transcript.jsonl`
+/// (which has no model field), its `gen_metadata` table carries a blob per
+/// generation that — best effort — embeds the active model. See
+/// `model_from_gen_metadata_blob`.
+fn conversation_db_path(conversation_id: &str) -> Option<PathBuf> {
+    Some(
+        antigravity_home()?
+            .join("conversations")
+            .join(format!("{conversation_id}.db")),
+    )
+}
+
+/// Printable-ASCII byte runs (length >= 4) found in a raw blob. Used to
+/// best-effort scrape a model name out of `gen_metadata`'s binary/protobuf
+/// blob without a real schema for it.
+fn ascii_strings(data: &[u8]) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, &b) in data.iter().enumerate() {
+        let printable = (0x20..=0x7e).contains(&b);
+        match (printable, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                if i - s >= 4 {
+                    if let Ok(text) = std::str::from_utf8(&data[s..i]) {
+                        out.push(text);
+                    }
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        if data.len() - s >= 4 {
+            if let Ok(text) = std::str::from_utf8(&data[s..]) {
+                out.push(text);
+            }
+        }
+    }
+    out
+}
+
+const MODEL_DISPLAY_QUALIFIERS: [&str; 9] = [
+    "High", "Low", "Medium", "Fast", "Standard", "Balanced", "Thinking", "Pro", "Preview",
+];
+
+const MODEL_ID_PREFIXES: [&str; 7] =
+    ["gemini-", "claude-", "gpt-", "grok-", "o1-", "o3-", "o4-"];
+
+/// A `Title Case Words (Qualifier)` display label, e.g.
+/// `"Gemini 3.5 Flash (High)"`.
+fn looks_like_model_display_label(s: &str) -> bool {
+    let s = s.trim();
+    if !s.ends_with(')') {
+        return false;
+    }
+    let Some(open) = s.rfind('(') else {
+        return false;
+    };
+    let qualifier = &s[open + 1..s.len() - 1];
+    if !MODEL_DISPLAY_QUALIFIERS.contains(&qualifier) {
+        return false;
+    }
+    let head = s[..open].trim();
+    head.chars().next().map(|c| c.is_ascii_uppercase()) == Some(true)
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c.is_whitespace() || c == '.')
+}
+
+/// A bare kebab-case model id with a known vendor prefix, e.g.
+/// `"gemini-3-flash-agent"`.
+fn looks_like_model_id(s: &str) -> bool {
+    MODEL_ID_PREFIXES.iter().any(|p| s.starts_with(p))
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+}
+
+/// Best-effort extraction of the model a `gen_metadata` row's blob was
+/// generated with. The blob is a binary/protobuf-shaped internal format we
+/// have no schema for, so this scrapes its printable-ASCII strings for
+/// known shapes rather than parsing it properly. Expected to degrade to
+/// `None`, never panic, if agy's internal format changes.
+fn model_from_gen_metadata_blob(data: &[u8]) -> Option<String> {
+    let strings = ascii_strings(data);
+    // Strongest signal: agy's own explicit record of a model switch, e.g.
+    // "The user changed setting `Model Selection` from X to Gemini 3.5
+    // Flash (High)." — self-describing, so trust it over any inference.
+    const MARKER: &str = "Model Selection` from ";
+    for s in &strings {
+        if let Some(idx) = s.find(MARKER) {
+            let rest = &s[idx + MARKER.len()..];
+            if let Some(to_idx) = rest.find(" to ") {
+                let after_to = rest[to_idx + " to ".len()..].trim();
+                // The whole printable run this sentence lives in can carry
+                // unrelated trailing prose with no boundary of its own (real
+                // agy blobs append more instructions right after), so the
+                // first bare '.' (which also matches the decimal point in
+                // e.g. "3.5") is not a safe bound. The model name's own
+                // closing paren ("... (High)") is: take through the first
+                // ")." pair. Bare names with no qualifier fall back to a
+                // short bounded window so a match never runs away into
+                // unrelated text.
+                let model = if let Some(paren_end) = after_to.find(").") {
+                    after_to[..=paren_end].trim()
+                } else {
+                    let bounded = &after_to[..after_to.len().min(80)];
+                    let end = bounded.find(". ").unwrap_or(bounded.len());
+                    bounded[..end].trim()
+                };
+                if !model.is_empty() {
+                    return Some(model.to_string());
+                }
+            }
+        }
+    }
+    if let Some(s) = strings.iter().find(|s| looks_like_model_display_label(s)) {
+        return Some(s.trim().to_string());
+    }
+    if let Some(s) = strings.iter().find(|s| looks_like_model_id(s)) {
+        return Some((*s).to_string());
+    }
+    None
+}
+
+/// Poll `conversations/<id>.db`'s `gen_metadata` table for rows newer than
+/// `after_idx`. Returns the highest idx seen (so the caller can advance its
+/// high-water mark even when no row yields a recognizable model) and the
+/// most recent model extracted from any new row.
+fn poll_gen_metadata_model(
+    db_path: &Path,
+    after_idx: i64,
+) -> Result<(i64, Option<String>), rusqlite::Error> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    conn.busy_timeout(Duration::from_millis(200))?;
+    let mut stmt =
+        conn.prepare("SELECT idx, data FROM gen_metadata WHERE idx > ?1 ORDER BY idx ASC")?;
+    let mut rows = stmt.query([after_idx])?;
+    let mut high = after_idx;
+    let mut model = None;
+    while let Some(row) = rows.next()? {
+        let idx: i64 = row.get(0)?;
+        let data: Vec<u8> = row.get(1)?;
+        high = high.max(idx);
+        if let Some(m) = model_from_gen_metadata_blob(&data) {
+            model = Some(m);
+        }
+    }
+    Ok((high, model))
 }
 
 /// File where we stash the conversation id so a daemon restart can
@@ -271,10 +424,19 @@ fn spawn_interactive_transcript_watcher(
         let mut skip_next_transcript = skip_existing && conv_id.is_some();
         let mut children: HashMap<String, AntigravityNativeChild> = HashMap::new();
         let mut child_seq: HashMap<String, u64> = HashMap::new();
+        // Best-effort model capture (see `model_from_gen_metadata_blob`):
+        // polled far less often than the transcript, since it's a
+        // heuristic scrape of a separate per-conversation sqlite db, not a
+        // latency-sensitive signal.
+        let mut last_model: Option<String> = None;
+        let mut last_gen_idx: i64 = -1;
+        let mut gen_metadata_error_logged = false;
+        let mut tick_count: u64 = 0;
         let mut tick = tokio::time::interval(Duration::from_millis(500));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
+            tick_count += 1;
 
             // Always re-scan the log. Agy appends another
             // "Created conversation" after /clear; parse returns the last
@@ -294,6 +456,9 @@ fn spawn_interactive_transcript_watcher(
                             conv_id = Some(id);
                             last_step = -1;
                             children.clear();
+                            // A new conversation has its own gen_metadata db.
+                            last_gen_idx = -1;
+                            gen_metadata_error_logged = false;
                             // Only the initial resume attach skips history.
                             skip_next_transcript = false;
                         }
@@ -359,6 +524,33 @@ fn spawn_interactive_transcript_watcher(
                 &mut children,
                 Some(&emit),
             );
+
+            // Best-effort model capture, throttled to ~every 2s.
+            if tick_count % 4 == 0 {
+                if let Some(db_path) = conversation_db_path(id) {
+                    if db_path.exists() {
+                        match poll_gen_metadata_model(&db_path, last_gen_idx) {
+                            Ok((high, model)) => {
+                                last_gen_idx = high;
+                                if let Some(model) = model {
+                                    if last_model.as_deref() != Some(model.as_str()) {
+                                        last_model = Some(model.clone());
+                                        emit.emit(SessionEvent::ModelChanged { model });
+                                    }
+                                }
+                            }
+                            Err(e) if !gen_metadata_error_logged => {
+                                gen_metadata_error_logged = true;
+                                emit.log(format!(
+                                    "antigravity: gen_metadata model capture failed (best effort, \
+                                     won't retry logging): {e}"
+                                ));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -985,5 +1177,95 @@ mod tests {
             "content": "command output: {\"conversationId\":\"825753eb-7780-4b85-a59b-f86fe4972dd9\"}"
         });
         assert!(antigravity_spawned_subagent_ids(&value).is_empty());
+    }
+
+    /// Builds a synthetic `gen_metadata`-shaped blob: binary filler bytes
+    /// (mimicking protobuf framing we don't parse) around embedded
+    /// printable strings — never real captured session data.
+    fn synthetic_blob(strings: &[&str]) -> Vec<u8> {
+        let mut out = vec![0x00, 0x01, 0xff, 0xfe, 0x02];
+        for s in strings {
+            out.extend_from_slice(s.as_bytes());
+            out.extend_from_slice(&[0x00, 0x03, 0xff]);
+        }
+        out
+    }
+
+    #[test]
+    fn ascii_strings_skips_short_and_binary_runs() {
+        let blob = synthetic_blob(&["hi", "a real string here"]);
+        let strings = ascii_strings(&blob);
+        // "hi" is below the length-4 floor and must not appear.
+        assert!(!strings.contains(&"hi"));
+        assert!(strings.contains(&"a real string here"));
+    }
+
+    #[test]
+    fn ascii_strings_empty_on_pure_binary() {
+        assert!(ascii_strings(&[0x00, 0x01, 0xff, 0xfe]).is_empty());
+    }
+
+    #[test]
+    fn model_from_blob_prefers_switch_sentence_over_display_label() {
+        let blob = synthetic_blob(&[
+            "Gemini 2.5 Pro (Standard)",
+            "The user changed setting `Model Selection` from None to Gemini 3.5 Flash (High).",
+        ]);
+        assert_eq!(
+            model_from_gen_metadata_blob(&blob).as_deref(),
+            Some("Gemini 3.5 Flash (High)")
+        );
+    }
+
+    #[test]
+    fn model_from_blob_switch_sentence_stops_at_closing_paren_not_first_period() {
+        // Real agy blobs keep the sentence and unrelated trailing prose in
+        // one continuous printable run with no separator of their own — a
+        // regression case: naive truncation at the first '.' would stop
+        // inside "3.5" (a decimal point), and truncation at the last '.' in
+        // the whole string would swallow the trailing prose too.
+        let sentence = "The user changed setting `Model Selection` from None to Gemini 3.5 \
+                         Flash (High). No need to comment on this change if the user doesn't \
+                         ask about it.";
+        let mut blob = vec![0x00, 0x01, 0xff];
+        blob.extend_from_slice(sentence.as_bytes());
+        blob.extend_from_slice(&[0x00, 0x02]);
+        assert_eq!(
+            model_from_gen_metadata_blob(&blob).as_deref(),
+            Some("Gemini 3.5 Flash (High)")
+        );
+    }
+
+    #[test]
+    fn model_from_blob_finds_display_label_without_sentence() {
+        let blob = synthetic_blob(&["model_enum", "Gemini 3.5 Flash (High)"]);
+        assert_eq!(
+            model_from_gen_metadata_blob(&blob).as_deref(),
+            Some("Gemini 3.5 Flash (High)")
+        );
+    }
+
+    #[test]
+    fn model_from_blob_falls_back_to_bare_model_id() {
+        let blob = synthetic_blob(&["gemini-3-flash-agent"]);
+        assert_eq!(
+            model_from_gen_metadata_blob(&blob).as_deref(),
+            Some("gemini-3-flash-agent")
+        );
+    }
+
+    #[test]
+    fn model_from_blob_none_when_nothing_matches() {
+        let blob = synthetic_blob(&["used_non_gemini_model", "MODEL_PLACEHOLDER_M132"]);
+        assert_eq!(model_from_gen_metadata_blob(&blob), None);
+    }
+
+    #[test]
+    fn model_from_blob_handles_empty_and_binary_only() {
+        assert_eq!(model_from_gen_metadata_blob(&[]), None);
+        assert_eq!(
+            model_from_gen_metadata_blob(&[0x00, 0x01, 0xff, 0xfe]),
+            None
+        );
     }
 }

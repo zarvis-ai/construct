@@ -145,6 +145,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     app.layout.main_window_areas.clear();
     app.layout.main_window_dividers.clear();
     app.layout.session_title_name_hits.clear();
+    app.layout.session_harness_hits.clear();
     app.layout.lineage_area = None;
     app.layout.lineage_header_hit = None;
     app.layout.lineage_collapse_hit = None;
@@ -311,6 +312,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_list_title_button_tooltips(f, app);
     render_view_uncollapse_tooltip(f, app);
     render_harness_unavailable_tooltip(f, app);
+    render_harness_model_tooltip(f, app);
     render_modeline_approval_mode_tooltip(f, app);
     render_modeline_version_notice_tooltip(f, app);
     render_modeline_theme_tooltip(f, app);
@@ -889,6 +891,25 @@ pub fn dynamic_ui_trigger_range(
     (x_end.saturating_sub(label_width), x_end, view_area.y)
 }
 
+/// On-screen span of the harness label itself on a pane's top border —
+/// unlike `dynamic_ui_trigger_range` (which computes a cluster sitting to
+/// the *left* of the harness label, reserving a separator for it), this is
+/// the harness label's own range, immediately left of the close button with
+/// no further reservation beyond that one separator.
+pub fn harness_title_range(view_area: Rect, close_width: u16, harness_width: u16) -> (u16, u16, u16) {
+    let titles_right = view_area
+        .x
+        .saturating_add(view_area.width)
+        .saturating_sub(1);
+    let close_reserved = if close_width > 0 {
+        close_width.saturating_add(1)
+    } else {
+        0
+    };
+    let x_end = titles_right.saturating_sub(close_reserved);
+    (x_end.saturating_sub(harness_width), x_end, view_area.y)
+}
+
 fn session_sticky_widget_panels(app: &App, session_id: &str) -> Vec<construct_protocol::UiPanel> {
     let Some(panels) = app.ui_panels.get(session_id) else {
         return Vec::new();
@@ -1186,6 +1207,31 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
             height: h,
         },
     );
+}
+
+/// Tooltip showing a session's current model when hovering its harness
+/// name — either its session-list row or a session view's title bar (both
+/// push into the same `app.layout.session_harness_hits`). Shows "unknown"
+/// rather than nothing when the harness hasn't reported a model — only
+/// `smith`/`grok` (and agy, best effort) track it live today; others show
+/// whatever was requested at spawn, if anything.
+fn render_harness_model_tooltip(f: &mut Frame, app: &App) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    let Some(hit) = app
+        .layout
+        .session_harness_hits
+        .iter()
+        .find(|h| h.contains(mx, my))
+    else {
+        return;
+    };
+    let Some(s) = app.sessions.iter().find(|s| s.id == hit.session_id) else {
+        return;
+    };
+    let model = s.model.as_deref().unwrap_or("unknown");
+    render_button_tooltip(f, &app.theme, &format!(" model: {model} "), hit.x_start, hit.y);
 }
 
 /// Render the new-session harness picker with each name as a
@@ -1925,6 +1971,25 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_items_area = Some(list_items_area);
     app.layout.list_scroll_offset = visible_start + state.offset();
     app.list_scroll_offset = app.layout.list_scroll_offset;
+    // Hover zones for the harness label of each visible row, for
+    // `render_harness_model_tooltip`. A deliberate second pass (rather than
+    // threading a push through the item-building closure above) — recomputes
+    // the harness width already computed there, mirroring the same tradeoff
+    // `hovered_diamond` already makes for its own hit zone.
+    for (offset, item) in app_items[visible_start..visible_end].iter().enumerate() {
+        if let AppListItem::Session { summary, .. } = item {
+            let harness_w = harness_label(summary).chars().count() as u16;
+            let x_end = list_items_area.x + list_items_area.width;
+            app.layout
+                .session_harness_hits
+                .push(crate::app::SessionHarnessHit {
+                    session_id: summary.id.clone(),
+                    x_start: x_end.saturating_sub(harness_w),
+                    x_end,
+                    y: list_items_area.y + offset as u16,
+                });
+        }
+    }
     clear_pane_side_borders(f, area, app);
     if let (Some(rect), Some((id, mut rows))) = (lineage_rect, lineage) {
         render_lineage_section(f, rect, app, &id, &mut rows);
@@ -3921,6 +3986,19 @@ fn render_detail(f: &mut Frame, area: Rect, app: &mut App, window_id: Option<u64
         .as_ref()
         .map(|s| 2 + UnicodeWidthStr::width(harness_label(s).as_str()))
         .unwrap_or(0);
+    // Hover zone for the harness label itself, for
+    // `render_harness_model_tooltip`.
+    if let Some(s) = summary.as_ref() {
+        let (x_start, x_end, y) = harness_title_range(area, close_w as u16, harness_w as u16);
+        app.layout
+            .session_harness_hits
+            .push(crate::app::SessionHarnessHit {
+                session_id: s.id.clone(),
+                x_start,
+                x_end,
+                y,
+            });
+    }
     // The exposed session pane remains a session pane even when its Program
     // is slid aside. Keep its ordinary lifecycle glyph/color; the Program
     // popup owns the distinct square, program-colored glyph.
@@ -15164,6 +15242,45 @@ mod tests {
             rect.y, 28,
             "card should flip above the mouse near the bottom"
         );
+    }
+
+    #[test]
+    fn session_harness_hit_contains_only_its_own_row_and_columns() {
+        let hit = crate::app::SessionHarnessHit {
+            session_id: "s1".into(),
+            x_start: 10,
+            x_end: 15,
+            y: 3,
+        };
+        assert!(hit.contains(10, 3));
+        assert!(hit.contains(14, 3));
+        assert!(!hit.contains(15, 3), "x_end is exclusive");
+        assert!(!hit.contains(9, 3));
+        assert!(!hit.contains(12, 4), "wrong row");
+    }
+
+    #[test]
+    fn harness_title_range_sits_directly_left_of_close_with_one_separator() {
+        // This is exactly how `render_detail` calls it for the harness
+        // label's own hover zone: harness sits right next to the close
+        // button, separated by the close button's own reserved separator —
+        // no extra gap (unlike `dynamic_ui_trigger_range`, which always
+        // reserves a further separator for an assumed harness label to its
+        // right; not applicable here since this *is* the harness label).
+        let view = Rect::new(0, 0, 40, 10);
+        let (x_start, x_end, y) = harness_title_range(view, 3, 8);
+        // close button occupies the last (3 + 1 separator) = 4 cells before
+        // the border; the harness label's 8 cells sit right before that.
+        assert_eq!(x_end, view.width - 1 - 4);
+        assert_eq!(x_start, x_end - 8);
+        assert_eq!(y, view.y);
+    }
+
+    #[test]
+    fn harness_title_range_with_no_close_button_reaches_the_border() {
+        let view = Rect::new(0, 0, 40, 10);
+        let (_, x_end, _) = harness_title_range(view, 0, 8);
+        assert_eq!(x_end, view.width - 1, "no close button reserved");
     }
 
     #[test]

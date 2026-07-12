@@ -60,6 +60,7 @@ httparse = "1"
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 diffy = "0.4"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 construct-protocol = { path = "crates/protocol" }
 construct-client = { path = "crates/client" }
