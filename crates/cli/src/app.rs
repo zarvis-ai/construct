@@ -680,6 +680,27 @@ pub enum ViewMode {
     Terminal,
 }
 
+/// The view mode a session should default to when newly selected.
+/// `has_pty` normally means Terminal — except a reset-synthesized archived
+/// snapshot (spec 0085), which copies `has_pty`/`mode` from the live
+/// session purely so *forking* it spawns interactive rather than headless
+/// (`Client::fork_session`'s own has_pty-driven decision, unrelated to what
+/// this pane should show). That flag is overloaded across those two
+/// concerns; a reset snapshot has no PTY replay data of its own to default
+/// to, but it always has a real, complete, physically-copied transcript —
+/// Chat mode is the one that's always correct for it.
+fn natural_view_mode(summary: &SessionSummary) -> ViewMode {
+    let is_reset_snapshot = summary
+        .forked_from
+        .as_ref()
+        .is_some_and(|f| f.is_reset_snapshot);
+    if summary.has_pty && !is_reset_snapshot {
+        ViewMode::Terminal
+    } else {
+        ViewMode::Chat
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChatScrollKind {
     Hidden,
@@ -3407,8 +3428,8 @@ async fn run_with_socket_initial_selection(
     }
     app.refresh_daemon_build_id().await;
     // Default to Terminal view when the currently-selected session has a PTY.
-    if app.selected_session().map(|s| s.has_pty).unwrap_or(false) {
-        app.set_active_view(ViewMode::Terminal);
+    if let Some(mode) = app.selected_session().map(natural_view_mode) {
+        app.set_active_view(mode);
     }
     app.restore_open_program_popups(&persisted.open_program_session_ids)
         .await;
@@ -4510,11 +4531,10 @@ impl App {
         self.set_scrollback_for_window(active_window, 0);
         // Navigating to a new session in the focused pane resets it to that
         // session's natural mode, recorded per-window so the pane keeps it.
-        let natural = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
-            ViewMode::Terminal
-        } else {
-            ViewMode::Chat
-        };
+        let natural = self
+            .selected_session()
+            .map(natural_view_mode)
+            .unwrap_or(ViewMode::Chat);
         self.set_active_view(natural);
         // The program is a per-session surface: keep it attached to whatever
         // session is now selected. The outgoing session's program is stashed
@@ -5737,19 +5757,13 @@ impl App {
     /// a PTY, Chat otherwise. Used as the default when a window has no explicit
     /// per-window override in `window_views`.
     fn natural_view_for_window(&self, window_id: u64) -> ViewMode {
-        let has_pty = self
-            .selection_for_window(window_id)
+        self.selection_for_window(window_id)
             .and_then(|sel| {
                 sel.session_id()
                     .and_then(|sid| self.sessions.iter().find(|s| s.id == sid))
-                    .map(|s| s.has_pty)
+                    .map(natural_view_mode)
             })
-            .unwrap_or(false);
-        if has_pty {
-            ViewMode::Terminal
-        } else {
-            ViewMode::Chat
-        }
+            .unwrap_or(ViewMode::Chat)
     }
 
     /// View mode for a specific split pane. The focused window uses the live
@@ -6189,11 +6203,10 @@ impl App {
             self.transcript_scroll = u16::MAX;
             let active_window = Some(self.active_window_id);
             self.set_scrollback_for_window(active_window, 0);
-            let natural = if self.selected_session().map(|s| s.has_pty).unwrap_or(false) {
-                ViewMode::Terminal
-            } else {
-                ViewMode::Chat
-            };
+            let natural = self
+                .selected_session()
+                .map(natural_view_mode)
+                .unwrap_or(ViewMode::Chat);
             self.set_active_view(natural);
         }
     }
@@ -11092,6 +11105,46 @@ mod tests {
         assert!(should_force_hydration_redraw(false, true));
         assert!(should_force_hydration_redraw(true, false));
         assert!(!should_force_hydration_redraw(false, false));
+    }
+
+    #[test]
+    fn natural_view_mode_prefers_chat_for_a_reset_snapshot_despite_has_pty() {
+        // spec 0085: a reset-synthesized archived snapshot copies has_pty
+        // from the live session purely so FORKING it spawns interactive —
+        // that must not also make the PANE default to a Terminal replay it
+        // has no real PTY history for. An ordinary has_pty session (no
+        // reset flag) keeps defaulting to Terminal, unaffected.
+        let mut ordinary = summary_with_kind(construct_protocol::SessionKind::User);
+        ordinary.has_pty = true;
+        assert_eq!(natural_view_mode(&ordinary), ViewMode::Terminal);
+
+        let mut snapshot = summary_with_kind(construct_protocol::SessionKind::User);
+        snapshot.has_pty = true;
+        snapshot.archived = true;
+        snapshot.forked_from = Some(construct_protocol::ForkedFrom {
+            session_id: "live".into(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+            is_reset_snapshot: true,
+        });
+        assert_eq!(natural_view_mode(&snapshot), ViewMode::Chat);
+
+        // A session merely forked (not a reset snapshot) still gets its
+        // ordinary has_pty-driven default — this must be a no-op for the
+        // existing fork feature.
+        let mut ordinary_fork = summary_with_kind(construct_protocol::SessionKind::User);
+        ordinary_fork.has_pty = true;
+        ordinary_fork.forked_from = Some(construct_protocol::ForkedFrom {
+            session_id: "parent".into(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+            is_reset_snapshot: false,
+        });
+        assert_eq!(natural_view_mode(&ordinary_fork), ViewMode::Terminal);
     }
 
     #[test]
