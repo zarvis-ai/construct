@@ -105,7 +105,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #
 # `usage_probe` is the interactive slash command the daemon sends to a
 # short-lived ephemeral session to capture this harness's own usage/status
-# panel (spec 0086), cached for 10 minutes and surfaced as a hover tooltip.
+# panel (spec 0086), cached for 5 minutes and surfaced as a hover tooltip.
 # The raw rendered output is captured and redisplayed verbatim — never
 # parsed into token counts or other structured fields.
 #

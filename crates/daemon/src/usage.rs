@@ -14,7 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-pub const USAGE_CACHE_TTL: Duration = Duration::from_secs(600);
+pub const USAGE_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// One cached usage-probe capture for a harness.
 #[derive(Debug, Clone)]

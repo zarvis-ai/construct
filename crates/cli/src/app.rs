@@ -120,7 +120,7 @@ const PROGRAM_UNDO_STACK_LIMIT: usize = 100;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
 /// Minimum spacing between `usage.query` fetches for the same harness while
 /// its name is continuously hovered (spec 0086's tooltip). The daemon's own
-/// probe cache is separately gated to 10 minutes server-side; this just
+/// probe cache is separately gated to 5 minutes server-side; this just
 /// bounds client-side IPC chatter, so it can stay short.
 const HARNESS_USAGE_QUERY_INTERVAL: Duration = Duration::from_secs(2);
 

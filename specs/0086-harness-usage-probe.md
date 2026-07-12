@@ -12,7 +12,7 @@ slash command for account/token usage (`/usage`, `/status`, ...). The
 daemon can capture what that command renders on demand: spin up a
 short-lived, daemon-internal session, send the harness's usage command,
 capture the raw PTY bytes it produces, cache the capture in daemon memory
-for 10 minutes, and tear the ephemeral session back down — including the
+for a short TTL, and tear the ephemeral session back down — including the
 native transcript file the harness CLI wrote for it.
 
 This capture is:

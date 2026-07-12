@@ -1821,7 +1821,7 @@ pub struct UsageQueryParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageQueryResult {
     /// The most recently cached snapshot, if any — regardless of whether it
-    /// is still fresh (the daemon's 10-minute TTL only governs whether a
+    /// is still fresh (the daemon's 5-minute TTL only governs whether a
     /// new probe is warranted, not whether the last snapshot is returned).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<UsageSnapshotInfo>,
