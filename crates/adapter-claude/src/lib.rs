@@ -269,6 +269,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             ctx.emit.clone(),
             resuming,
             params.model.clone(),
+            fork_from.is_some(),
         );
     }
     let label = command.argv_preview();
@@ -331,6 +332,7 @@ fn spawn_interactive_transcript_watcher(
     emit: EventEmitter,
     skip_existing: bool,
     initial_model: Option<String>,
+    expect_immediate_rebind: bool,
 ) {
     let Some(initial_path) = claude_transcript_path(&cwd, &session_id) else {
         emit.log("claude: no CLAUDE_HOME or HOME — cannot watch native transcript");
@@ -340,6 +342,15 @@ fn spawn_interactive_transcript_watcher(
         let mut current_id = session_id;
         let mut path = initial_path;
         let mut last_model = initial_model;
+        // A same-harness fork spawns with a made-up placeholder id (nothing
+        // chosen by us survives `--fork-session`; see `watch_session_id`
+        // above) that Claude's own SessionStart hook immediately overwrites
+        // with the real, freshly-minted id once the process actually starts.
+        // That first overwrite is expected wiring, not a mid-session
+        // `/clear` (spec 0085) — suppress just the one `NativeIdChanged` it
+        // would otherwise produce; every change after this point is a real
+        // one.
+        let mut suppress_next_reset_event = expect_immediate_rebind;
         // On resume we skip history already in the transcript; after a mid-
         // session native id change (/clear, /branch, /resume) we always start
         // at the top of the new file so chat mode sees the fresh conversation.
@@ -363,14 +374,22 @@ fn spawn_interactive_transcript_watcher(
             tick.tick().await;
             if let Some(new_id) = read_updated_session_id(sid_file.as_deref(), &current_id) {
                 if let Some(new_path) = claude_transcript_path(&cwd, &new_id) {
-                    emit.log(format!(
-                        "claude: native session id changed {current_id} -> {new_id}; \
-                         rebinding transcript watcher"
-                    ));
-                    emit.emit(SessionEvent::NativeIdChanged {
-                        prior_native_id: current_id.clone(),
-                        new_native_id: new_id.clone(),
-                    });
+                    if should_emit_reset_for_id_change(&mut suppress_next_reset_event) {
+                        emit.log(format!(
+                            "claude: native session id changed {current_id} -> {new_id}; \
+                             rebinding transcript watcher"
+                        ));
+                        emit.emit(SessionEvent::NativeIdChanged {
+                            prior_native_id: current_id.clone(),
+                            new_native_id: new_id.clone(),
+                        });
+                    } else {
+                        emit.log(format!(
+                            "claude: fork's real native id {new_id} arrived (placeholder was \
+                             {current_id}); rebinding transcript watcher without treating it as \
+                             a reset"
+                        ));
+                    }
                     current_id = new_id;
                     path = new_path;
                     next_line = 0;
@@ -499,6 +518,23 @@ fn read_updated_session_id(sid_file: Option<&Path>, current: &str) -> Option<Str
         return None;
     }
     Some(next.to_string())
+}
+
+/// Whether a detected id-change is a real mid-session reset (spec 0085)
+/// worth emitting `NativeIdChanged` for, or just the fork's own real native
+/// id arriving over a made-up placeholder (`watch_session_id`'s fork
+/// branch writes a random UUID to `sid_file` before Claude even starts,
+/// since `--fork-session` doesn't take an explicit id — Claude's own
+/// SessionStart hook then immediately overwrites it with the real one).
+/// Mutates `suppress_next` to consume the one-shot suppression: `true` for
+/// every change except the first one on a freshly-forked watcher.
+fn should_emit_reset_for_id_change(suppress_next: &mut bool) -> bool {
+    if *suppress_next {
+        *suppress_next = false;
+        false
+    } else {
+        true
+    }
 }
 
 fn claude_transcript_path(cwd: &Path, session_id: &str) -> Option<PathBuf> {
@@ -1158,6 +1194,28 @@ mod tests {
             Some("new-id-after-clear")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_emit_reset_for_id_change_suppresses_only_the_first_change() {
+        // A fresh (non-forked) watcher: every detected change is real.
+        let mut suppress = false;
+        assert!(should_emit_reset_for_id_change(&mut suppress));
+        assert!(should_emit_reset_for_id_change(&mut suppress));
+
+        // A forked watcher: the FIRST change is the fork's real native id
+        // replacing the made-up placeholder — not a reset, spec 0085's bug.
+        // Every change after that is a genuine mid-session /clear.
+        let mut suppress = true;
+        assert!(
+            !should_emit_reset_for_id_change(&mut suppress),
+            "fork's placeholder-to-real transition must not emit NativeIdChanged"
+        );
+        assert!(
+            should_emit_reset_for_id_change(&mut suppress),
+            "a later change on the same (now real) id must emit normally"
+        );
+        assert!(should_emit_reset_for_id_change(&mut suppress));
     }
 
     #[test]
