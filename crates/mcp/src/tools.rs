@@ -657,7 +657,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 harness,
                 cwd,
                 prompt: arg_str(&args, "prompt").ok(),
-                model: arg_str(&args, "model").ok(),
+                model: arg_str(&args, "model").ok().filter(|s| !s.is_empty()),
                 title: arg_str(&args, "title").ok(),
                 mode: arg_str(&args, "mode").ok(),
                 pty_size: Some(PtySize {
@@ -796,7 +796,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 harness,
                 cwd,
                 prompt: arg_str(&args, "prompt").ok(),
-                model: arg_str(&args, "model").ok(),
+                model: arg_str(&args, "model").ok().filter(|s| !s.is_empty()),
                 mode: Some(arg_str(&args, "mode").unwrap_or_else(|_| "headless".to_string())),
                 pty_size: Some(PtySize {
                     cols: 100,
