@@ -122,6 +122,11 @@ pub(crate) const PROGRAM_COLLAB_CURSOR_TTL_MS: i64 = 60 * 1000;
 pub(crate) const PROGRAM_AGENT_COLLAB_CURSOR_TTL_MS: i64 = 2 * 1000;
 /// Wrapped rows the program body scrolls per mouse-wheel notch.
 pub(crate) const PROGRAM_WHEEL_SCROLL_ROWS: usize = 3;
+/// Horizontal pan step for the pinned clip card (spec 0090). Much larger
+/// than the vertical step: the hidden width can span 70+ columns (a 140-col
+/// parser behind a 64-col card), and 3-per-tick was measured too slow to
+/// traverse with a discrete mouse wheel.
+pub(crate) const PROGRAM_PINNED_PAN_COLS_STEP: usize = 8;
 const PROGRAM_UNDO_STACK_LIMIT: usize = 100;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
 /// Minimum spacing between `usage.query` fetches for the same harness while
@@ -13584,25 +13589,19 @@ mod tests {
             "wheel-down returns toward the live tail and saturates at it"
         );
 
+        // Horizontal signs are inverted relative to the raw event names —
+        // terminals deliver horizontal deltas gesture-encoded, without the
+        // scroll-intent normalization they apply vertically (see
+        // `pan_pinned_clip_card`).
         app.handle_program_mouse(&wheel(
-            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
             crossterm::event::KeyModifiers::SHIFT,
         ))
         .await;
         assert_eq!(
             app.program_popup.as_ref().unwrap().pinned_scroll_cols,
-            PROGRAM_WHEEL_SCROLL_ROWS as u16,
-            "Shift+wheel pans horizontally"
-        );
-        app.handle_program_mouse(&wheel(
-            MouseEventKind::ScrollRight,
-            crossterm::event::KeyModifiers::empty(),
-        ))
-        .await;
-        assert_eq!(
-            app.program_popup.as_ref().unwrap().pinned_scroll_cols,
-            2 * PROGRAM_WHEEL_SCROLL_ROWS as u16,
-            "a horizontal wheel event pans right"
+            PROGRAM_PINNED_PAN_COLS_STEP as u16,
+            "Shift+wheel pans horizontally, one h-step per tick"
         );
         app.handle_program_mouse(&wheel(
             MouseEventKind::ScrollLeft,
@@ -13611,8 +13610,18 @@ mod tests {
         .await;
         assert_eq!(
             app.program_popup.as_ref().unwrap().pinned_scroll_cols,
-            PROGRAM_WHEEL_SCROLL_ROWS as u16,
-            "a horizontal wheel event pans back left"
+            2 * PROGRAM_PINNED_PAN_COLS_STEP as u16,
+            "a raw ScrollLeft event pans the crop right (gesture-encoded)"
+        );
+        app.handle_program_mouse(&wheel(
+            MouseEventKind::ScrollRight,
+            crossterm::event::KeyModifiers::empty(),
+        ))
+        .await;
+        assert_eq!(
+            app.program_popup.as_ref().unwrap().pinned_scroll_cols,
+            PROGRAM_PINNED_PAN_COLS_STEP as u16,
+            "a raw ScrollRight event pans the crop back left (gesture-encoded)"
         );
 
         // Unpinning resets the pan; the next pin starts at the live tail.
@@ -13644,7 +13653,7 @@ mod tests {
         app.layout.program_pinned_card_rect = Some(ratatui::layout::Rect::new(15, 5, 20, 4));
 
         app.handle_program_mouse(&MouseEvent {
-            kind: MouseEventKind::ScrollDown,
+            kind: MouseEventKind::ScrollUp,
             column: 20,
             row: 6,
             modifiers: crossterm::event::KeyModifiers::ALT,
@@ -13653,7 +13662,7 @@ mod tests {
 
         let popup = app.program_popup.as_ref().unwrap();
         assert_eq!(
-            popup.pinned_scroll_cols, PROGRAM_WHEEL_SCROLL_ROWS as u16,
+            popup.pinned_scroll_cols, PROGRAM_PINNED_PAN_COLS_STEP as u16,
             "Alt+wheel pans horizontally"
         );
         assert_eq!(popup.pinned_scroll_rows, 0, "Alt+wheel must not pan vertically");
@@ -13672,12 +13681,13 @@ mod tests {
         app.program_popup = Some(popup);
         let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
         app.pty_input_tx = tx;
-        let step = PROGRAM_WHEEL_SCROLL_ROWS as u16;
+        let v_step = PROGRAM_WHEEL_SCROLL_ROWS as u16;
+        let h_step = PROGRAM_PINNED_PAN_COLS_STEP as u16;
 
         for (code, expect_cols, expect_rows) in [
-            (KeyCode::Right, step, 0),
-            (KeyCode::Up, step, step),
-            (KeyCode::Left, 0, step),
+            (KeyCode::Right, h_step, 0),
+            (KeyCode::Up, h_step, v_step),
+            (KeyCode::Left, 0, v_step),
             (KeyCode::Down, 0, 0),
         ] {
             let handled = app

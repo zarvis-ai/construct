@@ -687,17 +687,26 @@ impl App {
     /// Alt tends to pass through) — pans across the screen width.
     /// Shift+arrows (see `handle_pinned_clip_key`) are the guaranteed
     /// keyboard fallback when a terminal delivers none of these.
+    ///
+    /// Horizontal signs are the OPPOSITE of the raw event names: terminals
+    /// normalize vertical wheel events for scroll intent ("ScrollUp" always
+    /// means "look back", whatever the natural-scroll setting), but they do
+    /// not apply the same normalization horizontally — observed in practice,
+    /// the raw horizontal deltas arrive gesture-encoded, so the naive
+    /// mapping panned the wrong way. Keyboard pan is unambiguous and stays
+    /// direction-literal.
     fn pan_pinned_clip_card(&mut self, ev: &MouseEvent) {
-        let step = PROGRAM_WHEEL_SCROLL_ROWS as i32;
+        let v_step = PROGRAM_WHEEL_SCROLL_ROWS as i32;
+        let h_step = PROGRAM_PINNED_PAN_COLS_STEP as i32;
         let horizontal = ev.modifiers.contains(KeyModifiers::SHIFT)
             || ev.modifiers.contains(KeyModifiers::ALT);
         match (ev.kind, horizontal) {
-            (MouseEventKind::ScrollUp, true) => self.pan_pinned_card_by(-step, 0),
-            (MouseEventKind::ScrollDown, true) => self.pan_pinned_card_by(step, 0),
-            (MouseEventKind::ScrollUp, false) => self.pan_pinned_card_by(0, step),
-            (MouseEventKind::ScrollDown, false) => self.pan_pinned_card_by(0, -step),
-            (MouseEventKind::ScrollLeft, _) => self.pan_pinned_card_by(-step, 0),
-            (MouseEventKind::ScrollRight, _) => self.pan_pinned_card_by(step, 0),
+            (MouseEventKind::ScrollUp, true) => self.pan_pinned_card_by(h_step, 0),
+            (MouseEventKind::ScrollDown, true) => self.pan_pinned_card_by(-h_step, 0),
+            (MouseEventKind::ScrollUp, false) => self.pan_pinned_card_by(0, v_step),
+            (MouseEventKind::ScrollDown, false) => self.pan_pinned_card_by(0, -v_step),
+            (MouseEventKind::ScrollLeft, _) => self.pan_pinned_card_by(h_step, 0),
+            (MouseEventKind::ScrollRight, _) => self.pan_pinned_card_by(-h_step, 0),
             _ => {}
         }
     }
@@ -726,25 +735,27 @@ impl App {
         // Keyboard pan: the guaranteed path on terminals that report neither
         // horizontal wheel events nor Shift/Alt-modified wheels (many
         // reserve Shift+wheel for native selection/scrollback and never send
-        // it to the app). Same orientation as the wheel: Shift+Up pans back
-        // from the tail, Shift+Right pans right.
+        // it to the app). Direction-literal: the arrow points where the crop
+        // window moves — Shift+Up looks back from the tail, Shift+Right
+        // reveals content further right.
         if key.modifiers.contains(KeyModifiers::SHIFT) {
-            let step = PROGRAM_WHEEL_SCROLL_ROWS as i32;
+            let v_step = PROGRAM_WHEEL_SCROLL_ROWS as i32;
+            let h_step = PROGRAM_PINNED_PAN_COLS_STEP as i32;
             match key.code {
                 KeyCode::Up => {
-                    self.pan_pinned_card_by(0, step);
+                    self.pan_pinned_card_by(0, v_step);
                     return true;
                 }
                 KeyCode::Down => {
-                    self.pan_pinned_card_by(0, -step);
+                    self.pan_pinned_card_by(0, -v_step);
                     return true;
                 }
                 KeyCode::Left => {
-                    self.pan_pinned_card_by(-step, 0);
+                    self.pan_pinned_card_by(-h_step, 0);
                     return true;
                 }
                 KeyCode::Right => {
-                    self.pan_pinned_card_by(step, 0);
+                    self.pan_pinned_card_by(h_step, 0);
                     return true;
                 }
                 _ => {}
