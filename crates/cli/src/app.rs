@@ -13627,6 +13627,85 @@ mod tests {
         );
     }
 
+    /// Alt+wheel pans horizontally like Shift+wheel — the second modifier
+    /// exists because some terminals never report Shift-modified wheel
+    /// events to the application (Shift is reserved for native selection).
+    #[tokio::test]
+    async fn program_alt_wheel_over_pinned_card_pans_horizontally() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
+        popup.pinned_clip = Some("worker1".to_string());
+        app.program_popup = Some(popup);
+        app.layout.modal_area = Some(ratatui::layout::Rect::new(0, 0, 40, 10));
+        app.layout.program_clip_hits = vec![program_clip_click_fixture("worker1")];
+        app.layout.program_pinned_card_rect = Some(ratatui::layout::Rect::new(15, 5, 20, 4));
+
+        app.handle_program_mouse(&MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 20,
+            row: 6,
+            modifiers: crossterm::event::KeyModifiers::ALT,
+        })
+        .await;
+
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.pinned_scroll_cols, PROGRAM_WHEEL_SCROLL_ROWS as u16,
+            "Alt+wheel pans horizontally"
+        );
+        assert_eq!(popup.pinned_scroll_rows, 0, "Alt+wheel must not pan vertically");
+    }
+
+    /// Shift+arrows pan the pinned card's crop without forwarding anything
+    /// to the session — the guaranteed fallback for terminals that deliver
+    /// neither horizontal wheel events nor modified wheels. Plain arrows
+    /// still forward as PTY bytes.
+    #[tokio::test]
+    async fn pinned_clip_shift_arrows_pan_without_forwarding() {
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        let mut popup = program_popup_for_test("s1", "see @{session:worker1}", 0);
+        popup.pinned_clip = Some("worker1".to_string());
+        app.program_popup = Some(popup);
+        let (tx, mut rx) = mpsc::unbounded_channel::<PtyInputJob>();
+        app.pty_input_tx = tx;
+        let step = PROGRAM_WHEEL_SCROLL_ROWS as u16;
+
+        for (code, expect_cols, expect_rows) in [
+            (KeyCode::Right, step, 0),
+            (KeyCode::Up, step, step),
+            (KeyCode::Left, 0, step),
+            (KeyCode::Down, 0, 0),
+        ] {
+            let handled = app
+                .handle_pinned_clip_key(KeyEvent::new(code, KeyModifiers::SHIFT))
+                .await;
+            assert!(handled);
+            let popup = app.program_popup.as_ref().unwrap();
+            assert_eq!(
+                (popup.pinned_scroll_cols, popup.pinned_scroll_rows),
+                (expect_cols, expect_rows),
+                "Shift+{code:?} pans the crop"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "Shift+arrows are a pan carve-out and must never reach the session"
+        );
+
+        let handled = app
+            .handle_pinned_clip_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await;
+        assert!(handled);
+        assert!(
+            rx.try_recv().is_ok(),
+            "a plain arrow still forwards to the pinned session's PTY"
+        );
+    }
+
     /// Wheel outside the pinned card keeps scrolling the Program doc and
     /// leaves both the pin and its pan untouched — only left clicks dismiss.
     #[tokio::test]

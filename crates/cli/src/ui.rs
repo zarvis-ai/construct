@@ -11902,7 +11902,7 @@ fn render_program_clip_hover(
                 pinned_session_id,
                 hit.col_start,
                 hit.row,
-                Some("pinned — type to send, scroll to pan, Esc to unpin"),
+                Some("pinned — type to send, scroll/Shift+arrows pan, Esc unpins"),
                 true,
                 pinned_pan,
             );

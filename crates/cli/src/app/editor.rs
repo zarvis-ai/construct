@@ -656,15 +656,15 @@ impl App {
         }
     }
 
-    /// Pan the pinned clip card's cropped viewport by one wheel step (spec
-    /// 0090). Vertical steps back/forward through the tail-anchored content;
-    /// ScrollLeft/ScrollRight — or Shift+vertical-wheel, since not every
-    /// terminal synthesizes horizontal wheel events — pans across the screen
-    /// width. Offsets clamp loosely to the session's cached screen here; the
-    /// renderer clamps precisely against the visible content every frame, so
-    /// a pan can never scroll past the content into blank space for long.
-    fn pan_pinned_clip_card(&mut self, ev: &MouseEvent) {
-        let step = PROGRAM_WHEEL_SCROLL_ROWS as u16;
+    /// Shift the pinned card's crop pan by `(d_cols, d_rows)` — positive
+    /// cols pan right, positive rows pan back from the tail. Offsets clamp
+    /// loosely to the session's cached screen here; the renderer clamps
+    /// precisely against the visible content every frame, so a pan can never
+    /// scroll past the content into blank space for long.
+    fn pan_pinned_card_by(&mut self, d_cols: i32, d_rows: i32) {
+        fn shift(value: u16, delta: i32, max: u16) -> u16 {
+            (i32::from(value) + delta).clamp(0, i32::from(max)) as u16
+        }
         let dims = self
             .program_popup
             .as_ref()
@@ -675,38 +675,40 @@ impl App {
             return;
         };
         let (max_cols, max_rows) = dims.unwrap_or((u16::MAX, u16::MAX));
-        let horizontal = ev.modifiers.contains(KeyModifiers::SHIFT);
-        match ev.kind {
-            MouseEventKind::ScrollUp if horizontal => {
-                popup.pinned_scroll_cols = popup.pinned_scroll_cols.saturating_sub(step);
-            }
-            MouseEventKind::ScrollDown if horizontal => {
-                popup.pinned_scroll_cols =
-                    popup.pinned_scroll_cols.saturating_add(step).min(max_cols);
-            }
-            MouseEventKind::ScrollUp => {
-                popup.pinned_scroll_rows =
-                    popup.pinned_scroll_rows.saturating_add(step).min(max_rows);
-            }
-            MouseEventKind::ScrollDown => {
-                popup.pinned_scroll_rows = popup.pinned_scroll_rows.saturating_sub(step);
-            }
-            MouseEventKind::ScrollLeft => {
-                popup.pinned_scroll_cols = popup.pinned_scroll_cols.saturating_sub(step);
-            }
-            MouseEventKind::ScrollRight => {
-                popup.pinned_scroll_cols =
-                    popup.pinned_scroll_cols.saturating_add(step).min(max_cols);
-            }
+        popup.pinned_scroll_cols = shift(popup.pinned_scroll_cols, d_cols, max_cols);
+        popup.pinned_scroll_rows = shift(popup.pinned_scroll_rows, d_rows, max_rows);
+    }
+
+    /// Pan the pinned clip card's cropped viewport by one wheel step (spec
+    /// 0090). Vertical steps back/forward through the tail-anchored content;
+    /// ScrollLeft/ScrollRight — or Shift/Alt+vertical-wheel, since not every
+    /// terminal synthesizes horizontal wheel events (and some never report
+    /// Shift-modified wheels at all, reserving Shift for native selection;
+    /// Alt tends to pass through) — pans across the screen width.
+    /// Shift+arrows (see `handle_pinned_clip_key`) are the guaranteed
+    /// keyboard fallback when a terminal delivers none of these.
+    fn pan_pinned_clip_card(&mut self, ev: &MouseEvent) {
+        let step = PROGRAM_WHEEL_SCROLL_ROWS as i32;
+        let horizontal = ev.modifiers.contains(KeyModifiers::SHIFT)
+            || ev.modifiers.contains(KeyModifiers::ALT);
+        match (ev.kind, horizontal) {
+            (MouseEventKind::ScrollUp, true) => self.pan_pinned_card_by(-step, 0),
+            (MouseEventKind::ScrollDown, true) => self.pan_pinned_card_by(step, 0),
+            (MouseEventKind::ScrollUp, false) => self.pan_pinned_card_by(0, step),
+            (MouseEventKind::ScrollDown, false) => self.pan_pinned_card_by(0, -step),
+            (MouseEventKind::ScrollLeft, _) => self.pan_pinned_card_by(-step, 0),
+            (MouseEventKind::ScrollRight, _) => self.pan_pinned_card_by(step, 0),
             _ => {}
         }
     }
 
     /// Route a keypress to the Program popup's pinned clip, if one is
-    /// pinned. `Esc` unpins; every other key encodes to raw PTY bytes and
-    /// forwards to that clip's session — not `self.selected_id()`, since a
-    /// pinned clip is usually a different session than the one selected in
-    /// the sidebar. Returns `false` (nothing to do) when no clip is pinned.
+    /// pinned. `Esc` unpins and `Shift+arrows` pan the card's crop (spec
+    /// 0090) — the two deliberate key carve-outs that never reach the
+    /// session; every other key encodes to raw PTY bytes and forwards to
+    /// that clip's session — not `self.selected_id()`, since a pinned clip
+    /// is usually a different session than the one selected in the sidebar.
+    /// Returns `false` (nothing to do) when no clip is pinned.
     pub(super) async fn handle_pinned_clip_key(&mut self, key: KeyEvent) -> bool {
         let Some(pinned_session_id) = self
             .program_popup
@@ -720,6 +722,33 @@ impl App {
                 popup.set_pinned_clip(None);
             }
             return true;
+        }
+        // Keyboard pan: the guaranteed path on terminals that report neither
+        // horizontal wheel events nor Shift/Alt-modified wheels (many
+        // reserve Shift+wheel for native selection/scrollback and never send
+        // it to the app). Same orientation as the wheel: Shift+Up pans back
+        // from the tail, Shift+Right pans right.
+        if key.modifiers.contains(KeyModifiers::SHIFT) {
+            let step = PROGRAM_WHEEL_SCROLL_ROWS as i32;
+            match key.code {
+                KeyCode::Up => {
+                    self.pan_pinned_card_by(0, step);
+                    return true;
+                }
+                KeyCode::Down => {
+                    self.pan_pinned_card_by(0, -step);
+                    return true;
+                }
+                KeyCode::Left => {
+                    self.pan_pinned_card_by(-step, 0);
+                    return true;
+                }
+                KeyCode::Right => {
+                    self.pan_pinned_card_by(step, 0);
+                    return true;
+                }
+                _ => {}
+            }
         }
         if let Some(bytes) = encode_key_to_bytes(key) {
             self.queue_pty_input(pinned_session_id, bytes, "pinned_clip_pty_input");
