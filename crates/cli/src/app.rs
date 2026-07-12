@@ -1159,6 +1159,18 @@ pub struct App {
     pub transcript_session: Option<String>,
     pub transcript_scroll: u16,
     pub minibuffer: Option<Minibuffer>,
+    /// Rotation index into the idle minibuffer placeholder's context hint
+    /// pool: advances by the shown-window size every
+    /// `MINIBUFFER_HINT_ROTATE_EVERY`, or immediately whenever
+    /// `minibuffer_hint_context` shows the context (zoom mode) changed,
+    /// cycling through candidates the current viewport is too narrow to
+    /// show all at once.
+    pub minibuffer_hint_offset: usize,
+    pub minibuffer_hint_rotated_at: Option<Instant>,
+    /// Zoom mode as of the last placeholder render — compared each frame so
+    /// a zoom change (a new relevant-hints context) rotates the window
+    /// immediately instead of waiting out the timer.
+    pub minibuffer_hint_context: Option<ZoomMode>,
     pub harnesses: Vec<HarnessInfo>,
     /// Program templates offered as clickable buttons in the empty-program
     /// placeholder. Fetched at startup and on reconnect, and refreshed in the
@@ -1190,6 +1202,10 @@ pub struct App {
     pub theme_name: crate::theme::ThemeName,
     terminal_background_is_light: Option<bool>,
     pub help_visible: bool,
+    /// Wrapped-row scroll offset into the help dialog's content, clamped to
+    /// the current content/viewport size each time it renders (spec-free —
+    /// mirrors the `list_scroll_offset` clamp-at-render pattern).
+    pub help_scroll_offset: usize,
     help_dismiss_mouse_button: Option<crossterm::event::MouseButton>,
     pub profile: Profile,
     pub keymap: Keymap,
@@ -3240,6 +3256,9 @@ async fn run_with_socket_initial_selection(
         transcript_session: None,
         transcript_scroll: 0,
         minibuffer: None,
+        minibuffer_hint_offset: 0,
+        minibuffer_hint_rotated_at: None,
+        minibuffer_hint_context: None,
         harnesses,
         program_templates,
         program_templates_tx,
@@ -3250,6 +3269,7 @@ async fn run_with_socket_initial_selection(
         theme_name: theme_config.active_name(None),
         terminal_background_is_light: None,
         help_visible: false,
+        help_scroll_offset: 0,
         help_dismiss_mouse_button: None,
         profile,
         keymap,
@@ -7317,13 +7337,22 @@ impl App {
         // dismiss it before program hit-testing or a mouse-grabbing child PTY
         // can consume the event. The matching button-up is swallowed too, so
         // the dismissing click cannot activate a control behind the dialog.
-        // Motion and scroll events leave it open.
+        // The wheel scrolls the dialog's own content instead of falling
+        // through to whatever is underneath; other motion events leave it open.
         if self.help_visible {
-            let MouseEventKind::Down(button) = ev.kind else {
-                return;
-            };
-            self.help_visible = false;
-            self.help_dismiss_mouse_button = Some(button);
+            match ev.kind {
+                MouseEventKind::Down(button) => {
+                    self.help_visible = false;
+                    self.help_dismiss_mouse_button = Some(button);
+                }
+                MouseEventKind::ScrollUp => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_add(3);
+                }
+                _ => {}
+            }
             return;
         }
         // The `/configure` dialog (spec 0069) is a topmost modal: a
@@ -8474,10 +8503,27 @@ impl App {
             return;
         }
         // Help is the topmost keyboard surface. Check it before the program,
-        // minibuffer, and focused child PTY routing so "any key to close"
-        // remains true regardless of which underlying surface has focus.
+        // minibuffer, and focused child PTY routing. Up/Down/PageUp/PageDown
+        // scroll the dialog's content (help text usually overflows a normal
+        // terminal height); every other key still closes it immediately, so
+        // "any key to close" remains the fallback and scrolling can't trap
+        // the user inside the dialog.
         if self.help_visible {
-            self.help_visible = false;
+            match key.code {
+                KeyCode::Up => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll_offset = self.help_scroll_offset.saturating_add(10);
+                }
+                _ => self.help_visible = false,
+            }
             return;
         }
         // An in-progress inline title rename owns every keystroke, same
@@ -9409,6 +9455,9 @@ impl App {
             }
             ToggleHelp => {
                 self.help_visible = !self.help_visible;
+                if self.help_visible {
+                    self.help_scroll_offset = 0;
+                }
             }
             ToggleAutomode => {
                 self.cycle_approval_mode().await;
@@ -9636,7 +9685,10 @@ impl App {
             "mouse" | "select" | "selection" => {
                 self.run_action(KeyAction::ToggleMouseCapture).await
             }
-            "help" | "?" => self.help_visible = true,
+            "help" | "?" => {
+                self.help_visible = true;
+                self.help_scroll_offset = 0;
+            }
             "tasks" => {
                 self.open_tasks_popup().await;
             }
@@ -11358,6 +11410,9 @@ mod tests {
             transcript_session: None,
             transcript_scroll: 0,
             minibuffer: None,
+            minibuffer_hint_offset: 0,
+            minibuffer_hint_rotated_at: None,
+            minibuffer_hint_context: None,
             harnesses: Vec::new(),
             program_templates: Vec::new(),
             program_templates_tx: mpsc::unbounded_channel().0,
@@ -11368,6 +11423,7 @@ mod tests {
             theme_name: crate::theme::ThemeName::Matrix,
             terminal_background_is_light: None,
             help_visible: false,
+            help_scroll_offset: 0,
             help_dismiss_mouse_button: None,
             profile: Profile::Emacs,
             keymap: keymap::default_for(Profile::Emacs),
@@ -20965,10 +21021,7 @@ mod tests {
             archive_row + 1,
             "merge and archive should render below archive"
         );
-        assert_eq!(
-            SessionTitleMenuAction::Merge.label(),
-            "merge and archive"
-        );
+        assert_eq!(SessionTitleMenuAction::Merge.label(), "merge and archive");
 
         let parent_menu = SessionTitleMenu {
             session_id: "parent".into(),
@@ -23786,8 +23839,10 @@ mod tests {
 
     #[tokio::test]
     async fn delete_confirm_render_has_three_non_overlapping_choice_hits() {
-        let (mut app, _dir, server, _calls) =
-            choice_click_app(vec![summary_with_kind(construct_protocol::SessionKind::User)]).await;
+        let (mut app, _dir, server, _calls) = choice_click_app(vec![summary_with_kind(
+            construct_protocol::SessionKind::User,
+        )])
+        .await;
         app.minibuffer = Some(Minibuffer {
             prompt: "Session s1: ".into(),
             input: String::new(),
@@ -23869,12 +23924,10 @@ mod tests {
         };
         app.run_minibuffer_submit(intent, "d".to_string()).await;
 
-        let calls = vec![
-            tokio::time::timeout(Duration::from_secs(1), calls.recv())
-                .await
-                .expect("background delete should reach mock daemon")
-                .expect("mock daemon call channel should stay open"),
-        ];
+        let calls = vec![tokio::time::timeout(Duration::from_secs(1), calls.recv())
+            .await
+            .expect("background delete should reach mock daemon")
+            .expect("mock daemon call channel should stay open")];
         assert!(
             calls
                 .iter()
@@ -23917,12 +23970,10 @@ mod tests {
             app.minibuffer.is_none(),
             "clicking d should close the prompt"
         );
-        let calls = vec![
-            tokio::time::timeout(Duration::from_secs(1), calls.recv())
-                .await
-                .expect("background delete should reach mock daemon")
-                .expect("mock daemon call channel should stay open"),
-        ];
+        let calls = vec![tokio::time::timeout(Duration::from_secs(1), calls.recv())
+            .await
+            .expect("background delete should reach mock daemon")
+            .expect("mock daemon call channel should stay open")];
         assert!(
             calls
                 .iter()
@@ -25987,6 +26038,279 @@ mod tests {
                 .map(|popup| popup.buffer.as_str()),
             Some("draft"),
             "the dismissing key must not leak into the focused program"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn help_modal_arrow_and_page_keys_scroll_instead_of_closing() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.help_visible = true;
+        // Short enough that the ~70-line emacs help text overflows the popup.
+        let backend = ratatui::backend::TestBackend::new(120, 15);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let top = rendered_text(terminal.backend().buffer());
+        assert!(
+            top.contains("A session is one live task"),
+            "premise: opens scrolled to the top of the help text:\n{top}"
+        );
+        assert!(
+            !top.contains("escape prefix"),
+            "premise: a short terminal clips the tail of the help text:\n{top}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await;
+        assert!(app.help_visible, "Down should scroll help, not close it");
+        assert_eq!(app.help_scroll_offset, 1);
+
+        for _ in 0..20 {
+            app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+                .await;
+        }
+        assert!(
+            app.help_visible,
+            "PageDown should scroll help, not close it"
+        );
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let scrolled_offset = app.help_scroll_offset;
+        let bottom = rendered_text(terminal.backend().buffer());
+        assert!(
+            bottom.contains("escape prefix"),
+            "scrolling down enough should reveal the trailing paragraph:\n{bottom}"
+        );
+        assert!(
+            !bottom.contains("A session is one live task"),
+            "scrolling to the bottom should have moved past the intro:\n{bottom}"
+        );
+
+        // Once the bottom is reached, further PageDowns clamp instead of
+        // scrolling past the available content.
+        app.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE))
+            .await;
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        assert_eq!(
+            app.help_scroll_offset, scrolled_offset,
+            "offset should clamp once the bottom is reached"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await;
+        assert!(app.help_visible, "Up should scroll help, not close it");
+        assert_eq!(app.help_scroll_offset, scrolled_offset - 1);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            .await;
+        assert!(
+            !app.help_visible,
+            "a non-scroll key should still close help"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn help_modal_mouse_wheel_scrolls_without_closing() {
+        use crossterm::event::MouseButton;
+
+        let (mut app, _dir, server) = captured_app().await;
+        app.help_visible = true;
+        let backend = ratatui::backend::TestBackend::new(120, 15);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let popup = app.layout.modal_area.expect("help popup area");
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: popup.x + 2,
+            row: popup.y + 2,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert!(app.help_visible, "wheel scroll must not close help");
+        assert_eq!(app.help_scroll_offset, 3);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: popup.x + 2,
+            row: popup.y + 2,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert_eq!(app.help_scroll_offset, 0);
+
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: popup.x + 2,
+            row: popup.y + 2,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+        assert!(!app.help_visible, "a click should still close help");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn minibuffer_placeholder_shows_at_most_three_rotating_hints_plus_help() {
+        let (mut app, _dir, server) = captured_app().await;
+        app.zoom = ZoomMode::None;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        // `shortcut_hints` also carries unrelated hints from other panes
+        // (e.g. the modeline's theme toggle) — isolate the placeholder's
+        // own row.
+        let mb_row = app.layout.minibuffer_area.expect("minibuffer area").y;
+        let placeholder_hints: Vec<_> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .collect();
+        assert_eq!(
+            placeholder_hints.len(),
+            4,
+            "placeholder should show 3 rotating hints + a trailing help hint: {:?}",
+            placeholder_hints
+        );
+        assert_eq!(
+            placeholder_hints.last().map(|h| h.action),
+            Some(KeyAction::ToggleHelp),
+            "help should always be the trailing hint"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn minibuffer_placeholder_help_hint_opens_help_dialog() {
+        use crossterm::event::MouseButton;
+
+        let (mut app, _dir, server) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+
+        let mb_row = app.layout.minibuffer_area.expect("minibuffer area").y;
+        let hit = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .find(|h| h.action == KeyAction::ToggleHelp && h.y == mb_row)
+            .copied()
+            .expect("placeholder should offer a clickable help hint");
+
+        // Shortcut hints dispatch on button release, not press.
+        app.on_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: hit.x_start,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .await;
+
+        assert!(
+            app.help_visible,
+            "clicking the placeholder's help hint should open help"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn minibuffer_placeholder_rotates_through_the_hint_pool_over_time() {
+        let (mut app, _dir, server) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let mb_row = app.layout.minibuffer_area.expect("minibuffer area").y;
+        let first: Vec<KeyAction> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .map(|h| h.action)
+            .collect();
+
+        // Force the rotation timer overdue without waiting on wall-clock time.
+        app.minibuffer_hint_rotated_at = Some(Instant::now() - Duration::from_secs(200));
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let second: Vec<KeyAction> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .map(|h| h.action)
+            .collect();
+
+        assert_ne!(
+            first, second,
+            "the rotating window should advance once its timer is overdue"
+        );
+        assert_eq!(
+            second.last(),
+            Some(&KeyAction::ToggleHelp),
+            "help stays trailing after rotation"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn minibuffer_placeholder_rotates_immediately_on_zoom_change() {
+        let (mut app, _dir, server) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let mb_row = app.layout.minibuffer_area.expect("minibuffer area").y;
+        let first: Vec<KeyAction> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .map(|h| h.action)
+            .collect();
+        let rotated_at_before = app.minibuffer_hint_rotated_at;
+
+        // Well under the 180s timer — only the zoom (context) change should
+        // trigger a rotation here.
+        app.zoom = ZoomMode::View;
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let second: Vec<KeyAction> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .map(|h| h.action)
+            .collect();
+
+        assert_ne!(
+            first, second,
+            "a zoom change should rotate the window immediately, without waiting for the timer"
+        );
+        assert_ne!(
+            app.minibuffer_hint_rotated_at, rotated_at_before,
+            "a context-triggered rotation should also reset the timer"
         );
         server.abort();
     }

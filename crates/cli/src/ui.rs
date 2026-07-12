@@ -295,7 +295,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_tasks_popup(f, app);
     render_remote_control_popup(f, app);
     if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
+        let help_popup = render_help(f, area, app);
+        app.layout.modal_area = Some(help_popup);
     }
     render_session_title_menu(f, app);
     render_tutorial_card(f, app);
@@ -1582,7 +1583,8 @@ fn render_zoomed_view(f: &mut Frame, area: Rect, app: &mut App) {
     }
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
+        let help_popup = render_help(f, area, app);
+        app.layout.modal_area = Some(help_popup);
     }
 }
 
@@ -1612,7 +1614,8 @@ fn render_zoomed_list(f: &mut Frame, area: Rect, app: &mut App) {
     render_sessions(f, main_area, app);
     render_minibuffer(f, minibuffer_area, app);
     if app.help_visible {
-        app.layout.modal_area = Some(render_help(f, area, &app.theme, app.profile));
+        let help_popup = render_help(f, area, app);
+        app.layout.modal_area = Some(help_popup);
     }
 }
 
@@ -7786,6 +7789,39 @@ fn minibuffer_panel_height(preferred: Option<u16>, total_h: u16) -> u16 {
     preferred.min(max_allowed)
 }
 
+/// Profile-aware label for an entry in the idle minibuffer placeholder's
+/// context-hint pool. Scoped to just the actions that pool offers — not a
+/// general keymap-label lookup — so every match arm stays correct instead
+/// of silently falling back to `"?"` for an action nobody checked.
+fn minibuffer_hint_label(action: KeyAction, profile: Profile) -> &'static str {
+    use KeyAction::*;
+    match (action, profile) {
+        (OpenCommandPalette, Profile::Vim) => ": operator",
+        (OpenCommandPalette, Profile::Emacs) => "C-x x operator",
+        (OpenNewSession, Profile::Vim) => "o new",
+        (OpenNewSession, Profile::Emacs) => "C-x C-f new",
+        (OpenFork, Profile::Vim) => "f fork",
+        (OpenFork, Profile::Emacs) => "C-x f fork",
+        (OpenDiff, Profile::Vim) => "g d diff",
+        (OpenDiff, Profile::Emacs) => "C-x d diff",
+        (OpenRename, Profile::Vim) => "r rename",
+        (OpenRename, Profile::Emacs) => "C-x r rename",
+        (OpenSwitchSession, _) => "C-x b switch",
+        _ => "?",
+    }
+}
+
+/// `ToggleZoom`'s label depends on both profile and whether the dialog
+/// would zoom in or out, so it doesn't fit `minibuffer_hint_label`'s table.
+fn zoom_hint_label(profile: Profile, unzoom: bool) -> &'static str {
+    match (profile, unzoom) {
+        (Profile::Vim, true) => "z unzoom",
+        (Profile::Vim, false) => "z zoom",
+        (Profile::Emacs, true) => "C-x z unzoom",
+        (Profile::Emacs, false) => "C-x z zoom",
+    }
+}
+
 fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.minibuffer_harness_hits.clear();
     app.layout.minibuffer_choice_hits.clear();
@@ -7838,40 +7874,101 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
         f.render_widget(para, area);
         return;
     }
-    // Build the hint as a sequence of (prefix, [(label, action), ...])
-    // — prefix is non-clickable plain text, segments are individually
+    // Build the hint as a sequence of (prefix, [(label, action), ...]) —
+    // prefix is non-clickable plain text, segments are individually
     // clickable + hover-highlightable. In the unzoomed layout focus is
-    // a mouse click away, so `C-x o` is dropped — only zoom + palette
-    // are shown. The zoomed layout keeps `C-x o` since the other pane
-    // isn't visible to click.
-    let (prefix, segments): (&str, Vec<(&str, KeyAction)>) = match app.zoom {
+    // a mouse click away, so `C-x o` is dropped from the pool — only
+    // zoomed layouts keep it, since the other pane isn't visible to click.
+    //
+    // The pool holds every action relevant to the current context; only
+    // `MINIBUFFER_HINT_WINDOW` of them show at once, rotating every
+    // `MINIBUFFER_HINT_ROTATE_EVERY` — or immediately when the context
+    // (zoom mode) changes, since the previous window may no longer be the
+    // most relevant one — so the user discovers bindings beyond the first
+    // few instead of always seeing the same set. A permanent `help`
+    // segment is appended after the rotating window.
+    let profile = app.profile;
+    let (prefix, mut pool): (&str, Vec<(&'static str, KeyAction)>) = match app.zoom {
         ZoomMode::View => (
             "zoomed: view — ",
             vec![
-                ("C-x x operator", KeyAction::OpenCommandPalette),
+                (
+                    minibuffer_hint_label(KeyAction::OpenCommandPalette, profile),
+                    KeyAction::OpenCommandPalette,
+                ),
                 ("C-x Space program", KeyAction::OpenProgram),
-                ("C-x z unzoom", KeyAction::ToggleZoom),
+                (zoom_hint_label(profile, true), KeyAction::ToggleZoom),
                 ("C-x o list", KeyAction::SwitchFocus),
             ],
         ),
         ZoomMode::List => (
             "zoomed: list — ",
             vec![
-                ("C-x x operator", KeyAction::OpenCommandPalette),
+                (
+                    minibuffer_hint_label(KeyAction::OpenCommandPalette, profile),
+                    KeyAction::OpenCommandPalette,
+                ),
                 ("C-x Space program", KeyAction::OpenProgram),
-                ("C-x z unzoom", KeyAction::ToggleZoom),
+                (zoom_hint_label(profile, true), KeyAction::ToggleZoom),
                 ("C-x o view", KeyAction::SwitchFocus),
             ],
         ),
         ZoomMode::None => (
             "",
             vec![
-                ("C-x x operator", KeyAction::OpenCommandPalette),
+                (
+                    minibuffer_hint_label(KeyAction::OpenCommandPalette, profile),
+                    KeyAction::OpenCommandPalette,
+                ),
                 ("C-x Space program", KeyAction::OpenProgram),
-                ("C-x z zoom", KeyAction::ToggleZoom),
+                (zoom_hint_label(profile, false), KeyAction::ToggleZoom),
             ],
         ),
     };
+    pool.push((
+        minibuffer_hint_label(KeyAction::OpenNewSession, profile),
+        KeyAction::OpenNewSession,
+    ));
+    pool.push((
+        minibuffer_hint_label(KeyAction::OpenSwitchSession, profile),
+        KeyAction::OpenSwitchSession,
+    ));
+    pool.push((
+        minibuffer_hint_label(KeyAction::OpenFork, profile),
+        KeyAction::OpenFork,
+    ));
+    pool.push((
+        minibuffer_hint_label(KeyAction::OpenDiff, profile),
+        KeyAction::OpenDiff,
+    ));
+    pool.push((
+        minibuffer_hint_label(KeyAction::OpenRename, profile),
+        KeyAction::OpenRename,
+    ));
+
+    const MINIBUFFER_HINT_WINDOW: usize = 3;
+    const MINIBUFFER_HINT_ROTATE_EVERY: Duration = Duration::from_secs(180);
+    let context_changed = app.minibuffer_hint_context != Some(app.zoom);
+    app.minibuffer_hint_context = Some(app.zoom);
+    if pool.len() > MINIBUFFER_HINT_WINDOW {
+        let now = Instant::now();
+        let timer_due = match app.minibuffer_hint_rotated_at {
+            Some(last) => now.duration_since(last) >= MINIBUFFER_HINT_ROTATE_EVERY,
+            None => true,
+        };
+        if timer_due || context_changed {
+            app.minibuffer_hint_rotated_at = Some(now);
+            app.minibuffer_hint_offset =
+                (app.minibuffer_hint_offset + MINIBUFFER_HINT_WINDOW) % pool.len();
+        }
+    } else {
+        app.minibuffer_hint_offset = 0;
+    }
+    let shown = pool.len().min(MINIBUFFER_HINT_WINDOW);
+    let mut segments: Vec<(&str, KeyAction)> = (0..shown)
+        .map(|i| pool[(app.minibuffer_hint_offset + i) % pool.len()])
+        .collect();
+    segments.push(("help", KeyAction::ToggleHelp));
 
     let mouse = app.mouse_pos;
     let base_style = Style::default().fg(app.theme.dim);
@@ -7912,7 +8009,7 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(para, area);
 }
 
-fn render_help(f: &mut Frame, area: Rect, theme: &Theme, profile: Profile) -> Rect {
+fn render_help(f: &mut Frame, area: Rect, app: &mut App) -> Rect {
     // Target a comfortable reading width — long enough to keep each
     // command line on one row without wrapping, capped so it doesn't
     // span an ultra-wide terminal edge-to-edge. The outer rect adds
@@ -7923,10 +8020,26 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme, profile: Profile) -> Re
     const MARGIN: u16 = 1;
     let target_w = 92u16;
     let width = target_w.min(area.width.saturating_sub(2 * MARGIN + 4));
-    // Content height = lines + 2 borders + 2 vertical padding.
-    let help_text = help_text_for_profile(profile);
-    let height =
-        (help_text.lines().count() as u16 + 4).min(area.height.saturating_sub(2 * MARGIN + 2));
+    let help_text = help_text_for_profile(app.profile);
+    // Block borders (2) + horizontal padding (2+2) eat into the popup width
+    // before text wraps; count wrapped rows at that inner width (the same
+    // word-wrap `Paragraph`'s own `Wrap` uses) so the height budget and the
+    // scroll clamp below reflect what actually renders on a narrow terminal,
+    // not just the raw line count.
+    let inner_width = width.saturating_sub(6).max(1) as usize;
+    let total_rows: usize = help_text
+        .lines()
+        .map(|line| program_wrap_row_starts(line, inner_width).len())
+        .sum();
+    // Content height = rows + 2 borders + 2 vertical padding, capped to fit
+    // the terminal — when it doesn't fit, the dialog scrolls (see below)
+    // instead of silently clipping off the bottom.
+    let max_height = area.height.saturating_sub(2 * MARGIN + 2);
+    let height = (total_rows as u16 + 4).min(max_height);
+    let viewport_rows = height.saturating_sub(4) as usize;
+    let max_scroll = total_rows.saturating_sub(viewport_rows);
+    app.help_scroll_offset = app.help_scroll_offset.min(max_scroll);
+    let scroll_offset = app.help_scroll_offset;
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let popup = Rect {
@@ -7946,16 +8059,35 @@ fn render_help(f: &mut Frame, area: Rect, theme: &Theme, profile: Profile) -> Re
         height: height + 2 * MARGIN,
     };
     f.render_widget(Clear, outer);
+    let title = if max_scroll > 0 {
+        " help (any key to close, ↑/↓ scroll) "
+    } else {
+        " help (any key to close) "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.border_focused))
+        .border_style(Style::default().fg(app.theme.border_focused))
         .padding(ratatui::widgets::Padding::new(2, 2, 1, 1))
-        .title(" help (any key to close) ");
+        .title(title);
+    let inner = block.inner(popup);
     let para = Paragraph::new(help_text)
         .block(block)
-        .style(Style::default().fg(theme.text))
-        .wrap(Wrap { trim: false });
+        .style(Style::default().fg(app.theme.text))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_offset.min(u16::MAX as usize) as u16, 0));
     f.render_widget(para, popup);
+    // Reuses the program popup's scroll-thumb painter — it only takes rects
+    // and offsets, nothing program-specific — so both dialogs share one
+    // scrollbar indicator instead of drawing two.
+    render_program_scroll_indicator(
+        f,
+        &app.theme,
+        popup,
+        inner,
+        scroll_offset,
+        total_rows,
+        viewport_rows,
+    );
     popup
 }
 
