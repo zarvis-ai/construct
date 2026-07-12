@@ -566,7 +566,7 @@ fn program_execution_prompt_with_comment(comment: Option<&str>) -> String {
 }
 
 /// A Program-verb session awaiting a structured result to merge back into
-/// its owning Program (spec 0087), tracked from the moment its provisional
+/// its owning Program (spec 0089), tracked from the moment its provisional
 /// clip-annotation edit lands until either a mechanical merge or an
 /// escalation resolves it.
 #[derive(Clone)]
@@ -583,7 +583,7 @@ struct PendingVerbMerge {
     anchor: String,
     /// Where the verb session is instructed to write its result JSON — its
     /// own session-widgets directory, already auto-approved for that
-    /// session's harness (spec 0087 "enforced by construction": the verb
+    /// session's harness (spec 0089 "enforced by construction": the verb
     /// session has no Program-editing tool at all, native or MCP, so this
     /// file drop is the only channel it has back to the document).
     result_file: PathBuf,
@@ -602,13 +602,13 @@ struct VerbResultPayload {
 }
 
 /// Cap on how much of the full Program document is inlined directly into a
-/// verb session's prompt (spec 0087). Above this the document is truncated
+/// verb session's prompt (spec 0089). Above this the document is truncated
 /// with a pointer to the live `agentd_program_get`/`construct_program_get`
 /// tool instead of growing the prompt unboundedly — a fresh read is also the
 /// only way an interactive verb sees a document that changed after spawn.
 const PROGRAM_VERB_INLINE_DOC_MAX_CHARS: usize = 100_000;
 
-/// Build the initial prompt for a Program-verb session (spec 0087): the
+/// Build the initial prompt for a Program-verb session (spec 0089): the
 /// verb's own purpose prompt, the full Program document as background
 /// context, the selection framed as the session's entire jurisdiction, the
 /// optional free-text instruction (same composition rule as selection Run's
@@ -1107,7 +1107,7 @@ pub struct SessionManager {
     widget_snapshots: tokio::sync::Mutex<HashMap<String, WidgetSnapshot>>,
     program_runs: std::sync::Mutex<HashMap<String, ProgramRunProgress>>,
     /// Program-verb sessions awaiting a structured result to merge back
-    /// into their owning Program (spec 0087), keyed by the *verb session's*
+    /// into their owning Program (spec 0089), keyed by the *verb session's*
     /// own id. In-memory only: a daemon restart mid-verb drops the pending
     /// merge (the verb session, if still running, finishes with nowhere to
     /// deliver its result — a known v1 limitation, not a data-loss risk
@@ -2287,7 +2287,7 @@ impl SessionManager {
     /// for an external agent TUI, CR-terminated PTY submit for a PTY-backed
     /// line editor, or a structured adapter input for a headless harness).
     /// Shared by Program Run's prompt delivery and verb-drift escalation
-    /// (spec 0087) — both are "say this to the session as if the user typed
+    /// (spec 0089) — both are "say this to the session as if the user typed
     /// it," differing only in the message.
     async fn deliver_text_to_session(&self, session_id: &str, text: &str) -> Result<()> {
         let entry = self
@@ -2534,7 +2534,7 @@ impl SessionManager {
         }
     }
 
-    /// Run a Program selection verb (spec 0087): fork the owning session
+    /// Run a Program selection verb (spec 0089): fork the owning session
     /// into a new sibling scoped to `params.selection`, annotate the
     /// selection with that session's clip (the same in-flight affordance as
     /// the 0066 fast path), and record a pending merge that resolves once
@@ -2586,7 +2586,7 @@ impl SessionManager {
                 summary.message_count,
             )
         };
-        // Fork, not a fresh child (spec 0087): when the owning session's
+        // Fork, not a fresh child (spec 0089): when the owning session's
         // harness supports native fork-resume (currently claude, codex,
         // grok — see `Self::native_id_file_name`), spawning with the same
         // harness and `forked_from` set makes the daemon's existing fork-
@@ -2741,7 +2741,7 @@ impl SessionManager {
     /// exists, consumes and applies it exactly once. When the subagent
     /// reaches a terminal state with no result ever written, the verb is
     /// abandoned: the pending entry is dropped and the document is left
-    /// untouched (spec 0087 — a cancelled/errored verb must not leave a
+    /// untouched (spec 0089 — a cancelled/errored verb must not leave a
     /// stray in-flight affordance, but also must not apply a partial
     /// result).
     pub(crate) async fn maybe_complete_verb_merge(
@@ -2780,7 +2780,7 @@ impl SessionManager {
     }
 
     /// Turn off a verb's in-progress shimmer without touching the document
-    /// text (spec 0087: an abandoned verb must clear its in-flight affordance
+    /// text (spec 0089: an abandoned verb must clear its in-flight affordance
     /// but leave the document untouched). A no-op text edit — `old_string`
     /// and `new_string` both equal to the anchor — paired with a `shimmer:
     /// false` declaration is the documented way to settle a block without
@@ -4623,7 +4623,7 @@ mod tests {
         }
     }
 
-    /// spec 0087: the full Program document is inlined as context alongside
+    /// spec 0089: the full Program document is inlined as context alongside
     /// the selection, and the "no edit tool" instruction no longer claims the
     /// document is hidden — it's readable, just not editable.
     #[test]
@@ -5300,7 +5300,7 @@ mod tests {
         }
     }
 
-    /// spec 0087/0042: `narrow_program_run` only narrows an *existing* run —
+    /// spec 0089/0042: `narrow_program_run` only narrows an *existing* run —
     /// it creates nothing on its own — so a `ProgramShimmerDecl` on an edit
     /// is silently dropped unless something seeded a `ProgramRunProgress`
     /// for the session first. This reproduces `program_verb_execute`'s own
@@ -5423,7 +5423,7 @@ mod tests {
         );
     }
 
-    /// spec 0087: once a verb session's result file exists and its anchor
+    /// spec 0089: once a verb session's result file exists and its anchor
     /// still matches the live document, `maybe_complete_verb_merge` applies
     /// it mechanically — no escalation, no LLM round trip — and retires the
     /// verb session.
@@ -5523,7 +5523,7 @@ mod tests {
         );
     }
 
-    /// spec 0087: when the selection changed underneath an in-flight verb,
+    /// spec 0089: when the selection changed underneath an in-flight verb,
     /// the mechanical merge's anchor no longer matches — the document must be
     /// left exactly as-is (no partial/garbled merge), and the subagent still
     /// retires even though delivering the escalation message fails here (the
@@ -5604,7 +5604,7 @@ mod tests {
         );
     }
 
-    /// spec 0087: a verb session that reaches a terminal state without ever
+    /// spec 0089: a verb session that reaches a terminal state without ever
     /// writing a result is abandoned — the document is untouched and the
     /// pending entry is cleared so it doesn't linger forever.
     #[tokio::test]

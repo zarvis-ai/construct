@@ -1216,7 +1216,7 @@ pub struct App {
     /// loop applies it on the next iteration (no flicker — the placeholder keeps
     /// the cached list until the fresh one lands).
     pub program_templates_tx: mpsc::UnboundedSender<Vec<construct_protocol::ProgramTemplate>>,
-    /// Program selection verbs (spec 0087) offered as buttons in the
+    /// Program selection verbs (spec 0089) offered as buttons in the
     /// selection context menu. Fetched and refreshed the same way as
     /// `program_templates`.
     pub program_verbs: Vec<construct_protocol::ProgramVerb>,
@@ -2505,7 +2505,7 @@ pub struct ProgramSelectionMenu {
     pub comment: String,
     pub cursor: usize,
     /// Which row of the focused menu Up/Down (and C-p/C-n) navigation is on
-    /// (spec 0087): Comment, then Run, then each advertised verb in order.
+    /// (spec 0089): Comment, then Run, then each advertised verb in order.
     /// Enter activates whichever row this is. Typing/comment-editing keys
     /// only take effect while this is `Comment`.
     pub selected_action: ProgramSelectionAction,
@@ -3043,7 +3043,7 @@ pub struct LayoutSnapshot {
     pub program_title_name_window_start: usize,
     /// Program selected-text context Run button bounds: `(x_start, x_end, y)`.
     pub program_selection_run_hit: Option<(u16, u16, u16)>,
-    /// Program selected-text context menu verb-row bounds (spec 0087): one
+    /// Program selected-text context menu verb-row bounds (spec 0089): one
     /// `(x_start, x_end, y, verb_name)` per rendered verb button, in the same
     /// order as `App::program_verbs`.
     pub program_selection_verb_hits: Vec<(u16, u16, u16, String)>,
@@ -3745,7 +3745,7 @@ async fn run_loop(
         mpsc::unbounded_channel::<Vec<construct_protocol::ProgramTemplate>>();
     app.program_templates_tx = program_templates_tx;
     // Live-reload channel for program verbs, the `program_templates_tx`
-    // counterpart for spec 0087's selection-menu verbs.
+    // counterpart for spec 0089's selection-menu verbs.
     let (program_verbs_tx, mut program_verbs_rx) =
         mpsc::unbounded_channel::<Vec<construct_protocol::ProgramVerb>>();
     app.program_verbs_tx = program_verbs_tx;
@@ -4285,7 +4285,7 @@ async fn run_loop(
                 }
             }
             verbs = program_verbs_rx.recv() => {
-                // Live-reloaded program verbs (spec 0087), the `templates`
+                // Live-reloaded program verbs (spec 0089), the `templates`
                 // arm's counterpart — same drain-to-latest, same
                 // don't-replace-with-empty guard.
                 if let Some(mut latest) = verbs {
@@ -14788,7 +14788,7 @@ mod tests {
         server.abort();
     }
 
-    /// spec 0087: the selection menu renders one row per advertised verb,
+    /// spec 0089: the selection menu renders one row per advertised verb,
     /// below the comment/Run row, each with its own click hit-rect.
     #[tokio::test]
     async fn program_render_registers_verb_button_hits() {
@@ -14907,7 +14907,7 @@ mod tests {
             cursor: 5,
             // Run, not Comment: this test asserts the Run button's own
             // highlighted appearance, which now depends on Run specifically
-            // being the keyboard-selected row (spec 0087).
+            // being the keyboard-selected row (spec 0089).
             selected_action: ProgramSelectionAction::Run,
         });
 
@@ -15017,10 +15017,10 @@ mod tests {
         assert_ne!(
             tab_focused_run_cell.style().bg,
             Some(app.theme.accent),
-            "Tab focuses the comment row by default (spec 0087) — Run stays plain until Down selects it"
+            "Tab focuses the comment row by default (spec 0089) — Run stays plain until Down selects it"
         );
 
-        // Down moves keyboard selection off Comment onto Run (spec 0087).
+        // Down moves keyboard selection off Comment onto Run (spec 0089).
         app.handle_program_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
             .await;
         term.draw(|f| crate::ui::render(f, &mut app))
@@ -17798,7 +17798,7 @@ mod tests {
         server.abort();
     }
 
-    /// spec 0087: Up/Down (and C-p/C-n) no longer move the cursor within a
+    /// spec 0089: Up/Down (and C-p/C-n) no longer move the cursor within a
     /// wrapped multi-line comment — they cycle the menu's keyboard-selected
     /// row through Comment, Run, then each advertised verb in order, wrapping
     /// at both ends. Only Comment accepts typed/editing keys.

@@ -891,10 +891,10 @@ pub mod ipc_method {
     pub const PROGRAM_CURSOR: &str = "program.cursor";
     pub const PROGRAM_EXECUTE: &str = "program.execute";
     pub const PROGRAM_LIST_TEMPLATES: &str = "program.list_templates";
-    /// List available Program selection verbs (spec 0087): built-in plus any
+    /// List available Program selection verbs (spec 0089): built-in plus any
     /// user-defined `verbs/*.md` overrides/additions.
     pub const PROGRAM_LIST_VERBS: &str = "program.list_verbs";
-    /// Run a Program selection verb (spec 0087): spawns a result-returning
+    /// Run a Program selection verb (spec 0089): spawns a result-returning
     /// subagent scoped to the selection; the daemon merges its structured
     /// result back into the document once the subagent completes.
     pub const PROGRAM_VERB_EXECUTE: &str = "program.verb_execute";
@@ -1714,7 +1714,7 @@ pub struct ProgramListTemplatesResult {
 }
 
 /// What a Program selection verb does with its subagent's structured result
-/// (spec 0087): `Annotate` inserts new content adjacent to the selection and
+/// (spec 0089): `Annotate` inserts new content adjacent to the selection and
 /// leaves the selected text untouched; `Rewrite` replaces the selected
 /// markdown with the returned content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1726,7 +1726,7 @@ pub enum ProgramVerbEffect {
 
 /// Whether a Program selection verb's subagent runs to completion unattended
 /// (`SingleShot`) or may hold a dialogue with the user inside its own session
-/// before producing a result (`Interactive`) (spec 0087).
+/// before producing a result (`Interactive`) (spec 0089).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProgramVerbInteraction {
@@ -1735,7 +1735,7 @@ pub enum ProgramVerbInteraction {
 }
 
 /// A typed refinement action offered on a Program selection alongside Run
-/// (spec 0087). Loaded from a markdown definition file: built-in verbs ship
+/// (spec 0089). Loaded from a markdown definition file: built-in verbs ship
 /// embedded; user files under a `verbs/` config directory add to or, by
 /// matching `name`, override them.
 #[derive(Debug, Clone, Serialize, Deserialize)]

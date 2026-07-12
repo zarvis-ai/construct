@@ -1,4 +1,4 @@
-//! Program selection verbs (spec 0087): typed refinement actions on a
+//! Program selection verbs (spec 0089): typed refinement actions on a
 //! Program selection, loaded from markdown definition files. Built-ins ship
 //! embedded here; user files under a `verbs/` config directory add to, or by
 //! matching `name`, override them.

@@ -122,7 +122,7 @@ impl App {
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_selection_run = selection_run_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
-        // Program selection verb buttons (spec 0087): a small vertical list
+        // Program selection verb buttons (spec 0089): a small vertical list
         // of rows below the comment/Run row, each its own hit-rect.
         let hit_selection_verb = self
             .layout
@@ -880,7 +880,7 @@ impl App {
 
     /// Move the selection menu's keyboard focus among its rows — Comment,
     /// Run, then each advertised verb in order — wrapping at both ends
-    /// (spec 0087). `delta` is `-1` for Up/C-p, `1` for Down/C-n.
+    /// (spec 0089). `delta` is `-1` for Up/C-p, `1` for Down/C-n.
     fn move_program_selection_action(&mut self, delta: isize) {
         let verb_count = self.program_verbs.len();
         let count = 2 + verb_count;
@@ -924,7 +924,7 @@ impl App {
             .await
     }
 
-    /// Run a Program selection verb (spec 0087) on the active popup's current
+    /// Run a Program selection verb (spec 0089) on the active popup's current
     /// selection. Unlike `execute_program_selected_text` (Run), a verb always
     /// needs an explicit, non-empty selection — there is no whole-document
     /// fallback — and it doesn't touch the Run-progress/pending/shimmer

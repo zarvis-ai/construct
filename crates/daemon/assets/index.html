@@ -1704,7 +1704,7 @@
     color: var(--bg);
     outline: none;
   }
-  /* Program selection verbs (spec 0087): a vertical list of refinement
+  /* Program selection verbs (spec 0089): a vertical list of refinement
      actions below Run, one button per verb the daemon advertises. Empty
      when no verbs loaded yet, so it never leaves a stray gap in the menu. */
   .program-selection-verbs {
@@ -2188,7 +2188,7 @@
             <button type="button" id="programSelectionRunBtn" title="Run selected program text">
               <span aria-hidden="true">▶</span><span>Run</span>
             </button>
-            <!-- Program selection verbs (spec 0087): typed refinement actions
+            <!-- Program selection verbs (spec 0089): typed refinement actions
                  populated by programEnsureVerbs()/programRenderSelectionVerbs(),
                  one button per verb the daemon advertises via program.list_verbs. -->
             <div class="program-selection-verbs" id="programSelectionVerbs"></div>
@@ -2905,7 +2905,7 @@ const state = {
     applyingRemote: false,
     // Cached templates from program.list_templates (fetched lazily once).
     templates: null,
-    // Cached Program selection verbs from program.list_verbs (spec 0087,
+    // Cached Program selection verbs from program.list_verbs (spec 0089,
     // fetched lazily once — same shape as `templates`).
     verbs: null,
     // Session id whose program is currently mounted in the editor, or null.
@@ -6042,7 +6042,7 @@ async function programRun() {
   }
 }
 
-// Run a Program selection verb (spec 0087). Unlike programRun, a verb always
+// Run a Program selection verb (spec 0089). Unlike programRun, a verb always
 // needs an explicit selection — there's no whole-document fallback — and it
 // skips the optimistic run-progress/shimmer machinery entirely: the daemon
 // owns the in-flight affordance for a verb (the provisional clip annotation
@@ -6105,7 +6105,7 @@ async function programEnsureTemplates() {
   return state.program.templates;
 }
 
-// --- selection verbs (spec 0087) ---
+// --- selection verbs (spec 0089) ---
 
 async function programEnsureVerbs() {
   if (state.program.verbs) return state.program.verbs;

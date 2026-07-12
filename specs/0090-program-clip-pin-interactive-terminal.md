@@ -1,4 +1,4 @@
-# 0088-program-clip-pin-interactive-terminal
+# 0090-program-clip-pin-interactive-terminal
 
 Status: accepted
 Date: 2026-07-12
@@ -9,14 +9,14 @@ Scope: Single-clicking a Program `@{session:…}` clip pins its hover-preview ca
 
 Clicking a Program `@{session:…}` smart-clip chip has two distinct gestures, distinguished by timing:
 
-- **Single click** toggles the clip's hover-preview card **pinned**. A pinned card stops disappearing when the pointer moves away, gains a focused border and a visible cursor, and captures keyboard input: keystrokes forward as raw PTY bytes to the pinned session, not to the Program's own markdown editor. Clicking the same pinned clip again unpins it. Clicking a different clip while one is pinned switches the pin to it. `Esc` unpins without forwarding the keystroke. This is how a user answers an in-flight verb session's questions (spec 0087's `interview`, most saliently) without leaving the Program doc view.
+- **Single click** toggles the clip's hover-preview card **pinned**. A pinned card stops disappearing when the pointer moves away, gains a focused border and a visible cursor, and captures keyboard input: keystrokes forward as raw PTY bytes to the pinned session, not to the Program's own markdown editor. Clicking the same pinned clip again unpins it. Clicking a different clip while one is pinned switches the pin to it. `Esc` unpins without forwarding the keystroke. This is how a user answers an in-flight verb session's questions (spec 0089's `interview`, most saliently) without leaving the Program doc view.
 - **Double click** (a second click on the *same* clip within a short window) navigates to the clip's session as a full view — unchanged from the click behavior that existed before pinning did.
 
 A pinned card renders anchored to the clip's on-screen position (not the pointer), and continues to do so as long as the clip is visible; scrolling it off-screen hides the card without clearing the pin, so scrolling back re-shows it. It does not own its own terminal size: like the plain hover card, it crops the session's existing cached viewport rather than replaying at its own dimensions, so it never fights the main/split view over the shared parser's size (see Consequences).
 
 ## Reason
 
-A verb session (spec 0087) may need the user's input mid-run — the `interview` verb is built around exactly this. Before this, the only way to answer was to fully navigate to that session, losing your place in the Program doc. A raw double-click-only affordance existed for navigation but nothing let the user interact in place.
+A verb session (spec 0089) may need the user's input mid-run — the `interview` verb is built around exactly this. Before this, the only way to answer was to fully navigate to that session, losing your place in the Program doc. A raw double-click-only affordance existed for navigation but nothing let the user interact in place.
 
 The click gesture was chosen over a separate keybinding or button because it reuses the one interaction surface a clip chip already has (a click), and reserving single-click for the *lower-friction, more reversible* action (pin, i.e. glance and possibly answer) while promoting the existing navigate behavior to double-click (a deliberate, higher-commitment action to leave the doc) matches how the two actions actually differ in cost. Crossterm has no native double-click event; this timing is owned by the client.
 

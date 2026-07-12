@@ -12683,7 +12683,7 @@ fn render_program_selection_context_menu(
         return;
     };
     let menu = popup.selection_menu.as_ref().cloned().unwrap_or_default();
-    // Verb buttons (spec 0087) render as a vertical list below the
+    // Verb buttons (spec 0089) render as a vertical list below the
     // comment/Run row, one row per verb, ordered as advertised by the daemon.
     let verbs = app.program_verbs.clone();
     let rect = program_selection_context_menu_rect(pos, program_area, &menu, verbs.len());
@@ -12868,7 +12868,7 @@ fn program_selection_context_menu_rect(
     let width = PROGRAM_SELECTION_RUN_MENU_W.min(total.width);
     let max_comment_rows = total.height.saturating_sub(2) as usize;
     let comment_rows = program_selection_comment_line_count(menu, width, max_comment_rows);
-    // One extra row per verb (spec 0087), below the comment/Run row.
+    // One extra row per verb (spec 0089), below the comment/Run row.
     let height = (2 + comment_rows as u16 + verb_count as u16)
         .min(total.height)
         .max(1);
