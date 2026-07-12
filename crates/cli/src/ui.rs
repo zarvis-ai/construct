@@ -10310,6 +10310,15 @@ fn render_lineage_row(
     selected_session: Option<&str>,
     hovered_session: Option<&str>,
 ) -> Line<'static> {
+    // Mouse hover takes visual priority over the keyboard selection: with
+    // both lit at once, the two highlighted lineages are hard to tell
+    // apart. Hovering a session other than the selected one suppresses the
+    // selection highlight for this frame; hovering the selected session
+    // itself (or hovering nothing) leaves it alone.
+    let selected_session = match (selected_session, hovered_session) {
+        (Some(sel), Some(hov)) if sel != hov => None,
+        _ => selected_session,
+    };
     let interior_highlight = Style::default()
         .bg(theme.highlight_bg)
         .fg(theme.highlight_fg)
