@@ -1008,7 +1008,7 @@ pub mod ipc_method {
     /// restart.
     pub const DEV_SET_ASSETS: &str = "dev.set_assets";
     /// Query (and optionally trigger a background refresh of) the cached
-    /// harness usage-probe snapshot for one harness (spec 0085). Read-mostly:
+    /// harness usage-probe snapshot for one harness (spec 0086). Read-mostly:
     /// never blocks on the probe itself — when a refresh is warranted it is
     /// spawned in the background and this call returns immediately with
     /// `refreshing: true`. Backs the TUI's hover tooltip over a harness name.

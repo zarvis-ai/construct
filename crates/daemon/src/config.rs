@@ -105,7 +105,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #
 # `usage_probe` is the interactive slash command the daemon sends to a
 # short-lived ephemeral session to capture this harness's own usage/status
-# panel (spec 0085), cached for 10 minutes and surfaced as a hover tooltip.
+# panel (spec 0086), cached for 10 minutes and surfaced as a hover tooltip.
 # The raw rendered output is captured and redisplayed verbatim — never
 # parsed into token counts or other structured fields.
 #
@@ -433,7 +433,7 @@ pub struct AdapterConfig {
     #[serde(default)]
     pub env: HashMap<String, String>,
     /// The interactive slash command a usage-probe session sends to capture
-    /// this harness's own usage/status panel (spec 0085). TOML has no
+    /// this harness's own usage/status panel (spec 0086). TOML has no
     /// `null` literal, so "absent" and "explicitly unset" collapse to the
     /// same state; the three-way split is: absent (`None` here) → the
     /// built-in default command for this harness; explicit `""` → probe
@@ -497,7 +497,7 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
 ];
 
 /// Built-in usage-probe command for each harness that has an interactive
-/// usage/status slash command (spec 0085). Harnesses not listed here
+/// usage/status slash command (spec 0086). Harnesses not listed here
 /// (`shell`, `smith`) have no probe unless an operator sets `usage_probe`
 /// explicitly in `config.toml`.
 const DEFAULT_USAGE_PROBE: &[(&str, &str)] = &[
@@ -520,7 +520,7 @@ fn default_usage_probe(harness: &str) -> Option<&'static str> {
 
 impl Config {
     /// The command a usage-probe session should send for `harness`
-    /// (spec 0085), or `None` when probing is disabled for it. Mirrors the
+    /// (spec 0086), or `None` when probing is disabled for it. Mirrors the
     /// empty-string-means-unset convention `OrchestratorConfig::effective_harness`
     /// uses: an explicit `usage_probe = ""` disables the probe, an absent
     /// field falls back to the harness's built-in default command (see
@@ -740,7 +740,7 @@ mod tests {
         assert_eq!(resolve_program_templates_dir(&cfg, Some("")), None);
     }
 
-    /// `Config::effective_usage_probe` (spec 0085): absent `usage_probe`
+    /// `Config::effective_usage_probe` (spec 0086): absent `usage_probe`
     /// falls back to the harness's built-in default command; a harness with
     /// no built-in default (and no override) has probing disabled.
     #[test]

@@ -1210,7 +1210,7 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
 }
 
 /// Sanity ceiling on how many rows of a harness's captured usage-panel
-/// output the hover tooltip will render (spec 0085). The daemon's probe
+/// output the hover tooltip will render (spec 0086). The daemon's probe
 /// captures at a fixed 40-row PTY, so real content can never exceed that —
 /// this constant exists only as a safety bound distinct from that daemon
 /// implementation detail, not as the primary size control. The tooltip's
@@ -1221,7 +1221,7 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
 const HARNESS_USAGE_TOOLTIP_MAX_ROWS: u16 = 40;
 
 /// Which portion of the harness hover tooltip's usage panel to render,
-/// decided purely from the cached `usage.query` result (spec 0085) so the
+/// decided purely from the cached `usage.query` result (spec 0086) so the
 /// decision is unit-testable without a live `Frame`. The model line above
 /// it is unconditional — this only governs what (if anything) appears
 /// below it.
@@ -1259,7 +1259,7 @@ fn harness_usage_tooltip_case(
 }
 
 /// Style for the model (+ effort) header line when the harness hover
-/// tooltip also shows usage-probe content underneath it (spec 0085) — bold
+/// tooltip also shows usage-probe content underneath it (spec 0086) — bold
 /// + the theme's accent color, so the header reads as visually distinct
 /// from the usage panel below it rather than blending into a wall of text.
 /// Only used when there's a second section to stand out *from*; the
@@ -1275,7 +1275,7 @@ fn harness_hover_tooltip_header_style(theme: &Theme) -> Style {
 /// reasoning effort, when known) on the first line — "unknown" rather than
 /// nothing when the harness hasn't reported a model, since only
 /// `smith`/`grok` (and agy, best effort) track it live today. When a
-/// usage-probe snapshot is cached for that harness (spec 0085), the same
+/// usage-probe snapshot is cached for that harness (spec 0086), the same
 /// box grows to show it underneath (highlighted header, a blank separator
 /// row, then the panel), redisplayed verbatim (color/layout intact, never
 /// parsed into text) rather than as a second, competing tooltip.
@@ -1421,7 +1421,7 @@ fn render_harness_hover_tooltip(f: &mut Frame, app: &App) {
 /// very top of the screen). Unlike `render_button_tooltip`'s generic
 /// 1-row offset — fine for a 1-cell button, but a taller box offset by only
 /// 1 row still overlaps the anchor — this never covers `anchor_y`, no
-/// matter how tall `h` grows to fit a usage panel (spec 0085).
+/// matter how tall `h` grows to fit a usage panel (spec 0086).
 fn harness_hover_tooltip_rect(anchor_x: u16, anchor_y: u16, w: u16, h: u16, total: Rect) -> Rect {
     let mut x = anchor_x;
     if x + w > total.x + total.width {
@@ -9527,7 +9527,7 @@ fn row_has_contents(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
 /// assumes content is gapless from row 0 — true for `render_pty_tail`'s
 /// chat-pane use case, where output always starts printing at the top), a
 /// harness's usage/status panel is a full-screen TUI dialog that can be
-/// positioned starting at any row — confirmed live for spec 0085's hover
+/// positioned starting at any row — confirmed live for spec 0086's hover
 /// tooltip: codex's real panel starts around row 11, claude's around row 2,
 /// with unrelated blank rows above. Rendering from a hardcoded row 0 showed
 /// only that leading blank margin (or, worse, whatever stray content sat
@@ -9552,7 +9552,7 @@ fn render_pty_tail(f: &mut Frame, area: Rect, screen: &vt100::Screen, theme: &Th
 
 /// Shared cell-painting loop behind `render_pty_tail`'s bottom-anchored
 /// scrollback view and the harness-usage hover tooltip's top-anchored
-/// snapshot view (spec 0085): paints up to `visible_h` rows of `screen`
+/// snapshot view (spec 0086): paints up to `visible_h` rows of `screen`
 /// starting at `start_row`, cell for cell, preserving vt100 color and
 /// attributes. Needs no live session state — `screen` can come from a
 /// throwaway parser fed a captured byte buffer.
@@ -15564,7 +15564,7 @@ mod tests {
         );
     }
 
-    // -- Variable-height coverage (spec 0085): the geometry function itself
+    // -- Variable-height coverage (spec 0086): the geometry function itself
     // already took `h` as a parameter before the usage panel existed, but
     // it was only ever called with a hardcoded `3`. These exercise the
     // same above/below-flip and width-clamp logic at the taller heights a
@@ -15617,7 +15617,7 @@ mod tests {
         assert!(rect.y + rect.height >= rect.y, "no overflow panic");
     }
 
-    // -- `harness_usage_tooltip_case` (spec 0085): pure decision logic for
+    // -- `harness_usage_tooltip_case` (spec 0086): pure decision logic for
     // which of the three tooltip states to render, factored out so it's
     // testable without a live `Frame` (mirrors the daemon-side
     // `usage_probe_wait_outcome` style of extracting the decision into a
@@ -15693,7 +15693,7 @@ mod tests {
         assert_eq!(harness_usage_tooltip_case(Some(&r)), HarnessUsageTooltipCase::None);
     }
 
-    // -- `non_blank_row_bounds` (spec 0085): regression coverage for the
+    // -- `non_blank_row_bounds` (spec 0086): regression coverage for the
     // hover-tooltip bug where a harness's usage/status panel positioned
     // below row 0 (codex ~row 11, claude ~row 2) rendered as a blank/wrong
     // leading margin instead of the actual panel, because the tooltip

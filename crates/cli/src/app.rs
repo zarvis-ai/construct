@@ -119,7 +119,7 @@ pub(crate) const PROGRAM_WHEEL_SCROLL_ROWS: usize = 3;
 const PROGRAM_UNDO_STACK_LIMIT: usize = 100;
 const LARGE_TEXT_PASTE_CHARS: usize = 16 * 1024;
 /// Minimum spacing between `usage.query` fetches for the same harness while
-/// its name is continuously hovered (spec 0085's tooltip). The daemon's own
+/// its name is continuously hovered (spec 0086's tooltip). The daemon's own
 /// probe cache is separately gated to 10 minutes server-side; this just
 /// bounds client-side IPC chatter, so it can stay short.
 const HARNESS_USAGE_QUERY_INTERVAL: Duration = Duration::from_secs(2);
@@ -1226,7 +1226,7 @@ pub struct App {
     /// Background channel delivering `(session_id, program_markdown)` fetch
     /// results into the event loop; drained alongside the template channel.
     pub program_projection_tx: mpsc::UnboundedSender<(String, String)>,
-    /// Last `usage.query` result per harness *name* (spec 0085) — usage is
+    /// Last `usage.query` result per harness *name* (spec 0086) — usage is
     /// per-subscription, shared across every session running that harness,
     /// so this is keyed by harness rather than session id. Populated by a
     /// background fetch kicked off while a harness-name hover is active
@@ -1241,7 +1241,7 @@ pub struct App {
     /// for a harness (regardless of outcome), used to throttle the
     /// hover-driven fetch loop to roughly once every couple of seconds per
     /// harness. The daemon's own probe cache is separately gated to 10
-    /// minutes server-side (spec 0085); this only bounds client-side IPC
+    /// minutes server-side (spec 0086); this only bounds client-side IPC
     /// chatter while continuously hovering.
     pub harness_usage_last_query: HashMap<String, Instant>,
     pub theme: crate::theme::Theme,
@@ -2818,7 +2818,7 @@ impl SessionTitleNameHit {
 /// Hover hit zone for a harness-name span — the session list's right-aligned
 /// per-row label, or a session view's title-bar label. Hit-tested against
 /// `app.mouse_pos` to show `render_harness_hover_tooltip`'s current-model
-/// (+ usage-probe, spec 0085) tooltip; not a click target, so (unlike
+/// (+ usage-probe, spec 0086) tooltip; not a click target, so (unlike
 /// `SessionTitleNameHit`) there's no need to track which pane it belongs to
 /// — on-screen geometry alone disambiguates which row/pane the pointer is
 /// over.
@@ -2920,7 +2920,7 @@ pub struct LayoutSnapshot {
     /// Hover zones for harness-name labels — session-list rows plus each
     /// rendered session view's title bar — so `render_harness_hover_tooltip`
     /// can show the session's current model (and cached usage-probe data,
-    /// spec 0085) on hover.
+    /// spec 0086) on hover.
     pub session_harness_hits: Vec<SessionHarnessHit>,
     /// Bounds of the sidebar's lineage section from the last frame (header
     /// row included). `None` when the selected session has no lineage to
@@ -3673,7 +3673,7 @@ async fn run_loop(
     // channels above this one stays local instead of living on `App`.
     let (content_search_tx, mut content_search_rx) =
         mpsc::unbounded_channel::<(u64, anyhow::Result<construct_protocol::SearchResult>)>();
-    // Harness usage-probe hover tooltip (spec 0085): the throttled
+    // Harness usage-probe hover tooltip (spec 0086): the throttled
     // `usage.query` call fired below (while a harness-name hover is
     // active) is spawned entirely within this loop, so like tier-2
     // content search this channel stays local instead of living on `App`.
@@ -3940,7 +3940,7 @@ async fn run_loop(
                     }
                 }
             }
-            // Harness usage-probe hover tooltip (spec 0085): while the
+            // Harness usage-probe hover tooltip (spec 0086): while the
             // cursor sits over a harness-name hit (just populated by the
             // draw call above), keep its cached `usage.query` result warm.
             // Throttled per-harness rather than per-frame — see

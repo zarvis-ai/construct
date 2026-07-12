@@ -1,4 +1,4 @@
-# 0085-harness-usage-probe
+# 0086-harness-usage-probe
 
 Status: accepted
 Date: 2026-07-11

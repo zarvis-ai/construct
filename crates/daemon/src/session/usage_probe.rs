@@ -1,4 +1,4 @@
-//! Harness usage-probe orchestration (spec 0085): `usage.query`'s
+//! Harness usage-probe orchestration (spec 0086): `usage.query`'s
 //! background half. See `crate::usage` for the cache types this module
 //! populates.
 //!
@@ -39,7 +39,7 @@ const USAGE_PROBE_ROWS: u16 = 40;
 const PROBE_HARD_CEILING: Duration = Duration::from_secs(120);
 
 impl SessionManager {
-    /// `usage.query` (spec 0085). Read-mostly: never blocks on the probe
+    /// `usage.query` (spec 0086). Read-mostly: never blocks on the probe
     /// itself. Returns the most recently cached snapshot for `harness`
     /// (regardless of freshness — the TTL only gates whether a new probe is
     /// warranted, not whether the last one is still returned) plus whether
@@ -479,7 +479,7 @@ impl SessionManager {
     /// transcript file there would still leave a real entry in the
     /// harness's own session picker, so the whole directory is removed
     /// instead. Verified against a real antigravity conversation directory
-    /// during manual testing (spec 0085): far more lives there than just
+    /// during manual testing (spec 0086): far more lives there than just
     /// the transcript file this module reads to mirror chat history.
     fn try_unlink_usage_probe_native_transcript(&self, harness: &str, id: &str) -> UnlinkOutcome {
         let session_dir = self.storage.session_dir(id);
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(read_native_id_file(&tmp.path().join("missing.txt")), None);
     }
 
-    // -- `capture_shows_command_ran` (spec 0085): regression coverage for
+    // -- `capture_shows_command_ran` (spec 0086): regression coverage for
     // the live-observed startup-quiescence race where a probe's command
     // never actually landed, and the harness's own idle welcome screen got
     // captured and cached as if it were a real response.

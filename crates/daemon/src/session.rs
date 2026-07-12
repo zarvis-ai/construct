@@ -1011,7 +1011,7 @@ pub struct SessionManager {
     /// `.await`.
     availability_cache: std::sync::Mutex<crate::availability::AvailabilityCache>,
     /// Cache of the most recent harness usage-probe capture per harness
-    /// (spec 0085), plus the in-flight refresh guard — see
+    /// (spec 0086), plus the in-flight refresh guard — see
     /// `crate::usage`. `std::sync::Mutex` deliberately: every critical
     /// section is a tiny read/write, never held across an `.await` (the
     /// probe itself — session create/submit-command/sleep/delete — all runs

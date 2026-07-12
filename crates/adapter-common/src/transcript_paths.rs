@@ -4,7 +4,7 @@
 //! Each adapter crate already knows how to find the file its own harness
 //! CLI writes a conversation's transcript to — it needs that to mirror
 //! native history into construct's own transcript. The daemon needs the
-//! exact same formula for one more reason: spec 0085's usage-probe cleanup
+//! exact same formula for one more reason: spec 0086's usage-probe cleanup
 //! resolves and best-effort-unlinks the native transcript file a
 //! short-lived `SessionKind::UsageProbe` session caused a harness CLI to
 //! create, so probing never leaves a stray entry in the harness's own
@@ -313,7 +313,7 @@ mod tests {
 
     /// `grok_session_dir` is the whole per-session directory the transcript
     /// file lives inside — exercised by the daemon's native-transcript
-    /// cleanup (spec 0085), which must erase the whole directory (grok
+    /// cleanup (spec 0086), which must erase the whole directory (grok
     /// keeps several sibling files there: `summary.json`,
     /// `prompt_context.json`, `system_prompt.txt`), not just the one
     /// transcript file `grok_transcript_path` points at.

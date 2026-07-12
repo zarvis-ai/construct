@@ -230,7 +230,7 @@ impl Client {
         .await
     }
     /// Query (and optionally trigger a background refresh of) the cached
-    /// usage-probe snapshot for `harness` (spec 0085). Never blocks on the
+    /// usage-probe snapshot for `harness` (spec 0086). Never blocks on the
     /// probe itself — see [`UsageQueryResult`].
     pub async fn usage_query(&self, harness: &str, allow_refresh: bool) -> Result<UsageQueryResult> {
         self.request(

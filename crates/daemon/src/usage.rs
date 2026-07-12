@@ -1,4 +1,4 @@
-//! Daemon-side cache for harness usage-probe captures (spec 0085).
+//! Daemon-side cache for harness usage-probe captures (spec 0086).
 //!
 //! One [`UsageSnapshot`] per harness: the raw PTY bytes the harness's own
 //! usage/status slash command rendered, captured by a short-lived
@@ -20,7 +20,7 @@ pub const USAGE_CACHE_TTL: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone)]
 pub struct UsageSnapshot {
     /// Raw PTY bytes the harness's usage/status command rendered.
-    /// Deliberately unparsed — see spec 0085's "redisplay verbatim, never
+    /// Deliberately unparsed — see spec 0086's "redisplay verbatim, never
     /// parse" decision.
     pub bytes: Vec<u8>,
     pub cols: u16,
