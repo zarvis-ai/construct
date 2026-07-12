@@ -291,8 +291,8 @@ impl App {
             return;
         }
         // Session rows reserve disclosure before the 4-cell pin/status gutter.
-        // Disclosure clicks toggle subagents; the gutter toggles pinning.
-        // Must stay in lockstep with `hovered_diamond` in ui.rs.
+        // Disclosure clicks toggle nested subagents/forks; the gutter toggles
+        // pinning. Must stay in lockstep with `hovered_diamond` in ui.rs.
         if let ListItem::Session {
             summary,
             indented,
@@ -304,8 +304,8 @@ impl App {
             let disclosure_col = list.x + 1 + indent;
             if *has_children && col == disclosure_col {
                 let id = summary.id.clone();
-                if !self.subagent_collapsed.insert(id.clone()) {
-                    self.subagent_collapsed.remove(&id);
+                if !self.children_collapsed.insert(id.clone()) {
+                    self.children_collapsed.remove(&id);
                 }
                 return;
             }

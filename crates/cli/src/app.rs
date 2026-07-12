@@ -1154,7 +1154,7 @@ pub struct App {
     pub main_windows: MainWindowTree,
     pub active_window_id: u64,
     pub next_window_id: u64,
-    pub subagent_collapsed: HashSet<String>,
+    pub children_collapsed: HashSet<String>,
     pub transcript: Vec<TimestampedEvent>,
     pub transcript_session: Option<String>,
     pub transcript_scroll: u16,
@@ -3235,7 +3235,7 @@ async fn run_with_socket_initial_selection(
         next_window_id: initial_main_windows.max_id().saturating_add(1),
         active_window_id: initial_active_window_id,
         main_windows: initial_main_windows,
-        subagent_collapsed: HashSet::new(),
+        children_collapsed: HashSet::new(),
         transcript: Vec::new(),
         transcript_session: None,
         transcript_scroll: 0,
@@ -4726,11 +4726,14 @@ impl App {
         }
     }
 
-    fn selected_session_has_subagents(&self) -> Option<String> {
+    fn selected_session_has_children(&self) -> Option<String> {
         let id = self.selection.session_id()?;
         self.sessions
             .iter()
-            .any(|s| s.parent_session_id.as_deref() == Some(id))
+            .any(|s| {
+                s.parent_session_id.as_deref() == Some(id)
+                    || s.forked_from.as_ref().map(|f| f.session_id.as_str()) == Some(id)
+            })
             .then(|| id.to_string())
     }
 
@@ -4966,8 +4969,9 @@ impl App {
     /// Materialize the rendered list: ungrouped sessions (sorted by
     /// position) on top, then groups in position order with each group's
     /// members indented underneath (skipped entirely when the group is
-    /// collapsed). Subagents are nested under their parent session and are
-    /// expanded by default.
+    /// collapsed). Subagents and forks alike are nested under their parent
+    /// session, expanded by default, and hidden together when the parent
+    /// is collapsed.
     pub fn list_items(&self) -> Vec<ListItem> {
         let mut out: Vec<ListItem> = Vec::new();
 
@@ -5030,7 +5034,12 @@ impl App {
             show_archived: &HashSet<String>,
         ) {
             let children = subagents_by_parent.get(s.id.as_str());
-            let has_children = children.map(|v| !v.is_empty()).unwrap_or(false);
+            let has_subagents = children.map(|v| !v.is_empty()).unwrap_or(false);
+            let has_forks = forks_by_parent
+                .get(s.id.as_str())
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+            let has_children = has_subagents || has_forks;
             let children_expanded = has_children && !collapsed.contains(&s.id);
             out.push(ListItem::Session {
                 summary: s.clone(),
@@ -5038,23 +5047,27 @@ impl App {
                 has_children,
                 children_expanded,
             });
+            // Collapsing a session hides everything nested under it —
+            // active subagents, active forks, and the archived-children
+            // summary row alike — until it's expanded again.
+            if !children_expanded {
+                return;
+            }
             let mut archived_children = Vec::new();
-            if children_expanded {
-                if let Some(children) = children {
-                    let (active_children, archived): (Vec<&SessionSummary>, Vec<&SessionSummary>) =
-                        children.iter().copied().partition(|child| !child.archived);
-                    archived_children = archived;
-                    for child in active_children {
-                        push_session_tree(
-                            out,
-                            child,
-                            true,
-                            subagents_by_parent,
-                            forks_by_parent,
-                            collapsed,
-                            show_archived,
-                        );
-                    }
+            if let Some(children) = children {
+                let (active_children, archived): (Vec<&SessionSummary>, Vec<&SessionSummary>) =
+                    children.iter().copied().partition(|child| !child.archived);
+                archived_children = archived;
+                for child in active_children {
+                    push_session_tree(
+                        out,
+                        child,
+                        true,
+                        subagents_by_parent,
+                        forks_by_parent,
+                        collapsed,
+                        show_archived,
+                    );
                 }
             }
             // Forks nest indented under their parent — recursively, so a
@@ -5139,7 +5152,7 @@ impl App {
                 indented,
                 &subagents_by_parent,
                 &forks_by_parent,
-                &self.subagent_collapsed,
+                &self.children_collapsed,
                 &self.show_archived_children,
             );
         };
@@ -9305,8 +9318,8 @@ impl App {
                         self.set_status(format!("expand failed: {e}"));
                     }
                 } else if self.focus == PaneFocus::List {
-                    if let Some(id) = self.selected_session_has_subagents() {
-                        self.subagent_collapsed.remove(&id);
+                    if let Some(id) = self.selected_session_has_children() {
+                        self.children_collapsed.remove(&id);
                     }
                 }
             }
@@ -9319,8 +9332,8 @@ impl App {
                         self.set_status(format!("collapse failed: {e}"));
                     }
                 } else if self.focus == PaneFocus::List {
-                    if let Some(id) = self.selected_session_has_subagents() {
-                        self.subagent_collapsed.insert(id);
+                    if let Some(id) = self.selected_session_has_children() {
+                        self.children_collapsed.insert(id);
                     }
                 }
             }
@@ -11340,7 +11353,7 @@ mod tests {
             main_windows: MainWindowTree::single(1, Selection::Session("s1".into())),
             active_window_id: 1,
             next_window_id: 2,
-            subagent_collapsed: HashSet::new(),
+            children_collapsed: HashSet::new(),
             transcript: Vec::new(),
             transcript_session: None,
             transcript_scroll: 0,
@@ -29117,7 +29130,7 @@ mod tests {
         app.run_action(KeyAction::ExpandGroup).await;
         assert_eq!(app.list_items().len(), 3);
 
-        app.subagent_collapsed.insert("sparent".into());
+        app.children_collapsed.insert("sparent".into());
         let collapsed = app.list_items();
         assert_eq!(collapsed.len(), 1);
         match &collapsed[0] {
@@ -29133,6 +29146,109 @@ mod tests {
             }
             _ => panic!("expected collapsed parent session"),
         }
+    }
+
+    #[tokio::test]
+    async fn collapsing_a_session_hides_its_forks_too() {
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let _server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut parent = summary_with_kind(construct_protocol::SessionKind::User);
+        parent.id = "sparent".into();
+        parent.position = 0;
+        let mut sub = summary_with_kind(construct_protocol::SessionKind::Subagent);
+        sub.id = "ssub".into();
+        sub.parent_session_id = Some("sparent".into());
+        sub.position = 1;
+        let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
+        fork.id = "sfork".into();
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
+            session_id: "sparent".into(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+
+        let mut app = test_app(client, vec![fork, sub, parent]);
+        // Expanded by default: parent, subagent, and fork all render.
+        let items = app.list_items();
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            ListItem::Session { summary, has_children: true, children_expanded: true, .. }
+                if summary.id == "sparent"
+        ));
+
+        // Collapsing the parent (via the same key action used for subagents)
+        // hides the subagent AND the fork — they're both "children" now.
+        app.selection = Selection::Session("sparent".into());
+        app.focus = PaneFocus::List;
+        app.run_action(KeyAction::CollapseGroup).await;
+        let collapsed = app.list_items();
+        assert_eq!(collapsed.len(), 1, "collapsing hides subagent and fork alike");
+        assert!(matches!(
+            &collapsed[0],
+            ListItem::Session { summary, has_children: true, children_expanded: false, .. }
+                if summary.id == "sparent"
+        ));
+
+        // Expanding brings both back.
+        app.run_action(KeyAction::ExpandGroup).await;
+        assert_eq!(app.list_items().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fork_only_parent_gets_a_disclosure_toggle() {
+        use tokio::net::UnixListener;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("construct.sock");
+        let listener = UnixListener::bind(&sock).expect("bind mock daemon");
+        let _server = tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let client = Client::connect(&sock).await.expect("client connects");
+        let mut parent = summary_with_kind(construct_protocol::SessionKind::User);
+        parent.id = "sparent".into();
+        parent.position = 0;
+        let mut fork = summary_with_kind(construct_protocol::SessionKind::User);
+        fork.id = "sfork".into();
+        fork.forked_from = Some(construct_protocol::ForkedFrom {
+            session_id: "sparent".into(),
+            transcript_seq: 0,
+            at_ms: 0,
+            parent_busy_ms: 0,
+            parent_message_count: 0,
+        });
+
+        // A session with ONLY a fork (no subagents) still gets `has_children`
+        // and can be collapsed — this used to be impossible since
+        // `has_children`/the toggle gate only ever looked at subagents.
+        let mut app = test_app(client, vec![fork, parent]);
+        assert!(matches!(
+            &app.list_items()[0],
+            ListItem::Session { summary, has_children: true, .. } if summary.id == "sparent"
+        ));
+
+        app.selection = Selection::Session("sparent".into());
+        app.focus = PaneFocus::List;
+        app.run_action(KeyAction::CollapseGroup).await;
+        assert_eq!(app.list_items().len(), 1);
+        app.run_action(KeyAction::ExpandGroup).await;
+        assert_eq!(app.list_items().len(), 2);
     }
 
     #[tokio::test]
