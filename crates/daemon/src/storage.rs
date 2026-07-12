@@ -87,27 +87,21 @@ const INVESTIGATION_PROGRAM: &str = concat!(
     "\n",
     "Closed-out work and the final answer to the Question.\n",
 );
-const SPEC_PROGRAM: &str = concat!(
-    "# Spec\n",
+const GOAL_PROGRAM: &str = concat!(
+    "# Goal\n",
     "\n",
     "Run this program to complete the Goal. The agent uses Context and ",
-    "Requirements to refine the Plan, executes each step, verifies the result, ",
-    "and records the outcome in Done. Ask only when a missing decision blocks ",
-    "safe progress. Type @ to embed a live session or harness.\n",
+    "Requirements to execute the work, verifies the result, and records the ",
+    "outcome in Done. Ask only when a missing decision blocks safe progress. ",
+    "Type @ to embed a live session or harness.\n",
     "\n",
-    "## Goal\n",
-    "\n",
-    "What should be true when this spec is done.\n",
+    "What should be true when this goal is done.\n",
     "\n",
     "## Context\n",
     "\n",
     "Relevant background, constraints, and starting points.\n",
     "\n",
     "## Requirements\n",
-    "\n",
-    "- \n",
-    "\n",
-    "## Plan\n",
     "\n",
     "- \n",
     "\n",
@@ -588,12 +582,12 @@ impl Storage {
                 built_in: true,
             },
             ProgramTemplate {
-                id: "spec".to_string(),
-                name: "Spec".to_string(),
+                id: "goal".to_string(),
+                name: "Goal".to_string(),
                 description: Some(
-                    "Goal, requirements, plan, and verification — run to execute".to_string(),
+                    "Goal, context, requirements, and verification — run to execute".to_string(),
                 ),
-                markdown: SPEC_PROGRAM.to_string(),
+                markdown: GOAL_PROGRAM.to_string(),
                 built_in: true,
             },
         ];
@@ -2173,25 +2167,24 @@ mod program_tests {
     }
 
     #[test]
-    fn program_templates_include_spec_builtin() {
+    fn program_templates_include_goal_builtin() {
         let tmp = tempfile::tempdir().unwrap();
         let storage = Storage::new(tmp.path().join("data")).unwrap();
 
         let templates = storage.program_templates().unwrap();
-        let spec = templates.iter().find(|t| t.id == "spec").unwrap();
+        let goal = templates.iter().find(|t| t.id == "goal").unwrap();
 
-        assert_eq!(spec.name, "Spec");
-        assert!(spec.built_in);
-        assert!(spec.description.is_some());
+        assert_eq!(goal.name, "Goal");
+        assert!(goal.built_in);
+        assert!(goal.description.is_some());
         for heading in [
-            "## Goal",
+            "# Goal",
             "## Context",
             "## Requirements",
-            "## Plan",
             "## Verification",
             "## Done",
         ] {
-            assert!(spec.markdown.contains(heading), "missing {heading}");
+            assert!(goal.markdown.contains(heading), "missing {heading}");
         }
     }
 

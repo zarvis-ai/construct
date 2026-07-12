@@ -136,7 +136,7 @@ enabled = true
 # ── Program ──────────────────────────────────────────────────────────────────
 #
 # The program is the shared Markdown space each session can run. Built-in
-# templates (Blank, Tasks, Investigation, Spec) are always offered; drop your own
+# templates (Blank, Tasks, Investigation, Goal) are always offered; drop your own
 # `<name>.md` files in the templates directory to add custom templates. A custom
 # template is just a Markdown file — its filename is its name and its contents are
 # the program. Custom templates reload on every program open — no daemon restart

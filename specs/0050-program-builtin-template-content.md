@@ -11,7 +11,7 @@ Built-in program templates are scaffolds that both structure a workflow and teac
 
 Template Markdown may only contain smart clips that resolve, and must not contain illustrative or placeholder clips that would render as dangling chips. In practice that means harness clips (which always resolve to a harness) are fine to embed as live examples, while a concrete session reference cannot be baked into a static template because the session does not exist yet. Session embeds and fenced `:::clip` blocks are therefore described in prose ("type @ to embed a live session") rather than shown as literal syntax.
 
-The built-in set is Blank (empty), Tasks (a Todo / Progress / Done board), Investigation (Question / Context / Plan / Findings / Done), and Spec (Goal / Context / Requirements / Plan / Verification / Done). Spec is an executable work document: running it tells the owning agent to refine the plan, perform the work, verify the result, and record the outcome.
+The built-in set is Blank (empty), Tasks (a Todo / Progress / Done board), Investigation (Question / Context / Plan / Findings / Done), and Goal (Goal / Context / Requirements / Verification / Done). Goal is an executable work document: running it tells the owning agent to perform the work, verify the result, and record the outcome.
 
 ## Reason
 

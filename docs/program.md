@@ -114,7 +114,8 @@ adds to existing shimmer instead of replacing it.
 
 An empty Program offers templates as one-click buttons. Built-ins: **Tasks**
 (a Todo / In progress / Done board), **Investigation** (question, context,
-plan, findings), and **Spec** (goal, requirements, plan, verification, and done).
+plan, findings), and **Goal** (goal, context, requirements, verification, and
+done).
 Add your own by dropping `*.md` files into the template directory — the
 filename becomes the template id, the contents are inserted
 verbatim, and edits are picked up the next time a Program opens (no restart):
