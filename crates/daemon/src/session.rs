@@ -1156,6 +1156,49 @@ pub(crate) fn set_state_tracked(
 }
 
 impl SessionManager {
+    /// Return the live adapter for an operation, closing the session when its
+    /// adapter has already disappeared. A missing adapter is terminal from a
+    /// client's perspective: leaving a non-terminal summary behind traps the
+    /// user in a session that cannot accept input or offer the restart flow.
+    pub(crate) async fn live_adapter_or_mark_closed(
+        &self,
+        entry: &Arc<SessionEntry>,
+    ) -> Result<Arc<Adapter>> {
+        let adapter = entry.adapter.lock().await;
+        if let Some(adapter) = adapter.clone() {
+            return Ok(adapter);
+        }
+
+        // Keep the adapter lock while changing state so a concurrent restart
+        // cannot install a new adapter between the absence check and this
+        // terminal transition.
+        let snapshot = {
+            let mut summary = entry.summary.write().await;
+            if summary.state.is_terminal() {
+                None
+            } else {
+                set_state_tracked(
+                    &mut summary,
+                    SessionState::Done,
+                    Utc::now().timestamp_millis(),
+                );
+                summary.last_event_at = Some(Utc::now());
+                Some(summary.clone())
+            }
+        };
+        drop(adapter);
+
+        if let Some(snapshot) = snapshot {
+            let _ = self.storage.save_summary(&snapshot);
+            let _ = self
+                .broadcast
+                .send(BroadcastMsg::State(StateNotificationPayload {
+                    session: snapshot,
+                }));
+        }
+        Err(anyhow!("session has no live adapter"))
+    }
+
     /// Construct the manager along with the receiver side of the
     /// remote-start channel. The caller (`main.rs`) spawns the
     /// supervisor task with that receiver so on-demand
@@ -2716,12 +2759,7 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let adapter = self.live_adapter_or_mark_closed(&entry).await?;
         // Record the input as a user message so it shows in the transcript.
         // Auto-title is triggered inside handle_event for any User message.
         self.handle_event(
@@ -2807,12 +2845,7 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let adapter = self.live_adapter_or_mark_closed(&entry).await?;
         let params = serde_json::to_value(&construct_protocol::SessionIdParams {
             session_id: id.to_string(),
         })?;
@@ -2827,12 +2860,7 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let adapter = self.live_adapter_or_mark_closed(&entry).await?;
         let params = serde_json::to_value(&construct_protocol::SessionIdParams {
             session_id: id.to_string(),
         })?;
@@ -3762,12 +3790,7 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let adapter = self.live_adapter_or_mark_closed(&entry).await?;
         let mode = match decision.as_str() {
             "auto_review" => Some(construct_protocol::ApprovalMode::AutoReview),
             "unsafe_auto" => Some(construct_protocol::ApprovalMode::UnsafeAuto),
@@ -3857,12 +3880,7 @@ impl SessionManager {
             .get_entry(id)
             .await
             .ok_or_else(|| anyhow!("session not found: {}", id))?;
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let adapter = self.live_adapter_or_mark_closed(&entry).await?;
         let params = serde_json::to_value(&construct_protocol::SessionToolActionParams {
             session_id: id.to_string(),
             call_id,
@@ -8563,6 +8581,29 @@ done
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn missing_adapter_closes_session_for_restart() {
+        let (mgr, storage, id) = program_test_mgr("# T\n").await;
+        let mut updates = mgr.subscribe();
+
+        let err = mgr
+            .pty_input(&id, b"hello".to_vec())
+            .await
+            .expect_err("input without an adapter must fail");
+        assert!(err.to_string().contains("no live adapter"));
+
+        let entry = mgr.get_entry(&id).await.expect("entry");
+        assert_eq!(entry.summary.read().await.state, SessionState::Done);
+        assert_eq!(
+            storage.load_summary(&id).expect("persisted summary").state,
+            SessionState::Done
+        );
+        assert!(matches!(
+            updates.recv().await.expect("state update"),
+            BroadcastMsg::State(StateNotificationPayload { session }) if session.id == id && session.state == SessionState::Done
+        ));
     }
 
     /// Spec 0087: every input path funnels through the same per-session

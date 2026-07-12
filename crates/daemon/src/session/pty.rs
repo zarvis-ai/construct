@@ -29,7 +29,7 @@ impl SessionManager {
     /// typing into every session plus everything else queued on the
     /// connection. Delivery failures after enqueue are logged, not
     /// returned; typing into a session with no live adapter still fails
-    /// synchronously via the liveness check below.
+    /// synchronously, while also closing it so the client can restart it.
     pub async fn pty_input(&self, id: &str, bytes: Vec<u8>) -> Result<()> {
         self.pty_input_inner(id, bytes, true, false).await
     }
@@ -90,9 +90,7 @@ impl SessionManager {
         // response channel left to report a delivery error through. Best
         // effort — the adapter can still die between this check and
         // delivery, which the writer then logs.
-        if entry.adapter.lock().await.is_none() {
-            return Err(anyhow!("session has no live adapter"));
-        }
+        self.live_adapter_or_mark_closed(&entry).await?;
         if await_delivery {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.enqueue_pty_input(
@@ -287,12 +285,7 @@ impl SessionManager {
         // render at the real width instead of wrapping. Only fires on an
         // actual change — the dedup above already returned for a no-op.
         self.broadcast_widget_event(id, SessionEvent::PtyResize { cols, rows });
-        let adapter = entry
-            .adapter
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow!("session has no live adapter"))?;
+        let adapter = self.live_adapter_or_mark_closed(&entry).await?;
         let params = serde_json::to_value(&construct_protocol::SessionPtyResizeParams {
             session_id: id.to_string(),
             cols,
