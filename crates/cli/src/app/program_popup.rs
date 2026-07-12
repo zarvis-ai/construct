@@ -646,7 +646,7 @@ impl App {
     /// `session_id`. Used by selection runs so that optimistically shimmering
     /// the freshly-run block never clears shimmer another in-flight run
     /// already declared elsewhere in the program (see spec 0042).
-    fn program_run_pending_with_existing(
+    pub(super) fn program_run_pending_with_existing(
         &self,
         session_id: &str,
         ids: HashSet<String>,
@@ -657,7 +657,11 @@ impl App {
         }
     }
 
-    fn start_program_run_with_pending(&mut self, session_id: &str, pending: HashSet<String>) {
+    pub(super) fn start_program_run_with_pending(
+        &mut self,
+        session_id: &str,
+        pending: HashSet<String>,
+    ) {
         if pending.is_empty() {
             self.program_runs.remove(session_id);
             return;

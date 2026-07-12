@@ -914,9 +914,18 @@ impl App {
             .as_ref()
             .map(|popup| popup.program.version);
         let selection = program_normalize_smart_clip_instance_ids(&selection);
-        let selection_block_ids: Option<Vec<String>> = selected_block_ids
-            .filter(|ids| !ids.is_empty())
-            .map(|ids| ids.into_iter().collect());
+        let selected_block_ids = selected_block_ids.filter(|ids| !ids.is_empty());
+        // Optimistic shimmer (spec 0042/0087): mark the verb's block(s)
+        // pending locally before the round trip, the same instant-feedback
+        // treatment selection Run gives itself. `program_run_pending_with_existing`
+        // unions with any already-active run on this session rather than
+        // clobbering it, matching Run's own selection semantics.
+        if let Some(ids) = selected_block_ids.clone() {
+            let pending = self.program_run_pending_with_existing(&session_id, ids);
+            self.start_program_run_with_pending(&session_id, pending);
+        }
+        let selection_block_ids: Option<Vec<String>> =
+            selected_block_ids.map(|ids| ids.into_iter().collect());
         let params = construct_protocol::ProgramVerbExecuteParams {
             session_id,
             verb: verb.clone(),
@@ -2299,7 +2308,10 @@ impl App {
     }
 }
 
-fn program_anchored_live_edit(before: &str, after: &str) -> Option<construct_protocol::ProgramEdit> {
+fn program_anchored_live_edit(
+    before: &str,
+    after: &str,
+) -> Option<construct_protocol::ProgramEdit> {
     if before == after {
         return None;
     }
@@ -2350,4 +2362,3 @@ fn program_anchored_live_edit(before: &str, after: &str) -> Option<construct_pro
         keep_pending: false,
     })
 }
-

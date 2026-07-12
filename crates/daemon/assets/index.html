@@ -6077,6 +6077,11 @@ async function programRunVerb(verbName) {
   if (!selectedBlockIds || !selectedBlockIds.size) {
     selectedBlockIds = new Set(programBlockSpans(selection).map((b) => b.id));
   }
+  // Optimistic shimmer (spec 0042/0087): mark the verb's block(s) pending
+  // locally before the round trip, same instant-feedback treatment Run gives
+  // itself via programStartOptimisticRun — unions with any already-active
+  // run on this session rather than clobbering it.
+  programStartOptimisticRun(id, selection, true, selectedBlockIds, doc.saved);
   programSetMsg(`running verb "${verbName}"…`);
   try {
     const params = { session_id: id, verb: verbName, selection, base_version: doc.version };
