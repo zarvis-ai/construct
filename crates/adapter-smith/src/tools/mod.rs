@@ -224,8 +224,9 @@ impl ToolRegistry {
             Box::new(construct_daemon::LoopList),
             Box::new(construct_daemon::LoopUpdate),
             Box::new(construct_daemon::LoopRemove),
-            // Native mirror of MCP's construct_program_edit — see its doc
-            // comment for why this exists (verb-drift escalation, spec 0087).
+            // Native mirrors of MCP's construct_program_get/construct_program_edit
+            // — see their doc comments for why they exist (spec 0087).
+            Box::new(construct_daemon::ProgramGet),
             Box::new(construct_daemon::ProgramEdit),
             // Smith-owned subagents: hidden backing sessions exposed as
             // task-like child agents to this parent session.

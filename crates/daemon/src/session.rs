@@ -601,25 +601,55 @@ struct VerbResultPayload {
     content: String,
 }
 
+/// Cap on how much of the full Program document is inlined directly into a
+/// verb subagent's prompt (spec 0087). Above this the document is truncated
+/// with a pointer to the live `agentd_program_get`/`construct_program_get`
+/// tool instead of growing the prompt unboundedly — a fresh read is also the
+/// only way an interactive verb sees a document that changed after spawn.
+const PROGRAM_VERB_INLINE_DOC_MAX_CHARS: usize = 100_000;
+
 /// Build the initial prompt for a Program-verb subagent (spec 0087): the
-/// verb's own purpose prompt, the selection framed as the subagent's entire
-/// jurisdiction, the optional free-text instruction (same composition rule
-/// as selection Run's comment, spec 0076), and the structured-return
-/// contract — including that the subagent has no Program-editing tool and
-/// must not attempt to act like it does.
+/// verb's own purpose prompt, the full Program document as background
+/// context, the selection framed as the subagent's entire jurisdiction, the
+/// optional free-text instruction (same composition rule as selection Run's
+/// comment, spec 0076), and the structured-return contract — including that
+/// the subagent has no Program-editing tool and must not attempt to act
+/// like it does.
 fn program_verb_prompt(
     verb: &construct_protocol::ProgramVerb,
+    owner_session_id: &str,
+    full_document: &str,
     selection: &str,
     comment: Option<&str>,
 ) -> String {
     use construct_protocol::{ProgramVerbEffect, ProgramVerbInteraction};
     let mut prompt = String::new();
     prompt.push_str(verb.prompt.trim());
+    let doc_char_count = full_document.chars().count();
+    let doc_truncated = doc_char_count > PROGRAM_VERB_INLINE_DOC_MAX_CHARS;
+    prompt.push_str("\n\n---\n\nFor context, here is the full Program (orchestration) document this selection is part of");
+    if doc_truncated {
+        prompt.push_str(&format!(
+            " (truncated to its first {PROGRAM_VERB_INLINE_DOC_MAX_CHARS} characters — call \
+             agentd_program_get, or construct_program_get if you are using MCP, with \
+             session_id \"{owner_session_id}\" for the rest, or for a fresh read if the \
+             document may have changed since)"
+        ));
+    }
+    prompt.push_str(":\n\n");
+    let doc_excerpt: String = full_document
+        .chars()
+        .take(PROGRAM_VERB_INLINE_DOC_MAX_CHARS)
+        .collect();
+    prompt.push_str(&doc_excerpt);
+    if doc_truncated {
+        prompt.push_str("\n\n[... truncated ...]");
+    }
     prompt.push_str(
-        "\n\n---\n\nYour jurisdiction is exactly the following selected Markdown from a \
-         Program (orchestration) document. The rest of the document is not shown to you and \
-         is out of scope: do not describe, reference, or act on anything beyond this \
-         selection.\n\n",
+        "\n\n---\n\nYour jurisdiction is exactly the following selected Markdown — a substring \
+         of the document above. Use the rest of the document only as context: do not describe, \
+         reference, or act on anything outside this selection; your result applies to this \
+         selection alone.\n\n",
     );
     prompt.push_str(selection);
     prompt.push_str("\n\n---\n\n");
@@ -649,9 +679,10 @@ fn program_verb_prompt(
         ProgramVerbEffect::Rewrite => "the complete replacement Markdown for the selection",
     };
     prompt.push_str(&format!(
-        "You have no tool, native or MCP, that can edit this Program document — do not \
-         attempt to use construct_program_edit, agentd_program_edit, or any similar tool; the \
-         platform applies your result on your behalf once you deliver it. When you are ready, \
+        "You may read this Program document (agentd_program_get / construct_program_get) but \
+         have no tool, native or MCP, that can edit it — do not attempt to use \
+         construct_program_edit, agentd_program_edit, or any similar tool; the platform applies \
+         your result on your behalf once you deliver it. When you are ready, \
          call agentd_context (or construct_context if you are using MCP) and read \
          `session_widgets.dir` from the response, then write a single JSON object to \
          `<that dir>/verb-result.json` with exactly one field, `content`: {content_meaning}. \
@@ -2546,7 +2577,13 @@ impl SessionManager {
             "CONSTRUCT_PARENT_SESSION_ID".to_string(),
             params.session_id.clone(),
         );
-        let prompt = program_verb_prompt(&verb, selection_trimmed, comment);
+        let prompt = program_verb_prompt(
+            &verb,
+            &params.session_id,
+            &program.markdown,
+            selection_trimmed,
+            comment,
+        );
         let subagent_id = self
             .create(CreateSessionParams {
                 // Same harness as the Program-owning session, not a
@@ -4502,6 +4539,65 @@ mod tests {
         std::fs::write(&plain, b"data").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(validate_restart_exe(&plain).is_err());
+    }
+
+    fn test_verb_for_prompt(
+        effect: construct_protocol::ProgramVerbEffect,
+    ) -> construct_protocol::ProgramVerb {
+        construct_protocol::ProgramVerb {
+            name: "simplify".to_string(),
+            label: "Simplify".to_string(),
+            description: None,
+            effect,
+            interaction: construct_protocol::ProgramVerbInteraction::SingleShot,
+            order: 0,
+            built_in: true,
+            prompt: "Be the Simplifier.".to_string(),
+        }
+    }
+
+    /// spec 0087: the full Program document is inlined as context alongside
+    /// the selection, and the "no edit tool" instruction no longer claims the
+    /// document is hidden — it's readable, just not editable.
+    #[test]
+    fn program_verb_prompt_includes_full_document_as_context() {
+        let verb = test_verb_for_prompt(construct_protocol::ProgramVerbEffect::Rewrite);
+        let doc = "# Plan\n\nSection A.\n\nSection B: do the thing.\n\nSection C.\n";
+        let prompt = program_verb_prompt(&verb, "owner1", doc, "Section B: do the thing.", None);
+        assert!(
+            prompt.contains("Section A.") && prompt.contains("Section C."),
+            "full document, not just the selection, must appear in the prompt: {prompt}"
+        );
+        assert!(
+            prompt.contains("Section B: do the thing."),
+            "selection itself must still appear: {prompt}"
+        );
+        assert!(
+            !prompt.contains("is not shown to you"),
+            "prompt must not claim the rest of the document is hidden now that it's included: {prompt}"
+        );
+    }
+
+    /// A document over the inline cap is truncated with a pointer to the
+    /// live read tool + the owning session id, rather than growing the
+    /// prompt unboundedly.
+    #[test]
+    fn program_verb_prompt_truncates_oversized_document_with_a_pointer() {
+        let verb = test_verb_for_prompt(construct_protocol::ProgramVerbEffect::Annotate);
+        let huge_doc = "x".repeat(PROGRAM_VERB_INLINE_DOC_MAX_CHARS + 5_000);
+        let prompt = program_verb_prompt(&verb, "owner42", &huge_doc, "selected bit", None);
+        assert!(
+            prompt.contains("truncated"),
+            "oversized document must be flagged as truncated: {prompt}"
+        );
+        assert!(
+            prompt.contains("agentd_program_get") && prompt.contains("owner42"),
+            "truncation notice must point at the live read tool with the owning session id: {prompt}"
+        );
+        assert!(
+            prompt.len() < huge_doc.len() + 2_000,
+            "prompt must not embed the full oversized document"
+        );
     }
 
     #[test]

@@ -776,6 +776,47 @@ impl Tool for LoopRemove {
 
 // ---------- Program ----------
 
+/// Native mirror of the MCP `construct_program_get` tool: read a session's
+/// current Program document. Exists so a smith session without an MCP
+/// connection can read Program content at all — no native tool covered this
+/// before (spec 0087 verb subagents get the document inlined in their
+/// prompt at spawn time, but this is their live, always-fresh fallback for a
+/// document that changed since, or one too large to inline in full).
+pub struct ProgramGet;
+#[async_trait]
+impl Tool for ProgramGet {
+    fn name(&self) -> &str {
+        "agentd_program_get"
+    }
+    fn description(&self) -> &str {
+        "Read a session's current Program document: its Markdown, version, and per-block \
+         shimmer state. `session_id` defaults to the calling session."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": { "session_id": { "type": "string" } }
+        })
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Safe
+    }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let sid = input
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .or_else(calling_session_id)
+            .ok_or_else(|| anyhow!("session_id required (and CONSTRUCT_SESSION_ID unset)"))?;
+        let c = client(ctx).await?;
+        let result = c.program_get(&sid).await?;
+        Ok(ToolOutcome {
+            ok: true,
+            output: serde_json::to_string(&result)?,
+        })
+    }
+}
+
 /// Native mirror of the MCP `construct_program_edit` tool, minus shimmer
 /// declaration. Exists so a smith session — the orchestrator included — can
 /// apply an anchored Program edit without an MCP connection; today the only
