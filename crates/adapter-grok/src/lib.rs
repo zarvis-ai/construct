@@ -255,8 +255,17 @@ fn emit_new_grok_transcript_lines(
 
 /// The root session's active model, if `v` is an assistant turn carrying a
 /// `model_id` that differs from what we last saw — grok stamps `model_id` on
-/// every assistant line in `chat_history.jsonl`, so this both establishes the
-/// initial model and catches a mid-session `/model` switch.
+/// every assistant line in `chat_history.jsonl`, so this establishes the
+/// initial model and, in principle, catches a mid-session `/model` switch.
+///
+/// Verified against a real session (2026-07-12): running `/model` and
+/// picking a different one did not change `model_id` on the next turn, nor
+/// `summary.json`'s `current_model_id` — and grok's own status bar kept
+/// showing the old model too, so the switch never actually took effect at
+/// the grok CLI level. That's an external grok issue, not something this
+/// diff-against-`last_model` logic can work around: there's nothing on disk
+/// to observe when grok itself never persists the change. Initial-model
+/// capture is unaffected and works reliably.
 fn grok_model_change(v: &Value, last_model: &Option<String>) -> Option<String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
         return None;
