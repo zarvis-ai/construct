@@ -143,6 +143,13 @@ fn find_session_id(cwd: &Path) -> Option<String> {
 
 fn find_session_id_excluding(cwd: &Path, excluded: &HashSet<String>) -> Option<String> {
     let sessions_dir = grok_home()?.join("sessions").join(url_encode_path(cwd));
+    find_session_id_excluding_in(&sessions_dir, excluded)
+}
+
+fn find_session_id_excluding_in(
+    sessions_dir: &Path,
+    excluded: &HashSet<String>,
+) -> Option<String> {
     if !sessions_dir.exists() {
         return None;
     }
@@ -169,6 +176,33 @@ fn find_session_id_excluding(cwd: &Path, excluded: &HashSet<String>) -> Option<S
         }
     }
     best.map(|(_, name)| name)
+}
+
+/// Native Grok session ids that already exist for `cwd`.
+///
+/// A resumed construct session is already bound to one of these ids. All of
+/// the others are historical or belong to sibling construct sessions, so they
+/// must never be considered evidence that this session was cleared. A real
+/// `/clear` creates a fresh UUID after the adapter starts.
+fn existing_session_ids(cwd: &Path) -> HashSet<String> {
+    let Some(sessions_dir) =
+        grok_home().map(|home| home.join("sessions").join(url_encode_path(cwd)))
+    else {
+        return HashSet::new();
+    };
+    existing_session_ids_in(&sessions_dir)
+}
+
+fn existing_session_ids_in(sessions_dir: &Path) -> HashSet<String> {
+    let Ok(entries) = std::fs::read_dir(sessions_dir) else {
+        return HashSet::new();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.len() == 36)
+        .collect()
 }
 
 /// Whether a grok session dir was created by `--fork-session`
@@ -815,7 +849,19 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
     // newest session dir under this cwd. That covers first spawn *and*
     // mid-session /clear (a fresh dir with a newer mtime).
     let attached_to_existing = grok_session_id.is_some();
-    let never_rebind_onto: HashSet<String> = fork_parent_id.into_iter().collect();
+    let mut never_rebind_onto: HashSet<String> = fork_parent_id.into_iter().collect();
+    if attached_to_existing {
+        // Snapshot synchronously, before spawning the PTY. On bulk daemon
+        // restart every Grok process shares the cwd-level native-session
+        // directory, and resume itself can make a sibling directory newest.
+        // Persisted sibling metadata is a useful live safeguard, but the
+        // stronger restart invariant is that no directory which predates
+        // this resumed adapter can represent its future `/clear`.
+        never_rebind_onto.extend(existing_session_ids(&cwd));
+        if let Some(own_id) = grok_session_id.as_ref() {
+            never_rebind_onto.remove(own_id);
+        }
+    }
     spawn_interactive_transcript_watcher(
         grok_session_id,
         cwd,
@@ -1301,6 +1347,43 @@ mod tests {
         std::env::set_var("CONSTRUCT_GROK_HOME", &home);
         assert_eq!(find_session_id(cwd).as_deref(), Some(new_id));
         std::env::remove_var("CONSTRUCT_GROK_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn resumed_session_excludes_every_preexisting_native_sibling() {
+        let home = std::env::temp_dir().join(format!(
+            "agentd-grok-resume-baseline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let cwd = Path::new("/tmp/agentd-grok-resume-baseline-test");
+        let sessions = home.join("sessions").join(url_encode_path(cwd));
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let own_id = "aaaaaaaa-bbbb-cccc-dddd-000000000001";
+        let sibling_id = "aaaaaaaa-bbbb-cccc-dddd-000000000002";
+        let cleared_id = "aaaaaaaa-bbbb-cccc-dddd-000000000003";
+        std::fs::create_dir_all(sessions.join(own_id)).unwrap();
+        std::fs::create_dir_all(sessions.join(sibling_id)).unwrap();
+
+        let mut baseline = existing_session_ids_in(&sessions);
+        baseline.remove(own_id);
+        assert_eq!(
+            find_session_id_excluding_in(&sessions, &baseline).as_deref(),
+            Some(own_id)
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::create_dir_all(sessions.join(cleared_id)).unwrap();
+        assert_eq!(
+            find_session_id_excluding_in(&sessions, &baseline).as_deref(),
+            Some(cleared_id)
+        );
+
         let _ = std::fs::remove_dir_all(&home);
     }
 
