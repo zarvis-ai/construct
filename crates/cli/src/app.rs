@@ -15502,6 +15502,128 @@ mod tests {
         server.abort();
     }
 
+    fn test_verb_with_description(name: &str, label: &str, description: &str) -> construct_protocol::ProgramVerb {
+        construct_protocol::ProgramVerb {
+            name: name.to_string(),
+            label: label.to_string(),
+            description: Some(description.to_string()),
+            effect: construct_protocol::ProgramVerbEffect::Rewrite,
+            interaction: construct_protocol::ProgramVerbInteraction::SingleShot,
+            order: 0,
+            built_in: true,
+            prompt: "test".to_string(),
+        }
+    }
+
+    /// spec 0089: while the menu is unfocused (just opened, before Tab),
+    /// nothing is keyboard-highlighted yet, so no description row shows —
+    /// only Tab-focusing (which can then have a highlighted row) reserves
+    /// the extra row.
+    #[tokio::test]
+    async fn program_selection_menu_hides_description_row_when_unfocused() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.program_verbs = vec![test_verb_with_description(
+            "simplify",
+            "Simplify",
+            "Rewrite to the minimum that preserves intent.",
+        )];
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            !text.contains("Rewrite to the minimum")
+                && !text.contains("Execute the selection")
+                && !text.contains("Free-text guidance"),
+            "no description shows before Tab focuses the menu: {text:?}"
+        );
+        server.abort();
+    }
+
+    /// spec 0089: once Tab focuses the menu, the highlighted row's
+    /// description appears, and it updates as Up/Down moves the highlight
+    /// to a different row instead of getting stuck on the first one shown.
+    #[tokio::test]
+    async fn program_selection_menu_shows_highlighted_row_description() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.program_verbs = vec![
+            test_verb_with_description(
+                "simplify",
+                "Simplify",
+                "Rewrite to the minimum that preserves intent.",
+            ),
+            test_verb_with_description("crystallize", "Crystallize spec", "Rewrite into a goal."),
+        ];
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+        app.program_popup.as_mut().unwrap().selection_menu = Some(ProgramSelectionMenu {
+            focused: true,
+            selected_action: ProgramSelectionAction::Run,
+            ..Default::default()
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("Execute the selection now"),
+            "Run's description shows while Run is highlighted: {text:?}"
+        );
+
+        app.program_popup.as_mut().unwrap().selection_menu.as_mut().unwrap().selected_action =
+            ProgramSelectionAction::Verb(0);
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render after navigating to verb 0");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("Rewrite to the minimum"),
+            "verb 0's own description shows once highlighted: {text:?}"
+        );
+        assert!(
+            !text.contains("Execute the selection now"),
+            "Run's description must not linger once highlight moved off Run: {text:?}"
+        );
+
+        app.program_popup.as_mut().unwrap().selection_menu.as_mut().unwrap().selected_action =
+            ProgramSelectionAction::Verb(1);
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render after navigating to verb 1");
+        let text = rendered_text(term.backend().buffer());
+        assert!(
+            text.contains("Rewrite into a goal"),
+            "verb 1's own description shows once highlighted: {text:?}"
+        );
+        assert!(
+            !text.contains("Rewrite to the minimum"),
+            "verb 0's description must not linger once highlight moved to verb 1: {text:?}"
+        );
+        server.abort();
+    }
+
     /// spec 0089/0057: a stale pointer position that merely happens to
     /// coincide with a verb row (or the Run button) the instant the
     /// selection menu appears must NOT render as hovered — only a pointer
@@ -15647,6 +15769,75 @@ mod tests {
             comment_cell.style().bg,
             Some(app.theme.accent),
             "typed comment text should not use the button highlight background"
+        );
+        server.abort();
+    }
+
+    /// Typed comment text must stay visually distinct from plain menu-action
+    /// labels (Run, verbs) even after keyboard focus moves off Comment onto
+    /// one of them — the underline is what marks it as typed content, not
+    /// an action, and must not vanish just because Comment lost the
+    /// highlight. Regression test for exactly that: navigate Comment ->
+    /// Run and confirm the comment text is still underlined and still not
+    /// styled identically to an unselected action row.
+    #[tokio::test]
+    async fn program_selection_comment_text_stays_underlined_after_focus_moves_to_run() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+        app.program_popup.as_mut().unwrap().selection_menu = Some(ProgramSelectionMenu {
+            focused: true,
+            comment: "focus".into(),
+            cursor: 5,
+            // Run, not Comment: the bug reproduces once the highlight moves
+            // off the comment row.
+            selected_action: ProgramSelectionAction::Run,
+
+            ..Default::default()
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let buf = term.backend().buffer();
+        let mut focus_pos = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect();
+            if let Some(x) = row.find("focus") {
+                focus_pos = Some((x as u16, y));
+                break;
+            }
+        }
+        let (x, y) = focus_pos.expect("comment row rendered");
+        let comment_cell = buf.cell((x, y)).expect("comment cell");
+        assert!(
+            comment_cell
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "typed comment text must stay underlined even once Run is the highlighted row"
+        );
+        // The reported bug specifically: once the highlight left Comment,
+        // its typed text fell back to plain `accent` fg with no
+        // modifier — pixel-identical to every *unselected* Run/verb label
+        // (see `row_style(false)`). Assert directly against that color,
+        // not against Run's own (differently-styled, highlighted) cell.
+        assert_ne!(
+            comment_cell.style().fg,
+            Some(app.theme.accent),
+            "typed comment text must not fall back to the plain unselected-row color"
         );
         server.abort();
     }
