@@ -1161,10 +1161,16 @@ pub struct App {
     pub minibuffer: Option<Minibuffer>,
     /// Rotation index into the idle minibuffer placeholder's context hint
     /// pool: advances by the shown-window size every
-    /// `MINIBUFFER_HINT_ROTATE_INTERVAL`, cycling through candidates the
-    /// current viewport is too narrow to show all at once.
+    /// `MINIBUFFER_HINT_ROTATE_EVERY`, or immediately whenever
+    /// `minibuffer_hint_context` shows the context (zoom mode) changed,
+    /// cycling through candidates the current viewport is too narrow to
+    /// show all at once.
     pub minibuffer_hint_offset: usize,
     pub minibuffer_hint_rotated_at: Option<Instant>,
+    /// Zoom mode as of the last placeholder render — compared each frame so
+    /// a zoom change (a new relevant-hints context) rotates the window
+    /// immediately instead of waiting out the timer.
+    pub minibuffer_hint_context: Option<ZoomMode>,
     pub harnesses: Vec<HarnessInfo>,
     /// Program templates offered as clickable buttons in the empty-program
     /// placeholder. Fetched at startup and on reconnect, and refreshed in the
@@ -3252,6 +3258,7 @@ async fn run_with_socket_initial_selection(
         minibuffer: None,
         minibuffer_hint_offset: 0,
         minibuffer_hint_rotated_at: None,
+        minibuffer_hint_context: None,
         harnesses,
         program_templates,
         program_templates_tx,
@@ -11392,6 +11399,7 @@ mod tests {
             minibuffer: None,
             minibuffer_hint_offset: 0,
             minibuffer_hint_rotated_at: None,
+            minibuffer_hint_context: None,
             harnesses: Vec::new(),
             program_templates: Vec::new(),
             program_templates_tx: mpsc::unbounded_channel().0,
@@ -26227,7 +26235,7 @@ mod tests {
             .collect();
 
         // Force the rotation timer overdue without waiting on wall-clock time.
-        app.minibuffer_hint_rotated_at = Some(Instant::now() - Duration::from_secs(60));
+        app.minibuffer_hint_rotated_at = Some(Instant::now() - Duration::from_secs(200));
         terminal
             .draw(|f| crate::ui::render(f, &mut app))
             .expect("draw");
@@ -26247,6 +26255,49 @@ mod tests {
             second.last(),
             Some(&KeyAction::ToggleHelp),
             "help stays trailing after rotation"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn minibuffer_placeholder_rotates_immediately_on_zoom_change() {
+        let (mut app, _dir, server) = captured_app().await;
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let mb_row = app.layout.minibuffer_area.expect("minibuffer area").y;
+        let first: Vec<KeyAction> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .map(|h| h.action)
+            .collect();
+        let rotated_at_before = app.minibuffer_hint_rotated_at;
+
+        // Well under the 180s timer — only the zoom (context) change should
+        // trigger a rotation here.
+        app.zoom = ZoomMode::View;
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let second: Vec<KeyAction> = app
+            .layout
+            .shortcut_hints
+            .iter()
+            .filter(|h| h.y == mb_row)
+            .map(|h| h.action)
+            .collect();
+
+        assert_ne!(
+            first, second,
+            "a zoom change should rotate the window immediately, without waiting for the timer"
+        );
+        assert_ne!(
+            app.minibuffer_hint_rotated_at, rotated_at_before,
+            "a context-triggered rotation should also reset the timer"
         );
         server.abort();
     }

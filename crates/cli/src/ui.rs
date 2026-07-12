@@ -7881,10 +7881,12 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     // zoomed layouts keep it, since the other pane isn't visible to click.
     //
     // The pool holds every action relevant to the current context; only
-    // `MINIBUFFER_HINT_WINDOW` of them show at once, rotating on a timer
-    // so the user discovers bindings beyond the first few instead of
-    // always seeing the same set. A permanent `help` segment is appended
-    // after the rotating window.
+    // `MINIBUFFER_HINT_WINDOW` of them show at once, rotating every
+    // `MINIBUFFER_HINT_ROTATE_EVERY` — or immediately when the context
+    // (zoom mode) changes, since the previous window may no longer be the
+    // most relevant one — so the user discovers bindings beyond the first
+    // few instead of always seeing the same set. A permanent `help`
+    // segment is appended after the rotating window.
     let profile = app.profile;
     let (prefix, mut pool): (&str, Vec<(&'static str, KeyAction)>) = match app.zoom {
         ZoomMode::View => (
@@ -7945,14 +7947,16 @@ fn render_minibuffer(f: &mut Frame, area: Rect, app: &mut App) {
     ));
 
     const MINIBUFFER_HINT_WINDOW: usize = 3;
-    const MINIBUFFER_HINT_ROTATE_EVERY: Duration = Duration::from_secs(6);
+    const MINIBUFFER_HINT_ROTATE_EVERY: Duration = Duration::from_secs(180);
+    let context_changed = app.minibuffer_hint_context != Some(app.zoom);
+    app.minibuffer_hint_context = Some(app.zoom);
     if pool.len() > MINIBUFFER_HINT_WINDOW {
         let now = Instant::now();
-        let due = match app.minibuffer_hint_rotated_at {
+        let timer_due = match app.minibuffer_hint_rotated_at {
             Some(last) => now.duration_since(last) >= MINIBUFFER_HINT_ROTATE_EVERY,
             None => true,
         };
-        if due {
+        if timer_due || context_changed {
             app.minibuffer_hint_rotated_at = Some(now);
             app.minibuffer_hint_offset =
                 (app.minibuffer_hint_offset + MINIBUFFER_HINT_WINDOW) % pool.len();
