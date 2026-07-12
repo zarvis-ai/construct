@@ -1214,10 +1214,11 @@ fn render_harness_unavailable_tooltip(f: &mut Frame, app: &App) {
 /// captures at a fixed 40-row PTY, so real content can never exceed that —
 /// this constant exists only as a safety bound distinct from that daemon
 /// implementation detail, not as the primary size control. The tooltip's
-/// actual height auto-adjusts to the captured content's real (trimmed)
-/// bounding box (see `non_blank_row_bounds`) and is separately clamped to
-/// the current terminal's available height, so this ceiling only matters
-/// for a pathologically tall capture.
+/// actual height auto-adjusts to the captured content's real (trimmed and
+/// blank-run-collapsed) bounding box (see `non_blank_row_bounds` and
+/// `usage_panel_render_rows`) and is separately clamped to the current
+/// terminal's available height, so this ceiling only matters for a
+/// pathologically tall capture.
 const HARNESS_USAGE_TOOLTIP_MAX_ROWS: u16 = 40;
 
 /// Which portion of the harness hover tooltip's usage panel to render,
@@ -1359,8 +1360,14 @@ fn render_harness_hover_tooltip(f: &mut Frame, app: &App) {
                 render_tooltip_rect(f, &app.theme, model_label.as_str(), rect);
                 return;
             };
-            let content_height = last_row - first_row + 1;
-            let usage_rows = content_height.min(HARNESS_USAGE_TOOLTIP_MAX_ROWS);
+            // Collapse long interior blank-glyph runs (see
+            // `MAX_INTERIOR_BLANK_RUN`) before sizing the box, not just
+            // trimming the outer margin — some harnesses (grok) paint their
+            // entire viewport background, so the raw `first_row..=last_row`
+            // span can still be almost the full capture height even after
+            // trimming.
+            let render_rows = usage_panel_render_rows(parser.screen(), first_row, last_row);
+            let usage_rows = (render_rows.len() as u16).min(HARNESS_USAGE_TOOLTIP_MAX_ROWS);
             let inner_w = model_w.max(info.cols);
             let w = (inner_w + 2).min(total.width.max(1));
             // model line + blank separator + usage rows + 2 border rows.
@@ -1398,17 +1405,17 @@ fn render_harness_hover_tooltip(f: &mut Frame, app: &App) {
                     width: inner.width,
                     height: inner.height - 2,
                 };
-                // `render_vt100_screen_rows` independently clamps
-                // `visible_h` to `usage_area.height`, so it self-corrects
-                // if `h` above got clamped smaller by the terminal-height
-                // bound — no need to recompute `usage_rows` here.
-                render_vt100_screen_rows(
+                // `render_vt100_screen_rows_indexed` independently clamps
+                // to `usage_area.height`, so it self-corrects if `h` above
+                // got clamped smaller by the terminal-height bound — no
+                // need to recompute `usage_rows` or truncate `render_rows`
+                // here.
+                render_vt100_screen_rows_indexed(
                     f,
                     usage_area,
                     parser.screen(),
                     &app.theme,
-                    first_row,
-                    usage_rows,
+                    &render_rows,
                 );
             }
         }
@@ -9635,8 +9642,19 @@ fn non_empty_row_span(screen: &vt100::Screen) -> u16 {
     0
 }
 
-fn row_has_contents(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
-    (0..cols).any(|c| screen.cell(row, c).is_some_and(|cell| cell.has_contents()))
+/// Unlike `cell.has_contents()` (true for *any* explicitly-written cell,
+/// including a plain space painted only for its background color), this
+/// requires an actual visible glyph. Some harnesses (confirmed live for
+/// grok) paint their entire viewport with an explicit background color on
+/// every cell, even where nothing is displayed — `has_contents()` would
+/// treat that whole screen as "content" and defeat the bounding-box trim
+/// below entirely.
+fn row_has_visible_glyph(screen: &vt100::Screen, row: u16, cols: u16) -> bool {
+    (0..cols).any(|c| {
+        screen
+            .cell(row, c)
+            .is_some_and(|cell| !cell.contents().trim().is_empty())
+    })
 }
 
 /// Tight bounding box of non-blank content: `(first_row, last_row_inclusive)`.
@@ -9654,9 +9672,46 @@ fn non_blank_row_bounds(screen: &vt100::Screen) -> Option<(u16, u16)> {
     if rows == 0 || cols == 0 {
         return None;
     }
-    let first = (0..rows).find(|&r| row_has_contents(screen, r, cols))?;
-    let last = (0..rows).rev().find(|&r| row_has_contents(screen, r, cols))?;
+    let first = (0..rows).find(|&r| row_has_visible_glyph(screen, r, cols))?;
+    let last = (0..rows).rev().find(|&r| row_has_visible_glyph(screen, r, cols))?;
     Some((first, last))
+}
+
+/// Interior runs of glyph-less rows longer than this are collapsed down to
+/// this many rows by `usage_panel_render_rows`. A short gap of a row or two
+/// between two sections is normal formatting (a blank line separating two
+/// paragraphs) and stays untouched; a long run only shows up when a harness
+/// paints its entire viewport background (confirmed live for grok: ~29 rows
+/// of a single solid near-black fill color between its header line and its
+/// input box) — reproducing that verbatim just fills the tooltip with a
+/// giant blank-colored rectangle around a sliver of real text.
+const MAX_INTERIOR_BLANK_RUN: u16 = 1;
+
+/// Which source rows of `screen` to actually paint into the tooltip, in
+/// order, given the trimmed `(first, last)` bounds from
+/// `non_blank_row_bounds`. Rows with a visible glyph are always kept; a run
+/// of consecutive glyph-less rows longer than `MAX_INTERIOR_BLANK_RUN` is
+/// truncated to that many rows rather than reproduced in full — see
+/// `MAX_INTERIOR_BLANK_RUN` for why. The dropped rows are simply omitted
+/// (not replaced by synthesized content), so every row this returns is a
+/// real row from the capture, just not always contiguous with its
+/// neighbor.
+fn usage_panel_render_rows(screen: &vt100::Screen, first: u16, last: u16) -> Vec<u16> {
+    let (_, cols) = screen.size();
+    let mut out = Vec::new();
+    let mut blank_run = 0u16;
+    for r in first..=last {
+        if row_has_visible_glyph(screen, r, cols) {
+            blank_run = 0;
+            out.push(r);
+        } else {
+            if blank_run < MAX_INTERIOR_BLANK_RUN {
+                out.push(r);
+            }
+            blank_run += 1;
+        }
+    }
+    out
 }
 
 fn render_pty_tail(f: &mut Frame, area: Rect, screen: &vt100::Screen, theme: &Theme) {
@@ -9699,6 +9754,38 @@ fn render_vt100_screen_rows(
             };
             let x = area.x + c;
             let y = area.y + r;
+            if let Some(buf_cell) = buf.cell_mut(Position { x, y }) {
+                paint_vt100_cell(buf_cell, cell, theme);
+            }
+        }
+    }
+}
+
+/// Same per-cell painting as `render_vt100_screen_rows`, but for an
+/// explicit, possibly-non-contiguous list of source rows (in display
+/// order) rather than a contiguous `start_row..start_row+visible_h` span —
+/// what `usage_panel_render_rows` returns after collapsing long interior
+/// blank runs.
+fn render_vt100_screen_rows_indexed(
+    f: &mut Frame,
+    area: Rect,
+    screen: &vt100::Screen,
+    theme: &Theme,
+    src_rows: &[u16],
+) {
+    let (_, cols) = screen.size();
+    if cols == 0 || area.width == 0 || area.height == 0 {
+        return;
+    }
+    let visible_w = area.width.min(cols);
+    let buf = f.buffer_mut();
+    for (r, &src_row) in src_rows.iter().take(area.height as usize).enumerate() {
+        for c in 0..visible_w {
+            let Some(cell) = screen.cell(src_row, c) else {
+                continue;
+            };
+            let x = area.x + c;
+            let y = area.y + r as u16;
             if let Some(buf_cell) = buf.cell_mut(Position { x, y }) {
                 paint_vt100_cell(buf_cell, cell, theme);
             }
@@ -15843,6 +15930,84 @@ mod tests {
     fn non_blank_row_bounds_blank_screen_is_none() {
         let parser = vt100::Parser::new(5, 20, 0);
         assert_eq!(non_blank_row_bounds(parser.screen()), None);
+    }
+
+    #[test]
+    fn non_blank_row_bounds_ignores_colored_but_glyph_less_rows() {
+        // Regression guard for the grok usage-tooltip bug: grok paints its
+        // entire viewport with an explicit background color on every cell
+        // (confirmed live: `RGB(20, 20, 20)` on every row, even where
+        // nothing is displayed), unlike claude/codex/agy which leave
+        // non-content cells fully untouched. `cell.has_contents()` is true
+        // for those painted-but-textless cells too, so the old bounding-box
+        // logic (built and verified only against harnesses that leave
+        // margins untouched) would have counted them as "content" and
+        // included them in the tooltip's rendered span, unbounded.
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        let bg = b"\x1b[48;2;20;20;20m";
+        let blank_row = b"                    \r\n"; // 20 painted spaces, no glyph
+        parser.process(bg);
+        for _ in 0..3 {
+            parser.process(blank_row);
+        }
+        parser.process(b"\x1b[0mhello\r\n\r\nworld\r\n");
+        parser.process(bg);
+        for _ in 0..3 {
+            parser.process(blank_row);
+        }
+        let (first, last) = non_blank_row_bounds(parser.screen()).expect("some content");
+        assert_eq!(
+            first, 3,
+            "leading colored-but-glyph-less rows must not count as content"
+        );
+        assert_eq!(
+            last, 5,
+            "trailing colored-but-glyph-less rows must not count as content"
+        );
+    }
+
+    #[test]
+    fn usage_panel_render_rows_collapses_a_long_interior_blank_run() {
+        // Same grok scenario as above, but for the interior gap: real
+        // content sits at both ends (a header, then far below it an input
+        // box) with a long run of the harness's own colored background
+        // fill in between. Trimming only the outer margin leaves that
+        // whole run in the rendered span — this checks it gets collapsed
+        // down to `MAX_INTERIOR_BLANK_RUN` instead.
+        let mut parser = vt100::Parser::new(10, 20, 0);
+        parser.process(b"top\r\n\x1b[48;2;20;20;20m");
+        for _ in 0..5 {
+            parser.process(b"                    \r\n");
+        }
+        parser.process(b"\x1b[0mbottom");
+        let (first, last) = non_blank_row_bounds(parser.screen()).expect("some content");
+        let rows = usage_panel_render_rows(parser.screen(), first, last);
+        assert_eq!(
+            rows,
+            vec![0, 1, 6],
+            "long interior blank run collapses to MAX_INTERIOR_BLANK_RUN rows"
+        );
+    }
+
+    #[test]
+    fn usage_panel_render_rows_keeps_a_short_gap_untouched() {
+        // A single blank line between two paragraphs is normal formatting,
+        // not a harness painting its whole background — must not be
+        // collapsed away.
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process(b"a\r\n\r\nb");
+        let (first, last) = non_blank_row_bounds(parser.screen()).expect("some content");
+        let rows = usage_panel_render_rows(parser.screen(), first, last);
+        assert_eq!(rows, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn usage_panel_render_rows_keeps_gapless_content_unchanged() {
+        let mut parser = vt100::Parser::new(5, 20, 0);
+        parser.process(b"hello\r\nworld");
+        let (first, last) = non_blank_row_bounds(parser.screen()).expect("some content");
+        let rows = usage_panel_render_rows(parser.screen(), first, last);
+        assert_eq!(rows, vec![0, 1]);
     }
 
     #[test]
