@@ -122,14 +122,25 @@ impl App {
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
         let hit_selection_run = selection_run_hit
             .is_some_and(|(xs, xe, y)| ev.row == y && ev.column >= xs && ev.column < xe);
+        // Program selection verb buttons (spec 0087): a small vertical list
+        // of rows below the comment/Run row, each its own hit-rect.
+        let hit_selection_verb = self
+            .layout
+            .program_selection_verb_hits
+            .iter()
+            .find(|(xs, xe, y, _)| ev.row == *y && ev.column >= *xs && ev.column < *xe)
+            .map(|(_, _, _, name)| name.clone());
         if hit_title_toggle
             || hit_title_run
             || hit_title_close
             || hit_title_name
             || hit_selection_run
+            || hit_selection_verb.is_some()
         {
             if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
-                if hit_title_toggle {
+                if let Some(verb) = hit_selection_verb.clone() {
+                    self.execute_program_selected_verb(verb).await;
+                } else if hit_title_toggle {
                     self.close_program_popup().await;
                 } else if hit_title_close {
                     if let Some(session_id) = self
@@ -616,6 +627,7 @@ impl App {
                     popup.selection_menu = None;
                 }
                 self.layout.program_selection_run_hit = None;
+                self.layout.program_selection_verb_hits.clear();
                 self.set_status("program selection canceled".to_string());
             }
             KeyCode::Up => self.move_program_selection_comment_cursor_vertical(-1),
@@ -828,8 +840,80 @@ impl App {
             popup.selection_menu = None;
         }
         self.layout.program_selection_run_hit = None;
+        self.layout.program_selection_verb_hits.clear();
         self.execute_program_popup(Some(selection), Some(selected_block_ids), comment)
             .await
+    }
+
+    /// Run a Program selection verb (spec 0087) on the active popup's current
+    /// selection. Unlike `execute_program_selected_text` (Run), a verb always
+    /// needs an explicit, non-empty selection — there is no whole-document
+    /// fallback — and it doesn't touch the Run-progress/pending/shimmer
+    /// machinery: the daemon owns the in-flight affordance for a verb (the
+    /// provisional clip annotation it applies before this call returns), and
+    /// its eventual merge arrives back through the same `program/state`
+    /// broadcast every other program-mutating call already updates the popup
+    /// from — this method does not need to poke `popup.buffer` itself.
+    pub(super) async fn execute_program_selected_verb(&mut self, verb: String) -> bool {
+        let Some(popup) = self.program_popup.as_ref() else {
+            self.set_status("program verb failed: no active program".to_string());
+            return false;
+        };
+        let Some(selection) = Self::selected_program_text(popup) else {
+            self.set_status("program verb failed: no selection".to_string());
+            return false;
+        };
+        let selected_block_ids = Self::selected_program_block_ids(popup);
+        let session_id = popup.program.session_id.clone();
+        let comment = popup
+            .selection_menu
+            .as_ref()
+            .map(|menu| menu.comment.clone())
+            .filter(|c| !c.trim().is_empty());
+
+        let dirty = self.program_popup.as_ref().is_some_and(|popup| {
+            program_normalize_smart_clip_instance_ids(&popup.buffer) != popup.saved_markdown
+        });
+        if dirty && !self.save_program_popup().await {
+            return false;
+        }
+
+        if let Some(popup) = self.program_popup.as_mut() {
+            popup.selection = None;
+            popup.selection_menu = None;
+        }
+        self.layout.program_selection_run_hit = None;
+        self.layout.program_selection_verb_hits.clear();
+
+        let base_version = self
+            .program_popup
+            .as_ref()
+            .map(|popup| popup.program.version);
+        let selection = program_normalize_smart_clip_instance_ids(&selection);
+        let selection_block_ids: Option<Vec<String>> = selected_block_ids
+            .filter(|ids| !ids.is_empty())
+            .map(|ids| ids.into_iter().collect());
+        let params = construct_protocol::ProgramVerbExecuteParams {
+            session_id,
+            verb: verb.clone(),
+            selection,
+            base_version,
+            comment,
+            selection_block_ids,
+        };
+        match self.client.program_verb_execute(params).await {
+            Ok(result) => {
+                self.set_status(format!(
+                    "verb '{verb}' dispatched ({})",
+                    short_id(&result.subagent_session_id)
+                ));
+                true
+            }
+            Err(e) => {
+                self.set_status(format!("program verb failed: {e}"));
+                false
+            }
+        }
     }
 
     fn normalized_ctrl_char(key: KeyEvent) -> Option<char> {

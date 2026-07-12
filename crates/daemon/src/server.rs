@@ -9,7 +9,7 @@ use construct_protocol::{
     GroupCreateParams, GroupCreateResult, GroupDeleteParams, GroupMoveParams, GroupRenameParams,
     GroupSetCollapsedParams, Notification, PingResult, ProgramCursorParams, ProgramEditParams,
     ProgramExecuteParams, ProgramGetParams, ProgramUpdateActor, ProgramUpdateParams,
-    ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
+    ProgramVerbExecuteParams, ProjectCreateParams, ProjectCreateResult, ProjectDeleteParams,
     ProjectDeletedNotificationPayload, ProjectMoveParams, ProjectRenameParams,
     ProjectSetCollapsedParams, ProjectStateNotificationPayload, PtyReplayParams, Request, Response,
     SearchParams, SessionAttachClipboardParams, SessionIdParams, SessionInputParams,
@@ -1151,6 +1151,16 @@ async fn dispatch(
     });
     dispatch_entry!(ipc_method::PROGRAM_LIST_TEMPLATES, {
         match manager.program_templates() {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
+    dispatch_entry!(ipc_method::PROGRAM_LIST_VERBS, {
+        ok!(req, &manager.program_verbs())
+    });
+    dispatch_entry!(ipc_method::PROGRAM_VERB_EXECUTE, {
+        let p = params!(req, ProgramVerbExecuteParams);
+        match manager.program_verb_execute(p).await {
             Ok(result) => ok!(req, &result),
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }

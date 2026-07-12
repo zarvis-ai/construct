@@ -7,7 +7,8 @@ use construct_protocol::{
     GroupSetCollapsedParams, GroupSummary, HarnessInfo, MoveDirection, Notification, PingResult,
     ProgramCursorParams, ProgramCursorResult, ProgramEditParams, ProgramExecuteParams,
     ProgramExecuteResult, ProgramGetParams, ProgramGetResult, ProgramListTemplatesResult,
-    ProgramUpdateActor, ProgramUpdateParams, ProgramUpdateResult, ProjectCreateParams,
+    ProgramListVerbsResult, ProgramUpdateActor, ProgramUpdateParams, ProgramUpdateResult,
+    ProgramVerbExecuteParams, ProgramVerbExecuteResult, ProjectCreateParams,
     ProjectCreateResult, ProjectDeleteParams, ProjectMoveParams, ProjectRenameParams,
     ProjectSetCollapsedParams, ProjectSummary, PtyReplayResult, PtySize, Request, Response,
     SearchParams, SearchResult, SessionAttachClipboardParams, SessionAttachClipboardResult,
@@ -268,6 +269,17 @@ impl Client {
     }
     pub async fn program_templates(&self) -> Result<ProgramListTemplatesResult> {
         self.request(ipc_method::PROGRAM_LIST_TEMPLATES, &serde_json::Value::Null)
+            .await
+    }
+    pub async fn program_verbs(&self) -> Result<ProgramListVerbsResult> {
+        self.request(ipc_method::PROGRAM_LIST_VERBS, &serde_json::Value::Null)
+            .await
+    }
+    pub async fn program_verb_execute(
+        &self,
+        params: ProgramVerbExecuteParams,
+    ) -> Result<ProgramVerbExecuteResult> {
+        self.request(ipc_method::PROGRAM_VERB_EXECUTE, &params)
             .await
     }
     /// Start (or look up) the daemon's remote WS listener and

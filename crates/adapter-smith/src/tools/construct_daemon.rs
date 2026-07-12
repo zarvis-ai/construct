@@ -773,3 +773,88 @@ impl Tool for LoopRemove {
         })
     }
 }
+
+// ---------- Program ----------
+
+/// Native mirror of the MCP `construct_program_edit` tool, minus shimmer
+/// declaration. Exists so a smith session — the orchestrator included — can
+/// apply an anchored Program edit without an MCP connection; today the only
+/// caller is verb-drift escalation (spec 0087), where the daemon asks the
+/// Program-owning session to reconcile a subagent's result whose selection
+/// anchor changed underneath it.
+pub struct ProgramEdit;
+#[async_trait]
+impl Tool for ProgramEdit {
+    fn name(&self) -> &str {
+        "agentd_program_edit"
+    }
+    fn description(&self) -> &str {
+        "Apply one or more anchored find/replace edits to a session's Program document. Each \
+         edit replaces `old_string` with `new_string`; set `replace_all` to replace every \
+         occurrence, or include enough surrounding context to make `old_string` unique. An \
+         empty `old_string` appends `new_string`. Edits apply to the LATEST program content, so \
+         concurrent changes to other regions merge cleanly. Fails — writing nothing — if an \
+         `old_string` is missing or ambiguous, meaning that exact text changed underneath you: \
+         re-read the program and retry. `session_id` defaults to the calling session."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "session_id": { "type": "string" },
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_string": { "type": "string" },
+                            "new_string": { "type": "string" },
+                            "replace_all": { "type": "boolean" }
+                        },
+                        "required": ["old_string", "new_string"]
+                    }
+                },
+                "note": { "type": "string" }
+            },
+            "required": ["edits"]
+        })
+    }
+    fn risk(&self) -> ToolRisk {
+        ToolRisk::Risky
+    }
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let sid = input
+            .get("session_id")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string())
+            .or_else(calling_session_id)
+            .ok_or_else(|| anyhow!("session_id required (and CONSTRUCT_SESSION_ID unset)"))?;
+        let edits_val = input
+            .get("edits")
+            .cloned()
+            .ok_or_else(|| anyhow!("missing `edits`"))?;
+        let edits: Vec<construct_protocol::ProgramEdit> = serde_json::from_value(edits_val)
+            .map_err(|e| anyhow!("invalid `edits`: {e}"))?;
+        if edits.is_empty() {
+            return Err(anyhow!("edits must not be empty"));
+        }
+        let note = input
+            .get("note")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        let params = construct_protocol::ProgramEditParams {
+            session_id: sid,
+            edits,
+            actor: construct_protocol::ProgramUpdateActor::Agent,
+            note,
+            shimmer: Vec::new(),
+        };
+        let c = client(ctx).await?;
+        let result = c.program_edit(params).await?;
+        Ok(ToolOutcome {
+            ok: true,
+            output: serde_json::to_string(&result)?,
+        })
+    }
+}

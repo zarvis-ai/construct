@@ -193,6 +193,13 @@ pub struct Storage {
     /// env override. `None` keeps the legacy default location (and its
     /// `canvas/templates` → `program/templates` migration).
     program_templates_dir_override: Option<PathBuf>,
+    /// Directory user Program-verb definition files are read from (spec
+    /// 0087): `verbs/*.md`, one file per verb, each replacing a built-in of
+    /// the same name. Daemon start always sets this to the config
+    /// directory's `verbs/` subdirectory — unlike program templates, verbs
+    /// are a personal customization, not project data. `None` (only in
+    /// tests that don't call the setter) falls back to `data_dir/verbs`.
+    program_verbs_dir_override: Option<PathBuf>,
 }
 
 impl Storage {
@@ -204,6 +211,7 @@ impl Storage {
         Ok(Self {
             data_dir,
             program_templates_dir_override: None,
+            program_verbs_dir_override: None,
         })
     }
 
@@ -212,6 +220,24 @@ impl Storage {
     pub fn with_program_templates_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.program_templates_dir_override = dir;
         self
+    }
+
+    /// Set the directory user Program-verb definition files are read from.
+    /// Daemon start always calls this with the config dir's `verbs/`
+    /// subdirectory (see `lib.rs::run`).
+    pub fn with_program_verbs_dir(mut self, dir: PathBuf) -> Self {
+        self.program_verbs_dir_override = Some(dir);
+        self
+    }
+
+    pub fn program_verbs_dir(&self) -> PathBuf {
+        self.program_verbs_dir_override
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("verbs"))
+    }
+
+    pub fn program_verbs(&self) -> Vec<construct_protocol::ProgramVerb> {
+        crate::program_verbs::load_verbs(&self.program_verbs_dir())
     }
 
     pub fn global_memory_path(&self) -> PathBuf {

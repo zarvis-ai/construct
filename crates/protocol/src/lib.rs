@@ -891,6 +891,13 @@ pub mod ipc_method {
     pub const PROGRAM_CURSOR: &str = "program.cursor";
     pub const PROGRAM_EXECUTE: &str = "program.execute";
     pub const PROGRAM_LIST_TEMPLATES: &str = "program.list_templates";
+    /// List available Program selection verbs (spec 0087): built-in plus any
+    /// user-defined `verbs/*.md` overrides/additions.
+    pub const PROGRAM_LIST_VERBS: &str = "program.list_verbs";
+    /// Run a Program selection verb (spec 0087): spawns a result-returning
+    /// subagent scoped to the selection; the daemon merges its structured
+    /// result back into the document once the subagent completes.
+    pub const PROGRAM_VERB_EXECUTE: &str = "program.verb_execute";
     pub const SESSION_LIST: &str = "session.list";
     pub const SESSION_CREATE: &str = "session.create";
     pub const SESSION_GET: &str = "session.get";
@@ -1704,6 +1711,82 @@ pub struct ProgramExecuteResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgramListTemplatesResult {
     pub templates: Vec<ProgramTemplate>,
+}
+
+/// What a Program selection verb does with its subagent's structured result
+/// (spec 0087): `Annotate` inserts new content adjacent to the selection and
+/// leaves the selected text untouched; `Rewrite` replaces the selected
+/// markdown with the returned content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgramVerbEffect {
+    Annotate,
+    Rewrite,
+}
+
+/// Whether a Program selection verb's subagent runs to completion unattended
+/// (`SingleShot`) or may hold a dialogue with the user inside its own session
+/// before producing a result (`Interactive`) (spec 0087).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProgramVerbInteraction {
+    SingleShot,
+    Interactive,
+}
+
+/// A typed refinement action offered on a Program selection alongside Run
+/// (spec 0087). Loaded from a markdown definition file: built-in verbs ship
+/// embedded; user files under a `verbs/` config directory add to or, by
+/// matching `name`, override them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramVerb {
+    pub name: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub effect: ProgramVerbEffect,
+    pub interaction: ProgramVerbInteraction,
+    #[serde(default)]
+    pub order: i64,
+    #[serde(default)]
+    pub built_in: bool,
+    /// The purpose prompt (definition body) handed to the verb's subagent.
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramListVerbsResult {
+    pub verbs: Vec<ProgramVerb>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramVerbExecuteParams {
+    pub session_id: String,
+    /// A verb's `name` from `program.list_verbs`.
+    pub verb: String,
+    /// The selected markdown the verb operates on — a verb's entire
+    /// jurisdiction. Unlike `program.execute`, there is no whole-document
+    /// fallback: a verb always targets an explicit selection.
+    pub selection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_version: Option<u64>,
+    /// Optional one-line instruction composed onto the verb's purpose prompt,
+    /// same convention as `program.execute`'s `comment` (spec 0076).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_block_ids: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgramVerbExecuteResult {
+    pub program: ProgramDocument,
+    /// The subagent spawned to run the verb; its session clip is what the
+    /// provisional edit annotates onto the selection.
+    pub subagent_session_id: String,
+    pub verb: String,
+    #[serde(default)]
+    pub blocks: Vec<ProgramBlockView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

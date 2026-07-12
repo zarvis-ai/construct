@@ -1210,6 +1210,13 @@ pub struct App {
     /// loop applies it on the next iteration (no flicker — the placeholder keeps
     /// the cached list until the fresh one lands).
     pub program_templates_tx: mpsc::UnboundedSender<Vec<construct_protocol::ProgramTemplate>>,
+    /// Program selection verbs (spec 0087) offered as buttons in the
+    /// selection context menu. Fetched and refreshed the same way as
+    /// `program_templates`.
+    pub program_verbs: Vec<construct_protocol::ProgramVerb>,
+    /// Background channel for live-reloaded program verbs, the `program_verbs`
+    /// counterpart to `program_templates_tx`.
+    pub program_verbs_tx: mpsc::UnboundedSender<Vec<construct_protocol::ProgramVerb>>,
     /// Latest daemon-side program Markdown per session id, backing widget
     /// `:::clip program` projections (spec 0074: a widget mirrors a program
     /// region by reference, never by copy). Kept fresh by `program/state`
@@ -2997,6 +3004,10 @@ pub struct LayoutSnapshot {
     pub program_title_name_window_start: usize,
     /// Program selected-text context Run button bounds: `(x_start, x_end, y)`.
     pub program_selection_run_hit: Option<(u16, u16, u16)>,
+    /// Program selected-text context menu verb-row bounds (spec 0087): one
+    /// `(x_start, x_end, y, verb_name)` per rendered verb button, in the same
+    /// order as `App::program_verbs`.
+    pub program_selection_verb_hits: Vec<(u16, u16, u16, String)>,
     /// Inner content rect of the active program popup from the last frame.
     /// Cursor-move handlers and the mouse wheel read its width/height to keep
     /// the caret on-screen and to bound scrolling; `None` when no program is open.
@@ -3264,6 +3275,11 @@ async fn run_with_socket_initial_selection(
         .await
         .map(|r| r.templates)
         .unwrap_or_default();
+    let program_verbs = client
+        .program_verbs()
+        .await
+        .map(|r| r.verbs)
+        .unwrap_or_default();
     // Theme config is parsed now; the final palette (light vs dark) is resolved
     // after raw mode is on, once we can query the terminal background (OSC 11).
     let theme_config = crate::theme::ThemeConfig::load();
@@ -3335,6 +3351,7 @@ async fn run_with_socket_initial_selection(
     let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
     // Placeholder senders; `run_loop` installs the live channels it actually drains.
     let program_templates_tx = mpsc::unbounded_channel().0;
+    let program_verbs_tx = mpsc::unbounded_channel().0;
     let program_projection_tx = mpsc::unbounded_channel().0;
     let upgrade_status_tx = mpsc::unbounded_channel().0;
     let session_mutation_tx = mpsc::unbounded_channel().0;
@@ -3366,6 +3383,8 @@ async fn run_with_socket_initial_selection(
         harnesses,
         program_templates,
         program_templates_tx,
+        program_verbs,
+        program_verbs_tx,
         program_markdown_cache: HashMap::new(),
         program_projection_pending: HashSet::new(),
         program_projection_tx,
@@ -3685,6 +3704,11 @@ async fn run_loop(
     let (program_templates_tx, mut program_templates_rx) =
         mpsc::unbounded_channel::<Vec<construct_protocol::ProgramTemplate>>();
     app.program_templates_tx = program_templates_tx;
+    // Live-reload channel for program verbs, the `program_templates_tx`
+    // counterpart for spec 0087's selection-menu verbs.
+    let (program_verbs_tx, mut program_verbs_rx) =
+        mpsc::unbounded_channel::<Vec<construct_protocol::ProgramVerb>>();
+    app.program_verbs_tx = program_verbs_tx;
     // Background channel for widget program projections: `request_program_projection`
     // (kicked off by the widget renderer when a `:::clip program` block has no
     // cached program yet) delivers `(session_id, markdown)` here; the loop
@@ -4220,6 +4244,19 @@ async fn run_loop(
                     }
                 }
             }
+            verbs = program_verbs_rx.recv() => {
+                // Live-reloaded program verbs (spec 0087), the `templates`
+                // arm's counterpart — same drain-to-latest, same
+                // don't-replace-with-empty guard.
+                if let Some(mut latest) = verbs {
+                    while let Ok(next) = program_verbs_rx.try_recv() {
+                        latest = next;
+                    }
+                    if !latest.is_empty() {
+                        app.program_verbs = latest;
+                    }
+                }
+            }
             fetched = program_projection_rx.recv() => {
                 // A background program fetch for a widget `:::clip program`
                 // projection landed; cache it (draining any queued siblings)
@@ -4359,6 +4396,11 @@ impl App {
             .await
             .map(|r| r.templates)
             .unwrap_or_default();
+        let program_verbs = client
+            .program_verbs()
+            .await
+            .map(|r| r.verbs)
+            .unwrap_or_default();
         let (pty_input_tx, pty_input_errors) = spawn_pty_input_pump(client.clone());
 
         self.client = client;
@@ -4369,6 +4411,9 @@ impl App {
         self.harnesses = harnesses;
         if !program_templates.is_empty() {
             self.program_templates = program_templates;
+        }
+        if !program_verbs.is_empty() {
+            self.program_verbs = program_verbs;
         }
         // A daemon restart respawns every PTY session and truncates each
         // session's pty.log so the new child renders into a clean slate
@@ -9315,6 +9360,7 @@ impl App {
                         popup.selection_menu = None;
                     }
                     self.layout.program_selection_run_hit = None;
+                    self.layout.program_selection_verb_hits.clear();
                 }
                 self.execute_program_popup(selection, selected_block_ids, None)
                     .await;
@@ -11577,6 +11623,7 @@ mod tests {
             program_title_name_hit: None,
             program_title_name_window_start: 0,
             program_selection_run_hit: None,
+            program_selection_verb_hits: Vec::new(),
             program_inner_area: None,
             program_base_area: None,
             program_resize_hit: None,
@@ -11632,6 +11679,8 @@ mod tests {
             harnesses: Vec::new(),
             program_templates: Vec::new(),
             program_templates_tx: mpsc::unbounded_channel().0,
+            program_verbs: Vec::new(),
+            program_verbs_tx: mpsc::unbounded_channel().0,
             program_markdown_cache: HashMap::new(),
             program_projection_pending: HashSet::new(),
             program_projection_tx: mpsc::unbounded_channel().0,
@@ -14477,6 +14526,52 @@ mod tests {
         assert!(app.layout.program_title_run_hit.is_some());
         assert!(app.layout.program_title_toggle_hit.is_some());
         assert!(app.layout.program_selection_run_hit.is_some());
+        server.abort();
+    }
+
+    /// spec 0087: the selection menu renders one row per advertised verb,
+    /// below the comment/Run row, each with its own click hit-rect.
+    #[tokio::test]
+    async fn program_render_registers_verb_button_hits() {
+        let (mut app, _dir, server) = empty_app().await;
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+        session.id = "s1".into();
+        app.sessions = vec![session];
+        app.selection = Selection::Session("s1".into());
+        app.program_popup = Some(program_popup_for_test("s1", "alpha beta", 0));
+        {
+            let popup = app.program_popup.as_mut().unwrap();
+            popup.revealed_at = Instant::now() - Duration::from_millis(PROGRAM_REVEAL_MS);
+        }
+        app.program_verbs = vec![construct_protocol::ProgramVerb {
+            name: "simplify".to_string(),
+            label: "Simplify".to_string(),
+            description: None,
+            effect: construct_protocol::ProgramVerbEffect::Rewrite,
+            interaction: construct_protocol::ProgramVerbInteraction::SingleShot,
+            order: 0,
+            built_in: true,
+            prompt: "test".to_string(),
+        }];
+        app.begin_program_selection();
+        app.move_program_cursor(5);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+        term.draw(|f| crate::ui::render(f, &mut app))
+            .expect("program should render");
+        let text = rendered_text(term.backend().buffer());
+
+        assert!(
+            text.contains("Simplify"),
+            "verb label should render in the selection menu: {text:?}"
+        );
+        assert_eq!(
+            app.layout.program_selection_verb_hits.len(),
+            1,
+            "one hit-rect per advertised verb"
+        );
+        assert_eq!(app.layout.program_selection_verb_hits[0].3, "simplify");
         server.abort();
     }
 

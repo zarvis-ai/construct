@@ -19,6 +19,7 @@ mod adapter;
 mod availability;
 mod config;
 mod loops;
+mod program_verbs;
 mod remote;
 mod remote_supervisor;
 mod server;
@@ -130,7 +131,8 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
     }
     let storage = Arc::new(
         storage::Storage::new(paths.data_dir.clone())?
-            .with_program_templates_dir(program_templates_dir),
+            .with_program_templates_dir(program_templates_dir)
+            .with_program_verbs_dir(paths.config_dir.join("verbs")),
     );
     let (manager, remote_rx, mut restart_rx) =
         session::SessionManager::new(storage.clone(), Arc::new(config), paths.runtime_dir.clone())

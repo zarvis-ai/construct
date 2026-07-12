@@ -478,6 +478,11 @@ impl SessionManager {
             s.state
         };
         self.note_session_state_for_program_run(&entry.id, new_state);
+        // Boxed: this indirectly re-enters `handle_event` (verb-drift
+        // escalation delivers a prompt, which can synthesize a Message
+        // event), which would otherwise make this async fn's state machine
+        // infinitely recursive at compile time.
+        Box::pin(self.maybe_complete_verb_merge(&entry.id, new_state)).await;
 
         if session_event_is_program_output(&event) {
             self.mark_program_run_output_seen(&entry.id);

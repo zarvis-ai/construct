@@ -1675,7 +1675,8 @@
     position: absolute;
     z-index: 8;
     display: flex;
-    align-items: center;
+    flex-direction: column;
+    align-items: stretch;
     padding: 4px;
     background: var(--bg-elev);
     border: 1px solid var(--border);
@@ -1702,6 +1703,20 @@
     background: var(--accent);
     color: var(--bg);
     outline: none;
+  }
+  /* Program selection verbs (spec 0087): a vertical list of refinement
+     actions below Run, one button per verb the daemon advertises. Empty
+     when no verbs loaded yet, so it never leaves a stray gap in the menu. */
+  .program-selection-verbs {
+    display: flex;
+    flex-direction: column;
+  }
+  .program-selection-verbs:empty { display: none; }
+  .program-selection-verb-btn {
+    justify-content: flex-start;
+    width: 100%;
+    white-space: nowrap;
+    text-align: left;
   }
   /* Smart-clip chip: an atomic, content-fit widget (contenteditable=false). The
      TUI's ` label ` padding is the .35em insets; the whole chip is one cursor
@@ -2173,6 +2188,10 @@
             <button type="button" id="programSelectionRunBtn" title="Run selected program text">
               <span aria-hidden="true">▶</span><span>Run</span>
             </button>
+            <!-- Program selection verbs (spec 0087): typed refinement actions
+                 populated by programEnsureVerbs()/programRenderSelectionVerbs(),
+                 one button per verb the daemon advertises via program.list_verbs. -->
+            <div class="program-selection-verbs" id="programSelectionVerbs"></div>
           </div>
           <div class="program-clip-menu" id="programClipMenu" hidden role="listbox"
                aria-label="smart-clip suggestions"></div>
@@ -2381,6 +2400,7 @@ const programCursorLayerEl = $("programCursorLayer");
 const programEmptyEl = $("programEmpty");
 const programSelectionMenuEl = $("programSelectionMenu");
 const programSelectionRunBtn = $("programSelectionRunBtn");
+const programSelectionVerbsEl = $("programSelectionVerbs");
 const programClipMenuEl = $("programClipMenu");
 const programHoverCardEl = $("programHoverCard");
 const programHoverTerminalEl = $("programHoverTerminal");
@@ -2885,6 +2905,9 @@ const state = {
     applyingRemote: false,
     // Cached templates from program.list_templates (fetched lazily once).
     templates: null,
+    // Cached Program selection verbs from program.list_verbs (spec 0087,
+    // fetched lazily once — same shape as `templates`).
+    verbs: null,
     // Session id whose program is currently mounted in the editor, or null.
     mountedId: null,
     // Shimmer backstop timer id (clears the run highlight at its deadline), or 0.
@@ -5562,6 +5585,7 @@ async function programMountSession(id) {
   programPublishCursor(0);
   if (run) programStartShimmer(id); else programApplyShimmer();
   programEnsureTemplates();
+  programEnsureVerbs();
 }
 
 function programSetMsg(text, isError) {
@@ -6018,6 +6042,52 @@ async function programRun() {
   }
 }
 
+// Run a Program selection verb (spec 0087). Unlike programRun, a verb always
+// needs an explicit selection — there's no whole-document fallback — and it
+// skips the optimistic run-progress/shimmer machinery entirely: the daemon
+// owns the in-flight affordance for a verb (the provisional clip annotation
+// it applies before this call returns), and the eventual merge arrives back
+// through the same program/state broadcast that already repaints the editor
+// for any other agent-driven edit.
+async function programRunVerb(verbName) {
+  const id = state.program.mountedId;
+  if (!id) return;
+  let doc = state.program.docById.get(id);
+  if (!doc) return;
+  const selMarkdown = programSelectionMarkdown();
+  const hasSel = selMarkdown != null && selMarkdown.trim() !== "";
+  if (!hasSel) { programSetMsg("select text first to run a verb", true); return; }
+  const selOffsetsPreSave = programSelectionOffsets();
+  const fullMarkdownPreSave = programSerialize();
+
+  if (programNormalizeClipIds(programSerialize()) !== doc.saved) {
+    await programSave();
+    doc = state.program.docById.get(id);
+    if (!doc) return;
+  }
+  const selection = programNormalizeClipIds(selMarkdown);
+  let selectedBlockIds = null;
+  if (selOffsetsPreSave) {
+    selectedBlockIds = programOverlapSelectedBlockIds(
+      fullMarkdownPreSave,
+      Math.min(selOffsetsPreSave.anchor, selOffsetsPreSave.head),
+      Math.max(selOffsetsPreSave.anchor, selOffsetsPreSave.head),
+    );
+  }
+  if (!selectedBlockIds || !selectedBlockIds.size) {
+    selectedBlockIds = new Set(programBlockSpans(selection).map((b) => b.id));
+  }
+  programSetMsg(`running verb "${verbName}"…`);
+  try {
+    const params = { session_id: id, verb: verbName, selection, base_version: doc.version };
+    if (selectedBlockIds && selectedBlockIds.size) params.selection_block_ids = Array.from(selectedBlockIds);
+    await rpc("program.verb_execute", params);
+    programSetMsg(`verb "${verbName}" dispatched`);
+  } catch (e) {
+    programSetMsg("verb failed: " + e.message, true);
+  }
+}
+
 // --- templates / empty state ---
 
 async function programEnsureTemplates() {
@@ -6028,6 +6098,37 @@ async function programEnsureTemplates() {
   } catch (e) { state.program.templates = []; }
   programRefreshEmptyState();
   return state.program.templates;
+}
+
+// --- selection verbs (spec 0087) ---
+
+async function programEnsureVerbs() {
+  if (state.program.verbs) return state.program.verbs;
+  try {
+    const r = await rpc("program.list_verbs", {});
+    state.program.verbs = r.verbs || [];
+  } catch (e) { state.program.verbs = []; }
+  programRenderSelectionVerbs();
+  return state.program.verbs;
+}
+
+// Populate #programSelectionVerbs with one button per cached verb. Called
+// once verbs are known (programEnsureVerbs resolving) and again whenever the
+// selection menu is about to show, so a live-reloaded verb list (a dropped
+// verbs/*.md file) appears without a page reload.
+function programRenderSelectionVerbs() {
+  const verbs = state.program.verbs || [];
+  programSelectionVerbsEl.replaceChildren(
+    ...verbs.map((v) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "program-selection-verb-btn";
+      btn.dataset.verb = v.name;
+      btn.title = v.description || v.label;
+      btn.textContent = `▸ ${v.label}`;
+      return btn;
+    }),
+  );
 }
 
 function programRefreshEmptyState() {
@@ -6566,6 +6667,18 @@ function programWireEvents() {
     e.preventDefault();
     e.stopPropagation();
     await programRun();
+    programClearSelection();
+    try { programInputEl.focus(); } catch (_) {}
+  });
+  // Delegated: verb buttons are rebuilt by programRenderSelectionVerbs
+  // whenever the verb list changes, so a per-button listener would need
+  // re-attaching on every rebuild — one listener on the container instead.
+  programSelectionVerbsEl.addEventListener("mousedown", async (e) => {
+    const btn = e.target.closest(".program-selection-verb-btn");
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    await programRunVerb(btn.dataset.verb);
     programClearSelection();
     try { programInputEl.focus(); } catch (_) {}
   });

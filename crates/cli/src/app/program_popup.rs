@@ -65,6 +65,7 @@ impl App {
                 // refresh on open so edits / new template files surface in the
                 // empty-state placeholder without a daemon restart.
                 self.refresh_program_templates();
+                self.refresh_program_verbs();
             }
             Err(e) => {
                 self.set_status(format!("program get failed: {e}"));
@@ -112,6 +113,20 @@ impl App {
         tokio::spawn(async move {
             if let Ok(result) = client.program_templates().await {
                 let _ = tx.send(result.templates);
+            }
+        });
+    }
+
+    /// `refresh_program_templates`'s counterpart for program verbs (spec
+    /// 0087): the same "fetch fresh, deliver via channel" shape so a newly
+    /// dropped `verbs/*.md` file appears in the selection menu on the next
+    /// program open without a daemon restart.
+    fn refresh_program_verbs(&self) {
+        let client = self.client.clone();
+        let tx = self.program_verbs_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(result) = client.program_verbs().await {
+                let _ = tx.send(result.verbs);
             }
         });
     }

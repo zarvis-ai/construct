@@ -10,8 +10,10 @@ use construct_protocol::{
     EventNotificationPayload, GroupDeletedNotificationPayload, GroupStateNotificationPayload,
     GroupSummary, HarnessInfo, MessageRole, MoveDirection, NativeSubagentRef, ProgramDocument,
     ProgramEditParams, ProgramExecuteParams, ProgramExecuteResult, ProgramGetResult,
-    ProgramListTemplatesResult, ProgramRunProgress, ProgramStateNotificationPayload,
-    ProgramUpdateParams, ProgramUpdateResult, PtyReplayResult, PtySize, SearchParams, SearchResult,
+    ProgramListTemplatesResult, ProgramListVerbsResult, ProgramRunProgress,
+    ProgramStateNotificationPayload, ProgramUpdateParams, ProgramUpdateResult,
+    ProgramVerbExecuteParams, ProgramVerbExecuteResult, PtyReplayResult, PtySize, SearchParams,
+    SearchResult,
     SessionAttachClipboardParams, SessionAttachClipboardResult, SessionDetail,
     SessionEmitEventParams, SessionEvent, SessionStartParams, SessionState, SessionSummary,
     SmithAuthMethodInfo, SmithAuthStatusResult, SmithSetAuthMethodResult, StateNotificationPayload,
@@ -564,6 +566,102 @@ fn program_execution_prompt_with_comment(comment: Option<&str>) -> String {
     prompt
 }
 
+/// A Program-verb subagent awaiting a structured result to merge back into
+/// its owning Program (spec 0087), tracked from the moment its provisional
+/// clip-annotation edit lands until either a mechanical merge or an
+/// escalation resolves it.
+#[derive(Clone)]
+struct PendingVerbMerge {
+    /// The session whose Program document this verb is refining.
+    program_session_id: String,
+    verb: construct_protocol::ProgramVerb,
+    /// The text currently anchoring this verb's selection in the document —
+    /// the original selection with the subagent's `@{session:<id>}` clip
+    /// appended by the provisional edit. Authoritative for drift detection:
+    /// the subagent's own belief about its anchor (if any) is advisory only,
+    /// since the daemon is the one source of truth for the live document.
+    anchor: String,
+    /// Where the subagent is instructed to write its result JSON — its own
+    /// session-widgets directory, already auto-approved for that session's
+    /// harness (spec 0087 "enforced by construction": the subagent has no
+    /// Program-editing tool at all, native or MCP, so this file drop is the
+    /// only channel it has back to the document).
+    result_file: PathBuf,
+}
+
+/// The JSON contract a Program-verb subagent writes to its result file (spec
+/// 0087). `effect` is accepted but not trusted — the daemon always applies
+/// the verb definition's own declared effect, so a subagent cannot change
+/// how its result is merged just by mis-stating this field.
+#[derive(Debug, serde::Deserialize)]
+struct VerbResultPayload {
+    #[serde(default)]
+    #[allow(dead_code)]
+    effect: Option<String>,
+    content: String,
+}
+
+/// Build the initial prompt for a Program-verb subagent (spec 0087): the
+/// verb's own purpose prompt, the selection framed as the subagent's entire
+/// jurisdiction, the optional free-text instruction (same composition rule
+/// as selection Run's comment, spec 0076), and the structured-return
+/// contract — including that the subagent has no Program-editing tool and
+/// must not attempt to act like it does.
+fn program_verb_prompt(
+    verb: &construct_protocol::ProgramVerb,
+    selection: &str,
+    comment: Option<&str>,
+) -> String {
+    use construct_protocol::{ProgramVerbEffect, ProgramVerbInteraction};
+    let mut prompt = String::new();
+    prompt.push_str(verb.prompt.trim());
+    prompt.push_str(
+        "\n\n---\n\nYour jurisdiction is exactly the following selected Markdown from a \
+         Program (orchestration) document. The rest of the document is not shown to you and \
+         is out of scope: do not describe, reference, or act on anything beyond this \
+         selection.\n\n",
+    );
+    prompt.push_str(selection);
+    prompt.push_str("\n\n---\n\n");
+    if let Some(comment) = comment {
+        let one_line = comment.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !one_line.is_empty() {
+            prompt.push_str("Additional user instruction for this verb: ");
+            prompt.push_str(&one_line);
+            prompt.push_str("\n\n");
+        }
+    }
+    match verb.interaction {
+        ProgramVerbInteraction::Interactive => prompt.push_str(
+            "This is an interactive verb: do not write a result yet. Hold a focused dialogue \
+             with the user in this session first, following the questioning approach above, \
+             until you have enough to produce a result. Only once you decide to stop should \
+             you write the result described below.\n\n",
+        ),
+        ProgramVerbInteraction::SingleShot => {
+            prompt.push_str("Produce your result now without asking the user anything.\n\n")
+        }
+    }
+    let content_meaning = match verb.effect {
+        ProgramVerbEffect::Annotate => {
+            "only the new Markdown to add after the selection — do not restate the selection itself"
+        }
+        ProgramVerbEffect::Rewrite => "the complete replacement Markdown for the selection",
+    };
+    prompt.push_str(&format!(
+        "You have no tool, native or MCP, that can edit this Program document — do not \
+         attempt to use construct_program_edit, agentd_program_edit, or any similar tool; the \
+         platform applies your result on your behalf once you deliver it. When you are ready, \
+         call agentd_context (or construct_context if you are using MCP) and read \
+         `session_widgets.dir` from the response, then write a single JSON object to \
+         `<that dir>/verb-result.json` with exactly one field, `content`: {content_meaning}. \
+         Preserve any @{{session:...}} or @{{harness:...}} smart clips present in the \
+         selection unless removing one is this verb's explicit purpose. Keep the result \
+         focused; do not pad it."
+    ));
+    prompt
+}
+
 fn program_run_context(
     program: &ProgramDocument,
     scope: &str,
@@ -977,6 +1075,13 @@ pub struct SessionManager {
     dev_assets: std::sync::Mutex<Option<PathBuf>>,
     widget_snapshots: tokio::sync::Mutex<HashMap<String, WidgetSnapshot>>,
     program_runs: std::sync::Mutex<HashMap<String, ProgramRunProgress>>,
+    /// Program-verb subagents awaiting a structured result to merge back
+    /// into their owning Program (spec 0087), keyed by the *subagent's* own
+    /// session id. In-memory only: a daemon restart mid-verb drops the
+    /// pending merge (the subagent, if still running, finishes with nowhere
+    /// to deliver its result — a known v1 limitation, not a data-loss risk
+    /// since the result file itself survives on disk for manual recovery).
+    pending_verb_merges: std::sync::Mutex<HashMap<String, PendingVerbMerge>>,
     program_cursors: std::sync::Mutex<HashMap<u64, construct_protocol::ProgramCursor>>,
     /// Reserved pseudo-connection id for each session's agent-authored
     /// Program cursor (spec 0065 agent presence), keyed by session id and
@@ -1286,6 +1391,7 @@ impl SessionManager {
                 dev_assets: std::sync::Mutex::new(dev_assets),
                 widget_snapshots: tokio::sync::Mutex::new(widget_snapshots),
                 program_runs: std::sync::Mutex::new(HashMap::new()),
+                pending_verb_merges: std::sync::Mutex::new(HashMap::new()),
                 program_cursors: std::sync::Mutex::new(HashMap::new()),
                 agent_program_cursor_conn_ids: std::sync::Mutex::new(HashMap::new()),
                 next_conn_id: AtomicU64::new(1),
@@ -2139,6 +2245,37 @@ impl SessionManager {
         })
     }
 
+    /// Deliver `text` into `session_id` as its harness's native next input,
+    /// picking the framing its harness needs (bracketed-paste typed submit
+    /// for an external agent TUI, CR-terminated PTY submit for a PTY-backed
+    /// line editor, or a structured adapter input for a headless harness).
+    /// Shared by Program Run's prompt delivery and verb-drift escalation
+    /// (spec 0087) — both are "say this to the session as if the user typed
+    /// it," differing only in the message.
+    async fn deliver_text_to_session(&self, session_id: &str, text: &str) -> Result<()> {
+        let entry = self
+            .get_entry(session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let delivery = {
+            let summary = entry.summary.read().await;
+            program_execution_delivery(&summary)
+        };
+        match delivery {
+            ProgramExecutionDelivery::ExternalPtyTypedSubmit => {
+                self.program_submit_typed_prompt(session_id, text).await?;
+            }
+            ProgramExecutionDelivery::PtySubmit => {
+                self.pty_input(session_id, program_pty_submit_bytes(text))
+                    .await?;
+            }
+            ProgramExecutionDelivery::AdapterInput => {
+                self.send_input(session_id, text.to_string()).await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn program_execute(
         self: &Arc<Self>,
         params: ProgramExecuteParams,
@@ -2221,26 +2358,12 @@ impl SessionManager {
         let run_context = program_run_context(&result.program, scope, body);
         self.write_program_run_context(&params.session_id, &run_context)?;
         let prompt = program_execution_prompt_with_comment(run_comment);
-        let (delivery, queued_behind_current_turn) = {
+        let queued_behind_current_turn = {
             let summary = entry.summary.read().await;
-            (
-                program_execution_delivery(&*summary),
-                summary.state == construct_protocol::SessionState::Running,
-            )
+            summary.state == construct_protocol::SessionState::Running
         };
-        match delivery {
-            ProgramExecutionDelivery::ExternalPtyTypedSubmit => {
-                self.program_submit_typed_prompt(&params.session_id, &prompt)
-                    .await?;
-            }
-            ProgramExecutionDelivery::PtySubmit => {
-                self.pty_input(&params.session_id, program_pty_submit_bytes(&prompt))
-                    .await?;
-            }
-            ProgramExecutionDelivery::AdapterInput => {
-                self.send_input(&params.session_id, prompt.clone()).await?;
-            }
-        }
+        self.deliver_text_to_session(&params.session_id, &prompt)
+            .await?;
         let active_run = self.start_program_run_with_dispatch_state(
             &params.session_id,
             &run_body,
@@ -2366,6 +2489,319 @@ impl SessionManager {
         Ok(ProgramListTemplatesResult {
             templates: self.storage.program_templates()?,
         })
+    }
+
+    pub fn program_verbs(&self) -> ProgramListVerbsResult {
+        ProgramListVerbsResult {
+            verbs: self.storage.program_verbs(),
+        }
+    }
+
+    /// Run a Program selection verb (spec 0087): spawn a subagent scoped to
+    /// `params.selection`, annotate the selection with the subagent's clip
+    /// (the same in-flight affordance as the 0066 fast path), and record a
+    /// pending merge that resolves once the subagent delivers a result — see
+    /// [`Self::maybe_complete_verb_merge`].
+    pub async fn program_verb_execute(
+        self: &Arc<Self>,
+        params: ProgramVerbExecuteParams,
+    ) -> Result<ProgramVerbExecuteResult> {
+        let entry = self
+            .get_entry(&params.session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", params.session_id))?;
+        let verb = self
+            .storage
+            .program_verbs()
+            .into_iter()
+            .find(|v| v.name == params.verb)
+            .ok_or_else(|| anyhow!("unknown program verb: {}", params.verb))?;
+
+        let program = self.storage.read_program(&params.session_id)?;
+        if let Some(base) = params.base_version {
+            if base != program.version {
+                anyhow::bail!(
+                    "program conflict: current version is {}, attempted base version is {}",
+                    program.version,
+                    base
+                );
+            }
+        }
+        let selection_trimmed = params.selection.trim();
+        if selection_trimmed.is_empty() {
+            anyhow::bail!("verb selection is empty");
+        }
+        let comment = params
+            .comment
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty());
+
+        let owner_cwd = entry.summary.read().await.cwd.clone();
+        let mut env = HashMap::new();
+        env.insert(
+            "CONSTRUCT_PARENT_SESSION_ID".to_string(),
+            params.session_id.clone(),
+        );
+        let prompt = program_verb_prompt(&verb, selection_trimmed, comment);
+        let subagent_id = self
+            .create(CreateSessionParams {
+                harness: "smith".to_string(),
+                cwd: owner_cwd,
+                prompt: Some(prompt),
+                model: None,
+                title: Some(format!("verb:{}", verb.name)),
+                mode: Some("headless".to_string()),
+                pty_size: Some(PtySize {
+                    cols: 100,
+                    rows: 30,
+                }),
+                worktree: false,
+                env,
+                args: Vec::new(),
+                kind: construct_protocol::SessionKind::Subagent,
+                parent_session_id: Some(params.session_id.clone()),
+                group_id: None,
+                position_after_session_id: None,
+                forked_from: None,
+            })
+            .await?;
+
+        let anchor = format!("{} @{{session:{}}}", params.selection, subagent_id);
+        let content_id = construct_protocol::program_block_spans(&anchor)
+            .into_iter()
+            .next()
+            .map(|span| span.id)
+            .unwrap_or_default();
+        let edit_result = self
+            .program_edit_from_conn(
+                ProgramEditParams {
+                    session_id: params.session_id.clone(),
+                    edits: vec![construct_protocol::ProgramEdit {
+                        old_string: params.selection.clone(),
+                        new_string: anchor.clone(),
+                        replace_all: false,
+                        keep_pending: true,
+                    }],
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
+                    note: Some(format!("verb: {}", verb.name)),
+                    shimmer: vec![construct_protocol::ProgramShimmerDecl {
+                        id: content_id,
+                        shimmer: true,
+                        tooltip: Some(verb.label.clone()),
+                    }],
+                },
+                None,
+            )
+            .await;
+        let edit_result = match edit_result {
+            Ok(result) => result,
+            Err(e) => {
+                // The selection anchor didn't apply (e.g. it changed or is
+                // not unique between the read above and this edit) — the
+                // subagent already exists but nothing will ever merge its
+                // result, so it would otherwise linger unexplained.
+                let _ = self.archive(&subagent_id).await;
+                return Err(e);
+            }
+        };
+
+        self.pending_verb_merges.lock().unwrap().insert(
+            subagent_id.clone(),
+            PendingVerbMerge {
+                program_session_id: params.session_id.clone(),
+                verb: verb.clone(),
+                anchor,
+                result_file: self.storage.widgets_dir(&subagent_id).join("verb-result.json"),
+            },
+        );
+
+        Ok(ProgramVerbExecuteResult {
+            program: edit_result.program,
+            subagent_session_id: subagent_id,
+            verb: verb.name,
+            blocks: edit_result.blocks,
+        })
+    }
+
+    /// Called off every session state transition (see `session::events`).
+    /// When `session_id` has a pending verb merge and its result file now
+    /// exists, consumes and applies it exactly once. When the subagent
+    /// reaches a terminal state with no result ever written, the verb is
+    /// abandoned: the pending entry is dropped and the document is left
+    /// untouched (spec 0087 — a cancelled/errored verb must not leave a
+    /// stray in-flight affordance, but also must not apply a partial
+    /// result).
+    pub(crate) async fn maybe_complete_verb_merge(
+        &self,
+        session_id: &str,
+        state: construct_protocol::SessionState,
+    ) {
+        let pending = {
+            let map = self.pending_verb_merges.lock().unwrap();
+            map.get(session_id).cloned()
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        if !pending.result_file.exists() {
+            if matches!(
+                state,
+                construct_protocol::SessionState::Done | construct_protocol::SessionState::Errored
+            ) {
+                self.pending_verb_merges.lock().unwrap().remove(session_id);
+                self.clear_verb_shimmer_best_effort(&pending).await;
+                tracing::info!(
+                    session = %session_id,
+                    verb = %pending.verb.name,
+                    "verb subagent ended without a result; leaving program untouched"
+                );
+            }
+            return;
+        }
+        // Consume before awaiting so a second state transition arriving
+        // while the merge below is in flight can't double-apply it.
+        self.pending_verb_merges.lock().unwrap().remove(session_id);
+        if let Err(e) = self.apply_verb_merge(session_id, pending).await {
+            tracing::warn!(session = %session_id, error = %e, "program verb merge failed");
+        }
+    }
+
+    /// Turn off a verb's in-progress shimmer without touching the document
+    /// text (spec 0087: an abandoned verb must clear its in-flight affordance
+    /// but leave the document untouched). A no-op text edit — `old_string`
+    /// and `new_string` both equal to the anchor — paired with a `shimmer:
+    /// false` declaration is the documented way to settle a block without
+    /// changing it (see the Program Run planning-pass instructions). Best
+    /// effort: if the anchor has already drifted, the edit simply won't
+    /// match, which just means the block's identity already changed and so
+    /// isn't shimmering under this stale reference anyway.
+    async fn clear_verb_shimmer_best_effort(&self, pending: &PendingVerbMerge) {
+        let content_id = construct_protocol::program_block_spans(&pending.anchor)
+            .into_iter()
+            .next()
+            .map(|span| span.id)
+            .unwrap_or_default();
+        if content_id.is_empty() {
+            return;
+        }
+        let _ = self
+            .program_edit_from_conn(
+                ProgramEditParams {
+                    session_id: pending.program_session_id.clone(),
+                    edits: vec![construct_protocol::ProgramEdit {
+                        old_string: pending.anchor.clone(),
+                        new_string: pending.anchor.clone(),
+                        replace_all: false,
+                        keep_pending: false,
+                    }],
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
+                    note: Some("verb abandoned".to_string()),
+                    shimmer: vec![construct_protocol::ProgramShimmerDecl {
+                        id: content_id,
+                        shimmer: false,
+                        tooltip: None,
+                    }],
+                },
+                None,
+            )
+            .await;
+    }
+
+    async fn apply_verb_merge(&self, subagent_id: &str, pending: PendingVerbMerge) -> Result<()> {
+        let raw = std::fs::read(&pending.result_file).with_context(|| {
+            format!("read verb result {}", pending.result_file.display())
+        })?;
+        let result: VerbResultPayload =
+            serde_json::from_slice(&raw).context("parse verb result JSON")?;
+        let content = result.content.trim();
+        if content.is_empty() {
+            anyhow::bail!("verb result content is empty");
+        }
+        let clip = format!("@{{session:{subagent_id}}}");
+        let new_string = match pending.verb.effect {
+            construct_protocol::ProgramVerbEffect::Annotate => {
+                format!("{}\n\n{}", pending.anchor, content)
+            }
+            construct_protocol::ProgramVerbEffect::Rewrite => {
+                if content.contains(&clip) {
+                    content.to_string()
+                } else {
+                    format!("{content}\n\n{clip}")
+                }
+            }
+        };
+        let merge = self
+            .program_edit_from_conn(
+                ProgramEditParams {
+                    session_id: pending.program_session_id.clone(),
+                    edits: vec![construct_protocol::ProgramEdit {
+                        old_string: pending.anchor.clone(),
+                        new_string,
+                        replace_all: false,
+                        keep_pending: false,
+                    }],
+                    actor: construct_protocol::ProgramUpdateActor::Agent,
+                    note: Some(format!("verb: {}", pending.verb.name)),
+                    shimmer: Vec::new(),
+                },
+                None,
+            )
+            .await;
+        match merge {
+            Ok(_) => {
+                let _ = self.archive(subagent_id).await;
+                Ok(())
+            }
+            Err(_) => {
+                // The anchor drifted underneath the verb — the user (or
+                // another edit) touched the selection while it was in
+                // flight. Escalate to the Program-owning session rather
+                // than silently discarding a completed subagent's result.
+                // Archive unconditionally, even if delivery itself fails
+                // (e.g. the owning session has no live adapter right now) —
+                // the subagent's job is done either way, and leaving it
+                // un-archived would strand it in the active list forever.
+                if let Err(e) = self
+                    .escalate_verb_drift(&pending, subagent_id, content)
+                    .await
+                {
+                    tracing::warn!(
+                        session = %subagent_id,
+                        error = %e,
+                        "verb drift escalation delivery failed"
+                    );
+                }
+                let _ = self.archive(subagent_id).await;
+                Ok(())
+            }
+        }
+    }
+
+    async fn escalate_verb_drift(
+        &self,
+        pending: &PendingVerbMerge,
+        subagent_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        let effect_label = match pending.verb.effect {
+            construct_protocol::ProgramVerbEffect::Annotate => "annotate",
+            construct_protocol::ProgramVerbEffect::Rewrite => "rewrite",
+        };
+        let message = format!(
+            "The \"{label}\" verb (subagent {subagent_id}) finished on a Program selection \
+             that has since changed, so its result could not be merged automatically.\n\n\
+             Original selection anchor:\n{anchor}\n\n\
+             Verb result ({effect_label}):\n{content}\n\n\
+             Please reconcile: read the current program, then apply an anchored edit that \
+             incorporates this result into the document as it stands now, using whichever \
+             program-edit tool you have available (construct_program_edit via MCP, or \
+             agentd_program_edit natively).",
+            label = pending.verb.label,
+            anchor = pending.anchor,
+        );
+        self.deliver_text_to_session(&pending.program_session_id, &message)
+            .await
     }
 
     fn broadcast_program_state(&self, program: ProgramDocument) {
@@ -4675,6 +5111,254 @@ mod tests {
             is_reset_snapshot: false,
         });
         entry
+    }
+
+    fn test_verb(effect: construct_protocol::ProgramVerbEffect) -> construct_protocol::ProgramVerb {
+        construct_protocol::ProgramVerb {
+            name: "simplify".to_string(),
+            label: "Simplify".to_string(),
+            description: None,
+            effect,
+            interaction: construct_protocol::ProgramVerbInteraction::SingleShot,
+            order: 0,
+            built_in: true,
+            prompt: "test verb".to_string(),
+        }
+    }
+
+    /// spec 0087: once a verb subagent's result file exists and its anchor
+    /// still matches the live document, `maybe_complete_verb_merge` applies
+    /// it mechanically — no escalation, no LLM round trip — and retires the
+    /// subagent.
+    #[tokio::test]
+    async fn program_verb_merge_applies_mechanically_when_anchor_is_unchanged() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "vowner".into(),
+            synthetic_entry("vowner", construct_protocol::SessionKind::User, 0),
+        );
+        mgr.sessions.write().await.insert(
+            "vsub".into(),
+            synthetic_subagent_entry("vsub", "vowner", 1).await,
+        );
+
+        storage
+            .update_program(
+                "vowner",
+                "# Plan\n\nDo the thing.\n".to_string(),
+                construct_protocol::ProgramUpdateActor::Human,
+                None,
+                None,
+                None,
+            )
+            .expect("seed program");
+        // Mirrors the provisional clip-annotation edit `program_verb_execute`
+        // applies at spawn time, before any merge is pending.
+        let anchor = "Do the thing. @{session:vsub}".to_string();
+        storage
+            .edit_program(
+                "vowner",
+                &[construct_protocol::ProgramEdit {
+                    old_string: "Do the thing.".to_string(),
+                    new_string: anchor.clone(),
+                    replace_all: false,
+                    keep_pending: false,
+                }],
+                construct_protocol::ProgramUpdateActor::Agent,
+                None,
+            )
+            .expect("seed provisional anchor");
+
+        let widgets_dir = storage.widgets_dir("vsub");
+        std::fs::create_dir_all(&widgets_dir).unwrap();
+        let result_file = widgets_dir.join("verb-result.json");
+        std::fs::write(&result_file, r#"{"content":"Do the thing, carefully."}"#).unwrap();
+
+        mgr.pending_verb_merges.lock().unwrap().insert(
+            "vsub".to_string(),
+            PendingVerbMerge {
+                program_session_id: "vowner".to_string(),
+                verb: test_verb(construct_protocol::ProgramVerbEffect::Rewrite),
+                anchor,
+                result_file,
+            },
+        );
+
+        mgr.maybe_complete_verb_merge("vsub", construct_protocol::SessionState::Done)
+            .await;
+
+        assert!(
+            mgr.pending_verb_merges.lock().unwrap().get("vsub").is_none(),
+            "pending merge is consumed"
+        );
+        let program = storage.read_program("vowner").expect("read program");
+        assert!(
+            program.markdown.contains("Do the thing, carefully."),
+            "verb result applied: {}",
+            program.markdown
+        );
+        assert!(
+            program.markdown.contains("@{session:vsub}"),
+            "rewrite preserves the subagent's provenance clip: {}",
+            program.markdown
+        );
+        assert!(
+            mgr.get_entry("vsub")
+                .await
+                .unwrap()
+                .archived
+                .load(Ordering::SeqCst),
+            "merged verb subagent is archived"
+        );
+    }
+
+    /// spec 0087: when the selection changed underneath an in-flight verb,
+    /// the mechanical merge's anchor no longer matches — the document must be
+    /// left exactly as-is (no partial/garbled merge), and the subagent still
+    /// retires even though delivering the escalation message fails here (the
+    /// synthetic owner session has no live adapter to deliver into).
+    #[tokio::test]
+    async fn program_verb_merge_leaves_document_untouched_when_anchor_has_drifted() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "vowner2".into(),
+            synthetic_entry("vowner2", construct_protocol::SessionKind::User, 0),
+        );
+        mgr.sessions.write().await.insert(
+            "vsub2".into(),
+            synthetic_subagent_entry("vsub2", "vowner2", 1).await,
+        );
+
+        let drifted_markdown = "# Plan\n\nSomething entirely different now.\n";
+        storage
+            .update_program(
+                "vowner2",
+                drifted_markdown.to_string(),
+                construct_protocol::ProgramUpdateActor::Human,
+                None,
+                None,
+                None,
+            )
+            .expect("seed program");
+
+        let widgets_dir = storage.widgets_dir("vsub2");
+        std::fs::create_dir_all(&widgets_dir).unwrap();
+        let result_file = widgets_dir.join("verb-result.json");
+        std::fs::write(&result_file, r#"{"content":"Do the thing, carefully."}"#).unwrap();
+
+        mgr.pending_verb_merges.lock().unwrap().insert(
+            "vsub2".to_string(),
+            PendingVerbMerge {
+                program_session_id: "vowner2".to_string(),
+                verb: test_verb(construct_protocol::ProgramVerbEffect::Rewrite),
+                // References text no longer present in the document.
+                anchor: "Do the thing. @{session:vsub2}".to_string(),
+                result_file,
+            },
+        );
+
+        mgr.maybe_complete_verb_merge("vsub2", construct_protocol::SessionState::Done)
+            .await;
+
+        assert!(
+            mgr.pending_verb_merges.lock().unwrap().get("vsub2").is_none(),
+            "pending merge is consumed even when escalation delivery fails"
+        );
+        let program = storage.read_program("vowner2").expect("read program");
+        assert_eq!(
+            program.markdown, drifted_markdown,
+            "a drifted anchor must never partially merge into the document"
+        );
+        assert!(
+            mgr.get_entry("vsub2")
+                .await
+                .unwrap()
+                .archived
+                .load(Ordering::SeqCst),
+            "verb subagent retires even when escalation delivery fails"
+        );
+    }
+
+    /// spec 0087: a verb subagent that reaches a terminal state without ever
+    /// writing a result is abandoned — the document is untouched and the
+    /// pending entry is cleared so it doesn't linger forever.
+    #[tokio::test]
+    async fn program_verb_merge_abandoned_when_subagent_ends_without_result() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage.clone(), config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        mgr.sessions.write().await.insert(
+            "vowner3".into(),
+            synthetic_entry("vowner3", construct_protocol::SessionKind::User, 0),
+        );
+        mgr.sessions.write().await.insert(
+            "vsub3".into(),
+            synthetic_subagent_entry("vsub3", "vowner3", 1).await,
+        );
+
+        let markdown = "# Plan\n\nDo the thing.\n";
+        storage
+            .update_program(
+                "vowner3",
+                markdown.to_string(),
+                construct_protocol::ProgramUpdateActor::Human,
+                None,
+                None,
+                None,
+            )
+            .expect("seed program");
+
+        mgr.pending_verb_merges.lock().unwrap().insert(
+            "vsub3".to_string(),
+            PendingVerbMerge {
+                program_session_id: "vowner3".to_string(),
+                verb: test_verb(construct_protocol::ProgramVerbEffect::Annotate),
+                anchor: "Do the thing.".to_string(),
+                // Never written — the subagent errored before producing one.
+                result_file: storage.widgets_dir("vsub3").join("verb-result.json"),
+            },
+        );
+
+        mgr.maybe_complete_verb_merge("vsub3", construct_protocol::SessionState::Errored)
+            .await;
+
+        assert!(
+            mgr.pending_verb_merges.lock().unwrap().get("vsub3").is_none(),
+            "abandoned verb clears its pending entry"
+        );
+        let program = storage.read_program("vowner3").expect("read program");
+        assert_eq!(
+            program.markdown, markdown,
+            "an abandoned verb must not touch the document"
+        );
     }
 
     #[tokio::test]

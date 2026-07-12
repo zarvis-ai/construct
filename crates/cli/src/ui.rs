@@ -12627,6 +12627,7 @@ fn render_program_selection_context_menu(
 ) {
     if program_selection_range(popup).is_none() {
         app.layout.program_selection_run_hit = None;
+        app.layout.program_selection_verb_hits.clear();
         return;
     }
     let Some(pos) = program_cursor_position(
@@ -12637,12 +12638,17 @@ fn render_program_selection_context_menu(
         program_area,
     ) else {
         app.layout.program_selection_run_hit = None;
+        app.layout.program_selection_verb_hits.clear();
         return;
     };
     let menu = popup.selection_menu.as_ref().cloned().unwrap_or_default();
-    let rect = program_selection_context_menu_rect(pos, program_area, &menu);
+    // Verb buttons (spec 0087) render as a vertical list below the
+    // comment/Run row, one row per verb, ordered as advertised by the daemon.
+    let verbs = app.program_verbs.clone();
+    let rect = program_selection_context_menu_rect(pos, program_area, &menu, verbs.len());
     if rect.width < 3 || rect.height < 3 {
         app.layout.program_selection_run_hit = None;
+        app.layout.program_selection_verb_hits.clear();
         return;
     }
     let inner_x = rect.x.saturating_add(1 + PROGRAM_SELECTION_RUN_MENU_PAD_X);
@@ -12684,8 +12690,11 @@ fn render_program_selection_context_menu(
         menu.comment.clone()
     };
     let mut comment_lines = wrap_to_width(&comment_text, comment_width);
-    let visible_comment_rows = rect.height.saturating_sub(2) as usize;
-    comment_lines.truncate(visible_comment_rows);
+    // Reserve one row per verb at the bottom of the menu, below the comment
+    // rows — `visible_comment_rows` bounds how many comment lines fit above them.
+    let verb_rows = verbs.len().min(rect.height.saturating_sub(2) as usize);
+    let visible_comment_rows = (rect.height.saturating_sub(2) as usize).saturating_sub(verb_rows);
+    comment_lines.truncate(visible_comment_rows.max(1));
     let comment_style = if menu.comment.is_empty() {
         Style::default().fg(app.theme.muted)
     } else if menu.focused {
@@ -12734,12 +12743,45 @@ fn render_program_selection_context_menu(
                 .last()
                 .map(|line| UnicodeWidthStr::width(line.as_str()))
                 .unwrap_or(0);
-            let visible_row = cursor_row.min(visible_comment_rows.saturating_sub(1));
+            let visible_row = cursor_row.min(visible_comment_rows.max(1).saturating_sub(1));
             let y = inner_y.saturating_add(visible_row as u16);
             let x =
                 inner_x.saturating_add((cursor_col.min(comment_width.saturating_sub(1))) as u16);
             f.set_cursor_position(Position { x, y });
         }
+        let mut verb_hits = Vec::with_capacity(verb_rows);
+        for (idx, verb) in verbs.iter().take(verb_rows).enumerate() {
+            let y = inner_y.saturating_add(comment_lines.len() as u16).saturating_add(idx as u16);
+            let verb_hovered = app
+                .mouse_pos
+                .is_some_and(|(mx, my)| my == y && mx >= inner_x && mx < inner_x.saturating_add(inner_width as u16));
+            let label = format!("▸ {}", verb.label);
+            let truncated = truncate_to_width(&label, inner_width);
+            let text_width = UnicodeWidthStr::width(truncated.as_str());
+            let pad = inner_width.saturating_sub(text_width);
+            let spans = vec![
+                Span::styled(truncated, row_style(verb_hovered)),
+                Span::raw(" ".repeat(pad)),
+            ];
+            f.render_widget(
+                Paragraph::new(Line::from(spans)),
+                Rect {
+                    x: inner_x,
+                    y,
+                    width: inner_width as u16,
+                    height: 1,
+                },
+            );
+            verb_hits.push((
+                inner_x,
+                inner_x.saturating_add(inner_width as u16),
+                y,
+                verb.name.clone(),
+            ));
+        }
+        app.layout.program_selection_verb_hits = verb_hits;
+    } else {
+        app.layout.program_selection_verb_hits.clear();
     }
 }
 
@@ -12775,11 +12817,15 @@ fn program_selection_context_menu_rect(
     pos: Position,
     total: Rect,
     menu: &crate::app::ProgramSelectionMenu,
+    verb_count: usize,
 ) -> Rect {
     let width = PROGRAM_SELECTION_RUN_MENU_W.min(total.width);
     let max_comment_rows = total.height.saturating_sub(2) as usize;
     let comment_rows = program_selection_comment_line_count(menu, width, max_comment_rows);
-    let height = (2 + comment_rows as u16).min(total.height).max(1);
+    // One extra row per verb (spec 0087), below the comment/Run row.
+    let height = (2 + comment_rows as u16 + verb_count as u16)
+        .min(total.height)
+        .max(1);
     let max_x = total.x.saturating_add(total.width).saturating_sub(width);
     let max_y = total.y.saturating_add(total.height).saturating_sub(height);
     Rect {

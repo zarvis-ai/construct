@@ -99,6 +99,11 @@ pub fn catalog() -> Vec<Value> {
             "List built-in and user program templates. User templates live under the daemon data directory at `program/templates/*.md`.",
             schema_empty(),
         ),
+        tool(
+            "construct_program_list_verbs",
+            "List available Program selection verbs — typed refinement actions (like 'simplify' or 'crystallize') offered on a Program selection alongside execute. Each entry has a `name` (pass to construct_program_verb_execute), `label`, `effect` ('annotate' or 'rewrite'), and `interaction` ('single-shot' or 'interactive'). Built-in verbs ship with the daemon; user verbs live under the config directory at `verbs/*.md` and override a built-in of the same name.",
+            schema_empty(),
+        ),
         // ----- Write -----
         tool(
             "construct_program_edit",
@@ -180,6 +185,21 @@ pub fn catalog() -> Vec<Value> {
                         "items": { "type": "boolean" }
                     }
                 }
+            }),
+        ),
+        tool(
+            "construct_program_verb_execute",
+            "Run a Program selection verb (see construct_program_list_verbs). Spawns a subagent scoped to `selection` — the verb's entire jurisdiction — which cannot edit the program itself; the daemon merges its result back into the document once it completes (mechanically if the selection hasn't changed, or by asking the owning session to reconcile if it has). The selection is annotated with the subagent's session clip immediately, before the result lands. Defaults to the current session when `session_id` is omitted.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "string" },
+                    "verb": { "type": "string", "description": "A verb `name` from construct_program_list_verbs." },
+                    "selection": { "type": "string", "description": "The exact Markdown substring to refine — must match the current program content." },
+                    "base_version": { "type": "integer", "minimum": 0 },
+                    "comment": { "type": "string", "description": "Optional one-line instruction composed onto the verb's purpose prompt." }
+                },
+                "required": ["verb", "selection"]
             }),
         ),
         tool(
@@ -535,6 +555,7 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
         "construct_program_list_templates" => {
             serde_json::to_value(client.program_templates().await?)?
         }
+        "construct_program_list_verbs" => serde_json::to_value(client.program_verbs().await?)?,
         // ----- Write -----
         "construct_program_update" => {
             let sid = optional_session_arg(&args, session_id)?;
@@ -637,6 +658,18 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
                 selection_block_ids: None,
             };
             serde_json::to_value(client.program_execute(params).await?)?
+        }
+        "construct_program_verb_execute" => {
+            let sid = optional_session_arg(&args, session_id)?;
+            let params = construct_protocol::ProgramVerbExecuteParams {
+                session_id: sid,
+                verb: arg_str(&args, "verb")?,
+                selection: arg_str(&args, "selection")?,
+                base_version: args.get("base_version").and_then(|v| v.as_u64()),
+                comment: arg_str(&args, "comment").ok(),
+                selection_block_ids: None,
+            };
+            serde_json::to_value(client.program_verb_execute(params).await?)?
         }
         "construct_create_session" => {
             let harness = arg_str(&args, "harness")?;
@@ -1073,6 +1106,8 @@ mod tests {
             "construct_program_update",
             "construct_program_edit",
             "construct_program_execute",
+            "construct_program_list_verbs",
+            "construct_program_verb_execute",
         ] {
             assert!(names.contains(expected), "missing {expected}");
         }
