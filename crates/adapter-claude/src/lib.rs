@@ -268,6 +268,7 @@ async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
             PathBuf::from(&params.cwd),
             ctx.emit.clone(),
             resuming,
+            params.model.clone(),
         );
     }
     let label = command.argv_preview();
@@ -329,6 +330,7 @@ fn spawn_interactive_transcript_watcher(
     cwd: PathBuf,
     emit: EventEmitter,
     skip_existing: bool,
+    initial_model: Option<String>,
 ) {
     let Some(initial_path) = claude_transcript_path(&cwd, &session_id) else {
         emit.log("claude: no CLAUDE_HOME or HOME — cannot watch native transcript");
@@ -337,6 +339,7 @@ fn spawn_interactive_transcript_watcher(
     tokio::spawn(async move {
         let mut current_id = session_id;
         let mut path = initial_path;
+        let mut last_model = initial_model;
         // On resume we skip history already in the transcript; after a mid-
         // session native id change (/clear, /branch, /resume) we always start
         // at the top of the new file so chat mode sees the fresh conversation.
@@ -377,7 +380,8 @@ fn spawn_interactive_transcript_watcher(
                     child_parents.clear();
                 }
             }
-            let root_values = emit_new_claude_transcript_lines(&path, &mut next_line, &emit);
+            let root_values =
+                emit_new_claude_transcript_lines(&path, &mut next_line, &emit, &mut last_model);
             for value in root_values {
                 if let Some((id, state, title)) = claude_native_subagent_update(&value) {
                     child_states.insert(id.clone(), state);
@@ -524,6 +528,7 @@ fn emit_new_claude_transcript_lines(
     path: &Path,
     next_line: &mut usize,
     emit: &EventEmitter,
+    last_model: &mut Option<String>,
 ) -> Vec<Value> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -540,6 +545,10 @@ fn emit_new_claude_transcript_lines(
         }
         match serde_json::from_str::<Value>(line) {
             Ok(v) => {
+                if let Some(model) = claude_model_change(&v, last_model) {
+                    *last_model = Some(model.clone());
+                    emit.emit(SessionEvent::ModelChanged { model });
+                }
                 emit_event_from_json(emit, v.clone());
                 values.push(v);
             }
@@ -552,6 +561,27 @@ fn emit_new_claude_transcript_lines(
     }
     *next_line = seen;
     values
+}
+
+/// The root session's active model, if `v` is an assistant transcript
+/// record carrying `message.model` that differs from what we last saw.
+/// Scoped to `emit_new_claude_transcript_lines` (the interactive watcher's
+/// root-transcript reader) rather than the shared `emit_event_from_json` —
+/// that function is also called from headless mode's per-turn stream
+/// parser, where the model is already fully controlled by our own
+/// `--model` flag each turn, so there's no live switch to detect there.
+///
+/// Verified against 284 real Claude Code transcripts on this machine: 17
+/// had more than one distinct `message.model` value within a single
+/// session, confirming this field tracks a live `/model` switch (unlike
+/// grok's `model_id`, which turned out to be frozen per session — see
+/// `grok_model_change` in the grok adapter).
+fn claude_model_change(v: &Value, last_model: &Option<String>) -> Option<String> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let model = v.get("message")?.get("model")?.as_str()?;
+    (last_model.as_deref() != Some(model)).then(|| model.to_string())
 }
 
 fn read_new_claude_values(path: &Path, next_line: &mut usize, emit: &EventEmitter) -> Vec<Value> {
@@ -1310,5 +1340,44 @@ mod tests {
             }
             other => panic!("unexpected cost events: {other:?}"),
         }
+    }
+
+    #[test]
+    fn model_change_ignored_for_non_assistant_records() {
+        let v = serde_json::json!({"type": "user", "message": {"model": "claude-sonnet-5"}});
+        assert_eq!(claude_model_change(&v, &None), None);
+    }
+
+    #[test]
+    fn model_change_ignored_when_message_model_absent() {
+        let v = serde_json::json!({"type": "assistant", "message": {"content": []}});
+        assert_eq!(claude_model_change(&v, &None), None);
+    }
+
+    #[test]
+    fn model_change_fires_on_first_observation() {
+        let v = serde_json::json!({"type": "assistant", "message": {"model": "claude-sonnet-5"}});
+        assert_eq!(
+            claude_model_change(&v, &None).as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[test]
+    fn model_change_silent_when_unchanged() {
+        let v = serde_json::json!({"type": "assistant", "message": {"model": "claude-sonnet-5"}});
+        assert_eq!(
+            claude_model_change(&v, &Some("claude-sonnet-5".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn model_change_fires_on_switch() {
+        let v = serde_json::json!({"type": "assistant", "message": {"model": "claude-opus-4-8"}});
+        assert_eq!(
+            claude_model_change(&v, &Some("claude-sonnet-5".to_string())).as_deref(),
+            Some("claude-opus-4-8")
+        );
     }
 }

@@ -1231,7 +1231,30 @@ fn render_harness_model_tooltip(f: &mut Frame, app: &App) {
         return;
     };
     let model = s.model.as_deref().unwrap_or("unknown");
-    render_button_tooltip(f, &app.theme, &format!(" model: {model} "), hit.x_start, hit.y);
+    let label = format!(" model: {model} ");
+    let total = f.area();
+    let inner_w = UnicodeWidthStr::width(label.as_str()) as u16;
+    let rect = harness_model_tooltip_rect(hit.x_start, hit.y, inner_w + 2, 3, total);
+    render_tooltip_rect(f, &app.theme, label.as_str(), rect);
+}
+
+/// Placement for the harness-model tooltip: fully above the hovered
+/// row/label when there's room, flipping to fully below when there isn't
+/// (e.g. hovering the top row of the session list, or a title bar at the
+/// very top of the screen). Unlike `render_button_tooltip`'s generic
+/// 1-row offset — fine for a 1-cell button, but a 3-row-tall box offset by
+/// only 1 row still overlaps the anchor — this never covers `anchor_y`.
+fn harness_model_tooltip_rect(anchor_x: u16, anchor_y: u16, w: u16, h: u16, total: Rect) -> Rect {
+    let mut x = anchor_x;
+    if x + w > total.x + total.width {
+        x = total.x + total.width.saturating_sub(w);
+    }
+    let y = if anchor_y >= total.y + h {
+        anchor_y - h
+    } else {
+        (anchor_y + 1).min((total.y + total.height).saturating_sub(h))
+    };
+    Rect { x, y, width: w, height: h }
 }
 
 /// Render the new-session harness picker with each name as a
@@ -15257,6 +15280,40 @@ mod tests {
         assert!(!hit.contains(15, 3), "x_end is exclusive");
         assert!(!hit.contains(9, 3));
         assert!(!hit.contains(12, 4), "wrong row");
+    }
+
+    #[test]
+    fn harness_model_tooltip_rect_sits_fully_above_the_anchor_row() {
+        let total = Rect::new(0, 0, 80, 40);
+        let rect = harness_model_tooltip_rect(20, 10, 16, 3, total);
+        assert_eq!(rect.y + rect.height, 10, "bottom edge must stop at the anchor row");
+        assert!(
+            rect.y + rect.height <= 10,
+            "tooltip must never cover the anchor row: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn harness_model_tooltip_rect_flips_below_when_no_room_above() {
+        // Anchor near the top of the screen (row 1) — a 3-tall tooltip
+        // can't fit above without going off-screen, so it must flip below
+        // instead of covering (or clipping through) the anchor row.
+        let total = Rect::new(0, 0, 80, 40);
+        let rect = harness_model_tooltip_rect(20, 1, 16, 3, total);
+        assert!(
+            rect.y > 1,
+            "tooltip must start below the anchor row when flipped: {rect:?}"
+        );
+    }
+
+    #[test]
+    fn harness_model_tooltip_rect_clamps_within_screen_width() {
+        let total = Rect::new(0, 0, 80, 40);
+        let rect = harness_model_tooltip_rect(75, 10, 16, 3, total);
+        assert!(
+            rect.x + rect.width <= total.width,
+            "tooltip must not spill past the right edge: {rect:?}"
+        );
     }
 
     #[test]
