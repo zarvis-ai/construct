@@ -463,6 +463,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "construct-adapter-opencode"
+version = "0.14.1"
+dependencies = [
+ "anyhow",
+ "construct-protocol",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "construct-adapter-shell"
 version = "0.14.1"
 dependencies = [
@@ -514,6 +524,7 @@ dependencies = [
  "construct-adapter-claude",
  "construct-adapter-codex",
  "construct-adapter-grok",
+ "construct-adapter-opencode",
  "construct-adapter-shell",
  "construct-adapter-smith",
  "construct-client",

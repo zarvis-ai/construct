@@ -34,6 +34,7 @@ Everything ships as **one binary**: `construct` runs the TUI by default, the dae
 | `crates/adapter-shell` | — (lib, via `construct __adapter shell`) | Generic shell command runner |
 | `crates/adapter-claude` | — (lib, via `construct __adapter claude`) | Wraps the `claude` CLI |
 | `crates/adapter-codex` | — (lib, via `construct __adapter codex`) | Wraps the `codex` CLI |
+| `crates/adapter-opencode` | — (lib, via `construct __adapter opencode`) | Wraps the `opencode` CLI |
 | `crates/adapter-antigravity` | — (lib, via `construct __adapter antigravity`) | Wraps the `agy` CLI |
 | `crates/adapter-smith` | — (lib, via `construct __adapter smith`) | Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Ollama) |
 | `crates/mcp` | — (lib, via `construct __mcp`) | MCP stdio server for agents running inside sessions |

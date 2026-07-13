@@ -93,6 +93,7 @@ env = { CONSTRUCT_CODEX_CMD = "exec codex" }
 | Harness | Full command override | Binary-only fallback |
 |---|---|---|
 | `codex` | `CONSTRUCT_CODEX_CMD` | `CONSTRUCT_CODEX_BIN` |
+| `opencode` | `CONSTRUCT_OPENCODE_CMD` | `CONSTRUCT_OPENCODE_BIN` |
 | `claude` | `CONSTRUCT_CLAUDE_CMD` | `CONSTRUCT_CLAUDE_BIN` |
 | `antigravity` | `CONSTRUCT_ANTIGRAVITY_CMD` | `CONSTRUCT_ANTIGRAVITY_BIN` |
 | `grok` | `CONSTRUCT_GROK_CMD` | `CONSTRUCT_GROK_BIN` |

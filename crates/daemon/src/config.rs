@@ -25,7 +25,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # Active config:  ~/.config/construct/config.toml  (or $CONSTRUCT_CONFIG_DIR/config.toml)
 # This template:  ~/.config/construct/config.toml.template
 #
-# All built-in adapters (shell, claude, codex, antigravity, grok, smith) are
+# All built-in adapters (shell, claude, codex, opencode, antigravity, grok, smith) are
 # registered automatically — you do not need to declare them unless you want
 # to change a field.
 
@@ -39,6 +39,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #   shell       — generic shell command runner
 #   claude      — Claude Code (wraps the `claude` CLI)
 #   codex       — OpenAI Codex (wraps the `codex` CLI)
+#   opencode    — OpenCode (wraps the `opencode` CLI)
 #   antigravity — Google Antigravity (wraps the `agy` CLI)
 #   grok        — Grok CLI (wraps the `grok` CLI)
 #   smith       — native multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)
@@ -57,6 +58,11 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # binary      = "construct"
 # args        = ["__adapter", "codex"]
 # description = "OpenAI Codex (wraps the `codex` CLI)"
+
+# [adapters.opencode]
+# binary      = "construct"
+# args        = ["__adapter", "opencode"]
+# description = "OpenCode (wraps the `opencode` CLI)"
 
 # [adapters.agy]
 # binary      = "construct"
@@ -105,7 +111,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # the adapter's generated arguments. Wins over the binary-only CONSTRUCT_*_BIN.
 #
 # [adapters.codex.env]
-# CONSTRUCT_CODEX_CMD = "exec codex"        # also: CONSTRUCT_CLAUDE_CMD, CONSTRUCT_SHELL_CMD, CONSTRUCT_ANTIGRAVITY_CMD, CONSTRUCT_GROK_CMD
+# CONSTRUCT_CODEX_CMD = "exec codex"        # also: CONSTRUCT_CLAUDE_CMD, CONSTRUCT_OPENCODE_CMD, CONSTRUCT_SHELL_CMD, CONSTRUCT_ANTIGRAVITY_CMD, CONSTRUCT_GROK_CMD
 
 # Usage-probe command ────────────────────────────────────────────────────────
 #
@@ -267,6 +273,7 @@ enabled = true
 #   CONSTRUCT_SHELL_CMD       — command prefix for the shell adapter
 #   CONSTRUCT_CLAUDE_BIN      — binary path fallback for the claude adapter
 #   CONSTRUCT_CODEX_BIN       — binary path fallback for the codex adapter
+#   CONSTRUCT_OPENCODE_BIN    — binary path fallback for the opencode adapter
 #   CONSTRUCT_ANTIGRAVITY_BIN — binary path fallback for the antigravity adapter
 #   CONSTRUCT_GROK_BIN        — binary path fallback for the grok adapter
 "#;
@@ -490,6 +497,12 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         binary: "construct",
         args: &["__adapter", "codex"],
         description: "OpenAI Codex (wraps the `codex` CLI)",
+    },
+    BuiltinAdapter {
+        name: "opencode",
+        binary: "construct",
+        args: &["__adapter", "opencode"],
+        description: "OpenCode (wraps the `opencode` CLI)",
     },
     BuiltinAdapter {
         name: "agy",
@@ -768,6 +781,16 @@ mod tests {
         // No built-in default and no override -> disabled.
         assert_eq!(cfg.effective_usage_probe("shell"), None);
         assert_eq!(cfg.effective_usage_probe("smith"), None);
+    }
+
+    #[test]
+    fn opencode_is_registered_as_a_builtin_wrapper() {
+        let adapter = BUILTIN_ADAPTERS
+            .iter()
+            .find(|adapter| adapter.name == "opencode")
+            .expect("opencode builtin");
+        assert_eq!(adapter.binary, "construct");
+        assert_eq!(adapter.args, &["__adapter", "opencode"]);
     }
 
     /// Explicit `usage_probe = ""` disables the probe even though the

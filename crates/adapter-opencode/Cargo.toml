@@ -1,0 +1,22 @@
+[package]
+name = "construct-adapter-opencode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenCode CLI adapter for construct (wraps the `opencode` CLI)"
+
+[lib]
+name = "construct_adapter_opencode"
+path = "src/lib.rs"
+
+[dependencies]
+construct-protocol = { workspace = true, features = ["pty"] }
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+

@@ -43,6 +43,7 @@ construct-mcp = { path = "../mcp" }
 construct-adapter-shell = { path = "../adapter-shell" }
 construct-adapter-claude = { path = "../adapter-claude" }
 construct-adapter-codex = { path = "../adapter-codex" }
+construct-adapter-opencode = { path = "../adapter-opencode" }
 construct-adapter-antigravity = { path = "../adapter-antigravity" }
 construct-adapter-grok = { path = "../adapter-grok" }
 construct-adapter-smith = { path = "../adapter-smith" }

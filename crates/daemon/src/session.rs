@@ -2037,7 +2037,7 @@ impl SessionManager {
     }
 
     /// Probe real availability for one configured harness (spec 0068). The
-    /// six built-in adapters get kind-specific probes; anything else (a
+    /// built-in adapters get kind-specific probes; anything else (a
     /// community adapter registered via `[adapters.<name>]`) falls back to
     /// the original "does its `binary` resolve" check, since there's no
     /// protocol-level way to ask an arbitrary AHP adapter what it wraps.
@@ -2052,6 +2052,11 @@ impl SessionManager {
             "shell" => crate::availability::Availability::ready("ready"),
             "claude" => probe_wrapper_cli("CONSTRUCT_CLAUDE_CMD", "CONSTRUCT_CLAUDE_BIN", "claude"),
             "codex" => probe_wrapper_cli("CONSTRUCT_CODEX_CMD", "CONSTRUCT_CODEX_BIN", "codex"),
+            "opencode" => probe_wrapper_cli(
+                "CONSTRUCT_OPENCODE_CMD",
+                "CONSTRUCT_OPENCODE_BIN",
+                "opencode",
+            ),
             "antigravity" | "agy" => probe_wrapper_cli(
                 "CONSTRUCT_ANTIGRAVITY_CMD",
                 "CONSTRUCT_ANTIGRAVITY_BIN",
@@ -4649,7 +4654,7 @@ fn effective_mode(params: &CreateSessionParams) -> String {
 
 fn builtin_harness_capabilities(name: &str) -> construct_protocol::Capabilities {
     match name {
-        "shell" | "claude" | "codex" | "smith" => construct_protocol::Capabilities {
+        "shell" | "claude" | "codex" | "opencode" | "smith" => construct_protocol::Capabilities {
             supports_pty: true,
             ..Default::default()
         },

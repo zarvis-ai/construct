@@ -50,6 +50,10 @@ pub fn harness_guidance(name: &str) -> String {
         "codex" => "install the `codex` CLI and run `codex login`; it must be on the PATH of \
                      the shell that starts the construct daemon"
             .to_string(),
+        "opencode" => "install the `opencode` CLI and configure a provider with `opencode auth \
+                        login`; it must be on the PATH of the shell that starts the construct \
+                        daemon (or set CONSTRUCT_OPENCODE_BIN)"
+            .to_string(),
         "antigravity" | "agy" => "install the `agy` CLI; it must be on the PATH of the shell that \
                            starts the construct daemon"
             .to_string(),
