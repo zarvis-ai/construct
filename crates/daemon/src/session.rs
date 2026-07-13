@@ -4655,10 +4655,13 @@ fn effective_mode(params: &CreateSessionParams) -> String {
 
 fn builtin_harness_capabilities(name: &str) -> construct_protocol::Capabilities {
     match name {
-        "shell" | "claude" | "codex" | "opencode" | "smith" => construct_protocol::Capabilities {
-            supports_pty: true,
-            ..Default::default()
-        },
+        "shell" | "claude" | "codex" | "opencode" | "antigravity" | "agy" | "grok"
+        | "smith" => {
+            construct_protocol::Capabilities {
+                supports_pty: true,
+                ..Default::default()
+            }
+        }
         _ => Default::default(),
     }
 }
@@ -7889,6 +7892,29 @@ mod tests {
     #[test]
     fn effective_mode_defaults_to_headless_without_pty() {
         assert_eq!(effective_mode(&create_params(None, None)), "headless");
+    }
+
+    /// `harness.list` is the Web UI's source of truth for deciding whether a
+    /// new session should request an interactive PTY. Keep this lightweight
+    /// metadata aligned with every built-in adapter that supports one.
+    #[test]
+    fn builtin_interactive_harnesses_report_pty_support() {
+        for harness in [
+            "shell",
+            "claude",
+            "codex",
+            "opencode",
+            "antigravity",
+            "agy",
+            "grok",
+            "smith",
+        ] {
+            assert!(
+                builtin_harness_capabilities(harness).supports_pty,
+                "{harness} should be advertised as PTY-capable"
+            );
+        }
+        assert!(!builtin_harness_capabilities("custom").supports_pty);
     }
 
     #[tokio::test]
