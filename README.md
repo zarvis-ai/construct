@@ -4,6 +4,8 @@
   <img src="https://raw.githubusercontent.com/construct-worlds/construct/52849f56c902397d6729ec286293064c5b15bcfe/demos/lineage-program-run.gif" alt="construct lineage and program run">
 </div>
 
+### Quick start
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/construct-worlds/construct/main/install.sh | sh
 ```
