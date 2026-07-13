@@ -16,7 +16,7 @@ path = "src/lib.rs"
 construct-protocol = { workspace = true, features = ["pty"] }
 serde_json.workspace = true
 anyhow.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-

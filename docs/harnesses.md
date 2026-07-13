@@ -60,6 +60,12 @@ The adapter is the translation layer between these fleet-wide capabilities and a
 specific harness. Some capabilities are native in smith, some are injected into
 CLI-backed harnesses, and some depend on what the upstream CLI exposes.
 
+OpenCode receives Construct's unified tools through a process-local MCP entry.
+It also uses OpenCode's native session fork for same-harness forks and reports
+`/new` as reset lineage, matching the native context behavior of Claude and
+Codex. Set `CONSTRUCT_INJECT_MCP=0` to disable MCP injection for any supported
+wrapper harness.
+
 ## Built-in vs CLI-backed harnesses
 
 There are two kinds of harnesses:

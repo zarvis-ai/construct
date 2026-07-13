@@ -131,17 +131,13 @@ impl SessionManager {
         }
         // A same-harness fork can continue byte-for-byte using the
         // harness's native fork operation (claude: `--resume <id>
-        // --fork-session`; codex: `codex fork <id>`; grok: `-r <id>
+        // --fork-session`; codex: `codex fork <id>`; opencode:
+        // `--session <id> --fork`; grok: `-r <id>
         // --fork-session`). The native id is deliberately adapter-private;
         // only the daemon reads it from the source session directory. The
         // env var name mirrors the harness so each adapter only sees its
         // own.
-        let native_fork = match harness {
-            "claude" => Some(("claude_session_id.txt", "CONSTRUCT_CLAUDE_FORK_FROM")),
-            "codex" => Some(("codex_session_id.txt", "CONSTRUCT_CODEX_FORK_FROM")),
-            "grok" => Some(("grok_session_id.txt", "CONSTRUCT_GROK_FORK_FROM")),
-            _ => None,
-        };
+        let native_fork = native_fork_spec(harness);
         if let Some((id_file, env_key)) = native_fork {
             if let Some(parent) = params.forked_from.as_ref().map(|f| &f.session_id) {
                 let native_id = self.storage.session_dir(parent).join(id_file);
@@ -328,7 +324,8 @@ impl SessionManager {
             let guard = self.sessions.read().await;
             for entry in guard.values() {
                 let s = entry.summary.read().await;
-                if s.kind == construct_protocol::SessionKind::Orchestrator && !s.state.is_terminal() {
+                if s.kind == construct_protocol::SessionKind::Orchestrator && !s.state.is_terminal()
+                {
                     tracing::info!(
                         id = %s.id,
                         harness = %s.harness,
@@ -743,6 +740,16 @@ impl SessionManager {
             ));
         }
         self.respawn(id).await
+    }
+}
+
+pub(super) fn native_fork_spec(harness: &str) -> Option<(&'static str, &'static str)> {
+    match harness {
+        "claude" => Some(("claude_session_id.txt", "CONSTRUCT_CLAUDE_FORK_FROM")),
+        "codex" => Some(("codex_session_id.txt", "CONSTRUCT_CODEX_FORK_FROM")),
+        "opencode" => Some(("opencode_session_id.txt", "CONSTRUCT_OPENCODE_FORK_FROM")),
+        "grok" => Some(("grok_session_id.txt", "CONSTRUCT_GROK_FORK_FROM")),
+        _ => None,
     }
 }
 

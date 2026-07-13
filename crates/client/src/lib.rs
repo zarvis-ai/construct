@@ -1215,14 +1215,15 @@ impl Default for ForkOptions {
 /// conversation natively instead of via the portable transcript seed
 /// (spec 0078): the daemon hands the adapter the source's native session
 /// id and the harness forks it byte-for-byte (claude: `--resume <id>
-/// --fork-session`; codex: `codex fork <id>`; grok: `-r <id>
+/// --fork-session`; codex: `codex fork <id>`; opencode: `--session <id>
+/// --fork`; grok: `-r <id>
 /// --fork-session` — wired through the daemon's session lifecycle). For
 /// these, `fork_session` skips the rendered seed — the harness already
 /// holds the full context with better fidelity. Antigravity has no native
 /// fork primitive (only in-place `--conversation` resume, backed by an
 /// indexed store a state-copy would desync), so it keeps the seed.
 fn harness_forks_natively(harness: &str) -> bool {
-    matches!(harness, "claude" | "codex" | "grok")
+    matches!(harness, "claude" | "codex" | "opencode" | "grok")
 }
 
 fn render_fork_seed(
@@ -1758,12 +1759,19 @@ mod fork_lineage_tests {
         let _ = std::fs::remove_file(&sock);
     }
 
-    /// codex (`codex fork <id>`) and grok (`-r <id> --fork-session`) fork
+    /// codex (`codex fork <id>`), opencode (`--session <id> --fork`), and
+    /// grok (`-r <id> --fork-session`) fork
     /// natively like claude — same-harness terminal forks skip the seed.
     /// Antigravity has no native fork primitive, so it keeps the seed.
     #[tokio::test]
-    async fn codex_and_grok_forks_skip_the_seed_antigravity_keeps_it() {
-        for (harness, expect_seed) in [("codex", false), ("grok", false), ("antigravity", true), ("agy", true)] {
+    async fn native_fork_harnesses_skip_the_seed_antigravity_keeps_it() {
+        for (harness, expect_seed) in [
+            ("codex", false),
+            ("opencode", false),
+            ("grok", false),
+            ("antigravity", true),
+            ("agy", true),
+        ] {
             let (sock, captured, _server) = fork_capture_daemon(harness, true).await;
             let client = Client::connect(&sock).await.expect("connect");
             client

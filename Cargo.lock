@@ -470,6 +470,7 @@ dependencies = [
  "construct-protocol",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
