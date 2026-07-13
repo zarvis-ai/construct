@@ -2,7 +2,7 @@
 //!
 //! Read from `[smith.models.<name>]` tables in the shared `config.toml`.
 //! Each profile pins a wire protocol (`openai` / `anthropic` / `gemini` /
-//! `ollama` / `grok`) to its own base URL, credential, and default model — so a
+//! `meta` / `ollama` / `grok`) to its own base URL, credential, and default model — so a
 //! single session can switch between many distinct endpoints at runtime
 //! via `/model @<name>`, including several OpenAI-compatible vendors plus
 //! the real OpenAI API at the same time. The single `OPENAI_BASE_URL`
@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelProfile {
     /// Wire protocol to speak: `openai` | `anthropic` | `gemini` |
-    /// `ollama` | `grok`.
+    /// `meta` | `ollama` | `grok`.
     pub provider: String,
     /// Endpoint base URL. Falls back to the wire protocol's default when unset.
     #[serde(default)]

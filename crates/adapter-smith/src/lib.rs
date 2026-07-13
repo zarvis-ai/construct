@@ -1,6 +1,6 @@
 //! Smith — construct's built-in multi-provider agent harness.
 //!
-//! Talks to OpenAI / Anthropic / Gemini / Ollama directly (no vendor CLI required),
+//! Talks to OpenAI / Anthropic / Gemini / Meta / Ollama directly (no vendor CLI required),
 //! runs its own agent loop, and executes shell + filesystem +
 //! agentd-control tools on the model's behalf. See README for the full
 //! design.
@@ -145,6 +145,10 @@ fn model_startup_error_message(params: &SessionStartParams, error: &str) -> Stri
         msg.push_str(
             "\n\nAction: set `GEMINI_API_KEY` or `GOOGLE_API_KEY`, or switch smith to another model.",
         );
+    } else if lower.contains("meta_api_key") || lower.contains("model_api_key") {
+        msg.push_str(
+            "\n\nAction: set `META_API_KEY` or `MODEL_API_KEY`, or switch smith to another model.",
+        );
     } else if lower.contains("ollama") {
         msg.push_str("\n\nAction: start Ollama or set `OLLAMA_HOST` to the running Ollama server.");
     } else {
@@ -156,7 +160,7 @@ fn model_startup_error_message(params: &SessionStartParams, error: &str) -> Stri
 
     msg.push_str(
         "\n\nsmith needs one of: `CONSTRUCT_SMITH_MODEL`, `ANTHROPIC_API_KEY`, \
-         `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GROK_API_KEY`/`XAI_API_KEY`, \
+         `OPENAI_API_KEY`, `GEMINI_API_KEY`, `META_API_KEY`/`MODEL_API_KEY`, `GROK_API_KEY`/`XAI_API_KEY`, \
          a valid Grok OAuth login, or a local Ollama. Run `/configure` in the construct TUI \
          (or `M-x configure`) to check status and pick one.",
     );

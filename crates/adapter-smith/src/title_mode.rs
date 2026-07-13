@@ -52,6 +52,9 @@ fn pick_default_spec_str() -> Result<String> {
     if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok() {
         return Ok("gemini:gemini-2.5-flash".to_string());
     }
+    if std::env::var("META_API_KEY").is_ok() || std::env::var("MODEL_API_KEY").is_ok() {
+        return Ok("meta:muse-spark-1.1".to_string());
+    }
     Err(anyhow!(
         "no auto-detected smith credential and no CONSTRUCT_SMITH_MODEL pin set; skipping auto-title"
     ))
@@ -62,6 +65,7 @@ fn provider_for(p: Provider) -> Result<Box<dyn LlmProvider>> {
         Provider::OpenAI => Box::new(provider::openai::OpenAi::from_env()?),
         Provider::Anthropic => Box::new(provider::anthropic::Anthropic::from_env()?),
         Provider::Gemini => Box::new(provider::gemini::Gemini::from_env()?),
+        Provider::Meta => Box::new(provider::meta::Meta::from_env()?),
         Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
         Provider::Grok => Box::new(provider::openai::OpenAi::with_config(
             Some("https://api.x.ai/v1".to_string()),

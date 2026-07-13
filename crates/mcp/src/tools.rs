@@ -216,7 +216,7 @@ pub fn catalog() -> Vec<Value> {
                     "worktree": { "type": "boolean" },
                     "model": {
                         "type": "string",
-                        "description": "Model selection (config.toml can override). Claude: opus, fable, sonnet, haiku. codex: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna. agy: Gemini 3.5 Flash (Medium), Gemini 3.1 Pro (High). grok: grok-4.5, grok-composer-2.5-fast. smith: available providers (openai, anthropic, gemini, ollama, grok, grok-oauth, codex-oauth, claude-oauth, claude-code-oauth) using provider:model syntax."
+                        "description": "Model selection (config.toml can override). Claude: opus, fable, sonnet, haiku. codex: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna. agy: Gemini 3.5 Flash (Medium), Gemini 3.1 Pro (High). grok: grok-4.5, grok-composer-2.5-fast. smith: available providers (openai, anthropic, gemini, meta, ollama, grok, grok-oauth, codex-oauth, claude-oauth, claude-code-oauth) using provider:model syntax."
                     }
                 },
                 "required": ["harness"]
@@ -363,7 +363,7 @@ pub fn catalog() -> Vec<Value> {
                     "worktree": { "type": "boolean" },
                     "model": {
                         "type": "string",
-                        "description": "Model selection (config.toml can override). Claude: opus, fable, sonnet, haiku. codex: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna. agy: Gemini 3.5 Flash (Medium), Gemini 3.1 Pro (High). grok: grok-4.5, grok-composer-2.5-fast. smith: available providers (openai, anthropic, gemini, ollama, grok, grok-oauth, codex-oauth, claude-oauth, claude-code-oauth) using provider:model syntax."
+                        "description": "Model selection (config.toml can override). Claude: opus, fable, sonnet, haiku. codex: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna. agy: Gemini 3.5 Flash (Medium), Gemini 3.1 Pro (High). grok: grok-4.5, grok-composer-2.5-fast. smith: available providers (openai, anthropic, gemini, meta, ollama, grok, grok-oauth, codex-oauth, claude-oauth, claude-code-oauth) using provider:model syntax."
                     }
                 },
                 "required": ["harness"]

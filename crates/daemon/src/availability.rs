@@ -119,6 +119,9 @@ pub async fn probe_smith(cache: &std::sync::Mutex<AvailabilityCache>) -> Availab
     if env_present("GEMINI_API_KEY") || env_present("GOOGLE_API_KEY") {
         return Availability::ready("ready (Gemini API key)");
     }
+    if env_present("META_API_KEY") || env_present("MODEL_API_KEY") {
+        return Availability::ready("ready (Meta API key)");
+    }
     if env_present("GROK_API_KEY") || env_present("XAI_API_KEY") {
         return Availability::ready("ready (Grok API key)");
     }
@@ -276,7 +279,7 @@ fn env_key_method(
 /// can list all of them and let the user pin one explicitly.
 ///
 /// The `auto` entry is the exception: its `available` reflects only the
-/// three direct-API-key methods, because those are the only ones smith's
+/// four direct-API-key methods, because those are the only ones smith's
 /// real auto-detect ladder consults absent a pin (spec 0071) — every other
 /// method here requires an explicit `<prefix>:<model>` pin to be selected
 /// (spec 0069).
@@ -303,6 +306,13 @@ pub async fn smith_auth_methods(
         "gemini",
         "gemini-2.5-pro",
         &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    );
+    let meta = env_key_method(
+        "meta_api_key",
+        "Meta API key",
+        "meta",
+        "muse-spark-1.1",
+        &["META_API_KEY", "MODEL_API_KEY"],
     );
     let grok_key = env_key_method(
         "grok_api_key",
@@ -372,7 +382,8 @@ pub async fn smith_auth_methods(
     // is ready" while a session started without a pin still errors with
     // "no auto-detected smith credential" — the exact promise/behavior
     // mismatch this dialog exists to prevent.
-    let auto_available = anthropic.available || openai.available || gemini.available;
+    let auto_available =
+        anthropic.available || openai.available || gemini.available || meta.available;
     let auto = SmithAuthMethod {
         id: "auto",
         label: "Auto-detect",
@@ -380,14 +391,14 @@ pub async fn smith_auth_methods(
         default_model: "",
         available: auto_available,
         detail: if auto_available {
-            "auto-detects the first set API key: Anthropic → OpenAI → Gemini".to_string()
+            "auto-detects the first set API key: Anthropic → OpenAI → Gemini → Meta".to_string()
         } else {
             "no auto-detected API key set (subscriptions and Ollama must be picked explicitly)"
                 .to_string()
         },
     };
     vec![
-        anthropic, openai, gemini, grok_key, claude_sub, codex_sub, grok_sub, ollama, auto,
+        anthropic, openai, gemini, meta, grok_key, claude_sub, codex_sub, grok_sub, ollama, auto,
     ]
 }
 

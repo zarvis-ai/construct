@@ -1523,6 +1523,7 @@ impl ResolvedModel {
             provider::routing::Provider::OpenAI => "openai",
             provider::routing::Provider::Anthropic => "anthropic",
             provider::routing::Provider::Gemini => "gemini",
+            provider::routing::Provider::Meta => "meta",
             provider::routing::Provider::Ollama => "ollama",
             provider::routing::Provider::Grok => "grok",
             provider::routing::Provider::GrokOauth => "grok-oauth",
@@ -1557,7 +1558,8 @@ impl ResolvedModel {
 ///   3. ANTHROPIC_API_KEY set → `claude-opus-4-8`.
 ///   4. OPENAI_API_KEY set → `gpt-5`.
 ///   5. GEMINI_API_KEY (or GOOGLE_API_KEY) set → `gemini-2.5-pro`.
-///   6. none of the above → an error (spec 0069). Earlier versions fell
+///   6. META_API_KEY (or MODEL_API_KEY) set → `muse-spark-1.1`.
+///   7. none of the above → an error (spec 0069). Earlier versions fell
 ///      through to `ollama:llama3.1` here unconditionally, so a zero-config
 ///      machine with no Ollama server running got a session that looked
 ///      healthy and then died mid-turn with a raw transport error instead
@@ -1596,9 +1598,13 @@ fn default_auto_detect_spec() -> Result<String> {
     if std::env::var("GEMINI_API_KEY").is_ok() || std::env::var("GOOGLE_API_KEY").is_ok() {
         return Ok("gemini:gemini-2.5-pro".to_string());
     }
+    if std::env::var("META_API_KEY").is_ok() || std::env::var("MODEL_API_KEY").is_ok() {
+        return Ok("meta:muse-spark-1.1".to_string());
+    }
     anyhow::bail!(
         "no auto-detected smith credential (ANTHROPIC_API_KEY, OPENAI_API_KEY, or \
-         GEMINI_API_KEY/GOOGLE_API_KEY) and no CONSTRUCT_SMITH_MODEL pin set"
+         GEMINI_API_KEY/GOOGLE_API_KEY, or META_API_KEY/MODEL_API_KEY) and no \
+         CONSTRUCT_SMITH_MODEL pin set"
     )
 }
 
@@ -1623,6 +1629,7 @@ pub fn resolve_model_from_spec(spec_str: &str) -> Result<ResolvedModel> {
             Box::new(provider::anthropic::Anthropic::from_env()?)
         }
         provider::routing::Provider::Gemini => Box::new(provider::gemini::Gemini::from_env()?),
+        provider::routing::Provider::Meta => Box::new(provider::meta::Meta::from_env()?),
         provider::routing::Provider::Ollama => Box::new(provider::ollama::Ollama::from_env()?),
         provider::routing::Provider::Grok => Box::new(provider::openai::OpenAi::with_config(
             Some(GROK_BASE_URL.to_string()),
@@ -1680,6 +1687,7 @@ fn build_profile_model(
         "openai" => provider::routing::Provider::OpenAI,
         "anthropic" => provider::routing::Provider::Anthropic,
         "gemini" => provider::routing::Provider::Gemini,
+        "meta" => provider::routing::Provider::Meta,
         "ollama" => provider::routing::Provider::Ollama,
         "grok" => provider::routing::Provider::Grok,
         "codex-oauth" | "claude-oauth" | "claude-code-oauth" | "grok-oauth" => anyhow::bail!(
@@ -1690,7 +1698,7 @@ fn build_profile_model(
         ),
         other => anyhow::bail!(
             "profile `{name}`: unknown provider `{other}` \
-             (expected openai | anthropic | gemini | ollama | grok)"
+             (expected openai | anthropic | gemini | meta | ollama | grok)"
         ),
     };
 
@@ -1718,6 +1726,10 @@ fn build_profile_model(
         provider::routing::Provider::Gemini => Box::new(provider::gemini::Gemini::with_config(
             base_url,
             profile_api_key(profile, name, &["GEMINI_API_KEY", "GOOGLE_API_KEY"])?,
+        )?),
+        provider::routing::Provider::Meta => Box::new(provider::meta::Meta::with_config(
+            base_url,
+            profile_api_key(profile, name, &["META_API_KEY", "MODEL_API_KEY"])?,
         )?),
         provider::routing::Provider::Ollama => {
             Box::new(provider::ollama::Ollama::with_config(base_url)?)
@@ -2229,6 +2241,8 @@ mod tests {
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
+            "META_API_KEY",
+            "MODEL_API_KEY",
         ];
         let saved: Vec<Option<String>> = vars.iter().map(|v| env::var(v).ok()).collect();
         for v in vars {
@@ -2248,21 +2262,25 @@ mod tests {
     }
 
     #[test]
-    fn default_auto_detect_spec_precedence_anthropic_then_openai_then_gemini() {
+    fn default_auto_detect_spec_precedence_anthropic_openai_gemini_then_meta() {
         let _lock = MODEL_ENV_LOCK.lock().unwrap();
         let vars = [
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
+            "META_API_KEY",
+            "MODEL_API_KEY",
         ];
         let saved: Vec<Option<String>> = vars.iter().map(|v| env::var(v).ok()).collect();
         for v in vars {
             env::remove_var(v);
         }
 
+        env::set_var("MODEL_API_KEY", "x");
+        let meta_only = default_auto_detect_spec().expect("meta");
         env::set_var("GEMINI_API_KEY", "x");
-        let gemini_only = default_auto_detect_spec().expect("gemini");
+        let gemini_over_meta = default_auto_detect_spec().expect("gemini");
         env::set_var("OPENAI_API_KEY", "x");
         let openai_over_gemini = default_auto_detect_spec().expect("openai");
         env::set_var("ANTHROPIC_API_KEY", "x");
@@ -2274,7 +2292,8 @@ mod tests {
                 None => env::remove_var(v),
             }
         }
-        assert_eq!(gemini_only, "gemini:gemini-2.5-pro");
+        assert_eq!(meta_only, "meta:muse-spark-1.1");
+        assert_eq!(gemini_over_meta, "gemini:gemini-2.5-pro");
         assert_eq!(openai_over_gemini, "openai:gpt-5");
         assert_eq!(anthropic_over_both, "anthropic:claude-opus-4-8");
     }

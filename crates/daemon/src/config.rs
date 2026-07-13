@@ -41,7 +41,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 #   codex       — OpenAI Codex (wraps the `codex` CLI)
 #   antigravity — Google Antigravity (wraps the `agy` CLI)
 #   grok        — Grok CLI (wraps the `grok` CLI)
-#   smith       — native multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)
+#   smith       — native multi-provider agent (OpenAI / Anthropic / Gemini / Meta / Ollama / Grok)
 
 # [adapters.shell]
 # binary      = "construct"                 # default: resolved from PATH / next to daemon
@@ -71,7 +71,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # [adapters.smith]
 # binary      = "construct"
 # args        = ["__adapter", "smith"]
-# description = "Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)"
+# description = "Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Meta / Ollama / Grok)"
 
 # Per-harness environment variables ──────────────────────────────────────────
 #
@@ -81,9 +81,9 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # daemon. Per-session `construct new --env KEY=VAL` takes precedence.
 #
 # Smith model selection (pick one, or omit if ANTHROPIC_API_KEY / OPENAI_API_KEY /
-# GEMINI_API_KEY (or GOOGLE_API_KEY) is set in the daemon's environment — smith
-# auto-detects those three, in that order. Without a pin AND without one of those
-# three set, smith fails to start with an error rather than silently falling back
+# GEMINI_API_KEY (or GOOGLE_API_KEY) / META_API_KEY (or MODEL_API_KEY) is set in
+# the daemon's environment — smith auto-detects those four, in that order. Without
+# a pin AND without one of those four set, smith fails to start rather than falling back
 # to a local Ollama that may not be running. OAuth subscriptions and Ollama always
 # need an explicit pin here (or --model / CONSTRUCT_SMITH_MODEL per-session) since
 # there's no way to auto-detect them safely. The construct TUI's `/configure`
@@ -97,6 +97,7 @@ pub const CONFIG_TOML_TEMPLATE: &str = r#"# construct configuration template
 # # CONSTRUCT_SMITH_MODEL = "codex-oauth:gpt-5.5"             # via OpenAI subscription
 # # CONSTRUCT_SMITH_MODEL = "grok-oauth:grok-2-latest"        # via Grok subscription
 # # CONSTRUCT_SMITH_MODEL = "gemini:gemini-2.5-pro"           # via GEMINI_API_KEY
+# # CONSTRUCT_SMITH_MODEL = "meta:muse-spark-1.1"             # via META_API_KEY / MODEL_API_KEY
 # # CONSTRUCT_SMITH_MODEL = "ollama:llama3.1"                 # local Ollama server
 # # CONSTRUCT_SMITH_MODEL = "@deepseek"                       # named profile (see [smith.models.*])
 
@@ -179,7 +180,7 @@ enabled = true
 # `/model @<name>` (or `--model @<name>`). Lets multiple endpoints of the
 # same wire protocol coexist — unlike the single OPENAI_BASE_URL env var.
 #
-# `provider` is the wire protocol: openai | anthropic | gemini | grok | ollama
+# `provider` is the wire protocol: openai | anthropic | gemini | meta | grok | ollama
 #
 # OAuth-backed providers (claude-oauth / codex-oauth / grok-oauth) are not
 # configurable here — they have no base-URL/key surface.
@@ -217,6 +218,12 @@ enabled = true
 # api_key_env = "GEMINI_API_KEY"
 # model       = "gemini-2.5-pro"
 
+# Meta Model API:
+# [smith.models.meta]
+# provider    = "meta"
+# api_key_env = "META_API_KEY"   # MODEL_API_KEY is also accepted by default
+# model       = "muse-spark-1.1"
+
 # Grok / xAI direct API:
 # [smith.models.grok]
 # provider    = "grok"
@@ -249,6 +256,8 @@ enabled = true
 #   CONSTRUCT_SMITH_MAX_TURN_SECS — max seconds per turn
 #   CONSTRUCT_SMITH_HOOKS_JSON    — inline JSON hooks config
 #   CONSTRUCT_SMITH_HOOKS_CONFIG  — path to a hooks config file
+#   META_API_KEY / MODEL_API_KEY  — Meta Model API credential
+#   META_BASE_URL                 — Meta Model API base URL override
 #   CONSTRUCT_SHELL_BIN           — shell binary used by smith hooks
 #
 # Operator / orchestrator:
@@ -507,7 +516,8 @@ pub const BUILTIN_ADAPTERS: &[BuiltinAdapter] = &[
         name: "smith",
         binary: "construct",
         args: &["__adapter", "smith"],
-        description: "Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Ollama / Grok)",
+        description:
+            "Built-in multi-provider agent (OpenAI / Anthropic / Gemini / Meta / Ollama / Grok)",
     },
 ];
 

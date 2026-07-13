@@ -6,7 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Built-in multi-provider agent harness for construct (talks to OpenAI, Anthropic, Ollama directly)"
+description = "Built-in multi-provider agent harness for construct (talks to OpenAI, Anthropic, Gemini, Meta, Ollama, and Grok directly)"
 
 [lib]
 name = "construct_adapter_smith"

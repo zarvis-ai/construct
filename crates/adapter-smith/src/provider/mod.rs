@@ -12,6 +12,7 @@ pub mod claude_oauth;
 pub mod codex_oauth;
 pub mod config;
 pub mod gemini;
+pub mod meta;
 pub mod ollama;
 pub mod openai;
 pub mod routing;

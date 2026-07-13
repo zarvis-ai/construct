@@ -412,6 +412,8 @@ pub const MODEL_COMPLETIONS: &[&str] = &[
     "gemini:gemini-3.5-flash",
     "gemini:gemini-2.5-pro",
     "gemini:gemini-2.5-flash",
+    // Meta Model API path.
+    "meta:muse-spark-1.1",
     // Local Ollama examples.
     "ollama:llama3.1",
     "ollama:qwen3-coder",

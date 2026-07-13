@@ -32,6 +32,8 @@ pub fn context_window_tokens(provider: &str, model: &str) -> usize {
         ("openai", m) if m.starts_with("o") => 200_000,
         ("openai", _) => 32_000,
         ("anthropic", _) => 200_000,
+        ("meta", "muse-spark-1.1") => 1_000_000,
+        ("meta", _) => 128_000,
         ("ollama", _) => 8_000,
         // xAI Grok models currently expose large context windows on the
         // cloud endpoint (order-of-magnitude in the same class as recent

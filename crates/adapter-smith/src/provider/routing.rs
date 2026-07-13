@@ -1,6 +1,6 @@
 //! Translate a model spec string into a (provider, bare model name).
 //!
-//! Explicit prefixes (`openai:`, `anthropic:`, `gemini:`, `ollama:`,
+//! Explicit prefixes (`openai:`, `anthropic:`, `gemini:`, `meta:`, `ollama:`,
 //! `grok:`, `grok-oauth:`, `codex-oauth:`, `claude-oauth:`, `claude-code-oauth:`) always win.
 //! Otherwise we sniff the bare name:
 //!   - starts with `gpt-` or `o[1-5]` → OpenAI
@@ -26,6 +26,8 @@ pub enum Provider {
     OpenAI,
     Anthropic,
     Gemini,
+    /// Meta Model API Responses surface.
+    Meta,
     Ollama,
     /// xAI Grok API surface.
     Grok,
@@ -65,6 +67,12 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
     if let Some(rest) = s.strip_prefix("gemini:") {
         return Ok(ModelSpec {
             provider: Provider::Gemini,
+            model: rest.to_string(),
+        });
+    }
+    if let Some(rest) = s.strip_prefix("meta:") {
+        return Ok(ModelSpec {
+            provider: Provider::Meta,
             model: rest.to_string(),
         });
     }
@@ -109,6 +117,7 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
                 "openai"
                     | "anthropic"
                     | "gemini"
+                    | "meta"
                     | "ollama"
                     | "grok"
                     | "grok-oauth"
@@ -119,7 +128,7 @@ pub fn parse_model_spec(s: &str) -> Result<ModelSpec, String> {
         {
             return Err(format!(
                 "unknown provider prefix `{prefix}:` (expected one of \
-                 openai:, anthropic:, gemini:, ollama:, grok:, grok-oauth:, codex-oauth:, claude-oauth:)"
+                 openai:, anthropic:, gemini:, meta:, ollama:, grok:, grok-oauth:, codex-oauth:, claude-oauth:)"
             ));
         }
     }
@@ -213,6 +222,13 @@ mod tests {
         let s = parse("openai:gpt-5-mini");
         assert_eq!(s.provider, Provider::OpenAI);
         assert_eq!(s.model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn meta_prefix_is_recognized() {
+        let s = parse("meta:muse-spark-1.1");
+        assert_eq!(s.provider, Provider::Meta);
+        assert_eq!(s.model, "muse-spark-1.1");
     }
 
     #[test]
