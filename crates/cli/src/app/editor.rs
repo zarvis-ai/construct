@@ -474,6 +474,19 @@ impl App {
                 true
             }
             MouseEventKind::Up(MouseButton::Left) => {
+                if ev.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+                    if let Some(hit) = crate::app::url_hit_in_frame(
+                        &self.frame_text,
+                        ev.column,
+                        ev.row,
+                        modal,
+                    ) {
+                        match crate::app::open_url(&hit.url) {
+                            Ok(()) => self.set_status(format!("opened {}", hit.url)),
+                            Err(e) => self.set_status(format!("open URL failed: {e}")),
+                        }
+                    }
+                }
                 let should_copy = self
                     .program_popup
                     .as_ref()

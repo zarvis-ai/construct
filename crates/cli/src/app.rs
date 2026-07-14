@@ -10761,7 +10761,7 @@ fn slice_line(line: &str, start_col: u16, end_col: u16) -> String {
         .collect()
 }
 
-fn url_hit_in_frame(
+pub(crate) fn url_hit_in_frame(
     frame_text: &[String],
     col: u16,
     row: u16,
