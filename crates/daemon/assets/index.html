@@ -138,8 +138,10 @@
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
   }
+  /* Narrow view: the title bar is tight, so the badge goes square and
+     the view-mode switcher collapses to initials (see below). */
   @media (max-width: 720px) {
-    .mini-matrix { width: 84px; }
+    .mini-matrix { width: 32px; }
   }
   header .meta {
     color: var(--fg);
@@ -182,6 +184,13 @@
   }
   .view-mode-toggle button:not([aria-pressed="true"]):hover {
     color: var(--fg);
+  }
+  /* Collapsed (narrow-view) state: initials only, but keep a usable
+     tap target. The first tap expands to full labels without
+     switching; it auto-collapses again a few seconds later. */
+  .view-mode-toggle.collapsed button {
+    min-width: 28px;
+    padding: 4px 6px;
   }
   .conn {
     margin-left: auto;
@@ -244,7 +253,7 @@
   .session-list .item {
     position: relative;
     margin: 1px 8px;
-    padding: 8px 10px;
+    padding: 8px 10px 8px 6px;
     cursor: pointer;
     border-radius: 8px;
     display: flex;
@@ -395,8 +404,8 @@
     text-align: center;
   }
   .session-list .item .disclosure {
-    flex: 0 0 20px;
-    width: 20px;
+    flex: 0 0 12px;
+    width: 12px;
     color: var(--fg-faint);
     font-size: 14px;
     line-height: 1;
@@ -4354,6 +4363,25 @@ function preferredViewModeForSession(s) {
   return state.viewModeById.get(s.id) === "chat" ? "chat" : "terminal";
 }
 
+// Narrow-view collapse state for the view-mode switcher: initials only
+// ("T | P") until tapped; the first tap expands to full labels WITHOUT
+// switching, and the switcher auto-collapses a few seconds after the
+// last interaction so the title bar stays uncrowded.
+let viewModeExpanded = false;
+let viewModeCollapseTimer = null;
+
+function scheduleViewModeCollapse() {
+  clearTimeout(viewModeCollapseTimer);
+  viewModeCollapseTimer = setTimeout(() => setViewModeExpanded(false), 4000);
+}
+
+function setViewModeExpanded(on) {
+  viewModeExpanded = on;
+  renderViewModeToggle(currentSession());
+  if (on) scheduleViewModeCollapse();
+  else clearTimeout(viewModeCollapseTimer);
+}
+
 function renderViewModeToggle(s) {
   if (!s) { viewModeToggleEl.hidden = true; return; }
   // Program is available for every session; Terminal/Chat appear only when the
@@ -4364,6 +4392,17 @@ function renderViewModeToggle(s) {
   viewModeChatBtn.hidden = !chat;
   viewModeProgramBtn.hidden = false;
   viewModeToggleEl.hidden = false;
+  const collapsed = isNarrowLayout() && !viewModeExpanded;
+  viewModeToggleEl.classList.toggle("collapsed", collapsed);
+  for (const [btn, label] of [
+    [viewModeTerminalBtn, "Terminal"],
+    [viewModeChatBtn, "Chat"],
+    [viewModeProgramBtn, "Program"],
+  ]) {
+    const text = collapsed ? label[0] : label;
+    if (btn.textContent !== text) btn.textContent = text;
+    btn.title = label;
+  }
   // Reflect the per-session preference (which now includes "program") rather
   // than the global `state.mode`: during a session switch `state.mode` still
   // holds the outgoing session's view until the new surface is entered.
@@ -10989,7 +11028,21 @@ document.addEventListener("keydown", (ev) => {
 viewModeToggleEl.addEventListener("click", (ev) => {
   const btn = ev.target.closest("[data-view-mode]");
   if (!btn) return;
+  // Narrow view: the first tap on the collapsed "T | P" switcher only
+  // expands it — switching needs a second, informed tap.
+  if (isNarrowLayout() && !viewModeExpanded) {
+    setViewModeExpanded(true);
+    return;
+  }
+  scheduleViewModeCollapse();
   switchCurrentViewMode(btn.dataset.viewMode);
+});
+
+// Crossing the narrow/wide breakpoint re-renders the switcher (full
+// labels on wide, collapsed initials on narrow).
+window.addEventListener("resize", () => {
+  if (!isNarrowLayout() && viewModeExpanded) setViewModeExpanded(false);
+  else renderViewModeToggle(currentSession());
 });
 
 themePickerEl.addEventListener("change", () => {
