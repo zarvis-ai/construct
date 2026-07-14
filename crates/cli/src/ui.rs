@@ -14248,17 +14248,18 @@ fn program_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
 
 /// For a markdown list-item line, return `(leading_indent_chars, content)` where
 /// `content` is the text after the `- `/`* ` marker WITH its trailing whitespace
-/// preserved, or `None` when the line isn't a bullet. Detection matches the
-/// renderer (a fully-trimmed `* `/`- ` prefix, so a lone "* " with no content
-/// yet stays literal), but the returned content is sliced from the raw line so a
-/// trailing space the user just typed survives — `raw.trim()` would drop it,
-/// stranding the cursor at the end of the line because the rendered glyphs and
-/// the cursor column would then disagree on the line's width.
+/// preserved, or `None` when the line isn't a bullet. Detection runs on the
+/// start-trimmed line so a marker-only `- ` / `* ` already renders as a bullet
+/// the moment it is typed (spec 0094) — trailing whitespace must not defeat the
+/// match. The returned content is sliced from the raw line so a trailing space
+/// the user just typed survives — `raw.trim()` would drop it, stranding the
+/// cursor at the end of the line because the rendered glyphs and the cursor
+/// column would then disagree on the line's width.
 fn program_list_item_content(raw: &str) -> Option<(usize, &str)> {
-    let trimmed = raw.trim();
-    trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))?;
+    let stripped = raw.trim_start();
+    if !stripped.starts_with("- ") && !stripped.starts_with("* ") {
+        return None;
+    }
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     let after_indent = raw
         .char_indices()
@@ -14431,10 +14432,7 @@ fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Ve
         // fence lines paint fixed chip text — neither carries clickable clip
         // spans, so both report the rendered text with no clips.
         (program_rendered_line_text(app, raw), Vec::new())
-    } else if let Some(rest) = trimmed
-        .strip_prefix("- ")
-        .or_else(|| trimmed.strip_prefix("* "))
-    {
+    } else if let Some((_, rest)) = program_list_item_content(raw) {
         let (body, clips) = program_inline_with_clips(app, rest, leading + 4);
         (format!("{}  • {body}", " ".repeat(leading)), clips)
     } else {

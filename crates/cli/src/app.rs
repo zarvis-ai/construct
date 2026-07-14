@@ -10946,12 +10946,79 @@ fn program_cursor_at_modal_point(
 }
 
 fn program_list_marker_content_start(raw_line: &str) -> Option<usize> {
-    let trimmed = raw_line.trim();
-    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+    // Start-trimmed detection, matching the renderer: a marker-only `- ` is
+    // already a bullet (spec 0094), so the cursor snaps past its marker too.
+    let stripped = raw_line.trim_start();
+    if stripped.starts_with("- ") || stripped.starts_with("* ") {
         Some(raw_line.chars().take_while(|ch| ch.is_whitespace()).count() + 2)
     } else {
         None
     }
+}
+
+/// The list-aware action Enter performs at `cursor` in the program buffer
+/// (spec 0094).
+#[derive(Debug, PartialEq, Eq)]
+enum ProgramNewline {
+    /// Not on a list item (or the caret sits inside the indent/marker, or a
+    /// selection is being replaced): insert a plain newline.
+    Plain,
+    /// The item has content: split at the caret and prefix the new line with
+    /// this continuation (same indent and marker; checklists restart with an
+    /// unchecked box), so the tail becomes the next item.
+    Continue(String),
+    /// The item is empty: Enter dissolves it — clear chars
+    /// `line_start..line_end` instead of stacking empty bullets, ending the
+    /// list the way every mainstream editor does.
+    ClearItem { line_start: usize, line_end: usize },
+}
+
+fn program_newline_action(buffer: &str, cursor: usize) -> ProgramNewline {
+    let mut line_start = 0usize;
+    for (idx, ch) in buffer.chars().enumerate() {
+        if idx >= cursor {
+            break;
+        }
+        if ch == '\n' {
+            line_start = idx + 1;
+        }
+    }
+    let line_end = program_line_end(buffer, cursor);
+    let raw_line: String = buffer
+        .chars()
+        .skip(line_start)
+        .take(line_end - line_start)
+        .collect();
+    let indent: String = raw_line
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .collect();
+    let after_indent = &raw_line[indent.len()..];
+    let Some((marker, rest)) = after_indent
+        .strip_prefix("- ")
+        .map(|rest| ("- ", rest))
+        .or_else(|| after_indent.strip_prefix("* ").map(|rest| ("* ", rest)))
+    else {
+        return ProgramNewline::Plain;
+    };
+    // Checklist items (the four marks the renderer styles) continue with a
+    // fresh todo box; the current item keeps its own mark.
+    let boxed = ["[x] ", "[~] ", "[!] ", "[ ] "]
+        .iter()
+        .any(|mark| rest.starts_with(mark));
+    let (box_len, continuation_box) = if boxed { (4, "[ ] ") } else { (0, "") };
+    let content = &rest[box_len..];
+    let content_start = line_start + indent.chars().count() + 2 + box_len;
+    if cursor < content_start {
+        return ProgramNewline::Plain;
+    }
+    if content.trim().is_empty() {
+        return ProgramNewline::ClearItem {
+            line_start,
+            line_end,
+        };
+    }
+    ProgramNewline::Continue(format!("{indent}{marker}{continuation_box}"))
 }
 
 fn program_list_marker_cursor(buffer: &str, cursor: usize) -> Option<usize> {
@@ -22528,6 +22595,129 @@ mod tests {
         server.abort();
     }
 
+    /// Spec 0094: a marker-only `- ` / `* ` line is already a bullet — the
+    /// bullet glyph appears the moment the marker is typed, not only once the
+    /// first content char lands — and the cursor sits right after the
+    /// rendered `  • ` prefix.
+    #[tokio::test]
+    async fn program_lone_list_marker_renders_as_bullet() {
+        let (app, _dir, server) = empty_app().await;
+        for marker in ["- ", "* "] {
+            let lines = crate::ui::render_program_markdown_lines_for_test(&app, marker);
+            let painted: String = lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(
+                painted, "  • ",
+                "a lone {marker:?} should render as an empty bullet"
+            );
+            let (row, col) =
+                crate::ui::program_cursor_visual_pos(Some(&app), marker, 2, 40);
+            assert_eq!(
+                (row, col),
+                (0, 4),
+                "the caret on a lone {marker:?} should sit right after the bullet prefix"
+            );
+        }
+        server.abort();
+    }
+
+    /// Spec 0094: the list-aware classification Enter runs on the caret's
+    /// line — continue with the same indent/marker (checklists restart with
+    /// an unchecked box), dissolve empty items, plain newline elsewhere.
+    #[test]
+    fn program_newline_action_classifies_list_lines() {
+        assert_eq!(program_newline_action("hello", 5), ProgramNewline::Plain);
+        assert_eq!(
+            program_newline_action("- foo", 5),
+            ProgramNewline::Continue("- ".into())
+        );
+        assert_eq!(
+            program_newline_action("  * item", 8),
+            ProgramNewline::Continue("  * ".into())
+        );
+        assert_eq!(
+            program_newline_action("- [x] done", 10),
+            ProgramNewline::Continue("- [ ] ".into())
+        );
+        // Splitting mid-content still continues the list.
+        assert_eq!(
+            program_newline_action("- foobar", 5),
+            ProgramNewline::Continue("- ".into())
+        );
+        // A caret inside the indent/marker pushes the bullet down instead.
+        assert_eq!(program_newline_action("- foo", 0), ProgramNewline::Plain);
+        // Empty items dissolve — marker-only, whitespace-only, and empty
+        // checklist boxes alike; bounds are line-local within the buffer.
+        assert_eq!(
+            program_newline_action("- ", 2),
+            ProgramNewline::ClearItem {
+                line_start: 0,
+                line_end: 2
+            }
+        );
+        assert_eq!(
+            program_newline_action("a\n- [ ] \nb", 8),
+            ProgramNewline::ClearItem {
+                line_start: 2,
+                line_end: 8
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn program_enter_continues_and_splits_bullet() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "- foobar", 5));
+        app.insert_program_newline();
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.buffer, "- foo\n- bar",
+            "Enter mid-item should split it into two bullets"
+        );
+        assert_eq!(
+            popup.cursor, 8,
+            "the caret should land at the new item's content start"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_enter_continues_checklist_with_fresh_box() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "- [x] done", 10));
+        app.insert_program_newline();
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.buffer, "- [x] done\n- [ ] ",
+            "a checklist item should continue with an unchecked box"
+        );
+        assert_eq!(popup.cursor, 17);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn program_enter_dissolves_empty_bullet_and_undo_restores_it() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "- foo\n- ", 8));
+        app.insert_program_newline();
+        {
+            let popup = app.program_popup.as_ref().unwrap();
+            assert_eq!(
+                popup.buffer, "- foo\n",
+                "Enter on an empty item should dissolve the marker, not add another bullet"
+            );
+            assert_eq!(popup.cursor, 6, "the caret stays on the now-plain line");
+        }
+        app.undo_program_edit();
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(popup.buffer, "- foo\n- ", "undo restores the dissolved item");
+        assert_eq!(popup.cursor, 8);
+        server.abort();
+    }
+
     /// Differential regression harness for program-editor cursor/selection
     /// drift: for every alphanumeric char in each corpus doc, paint the real
     /// pipeline (`render_program_markdown_lines` + ratatui
@@ -22613,6 +22803,10 @@ mod tests {
             (
                 "plain-with-clip",
                 "plain with @{session:abc123} chip and trailing words\nZEND",
+            ),
+            (
+                "lone-bullets",
+                "- \n* \n  - \nafter the empty bullets\nZEND",
             ),
         ];
 

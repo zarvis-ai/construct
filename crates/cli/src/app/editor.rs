@@ -651,7 +651,7 @@ impl App {
             _ if ctrl_char == Some('d') => self.delete_program_forward(),
             _ if ctrl_char == Some('h') => self.delete_program_back(),
             _ if ctrl_char == Some('k') => self.cut_program_line(),
-            KeyCode::Enter => self.insert_program_text("\n"),
+            KeyCode::Enter => self.insert_program_newline(),
             KeyCode::Backspace => self.delete_program_back(),
             KeyCode::Delete => self.delete_program_forward(),
             KeyCode::Left => self.move_program_cursor(-1),
@@ -2331,6 +2331,47 @@ impl App {
         }
         Self::update_program_smart_clip_after_cursor_move(popup);
         self.follow_program_scroll();
+    }
+
+    /// Enter in the program body is list-aware (spec 0094): on a markdown
+    /// list item with content it continues the list — the new line starts
+    /// with the same indent and marker (checklists restart with an unchecked
+    /// box), and any text after the caret becomes the new item's content. On
+    /// an item with no content it dissolves the marker instead of stacking
+    /// empty bullets, which is how a list is ended. Everywhere else — plain
+    /// lines, a caret still inside the indent/marker, or an active selection
+    /// (which Enter replaces) — it inserts a plain newline.
+    pub(super) fn insert_program_newline(&mut self) {
+        let action = {
+            let Some(popup) = self.program_popup.as_ref() else {
+                return;
+            };
+            if Self::program_selection_range(popup).is_some() {
+                ProgramNewline::Plain
+            } else {
+                program_newline_action(&popup.buffer, popup.cursor)
+            }
+        };
+        match action {
+            ProgramNewline::Plain => self.insert_program_text("\n"),
+            ProgramNewline::Continue(prefix) => self.insert_program_text(&format!("\n{prefix}")),
+            ProgramNewline::ClearItem {
+                line_start,
+                line_end,
+            } => {
+                self.push_program_undo_state();
+                let Some(popup) = self.program_popup.as_mut() else {
+                    return;
+                };
+                let start = byte_pos(&popup.buffer, line_start);
+                let end = byte_pos(&popup.buffer, line_end);
+                popup.buffer.replace_range(start..end, "");
+                popup.cursor = line_start;
+                popup.preferred_col = None;
+                popup.selection = None;
+                Self::update_program_smart_clip_after_cursor_move(popup);
+            }
+        }
     }
 
     pub(super) fn insert_program_text(&mut self, text: &str) {
