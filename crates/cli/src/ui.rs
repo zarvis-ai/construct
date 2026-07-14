@@ -23,7 +23,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const MATRIX_RAIN_RAMP_UP_SECS: f32 = 5.0;
 const MATRIX_RAIN_DECAY_SECS: f32 = 20.0;
@@ -14090,6 +14091,51 @@ fn program_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (us
     (row.saturating_add(col / width), col % width)
 }
 
+/// The glyphs ratatui's `Paragraph` actually paints for `text`, as
+/// `(display_width, is_break_whitespace)` per grapheme cluster. Three rules
+/// mirror ratatui exactly, and all three diverge from a naive per-`char` walk:
+///
+/// - Text is segmented into grapheme clusters and each cluster is measured
+///   whole with `UnicodeWidthStr` — a VS16 emoji (`✔️`) or ZWJ sequence
+///   (`👩‍💻`) is one two-cell glyph, not the sum of its chars' widths.
+/// - Grapheme clusters containing control chars (tabs included) are dropped
+///   before wrapping, as `Span::styled_graphemes` does — they paint nothing
+///   and are not break opportunities.
+/// - Whitespace classification follows `StyledGrapheme::is_whitespace`: a
+///   zero-width space is a break opportunity, a no-break space is not.
+fn program_paint_graphemes(text: &str) -> impl Iterator<Item = (usize, bool)> + '_ {
+    text.graphemes(true)
+        .filter(|g| !g.contains(char::is_control))
+        .map(|g| {
+            let is_ws =
+                g == "\u{200b}" || (g.chars().all(char::is_whitespace) && g != "\u{a0}");
+            (UnicodeWidthStr::width(g), is_ws)
+        })
+}
+
+/// Display width of the first `n_chars` chars of `text`, measured on the
+/// grapheme clusters ratatui paints (see [`program_paint_graphemes`]). Cursor
+/// offsets are char offsets, so an offset can fall inside a multi-char
+/// cluster; the partially-covered cluster counts whole, placing the caret
+/// after the glyph the next edit will affect — and letting the inverse
+/// mapping ([`program_visual_to_cursor`]) resolve clicks to cluster
+/// boundaries rather than mid-sequence offsets.
+fn program_prefix_display_width(text: &str, n_chars: usize) -> usize {
+    let mut width = 0usize;
+    let mut chars_seen = 0usize;
+    for g in text.graphemes(true) {
+        if chars_seen >= n_chars {
+            break;
+        }
+        chars_seen += g.chars().count();
+        if g.contains(char::is_control) {
+            continue;
+        }
+        width += UnicodeWidthStr::width(g);
+    }
+    width
+}
+
 /// Word-wrap `text` exactly as ratatui's `Wrap { trim: false }` does and return,
 /// for each resulting visual row, the display-column offset (within the
 /// unwrapped line, counting collapsed break-whitespace) at which that row's
@@ -14099,10 +14145,13 @@ fn program_wrap_locate(starts: &[usize], visual_col: usize, width: usize) -> (us
 /// path: a finished word (or a word that on its own overflows the width) is
 /// flushed onto the pending row together with the whitespace that preceded it;
 /// once the row is full the whitespace sitting at the break is dropped so the
-/// next word starts the following row. Reusing the renderer's wrap rule keeps
-/// the cursor's row count and intra-line column on the same glyphs the body
+/// next word starts the following row. It walks the same units ratatui does —
+/// grapheme clusters, not chars (see [`program_paint_graphemes`]) — so emoji
+/// sequences, control chars, NBSP, and ZWSP wrap on the exact glyphs the body
 /// paints. Verified against ratatui's `TestBackend` output for word breaks,
-/// hard breaks, trailing/leading whitespace, and collapsed multi-space runs.
+/// hard breaks, trailing/leading whitespace, collapsed multi-space runs, and
+/// the grapheme cases above (the differential test in `app.rs` re-checks the
+/// whole pipeline against a painted buffer).
 fn program_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
     let max = width.max(1);
     // Each buffered glyph carries `(origin, glyph_width)` where `origin` is its
@@ -14119,15 +14168,13 @@ fn program_wrap_row_starts(text: &str, width: usize) -> Vec<usize> {
     let mut non_ws_previous = false;
     let mut origin = 0usize;
 
-    for ch in text.chars() {
-        let sw = UnicodeWidthChar::width(ch).unwrap_or(0);
+    for (sw, is_ws) in program_paint_graphemes(text) {
         let here = origin;
         origin = origin.saturating_add(sw);
         // ratatui ignores glyphs wider than the whole line.
         if sw > max {
             continue;
         }
-        let is_ws = ch.is_whitespace();
 
         let word_found = non_ws_previous && is_ws;
         let untrimmed_overflow = pending_line.is_empty() && word_width + ws_width + sw > max;
@@ -14250,22 +14297,33 @@ fn program_heading_content(raw: &str) -> Option<(usize, &str)> {
 /// The plain text the program body paints for one logical markdown line, before
 /// ratatui word-wraps it. Mirrors the per-line transformation in
 /// [`render_program_markdown_lines`] / [`program_visual_col_for_line`] — kept
-/// heading markers, the `  • ` list prefix, and expanded smart-clip chips — so
-/// the cursor's wrap math sees exactly the glyphs (and their spaces) ratatui
-/// wraps.
+/// heading markers (painted literally, chips included), the `  • ` list
+/// prefix, the fixed chip text of `:::clip` / `:::` fence lines, and expanded
+/// smart-clip chips — so the cursor's wrap math sees exactly the glyphs (and
+/// their spaces) ratatui wraps.
 fn program_rendered_line_text(app: Option<&App>, raw: &str) -> String {
     let trimmed = raw.trim();
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
         String::new()
     } else if let Some((_, content)) = program_heading_content(raw) {
-        program_inline_rendered_text(app, content)
+        // Headings paint their source literally (`render_program_heading_line`
+        // goes through `program_text_spans`, which never expands `@{…}`
+        // chips), so the wrap math must measure the literal text too.
+        content.to_string()
     } else if let Some((_, rest)) = program_list_item_content(raw) {
         format!(
             "{}  • {}",
             " ".repeat(leading),
             program_inline_rendered_text(app, rest)
         )
+    } else if let Some(rest) = trimmed.strip_prefix(":::clip") {
+        // Painted as `  ` + the padded chip label (`program_chip_span`), not
+        // the raw fence source; the leading indent is dropped with the rest
+        // of the source syntax.
+        format!("   {} ", format!("clip {}", rest.trim()).trim())
+    } else if trimmed == ":::" {
+        "  end clip".to_string()
     } else {
         // Normal line: the renderer keeps the raw leading whitespace and
         // expands any inline chips in the remainder.
@@ -14365,8 +14423,14 @@ fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Ve
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
         (String::new(), Vec::new())
-    } else if let Some((_, content)) = program_heading_content(raw) {
-        program_inline_with_clips(app, content, 0)
+    } else if program_heading_content(raw).is_some()
+        || trimmed.starts_with(":::clip")
+        || trimmed == ":::"
+    {
+        // Headings paint their source literally (no chip expansion) and clip
+        // fence lines paint fixed chip text — neither carries clickable clip
+        // spans, so both report the rendered text with no clips.
+        (program_rendered_line_text(app, raw), Vec::new())
     } else if let Some(rest) = trimmed
         .strip_prefix("- ")
         .or_else(|| trimmed.strip_prefix("* "))
@@ -14572,11 +14636,22 @@ fn program_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
 fn program_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> usize {
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     let col = raw_col.saturating_sub(leading);
+    let trimmed = raw.trim();
     if let Some((_, content)) = program_heading_content(raw) {
         // `content` keeps any trailing space (sliced from the raw line, leading
         // indent stripped) so the cursor column advances past a space typed at the
-        // end of the heading — matching the glyphs the renderer paints.
-        program_inline_visual_width(app, content, col)
+        // end of the heading — matching the glyphs the renderer paints. Headings
+        // paint literally (no chip expansion), so the width is the literal
+        // prefix width.
+        program_prefix_display_width(content, col)
+    } else if trimmed.starts_with(":::clip") || trimmed == ":::" {
+        // Fence lines paint as fixed chip text whose glyphs don't correspond
+        // 1:1 to the source chars; measure the source column literally and
+        // clamp it into the painted width so the caret stays on the line (and
+        // end-of-line clicks resolve to the line's last offset).
+        let rendered = program_rendered_line_text(app, raw);
+        program_prefix_display_width(raw, raw_col)
+            .min(UnicodeWidthStr::width(rendered.as_str()))
     } else if let Some((_, rest)) = program_list_item_content(raw) {
         // Mirror the proportional indent rendered for nested bullets: the bullet
         // glyph and text sit `leading` columns further right than a top-level
@@ -14597,14 +14672,6 @@ fn program_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> 
 }
 
 fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) -> usize {
-    // Display width of the first `n` chars of `s`, counting wide chars (emoji, CJK) as 2.
-    fn chars_display_width(s: &str, n: usize) -> usize {
-        s.chars()
-            .take(n)
-            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-            .sum()
-    }
-
     let mut visual = 0usize;
     let mut raw = 0usize;
     let mut rest = text;
@@ -14612,7 +14679,7 @@ fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) ->
         let before = &rest[..start_b];
         let before_len = before.chars().count();
         if raw_col <= raw + before_len {
-            return visual + chars_display_width(before, raw_col - raw);
+            return visual + program_prefix_display_width(before, raw_col - raw);
         }
         visual += UnicodeWidthStr::width(before);
         raw += before_len;
@@ -14620,7 +14687,8 @@ fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) ->
         let after_marker = &rest[start_b + 2..];
         let Some(end_b) = after_marker.find('}') else {
             // Malformed @{ without closing }: treat remainder as plain text.
-            return visual + chars_display_width(&rest[start_b..], raw_col.saturating_sub(raw));
+            return visual
+                + program_prefix_display_width(&rest[start_b..], raw_col.saturating_sub(raw));
         };
         let raw_clip = &after_marker[..end_b];
         let clip_len = 2 + raw_clip.chars().count() + 1;
@@ -14631,7 +14699,7 @@ fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) ->
         raw += clip_len;
         rest = &after_marker[end_b + 1..];
     }
-    visual + chars_display_width(rest, raw_col.saturating_sub(raw))
+    visual + program_prefix_display_width(rest, raw_col.saturating_sub(raw))
 }
 
 fn program_selection_range(popup: &crate::app::ProgramPopup) -> Option<(usize, usize)> {

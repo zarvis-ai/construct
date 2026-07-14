@@ -47,6 +47,7 @@ nix = { version = "0.29", features = ["signal", "process"] }
 which = "6"
 futures = "0.3"
 unicode-width = "0.2.1"
+unicode-segmentation = "1.12"
 base64 = "0.22"
 portable-pty = "0.9"
 vt100 = "0.16"

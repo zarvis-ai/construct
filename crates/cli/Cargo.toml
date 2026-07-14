@@ -32,6 +32,7 @@ clap = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 unicode-width = { workspace = true }
+unicode-segmentation = { workspace = true }
 vt100 = { workspace = true }
 tui-term = { workspace = true }
 base64 = { workspace = true }

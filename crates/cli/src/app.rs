@@ -22528,6 +22528,181 @@ mod tests {
         server.abort();
     }
 
+    /// Differential regression harness for program-editor cursor/selection
+    /// drift: for every alphanumeric char in each corpus doc, paint the real
+    /// pipeline (`render_program_markdown_lines` + ratatui
+    /// `Wrap { trim: false }`) into a TestBackend and assert the glyph at the
+    /// cell where `program_cursor_visual_pos` places that char's cursor is the
+    /// char itself. Any divergence between the wrap/cursor math and what
+    /// ratatui actually paints — the drift the user sees as "the caret is not
+    /// where edits land" — shows up as a mismatch. The corpus deliberately
+    /// covers the classes that have drifted before: VS16/ZWJ emoji, tabs,
+    /// NBSP, CJK at wrap boundaries, `:::` clip fences, and smart-clip chips
+    /// in heading/bullet/plain lines.
+    #[tokio::test]
+    async fn program_cursor_math_matches_painted_buffer_differential() {
+        let (app, _dir, server) = empty_app().await;
+
+        let cases: Vec<(&str, &str)> = vec![
+            (
+                "plain-wrap",
+                "The quick brown fox jumps over the lazy dog near the riverbank and keeps going until this line wraps a few times.\nZEND",
+            ),
+            (
+                "mixed-structure",
+                "# Alpha heading one\nIntro paragraph that is long enough to wrap at narrow widths with mixed word lengths like abcdefghij and k.\n\n## Beta section two that itself is long enough to wrap at narrow widths\n- first bullet item with enough words to wrap once or twice at narrow widths\n- second bullet\n  - nested child bullet that also wraps with more words here\n    - deeper child\n* star bullet variant\nTrailing paragraph after the list.\n\n### Gamma three\nFinal words.\nZEND",
+            ),
+            (
+                "checklist",
+                "- [x] done item with enough trailing words to wrap at narrow widths\n- [ ] todo item\n- [~] active item\n- [!] blocked item\nZEND",
+            ),
+            (
+                "double-spaces",
+                "alpha  beta   gamma    delta ends\nnext  line   here\n- bullet  with   runs of spaces inside it\nZEND",
+            ),
+            (
+                "trailing-spaces",
+                "word one   \n- bullet with trailing  \n# heading trailing \nZEND",
+            ),
+            (
+                "long-word",
+                "path /Users/moon/agentd/crates/cli/src/app/editor.rs plus supercalifragilisticexpialidocious word\nZEND",
+            ),
+            (
+                "emoji-vs16",
+                "note \u{2764}\u{fe0f} heart and \u{2714}\u{fe0f} check marks drift columns\nZEND",
+            ),
+            (
+                "emoji-zwj",
+                "family \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} group and coder \u{1f469}\u{200d}\u{1f4bb} person\nZEND",
+            ),
+            ("emoji-basic", "smile \u{1f600} wide and \u{1f44d} thumb\nZEND"),
+            (
+                "cjk",
+                "\u{6df7}\u{5408} CJK \u{6587}\u{5b57} mixed with latin words that wrap somewhere\nZEND",
+            ),
+            (
+                "clip-fences",
+                ":::clip session:abc123\nbody line inside\n:::\nafter fence line\nZEND",
+            ),
+            (
+                "timeline",
+                ":::timeline\n- [x] step one done\n- [ ] step two\n:::\nafter timeline\nZEND",
+            ),
+            (
+                "table",
+                "| alpha | beta |\n|---|---|\n| one | two |\nafter table\nZEND",
+            ),
+            (
+                "indented-plain",
+                "    indented codeish line wraps maybe\n  two space indent line\nZEND",
+            ),
+            ("tabs", "col\tone\ttab separated\nZEND"),
+            (
+                "nbsp",
+                "hard\u{a0}space joined words wrap test somewhere here\nZEND",
+            ),
+            (
+                "heading-with-clip",
+                "# Head with @{session:abc123} chip and trailing words\nZEND",
+            ),
+            (
+                "bullet-with-clip",
+                "- bullet with @{session:abc123} chip and trailing words\nZEND",
+            ),
+            (
+                "plain-with-clip",
+                "plain with @{session:abc123} chip and trailing words\nZEND",
+            ),
+        ];
+
+        let widths = [8usize, 12, 21, 34, 47, 60, 79];
+        let mut failures = Vec::new();
+        for (name, doc) in &cases {
+            // Char offsets inside `@{…}` smart-clip source spans: the renderer
+            // paints the span as one chip (or, in headings, as literal source),
+            // so per-char glyph equality is not meaningful inside it. The words
+            // painted after the chip still pin its modeled width.
+            let chars: Vec<char> = doc.chars().collect();
+            let mut in_clip = vec![false; chars.len()];
+            let mut i = 0;
+            while i < chars.len() {
+                if chars[i] == '@' && chars.get(i + 1) == Some(&'{') {
+                    if let Some(close) = (i + 2..chars.len()).find(|&j| chars[j] == '}') {
+                        for slot in &mut in_clip[i..=close] {
+                            *slot = true;
+                        }
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            for &width in &widths {
+                let total = crate::ui::program_total_visual_rows(Some(&app), doc, width);
+                let height = (total + 8).min(400) as u16;
+                let backend = ratatui::backend::TestBackend::new(width as u16, height);
+                let mut term = ratatui::Terminal::new(backend).expect("terminal");
+                term.draw(|f| {
+                    let lines = crate::ui::render_program_markdown_lines_for_test(&app, doc);
+                    let para = ratatui::widgets::Paragraph::new(lines)
+                        .wrap(ratatui::widgets::Wrap { trim: false });
+                    f.render_widget(para, Rect::new(0, 0, width as u16, height));
+                })
+                .expect("draw");
+                let buffer = term.backend().buffer();
+
+                for (offset, ch) in doc.chars().enumerate() {
+                    if !ch.is_ascii_alphanumeric() || in_clip[offset] {
+                        continue;
+                    }
+                    let (row, col) =
+                        crate::ui::program_cursor_visual_pos(Some(&app), doc, offset, width);
+                    let glyph = buffer
+                        .cell((col as u16, row as u16))
+                        .map(|c| c.symbol().to_string())
+                        .unwrap_or_default();
+                    if glyph != ch.to_string() {
+                        // Documented ratatui paint quirk, not a mapping bug:
+                        // WordWrapper emits a row one cell wider than the area
+                        // when a wide glyph lands exactly on the wrap boundary
+                        // at word-commit time, and the buffer diff then
+                        // swallows the first cell of the following row (it sits
+                        // on the wide glyph's continuation index). The wrap
+                        // math matches ratatui's rows exactly; only that one
+                        // painted cell goes missing.
+                        let boundary_artifact = col == 0
+                            && row > 0
+                            && glyph == " "
+                            && buffer
+                                .cell(((width - 1) as u16, (row - 1) as u16))
+                                .is_some_and(|c| {
+                                    unicode_width::UnicodeWidthStr::width(c.symbol()) >= 2
+                                });
+                        if boundary_artifact {
+                            continue;
+                        }
+                        let painted: String = (0..width as u16)
+                            .filter_map(|x| buffer.cell((x, row as u16)).map(|c| c.symbol()))
+                            .collect();
+                        failures.push(format!(
+                            "[{name} w={width}] char {ch:?} at offset {offset} → math ({row},{col}) but painted {glyph:?}; painted row: {painted:?}"
+                        ));
+                        break; // one failure per (case, width) keeps the report readable
+                    }
+                }
+            }
+        }
+
+        assert!(
+            failures.is_empty(),
+            "cursor math diverged from painted buffer in {} case(s):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn program_cursor_advances_when_space_appended_to_heading() {
         let (app, _dir, server) = empty_app().await;
