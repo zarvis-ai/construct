@@ -275,15 +275,18 @@
     scrollbar-width: thin;
     scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
   }
+  /* Session rows are single-line, TUI-style: a fixed two-cell gutter
+     (disclosure triangle, status glyph), the name, trailing markers,
+     and the harness label right-aligned in muted small type. The fixed
+     gutter keeps every name at one depth on the same left edge. */
   .session-list .item {
     position: relative;
     margin: 1px 8px;
-    padding: 8px 10px 8px 6px;
+    padding: 6px 10px 6px 6px;
     cursor: pointer;
     border-radius: 8px;
     display: flex;
     align-items: center;
-    gap: 4px;
     font-size: 13px;
     /* Rows are drag-reorder handles: keep press-and-hold from starting
        a text selection (iOS callout, desktop drag-select) instead. */
@@ -291,6 +294,13 @@
     -webkit-user-select: none;
     -webkit-touch-callout: none;
   }
+  /* Indent ladder: one 18px step per tree level. A child row's gutter
+     shifts so its status glyph sits under its parent's name — the same
+     relationship the TUI's session list draws. */
+  .session-list .item.depth-1 { padding-left: 24px; }
+  .session-list .item.depth-2 { padding-left: 42px; }
+  .session-list .item.depth-3 { padding-left: 60px; }
+  .session-list .item.depth-4 { padding-left: 78px; }
   /* Drag-and-drop reorder: the grabbed row dims, and an accent
      insertion line previews where the drop will land. */
   .session-list.drag-active {
@@ -321,43 +331,45 @@
     color: var(--fg);
     font-weight: 600;
   }
-  .session-list .item .row-main {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
   .session-list .item .name {
+    flex: 0 1 auto;
+    min-width: 0;
+    margin-left: 4px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .session-list .item .name-line {
-    min-width: 0;
-    display: flex;
-    align-items: center;
-    gap: 6px;
+  /* Trailing markers hug the (possibly truncated) name so they never
+     scroll out of view: live-fork count, pin star, needs-attention dot. */
+  .session-list .item .fork-count {
+    flex: none;
+    margin-left: 5px;
+    color: var(--fg-faint);
+    font-size: 10px;
+    line-height: 1;
   }
   .session-list .item .pin-indicator {
-    flex: 0 0 10px;
-    width: 10px;
+    flex: none;
+    margin-left: 5px;
     color: var(--accent);
-    font-size: 11px;
+    font-size: 10px;
     line-height: 1;
-    text-align: center;
-  }
-  .session-list .item .pin-indicator.is-empty {
-    color: transparent;
   }
   .session-list .item .attention-dot {
+    flex: none;
+    margin-left: 5px;
     color: var(--accent-alt);
-    font-size: 11px;
+    font-size: 10px;
     line-height: 1;
-    text-align: center;
-    flex-shrink: 0;
   }
+  /* Harness label: right-aligned on the same line (like the TUI); the
+     name yields first, so the label stays readable while a long name
+     truncates. */
   .session-list .item .sub {
+    flex: none;
+    margin-left: auto;
+    padding-left: 8px;
+    max-width: 45%;
     color: var(--fg-faint);
     font-size: 11px;
     overflow: hidden;
@@ -365,8 +377,7 @@
     white-space: nowrap;
   }
   .session-list .item .state {
-    flex: 0 0 14px;
-    width: 14px;
+    flex: 0 0 16px;
     text-align: center;
     font-size: 9px;
     line-height: 1;
@@ -378,15 +389,15 @@
   .session-list .item .state.state-paused { color: var(--warn); }
   .session-list .item .state.state-done { color: var(--accent); }
   .session-list .item .state.state-errored { color: var(--err); }
-  /* Group header (matches TUI's `▾ name` line above each group).
-     Tappable — flips the group's collapsed bit. */
+  /* Group header (matches TUI's `▾ name (n)` line above each group).
+     Tappable — flips the group's collapsed bit. Its glyph shares the
+     rows' disclosure column so the whole list hangs on one grid. */
   .session-list .group-header {
     padding: 8px 14px 4px;
     color: var(--fg-dim);
     font-size: 12px;
     font-weight: 600;
     display: flex;
-    gap: 6px;
     align-items: center;
     border-top: 1px solid var(--border-faint);
     margin-top: 6px;
@@ -395,57 +406,77 @@
   }
   .session-list .group-header:hover { color: var(--fg); }
   .session-list .group-glyph {
-    flex: 0 0 31px;
-    width: 31px;
+    flex: 0 0 16px;
     color: var(--fg-faint);
-    font-size: 14px;
+    font-size: 10px;
     line-height: 1;
     text-align: center;
   }
-  /* Sessions belonging to a group get a bit of left-padding so they
-     read as members under the header above them. */
-  .session-list .item.indent {
-    padding-left: 8px;
+  .session-list .group-name {
+    margin-left: 4px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
-  .session-list .item.is-subagent {
-    opacity: 0.92;
-    padding-left: 40px;
+  .session-list .group-count {
+    flex: none;
+    margin-left: 6px;
+    color: var(--fg-faint);
+    font-size: 11px;
+    font-weight: 400;
   }
   .session-list .item.is-archived {
     opacity: 0.55;
   }
+  /* "N archived" disclosure rows sit at the depth of the rows they
+     reveal; their triangle lines up with sibling rows' gutter. */
   .session-list .archived-row {
-    padding: 4px 14px;
-    color: var(--fg-dim);
-    font-size: 12px;
+    padding: 3px 14px;
+    color: var(--fg-faint);
+    font-size: 11px;
     display: flex;
     align-items: center;
-    gap: 6px;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
     user-select: none;
   }
-  .session-list .archived-row:hover { color: var(--fg); }
-  .session-list .archived-row.indent { padding-left: 20px; }
+  .session-list .archived-row:hover { color: var(--fg-dim); }
+  .session-list .archived-row.depth-1 { padding-left: 32px; }
+  .session-list .archived-row.depth-2 { padding-left: 50px; }
+  .session-list .archived-row.depth-3 { padding-left: 68px; }
+  .session-list .archived-row.depth-4 { padding-left: 86px; }
   .session-list .archived-glyph {
-    flex: 0 0 20px;
-    width: 20px;
+    flex: 0 0 16px;
     color: var(--fg-faint);
-    font-size: 13px;
+    font-size: 10px;
     line-height: 1;
     text-align: center;
   }
+  .session-list .archived-label { margin-left: 4px; }
   .session-list .item .disclosure {
-    flex: 0 0 12px;
-    width: 12px;
+    flex: 0 0 16px;
     color: var(--fg-faint);
-    font-size: 14px;
+    font-size: 10px;
     line-height: 1;
     text-align: center;
   }
   .session-list .item .disclosure.can-toggle {
     cursor: pointer;
     color: var(--fg-dim);
+  }
+  /* A fork's lineage marker occupies the same gutter cell a disclosure
+     triangle would, so fork and subagent names share one left edge. */
+  .session-list .item .disclosure.fork-glyph {
+    color: var(--accent-alt);
+    font-size: 11px;
+  }
+  /* Compact desktop rows are tight for fingers; restore taller touch
+     targets on phones. (After the base rules — their `padding`
+     shorthands would otherwise win on source order.) */
+  @media (max-width: 720px) {
+    .session-list .item { padding-top: 9px; padding-bottom: 9px; }
+    .session-list .archived-row { padding-top: 6px; padding-bottom: 6px; }
   }
   /* Operator / orchestrator row — pinned at the top, name in
      the accent color so it stands out as the special fleet
@@ -2182,6 +2213,8 @@
   html[data-theme="matrix"] .session-list .item.active .name,
   html[data-theme="matrix"] .session-list .item.active .sub,
   html[data-theme="matrix"] .session-list .item.active .pin-indicator,
+  html[data-theme="matrix"] .session-list .item.active .attention-dot,
+  html[data-theme="matrix"] .session-list .item.active .fork-count,
   html[data-theme="matrix"] .session-list .item.active .disclosure,
   html[data-theme="matrix"] .session-list .item.active .state {
     color: var(--accent-fg);
@@ -3559,6 +3592,7 @@ function orderedItems() {
   // restart actions on this row — the daemon owns its lifecycle.
   const operator = state.sessions.find((s) => s.kind === "orchestrator");
   const userSessions = state.sessions.filter((s) => s.kind === "user" || !s.kind);
+  const byId = new Map(state.sessions.map((s) => [s.id, s]));
   const subagentsByParent = new Map();
   for (const s of state.sessions.filter((s) => s.kind === "subagent")) {
     const parent = s.parent_session_id;
@@ -3570,44 +3604,92 @@ function orderedItems() {
   for (const list of subagentsByParent.values()) {
     list.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   }
+  // Forks nest as child rows under their fork parent (spec 0081), like
+  // subagents, so they are excluded from the top-level/group listings
+  // below. A fork whose parent summary is gone falls back to rendering
+  // as an ordinary top-level session rather than disappearing.
+  const forkParentId = (s) =>
+    s.forked_from && byId.has(s.forked_from.session_id) ? s.forked_from.session_id : null;
+  const forksByParent = new Map();
+  for (const s of userSessions) {
+    const parent = forkParentId(s);
+    if (!parent) continue;
+    const list = forksByParent.get(parent) || [];
+    list.push(s);
+    forksByParent.set(parent, list);
+  }
+  for (const list of forksByParent.values()) {
+    list.sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+  }
 
-  function pushSession(items, session, indented = false) {
-    const children = subagentsByParent.get(session.id) || [];
-    const hasChildren = children.length > 0;
+  // Archived forks — any generation, fork-of-a-fork included — collapse
+  // into the parent's single "N archived" row alongside archived
+  // subagents (spec 0081). Depth cap guards malformed lineage cycles.
+  function archivedForkDescendantsOf(parentId) {
+    const out = [];
+    const stack = (forksByParent.get(parentId) || []).map((f) => [f, 1]).reverse();
+    while (stack.length) {
+      const [fork, gen] = stack.pop();
+      if (fork.archived) out.push(fork);
+      if (gen >= 8) continue;
+      for (const nested of (forksByParent.get(fork.id) || []).slice().reverse()) {
+        stack.push([nested, gen + 1]);
+      }
+    }
+    return out;
+  }
+
+  function pushSession(items, session, depth = 0) {
+    const subagents = subagentsByParent.get(session.id) || [];
+    const forks = forksByParent.get(session.id) || [];
+    const hasChildren = subagents.length > 0 || forks.length > 0;
     const expanded = hasChildren && !state.subagentCollapsed.has(session.id);
     items.push({
       kind: "session",
       session,
-      indented,
+      depth,
       hasChildren,
       childrenExpanded: expanded,
+      liveForkCount: session.forked_from ? 0 : forks.filter((f) => !f.archived).length,
     });
-    if (expanded) {
-      const activeChildren = children.filter((c) => !c.archived);
-      const archivedChildren = children.filter((c) => c.archived);
-      for (const child of activeChildren) {
-        pushSession(items, child, true);
-      }
-      if (archivedChildren.length > 0) {
-        const archivedExpanded = state.showArchivedSubagents.has(session.id);
-        items.push({
-          kind: "archived-row",
-          section: "subagent:" + session.id,
-          count: archivedChildren.length,
-          expanded: archivedExpanded,
-          indented: true,
-        });
-        if (archivedExpanded) {
-          for (const child of archivedChildren) {
-            pushSession(items, child, true);
-          }
+    if (!expanded) return;
+    const activeSubagents = subagents.filter((c) => !c.archived);
+    const archivedSubagents = subagents.filter((c) => c.archived);
+    for (const child of activeSubagents) pushSession(items, child, depth + 1);
+    // Live forks render flat at one child level — a fork of a fork stays
+    // at the same indent, matching the TUI's convention.
+    const stack = forks.filter((f) => !f.archived).map((f) => [f, 1]).reverse();
+    while (stack.length) {
+      const [fork, gen] = stack.pop();
+      items.push({ kind: "session", session: fork, depth: depth + 1, hasChildren: false, childrenExpanded: false, liveForkCount: 0 });
+      if (gen >= 8) continue;
+      const nested = (forksByParent.get(fork.id) || []).filter((f) => !f.archived);
+      for (const q of nested.slice().reverse()) stack.push([q, gen + 1]);
+    }
+    const archivedForks = archivedForkDescendantsOf(session.id);
+    const archivedCount = archivedForks.length + archivedSubagents.length;
+    if (archivedCount > 0) {
+      const archivedExpanded = state.showArchivedSubagents.has(session.id);
+      items.push({
+        kind: "archived-row",
+        section: "subagent:" + session.id,
+        count: archivedCount,
+        expanded: archivedExpanded,
+        depth: depth + 1,
+      });
+      if (archivedExpanded) {
+        for (const fork of archivedForks) {
+          items.push({ kind: "session", session: fork, depth: depth + 1, hasChildren: false, childrenExpanded: false, liveForkCount: 0 });
+        }
+        for (const child of archivedSubagents) {
+          pushSession(items, child, depth + 1);
         }
       }
     }
   }
 
   const ungroupedAll = userSessions
-    .filter((s) => !s.group_id)
+    .filter((s) => !s.group_id && !forkParentId(s))
     .slice()
     .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   const ungrouped = ungroupedAll.filter((s) => !s.archived);
@@ -3616,32 +3698,32 @@ function orderedItems() {
     .slice()
     .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   const items = [];
-  if (operator) items.push({ kind: "session", session: operator, isOperator: true });
+  if (operator) items.push({ kind: "session", session: operator, isOperator: true, depth: 0 });
   for (const s of ungrouped) pushSession(items, s);
   if (archivedUngrouped.length > 0) {
     const expanded = state.showArchivedUngrouped;
-    items.push({ kind: "archived-row", section: "ungrouped", count: archivedUngrouped.length, expanded });
+    items.push({ kind: "archived-row", section: "ungrouped", count: archivedUngrouped.length, expanded, depth: 1 });
     if (expanded) {
       for (const s of archivedUngrouped) pushSession(items, s);
     }
   }
   for (const g of groups) {
-    items.push({ kind: "group", group: g });
-    if (g.collapsed) continue;
     const membersAll = userSessions
-      .filter((s) => s.group_id === g.id)
+      .filter((s) => s.group_id === g.id && !forkParentId(s))
       .slice()
       .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
     const activeMembers = membersAll.filter((s) => !s.archived);
     const archivedMembers = membersAll.filter((s) => s.archived);
+    items.push({ kind: "group", group: g, memberCount: activeMembers.length });
+    if (g.collapsed) continue;
     for (const s of activeMembers) {
-      pushSession(items, s, true);
+      pushSession(items, s, 1);
     }
     if (archivedMembers.length > 0) {
       const expanded = state.showArchivedGroups.has(g.id);
-      items.push({ kind: "archived-row", section: g.id, count: archivedMembers.length, expanded, indented: true });
+      items.push({ kind: "archived-row", section: g.id, count: archivedMembers.length, expanded, depth: 1 });
       if (expanded) {
-        for (const s of archivedMembers) pushSession(items, s, true);
+        for (const s of archivedMembers) pushSession(items, s, 1);
       }
     }
   }
@@ -3960,13 +4042,14 @@ function bindSessionListDrag() {
  *  HTML. renderSessions() diffs class and inner separately so a pure
  *  selection change (class only) never rebuilds a row's status element. */
 function sessionRowDescriptor(item) {
+  const depthClass = " depth-" + Math.min(item.depth ?? 0, 4);
   if (item.kind === "archived-row") {
     const glyph = item.expanded ? "▾" : "▸";
     return {
       key: "ar:" + item.section,
       datasetKey: "archivedSection",
       datasetVal: item.section,
-      className: "archived-row" + (item.indented ? " indent" : ""),
+      className: "archived-row" + depthClass,
       inner:
         `<span class="archived-glyph">${glyph}</span>` +
         `<span class="archived-label">${item.count} archived</span>`,
@@ -3982,13 +4065,14 @@ function sessionRowDescriptor(item) {
       className: "group-header",
       inner:
         `<span class="group-glyph">${glyph}</span>` +
-        `<span class="group-name">${escape(g.name || "(unnamed)")}</span>`,
+        `<span class="group-name">${escape(g.name || "(unnamed)")}</span>` +
+        `<span class="group-count">${item.memberCount ?? 0}</span>`,
     };
   }
   const s = item.session;
   const active = s.id === state.currentId ? " active" : "";
   // Operator / orchestrator row: fixed label, daemon-owned lifecycle, no
-  // action affordances — empty disclosure/pin spacers keep the grid aligned.
+  // action affordances — an empty disclosure spacer keeps the grid aligned.
   if (item.isOperator) {
     return {
       key: "s:" + s.id,
@@ -3997,33 +4081,43 @@ function sessionRowDescriptor(item) {
       className: "item is-operator" + active,
       inner:
         `<span class="disclosure"></span>` +
-        `<span class="pin-indicator is-empty" aria-hidden="true"></span>` +
         sessionStatusHtml(s) +
         `<div class="name">operator</div>`,
     };
   }
+  // Gutter cell: the children-disclosure triangle when the session has
+  // children; a fork's ⑂ lineage marker otherwise shares the same cell,
+  // so every name at one depth keeps a single left edge.
   const disclosure = item.hasChildren
     ? `<span class="disclosure can-toggle" data-parent-id="${attr(s.id)}">${item.childrenExpanded ? "▾" : "▸"}</span>`
-    : `<span class="disclosure"></span>`;
-  const pin = s.pinned
-    ? `<span class="pin-indicator" title="pinned" aria-label="pinned">★</span>`
-    : `<span class="pin-indicator is-empty" aria-hidden="true"></span>`;
+    : s.forked_from
+      ? `<span class="disclosure fork-glyph" title="fork" aria-label="fork">⑂</span>`
+      : `<span class="disclosure"></span>`;
+  // Trailing markers (TUI parity): live-fork count badge on the fork
+  // parent, pin star, and the needs-attention dot after the title.
+  const markers =
+    (item.liveForkCount > 0
+      ? `<span class="fork-count" title="${item.liveForkCount} fork${item.liveForkCount === 1 ? "" : "s"}">⑂${item.liveForkCount}</span>`
+      : "") +
+    (s.pinned ? `<span class="pin-indicator" title="pinned" aria-label="pinned">★</span>` : "") +
+    (s.needs_attention && !s.archived
+      ? `<span class="attention-dot" title="needs attention" aria-label="needs attention">●</span>`
+      : "");
   const harness = s.harness ? `<div class="sub">${escape(sessionHarnessLabel(s))}</div>` : "";
   return {
     key: "s:" + s.id,
     datasetKey: "id",
     datasetVal: s.id,
     className:
-      "item" + active +
-      (item.indented ? " indent" : "") +
+      "item" + depthClass + active +
       (s.kind === "subagent" ? " is-subagent" : "") +
+      (s.forked_from ? " is-fork" : "") +
       (s.pinned ? " is-pinned" : "") +
       (s.archived ? " is-archived" : ""),
     inner:
-      disclosure + pin + sessionStatusHtml(s) +
-      `<div class="row-main"><div class="name-line">${
-        s.needs_attention && !s.archived ? `<span class="attention-dot" title="needs attention" aria-label="needs attention">●</span>` : ""
-      }<div class="name">${escape(sessionDisplayTitle(s))}</div></div>${harness}</div>`,
+      disclosure + sessionStatusHtml(s) +
+      `<div class="name">${escape(sessionDisplayTitle(s))}</div>` +
+      markers + harness,
   };
 }
 
