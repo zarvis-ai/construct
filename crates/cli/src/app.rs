@@ -22970,7 +22970,7 @@ mod tests {
             + col
     }
 
-    /// Select `anchor..head` in a fresh popup over [`SHIMMER_DOC`], arm the
+    /// Select `anchor..head` in a fresh popup over `doc`, arm the
     /// optimistic run exactly the way Run/verb dispatch does
     /// (`selected_program_block_ids` → `start_program_run_with_pending`), and
     /// return the shimmer's per-source-line activity mask. `daemon_blocks`
@@ -22980,18 +22980,19 @@ mod tests {
     fn shimmer_lines_for_selection(
         app: &mut App,
         session: &str,
+        doc: &str,
         anchor: usize,
         head: usize,
         daemon_blocks: bool,
     ) -> Vec<bool> {
-        let mut popup = program_popup_for_test(session, SHIMMER_DOC, head);
+        let mut popup = program_popup_for_test(session, doc, head);
         popup.selection = Some(ProgramSelection {
             anchor,
             head,
             dragged: true,
         });
         if daemon_blocks {
-            popup.blocks = construct_protocol::program_block_spans(SHIMMER_DOC)
+            popup.blocks = construct_protocol::program_block_spans(doc)
                 .into_iter()
                 .enumerate()
                 .map(|(i, span)| construct_protocol::ProgramBlockView {
@@ -23057,8 +23058,14 @@ mod tests {
         for daemon_blocks in [false, true] {
             for (name, anchor, head, expected_lines) in &cases {
                 let session = format!("s-{name}-{daemon_blocks}");
-                let active =
-                    shimmer_lines_for_selection(&mut app, &session, *anchor, *head, daemon_blocks);
+                let active = shimmer_lines_for_selection(
+                    &mut app,
+                    &session,
+                    SHIMMER_DOC,
+                    *anchor,
+                    *head,
+                    daemon_blocks,
+                );
                 let expected: Vec<bool> = (0..SHIMMER_DOC.lines().count())
                     .map(|i| expected_lines.contains(&i))
                     .collect();
@@ -23067,6 +23074,35 @@ mod tests {
                     "case {name} (daemon_blocks={daemon_blocks}): shimmer lines mismatch"
                 );
             }
+        }
+        server.abort();
+    }
+
+    /// A selection running from the first item's marker to exactly the last
+    /// char of the second item — the trailing newline NOT included, and the
+    /// buffer itself ending without one — shimmers both items: the
+    /// end-exclusive overlap still contains the second item because the
+    /// selection reaches past its first char.
+    #[tokio::test]
+    async fn program_selection_shimmer_covers_trailing_item_without_newline() {
+        let (mut app, _dir, server) = empty_app().await;
+        let doc = "* item1\n* item2";
+        for daemon_blocks in [false, true] {
+            let session = format!("s-end-boundary-{daemon_blocks}");
+            let active = shimmer_lines_for_selection(
+                &mut app,
+                &session,
+                doc,
+                0,
+                doc.chars().count(),
+                daemon_blocks,
+            );
+            assert_eq!(
+                active,
+                vec![true, true],
+                "selecting both items without the trailing newline must shimmer both \
+                 (daemon_blocks={daemon_blocks})"
+            );
         }
         server.abort();
     }
