@@ -11027,6 +11027,36 @@ fn apply_program_shimmer(lines: &mut [Line], shimmer: &ProgramShimmer, theme: &T
     }
 }
 
+/// Test hook: the source-line activity mask `program_run_shimmer` derives for
+/// the popup's current run, so tests can assert the shimmer covers exactly the
+/// pending blocks' lines without reaching into the private wave state.
+#[cfg(test)]
+pub(crate) fn program_run_shimmer_active_lines_for_test(
+    app: &App,
+    popup: &crate::app::ProgramPopup,
+    now: Instant,
+) -> Option<Vec<bool>> {
+    program_run_shimmer(app, popup, now).map(|shimmer| shimmer.active_lines)
+}
+
+/// Test hook: run the shimmer overlay with an explicit line mask so tests can
+/// assert which rendered chars it re-styles.
+#[cfg(test)]
+pub(crate) fn apply_program_shimmer_for_test(
+    lines: &mut [Line],
+    active_lines: Vec<bool>,
+    theme: &Theme,
+) {
+    apply_program_shimmer(
+        lines,
+        &ProgramShimmer {
+            active_lines,
+            phase: 1.0,
+        },
+        theme,
+    );
+}
+
 fn apply_program_settle_flourish(
     lines: &mut [Line],
     flourish: &ProgramSettleFlourish,

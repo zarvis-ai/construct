@@ -22528,6 +22528,171 @@ mod tests {
         server.abort();
     }
 
+    /// Fixture for the shimmer-range tests: a heading, a multiline list item
+    /// (bullet + continuation line), a sibling item, a blank separator, and a
+    /// two-line paragraph. Lines: 0 heading / 1 item1 / 2 item1 continuation /
+    /// 3 item2 / 4 blank / 5-6 paragraph.
+    const SHIMMER_DOC: &str = "# Plan\n- first item\n  continued under first\n- second item\n\nA paragraph line that\ncontinues here.\n";
+
+    /// Char offset of `(line, col)` in `doc` — for building selections.
+    fn doc_offset(doc: &str, line: usize, col: usize) -> usize {
+        doc.split('\n')
+            .take(line)
+            .map(|l| l.chars().count() + 1)
+            .sum::<usize>()
+            + col
+    }
+
+    /// Select `anchor..head` in a fresh popup over [`SHIMMER_DOC`], arm the
+    /// optimistic run exactly the way Run/verb dispatch does
+    /// (`selected_program_block_ids` → `start_program_run_with_pending`), and
+    /// return the shimmer's per-source-line activity mask. `daemon_blocks`
+    /// picks the shimmer path: the clean-buffer daemon-projection path
+    /// (stable refs with content-id fallback) or the dirty-buffer
+    /// locally-reparsed fallback (no daemon projection on file).
+    fn shimmer_lines_for_selection(
+        app: &mut App,
+        session: &str,
+        anchor: usize,
+        head: usize,
+        daemon_blocks: bool,
+    ) -> Vec<bool> {
+        let mut popup = program_popup_for_test(session, SHIMMER_DOC, head);
+        popup.selection = Some(ProgramSelection {
+            anchor,
+            head,
+            dragged: true,
+        });
+        if daemon_blocks {
+            popup.blocks = construct_protocol::program_block_spans(SHIMMER_DOC)
+                .into_iter()
+                .enumerate()
+                .map(|(i, span)| construct_protocol::ProgramBlockView {
+                    id: format!("blk-{i}:1"),
+                    block_id: format!("blk-{i}"),
+                    content_epoch: 1,
+                    block_ref: format!("blk-{i}:1"),
+                    content_id: span.id,
+                    start_line: span.start_line,
+                    end_line: span.end_line,
+                    text: span.text,
+                    shimmer: false,
+                    tooltip: None,
+                })
+                .collect();
+        }
+        let ids = App::selected_program_block_ids(&popup).expect("selection yields block ids");
+        assert!(!ids.is_empty(), "selection should cover at least one block");
+        let pending = app.program_run_pending_with_existing(session, ids);
+        app.start_program_run_with_pending(session, pending);
+        app.program_popup = Some(popup);
+        let popup_ref = app.program_popup.as_ref().unwrap();
+        crate::ui::program_run_shimmer_active_lines_for_test(app, popup_ref, Instant::now())
+            .expect("optimistic run should produce a shimmer")
+    }
+
+    /// The optimistic Run/verb shimmer must cover exactly the source lines of
+    /// the blocks the selection touches (spec 0042/0053): whole blocks —
+    /// a multiline item's continuation lines included — never partial
+    /// neighbors or the blank separators between blocks. Verified on both
+    /// shimmer paths (clean-buffer daemon projection and dirty-buffer local
+    /// reparse) for selections inside one item, across items, across a blank
+    /// line into a paragraph, and for the drag-to-line-start boundary.
+    #[tokio::test]
+    async fn program_selection_shimmer_covers_selected_blocks_exactly() {
+        let (mut app, _dir, server) = empty_app().await;
+        let cases: Vec<(&str, usize, usize, Vec<usize>)> = vec![
+            (
+                "word-in-item",
+                doc_offset(SHIMMER_DOC, 1, 2),
+                doc_offset(SHIMMER_DOC, 1, 7),
+                vec![1, 2],
+            ),
+            (
+                "across-items",
+                doc_offset(SHIMMER_DOC, 2, 5),
+                doc_offset(SHIMMER_DOC, 3, 4),
+                vec![1, 2, 3],
+            ),
+            (
+                "across-blank",
+                doc_offset(SHIMMER_DOC, 3, 9),
+                doc_offset(SHIMMER_DOC, 5, 3),
+                vec![3, 5, 6],
+            ),
+            (
+                "ends-at-line-start",
+                doc_offset(SHIMMER_DOC, 1, 0),
+                doc_offset(SHIMMER_DOC, 3, 0),
+                vec![1, 2],
+            ),
+        ];
+        for daemon_blocks in [false, true] {
+            for (name, anchor, head, expected_lines) in &cases {
+                let session = format!("s-{name}-{daemon_blocks}");
+                let active =
+                    shimmer_lines_for_selection(&mut app, &session, *anchor, *head, daemon_blocks);
+                let expected: Vec<bool> = (0..SHIMMER_DOC.lines().count())
+                    .map(|i| expected_lines.contains(&i))
+                    .collect();
+                assert_eq!(
+                    active, expected,
+                    "case {name} (daemon_blocks={daemon_blocks}): shimmer lines mismatch"
+                );
+            }
+        }
+        server.abort();
+    }
+
+    /// The shimmer overlay restyles every glyph of an active source line —
+    /// rendered bullet prefix included — and touches nothing on inactive
+    /// lines, so the visual band matches the block mask exactly. Wrapped rows
+    /// inherit the styling because the overlay runs on the logical line
+    /// before ratatui word-wraps it (the paint-vs-math differential test
+    /// above pins that mapping).
+    #[tokio::test]
+    async fn program_shimmer_overlay_restyles_only_active_lines() {
+        let (app, _dir, server) = empty_app().await;
+        let mut lines = crate::ui::render_program_markdown_lines_for_test(&app, SHIMMER_DOC);
+        let before_text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let before_span_counts: Vec<usize> = lines.iter().map(|line| line.spans.len()).collect();
+        let active = vec![false, true, true, false, false, false, false];
+        crate::ui::apply_program_shimmer_for_test(&mut lines, active.clone(), &app.theme);
+        for (i, line) in lines.iter().enumerate() {
+            let after_text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(
+                after_text, before_text[i],
+                "line {i}: the shimmer must never change the painted text"
+            );
+            if active[i] {
+                assert_eq!(
+                    line.spans.len(),
+                    after_text.chars().count(),
+                    "line {i}: every glyph of an active line is individually restyled"
+                );
+            } else {
+                assert_eq!(
+                    line.spans.len(),
+                    before_span_counts[i],
+                    "line {i}: inactive lines must be left untouched"
+                );
+            }
+        }
+        server.abort();
+    }
+
     /// Differential regression harness for program-editor cursor/selection
     /// drift: for every alphanumeric char in each corpus doc, paint the real
     /// pipeline (`render_program_markdown_lines` + ratatui
