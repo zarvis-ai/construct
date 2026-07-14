@@ -22718,6 +22718,35 @@ mod tests {
         server.abort();
     }
 
+    /// Backspace stays strictly char-wise on list items: the dissolve
+    /// affordance belongs to Enter alone (spec 0094), and the checklist box
+    /// is plain text — deleting at the end of `* [ ]` removes only the `]`,
+    /// never the box, the marker, or the line.
+    #[tokio::test]
+    async fn program_backspace_on_checklist_deletes_single_char() {
+        let (mut app, _dir, server) = empty_app().await;
+        app.program_popup = Some(program_popup_for_test("s1", "* [ ]", 5));
+        app.delete_program_back();
+        {
+            let popup = app.program_popup.as_ref().unwrap();
+            assert_eq!(
+                popup.buffer, "* [ ",
+                "backspace at the end of a checklist box should delete only the ']'"
+            );
+            assert_eq!(popup.cursor, 4);
+        }
+        // An empty marker-only item deletes char-wise too — no Enter-style
+        // dissolve on Backspace.
+        app.program_popup = Some(program_popup_for_test("s1", "- ", 2));
+        app.delete_program_back();
+        let popup = app.program_popup.as_ref().unwrap();
+        assert_eq!(
+            popup.buffer, "-",
+            "backspace on an empty item should delete only the marker space"
+        );
+        server.abort();
+    }
+
     /// Differential regression harness for program-editor cursor/selection
     /// drift: for every alphanumeric char in each corpus doc, paint the real
     /// pipeline (`render_program_markdown_lines` + ratatui
