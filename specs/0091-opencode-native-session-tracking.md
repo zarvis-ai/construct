@@ -45,6 +45,9 @@ across Construct daemon restarts.
   ordinary Construct reset lineage and make the new id the resume target.
 - `construct-mcp` tools are available inside OpenCode by default unless
   `CONSTRUCT_INJECT_MCP=0` is set.
+- OpenCode command discovery honors explicit Construct overrides first, then
+  the daemon's `PATH`, then the standard `~/.opencode/bin/opencode` installer
+  location. Availability reporting and process launch use the same resolution.
 - Failure to install or configure the capture plugin must not prevent OpenCode
   from launching; it degrades to a fresh conversation on a later respawn.
 - The OpenCode TUI continues to own approvals, tools, rendering, and session

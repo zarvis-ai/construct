@@ -6,7 +6,8 @@
 //! restart, including after OpenCode's `/new` or session-switching commands.
 //!
 //! Honors `CONSTRUCT_OPENCODE_CMD` for a full command prefix, falling back to
-//! `CONSTRUCT_OPENCODE_BIN`, then `opencode` on `PATH`.
+//! `CONSTRUCT_OPENCODE_BIN`, then `opencode` on `PATH`, then the standard
+//! OpenCode installer location at `~/.opencode/bin/opencode`.
 
 use construct_protocol::adapter::pty::{run_session as run_pty, PtySpec};
 use construct_protocol::adapter::{run as adapter_run, AdapterContext, EventEmitter};
@@ -46,10 +47,14 @@ pub async fn run() -> anyhow::Result<()> {
 }
 
 async fn run_interactive(params: SessionStartParams, ctx: AdapterContext) {
+    let default_bin = construct_protocol::adapter::default_cli_bin_with_home_fallback(
+        "opencode",
+        Path::new(".opencode/bin/opencode"),
+    );
     let command = construct_protocol::adapter::resolve_command_override(
         "CONSTRUCT_OPENCODE_CMD",
         "CONSTRUCT_OPENCODE_BIN",
-        "opencode",
+        &default_bin,
     );
     let resuming = std::env::var("CONSTRUCT_RESUME").as_deref() == Ok("1");
     let data_dir = std::env::var("CONSTRUCT_SESSION_DATA_DIR")

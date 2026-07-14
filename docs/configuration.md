@@ -99,6 +99,10 @@ env = { CONSTRUCT_CODEX_CMD = "exec codex" }
 | `grok` | `CONSTRUCT_GROK_CMD` | `CONSTRUCT_GROK_BIN` |
 | `shell` | `CONSTRUCT_SHELL_CMD` | `CONSTRUCT_SHELL_BIN` |
 
+OpenCode discovery checks `opencode` on the daemon's `PATH`, then the standard
+installer location at `~/.opencode/bin/opencode`. The explicit command and
+binary overrides above take precedence over both.
+
 ## TUI Theme
 
 The TUI ships a Matrix-inspired palette in two variants — one for dark

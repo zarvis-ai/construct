@@ -42,7 +42,7 @@ use crate::{
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
@@ -73,6 +73,37 @@ impl CommandOverride {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Prefer a named CLI on `PATH`, then fall back to its conventional location
+/// below the user's home directory.
+///
+/// Explicit `CONSTRUCT_*_CMD` / `CONSTRUCT_*_BIN` overrides remain the
+/// responsibility of [`resolve_command_override`] and therefore take
+/// precedence over the value returned here.
+pub fn default_cli_bin_with_home_fallback(default_bin: &str, home_relative: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    default_cli_bin_with_home_fallback_from(
+        default_bin,
+        home_relative,
+        home.as_deref(),
+        which::which(default_bin).is_ok(),
+    )
+}
+
+fn default_cli_bin_with_home_fallback_from(
+    default_bin: &str,
+    home_relative: &Path,
+    home: Option<&Path>,
+    found_on_path: bool,
+) -> String {
+    if found_on_path {
+        return default_bin.to_string();
+    }
+    home.map(|dir| dir.join(home_relative))
+        .filter(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| default_bin.to_string())
 }
 
 /// Resolve a child CLI command from either a full command override env var
@@ -1087,6 +1118,34 @@ mod tests {
     fn parse_command_words_rejects_unclosed_quotes() {
         assert!(parse_command_words("exec 'codex").is_none());
         assert!(parse_command_words("   ").is_none());
+    }
+
+    #[test]
+    fn home_fallback_is_used_only_when_cli_is_missing_from_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let relative = Path::new(".opencode/bin/opencode");
+        let fallback = tmp.path().join(relative);
+        std::fs::create_dir_all(fallback.parent().unwrap()).expect("mkdir");
+        std::fs::write(&fallback, "fixture").expect("write fixture");
+
+        assert_eq!(
+            default_cli_bin_with_home_fallback_from(
+                "opencode",
+                relative,
+                Some(tmp.path()),
+                false,
+            ),
+            fallback.to_string_lossy()
+        );
+        assert_eq!(
+            default_cli_bin_with_home_fallback_from(
+                "opencode",
+                relative,
+                Some(tmp.path()),
+                true,
+            ),
+            "opencode"
+        );
     }
 
     #[test]

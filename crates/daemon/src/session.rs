@@ -2055,7 +2055,10 @@ impl SessionManager {
             "opencode" => probe_wrapper_cli(
                 "CONSTRUCT_OPENCODE_CMD",
                 "CONSTRUCT_OPENCODE_BIN",
-                "opencode",
+                &construct_protocol::adapter::default_cli_bin_with_home_fallback(
+                    "opencode",
+                    std::path::Path::new(".opencode/bin/opencode"),
+                ),
             ),
             "antigravity" | "agy" => probe_wrapper_cli(
                 "CONSTRUCT_ANTIGRAVITY_CMD",

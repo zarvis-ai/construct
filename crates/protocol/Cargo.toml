@@ -20,6 +20,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 futures = { workspace = true }
 base64 = { workspace = true }
+which.workspace = true
 portable-pty = { workspace = true, optional = true }
 
 [features]
@@ -27,3 +28,6 @@ default = []
 # Enable the [`adapter::pty`] runtime helper. Heavy: pulls in `portable-pty`
 # and friends. Only adapters that spawn a PTY-backed child should opt in.
 pty = ["dep:portable-pty"]
+
+[dev-dependencies]
+tempfile = "3"
