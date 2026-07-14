@@ -3879,6 +3879,7 @@ const listDrag = {
   startY: 0,
   holdTimer: null,     // touch press-and-hold timer
   sourceId: null,
+  sourceGroupId: null,
   targetEl: null,
   dropAfter: false,
   suppressClick: false, // swallow the click that follows a drag
@@ -3886,9 +3887,13 @@ const listDrag = {
 };
 
 function listDragSourceEl() {
-  return listDrag.sourceId
-    ? sessionListEl.querySelector(`.item[data-id="${CSS.escape(listDrag.sourceId)}"]`)
-    : null;
+  if (listDrag.sourceId) {
+    return sessionListEl.querySelector(`.item[data-id="${CSS.escape(listDrag.sourceId)}"]`);
+  }
+  if (listDrag.sourceGroupId) {
+    return sessionListEl.querySelector(`.group-header[data-group-id="${CSS.escape(listDrag.sourceGroupId)}"]`);
+  }
+  return null;
 }
 
 function listDragClearIndicator() {
@@ -3916,9 +3921,11 @@ function listDragTrack(x, y) {
   else if (y > rect.bottom - 28) sessionListEl.scrollTop += 10;
   listDragClearIndicator();
   const under = document.elementFromPoint(x, y);
-  const row = under && under.closest ? under.closest(".session-list .item[data-id]") : null;
+  const isGroup = !!listDrag.sourceGroupId;
+  const row = under && under.closest ? under.closest(isGroup ? ".session-list .group-header[data-group-id]" : ".session-list .item[data-id]") : null;
   if (!row || !sessionListEl.contains(row)) return;
-  if (row.dataset.id === listDrag.sourceId || row.classList.contains("is-operator")) return;
+  if (isGroup && row.dataset.groupId === listDrag.sourceGroupId) return;
+  if (!isGroup && (row.dataset.id === listDrag.sourceId || row.classList.contains("is-operator"))) return;
   const r = row.getBoundingClientRect();
   listDrag.dropAfter = y > r.top + r.height / 2;
   row.classList.add(listDrag.dropAfter ? "drop-after" : "drop-before");
@@ -3941,37 +3948,63 @@ async function moveSessionSteps(sessionId, steps) {
   }
 }
 
+async function moveGroupSteps(groupId, steps) {
+  const direction = steps > 0 ? "down" : "up";
+  for (let i = 0; i < Math.abs(steps); i += 1) {
+    try {
+      const res = await rpc("group.move", { group_id: groupId, direction });
+      if (res && res.moved === false) break;
+    } catch (e) {
+      appendError(`reorder failed: ${e.message}`);
+      break;
+    }
+  }
+}
+
 function listDragFinish(commit) {
   clearTimeout(listDrag.holdTimer);
   listDrag.holdTimer = null;
   const wasActive = listDrag.active;
   const sourceId = listDrag.sourceId;
+  const sourceGroupId = listDrag.sourceGroupId;
   const targetEl = listDrag.targetEl;
   const dropAfter = listDrag.dropAfter;
   listDrag.armed = false;
   listDrag.active = false;
   listDrag.pointerId = null;
   listDrag.sourceId = null;
+  listDrag.sourceGroupId = null;
   sessionListEl.classList.remove("drag-active");
   const src = sourceId
     ? sessionListEl.querySelector(`.item[data-id="${CSS.escape(sourceId)}"]`)
-    : null;
+    : sourceGroupId
+      ? sessionListEl.querySelector(`.group-header[data-group-id="${CSS.escape(sourceGroupId)}"]`)
+      : null;
   if (src) src.classList.remove("drag-source");
   listDragClearIndicator();
   if (!wasActive) return;
   listDrag.suppressClick = true;
-  if (commit && sourceId && targetEl) {
+  if (commit && (sourceId || sourceGroupId) && targetEl) {
+    const isGroup = !!sourceGroupId;
     const ids = Array.from(
-      sessionListEl.querySelectorAll(".item[data-id]:not(.is-operator)")
-    ).map((el) => el.dataset.id);
-    const from = ids.indexOf(sourceId);
-    const slot = ids.indexOf(targetEl.dataset.id) + (dropAfter ? 1 : 0);
+      sessionListEl.querySelectorAll(isGroup ? ".group-header[data-group-id]" : ".item[data-id]:not(.is-operator)")
+    ).map((el) => isGroup ? el.dataset.groupId : el.dataset.id);
+    const idToMove = isGroup ? sourceGroupId : sourceId;
+    const from = ids.indexOf(idToMove);
+    const targetId = isGroup ? targetEl.dataset.groupId : targetEl.dataset.id;
+    const slot = ids.indexOf(targetId) + (dropAfter ? 1 : 0);
     if (from >= 0 && slot >= 0) {
       // Removing the row from its old index shifts every later slot
       // up by one, so a downward move covers one fewer row than the
       // raw slot delta.
       const steps = slot > from ? slot - from - 1 : slot - from;
-      if (steps !== 0) moveSessionSteps(sourceId, steps);
+      if (steps !== 0) {
+        if (isGroup) {
+          moveGroupSteps(idToMove, steps);
+        } else {
+          moveSessionSteps(idToMove, steps);
+        }
+      }
     }
   }
   if (listDrag.renderQueued) {
@@ -3985,7 +4018,7 @@ function bindSessionListDrag() {
   sessionListEl.__dragBound = true;
   sessionListEl.addEventListener("pointerdown", (ev) => {
     if (ev.button !== 0 || listDrag.armed) return;
-    const row = ev.target.closest(".item[data-id]");
+    const row = ev.target.closest(".item[data-id], .group-header[data-group-id]");
     if (!row || row.classList.contains("is-operator")) return;
     if (ev.target.closest(".disclosure.can-toggle")) return;
     listDrag.armed = true;
@@ -3993,7 +4026,11 @@ function bindSessionListDrag() {
     listDrag.isTouch = ev.pointerType === "touch";
     listDrag.startX = ev.clientX;
     listDrag.startY = ev.clientY;
-    listDrag.sourceId = row.dataset.id;
+    if (row.classList.contains("group-header")) {
+      listDrag.sourceGroupId = row.dataset.groupId;
+    } else {
+      listDrag.sourceId = row.dataset.id;
+    }
     // Touch arms via press-and-hold so an immediate swipe stays a
     // scroll; mouse arms on a small movement threshold instead.
     if (listDrag.isTouch) listDrag.holdTimer = setTimeout(listDragStart, 300);
