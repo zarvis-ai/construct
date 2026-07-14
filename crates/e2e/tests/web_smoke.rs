@@ -191,7 +191,7 @@ async fn web_client_loads_and_websocket_connects() {
         .expect("json value");
     assert_eq!(inherited_project["group_id"], "project-123");
 
-    // Every WebUI xterm paints a concrete background, even for Matrix/Basic.
+    // Every WebUI xterm paints a concrete background, even for Matrix.
     // Theme changes must report that RGB value so the daemon remains the sole
     // authority answering live child OSC 11 probes.
     let web_terminal_background: serde_json::Value = page
@@ -236,11 +236,11 @@ async fn web_client_loads_and_websocket_connects() {
     );
     assert_eq!(
         web_terminal_background["light"],
-        serde_json::json!([246, 248, 251])
+        serde_json::json!([255, 255, 255])
     );
     assert_eq!(
         web_terminal_background["report"]["params"]["background"],
-        serde_json::json!([246, 248, 251])
+        serde_json::json!([255, 255, 255])
     );
 
     // Terminal fast-open hydrates only a small recent PTY tail first;
@@ -930,7 +930,9 @@ async fn web_client_loads_and_websocket_connects() {
         .expect("json");
     assert_eq!(mini_matrix["tag"], "CANVAS");
     assert_eq!(mini_matrix["label"], "construct connected");
-    assert_eq!(mini_matrix["role"], "img");
+    // The badge doubles as the settings button (click opens the
+    // settings sheet), so it exposes a button role and stays focusable.
+    assert_eq!(mini_matrix["role"], "button");
     assert_eq!(mini_matrix["connState"], "open");
     assert_eq!(mini_matrix["connLabel"], "connected");
     assert_eq!(mini_matrix["visibleConnText"], "");
@@ -1382,8 +1384,8 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(operator_label["firstId"], "s-operator");
     assert_eq!(operator_label["hasOldGodClass"], false);
 
-    // Issue #132: the web session list exposes pin/unpin in the
-    // selected-session toolbar and marks pinned rows visibly.
+    // Issue #132: the web UI exposes pin/unpin for the selected session
+    // (as a session-menu item whose label flips) and marks pinned rows visibly.
     let pin_ui: serde_json::Value = page
         .evaluate(
             r#"
@@ -1417,21 +1419,19 @@ async fn web_client_loads_and_websocket_connects() {
               ];
               state.groups = [];
               renderSessions();
-              const initialButton = document.getElementById('toolbarPinBtn');
+              const initialItem = document.getElementById('sessionMenuPinItem');
               const initial = {
                 rowText: document.querySelector('[data-id="s2"]')?.innerText || '',
-                buttonText: initialButton?.textContent || '',
-                aria: initialButton?.getAttribute('aria-label') || '',
-                disabled: initialButton?.disabled === true,
+                itemText: initialItem?.textContent || '',
+                disabled: initialItem?.disabled === true,
               };
               await handleRowAction('pin', 's1');
               state.currentId = 's2';
               renderSessions();
-              const pinnedButton = document.getElementById('toolbarPinBtn');
+              const pinnedItem = document.getElementById('sessionMenuPinItem');
               const pinned = {
-                buttonText: pinnedButton?.textContent || '',
-                aria: pinnedButton?.getAttribute('aria-label') || '',
-                active: pinnedButton?.classList.contains('is-on') === true,
+                itemText: pinnedItem?.textContent || '',
+                disabled: pinnedItem?.disabled === true,
               };
               rpc = oldRpc;
               return { initial, pinned, calls };
@@ -1449,12 +1449,10 @@ async fn web_client_loads_and_websocket_connects() {
             .contains("★"),
         "pinned session row did not include visible pin marker: {pin_ui:?}"
     );
-    assert_eq!(pin_ui["initial"]["buttonText"], "☆");
-    assert_eq!(pin_ui["initial"]["aria"], "pin selected");
+    assert_eq!(pin_ui["initial"]["itemText"], "pin");
     assert_eq!(pin_ui["initial"]["disabled"], false);
-    assert_eq!(pin_ui["pinned"]["buttonText"], "★");
-    assert_eq!(pin_ui["pinned"]["aria"], "unpin selected");
-    assert_eq!(pin_ui["pinned"]["active"], true);
+    assert_eq!(pin_ui["pinned"]["itemText"], "unpin");
+    assert_eq!(pin_ui["pinned"]["disabled"], false);
     assert_eq!(
         pin_ui["calls"],
         serde_json::json!([
@@ -1723,15 +1721,18 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(scroll_buttons["bottomText"], "bottom");
     assert_eq!(scroll_buttons["position"], "absolute");
     assert_eq!(scroll_buttons["top"], "8px");
-    assert_eq!(scroll_buttons["right"], "8px");
+    // The session-menu pill owns the outermost top-right slot; the
+    // scroll cluster sits to its left.
+    assert_eq!(scroll_buttons["right"], "72px");
     assert_eq!(scroll_buttons["fontSize"], "11px");
     assert_eq!(scroll_buttons["hook"], true);
+    let overlay_bg = scroll_buttons["background"].as_str().unwrap_or_default();
+    // Chrome serializes the color-mix() result as `color(srgb r g b / a)`;
+    // older plain-rgba styling serialized as `rgba(...)`. Either way the
+    // contract is a translucent backdrop, not an opaque plate.
     assert!(
-        scroll_buttons["background"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("rgba"),
-        "expected transparent overlay background, got {scroll_buttons:?}"
+        overlay_bg.contains("rgba") || overlay_bg.contains("/ 0.75"),
+        "expected translucent overlay background, got {scroll_buttons:?}"
     );
     // Scroll only — no `focus` calls. Focusing xterm would summon the
     // mobile soft keyboard when the user merely jumps scrollback.

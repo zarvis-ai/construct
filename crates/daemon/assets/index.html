@@ -18,36 +18,64 @@
 <script src="/static/xterm.js" defer></script>
 <script src="/static/xterm-addon-fit.js" defer></script>
 <style>
+  /*
+    Design system: modern AI-chat-app styling with a construct accent.
+    The default themes (dark / light / basic) are intentionally familiar —
+    sans-serif UI, rounded surfaces, soft borders, restrained color.
+    The full CRT nostalgia (scanlines, phosphor glow, monospace chrome)
+    lives at the bottom of this sheet, scoped to html[data-theme="matrix"],
+    so it stays one theme-picker option instead of the baseline.
+
+    :root holds the "dark" theme values so the pre-JS first paint matches
+    the default theme; applyWebTheme() overrides these per theme.
+  */
   :root {
-    --bg: #020805;
-    --bg-elev: #06150c;
-    --bg-elev-2: #0a2112;
-    --border: #186030;
-    --border-faint: rgba(24, 96, 48, 0.46);
-    --fg: #beffcd;
-    --fg-dim: #4c965c;
-    --fg-faint: #20703a;
-    --accent: #39ff88;
-    --accent-alt: #5ce1ff;
-    --modeline-bg: #082e18;
-    --ok: #7dff73;
-    --warn: #ffd75c;
-    --err: #ff5f5a;
-    --bubble-user: rgba(8, 46, 24, 0.82);
-    --bubble-assistant: rgba(6, 21, 12, 0.86);
-    --bubble-system: rgba(4, 14, 8, 0.90);
-    --session-scrollbar-track: rgba(190, 255, 205, 0.30);
-    --session-scrollbar-thumb: rgba(190, 255, 205, 0.80);
-    --overlay-line-a: rgba(190, 255, 205, 0.025);
-    --overlay-line-b: rgba(0, 0, 0, 0.08);
-    --overlay-accent: rgba(57, 255, 136, 0.10);
-    --overlay-alt: rgba(92, 225, 255, 0.07);
-    --overlay-opacity: 0.70;
-    --header-tail: #04140a;
-    --button-pressed-fg: #06160c;
+    --bg: #131316;
+    --bg-elev: #1b1b1f;
+    --bg-elev-2: #26262c;
+    --border: #2e2e35;
+    --border-faint: rgba(235, 235, 245, 0.08);
+    --fg: #ececf1;
+    --fg-dim: #9d9da8;
+    --fg-faint: #6c6c76;
+    --accent: #2fbf71;
+    --accent-fg: #0b1f14;
+    --accent-alt: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+    --bubble-user: #26262c;
+    --session-scrollbar-track: transparent;
+    --session-scrollbar-thumb: rgba(236, 236, 241, 0.28);
+    --term-bg: #131316;
+    --font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+      "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
-    --glow-soft: 0 0 18px rgba(57, 255, 136, 0.12);
-    --glow-hard: 0 0 14px rgba(57, 255, 136, 0.28);
+  }
+  /* Default theme is "system": before the JS applies the stored choice,
+     the first paint follows the OS preference (dark values above, light
+     values here). applyWebTheme() then writes inline vars, which win. */
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff;
+      --bg-elev: #f7f7f8;
+      --bg-elev-2: #ececee;
+      --border: #e0e0e4;
+      --border-faint: rgba(20, 20, 30, 0.08);
+      --fg: #1c1c21;
+      --fg-dim: #6b6b76;
+      --fg-faint: #9494a0;
+      --accent: #1a9e58;
+      --accent-fg: #ffffff;
+      --accent-alt: #0969da;
+      --ok: #1a7f37;
+      --warn: #9a6700;
+      --err: #cf222e;
+      --bubble-user: #ececee;
+      --session-scrollbar-track: transparent;
+      --session-scrollbar-thumb: rgba(28, 28, 33, 0.30);
+      --term-bg: #ffffff;
+    }
   }
   * { box-sizing: border-box; }
   html, body {
@@ -57,9 +85,7 @@
     overscroll-behavior: none;
     background: var(--bg);
     color: var(--fg);
-    font: 13px/1.45 var(--mono);
-    letter-spacing: 0.01em;
-    text-shadow: 0 0 10px rgba(57, 255, 136, 0.10);
+    font: 14px/1.5 var(--font-ui);
     -webkit-text-size-adjust: 100%;
   }
   body {
@@ -70,31 +96,16 @@
     padding-top: env(safe-area-inset-top);
     padding-bottom: env(safe-area-inset-bottom);
   }
-  body::before {
-    content: "";
-    position: fixed;
-    inset: 0;
-    pointer-events: none;
-    z-index: 2000;
-    background:
-      linear-gradient(var(--overlay-line-a) 50%, var(--overlay-line-b) 50%),
-      radial-gradient(circle at 16% 8%, var(--overlay-accent), transparent 30%),
-      radial-gradient(circle at 88% 14%, var(--overlay-alt), transparent 34%);
-    background-size: 100% 4px, 100% 100%, 100% 100%;
-    mix-blend-mode: screen;
-    opacity: var(--overlay-opacity);
-  }
   header {
-    --header-h: 44px;
+    --header-h: 48px;
     flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 8px;
     min-height: var(--header-h);
-    padding: 0 0 0 10px;
-    background: linear-gradient(90deg, var(--modeline-bg, #082e18), var(--header-tail) 70%);
+    padding: 0 10px;
+    background: var(--bg);
     border-bottom: 1px solid var(--border);
-    box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent) 16%, transparent), var(--glow-soft);
     /* Lets our pull-to-refresh handler track a vertical drag without the
        browser fighting it. Horizontal scroll on the header isn't useful. */
     touch-action: pan-y;
@@ -119,10 +130,9 @@
     justify-content: center;
     overflow: hidden;
     background: linear-gradient(180deg,
-      color-mix(in srgb, var(--accent) 28%, transparent), transparent);
+      color-mix(in srgb, var(--accent) 24%, transparent), transparent);
     color: var(--accent);
     font-size: 12px;
-    letter-spacing: 0.04em;
     /* Snaps back when released under threshold. During the drag we add
        `.dragging` to suppress the transition so the indicator tracks the
        finger 1:1. */
@@ -131,72 +141,81 @@
   .pull-indicator.dragging { transition: none; }
   .pull-indicator.armed {
     background: linear-gradient(180deg,
-      color-mix(in srgb, var(--accent) 55%, transparent), transparent);
+      color-mix(in srgb, var(--accent) 48%, transparent), transparent);
   }
   .pull-indicator .label {
     padding-bottom: 6px;
-    font-weight: bold;
+    font-weight: 600;
   }
+  /* The construct signature: a live matrix-rain connection indicator.
+     Framed as a small rounded badge so it reads as an intentional accent
+     inside an otherwise conventional header. */
   .mini-matrix {
     flex: 0 0 auto;
-    align-self: stretch;
+    align-self: center;
     width: 104px;
-    height: auto;
-    min-height: var(--header-h);
+    height: 32px;
     display: block;
-    border-left: 1px solid var(--border);
-    border-radius: 0;
-    background: var(--bg);
-    box-shadow: inset 0 0 18px color-mix(in srgb, var(--accent) 14%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #020805;
+    /* Doubles as the settings button. */
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
   }
+  /* Narrow view: the title bar is tight, so the badge goes square and
+     the view-mode switcher collapses to initials (see below). */
   @media (max-width: 720px) {
-    .mini-matrix { width: 84px; }
+    .mini-matrix { width: 32px; }
   }
   header .meta {
     color: var(--fg);
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    font-size: 13px;
+    font-weight: 600;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Segmented control for terminal / chat / program. */
   .view-mode-toggle {
     flex: 0 0 auto;
     display: inline-flex;
     align-items: center;
     margin-left: 4px;
-    border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg) 70%, transparent);
+    padding: 2px;
+    gap: 2px;
+    border-radius: 8px;
+    background: var(--bg-elev-2);
   }
   .view-mode-toggle[hidden] { display: none; }
   .view-mode-toggle button {
     appearance: none;
     border: 0;
-    border-radius: 0;
-    padding: 5px 7px;
+    border-radius: 6px;
+    padding: 4px 10px;
     background: transparent;
     color: var(--fg-dim);
     font: inherit;
-    font-size: 10px;
-    line-height: 1;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-size: 12px;
+    line-height: 1.3;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
   }
-  .view-mode-toggle button + button {
-    border-left: 1px solid var(--border-faint);
-  }
   .view-mode-toggle button[aria-pressed="true"] {
-    background: var(--accent);
-    color: var(--button-pressed-fg);
-    text-shadow: none;
+    background: var(--bg);
+    color: var(--fg);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
   }
   .view-mode-toggle button:not([aria-pressed="true"]):hover {
-    background: var(--bg-elev-2);
     color: var(--fg);
+  }
+  /* Collapsed (narrow-view) state: initials only, but keep a usable
+     tap target. The first tap expands to full labels without
+     switching; it auto-collapses again a few seconds later. */
+  .view-mode-toggle.collapsed button {
+    min-width: 28px;
+    padding: 4px 6px;
   }
   .conn {
     margin-left: auto;
@@ -205,7 +224,7 @@
   }
 
   main {
-    --session-list-width: 240px;
+    --session-list-width: 260px;
     flex: 1 1 0;
     min-height: 0;
     display: grid;
@@ -234,20 +253,15 @@
       grid-template-rows: 0 1fr;
     }
     .session-list.collapsed { max-height: 0; padding: 0; border-bottom: none; }
-    /* Hide the shared reorder / restart toolbar when the list is
-       collapsed — the buttons act on a selected session, but
-       there's no list visible to pick a session from. Leaving
-       them visible just wastes vertical space and lets the user
-       fire move-up / down on a row they can't see. */
+    /* When the list is collapsed, drop its header controls too —
+       they act on the list, and there's no list visible. */
     .session-list-wrap:has(.session-list.collapsed) {
       min-height: 0;
       overflow: hidden;
       border-right: none;
       border-bottom: none;
     }
-    .session-list-wrap:has(.session-list.collapsed) .new-session-btn,
-    .session-list-wrap:has(.session-list.collapsed) .theme-picker,
-    .session-list-wrap:has(.session-list.collapsed) .list-toolbar {
+    .session-list-wrap:has(.session-list.collapsed) .new-session-btn {
       display: none;
     }
   }
@@ -255,33 +269,57 @@
   .session-list {
     overflow-y: auto;
     border-right: 1px solid var(--border);
-    background:
-      linear-gradient(90deg, rgba(57, 255, 136, 0.05), transparent 36%),
-      var(--bg-elev);
+    background: var(--bg-elev);
     padding: 4px 0;
     border-bottom: 1px solid var(--border);
+    scrollbar-width: thin;
+    scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
   }
   .session-list .item {
-    margin: 1px 6px 1px 3px;
-    padding: 7px 9px;
+    position: relative;
+    margin: 1px 8px;
+    padding: 8px 10px 8px 6px;
     cursor: pointer;
-    border: 1px solid transparent;
-    border-left: 3px solid transparent;
+    border-radius: 8px;
     display: flex;
     align-items: center;
     gap: 4px;
+    font-size: 13px;
+    /* Rows are drag-reorder handles: keep press-and-hold from starting
+       a text selection (iOS callout, desktop drag-select) instead. */
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
   }
+  /* Drag-and-drop reorder: the grabbed row dims, and an accent
+     insertion line previews where the drop will land. */
+  .session-list.drag-active {
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .session-list .item.drag-source { opacity: 0.45; }
+  .session-list .item.drop-before::after,
+  .session-list .item.drop-after::after {
+    content: "";
+    position: absolute;
+    left: 4px;
+    right: 4px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--accent);
+    pointer-events: none;
+  }
+  .session-list .item.drop-before::after { top: -2.5px; }
+  .session-list .item.drop-after::after { bottom: -2.5px; }
   .session-list .item:hover {
-    background: rgba(57, 255, 136, 0.07);
-    border-color: var(--border-faint);
+    background: var(--bg-elev-2);
   }
   .session-list .item.active {
-    background: var(--accent);
-    color: #06160c;
-    border-color: var(--accent);
-    border-left-color: var(--accent-alt);
-    text-shadow: none;
-    box-shadow: var(--glow-hard);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .session-list .item.active .name {
+    color: var(--fg);
+    font-weight: 600;
   }
   .session-list .item .row-main {
     flex: 1;
@@ -305,7 +343,7 @@
     flex: 0 0 10px;
     width: 10px;
     color: var(--accent);
-    font-size: 12px;
+    font-size: 11px;
     line-height: 1;
     text-align: center;
   }
@@ -314,26 +352,16 @@
   }
   .session-list .item .sub {
     color: var(--fg-faint);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    font-size: 11px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-  }
-  .session-list .item.active .sub,
-  .session-list .item.active .pin-indicator,
-  .session-list .item.active .disclosure {
-    color: #06160c;
-  }
-  .session-list .item.active .state {
-    color: #020805;
   }
   .session-list .item .state {
     flex: 0 0 14px;
     width: 14px;
     text-align: center;
-    font-size: 10px;
+    font-size: 9px;
     line-height: 1;
     color: var(--fg-dim);
   }
@@ -343,34 +371,27 @@
   .session-list .item .state.state-paused { color: var(--warn); }
   .session-list .item .state.state-done { color: var(--accent); }
   .session-list .item .state.state-errored { color: var(--err); }
-  .session-list .item.active .state.state-pending,
-  .session-list .item.active .state.state-done { color: #06160c; }
-  .session-list .item.active .state.state-running,
-  .session-list .item.active .state.state-awaiting_input { color: #005320; }
-  .session-list .item.active .state.state-paused { color: #5a3600; }
-  .session-list .item.active .state.state-errored { color: #6d0000; }
   /* Group header (matches TUI's `▾ name` line above each group).
      Tappable — flips the group's collapsed bit. */
   .session-list .group-header {
-    padding: 6px 12px 4px;
+    padding: 8px 14px 4px;
     color: var(--fg-dim);
     font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-weight: 600;
     display: flex;
     gap: 6px;
     align-items: center;
-    border-top: 1px solid var(--border);
-    margin-top: 4px;
+    border-top: 1px solid var(--border-faint);
+    margin-top: 6px;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
   }
-  .session-list .group-header:hover { background: var(--bg-elev-2); }
+  .session-list .group-header:hover { color: var(--fg); }
   .session-list .group-glyph {
     flex: 0 0 31px;
     width: 31px;
     color: var(--fg-faint);
-    font-size: 18px;
+    font-size: 14px;
     line-height: 1;
     text-align: center;
   }
@@ -387,7 +408,7 @@
     opacity: 0.55;
   }
   .session-list .archived-row {
-    padding: 3px 12px;
+    padding: 4px 14px;
     color: var(--fg-dim);
     font-size: 12px;
     display: flex;
@@ -397,21 +418,21 @@
     -webkit-tap-highlight-color: transparent;
     user-select: none;
   }
-  .session-list .archived-row:hover { background: var(--bg-elev-2); }
+  .session-list .archived-row:hover { color: var(--fg); }
   .session-list .archived-row.indent { padding-left: 20px; }
   .session-list .archived-glyph {
     flex: 0 0 20px;
     width: 20px;
     color: var(--fg-faint);
-    font-size: 14px;
+    font-size: 13px;
     line-height: 1;
     text-align: center;
   }
   .session-list .item .disclosure {
-    flex: 0 0 20px;
-    width: 20px;
+    flex: 0 0 12px;
+    width: 12px;
     color: var(--fg-faint);
-    font-size: 18px;
+    font-size: 14px;
     line-height: 1;
     text-align: center;
   }
@@ -425,47 +446,12 @@
   .session-list .item.is-operator .name {
     color: var(--accent);
     font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-  .session-list .item.is-operator.active .name {
-    color: inherit;
   }
   .session-list .item.is-operator {
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-faint);
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
     margin-bottom: 4px;
-  }
-  /* Per-row action button (restart, move up/down, future delete).
-     Small touch target on the right edge of each session row. */
-  .session-list .row-action,
-  .list-toolbar .row-action {
-    flex: 0 0 auto;
-    width: 24px;
-    height: 24px;
-    margin-left: 2px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: transparent;
-    color: var(--fg-dim);
-    font-size: 12px;
-    cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-    line-height: 1;
-  }
-  .session-list .row-action:hover,
-  .list-toolbar .row-action:hover {
-    background: var(--bg-elev-2);
-    color: var(--fg);
-  }
-  .session-list .row-action:active,
-  .list-toolbar .row-action:active {
-    background: var(--accent);
-    color: #06160c;
-  }
-  .session-list .row-action.is-on,
-  .list-toolbar .row-action.is-on {
-    color: var(--accent);
-    border-color: rgba(107, 123, 255, 0.55);
-    background: rgba(107, 123, 255, 0.12);
   }
   .session-list .empty {
     color: var(--fg-dim);
@@ -480,9 +466,7 @@
     flex-direction: column;
     min-width: 0;
     min-height: 0;
-    background:
-      radial-gradient(circle at 70% 0%, rgba(57, 255, 136, 0.06), transparent 36%),
-      #020805;
+    background: var(--bg);
   }
   .transcript {
     flex: 1 1 0;
@@ -490,11 +474,14 @@
     position: relative;
     overflow: hidden;
   }
+  /* Chat content sits in a centered column (the familiar AI-chat reading
+     measure) via symmetric padding that grows once the pane is wider than
+     52rem + the 16px minimum gutters. */
   .transcript-pane {
     position: absolute;
     inset: 0;
     overflow-y: auto;
-    padding: 12px 14px 16px;
+    padding: 16px max(16px, calc((100% - 52rem) / 2)) 24px;
     /* No `scroll-behavior: smooth` here: programmatic "stick to
        bottom" must land instantly. Smooth scrolling animates over a
        still-settling layout (widget hydration, <details>, composer
@@ -515,9 +502,11 @@
   .transcript-skeleton .sk-row { display: flex; gap: 8px; }
   .transcript-skeleton .sk-bar {
     height: 10px;
-    border-radius: 3px;
+    border-radius: 5px;
     background: linear-gradient(90deg,
-      rgba(57, 255, 136, 0.05), rgba(57, 255, 136, 0.14), rgba(57, 255, 136, 0.05));
+      color-mix(in srgb, var(--fg) 6%, transparent),
+      color-mix(in srgb, var(--fg) 14%, transparent),
+      color-mix(in srgb, var(--fg) 6%, transparent));
     background-size: 200% 100%;
     animation: sk-shimmer 1.2s ease-in-out infinite;
   }
@@ -541,17 +530,17 @@
     z-index: 5;
     padding: 6px 14px;
     font-size: 12px;
-    color: var(--dim);
+    color: var(--fg-dim);
     background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
     border-bottom: 1px solid var(--border);
     backdrop-filter: blur(4px);
     pointer-events: none;
   }
   .transcript-pane::-webkit-scrollbar {
-    width: 16px;
+    width: 12px;
   }
   .transcript-pane::-webkit-scrollbar-track {
-    background: var(--session-scrollbar-track);
+    background: transparent;
   }
   .transcript-pane::-webkit-scrollbar-thumb {
     background: var(--session-scrollbar-thumb);
@@ -560,56 +549,58 @@
     border-radius: 999px;
   }
   .transcript-pane::-webkit-scrollbar-thumb:hover {
-    background: var(--fg);
+    background: var(--fg-dim);
     background-clip: content-box;
   }
   .row {
-    margin: 8px 0;
+    margin: 10px 0;
     display: flex;
     flex-direction: column;
     gap: 4px;
     word-wrap: break-word;
     overflow-wrap: anywhere;
   }
-  .row .meta {
-    font-size: 11px;
-    color: var(--fg-faint);
-    letter-spacing: 0.02em;
-  }
+  /* Modern chat apps don't caption every message with its role — alignment
+     and surface carry it (user: tinted bubble on the right; assistant:
+     plain text on the left). */
+  .row .meta { display: none; }
   .bubble {
-    border-radius: 0;
-    padding: 8px 10px;
+    padding: 10px 14px;
     white-space: pre-wrap;
-    max-width: min(820px, 95%);
-    border: 1px solid var(--border-faint);
-    box-shadow: inset 0 0 18px rgba(57, 255, 136, 0.045);
+    max-width: min(820px, 92%);
+    border-radius: 18px;
   }
+  .role-user { align-items: flex-end; }
   .role-user .bubble {
     background: var(--bubble-user);
     align-self: flex-end;
-    border-color: rgba(92, 225, 255, 0.42);
-    color: #e1ffe6;
+    max-width: min(640px, 85%);
+    border-bottom-right-radius: 6px;
   }
-  .row.optimistic .bubble { opacity: 0.78; }
-  .row.optimistic .meta::after { content: " · sending"; color: var(--fg-faint); }
-  .role-user { align-items: flex-end; }
+  .row.optimistic .bubble { opacity: 0.7; }
+  /* Assistant replies read as the page itself, not a bubble. */
   .role-assistant .bubble {
-    background: var(--bubble-assistant);
-    border-left: 3px solid var(--accent);
+    background: transparent;
+    align-self: stretch;
+    max-width: none;
+    padding: 0 2px;
+    border-radius: 0;
   }
   .role-system .bubble {
-    background: var(--bubble-system);
+    background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
+    border: 1px solid var(--border-faint);
     color: var(--fg-dim);
-    font-size: 13px;
-    border-style: dashed;
+    font-size: 12.5px;
+    border-radius: 12px;
+    padding: 8px 12px;
   }
   .tool {
-    border-left: 3px solid var(--accent);
+    border: 1px solid var(--border-faint);
     background: var(--bg-elev);
-    padding: 6px 10px;
-    border-radius: 0;
+    padding: 8px 12px;
+    border-radius: 12px;
     font-family: var(--mono);
-    font-size: 12.5px;
+    font-size: 12px;
     color: var(--fg-dim);
   }
   .tool .tool-name { color: var(--fg); font-weight: 500; }
@@ -627,10 +618,11 @@
     max-height: 80%;
     overflow: auto;
     border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg-elev) 92%, transparent);
-    border-radius: 10px;
+    background: color-mix(in srgb, var(--bg-elev) 94%, transparent);
+    backdrop-filter: blur(8px);
+    border-radius: 12px;
     padding: 8px;
-    box-shadow: 0 12px 32px rgba(0,0,0,.42);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
     scrollbar-width: thin;
     scrollbar-color: var(--session-scrollbar-thumb) var(--session-scrollbar-track);
   }
@@ -646,13 +638,11 @@
     border-right: 0;
     border-bottom: 0;
     border-left: 0;
-    border-radius: 10px 10px 0 0;
+    border-radius: 12px 12px 0 0;
     z-index: 45;
   }
   .session-widgets.inline-open .widget-body { padding-left: 16px; padding-right: 16px; }
   .session-widgets.inline-open .widget-hide { margin-left: 0; }
-  .session-widgets.inline-open .widget-hide::before { content: none; }
-  .session-widgets.inline-open .widget-hide::after { content: none; }
   .inline-widget-backdrop {
     position: fixed;
     inset: 0;
@@ -663,24 +653,24 @@
   .widgets-toolbar { display: none; }
   .widgets-menu { display: grid; gap: 2px; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
   .widgets-menu-item { width: 100%; display: flex; gap: 8px; align-items: center; border: 0; background: transparent; color: var(--fg); text-align: left; padding: 5px 7px; border-radius: 6px; font: inherit; cursor: pointer; }
-  .widgets-menu-item:hover, .widgets-menu-item:focus { background: var(--bg-elev); outline: none; }
+  .widgets-menu-item:hover, .widgets-menu-item:focus { background: var(--bg-elev-2); outline: none; }
   .widgets-menu-mark { color: var(--accent); width: 1em; }
   .widget-stack { display: grid; gap: 8px; }
   .widget-card { border: 0; border-radius: 0; background: transparent; overflow: hidden; }
   .widget-card + .widget-card { border-top: 1px solid var(--border); padding-top: 8px; }
   .widget-card:focus { outline: 1px solid var(--accent); outline-offset: 2px; }
-  .widget-title { display: flex; align-items: center; gap: 8px; padding: 2px 0 6px; border-bottom: 1px solid var(--border); color: var(--accent); font-weight: 600; }
+  .widget-title { display: flex; align-items: center; gap: 8px; padding: 2px 0 6px; border-bottom: 1px solid var(--border); color: var(--fg); font-weight: 600; }
   .widget-title-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .widget-title-hint { margin-left: auto; color: var(--fg-dim); font-weight: 400; }
-  .widget-hide { margin-left: auto; border: 0; background: transparent; color: var(--fg-dim); padding: 0 2px; font: inherit; cursor: pointer; }
-  .widget-hide:hover, .widget-hide:focus { color: var(--accent); outline: none; background: color-mix(in srgb, var(--accent) 14%, transparent); }
-  .widget-body { padding: 8px; font-size: 13px; line-height: 1.35; }
+  .widget-hide { margin-left: auto; border: 0; background: transparent; color: var(--fg-dim); padding: 0 4px; border-radius: 4px; font: inherit; cursor: pointer; }
+  .widget-hide:hover, .widget-hide:focus { color: var(--fg); outline: none; background: var(--bg-elev-2); }
+  .widget-body { padding: 8px; font-size: 13px; line-height: 1.4; }
   .widget-body p { margin: 0 0 8px; }
-  .widget-body h1, .widget-body h2, .widget-body h3 { margin: 0 0 8px; font-size: 13px; color: var(--accent); }
+  .widget-body h1, .widget-body h2, .widget-body h3 { margin: 0 0 8px; font-size: 13px; color: var(--fg); }
   .widget-table { border-collapse: collapse; width: 100%; margin: 4px 0 8px; font-size: 12px; }
   .widget-table th, .widget-table td { border: 1px solid var(--border); padding: 3px 7px; vertical-align: top; }
-  .widget-table th { color: var(--accent); font-weight: 600; background: color-mix(in srgb, var(--accent) 10%, transparent); }
-  .widget-table tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--accent) 4%, transparent); }
+  .widget-table th { color: var(--fg); font-weight: 600; background: var(--bg-elev-2); }
+  .widget-table tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--fg) 3%, transparent); }
   .widget-line { display: flex; gap: 6px; align-items: baseline; min-height: 1.35em; }
   .widget-indent { display: inline-block; flex: 0 0 auto; }
   .widget-glyph { color: var(--accent); width: 1.2em; flex: 0 0 1.2em; text-align: center; }
@@ -689,7 +679,7 @@
   .widget-glyph.warn { color: var(--warn); }
   .widget-glyph.active { color: var(--accent); }
   .widget-action { border: 0; background: transparent; color: var(--accent); padding: 0; font: inherit; cursor: pointer; text-decoration: underline; text-decoration-style: dotted; }
-  .widget-action:hover, .widget-action:focus { color: var(--ok); outline: none; background: color-mix(in srgb, var(--accent) 14%, transparent); }
+  .widget-action:hover, .widget-action:focus { outline: none; background: color-mix(in srgb, var(--accent) 14%, transparent); }
   .widget-timeline { display: grid; gap: 0; }
   .timeline-item { position: relative; display: grid; grid-template-columns: 1.25rem 1fr; column-gap: 6px; padding-bottom: 10px; }
   .timeline-rail { position: relative; grid-row: 1 / span 2; min-height: 100%; }
@@ -723,7 +713,7 @@
     margin: 4px 0 0 0;
     padding: 6px 8px;
     background: var(--bg);
-    border-radius: 4px;
+    border-radius: 8px;
     overflow-x: auto;
     color: var(--fg);
     font-size: 12px;
@@ -731,26 +721,26 @@
   }
   .tool .badge {
     display: inline-block;
-    padding: 0 6px;
-    border-radius: 10px;
+    padding: 1px 8px;
+    border-radius: 999px;
     font-size: 10px;
     margin-left: 6px;
     vertical-align: middle;
     background: var(--bg-elev-2);
     color: var(--fg-dim);
   }
-  .tool .badge.ok { background: rgba(92, 209, 166, 0.18); color: var(--ok); }
-  .tool .badge.err { background: rgba(244, 124, 124, 0.18); color: var(--err); }
+  .tool .badge.ok { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .tool .badge.err { background: color-mix(in srgb, var(--err) 16%, transparent); color: var(--err); }
   .status {
     color: var(--fg-dim);
     font-size: 12px;
     font-style: italic;
   }
   .error {
-    background: rgba(244, 124, 124, 0.12);
-    border-left: 3px solid var(--err);
-    padding: 6px 10px;
-    border-radius: 4px;
+    background: color-mix(in srgb, var(--err) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--err) 30%, transparent);
+    padding: 8px 12px;
+    border-radius: 10px;
     color: var(--err);
     font-size: 13px;
   }
@@ -760,7 +750,7 @@
     color: var(--fg);
     background: var(--bg-elev);
     padding: 6px 10px;
-    border-radius: 4px;
+    border-radius: 8px;
     white-space: pre-wrap;
     overflow-x: auto;
   }
@@ -773,10 +763,10 @@
     z-index: 30;
     width: min(320px, 55vw);
     padding: 4px;
-    background: var(--bg);
+    background: var(--bg-elev);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   }
   .browser-preview[hidden] { display: none !important; }
   .browser-preview img {
@@ -785,7 +775,7 @@
     height: auto;
     max-height: min(180px, 26vh);
     object-fit: contain;
-    border-radius: 2px;
+    border-radius: 6px;
     background: #000;
   }
   .browser-preview-caption {
@@ -805,9 +795,9 @@
     line-height: 16px;
     padding: 0;
     border: none;
-    border-radius: 3px;
+    border-radius: 6px;
     background: rgba(0, 0, 0, 0.55);
-    color: var(--fg);
+    color: #fff;
     font-size: 14px;
     cursor: pointer;
   }
@@ -822,8 +812,7 @@
     flex-direction: column;
     gap: 4px;
     padding: 6px 10px;
-    border: 1px solid var(--border);
-    border-top: none;
+    border-top: 1px solid var(--border-faint);
     background: var(--bg-elev);
     font-family: var(--mono);
     font-size: 12.5px;
@@ -852,10 +841,33 @@
     font-style: italic;
   }
   .editor-state .editor-agent-status::before { content: "* "; }
-  /* Inline thinking row in chat mode */
-  .thinking-row .bubble { display: inline-flex; align-items: center; gap: 8px; }
-  .thinking-row .spinner { display: inline-block; animation: spin 1s linear infinite; }
-  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  /* Inline "assistant is working" row in chat mode: the familiar pulsing
+     typing dots. */
+  .thinking-row .bubble {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--fg-dim);
+    font-size: 13px;
+  }
+  .typing-dots {
+    display: inline-flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .typing-dots i {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--fg-dim);
+    animation: typing-pulse 1.2s ease-in-out infinite;
+  }
+  .typing-dots i:nth-child(2) { animation-delay: 0.15s; }
+  .typing-dots i:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes typing-pulse {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-2px); }
+  }
 
   .editor-state .editor-completions {
     color: var(--fg-faint);
@@ -866,122 +878,142 @@
   }
   @keyframes editor-cursor-blink { 50% { opacity: 0; } }
 
+  /* Composer: a rounded input surface in the same centered column as the
+     transcript, send button embedded bottom-right — the shape every
+     current AI chat app trains users on. */
   .composer {
     flex: 0 0 auto;
-    display: flex;
-    gap: 8px;
-    padding: 8px 10px;
-    border-top: 1px solid var(--border);
-    background: linear-gradient(90deg, var(--modeline-bg), #031006);
-    align-items: end;
-    box-shadow: inset 0 1px 0 rgba(57, 255, 136, 0.12);
+    padding: 8px max(12px, calc((100% - 52rem) / 2)) 12px;
+    background: var(--bg);
   }
-  /* Program view hides the composer (the editor is the input surface); the
-     `display` above otherwise overrides the `hidden` attribute. */
   .composer[hidden] { display: none; }
+  .composer-box {
+    display: flex;
+    gap: 6px;
+    align-items: flex-end;
+    width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 24px;
+    background: var(--bg-elev);
+    padding: 5px 5px 5px 16px;
+    transition: border-color 120ms ease;
+  }
+  .composer-box:focus-within {
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }
   .composer textarea {
     flex: 1;
     resize: none;
     min-height: 36px;
     max-height: 30vh;
-    padding: 8px 10px;
-    border: 1px solid var(--border);
-    border-radius: 0;
-    background: #020805;
-    background: var(--bg);
+    padding: 7px 0;
+    border: none;
+    background: transparent;
     color: var(--fg);
     font: inherit;
     line-height: 1.4;
-    box-shadow: inset 0 0 12px rgba(57, 255, 136, 0.08);
+    outline: none;
     /* iOS: keep font ≥16px to suppress auto-zoom on focus */
     font-size: 16px;
   }
   .composer textarea::placeholder {
     color: var(--fg-faint);
     opacity: 1;
-    text-shadow: 0 0 8px rgba(57, 255, 136, 0.18);
-  }
-  .composer textarea:focus {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
   }
   .composer button {
     flex: 0 0 auto;
-    padding: 8px 14px;
-    border-radius: 0;
-    border: 1px solid var(--accent);
-    background: var(--accent);
-    color: #06160c;
-    font-family: var(--mono);
-    font-weight: 700;
-    font-size: 13px;
-    text-transform: uppercase;
-    letter-spacing: 0.07em;
+    height: 36px;
+    border: none;
+    border-radius: 999px;
+    font-family: inherit;
     cursor: pointer;
-    text-shadow: none;
-    box-shadow: var(--glow-soft);
-    transition: background-color 120ms ease, box-shadow 120ms ease,
-      transform 60ms ease, opacity 120ms ease;
+    transition: background-color 120ms ease, transform 60ms ease, opacity 120ms ease;
   }
-  .composer button:hover:not(:disabled) {
-    box-shadow: var(--glow-hard);
-  }
-  .composer button:active:not(:disabled) {
-    transform: translateY(1px);
-    box-shadow: var(--glow-soft);
-  }
+  .composer button:active:not(:disabled) { transform: scale(0.96); }
   .composer button:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
   }
   .composer button:disabled {
-    opacity: 0.4;
+    opacity: 0.35;
     cursor: not-allowed;
   }
-  /* "Type" button styling — visually subordinate to the primary
-     "Send" (it's the "type but don't submit" path, shown only for
-     PTY sessions), so muted background to differentiate. */
+  /* Round accent send button (↑), the familiar submit affordance. */
+  .composer #enterBtn {
+    width: 36px;
+    background: var(--accent);
+    color: var(--accent-fg);
+    font-size: 17px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .composer #enterBtn:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--accent) 85%, var(--fg));
+  }
+  /* "Type" button — the secondary "type into the PTY without submitting"
+     path, shown only for terminal sessions. */
   .composer #insertBtn {
+    padding: 0 14px;
     background: transparent;
-    color: var(--fg);
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font-size: 12.5px;
   }
   .composer #insertBtn:hover:not(:disabled) {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    box-shadow: none;
+    background: var(--bg-elev-2);
+    color: var(--fg);
   }
 
   .toggle-list {
-    display: none;
     flex: 0 0 auto;
-    padding: 4px 8px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--bg-elev-2);
+    display: inline-block;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    border-radius: 8px;
+    border: none;
+    background: transparent;
     color: var(--fg-dim);
     cursor: pointer;
-    font-size: 12px;
+    font-size: 16px;
+    line-height: 1;
   }
-  .toggle-list { display: inline-block; }
+  .toggle-list:hover {
+    background: var(--bg-elev-2);
+    color: var(--fg);
+  }
+  /* Pin / rename icon buttons flanking the session title. */
+  .title-action {
+    flex: 0 0 auto;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--fg-dim);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .title-action[hidden] { display: none; }
+  .title-action:hover {
+    background: var(--bg-elev-2);
+    color: var(--fg);
+  }
+  .title-action.is-on { color: var(--accent); }
 
   .terminal-wrap {
     flex: 1 1 0;
     min-height: 0;
-    background:
-      linear-gradient(rgba(190, 255, 205, 0.018) 50%, rgba(0, 0, 0, 0.055) 50%),
-      radial-gradient(ellipse at center, rgba(57, 255, 136, 0.10), rgba(57, 255, 136, 0.035) 42%, transparent 78%),
-      #020805;
-    background-size: 100% 4px, 100% 100%, 100% 100%;
+    background: var(--term-bg);
     position: relative;
     overflow: hidden;
     overscroll-behavior: contain;
     touch-action: pan-y;
-    padding: 6px 0 0 6px;
-    border: 1px solid var(--border);
-    border-bottom: none;
-    box-shadow:
-      inset 0 0 28px rgba(57, 255, 136, 0.12),
-      inset 0 0 90px rgba(0, 0, 0, 0.52),
-      var(--glow-soft);
+    padding: 8px 0 0 8px;
+    border-top: 1px solid var(--border);
     /* iOS safe-area inset on the right edge for landscape with notch. */
     padding-right: env(safe-area-inset-right);
   }
@@ -991,7 +1023,6 @@
     overflow: hidden;
     overscroll-behavior: contain;
     touch-action: pan-y;
-    mix-blend-mode: screen;
   }
   .terminal-host:focus,
   .terminal-host .xterm:focus { outline: none; }
@@ -1005,10 +1036,6 @@
   .terminal-host .xterm .xterm-screen { height: 100%; }
   .terminal-host .xterm {
     padding: 2px 0 0 2px;
-    text-shadow: 0 0 9px rgba(57, 255, 136, 0.28);
-  }
-  .terminal-host .xterm .xterm-screen canvas {
-    filter: saturate(1.18) contrast(1.08);
   }
   .terminal-host.hide-xterm-cursor .xterm-cursor {
     visibility: hidden !important;
@@ -1025,10 +1052,10 @@
     scrollbar-width: thin;
   }
   .terminal-host .xterm .xterm-viewport::-webkit-scrollbar {
-    width: 16px;
+    width: 12px;
   }
   .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-track {
-    background: var(--session-scrollbar-track);
+    background: transparent;
   }
   .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb {
     background: var(--session-scrollbar-thumb);
@@ -1037,7 +1064,7 @@
     border-radius: 999px;
   }
   .terminal-host .xterm .xterm-viewport::-webkit-scrollbar-thumb:hover {
-    background: var(--fg);
+    background: var(--fg-dim);
     background-clip: content-box;
   }
   .terminal-loading {
@@ -1051,10 +1078,12 @@
     pointer-events: none;
   }
   .terminal-loading.gone { display: none; }
+  /* The session-menu pill claims the top-right corner in every view
+     mode, so the terminal-only scroll cluster sits to its left. */
   .terminal-scroll-overlay {
     position: absolute;
     top: 8px;
-    right: calc(8px + env(safe-area-inset-right));
+    right: calc(72px + env(safe-area-inset-right));
     z-index: 5;
     display: flex;
     gap: 4px;
@@ -1064,55 +1093,101 @@
   .terminal-widget-controls {
     position: absolute;
     top: 8px;
-    right: calc(86px + env(safe-area-inset-right));
+    right: calc(150px + env(safe-area-inset-right));
     z-index: 5;
     display: flex;
     gap: 4px;
     pointer-events: none;
   }
   .terminal-widget-controls[hidden] { display: none; }
+  .session-menu-overlay {
+    position: absolute;
+    top: 8px;
+    right: calc(8px + env(safe-area-inset-right));
+    z-index: 40;
+    display: flex;
+    pointer-events: none;
+  }
+  .session-menu-overlay[hidden] { display: none; }
   .terminal-scroll-overlay button,
-  .terminal-widget-controls button {
+  .terminal-widget-controls button,
+  .session-menu-overlay button {
     pointer-events: auto;
     appearance: none;
-    border: 1px solid transparent;
-    border-radius: 0;
-    padding: 2px 7px;
-    background: rgba(2, 8, 5, 0.78);
-    color: var(--fg);
-    font: 11px/1.35 var(--mono);
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    border: 1px solid var(--border-faint);
+    border-radius: 999px;
+    padding: 3px 12px;
+    background: color-mix(in srgb, var(--bg) 75%, transparent);
+    color: var(--fg-dim);
+    font: 11px/1.4 var(--font-ui);
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
-    backdrop-filter: blur(4px);
-    box-shadow:
-      inset 0 0 10px rgba(57, 255, 136, 0.12),
-      0 0 12px rgba(57, 255, 136, 0.14);
-    text-shadow: 0 0 8px rgba(57, 255, 136, 0.34);
+    backdrop-filter: blur(6px);
   }
   .terminal-scroll-overlay button[hidden],
   .terminal-widget-controls button[hidden] { display: none; }
-  .terminal-scroll-overlay button::before,
-  .terminal-widget-controls button::before { content: "["; color: var(--fg-faint); }
-  .terminal-scroll-overlay button::after,
-  .terminal-widget-controls button::after { content: "]"; color: var(--fg-faint); }
   .terminal-scroll-overlay button:hover,
   .terminal-scroll-overlay button:focus-visible,
   .terminal-widget-controls button:hover,
-  .terminal-widget-controls button:focus-visible {
-    background: rgba(57, 255, 136, 0.18);
-    border-color: transparent;
-    color: #e1ffe6;
+  .terminal-widget-controls button:focus-visible,
+  .session-menu-overlay button:hover,
+  .session-menu-overlay button:focus-visible {
+    background: var(--bg-elev-2);
+    color: var(--fg);
     outline: none;
-    box-shadow: var(--glow-hard);
   }
   .terminal-scroll-overlay button:active,
-  .terminal-widget-controls button:active {
+  .terminal-widget-controls button:active,
+  .session-menu-overlay button:active {
     background: var(--accent);
     border-color: transparent;
-    color: #06160c;
-    text-shadow: none;
+    color: var(--accent-fg);
+  }
+  .session-menu-overlay button[aria-expanded="true"] {
+    background: var(--bg-elev-2);
+    color: var(--fg);
+  }
+  /* The dropdown itself: a small anchored menu card, same items as the
+     TUI session-title menu (minus the split-pane entries). */
+  .session-menu {
+    position: absolute;
+    top: 40px;
+    right: calc(8px + env(safe-area-inset-right));
+    z-index: 60;
+    min-width: 200px;
+    padding: 4px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36);
+  }
+  .session-menu[hidden] { display: none; }
+  .session-menu button {
+    display: block;
+    width: 100%;
+    padding: 8px 12px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fg);
+    font: inherit;
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .session-menu button:hover:not(:disabled),
+  .session-menu button:focus-visible {
+    background: var(--bg-elev-2);
+    outline: none;
+  }
+  .session-menu button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .session-menu button.menu-danger { color: var(--err); }
+  .session-menu button.menu-danger:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--err) 12%, transparent);
   }
 
   /* Virtual keyboard — sits below the terminal in PTY mode.
@@ -1141,7 +1216,7 @@
     gap: 4px;
     padding-bottom: 4px;
     margin-bottom: 4px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 1px solid var(--border-faint);
   }
   .vkbd-special {
     flex: 1 1 0;
@@ -1156,7 +1231,7 @@
     flex: 0 0 auto;
     width: 44px;
     height: 34px;
-    border-radius: 5px;
+    border-radius: 8px;
     border: 1px solid var(--border);
     background: var(--bg);
     color: var(--fg-dim);
@@ -1196,8 +1271,8 @@
     min-width: 28px;
     height: 38px;
     padding: 0 2px;
-    border-radius: 5px;
-    border: 1px solid var(--border);
+    border-radius: 8px;
+    border: 1px solid var(--border-faint);
     background: var(--bg-elev-2);
     color: var(--fg);
     font: inherit;
@@ -1208,9 +1283,9 @@
        press — we have our own :active style, so disable theirs. */
     -webkit-tap-highlight-color: transparent;
   }
-  .vk:active { background: var(--accent); color: #06160c; }
+  .vk:active { background: var(--accent); color: var(--accent-fg); }
   .vk.modifier { background: var(--bg); }
-  .vk.modifier.on { background: var(--accent); color: #06160c; }
+  .vk.modifier.on { background: var(--accent); color: var(--accent-fg); }
   /* Wide keys for the bottom row (space). Enter intentionally
      stays at default flex:1 so it's the same size as the `123`
      layer toggle — large enter is easy to mash by accident when
@@ -1230,7 +1305,7 @@
   .approval-sheet {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.45);
+    background: rgba(0, 0, 0, 0.5);
     display: flex;
     align-items: flex-end;
     justify-content: center;
@@ -1244,15 +1319,30 @@
     width: 100%;
     max-width: 480px;
     background: var(--bg-elev);
-    border-top: 1px solid var(--border);
-    border-radius: 14px 14px 0 0;
-    padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+    border: 1px solid var(--border);
+    border-bottom: none;
+    border-radius: 20px 20px 0 0;
+    padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
     box-shadow: 0 -12px 32px rgba(0, 0, 0, 0.35);
     animation: approval-slide-up 180ms cubic-bezier(0.2, 0.9, 0.3, 1);
   }
   @keyframes approval-slide-up {
     from { transform: translateY(40%); opacity: 0; }
     to   { transform: translateY(0);    opacity: 1; }
+  }
+  /* Desktop: dialogs center as modal cards instead of sticking to the
+     bottom edge (the bottom-sheet gesture idiom is a phone thing). */
+  @media (min-width: 721px) {
+    .approval-sheet {
+      align-items: center;
+      padding: 24px;
+    }
+    .approval-card {
+      border-radius: 16px;
+      border-bottom: 1px solid var(--border);
+      padding: 20px;
+      box-shadow: 0 24px 48px rgba(0, 0, 0, 0.4);
+    }
   }
   .approval-head { display: flex; gap: 8px; align-items: baseline; }
   .approval-tool-name {
@@ -1263,22 +1353,20 @@
   }
   .approval-risk {
     display: inline-block;
-    padding: 1px 8px;
-    border-radius: 10px;
+    padding: 1px 10px;
+    border-radius: 999px;
     font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
     background: var(--bg-elev-2);
     color: var(--fg-dim);
   }
-  .approval-risk.safe { background: rgba(92, 209, 166, 0.18); color: var(--ok); }
-  .approval-risk.risky { background: rgba(244, 124, 124, 0.18); color: var(--err); }
+  .approval-risk.safe { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+  .approval-risk.risky { background: color-mix(in srgb, var(--err) 16%, transparent); color: var(--err); }
   .approval-summary {
     margin-top: 8px;
     padding: 8px 10px;
     background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
+    border: 1px solid var(--border-faint);
+    border-radius: 10px;
     font-family: var(--mono);
     font-size: 12.5px;
     color: var(--fg);
@@ -1293,7 +1381,7 @@
     margin-top: 6px;
   }
   .approval-actions {
-    margin-top: 12px;
+    margin-top: 14px;
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 8px;
@@ -1302,7 +1390,7 @@
   .approval-actions button {
     appearance: none;
     border: none;
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 10px 12px;
     font: inherit;
     font-weight: 500;
@@ -1312,10 +1400,11 @@
   }
   .approval-actions .btn-approve {
     background: var(--accent);
-    color: #06160c;
+    color: var(--accent-fg);
+    font-weight: 600;
   }
   .approval-actions .btn-deny {
-    background: rgba(244, 124, 124, 0.18);
+    background: color-mix(in srgb, var(--err) 14%, transparent);
     color: var(--err);
   }
   .approval-actions .btn-auto-review {
@@ -1325,15 +1414,16 @@
     font-size: 13px;
   }
   .approval-actions .btn-unsafe-auto {
-    background: rgba(255, 178, 92, 0.18);
-    border: 1px solid rgba(255, 178, 92, 0.34);
+    background: color-mix(in srgb, var(--warn) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
     color: var(--warn);
     font-size: 13px;
   }
   .approval-actions button:disabled { opacity: 0.5; cursor: progress; }
+  .approval-actions.single { grid-template-columns: 1fr; }
 
-  /* New-session button at the top of the list panel. Visually
-     prominent but unobtrusive — same width as a session row. */
+  /* New-session button at the top of the list panel. Tonal accent pill,
+     the familiar "new chat" affordance. */
   .session-list-wrap {
     display: flex;
     flex-direction: column;
@@ -1341,12 +1431,10 @@
     position: relative;
     border-right: 1px solid var(--border);
     background: var(--bg-elev);
-    box-shadow: inset -1px 0 0 rgba(57, 255, 136, 0.10);
   }
   main.session-list-hidden .session-list-wrap {
     overflow: hidden;
     border-right: none;
-    box-shadow: none;
   }
   .session-list-resizer {
     position: absolute;
@@ -1371,7 +1459,6 @@
   .session-list-resizer:hover::after,
   .session-list-resizer.is-dragging::after {
     background: var(--accent);
-    box-shadow: var(--glow-hard);
   }
   main.session-list-hidden .session-list-resizer {
     display: none;
@@ -1390,63 +1477,20 @@
   .new-session-btn {
     appearance: none;
     flex: 0 0 auto;
-    margin: 6px 8px;
-    padding: 7px 10px;
-    border-radius: 0;
-    border: 1px dashed var(--border);
-    background: transparent;
-    color: var(--fg-dim);
+    margin: 10px 10px 6px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    border: none;
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
     font: inherit;
-    font-size: 12px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
+    font-size: 13px;
+    font-weight: 600;
     cursor: pointer;
     -webkit-tap-highlight-color: transparent;
   }
   .new-session-btn:hover {
-    background: var(--bg-elev-2);
-    color: var(--fg);
-    border-style: solid;
-  }
-  /* Theme picker row under the "+ new session" button — lives in the
-     collapsible sidebar the `≡` menu toggles, so the header stays
-     uncluttered. */
-  .theme-picker {
-    flex: 0 0 auto;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 0 8px 6px;
-    color: var(--fg-dim);
-    font-size: 10px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-  }
-  .theme-picker-label { flex: 0 0 auto; }
-  .theme-picker select {
-    flex: 1 1 auto;
-    min-width: 0;
-    appearance: none;
-    border: 1px solid var(--border);
-    border-radius: 0;
-    padding: 5px 22px 5px 7px;
-    background:
-      linear-gradient(45deg, transparent 50%, var(--fg-dim) 50%) right 10px center / 5px 5px no-repeat,
-      linear-gradient(135deg, var(--fg-dim) 50%, transparent 50%) right 5px center / 5px 5px no-repeat,
-      color-mix(in srgb, var(--bg) 70%, transparent);
-    color: var(--fg-dim);
-    font: inherit;
-    font-size: 10px;
-    line-height: 1;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    cursor: pointer;
-  }
-  .theme-picker select:hover,
-  .theme-picker select:focus {
-    color: var(--fg);
-    outline: none;
-    background-color: var(--bg-elev-2);
+    background: color-mix(in srgb, var(--accent) 20%, transparent);
   }
   /* When `.session-list-wrap` becomes the list container, the
      inner `<aside>` keeps its scrollbar but loses its right border
@@ -1457,66 +1501,42 @@
     border-right: none;
     background: transparent;
   }
-  /* Shared action toolbar pinned to the bottom of the list wrap.
-     Acts on the currently-selected session (state.currentId). */
-  .list-toolbar {
-    flex: 0 0 auto;
-    display: flex;
-    flex-wrap: wrap;
-    align-content: flex-start;
-    gap: 6px;
-    min-width: 0;
-    padding: 6px 8px;
-    border-top: 1px solid var(--border);
-    background: var(--modeline-bg);
-  }
-  .list-toolbar .row-action {
-    /* Override the per-row sizing — toolbar gets slightly larger
-       touch targets since it's the only button surface. */
-    width: 36px;
-    height: 32px;
-    font-size: 14px;
-    margin-left: 0;
-  }
-  .list-toolbar .row-action:disabled {
-    opacity: 0.35;
-    cursor: not-allowed;
-  }
-
   /* New-session form rows reuse the approval-sheet shell. */
   .ns-row {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    margin-top: 10px;
+    margin-top: 12px;
   }
   .ns-label {
     color: var(--fg-dim);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+    font-size: 12px;
+    font-weight: 500;
   }
   .ns-input {
     width: 100%;
-    padding: 8px 10px;
+    padding: 8px 12px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 10px;
     background: var(--bg);
     color: var(--fg);
     font: inherit;
     /* iOS-safe 16px to suppress focus auto-zoom. */
     font-size: 16px;
   }
-  .ns-input:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+  .ns-input:focus {
+    outline: none;
+    border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  }
   textarea.ns-input { resize: vertical; min-height: 60px; }
   .ns-error {
     margin-top: 8px;
-    padding: 6px 8px;
-    background: rgba(244, 124, 124, 0.12);
-    border-left: 3px solid var(--err);
+    padding: 8px 12px;
+    background: color-mix(in srgb, var(--err) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--err) 30%, transparent);
     color: var(--err);
     font-size: 13px;
-    border-radius: 4px;
+    border-radius: 10px;
   }
 
   /* Global keyboard-focus ring. Low specificity so components that
@@ -1564,15 +1584,14 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 10px;
+    padding: 6px 12px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-elev);
     font-size: 13px;
   }
   .program-bar-label {
-    color: var(--accent);
+    color: var(--fg);
     font-weight: 600;
-    letter-spacing: 0.04em;
   }
   .program-version { color: var(--fg-faint); font-size: 12px; }
   .program-flex { flex: 1 1 auto; }
@@ -1590,11 +1609,11 @@
   .program-bar button {
     background: var(--bg-elev-2);
     color: var(--fg);
-    border: 1px solid var(--border-faint);
-    border-radius: 5px;
-    padding: 3px 12px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 4px 12px;
     font: inherit;
-    font-size: 12px;
+    font-size: 12.5px;
     cursor: pointer;
   }
   .program-bar button:hover { border-color: var(--accent); }
@@ -1621,7 +1640,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 5px 10px;
+    padding: 5px 12px;
     border-bottom: 1px solid var(--border-faint);
     background: var(--bg-elev);
   }
@@ -1629,17 +1648,17 @@
     flex: 1 1 auto;
     background: var(--bg);
     color: var(--fg);
-    border: 1px solid var(--border-faint);
-    border-radius: 5px;
-    padding: 3px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 3px 10px;
     font: inherit;
     font-size: 13px;
   }
   .program-find-count { color: var(--fg-faint); font-size: 12px; min-width: 6ch; }
   .program-find button {
     background: var(--bg-elev-2); color: var(--fg);
-    border: 1px solid var(--border-faint); border-radius: 5px;
-    padding: 2px 9px; font: inherit; cursor: pointer;
+    border: 1px solid transparent; border-radius: 8px;
+    padding: 2px 10px; font: inherit; cursor: pointer;
   }
   .program-find button:hover { border-color: var(--accent); }
   /* The editor stacks a styled overlay under a transparent-text textarea so the
@@ -1668,7 +1687,7 @@
     caret-color: var(--accent);
     outline: none;
   }
-  .program-input ::selection { background: rgba(57, 255, 136, 0.28); }
+  .program-input ::selection { background: color-mix(in srgb, var(--accent) 28%, transparent); }
   /* One source line. Empty lines keep height via a <br>. */
   .program-line { min-height: 1.6em; }
   .program-selection-menu {
@@ -1680,7 +1699,7 @@
     padding: 4px;
     background: var(--bg-elev);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 10px;
     box-shadow: 0 10px 24px rgba(0, 0, 0, 0.36);
   }
   .program-selection-menu[hidden] { display: none; }
@@ -1693,7 +1712,7 @@
     background: transparent;
     color: var(--accent);
     border: 0;
-    border-radius: 4px;
+    border-radius: 6px;
     font: inherit;
     font-size: 13px;
     cursor: pointer;
@@ -1701,7 +1720,7 @@
   .program-selection-menu button:hover,
   .program-selection-menu button:focus-visible {
     background: var(--accent);
-    color: var(--bg);
+    color: var(--accent-fg);
     outline: none;
   }
   /* Program selection verbs (spec 0089): a vertical list of refinement
@@ -1723,10 +1742,10 @@
      stop and Backspace deletes it whole. */
   .program-clip {
     display: inline-block;
-    background: color-mix(in srgb, var(--accent-alt) 22%, transparent);
+    background: color-mix(in srgb, var(--accent-alt) 18%, transparent);
     color: var(--accent-alt);
-    border: 1px solid color-mix(in srgb, var(--accent-alt) 40%, transparent);
-    border-radius: 4px;
+    border: 1px solid color-mix(in srgb, var(--accent-alt) 35%, transparent);
+    border-radius: 6px;
     padding: 0 0.35em;
     margin: 0 1px;
     line-height: 1.35;
@@ -1776,15 +1795,14 @@
      editor (spec 0074 shared dialect). Styling only — serialization reads
      data-raw, never the label — so the source round-trips byte-identically. */
   .program-clip.program-action {
-    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 42%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 38%, transparent);
     cursor: pointer;
     user-select: none;
   }
   .program-clip.program-action:hover {
-    background: color-mix(in srgb, var(--accent) 30%, transparent);
-    color: var(--ok);
+    background: color-mix(in srgb, var(--accent) 26%, transparent);
   }
   /* Display-extension source lines (`:::timeline`, `:::clip …`, bare `:::`
      fences, table delimiter rows) stay fully editable text in the Program
@@ -1850,17 +1868,17 @@
     z-index: 6;
     width: min(440px, calc(100% - 24px));
     max-width: calc(100% - 24px);
-    background: color-mix(in srgb, var(--bg-elev) 94%, black);
+    background: var(--bg-elev);
     color: var(--fg);
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 10px;
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.36);
     overflow: hidden;
     pointer-events: none;
   }
   .program-hover-terminal {
     height: 154px;
-    background: #020805;
+    background: var(--term-bg);
     border-bottom: 1px solid var(--border-faint);
   }
   .program-hover-terminal[hidden],
@@ -1905,7 +1923,7 @@
     color: var(--bg);
     border-radius: 3px;
     padding: 0 4px;
-    font: 11px/1.35 system-ui, -apple-system, sans-serif;
+    font: 11px/1.35 var(--font-ui);
   }
   .program-remote-cursor[data-color="1"] { background: var(--accent); }
   .program-remote-cursor[data-color="1"]::after { background: var(--accent); }
@@ -1968,7 +1986,8 @@
     background: transparent;
     color: var(--fg);
     border: none;
-    padding: 4px 2px;
+    border-radius: 8px;
+    padding: 4px 6px;
     font: inherit;
     font-weight: 600;
     cursor: pointer;
@@ -1990,10 +2009,10 @@
     max-width: 380px;
     max-height: 260px;
     overflow-y: auto;
-    background: var(--bg-elev-2);
+    background: var(--bg-elev);
     border: 1px solid var(--border);
-    border-radius: 7px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
     padding: 4px;
   }
   .program-clip-item {
@@ -2001,7 +2020,7 @@
     flex-direction: column;
     gap: 1px;
     padding: 5px 9px;
-    border-radius: 5px;
+    border-radius: 6px;
     cursor: pointer;
   }
   .program-clip-item .pc-label { color: var(--fg); font-size: 13px; }
@@ -2011,7 +2030,7 @@
     letter-spacing: 0.06em; margin-right: 6px;
   }
   .program-clip-item.is-active, .program-clip-item:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
   }
   /* Submenu items that do not match the type-ahead query stay visible but dim. */
   .program-clip-item.is-dim { opacity: 0.4; }
@@ -2022,13 +2041,12 @@
   }
   /* Project / group header inside the session submenu. */
   .program-clip-header {
-    color: var(--fg-faint); font-size: 10px; text-transform: uppercase;
-    letter-spacing: 0.06em; font-weight: 600; padding: 5px 9px 2px;
+    color: var(--fg-faint); font-size: 11px; font-weight: 600; padding: 5px 9px 2px;
   }
   /* Expandable category row (session, harness) in the root view. */
   .program-clip-cat {
     display: flex; align-items: center; gap: 8px;
-    padding: 5px 9px; border-radius: 5px; cursor: pointer; color: var(--fg);
+    padding: 5px 9px; border-radius: 6px; cursor: pointer; color: var(--fg);
   }
   .program-clip-cat .pc-cat-label {
     flex: 1; font-size: 13px; font-weight: 500; text-transform: capitalize;
@@ -2036,14 +2054,147 @@
   .program-clip-cat .pc-cat-count { color: var(--fg-faint); font-size: 11px; }
   .program-clip-cat .pc-cat-chevron { color: var(--accent-alt); font-size: 12px; }
   .program-clip-cat.is-active, .program-clip-cat:hover {
-    background: color-mix(in srgb, var(--accent) 20%, transparent);
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+  }
+
+  /* ---- Matrix theme: the full CRT construct ------------------------------
+     Everything below reinstates the phosphor look for the opt-in "Matrix"
+     theme only: monospace chrome, scanlines, glow, CRT terminal. The
+     modern layout (rounded surfaces, centered chat column, pill composer)
+     is shared; this skin recolors and re-textures it. */
+  html[data-theme="matrix"] body {
+    font: 13px/1.45 var(--mono);
+    letter-spacing: 0.01em;
+    text-shadow: 0 0 10px rgba(57, 255, 136, 0.10);
+  }
+  /* Scanline + vignette overlay across the whole app. */
+  html[data-theme="matrix"] body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 2000;
+    background:
+      linear-gradient(rgba(190, 255, 205, 0.025) 50%, rgba(0, 0, 0, 0.08) 50%),
+      radial-gradient(circle at 16% 8%, rgba(57, 255, 136, 0.10), transparent 30%),
+      radial-gradient(circle at 88% 14%, rgba(92, 225, 255, 0.07), transparent 34%);
+    background-size: 100% 4px, 100% 100%, 100% 100%;
+    mix-blend-mode: screen;
+    opacity: 0.7;
+  }
+  html[data-theme="matrix"] header {
+    background: linear-gradient(90deg, #082e18, #04140a 70%);
+    box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--accent) 16%, transparent),
+      0 0 18px rgba(57, 255, 136, 0.12);
+  }
+  html[data-theme="matrix"] header .meta {
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 12px;
+  }
+  html[data-theme="matrix"] .view {
+    background:
+      radial-gradient(circle at 70% 0%, rgba(57, 255, 136, 0.06), transparent 36%),
+      var(--bg);
+  }
+  html[data-theme="matrix"] .role-user .bubble {
+    border: 1px solid rgba(92, 225, 255, 0.42);
+    color: #e1ffe6;
+  }
+  html[data-theme="matrix"] .tool {
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+  }
+  /* CRT terminal: scanlines, phosphor bloom, screen-blend glass. */
+  html[data-theme="matrix"] .terminal-wrap {
+    background:
+      linear-gradient(rgba(190, 255, 205, 0.018) 50%, rgba(0, 0, 0, 0.055) 50%),
+      radial-gradient(ellipse at center, rgba(57, 255, 136, 0.10), rgba(57, 255, 136, 0.035) 42%, transparent 78%),
+      var(--term-bg);
+    background-size: 100% 4px, 100% 100%, 100% 100%;
+    border: 1px solid var(--border);
+    border-bottom: none;
+    box-shadow:
+      inset 0 0 28px rgba(57, 255, 136, 0.12),
+      inset 0 0 90px rgba(0, 0, 0, 0.52),
+      0 0 18px rgba(57, 255, 136, 0.12);
+  }
+  html[data-theme="matrix"] .terminal-host { mix-blend-mode: screen; }
+  html[data-theme="matrix"] .terminal-host .xterm {
+    text-shadow: 0 0 9px rgba(57, 255, 136, 0.28);
+  }
+  html[data-theme="matrix"] .terminal-host .xterm .xterm-screen canvas {
+    filter: saturate(1.18) contrast(1.08);
+  }
+  html[data-theme="matrix"] .terminal-scroll-overlay button,
+  html[data-theme="matrix"] .terminal-widget-controls button,
+  html[data-theme="matrix"] .session-menu-overlay button {
+    border-radius: 0;
+    border-color: transparent;
+    background: rgba(2, 8, 5, 0.78);
+    color: var(--fg);
+    font: 11px/1.35 var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    box-shadow:
+      inset 0 0 10px rgba(57, 255, 136, 0.12),
+      0 0 12px rgba(57, 255, 136, 0.14);
+    text-shadow: 0 0 8px rgba(57, 255, 136, 0.34);
+  }
+  html[data-theme="matrix"] .terminal-scroll-overlay button::before,
+  html[data-theme="matrix"] .terminal-widget-controls button::before,
+  html[data-theme="matrix"] .session-menu-overlay button::before { content: "["; color: var(--fg-faint); }
+  html[data-theme="matrix"] .terminal-scroll-overlay button::after,
+  html[data-theme="matrix"] .terminal-widget-controls button::after,
+  html[data-theme="matrix"] .session-menu-overlay button::after { content: "]"; color: var(--fg-faint); }
+  html[data-theme="matrix"] .mini-matrix {
+    align-self: stretch;
+    height: auto;
+    min-height: var(--header-h);
+    border: none;
+    border-left: 1px solid var(--border);
+    border-radius: 0;
+    box-shadow: inset 0 0 18px color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  html[data-theme="matrix"] .composer-box {
+    border-radius: 4px;
+    background: var(--bg);
+    box-shadow: inset 0 0 12px rgba(57, 255, 136, 0.08);
+  }
+  html[data-theme="matrix"] .composer #enterBtn {
+    box-shadow: 0 0 14px rgba(57, 255, 136, 0.28);
+  }
+  html[data-theme="matrix"] .composer textarea::placeholder {
+    text-shadow: 0 0 8px rgba(57, 255, 136, 0.18);
+  }
+  html[data-theme="matrix"] .session-list .item.active {
+    background: var(--accent);
+    box-shadow: 0 0 14px rgba(57, 255, 136, 0.28);
+    text-shadow: none;
+  }
+  html[data-theme="matrix"] .session-list .item.active .name,
+  html[data-theme="matrix"] .session-list .item.active .sub,
+  html[data-theme="matrix"] .session-list .item.active .pin-indicator,
+  html[data-theme="matrix"] .session-list .item.active .disclosure,
+  html[data-theme="matrix"] .session-list .item.active .state {
+    color: var(--accent-fg);
+  }
+  html[data-theme="matrix"] .session-list .item.is-operator.active .name {
+    color: var(--accent-fg);
   }
 </style>
 </head>
 <body>
   <header>
     <button class="toggle-list" id="toggleList" type="button">≡</button>
+    <!--
+      Rename acts on the current session and lives in the title bar next
+      to the session name, mirroring where the eye already is when
+      thinking about "this session". Pin lives in the session menu.
+    -->
     <div class="meta" id="sessionTitle"></div>
+    <button type="button" class="title-action" id="titleRenameBtn" hidden
+            aria-label="rename session" title="Rename session">✎</button>
     <div class="view-mode-toggle" id="viewModeToggle" hidden
          role="group" aria-label="session view mode">
       <button type="button" id="viewModeTerminal" data-view-mode="terminal"
@@ -2053,9 +2204,15 @@
       <button type="button" id="viewModeProgram" data-view-mode="program"
               aria-pressed="false">Program</button>
     </div>
+    <!--
+      The matrix-rain badge doubles as the settings button: click (or
+      Enter/Space) opens the settings sheet. Its aria-label keeps
+      announcing the live connection state.
+    -->
     <div class="conn" id="conn" data-state="connecting" aria-label="connecting">
       <canvas class="mini-matrix" id="miniMatrix" width="192" height="84"
-              aria-label="construct connecting" role="img"></canvas>
+              aria-label="construct connecting" role="button" tabindex="0"
+              title="Settings"></canvas>
     </div>
   </header>
   <main>
@@ -2068,50 +2225,19 @@
       -->
       <button type="button" class="new-session-btn" id="newSessionBtn"
               aria-label="new session">+ new session</button>
-      <!--
-        Theme picker lives in the collapsible sidebar (under the `≡`
-        menu) rather than the header, keeping the title bar free for
-        the session title and view controls.
-      -->
-      <label class="theme-picker" aria-label="theme">
-        <span class="theme-picker-label">theme</span>
-        <select id="themePicker" title="Theme">
-          <option value="matrix">Matrix</option>
-          <option value="basic">Basic</option>
-          <option value="dark">Dark</option>
-          <option value="light">Light</option>
-        </select>
-      </label>
       <span class="session-list-sr-label">sessions</span>
       <aside class="session-list" id="sessionList">
         <div class="empty">connecting…</div>
       </aside>
       <!--
-        Shared action toolbar — acts on the currently-selected
-        session. Used to be per-row but on a narrow phone the row
-        got cluttered (title + state + 3 buttons + harness name)
-        and the buttons fell off the right edge. Single bar at
-        the bottom is simpler. Buttons disable when there's no
-        selection (or when the selection isn't eligible for that
-        action — restart only enables on terminal-state sessions).
+        The old shared action toolbar is gone: reorder is drag-and-drop
+        on the rows themselves, pin/rename live in the title bar, and
+        restart/archive/delete live in the session menu (top-right of
+        the session view).
       -->
       <div class="session-list-resizer" id="sessionListResizer"
            role="separator" aria-orientation="vertical"
            aria-label="resize session list" tabindex="0"></div>
-      <div class="list-toolbar" id="listToolbar">
-        <button type="button" class="row-action" data-action="move-up"
-                id="toolbarUpBtn" aria-label="move selected up" disabled>↑</button>
-        <button type="button" class="row-action" data-action="move-down"
-                id="toolbarDownBtn" aria-label="move selected down" disabled>↓</button>
-        <button type="button" class="row-action" data-action="pin"
-                id="toolbarPinBtn" aria-label="pin selected" disabled>☆</button>
-        <button type="button" class="row-action" data-action="rename"
-                id="toolbarRenameBtn" aria-label="rename selected" disabled>✎</button>
-        <button type="button" class="row-action" data-action="restart"
-                id="toolbarRestartBtn" aria-label="restart selected" disabled>↻</button>
-        <button type="button" class="row-action" data-action="delete"
-                id="toolbarDeleteBtn" aria-label="delete selected" disabled>×</button>
-      </div>
     </div>
     <section class="view">
       <!--
@@ -2211,6 +2337,25 @@
       <div class="terminal-widget-controls" id="terminalWidgetControls" hidden>
         <button type="button" id="widgetsTrigger" aria-label="toggle widgets" hidden>widgets</button>
       </div>
+      <!--
+        Session menu — the web peer of the TUI's session-title menu
+        (top-right of the session view). Holds the lifecycle actions
+        that used to sit in the list toolbar. The split-pane entries
+        of the TUI menu are omitted: the web UI has no split panes.
+      -->
+      <div class="session-menu-overlay" id="sessionMenuOverlay" hidden>
+        <button type="button" id="sessionMenuBtn" aria-haspopup="menu"
+                aria-expanded="false" title="Session menu">menu</button>
+      </div>
+      <div class="session-menu" id="sessionMenu" hidden role="menu" aria-label="session menu">
+        <button type="button" role="menuitem" data-menu-action="rename">rename</button>
+        <button type="button" role="menuitem" data-menu-action="pin" id="sessionMenuPinItem">pin</button>
+        <button type="button" role="menuitem" data-menu-action="fork">fork conversation</button>
+        <button type="button" role="menuitem" data-menu-action="restart">restart</button>
+        <button type="button" role="menuitem" data-menu-action="archive" id="sessionMenuArchiveItem">archive</button>
+        <button type="button" role="menuitem" data-menu-action="merge">merge and archive</button>
+        <button type="button" role="menuitem" data-menu-action="delete" class="menu-danger">delete</button>
+      </div>
       <div class="inline-widget-backdrop" id="inlineWidgetBackdrop" hidden></div>
       <section class="session-widgets" id="sessionWidgets" hidden></section>
       <div class="editor-state" id="editorState" hidden></div>
@@ -2224,22 +2369,24 @@
         a PTY session also submits in the same gesture.
       -->
       <form class="composer" id="composer">
-        <textarea
-          id="input"
-          placeholder="Message…"
-          rows="1"
-          autocomplete="off"
-          autocapitalize="sentences"
-          spellcheck="true"
-          title="Enter to send · Shift+Enter for a newline"
-          aria-keyshortcuts="Enter"
-        ></textarea>
-        <button type="button" id="insertBtn" disabled hidden
-          title="Type into the terminal without pressing Enter"
-          aria-label="Type into terminal without Enter">Type</button>
-        <button type="submit" id="enterBtn" disabled
-          title="Send · Enter to send, Shift+Enter for a newline"
-          aria-label="Send">Send</button>
+        <div class="composer-box">
+          <textarea
+            id="input"
+            placeholder="Message…"
+            rows="1"
+            autocomplete="off"
+            autocapitalize="sentences"
+            spellcheck="true"
+            title="Enter to send · Shift+Enter for a newline"
+            aria-keyshortcuts="Enter"
+          ></textarea>
+          <button type="button" id="insertBtn" disabled hidden
+            title="Type into the terminal without pressing Enter"
+            aria-label="Type into terminal without Enter">Type</button>
+          <button type="submit" id="enterBtn" disabled
+            title="Send · Enter to send, Shift+Enter for a newline"
+            aria-label="Send">↑</button>
+        </div>
       </form>
       <!--
         Virtual keyboard for PTY-mode sessions on mobile. Two
@@ -2329,6 +2476,30 @@
         <button type="submit" class="btn-approve" id="newSessionCreate">Create</button>
       </div>
     </form>
+  </div>
+
+  <!--
+    Settings sheet — opened by clicking the matrix-rain badge in the
+    header. Client-side preferences live here (currently the theme).
+  -->
+  <div id="settingsSheet" class="approval-sheet" hidden role="dialog" aria-modal="true">
+    <div class="approval-card">
+      <div class="approval-head">
+        <div class="approval-tool-name">Settings</div>
+      </div>
+      <label class="ns-row">
+        <span class="ns-label">theme</span>
+        <select id="themePicker" class="ns-input" title="Theme">
+          <option value="system">System</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
+          <option value="matrix">Matrix</option>
+        </select>
+      </label>
+      <div class="approval-actions single">
+        <button type="button" class="btn-approve" id="settingsClose">Done</button>
+      </div>
+    </div>
   </div>
 
   <!--
@@ -2459,7 +2630,105 @@ const themePickerEl = $("themePicker");
 const VIEW_MODE_PREFS_KEY = "agentd.web.viewModePrefs";
 const WEB_THEME_KEY = "agentd.web.theme";
 
+const SANS_FONT_STACK =
+  '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", ' +
+  'Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji"';
+const MONO_FONT_STACK =
+  'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace';
+
 const WEB_THEMES = {
+  dark: {
+    css: {
+      "--bg": "#131316",
+      "--bg-elev": "#1b1b1f",
+      "--bg-elev-2": "#26262c",
+      "--border": "#2e2e35",
+      "--border-faint": "rgba(235, 235, 245, 0.08)",
+      "--fg": "#ececf1",
+      "--fg-dim": "#9d9da8",
+      "--fg-faint": "#6c6c76",
+      "--accent": "#2fbf71",
+      "--accent-fg": "#0b1f14",
+      "--accent-alt": "#58a6ff",
+      "--ok": "#3fb950",
+      "--warn": "#d29922",
+      "--err": "#f85149",
+      "--bubble-user": "#26262c",
+      "--session-scrollbar-track": "transparent",
+      "--session-scrollbar-thumb": "rgba(236, 236, 241, 0.28)",
+      "--term-bg": "#131316",
+      "--font-ui": SANS_FONT_STACK,
+    },
+    terminal: {
+      background: "#131316",
+      foreground: "#ececf1",
+      cursor: "#2fbf71",
+      cursorAccent: "#131316",
+      selectionBackground: "#33333c",
+      black: "#131316",
+      red: "#ff7b72",
+      green: "#3fb950",
+      yellow: "#d29922",
+      blue: "#58a6ff",
+      magenta: "#bc8cff",
+      cyan: "#39c5cf",
+      white: "#b1bac4",
+      brightBlack: "#6e7681",
+      brightRed: "#ffa198",
+      brightGreen: "#56d364",
+      brightYellow: "#e3b341",
+      brightBlue: "#79c0ff",
+      brightMagenta: "#d2a8ff",
+      brightCyan: "#56d4dd",
+      brightWhite: "#f0f6fc",
+    },
+  },
+  light: {
+    css: {
+      "--bg": "#ffffff",
+      "--bg-elev": "#f7f7f8",
+      "--bg-elev-2": "#ececee",
+      "--border": "#e0e0e4",
+      "--border-faint": "rgba(20, 20, 30, 0.08)",
+      "--fg": "#1c1c21",
+      "--fg-dim": "#6b6b76",
+      "--fg-faint": "#9494a0",
+      "--accent": "#1a9e58",
+      "--accent-fg": "#ffffff",
+      "--accent-alt": "#0969da",
+      "--ok": "#1a7f37",
+      "--warn": "#9a6700",
+      "--err": "#cf222e",
+      "--bubble-user": "#ececee",
+      "--session-scrollbar-track": "transparent",
+      "--session-scrollbar-thumb": "rgba(28, 28, 33, 0.30)",
+      "--term-bg": "#ffffff",
+      "--font-ui": SANS_FONT_STACK,
+    },
+    terminal: {
+      background: "#ffffff",
+      foreground: "#1f2328",
+      cursor: "#1a9e58",
+      cursorAccent: "#ffffff",
+      selectionBackground: "#c8e1ff",
+      black: "#24292e",
+      red: "#d73a49",
+      green: "#22863a",
+      yellow: "#b08800",
+      blue: "#0366d6",
+      magenta: "#6f42c1",
+      cyan: "#1b7c83",
+      white: "#6a737d",
+      brightBlack: "#959da5",
+      brightRed: "#cb2431",
+      brightGreen: "#28a745",
+      brightYellow: "#dbab09",
+      brightBlue: "#2188ff",
+      brightMagenta: "#8a63d2",
+      brightCyan: "#3192aa",
+      brightWhite: "#d1d5da",
+    },
+  },
   matrix: {
     css: {
       "--bg": "#020805",
@@ -2471,25 +2740,16 @@ const WEB_THEMES = {
       "--fg-dim": "#4c965c",
       "--fg-faint": "#20703a",
       "--accent": "#39ff88",
+      "--accent-fg": "#06160c",
       "--accent-alt": "#5ce1ff",
-      "--modeline-bg": "#082e18",
       "--ok": "#7dff73",
       "--warn": "#ffd75c",
       "--err": "#ff5f5a",
       "--bubble-user": "rgba(8, 46, 24, 0.82)",
-      "--bubble-assistant": "rgba(6, 21, 12, 0.86)",
-      "--bubble-system": "rgba(4, 14, 8, 0.90)",
       "--session-scrollbar-track": "rgba(190, 255, 205, 0.30)",
       "--session-scrollbar-thumb": "rgba(190, 255, 205, 0.80)",
-      "--overlay-line-a": "rgba(190, 255, 205, 0.025)",
-      "--overlay-line-b": "rgba(0, 0, 0, 0.08)",
-      "--overlay-accent": "rgba(57, 255, 136, 0.10)",
-      "--overlay-alt": "rgba(92, 225, 255, 0.07)",
-      "--overlay-opacity": "0.70",
-      "--header-tail": "#04140a",
-      "--button-pressed-fg": "#06160c",
-      "--glow-soft": "0 0 18px rgba(57, 255, 136, 0.12)",
-      "--glow-hard": "0 0 14px rgba(57, 255, 136, 0.28)",
+      "--term-bg": "#020805",
+      "--font-ui": MONO_FONT_STACK,
     },
     terminal: {
       background: "#020805",
@@ -2515,184 +2775,29 @@ const WEB_THEMES = {
       brightWhite: "#e1ffe6",
     },
   },
-  basic: {
-    css: {
-      "--bg": "#101010",
-      "--bg-elev": "#181818",
-      "--bg-elev-2": "#242424",
-      "--border": "#5f6368",
-      "--border-faint": "rgba(154, 160, 166, 0.42)",
-      "--fg": "#e5e5e5",
-      "--fg-dim": "#a3a3a3",
-      "--fg-faint": "#737373",
-      "--accent": "#3b82f6",
-      "--accent-alt": "#a855f7",
-      "--modeline-bg": "#2b2b2b",
-      "--ok": "#22c55e",
-      "--warn": "#eab308",
-      "--err": "#ef4444",
-      "--bubble-user": "rgba(39, 39, 42, 0.90)",
-      "--bubble-assistant": "rgba(24, 24, 27, 0.92)",
-      "--bubble-system": "rgba(16, 16, 16, 0.94)",
-      "--session-scrollbar-track": "rgba(229, 229, 229, 0.22)",
-      "--session-scrollbar-thumb": "rgba(229, 229, 229, 0.70)",
-      "--overlay-line-a": "rgba(229, 229, 229, 0.018)",
-      "--overlay-line-b": "rgba(0, 0, 0, 0.08)",
-      "--overlay-accent": "rgba(59, 130, 246, 0.08)",
-      "--overlay-alt": "rgba(168, 85, 247, 0.06)",
-      "--overlay-opacity": "0.38",
-      "--header-tail": "#181818",
-      "--button-pressed-fg": "#101010",
-      "--glow-soft": "0 0 18px rgba(59, 130, 246, 0.10)",
-      "--glow-hard": "0 0 14px rgba(59, 130, 246, 0.24)",
-    },
-    terminal: {
-      background: "#101010",
-      foreground: "#e5e5e5",
-      cursor: "#3b82f6",
-      cursorAccent: "#101010",
-      selectionBackground: "#374151",
-      black: "#101010",
-      red: "#ef4444",
-      green: "#22c55e",
-      yellow: "#eab308",
-      blue: "#3b82f6",
-      magenta: "#a855f7",
-      cyan: "#06b6d4",
-      white: "#e5e5e5",
-      brightBlack: "#737373",
-      brightRed: "#f87171",
-      brightGreen: "#4ade80",
-      brightYellow: "#facc15",
-      brightBlue: "#60a5fa",
-      brightMagenta: "#c084fc",
-      brightCyan: "#22d3ee",
-      brightWhite: "#fafafa",
-    },
-  },
-  dark: {
-    css: {
-      "--bg": "#0c121b",
-      "--bg-elev": "#111a26",
-      "--bg-elev-2": "#182435",
-      "--border": "#465264",
-      "--border-faint": "rgba(70, 82, 100, 0.48)",
-      "--fg": "#e8ecf3",
-      "--fg-dim": "#9199a6",
-      "--fg-faint": "#667080",
-      "--accent": "#79b8ff",
-      "--accent-alt": "#ffb054",
-      "--modeline-bg": "#1d2634",
-      "--ok": "#63c97f",
-      "--warn": "#eebe5a",
-      "--err": "#f46b74",
-      "--bubble-user": "rgba(28, 43, 61, 0.86)",
-      "--bubble-assistant": "rgba(17, 26, 38, 0.90)",
-      "--bubble-system": "rgba(12, 18, 27, 0.94)",
-      "--session-scrollbar-track": "rgba(232, 236, 243, 0.22)",
-      "--session-scrollbar-thumb": "rgba(232, 236, 243, 0.70)",
-      "--overlay-line-a": "rgba(232, 236, 243, 0.018)",
-      "--overlay-line-b": "rgba(0, 0, 0, 0.08)",
-      "--overlay-accent": "rgba(121, 184, 255, 0.08)",
-      "--overlay-alt": "rgba(255, 176, 84, 0.06)",
-      "--overlay-opacity": "0.42",
-      "--header-tail": "#111a26",
-      "--button-pressed-fg": "#0c121b",
-      "--glow-soft": "0 0 18px rgba(121, 184, 255, 0.10)",
-      "--glow-hard": "0 0 14px rgba(121, 184, 255, 0.24)",
-    },
-    terminal: {
-      background: "#0c121b",
-      foreground: "#e8ecf3",
-      cursor: "#79b8ff",
-      cursorAccent: "#0c121b",
-      selectionBackground: "#2b3442",
-      black: "#0c121b",
-      red: "#f46b74",
-      green: "#63c97f",
-      yellow: "#eebe5a",
-      blue: "#79b8ff",
-      magenta: "#d9a3ff",
-      cyan: "#73d2de",
-      white: "#e8ecf3",
-      brightBlack: "#667080",
-      brightRed: "#ff9aa1",
-      brightGreen: "#90e0a5",
-      brightYellow: "#f4d284",
-      brightBlue: "#a6ceff",
-      brightMagenta: "#e5bdff",
-      brightCyan: "#9de1e9",
-      brightWhite: "#f5f7fa",
-    },
-  },
-  light: {
-    css: {
-      "--bg": "#f6f8fb",
-      "--bg-elev": "#ffffff",
-      "--bg-elev-2": "#e8eef6",
-      "--border": "#c3ccd8",
-      "--border-faint": "rgba(128, 145, 166, 0.44)",
-      "--fg": "#222831",
-      "--fg-dim": "#5c6776",
-      "--fg-faint": "#7d8794",
-      "--accent": "#2273c3",
-      "--accent-alt": "#ae601c",
-      "--modeline-bg": "#345680",
-      "--ok": "#258748",
-      "--warn": "#ac7118",
-      "--err": "#be3844",
-      "--bubble-user": "rgba(232, 238, 246, 0.95)",
-      "--bubble-assistant": "rgba(255, 255, 255, 0.98)",
-      "--bubble-system": "rgba(244, 247, 251, 0.98)",
-      "--session-scrollbar-track": "rgba(34, 40, 49, 0.16)",
-      "--session-scrollbar-thumb": "rgba(34, 40, 49, 0.46)",
-      "--overlay-line-a": "rgba(34, 40, 49, 0.018)",
-      "--overlay-line-b": "rgba(255, 255, 255, 0.10)",
-      "--overlay-accent": "rgba(34, 115, 195, 0.05)",
-      "--overlay-alt": "rgba(174, 96, 28, 0.04)",
-      "--overlay-opacity": "0.30",
-      "--header-tail": "#294565",
-      "--button-pressed-fg": "#ffffff",
-      "--glow-soft": "0 0 18px rgba(34, 115, 195, 0.08)",
-      "--glow-hard": "0 0 14px rgba(34, 115, 195, 0.18)",
-    },
-    terminal: {
-      background: "#f6f8fb",
-      foreground: "#222831",
-      cursor: "#2273c3",
-      cursorAccent: "#ffffff",
-      selectionBackground: "#d8e7f7",
-      black: "#222831",
-      red: "#be3844",
-      green: "#258748",
-      yellow: "#ac7118",
-      blue: "#2273c3",
-      magenta: "#8c4bb3",
-      cyan: "#247f8f",
-      white: "#f6f8fb",
-      brightBlack: "#7d8794",
-      brightRed: "#d85e67",
-      brightGreen: "#3aa763",
-      brightYellow: "#c88a2a",
-      brightBlue: "#4b91d6",
-      brightMagenta: "#a96fca",
-      brightCyan: "#3c9aaa",
-      brightWhite: "#ffffff",
-    },
-  },
 };
 
 function loadWebThemeName() {
   const stored = localStorage.getItem(WEB_THEME_KEY);
-  return WEB_THEMES[stored] ? stored : "matrix";
+  return stored === "system" || WEB_THEMES[stored] ? stored : "system";
+}
+
+/** Resolve a picker value to a concrete WEB_THEMES entry: "system"
+ *  follows the OS light/dark preference. */
+function resolveWebThemeName(name = loadWebThemeName()) {
+  if (name === "system") {
+    const light = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+    return light ? "light" : "dark";
+  }
+  return WEB_THEMES[name] ? name : "dark";
 }
 
 function xtermThemeFor(name = loadWebThemeName()) {
-  return { ...WEB_THEMES[name].terminal };
+  return { ...WEB_THEMES[resolveWebThemeName(name)].terminal };
 }
 
 function webTerminalBackground(name = loadWebThemeName()) {
-  const color = WEB_THEMES[name]?.terminal?.background || "";
+  const color = WEB_THEMES[resolveWebThemeName(name)]?.terminal?.background || "";
   const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color);
   if (!match) return null;
   return match.slice(1).map((component) => parseInt(component, 16));
@@ -2705,10 +2810,13 @@ function reportWebTerminalBackground(name = loadWebThemeName()) {
 }
 
 function applyWebTheme(name, { persist = true } = {}) {
-  const themeName = WEB_THEMES[name] ? name : "matrix";
-  const theme = WEB_THEMES[themeName];
-  document.documentElement.dataset.theme = themeName;
-  document.documentElement.style.colorScheme = themeName === "light" ? "light" : "dark";
+  // The stored/picker value ("system" included); `resolved` is the
+  // concrete palette it lands on right now.
+  const themeName = name === "system" || WEB_THEMES[name] ? name : "system";
+  const resolved = resolveWebThemeName(themeName);
+  const theme = WEB_THEMES[resolved];
+  document.documentElement.dataset.theme = resolved;
+  document.documentElement.style.colorScheme = resolved === "light" ? "light" : "dark";
   for (const [key, value] of Object.entries(theme.css)) {
     document.documentElement.style.setProperty(key, value);
   }
@@ -2716,12 +2824,23 @@ function applyWebTheme(name, { persist = true } = {}) {
   if (persist) localStorage.setItem(WEB_THEME_KEY, themeName);
   if (typeof state !== "undefined") {
     for (const handle of state.terminalById.values()) {
-      if (handle.term) handle.term.options.theme = xtermThemeFor(themeName);
+      if (handle.term) handle.term.options.theme = xtermThemeFor(resolved);
     }
-    if (state.term) state.term.options.theme = xtermThemeFor(themeName);
-    if (state.program?.hover?.term) state.program.hover.term.options.theme = xtermThemeFor(themeName);
-    reportWebTerminalBackground(themeName);
+    if (state.term) state.term.options.theme = xtermThemeFor(resolved);
+    if (state.program?.hover?.term) state.program.hover.term.options.theme = xtermThemeFor(resolved);
+    reportWebTerminalBackground(resolved);
   }
+}
+
+// "System" follows the OS live: when the OS flips light/dark and the
+// stored choice is system, re-resolve without persisting anything.
+const systemThemeQuery = window.matchMedia
+  ? window.matchMedia("(prefers-color-scheme: light)")
+  : null;
+if (systemThemeQuery && systemThemeQuery.addEventListener) {
+  systemThemeQuery.addEventListener("change", () => {
+    if (loadWebThemeName() === "system") applyWebTheme("system", { persist: false });
+  });
 }
 
 function sessionIdFromLocation() {
@@ -3625,6 +3744,11 @@ function bindSessionListClicks() {
   if (sessionListEl.__clickBound) return;
   sessionListEl.__clickBound = true;
   sessionListEl.addEventListener("click", (ev) => {
+    // The click that follows a completed drag is not a selection.
+    if (listDrag.suppressClick) {
+      listDrag.suppressClick = false;
+      return;
+    }
     const t = ev.target;
     if (!t || !t.closest) return;
     const disclosure = t.closest(".disclosure.can-toggle");
@@ -3645,6 +3769,183 @@ function bindSessionListClicks() {
     }
     const item = t.closest(".item");
     if (item) selectSession(item.dataset.id);
+  });
+}
+
+// --- Session list drag-and-drop reorder ----------------------------------
+//
+// Rows reorder by direct manipulation: grab with the mouse, or
+// press-and-hold on touch (so plain swipes keep scrolling the list),
+// then drop on the target position. The daemon's reorder primitive is
+// single-step `session.move` — which enforces region boundaries
+// (pinned block, fork sibling runs, group membership) — so a drop
+// replays one step per row crossed and stops early at a region edge,
+// exactly like tapping the old ↑/↓ buttons repeatedly.
+const listDrag = {
+  armed: false,        // pointer is down on a draggable row
+  active: false,       // drag visuals engaged
+  pointerId: null,
+  isTouch: false,
+  startX: 0,
+  startY: 0,
+  holdTimer: null,     // touch press-and-hold timer
+  sourceId: null,
+  targetEl: null,
+  dropAfter: false,
+  suppressClick: false, // swallow the click that follows a drag
+  renderQueued: false,  // a renderSessions() arrived mid-drag
+};
+
+function listDragSourceEl() {
+  return listDrag.sourceId
+    ? sessionListEl.querySelector(`.item[data-id="${CSS.escape(listDrag.sourceId)}"]`)
+    : null;
+}
+
+function listDragClearIndicator() {
+  for (const el of sessionListEl.querySelectorAll(".drop-before, .drop-after")) {
+    el.classList.remove("drop-before", "drop-after");
+  }
+  listDrag.targetEl = null;
+}
+
+function listDragStart() {
+  listDrag.holdTimer = null;
+  if (listDrag.active || !listDrag.armed) return;
+  listDrag.active = true;
+  sessionListEl.classList.add("drag-active");
+  const src = listDragSourceEl();
+  if (src) src.classList.add("drag-source");
+  if (navigator.vibrate) navigator.vibrate(10);
+}
+
+function listDragTrack(x, y) {
+  // Auto-scroll when hovering near the list's edges so long lists can
+  // be reordered end to end.
+  const rect = sessionListEl.getBoundingClientRect();
+  if (y < rect.top + 28) sessionListEl.scrollTop -= 10;
+  else if (y > rect.bottom - 28) sessionListEl.scrollTop += 10;
+  listDragClearIndicator();
+  const under = document.elementFromPoint(x, y);
+  const row = under && under.closest ? under.closest(".session-list .item[data-id]") : null;
+  if (!row || !sessionListEl.contains(row)) return;
+  if (row.dataset.id === listDrag.sourceId || row.classList.contains("is-operator")) return;
+  const r = row.getBoundingClientRect();
+  listDrag.dropAfter = y > r.top + r.height / 2;
+  row.classList.add(listDrag.dropAfter ? "drop-after" : "drop-before");
+  listDrag.targetEl = row;
+}
+
+/** Replay a drop as single-step moves; the daemon stops us at region
+ *  edges (`moved: false`), which keeps pinned/fork/group semantics
+ *  without the client re-deriving them. */
+async function moveSessionSteps(sessionId, steps) {
+  const direction = steps > 0 ? "down" : "up";
+  for (let i = 0; i < Math.abs(steps); i += 1) {
+    try {
+      const res = await rpc("session.move", { session_id: sessionId, direction });
+      if (res && res.moved === false) break;
+    } catch (e) {
+      appendError(`reorder failed: ${e.message}`);
+      break;
+    }
+  }
+}
+
+function listDragFinish(commit) {
+  clearTimeout(listDrag.holdTimer);
+  listDrag.holdTimer = null;
+  const wasActive = listDrag.active;
+  const sourceId = listDrag.sourceId;
+  const targetEl = listDrag.targetEl;
+  const dropAfter = listDrag.dropAfter;
+  listDrag.armed = false;
+  listDrag.active = false;
+  listDrag.pointerId = null;
+  listDrag.sourceId = null;
+  sessionListEl.classList.remove("drag-active");
+  const src = sourceId
+    ? sessionListEl.querySelector(`.item[data-id="${CSS.escape(sourceId)}"]`)
+    : null;
+  if (src) src.classList.remove("drag-source");
+  listDragClearIndicator();
+  if (!wasActive) return;
+  listDrag.suppressClick = true;
+  if (commit && sourceId && targetEl) {
+    const ids = Array.from(
+      sessionListEl.querySelectorAll(".item[data-id]:not(.is-operator)")
+    ).map((el) => el.dataset.id);
+    const from = ids.indexOf(sourceId);
+    const slot = ids.indexOf(targetEl.dataset.id) + (dropAfter ? 1 : 0);
+    if (from >= 0 && slot >= 0) {
+      // Removing the row from its old index shifts every later slot
+      // up by one, so a downward move covers one fewer row than the
+      // raw slot delta.
+      const steps = slot > from ? slot - from - 1 : slot - from;
+      if (steps !== 0) moveSessionSteps(sourceId, steps);
+    }
+  }
+  if (listDrag.renderQueued) {
+    listDrag.renderQueued = false;
+    renderSessions();
+  }
+}
+
+function bindSessionListDrag() {
+  if (sessionListEl.__dragBound) return;
+  sessionListEl.__dragBound = true;
+  sessionListEl.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0 || listDrag.armed) return;
+    const row = ev.target.closest(".item[data-id]");
+    if (!row || row.classList.contains("is-operator")) return;
+    if (ev.target.closest(".disclosure.can-toggle")) return;
+    listDrag.armed = true;
+    listDrag.pointerId = ev.pointerId;
+    listDrag.isTouch = ev.pointerType === "touch";
+    listDrag.startX = ev.clientX;
+    listDrag.startY = ev.clientY;
+    listDrag.sourceId = row.dataset.id;
+    // Touch arms via press-and-hold so an immediate swipe stays a
+    // scroll; mouse arms on a small movement threshold instead.
+    if (listDrag.isTouch) listDrag.holdTimer = setTimeout(listDragStart, 300);
+  });
+  window.addEventListener("pointermove", (ev) => {
+    if (!listDrag.armed || ev.pointerId !== listDrag.pointerId) return;
+    const dx = ev.clientX - listDrag.startX;
+    const dy = ev.clientY - listDrag.startY;
+    if (!listDrag.active) {
+      const dist = Math.hypot(dx, dy);
+      if (listDrag.isTouch) {
+        // Moved before the hold fired: it's a scroll, not a drag.
+        if (dist > 10 && listDrag.holdTimer) listDragFinish(false);
+      } else if (dist > 6) {
+        listDragStart();
+      }
+      if (!listDrag.active) return;
+    }
+    listDragTrack(ev.clientX, ev.clientY);
+  });
+  window.addEventListener("pointerup", (ev) => {
+    if (!listDrag.armed || ev.pointerId !== listDrag.pointerId) return;
+    listDragFinish(true);
+  });
+  window.addEventListener("pointercancel", (ev) => {
+    if (!listDrag.armed || ev.pointerId !== listDrag.pointerId) return;
+    listDragFinish(false);
+  });
+  // While a touch drag is live, the move gesture belongs to the drag —
+  // stop the browser from also scrolling the list (needs non-passive).
+  sessionListEl.addEventListener(
+    "touchmove",
+    (ev) => {
+      if (listDrag.active) ev.preventDefault();
+    },
+    { passive: false }
+  );
+  // A press-and-hold that armed a touch drag must not also pop the
+  // browser's long-press context menu / text-selection callout.
+  sessionListEl.addEventListener("contextmenu", (ev) => {
+    if (listDrag.armed || listDrag.active) ev.preventDefault();
   });
 }
 
@@ -3718,7 +4019,14 @@ function sessionRowDescriptor(item) {
 }
 
 function renderSessions() {
+  // A re-render mid-drag would replace the very rows the pointer is
+  // tracking; park it and replay once the drag settles.
+  if (listDrag.active) {
+    listDrag.renderQueued = true;
+    return;
+  }
   bindSessionListClicks();
+  bindSessionListDrag();
   const items = orderedItems();
   if (!items.length) {
     const only = sessionListEl.firstElementChild;
@@ -3729,7 +4037,7 @@ function renderSessions() {
       empty.textContent = "no sessions";
       sessionListEl.appendChild(empty);
     }
-    refreshListToolbar();
+    refreshSessionActions();
     return;
   }
   // Keyed in-place reconcile. Only rows whose output actually changed are
@@ -3767,38 +4075,50 @@ function renderSessions() {
     prev = node;
   }
   for (const node of existing.values()) node.remove();
-  refreshListToolbar();
+  refreshSessionActions();
 }
 
-/** Recompute enable/disable state of the shared toolbar buttons
- *  against the currently-selected session. Restart only enables
- *  on terminal-state sessions; move-up/down enable as long as
- *  there's a non-operator selection. */
-function refreshListToolbar() {
+/** Recompute the per-session action affordances against the
+ *  currently-selected session: the title-bar pin/rename buttons and
+ *  the session-menu dropdown items. Rename/pin/fork/archive/delete
+ *  apply to user sessions only — the operator's label/lifecycle is
+ *  daemon-owned; restart only enables on terminal-state sessions;
+ *  merge only enables on forks (kept visible on non-forks so the menu
+ *  teaches the workflow, matching the TUI). */
+function refreshSessionActions() {
   const sel = state.sessions.find((s) => s.id === state.currentId);
-  const isUserSession = sel && sel.kind !== "orchestrator";
+  const isUserSession = !!(sel && sel.kind !== "orchestrator");
   const status = (sel && sel.state ? sel.state : "").toLowerCase();
   const terminal = ["done", "errored", "killed", "stopped"].includes(status);
-  const upBtn = $("toolbarUpBtn");
-  const downBtn = $("toolbarDownBtn");
-  const pinBtn = $("toolbarPinBtn");
-  const renameBtn = $("toolbarRenameBtn");
-  const restartBtn = $("toolbarRestartBtn");
-  const deleteBtn = $("toolbarDeleteBtn");
-  if (upBtn) upBtn.disabled = !isUserSession;
-  if (downBtn) downBtn.disabled = !isUserSession;
-  if (pinBtn) {
-    pinBtn.disabled = !isUserSession;
-    const pinned = !!(sel && sel.pinned);
-    pinBtn.textContent = pinned ? "★" : "☆";
-    pinBtn.classList.toggle("is-on", pinned);
-    pinBtn.setAttribute("aria-label", pinned ? "unpin selected" : "pin selected");
-    pinBtn.title = pinned ? "Unpin selected" : "Pin selected";
+  const archived = !!(sel && sel.archived);
+  const pinned = !!(sel && sel.pinned);
+  const renameBtn = $("titleRenameBtn");
+  if (renameBtn) renameBtn.hidden = !isUserSession;
+  // The menu pill overlays the view's top-right corner; the program
+  // view's own bar (Find/Run/Save) occupies that spot, so hide it there.
+  const overlay = $("sessionMenuOverlay");
+  if (overlay) overlay.hidden = !sel || state.mode === "program";
+  if (overlay && overlay.hidden) closeSessionMenu();
+  const menu = $("sessionMenu");
+  if (menu) {
+    const enabledByAction = {
+      rename: isUserSession,
+      pin: isUserSession,
+      fork: isUserSession && !archived,
+      restart: !!sel && terminal && !archived,
+      archive: isUserSession,
+      merge: !!(sel && sel.forked_from),
+      delete: isUserSession,
+    };
+    for (const btn of menu.querySelectorAll("[data-menu-action]")) {
+      const on = enabledByAction[btn.dataset.menuAction];
+      btn.disabled = on === false;
+    }
+    const pinItem = $("sessionMenuPinItem");
+    if (pinItem) pinItem.textContent = pinned ? "unpin" : "pin";
+    const archiveItem = $("sessionMenuArchiveItem");
+    if (archiveItem) archiveItem.textContent = archived ? "unarchive" : "archive";
   }
-  // Rename/delete user sessions only — operator's label/lifecycle is daemon-owned.
-  if (renameBtn) renameBtn.disabled = !isUserSession;
-  if (deleteBtn) deleteBtn.disabled = !isUserSession;
-  if (restartBtn) restartBtn.disabled = !sel || !terminal;
 }
 
 function setBrowserPreview(sessionId, preview) {
@@ -3888,14 +4208,19 @@ function toggleArchivedSection(section) {
   renderSessions();
 }
 
-/** Dispatch a session action by name. Wired up to the shared
- *  list toolbar (acts on `state.currentId`). Rename hands off
- *  to a slide-up sheet because it needs text input; delete asks
- *  for browser confirmation before firing the RPC. */
+/** Dispatch a session action by name. Wired up to the title-bar
+ *  pin/rename buttons and the session menu (acts on
+ *  `state.currentId`). Rename hands off to a slide-up sheet because
+ *  it needs text input; delete asks for confirmation via the
+ *  close-session sheet before firing the RPC. */
 async function handleRowAction(action, sessionId) {
   if (!sessionId) return;
   if (action === "rename") {
     openRenameDialog(sessionId);
+    return;
+  }
+  if (action === "fork") {
+    await forkSession(sessionId);
     return;
   }
   if (action === "pin") {
@@ -3923,13 +4248,105 @@ async function handleRowAction(action, sessionId) {
   try {
     if (action === "restart") {
       await rpc("session.restart", { session_id: sessionId });
-    } else if (action === "move-up") {
-      await rpc("session.move", { session_id: sessionId, direction: "up" });
-    } else if (action === "move-down") {
-      await rpc("session.move", { session_id: sessionId, direction: "down" });
+    } else if (action === "archive") {
+      // Archive is soft and reversible (unarchive = session.restart), so
+      // no confirm sheet: the label flips per the session's archived bit.
+      const s = state.sessions.find((x) => x.id === sessionId);
+      if (s && s.archived) await rpc("session.restart", { session_id: sessionId });
+      else await rpc("session.archive", { session_id: sessionId });
+    } else if (action === "merge") {
+      await mergeForkSession(sessionId);
     }
   } catch (e) {
     appendError(`${action} failed: ${e.message}`);
+  }
+}
+
+/** Wait for a freshly-created session's summary to arrive over the
+ *  session/state broadcast, so a follow-up selectSession sees it. */
+async function waitForSessionSummary(sessionId, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (state.sessions.some((x) => x.id === sessionId)) return true;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+}
+
+/** Fork the session into a new top-level sibling on the same harness.
+ *  Mirrors the daemon's own program-verb fork shape: same harness +
+ *  `forked_from` lineage makes the fork-resume wiring hand a
+ *  natively-forking harness (claude/codex/opencode/grok) the source's
+ *  real conversation state; other harnesses get a fresh start that
+ *  still records the lineage. */
+async function forkSession(sessionId) {
+  const s = state.sessions.find((x) => x.id === sessionId);
+  if (!s) return;
+  try {
+    const tr = await rpc("session.transcript", { session_id: sessionId, tail: 1 });
+    const interactive = !!s.has_pty && s.mode !== "headless";
+    const params = {
+      harness: s.harness,
+      cwd: s.cwd,
+      title: s.title ? `(fork) ${s.title}` : `(fork) fork of ${sessionId.slice(0, 8)}`,
+      position_after_session_id: sessionId,
+      forked_from: {
+        session_id: sessionId,
+        transcript_seq: (tr && tr.total) || 0,
+        at_ms: Date.now(),
+        parent_busy_ms: s.busy_ms || 0,
+        parent_message_count: s.message_count || 0,
+        is_reset_snapshot: false,
+      },
+    };
+    if (s.model) params.model = s.model;
+    if (s.group_id) params.group_id = s.group_id;
+    if (s.mode) params.mode = s.mode;
+    if (interactive) params.pty_size = { cols: 100, rows: 30 };
+    const res = await rpc("session.create", params);
+    if (res && res.session_id && (await waitForSessionSummary(res.session_id))) {
+      await selectSession(res.session_id);
+    }
+  } catch (e) {
+    appendError(`fork failed: ${e.message}`);
+  }
+}
+
+/** "Merge and archive" a fork, mirroring the TUI flow: hand the
+ *  parent a compact fork result (the fork's last assistant message,
+ *  with a stable session reference for the full history), stamp the
+ *  merge on the fork, archive it, and land back on the parent. */
+async function mergeForkSession(sessionId) {
+  const fork = state.sessions.find((x) => x.id === sessionId);
+  const parentId = fork && fork.forked_from && fork.forked_from.session_id;
+  if (!parentId) {
+    appendError("merge: not a fork");
+    return;
+  }
+  try {
+    const tr = await rpc("session.transcript", { session_id: sessionId, tail: 200 });
+    const events = (tr && tr.events) || [];
+    let summary = "";
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i] && events[i].event;
+      if (ev && ev.type === "message" && (ev.role || "assistant") === "assistant") {
+        summary = String(ev.text || "").trim();
+        break;
+      }
+    }
+    if (summary) {
+      if (summary.length > 6000) summary = `${summary.slice(0, 6000)}…`;
+      const title = (fork.title || "fork").trim();
+      await rpc("session.input", {
+        session_id: parentId,
+        text: `⑂ fork result (${title}; fork session: ${sessionId}): ${summary}`,
+      });
+    }
+    await rpc("session.merge", { session_id: sessionId, mode: "result" });
+    await rpc("session.archive", { session_id: sessionId });
+    if (state.sessions.some((x) => x.id === parentId)) await selectSession(parentId);
+  } catch (e) {
+    appendError(`merge failed: ${e.message}`);
   }
 }
 
@@ -3943,6 +4360,25 @@ function preferredViewModeForSession(s) {
   return state.viewModeById.get(s.id) === "chat" ? "chat" : "terminal";
 }
 
+// Narrow-view collapse state for the view-mode switcher: initials only
+// ("T | P") until tapped; the first tap expands to full labels WITHOUT
+// switching, and the switcher auto-collapses a few seconds after the
+// last interaction so the title bar stays uncrowded.
+let viewModeExpanded = false;
+let viewModeCollapseTimer = null;
+
+function scheduleViewModeCollapse() {
+  clearTimeout(viewModeCollapseTimer);
+  viewModeCollapseTimer = setTimeout(() => setViewModeExpanded(false), 4000);
+}
+
+function setViewModeExpanded(on) {
+  viewModeExpanded = on;
+  renderViewModeToggle(currentSession());
+  if (on) scheduleViewModeCollapse();
+  else clearTimeout(viewModeCollapseTimer);
+}
+
 function renderViewModeToggle(s) {
   if (!s) { viewModeToggleEl.hidden = true; return; }
   // Program is available for every session; Terminal/Chat appear only when the
@@ -3953,6 +4389,17 @@ function renderViewModeToggle(s) {
   viewModeChatBtn.hidden = !chat;
   viewModeProgramBtn.hidden = false;
   viewModeToggleEl.hidden = false;
+  const collapsed = isNarrowLayout() && !viewModeExpanded;
+  viewModeToggleEl.classList.toggle("collapsed", collapsed);
+  for (const [btn, label] of [
+    [viewModeTerminalBtn, "Terminal"],
+    [viewModeChatBtn, "Chat"],
+    [viewModeProgramBtn, "Program"],
+  ]) {
+    const text = collapsed ? label[0] : label;
+    if (btn.textContent !== text) btn.textContent = text;
+    btn.title = label;
+  }
   // Reflect the per-session preference (which now includes "program") rather
   // than the global `state.mode`: during a session switch `state.mode` still
   // holds the outgoing session's view until the new surface is entered.
@@ -5520,6 +5967,7 @@ async function enterProgramMode(id, opts = {}) {
   composerEl.hidden = true;
   terminalWrapEl.hidden = true;
   terminalScrollOverlayEl.hidden = true;
+  refreshSessionActions();
   widgetsTriggerBtn.hidden = true;
   terminalWidgetsProxyBtn.hidden = true;
   terminalWidgetControlsEl.hidden = true;
@@ -6757,6 +7205,7 @@ function enterChatMode() {
   if (pane && pane.dataset.loaded === "true") restoreTranscriptViewport(state.currentId);
   terminalEl.classList.remove("hide-xterm-cursor");
   terminalScrollOverlayEl.hidden = true;
+  refreshSessionActions();
   renderWidgets();
   hydrateWidgets(state.currentId);
   // Show minimal agent-status in chat mode so user sees "Working.. <elapsed>"
@@ -6828,6 +7277,7 @@ async function enterTerminalMode(id, options = {}) {
   composerEl.hidden = !showMobileControls;
   terminalWrapEl.hidden = false;
   terminalScrollOverlayEl.hidden = false;
+  refreshSessionActions();
   renderWidgets();
   hydrateWidgets(id);
   vkbdEl.hidden = !showMobileControls;
@@ -8461,7 +8911,7 @@ function handleNotification(method, params) {
       renderBrowserPreviewForSession(null);
       sessionTitleEl.textContent = "";
       viewModeToggleEl.hidden = true;
-      refreshListToolbar();
+      refreshSessionActions();
       if (neighborId) selectSession(neighborId);
     }
   } else if (method === "group/state" || method === "project/state") {
@@ -8767,9 +9217,9 @@ function ensureThinkingBanner(sessionId) {
   row.className = "row role-assistant thinking-row";
   row.innerHTML = `
     <div class="meta">assistant · thinking</div>
-    <div class="bubble">
-      <span class="spinner" aria-hidden="true">⏳</span>
-      <span>Working..</span>
+    <div class="bubble" role="status" aria-label="assistant is working">
+      <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span>Working…</span>
     </div>`;
   target.appendChild(row);
   scrollToBottom();
@@ -10527,25 +10977,94 @@ closeSessionDeleteBtn.addEventListener("click", async () => {
   }
 });
 
-// Shared list toolbar — delegate the click to the same
-// `handleRowAction` the per-row buttons used to call. After the
-// action, `session/state` notifications refresh the cached
-// summary and re-render the list (which calls
-// `refreshListToolbar` for us).
-$("listToolbar").addEventListener("click", (ev) => {
-  const btn = ev.target.closest("[data-action]");
+// The title-bar rename button acts on the current session. After an
+// action, `session/state` notifications refresh the cached summary and
+// re-render the list (which calls `refreshSessionActions` for us).
+$("titleRenameBtn").addEventListener("click", () => {
+  handleRowAction("rename", state.currentId);
+});
+
+// Session menu — the web peer of the TUI session-title menu. The pill
+// toggles the dropdown; a click elsewhere or Escape closes it.
+function closeSessionMenu() {
+  const menu = $("sessionMenu");
+  const btn = $("sessionMenuBtn");
+  if (menu) menu.hidden = true;
+  if (btn) btn.setAttribute("aria-expanded", "false");
+}
+
+$("sessionMenuBtn").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const menu = $("sessionMenu");
+  const open = menu.hidden;
+  refreshSessionActions();
+  menu.hidden = !open;
+  $("sessionMenuBtn").setAttribute("aria-expanded", open ? "true" : "false");
+});
+
+$("sessionMenu").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-menu-action]");
   if (!btn || btn.disabled) return;
-  handleRowAction(btn.dataset.action, state.currentId);
+  closeSessionMenu();
+  handleRowAction(btn.dataset.menuAction, state.currentId);
+});
+
+document.addEventListener("click", (ev) => {
+  const menu = $("sessionMenu");
+  if (!menu || menu.hidden) return;
+  if (ev.target.closest("#sessionMenu") || ev.target.closest("#sessionMenuBtn")) return;
+  closeSessionMenu();
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeSessionMenu();
 });
 
 viewModeToggleEl.addEventListener("click", (ev) => {
   const btn = ev.target.closest("[data-view-mode]");
   if (!btn) return;
+  // Narrow view: the first tap on the collapsed "T | P" switcher only
+  // expands it — switching needs a second, informed tap.
+  if (isNarrowLayout() && !viewModeExpanded) {
+    setViewModeExpanded(true);
+    return;
+  }
+  scheduleViewModeCollapse();
   switchCurrentViewMode(btn.dataset.viewMode);
+});
+
+// Crossing the narrow/wide breakpoint re-renders the switcher (full
+// labels on wide, collapsed initials on narrow).
+window.addEventListener("resize", () => {
+  if (!isNarrowLayout() && viewModeExpanded) setViewModeExpanded(false);
+  else renderViewModeToggle(currentSession());
 });
 
 themePickerEl.addEventListener("change", () => {
   applyWebTheme(themePickerEl.value);
+});
+
+// Settings sheet — opened from the matrix-rain badge in the header.
+const settingsSheetEl = $("settingsSheet");
+
+function openSettingsSheet() {
+  settingsSheetEl.hidden = false;
+}
+
+function closeSettingsSheet() {
+  settingsSheetEl.hidden = true;
+}
+
+miniMatrixEl.addEventListener("click", openSettingsSheet);
+miniMatrixEl.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" || ev.key === " ") {
+    ev.preventDefault();
+    openSettingsSheet();
+  }
+});
+$("settingsClose").addEventListener("click", closeSettingsSheet);
+settingsSheetEl.addEventListener("click", (ev) => {
+  // Click on the backdrop (the sheet itself, not the card) closes.
+  if (ev.target === settingsSheetEl) closeSettingsSheet();
 });
 
 // --- Mobile keyboard awareness ------------------------------------------
