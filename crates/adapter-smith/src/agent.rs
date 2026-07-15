@@ -377,6 +377,16 @@ const TOOL_OUTPUT_BUDGET: usize = 8_000;
 /// Build a fresh [`ToolCtx`] that shares the daemon `Client` with `src`
 /// when one has already been opened. Used to fan a turn's Safe tool
 /// calls into parallel tasks without each one re-connecting.
+/// Forget what the `agentd_context` tool already served this model: called
+/// whenever message history is compacted or pruned, since served-but-dropped
+/// content must be sent again (spec 0095).
+pub(crate) fn reset_context_serve(ctx: &ToolCtx) {
+    ctx.context_serve
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .reset();
+}
+
 pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
     let new_ctx = ToolCtx {
         cwd: src.cwd.clone(),
@@ -384,6 +394,7 @@ pub(crate) fn clone_tool_ctx(src: &ToolCtx) -> ToolCtx {
         client: tokio::sync::OnceCell::new(),
         emit: src.emit.clone(),
         procs: src.procs.clone(),
+        context_serve: src.context_serve.clone(),
         sandbox: src.sandbox.clone(),
         sandbox_policy: src.sandbox_policy.clone(),
     };
@@ -627,6 +638,7 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
         procs: Arc::new(crate::tools::proc::ProcRegistry::default()),
+        context_serve: Arc::new(std::sync::Mutex::new(Default::default())),
         sandbox: announce_sandbox(&emit),
         sandbox_policy: crate::sandbox::SandboxPolicy::workspace_default(&cwd),
     };
@@ -835,6 +847,9 @@ pub async fn run(
                                 tracing::warn!(error = ?e, "auto-compact: persist rewrite failed");
                             }
                         }
+                        // The summarized history no longer holds what the
+                        // context tool served; the next call must resend.
+                        reset_context_serve(&tool_ctx);
                         emit.emit(SessionEvent::ContextCompacted {
                             kept_turns: outcome.kept_turn_pairs,
                             dropped_turns: outcome.dropped_turn_pairs,
@@ -849,7 +864,9 @@ pub async fn run(
                     }
                 }
             }
-            let _pruned = context::prune_to_budget(&mut messages, budget);
+            if context::prune_to_budget(&mut messages, budget) > 0 {
+                reset_context_serve(&tool_ctx);
+            }
 
             let mut sink = MessageSink { emit: &emit };
             let turn = match crate::provider_watchdog::complete(
@@ -878,7 +895,9 @@ pub async fn run(
                             now_ms,
                         );
                         let retry_budget = ((new_limit as f64) * context::UTILIZATION) as usize;
-                        let _pruned = context::prune_to_budget(&mut messages, retry_budget);
+                        if context::prune_to_budget(&mut messages, retry_budget) > 0 {
+                            reset_context_serve(&tool_ctx);
+                        }
                         emit.emit(SessionEvent::Status {
                             state: SessionState::Running,
                             detail: Some(format!(
@@ -1444,6 +1463,7 @@ async fn run_with_interrupt(
     let session_id = ctx.session_id.clone();
     let emit = ctx.emit.clone();
     let procs = ctx.procs.clone();
+    let context_serve = ctx.context_serve.clone();
     let sandbox = ctx.sandbox.clone();
     let sandbox_policy = ctx.sandbox_policy.clone();
     let client_cell = std::sync::Mutex::new(None::<Arc<construct_client::Client>>);
@@ -1457,6 +1477,7 @@ async fn run_with_interrupt(
             client: tokio::sync::OnceCell::new(),
             emit,
             procs,
+            context_serve,
             sandbox,
             sandbox_policy,
         };

@@ -1,7 +1,7 @@
 # 0095-mcp-agent-context-budgets
 
 Status: accepted
-Date: 2026-07-14
+Date: 2026-07-15
 Area: protocol
 Scope: Model-facing MCP tools return bounded, compact projections instead of UI-oriented daemon payloads.
 
@@ -16,7 +16,9 @@ Construct's MCP boundary is an agent-context API, not a transparent serializatio
 - PTY reads default to a bounded byte tail and expose offsets so callers can page backward deliberately.
 - Program reads return current Markdown once, compact block addressing/status, and no revision bodies by default. Program write/execute responses acknowledge the mutation and return only identities the caller could not already know.
 - Program verb/template listings expose selection metadata by default; internal prompts and template bodies are returned only when explicitly requested.
-- Agent context omits long reference policies and the Markdown registry by default, and supports content etags so unchanged memory or Program-run payloads need not be repeated.
+- Agent context omits long reference policies and the Markdown registry by default, and never repeats what its serving process already sent: the server remembers per process what it served (one serving process serves one agent), so unchanged memory and Program-run payloads collapse to an etag marker without requiring the model to echo etags back. Static payloads (standing instructions, widget paths, reference hints) are served once per process. Program-run content and its static run reference (run instructions, smart-clip syntax) are tracked independently, so a Program edit does not resend the static reference.
+- Everything a serving process omits must remain recoverable out-of-band (memory by file path, the Program via its read tool), and the agent must have an explicit refresh escape that resends everything. This is the compaction contract: when the agent's own context is compacted, served-but-dropped content is re-obtainable; a harness that controls its own compaction resets the serve state itself, and external agents pass refresh.
+- The compact agent-context serving behavior is identical across surfaces: MCP and any native harness context tool share one implementation. A native tool must not bypass the budget layer (no pretty-printed or unconditionally-full serializations).
 
 The daemon's rich IPC structs remain authoritative for interactive clients. MCP projections may intentionally have a different and breaking shape.
 

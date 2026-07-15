@@ -53,6 +53,9 @@ async fn run_inner(
 ) -> Result<()> {
     let mut stdin = BufReader::new(tokio::io::stdin());
     let mut stdout = tokio::io::stdout();
+    // One MCP server process serves one agent, so what the context tool has
+    // already sent that agent is process state (spec 0095).
+    let context_state = tools::ContextServeState::default();
 
     loop {
         let raw = match transport::read_message(&mut stdin).await {
@@ -74,7 +77,8 @@ async fn run_inner(
                         client = new_client;
                     }
                 }
-                let resp = handle_request(&client, session_id.as_deref(), req).await;
+                let resp =
+                    handle_request(&client, session_id.as_deref(), &context_state, req).await;
                 let v = match serde_json::to_value(&resp) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -91,7 +95,12 @@ async fn run_inner(
     }
 }
 
-async fn handle_request(client: &Arc<Client>, session_id: Option<&str>, req: Request) -> Response {
+async fn handle_request(
+    client: &Arc<Client>,
+    session_id: Option<&str>,
+    context_state: &tools::ContextServeState,
+    req: Request,
+) -> Response {
     let id = req.id.clone();
     let params = req.params.clone().unwrap_or(serde_json::Value::Null);
 
@@ -110,7 +119,7 @@ async fn handle_request(client: &Arc<Client>, session_id: Option<&str>, req: Req
             }),
         ),
         "tools/list" => Response::ok(id, serde_json::json!({ "tools": tools::catalog() })),
-        "tools/call" => match tools::call(client, session_id, params).await {
+        "tools/call" => match tools::call(client, session_id, context_state, params).await {
             Ok(content) => Response::ok(id, content),
             Err(e) => Response::ok(
                 id,

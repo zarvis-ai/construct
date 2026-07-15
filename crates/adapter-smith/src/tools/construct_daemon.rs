@@ -43,15 +43,26 @@ impl Tool for Context {
         agent_context::TOOL_DESCRIPTION
     }
     fn schema(&self) -> Value {
-        json!({ "type": "object", "properties": {} })
+        json!({
+            "type": "object",
+            "properties": {
+                "refresh": { "type": "boolean", "description": "Resend static fields and unchanged content. Pass true when earlier agentd_context results may have been compacted out of your context." },
+                "skip_memory": { "type": "boolean", "description": "Omit memory file contents you already hold verbatim (e.g. you just wrote them); paths and etags are still returned." },
+                "include_reference": { "type": "boolean", "description": "Include the full memory/widget policy and Markdown extension reference." }
+            }
+        })
     }
     fn risk(&self) -> ToolRisk {
         ToolRisk::Safe
     }
-    async fn run(&self, _input: Value, _ctx: &ToolCtx) -> Result<ToolOutcome> {
+    async fn run(&self, input: Value, ctx: &ToolCtx) -> Result<ToolOutcome> {
+        let request = agent_context::ContextRequest::from_args(&input);
+        let mut state = ctx.context_serve.lock().unwrap_or_else(|p| p.into_inner());
+        let response =
+            agent_context::compact_response(agent_context::build_from_env(), &request, &mut state);
         Ok(ToolOutcome {
             ok: true,
-            output: serde_json::to_string_pretty(&agent_context::build_from_env())?,
+            output: serde_json::to_string(&response)?,
         })
     }
 }

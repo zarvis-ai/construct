@@ -149,6 +149,11 @@ pub struct ToolCtx {
     /// earlier `shell` call started. Cloned (not re-created) by
     /// [`crate::agent::clone_tool_ctx`] and the parallel-call paths.
     pub procs: Arc<proc::ProcRegistry>,
+    /// What the `agentd_context` tool has already served this session's
+    /// model, so repeat calls omit it (spec 0095). Shared across every clone
+    /// of the context; reset when the message history is compacted or pruned
+    /// (the model no longer holds what was served).
+    pub context_serve: Arc<std::sync::Mutex<construct_protocol::agent_context::ContextServeState>>,
     /// OS sandbox backend for the session (`Noop` when disabled). Shared
     /// across every clone of the context — selected once at session start.
     pub sandbox: Arc<dyn crate::sandbox::Sandbox>,

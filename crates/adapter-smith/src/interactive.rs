@@ -2184,6 +2184,7 @@ pub async fn run(
         client: tokio::sync::OnceCell::new(),
         emit: Some(emit.clone()),
         procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+        context_serve: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
         sandbox: crate::agent::announce_sandbox(&emit),
         sandbox_policy: crate::sandbox::SandboxPolicy::workspace_default(&cwd),
     };
@@ -2582,6 +2583,7 @@ pub async fn run(
                                                     tracing::warn!(error = ?e, "compact: persist rewrite failed");
                                                 }
                                             }
+                                            crate::agent::reset_context_serve(&tool_ctx);
                                             emit.emit(SessionEvent::ContextCompacted {
                                                 kept_turns: outcome.kept_turn_pairs,
                                                 dropped_turns: outcome.dropped_turn_pairs,
@@ -2815,6 +2817,7 @@ pub async fn run(
                                 tracing::warn!(error = ?e, "auto-compact: persist rewrite failed");
                             }
                         }
+                        crate::agent::reset_context_serve(&tool_ctx);
                         emit.emit(SessionEvent::ContextCompacted {
                             kept_turns: outcome.kept_turn_pairs,
                             dropped_turns: outcome.dropped_turn_pairs,
@@ -2833,7 +2836,9 @@ pub async fn run(
                     }
                 }
             }
-            let _pruned = context::prune_to_budget(&mut messages, budget);
+            if context::prune_to_budget(&mut messages, budget) > 0 {
+                crate::agent::reset_context_serve(&tool_ctx);
+            }
             let mut sink = PtySink::new(&emit, pty_width, turn_started_at_ms);
             // Wrap the provider call so user typing during the
             // stream is fed to the editor and pressed-Enter lines
@@ -2882,7 +2887,9 @@ pub async fn run(
                             now_ms,
                         );
                         let retry_budget = ((new_limit as f64) * context::UTILIZATION) as usize;
-                        let _pruned = context::prune_to_budget(&mut messages, retry_budget);
+                        if context::prune_to_budget(&mut messages, retry_budget) > 0 {
+                            crate::agent::reset_context_serve(&tool_ctx);
+                        }
                         term.note(&format!(
                             "(context overflow — relearned cap as {} tokens, retrying)",
                             new_limit
@@ -4428,6 +4435,7 @@ async fn run_with_supervisor(
     let session_id = ctx.session_id.clone();
     let emit = ctx.emit.clone();
     let procs = ctx.procs.clone();
+    let context_serve = ctx.context_serve.clone();
     let sandbox = ctx.sandbox.clone();
     let sandbox_policy = ctx.sandbox_policy.clone();
     let client_seed = ctx.client.get().cloned();
@@ -4439,6 +4447,7 @@ async fn run_with_supervisor(
             client: tokio::sync::OnceCell::new(),
             emit,
             procs,
+            context_serve,
             sandbox,
             sandbox_policy,
         };

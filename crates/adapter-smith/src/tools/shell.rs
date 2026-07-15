@@ -301,6 +301,7 @@ mod tests {
             client: tokio::sync::OnceCell::new(),
             emit: None,
             procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            context_serve: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             sandbox: std::sync::Arc::new(crate::sandbox::Noop),
             sandbox_policy,
         }
@@ -334,6 +335,7 @@ mod tests {
             client: tokio::sync::OnceCell::new(),
             emit: None,
             procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            context_serve: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             sandbox: std::sync::Arc::new(sb),
             sandbox_policy: policy,
         };
@@ -400,6 +402,7 @@ mod tests {
             client: tokio::sync::OnceCell::new(),
             emit: None,
             procs: std::sync::Arc::new(crate::tools::proc::ProcRegistry::default()),
+            context_serve: std::sync::Arc::new(std::sync::Mutex::new(Default::default())),
             sandbox: std::sync::Arc::new(sb),
             sandbox_policy: policy,
         };

@@ -135,92 +135,10 @@ fn render_terminal_text(bytes: &[u8], size: Option<construct_protocol::PtySize>)
     parser.screen().contents().trim_end().to_string()
 }
 
-fn content_etag(text: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in text.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:x}")
-}
-
-fn compact_memory_file(
-    file: Option<agent_context::MemoryFile>,
-    known: Option<&str>,
-) -> Option<Value> {
-    file.map(|file| {
-        let etag = content_etag(&file.content);
-        if known == Some(etag.as_str()) {
-            json!({ "path": file.path, "etag": etag, "unchanged": true })
-        } else {
-            json!({
-                "path": file.path,
-                "content": file.content,
-                "etag": etag,
-                "truncated": file.truncated,
-                "remaining_bytes": file.remaining_bytes,
-            })
-        }
-    })
-}
-
-fn compact_context_response(mut context: agent_context::AgentdContext, args: &Value) -> Value {
-    let known_global = args.get("known_global").and_then(Value::as_str);
-    let known_project = args.get("known_project").and_then(Value::as_str);
-    let known_program = args.get("known_program").and_then(Value::as_str);
-    let include_reference = args
-        .get("include_reference")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let global = compact_memory_file(context.global_memory.take(), known_global);
-    let project = compact_memory_file(context.project_memory.take(), known_project);
-    let program = context.program_run.take().map(|program| {
-        let encoded = serde_json::to_string(&program).unwrap_or_default();
-        let etag = content_etag(&encoded);
-        if known_program == Some(etag.as_str()) {
-            json!({
-                "session_id": program.session_id,
-                "program_version": program.program_version,
-                "etag": etag,
-                "unchanged": true,
-            })
-        } else {
-            let mut value = serde_json::to_value(program).unwrap_or_else(|_| json!({}));
-            value["etag"] = json!(etag);
-            value
-        }
-    });
-    let mut out = serde_json::Map::new();
-    out.insert("session_id".into(), json!(context.session_id));
-    out.insert("project_id".into(), json!(context.project_id));
-    out.insert("instructions".into(), json!(context.instructions));
-    if let Some(memory) = global {
-        out.insert("global_memory".into(), memory);
-    }
-    if let Some(memory) = project {
-        out.insert("project_memory".into(), memory);
-    }
-    if let Some(widgets) = context.session_widgets {
-        out.insert("session_widgets".into(), json!(widgets));
-    }
-    if let Some(program) = program {
-        out.insert("program_run".into(), program);
-    }
-    if include_reference {
-        out.insert("memory_policy".into(), json!(context.memory_policy));
-        out.insert("widget_policy".into(), json!(context.widget_policy));
-        out.insert(
-            "markdown_extensions".into(),
-            json!(context.markdown_extensions),
-        );
-    } else {
-        out.insert(
-            "reference".into(),
-            json!("Call again with include_reference:true for full memory/widget policy and Markdown extensions."),
-        );
-    }
-    Value::Object(out)
-}
+/// Per-process memory of what the context tool already served — one MCP
+/// server process serves one agent, so this is per-agent state. See
+/// [`agent_context::ContextServeState`].
+pub type ContextServeState = std::sync::Mutex<agent_context::ContextServeState>;
 
 fn diff_stats(patch: &str) -> Value {
     let mut files = Vec::new();
@@ -245,14 +163,13 @@ pub fn catalog() -> Vec<Value> {
         // ----- Read -----
         tool(
             CONTEXT_TOOL_NAME,
-            "Load current construct memory, Program-run state, and widget paths. Call before each task. Pass returned etags later to omit unchanged content; request reference policy only when needed.",
+            "Load current construct memory, Program-run state, and widget paths. Call before each task. Repeat calls omit unchanged and already-served content automatically; everything omitted stays recoverable (memory by path, the program via construct_program_get).",
             json!({
                 "type": "object",
                 "properties": {
-                    "known_global": { "type": "string" },
-                    "known_project": { "type": "string" },
-                    "known_program": { "type": "string" },
-                    "include_reference": { "type": "boolean" }
+                    "refresh": { "type": "boolean", "description": "Resend static fields and unchanged content. Pass true when earlier construct_context results may have been compacted out of your context." },
+                    "skip_memory": { "type": "boolean", "description": "Omit memory file contents you already hold verbatim (e.g. you just wrote them); paths and etags are still returned." },
+                    "include_reference": { "type": "boolean", "description": "Include the full memory/widget policy and Markdown extension reference." }
                 }
             }),
         ),
@@ -748,7 +665,12 @@ fn schema_obj(fields: &[(&str, &str, bool)]) -> Value {
 
 /// Dispatch a `tools/call` to the right method. Returns the full
 /// `tools/call` response payload (a `{content: [...], isError?}` object).
-pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value) -> Result<Value> {
+pub async fn call(
+    client: &Arc<Client>,
+    session_id: Option<&str>,
+    context_state: &ContextServeState,
+    params: Value,
+) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(|v| v.as_str())
@@ -770,7 +692,11 @@ pub async fn call(client: &Arc<Client>, session_id: Option<&str>, params: Value)
 
     let result_json: Value = match name.as_str() {
         // ----- Read -----
-        CONTEXT_TOOL_NAME => compact_context_response(agent_context::build_from_env(), &args),
+        CONTEXT_TOOL_NAME => {
+            let request = agent_context::ContextRequest::from_args(&args);
+            let mut state = context_state.lock().unwrap_or_else(|p| p.into_inner());
+            agent_context::compact_response(agent_context::build_from_env(), &request, &mut state)
+        }
         "construct_whoami" => json!({ "session_id": session_id }),
         "construct_list_sessions" => {
             let limit = args
@@ -1778,7 +1704,10 @@ mod tests {
     }
 
     #[test]
-    fn context_etags_omit_unchanged_content_and_reference_policy_by_default() {
+    fn context_serve_state_omits_repeat_content_across_calls() {
+        // The dedup logic itself is covered in construct_protocol::agent_context;
+        // this pins the MCP dispatcher wiring: one process-level state, mutated
+        // across calls.
         let make_context = || agent_context::AgentdContext {
             session_id: Some("s1".into()),
             project_id: Some("p1".into()),
@@ -1796,12 +1725,21 @@ mod tests {
             session_widgets: None,
             program_run: None,
         };
-        let first = compact_context_response(make_context(), &json!({}));
-        let etag = first["global_memory"]["etag"].as_str().unwrap();
+        let state = ContextServeState::default();
+        let request = agent_context::ContextRequest::from_args(&json!({}));
+        let first = agent_context::compact_response(
+            make_context(),
+            &request,
+            &mut state.lock().unwrap(),
+        );
         assert_eq!(first["global_memory"]["content"], "remember this");
         assert!(first.get("memory_policy").is_none());
 
-        let second = compact_context_response(make_context(), &json!({"known_global": etag}));
+        let second = agent_context::compact_response(
+            make_context(),
+            &request,
+            &mut state.lock().unwrap(),
+        );
         assert_eq!(second["global_memory"]["unchanged"], true);
         assert!(second["global_memory"].get("content").is_none());
     }
@@ -1850,7 +1788,7 @@ mod tests {
             .get("description")
             .and_then(|description| description.as_str())
             .unwrap_or_default()
-            .contains("Pass returned etags"));
+            .contains("omit unchanged and already-served content"));
     }
 
     #[test]
@@ -1992,7 +1930,10 @@ mod tests {
             .pointer("/inputSchema/properties/revisions")
             .is_some());
         assert!(find(CONTEXT_TOOL_NAME)
-            .pointer("/inputSchema/properties/known_global")
+            .pointer("/inputSchema/properties/refresh")
+            .is_some());
+        assert!(find(CONTEXT_TOOL_NAME)
+            .pointer("/inputSchema/properties/skip_memory")
             .is_some());
 
         let update = find("construct_program_update");
@@ -2200,6 +2141,7 @@ mod tests {
         let blocked = call(
             &client,
             Some("sparent"),
+            &ContextServeState::default(),
             json!({
                 "name": "construct_subagent_peek",
                 "arguments": { "subagent_id": "sother" }
@@ -2215,6 +2157,7 @@ mod tests {
         let legacy_name = call(
             &client,
             Some("sparent"),
+            &ContextServeState::default(),
             json!({
                 "name": "agentd_subagent_peek",
                 "arguments": { "subagent_id": "ssub" }
@@ -2242,6 +2185,7 @@ mod tests {
         let response = call(
             client,
             session_id,
+            &ContextServeState::default(),
             json!({ "name": name, "arguments": arguments }),
         )
         .await
