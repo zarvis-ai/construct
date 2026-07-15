@@ -21,7 +21,7 @@ const DEFAULT_API_URL: &str = "https://tunnel.zarvis.ai/api/v1/tunnels";
 
 #[derive(Serialize)]
 struct RegisterRequest<'a> {
-    subdomain: &'a str,
+    construct_instance_id: &'a str,
     upstream_username: &'static str,
     upstream_password: &'a str,
 }
@@ -64,13 +64,8 @@ struct InProcessClient {
 pub async fn run_once(
     remote: &RemoteState,
     local_port: u16,
-    requested_subdomain: Option<&str>,
+    construct_instance_id: &str,
 ) -> Result<()> {
-    let subdomain = requested_subdomain
-        .map(str::to_owned)
-        .ok_or_else(|| anyhow!("a tunnel name is required; choose one in `/remote-connect`"))?;
-    validate_subdomain(&subdomain)?;
-
     let api_url =
         std::env::var("CONSTRUCT_TUNNEL_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
     let http = reqwest::Client::new();
@@ -79,7 +74,7 @@ pub async fn run_once(
         .post(&api_url)
         .bearer_auth(&owner_token)
         .json(&RegisterRequest {
-            subdomain: &subdomain,
+            construct_instance_id,
             upstream_username: "remote",
             upstream_password: remote.password(),
         })
@@ -258,21 +253,6 @@ fn open_browser(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_subdomain(value: &str) -> Result<()> {
-    let valid = (1..=63).contains(&value.len())
-        && !value.starts_with('-')
-        && !value.ends_with('-')
-        && value
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if !valid {
-        anyhow::bail!(
-            "invalid tunnel subdomain `{value}`; use 1–63 lowercase letters, digits, or hyphens"
-        );
-    }
-    Ok(())
-}
-
 fn normalize_public_url(value: &str) -> Result<String> {
     let url = reqwest::Url::parse(value).context("service returned an invalid public URL")?;
     if url.scheme() != "https" || url.host_str().is_none() {
@@ -294,20 +274,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subdomain_validation_is_dns_label_safe() {
-        for valid in ["demo", "demo-2", "a"] {
-            assert!(validate_subdomain(valid).is_ok(), "{valid}");
-        }
-        for invalid in ["", "Demo", "-demo", "demo-", "two.labels", "has space"] {
-            assert!(validate_subdomain(invalid).is_err(), "{invalid}");
-        }
-    }
-
-    #[test]
     fn public_url_must_be_https() {
         assert_eq!(
-            normalize_public_url("https://demo.user.tunnel.zarvis.ai").unwrap(),
-            "https://demo.user.tunnel.zarvis.ai/"
+            normalize_public_url("https://swift-willow-4827.tunnel.zarvis.ai").unwrap(),
+            "https://swift-willow-4827.tunnel.zarvis.ai/"
         );
         assert!(normalize_public_url("http://demo.example").is_err());
     }

@@ -537,7 +537,7 @@ mod tests {
         let path = dir.path().join("remote.json");
         let mut snap = snapshot(0, now_secs());
         snap.tunnel_provider = TunnelProvider::Construct;
-        snap.tunnel_url = Some("https://demo.user.tunnel.zarvis.ai/".into());
+        snap.tunnel_url = Some("https://swift-willow-4827.tunnel.zarvis.ai/".into());
         snap.write(&path).unwrap();
 
         assert_eq!(restorable_provider(&path), None);

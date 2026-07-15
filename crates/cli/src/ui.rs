@@ -15384,7 +15384,6 @@ fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
         crate::app::RemoteControlPopup::Choose(c) => {
             render_remote_choose(app, c, total.width, total.height)
         }
-        crate::app::RemoteControlPopup::Name(n) => render_remote_name(app, n, total.width),
         crate::app::RemoteControlPopup::Starting(p) => {
             render_remote_starting(app, p, total.width)
         }
@@ -15729,50 +15728,6 @@ fn render_remote_choose<'a>(
     let (lines, width, height) = compose_qr_and_info(qr, info, area_w);
     (
         " /remote-connect — local network — Esc to close ".to_string(),
-        app.theme.info,
-        lines,
-        width,
-        height,
-    )
-}
-
-fn render_remote_name<'a>(
-    app: &App,
-    state: &crate::app::RemoteControlName,
-    area_w: u16,
-) -> RemotePopupBody<'a> {
-    let mut info = remote_info_lines(app, &state.choose.base, true);
-    info.push(Line::raw(""));
-    info.push(Line::from(Span::styled(
-        "Choose your tunnel name:",
-        Style::default().fg(app.theme.text),
-    )));
-    info.push(Line::from(vec![
-        Span::styled("  ", Style::default()),
-        Span::styled(
-            format!(" {} ", state.name),
-            Style::default()
-                .fg(app.theme.accent)
-                .add_modifier(Modifier::REVERSED | Modifier::BOLD),
-        ),
-        Span::styled(
-            ".<your-id>.tunnel.zarvis.ai",
-            Style::default().fg(app.theme.dim),
-        ),
-    ]));
-    info.push(Line::raw(""));
-    let guidance = if state.pristine {
-        "Type to replace the suggestion · Enter continue · Esc back"
-    } else {
-        "Lowercase letters, numbers, hyphens · Enter continue · Esc back"
-    };
-    info.extend(wrapped_lines(guidance, Style::default().fg(app.theme.dim)));
-
-    // This is an input step, so the editable name always takes precedence
-    // over the already-available LAN QR.
-    let (lines, width, height) = compose_qr_and_info("", info, area_w);
-    (
-        " /remote-connect — tunnel.zarvis.ai — name your tunnel ".to_string(),
         app.theme.info,
         lines,
         width,

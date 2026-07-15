@@ -242,7 +242,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
                     let params = construct_protocol::RemoteStartParams {
                         provider: boot_tunnel_provider(),
                         password: None,
-                        subdomain: std::env::var("CONSTRUCT_TUNNEL_SUBDOMAIN").ok(),
+                        subdomain: None,
                         wait_for_tunnel: true,
                     };
                     if let Err(e) = mgr.start_remote(Some(port), params).await {
@@ -280,7 +280,7 @@ pub async fn run(socket_override: Option<PathBuf>) -> Result<()> {
                 let params = construct_protocol::RemoteStartParams {
                     provider,
                     password: None,
-                    subdomain: std::env::var("CONSTRUCT_TUNNEL_SUBDOMAIN").ok(),
+                    subdomain: None,
                     wait_for_tunnel: true,
                 };
                 // port_hint=None — the supervisor reads the snapshot

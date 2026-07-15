@@ -112,8 +112,17 @@ pub async fn run(
     }
 
     let mut backoff_secs: u64 = 1;
+    let construct_instance_id = uuid::Uuid::new_v4().simple().to_string();
     loop {
-        match run_once(provider, &remote, local_port, subdomain.as_deref()).await {
+        match run_once(
+            provider,
+            &remote,
+            local_port,
+            subdomain.as_deref(),
+            &construct_instance_id,
+        )
+        .await
+        {
             Ok(()) => {
                 tracing::warn!(provider = label, "tunnel exited cleanly; respawning");
                 backoff_secs = 1;
@@ -144,11 +153,14 @@ async fn run_once(
     provider: TunnelProvider,
     remote: &RemoteState,
     local_port: u16,
-    subdomain: Option<&str>,
+    _subdomain: Option<&str>,
+    construct_instance_id: &str,
 ) -> anyhow::Result<()> {
     match provider {
         TunnelProvider::None => Ok(()),
         TunnelProvider::Cloudflare => cloudflare::run_once(remote, local_port).await,
-        TunnelProvider::Construct => construct::run_once(remote, local_port, subdomain).await,
+        TunnelProvider::Construct => {
+            construct::run_once(remote, local_port, construct_instance_id).await
+        }
     }
 }
