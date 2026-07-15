@@ -11,6 +11,8 @@ Construct's first-party tunnel provider uses a user-selected DNS label and a det
 
 The tunnel owner authenticates before registering a name. Registration produces a short-lived capability limited to one runtime reverse endpoint. The hosted service keeps active routes only in memory and may materialize generated restriction data only on ephemeral storage; it does not persist users, tunnels, names, or access-control lists.
 
+The hosted service is deployed independently on Oracle Cloud infrastructure. It is not part of the `zarvis.ai` web deployment. DNS delegates `tunnel.zarvis.ai` and `*.tunnel.zarvis.ai` to the tunnel service's reserved public address.
+
 The same social identity that owns the tunnel is the initial authorization boundary for browser access. A visitor authenticates with GitHub or Google, and the service derives their user identifier from the provider plus immutable provider subject. Access is allowed only when that identifier equals the hostname's user-id. Sharing and persistent ACLs are non-goals until they have an explicit product design.
 
 User identifiers are an HMAC of the provider and immutable provider subject under a server secret, encoded as a DNS-safe label. Display names, usernames, and email addresses are not identity keys. Changing providers intentionally changes the user-id.
@@ -30,6 +32,7 @@ Runtime allocation avoids deterministic TCP-port collisions. Short-lived, narrow
 - A public hostname is not reported ready until the gateway can reach its reverse endpoint.
 - Service restarts may briefly interrupt tunnels, but no database restore is required; clients reconnect and register again.
 - OAuth client secrets, the HMAC identity key, and the session-signing key are operational secrets, not persisted user or tunnel data.
+- The tunnel service has its own deployment lifecycle; changing the `zarvis.ai` web application does not deploy or configure it.
 
 ## Non-Goals
 
