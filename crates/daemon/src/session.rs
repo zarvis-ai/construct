@@ -1859,6 +1859,11 @@ impl SessionManager {
         tunnel_only: bool,
     ) -> anyhow::Result<construct_protocol::RemoteStopResult> {
         use anyhow::Context as _;
+        let provider = self
+            .remote_slot()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|handle| handle.state.tunnel_provider()))
+            .unwrap_or_default();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.remote_starter
             .send(crate::remote_supervisor::SupervisorMsg::Stop(
@@ -1873,6 +1878,7 @@ impl SessionManager {
             .context("remote supervisor dropped reply channel")??;
         Ok(construct_protocol::RemoteStopResult {
             was_running: outcome.was_running,
+            provider,
         })
     }
 

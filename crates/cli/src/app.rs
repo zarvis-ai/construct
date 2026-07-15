@@ -1682,6 +1682,7 @@ pub struct App {
     pub remote_control_task: Option<
         tokio::task::JoinHandle<(
             construct_protocol::TunnelProvider,
+            Option<String>,
             Result<construct_protocol::RemoteStartResult>,
         )>,
     >,
@@ -10402,10 +10403,11 @@ impl App {
 
         let client = self.client.clone();
         self.remote_control_task = Some(tokio::spawn(async move {
+            let remembered_name = subdomain.clone();
             let result = client
                 .remote_start_named_with_wait(provider, password, subdomain, true)
                 .await;
-            (provider, result)
+            (provider, remembered_name, result)
         }));
     }
 
@@ -10435,7 +10437,14 @@ impl App {
         };
         self.remote_control_task = None;
         match joined {
-            Ok((provider, Ok(r))) => {
+            Ok((provider, subdomain, Ok(r))) => {
+                if provider == construct_protocol::TunnelProvider::Construct {
+                    if let Some(name) = subdomain.as_deref() {
+                        if let Err(error) = persist_remembered_tunnel_name(name) {
+                            tracing::warn!(%error, "could not remember tunnel name");
+                        }
+                    }
+                }
                 let mut ok = RemoteControlOk::from(r);
                 ok.provider = provider;
                 self.remote_control_popup = Some(RemoteControlPopup::Ok {
@@ -10443,7 +10452,7 @@ impl App {
                     focus: ReadyButton::Back,
                 });
             }
-            Ok((provider, Err(e))) => {
+            Ok((provider, _, Err(e))) => {
                 self.remote_control_popup = Some(RemoteControlPopup::Err {
                     provider,
                     message: e.to_string(),
@@ -10495,7 +10504,8 @@ impl App {
                         self.remote_control_popup = Some(RemoteControlPopup::Name(
                             RemoteControlName {
                                 choose: choose.clone(),
-                                name: generated_tunnel_name(),
+                                name: remembered_tunnel_name()
+                                    .unwrap_or_else(generated_tunnel_name),
                                 pristine: true,
                             },
                         ));
@@ -10596,9 +10606,12 @@ impl App {
         if let Some(task) = self.remote_control_task.take() {
             task.abort();
         }
-        if let Err(e) = self.client.remote_stop_with(true).await {
-            self.set_status(format!("stop tunnel failed: {e}"));
-            return;
+        match self.client.remote_stop_with(true).await {
+            Ok(result) => logout_after_construct_stop(result.provider, self),
+            Err(e) => {
+                self.set_status(format!("stop tunnel failed: {e}"));
+                return;
+            }
         }
         self.show_remote_chooser(None).await;
     }
@@ -10629,7 +10642,11 @@ impl App {
         match self.client.remote_stop().await {
             Ok(r) if r.was_running => {
                 self.remote_control_popup = None;
-                self.set_status("remote stopped; QR + URL invalidated".into());
+                if r.provider == construct_protocol::TunnelProvider::Construct {
+                    logout_after_construct_stop(r.provider, self);
+                } else {
+                    self.set_status("remote stopped; QR + URL invalidated".into());
+                }
             }
             Ok(_) => {
                 self.set_status("remote wasn't running".into());
@@ -10637,6 +10654,23 @@ impl App {
             Err(e) => self.set_status(format!("remote-control stop failed: {e}")),
         }
     }
+}
+
+fn logout_after_construct_stop(provider: construct_protocol::TunnelProvider, app: &mut App) {
+    let Some(url) = tunnel_logout_url(provider) else {
+        return;
+    };
+    match open_url(url) {
+        Ok(()) => app.set_status("tunnel stopped; opened tunnel.zarvis.ai logout".into()),
+        Err(error) => app.set_status(format!(
+            "tunnel stopped, but could not open tunnel.zarvis.ai logout: {error}"
+        )),
+    }
+}
+
+fn tunnel_logout_url(provider: construct_protocol::TunnelProvider) -> Option<&'static str> {
+    (provider == construct_protocol::TunnelProvider::Construct)
+        .then_some("https://tunnel.zarvis.ai/logout")
 }
 
 fn generated_tunnel_name() -> String {
@@ -10657,6 +10691,45 @@ fn generated_tunnel_name() -> String {
         NOUNS[(seed / ADJECTIVES.len()) % NOUNS.len()],
         (seed / (ADJECTIVES.len() * NOUNS.len())) % 100
     )
+}
+
+fn remembered_tunnel_name_path() -> std::path::PathBuf {
+    construct_protocol::paths::Paths::discover()
+        .data_dir
+        .join("tunnel")
+        .join("last-name")
+}
+
+fn remembered_tunnel_name() -> Option<String> {
+    remembered_tunnel_name_at(&remembered_tunnel_name_path())
+}
+
+fn remembered_tunnel_name_at(path: &std::path::Path) -> Option<String> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    valid_tunnel_name(value).then(|| value.to_string())
+}
+
+fn persist_remembered_tunnel_name(value: &str) -> std::io::Result<()> {
+    persist_remembered_tunnel_name_at(&remembered_tunnel_name_path(), value)
+}
+
+fn persist_remembered_tunnel_name_at(
+    path: &std::path::Path,
+    value: &str,
+) -> std::io::Result<()> {
+    if !valid_tunnel_name(value) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid tunnel name",
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, format!("{value}\n"))?;
+    std::fs::rename(temporary, path)
 }
 
 fn valid_tunnel_name(value: &str) -> bool {
@@ -11887,6 +11960,40 @@ mod tests {
         assert!(!valid_tunnel_name("demo-"));
         assert!(!valid_tunnel_name("Demo"));
         assert!(!valid_tunnel_name(&"a".repeat(33)));
+    }
+
+    #[test]
+    fn successful_tunnel_name_can_be_remembered() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("tunnel").join("last-name");
+
+        assert_eq!(remembered_tunnel_name_at(&path), None);
+        persist_remembered_tunnel_name_at(&path, "quiet-otter-42").unwrap();
+        assert_eq!(
+            remembered_tunnel_name_at(&path).as_deref(),
+            Some("quiet-otter-42")
+        );
+        assert!(persist_remembered_tunnel_name_at(&path, "Not Valid").is_err());
+        assert_eq!(
+            remembered_tunnel_name_at(&path).as_deref(),
+            Some("quiet-otter-42")
+        );
+    }
+
+    #[test]
+    fn only_first_party_stop_has_a_browser_logout() {
+        assert_eq!(
+            tunnel_logout_url(construct_protocol::TunnelProvider::Construct),
+            Some("https://tunnel.zarvis.ai/logout")
+        );
+        assert_eq!(
+            tunnel_logout_url(construct_protocol::TunnelProvider::Cloudflare),
+            None
+        );
+        assert_eq!(
+            tunnel_logout_url(construct_protocol::TunnelProvider::None),
+            None
+        );
     }
 
     /// Spec 0065 agent presence: the local receipt clock must renew only when

@@ -2791,6 +2791,10 @@ pub struct RemoteStopParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteStopResult {
     pub was_running: bool,
+    /// Provider that was active immediately before the stop. Clients use
+    /// this to perform provider-specific logout without guessing from UI state.
+    #[serde(default)]
+    pub provider: TunnelProvider,
 }
 
 /// Params for `daemon.restart`. `exe: None` re-execs the daemon's own
