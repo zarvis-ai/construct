@@ -380,8 +380,7 @@ fn render_text_selection(f: &mut Frame, app: &App) {
     }
     let style = Style::default()
         .bg(app.theme.highlight_bg)
-        .fg(app.theme.highlight_fg)
-        .add_modifier(ratatui::style::Modifier::BOLD);
+        .fg(app.theme.highlight_fg);
     if let Some(sel) = &app.text_selection {
         if sel.dragged {
             let (start, end) = normalized_points(sel.anchor, sel.head);
@@ -439,7 +438,7 @@ fn render_selection_rect(
     area: Rect,
     start: ScreenPoint,
     end: ScreenPoint,
-    style: Style,
+    _style: Style,
 ) {
     let max_x = area.right().saturating_sub(1);
     for row in start.row..=end.row {
@@ -458,7 +457,7 @@ fn render_selection_rect(
         }
         for x in x_start..=x_end {
             if let Some(cell) = f.buffer_mut().cell_mut(Position { x, y: row }) {
-                cell.set_style(style);
+                cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::REVERSED));
             }
         }
     }
