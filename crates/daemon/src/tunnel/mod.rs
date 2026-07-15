@@ -133,6 +133,7 @@ pub async fn run(
             }
             Err(e) => {
                 tracing::warn!(provider = label, error = %e, "tunnel run failed; backing off");
+                remote.set_tunnel_error(Some(e.to_string())).await;
             }
         }
         remote.set_tunnel_url(None).await;

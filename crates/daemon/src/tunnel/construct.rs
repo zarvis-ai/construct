@@ -92,9 +92,16 @@ pub async fn run_once(
     if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         *cached_owner_token = None;
     }
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let detail = detail.trim();
+        if detail.is_empty() {
+            anyhow::bail!("Construct tunnel registration rejected ({status})");
+        }
+        anyhow::bail!("Construct tunnel registration rejected ({status}): {detail}");
+    }
     let registration = response
-        .error_for_status()
-        .context("Construct tunnel registration rejected")?
         .json::<Registration>()
         .await
         .context("decode Construct tunnel registration")?;

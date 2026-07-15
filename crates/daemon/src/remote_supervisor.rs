@@ -256,6 +256,7 @@ async fn handle_start(
     // `tunnel_task`, so a subsequent start spawns fresh.
     if provider != TunnelProvider::None && tunnel_task.is_none() {
         if std::env::var("CONSTRUCT_REMOTE_NO_TUNNEL").is_err() {
+            state.set_tunnel_error(None).await;
             state.set_tunnel_provider(provider).await;
             // `adopt_pid` is non-zero only after a `/construct
             // restart`: the snapshot captured a still-running tunnel
@@ -388,6 +389,7 @@ async fn handle_stop_tunnel(
         // tunnel rather than short-circuiting on the dead URL.
         state.set_tunnel_url(None).await;
         state.set_auth_url(None).await;
+        state.set_tunnel_error(None).await;
         state.set_tunnel_pid(0).await;
         state.set_tunnel_provider(TunnelProvider::None).await;
     }

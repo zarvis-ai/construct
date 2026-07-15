@@ -1980,6 +1980,9 @@ impl SessionManager {
                     auth_url: None,
                 });
             }
+            if let Some(error) = state.tunnel_error().await {
+                anyhow::bail!("{} tunnel failed: {error}", provider.label());
+            }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }

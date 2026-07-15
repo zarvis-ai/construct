@@ -52,6 +52,10 @@ pub struct RemoteState {
     /// start. Unlike the tunnel URL, this is deliberately never included
     /// in RemoteSnapshot or written to disk.
     auth_url: Arc<RwLock<Option<String>>>,
+    /// Most recent provider failure while establishing a public tunnel.
+    /// Ephemeral like `auth_url`: used to fail the waiting IPC request
+    /// promptly instead of leaving the TUI on its starting screen.
+    tunnel_error: Arc<RwLock<Option<String>>>,
     /// Active remote WS connection count. Bumped on accept,
     /// decremented when the connection task drops. Read by the
     /// `remote/state` broadcast path on every change so local
@@ -187,6 +191,7 @@ impl RemoteState {
             password: Arc::new(password),
             tunnel_url: Arc::new(RwLock::new(None)),
             auth_url: Arc::new(RwLock::new(None)),
+            tunnel_error: Arc::new(RwLock::new(None)),
             clients: Arc::new(AtomicUsize::new(0)),
             tunnel_pid: Arc::new(AtomicU32::new(0)),
             tunnel_provider: Arc::new(AtomicU8::new(TunnelProvider::None.as_u8())),
@@ -208,6 +213,7 @@ impl RemoteState {
             password: Arc::new(snap.password.clone()),
             tunnel_url: Arc::new(RwLock::new(snap.tunnel_url.clone())),
             auth_url: Arc::new(RwLock::new(None)),
+            tunnel_error: Arc::new(RwLock::new(None)),
             clients: Arc::new(AtomicUsize::new(0)),
             tunnel_pid: Arc::new(AtomicU32::new(snap.tunnel_pid)),
             tunnel_provider: Arc::new(AtomicU8::new(snap.tunnel_provider.as_u8())),
@@ -410,6 +416,14 @@ impl RemoteState {
     pub async fn auth_url(&self) -> Option<String> {
         self.auth_url.read().await.clone()
     }
+
+    pub async fn set_tunnel_error(&self, error: Option<String>) {
+        *self.tunnel_error.write().await = error;
+    }
+
+    pub async fn tunnel_error(&self) -> Option<String> {
+        self.tunnel_error.read().await.clone()
+    }
 }
 
 fn unix_now() -> u64 {
@@ -575,6 +589,8 @@ mod tests {
         let s = RemoteState::new();
         s.set_auth_url(Some("https://tunnel.zarvis.ai/auth/device/example".into()))
             .await;
+        s.set_tunnel_error(Some("registration rejected".into()))
+            .await;
         assert_eq!(
             s.auth_url().await.as_deref(),
             Some("https://tunnel.zarvis.ai/auth/device/example")
@@ -582,5 +598,6 @@ mod tests {
         let snapshot = s.snapshot().await;
         let restored = RemoteState::from_snapshot(&snapshot);
         assert_eq!(restored.auth_url().await, None);
+        assert_eq!(restored.tunnel_error().await, None);
     }
 }
