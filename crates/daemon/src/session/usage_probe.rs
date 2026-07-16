@@ -34,6 +34,16 @@ const USAGE_PROBE_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// than the startup cap since some harnesses' usage panels fetch live
 /// account data over the network.
 const USAGE_PROBE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval while waiting for the pasted probe command to echo back
+/// in the PTY output before the submit Enter is sent.
+const USAGE_PROBE_ECHO_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Hard cap on waiting for the paste echo. Generous relative to how fast a
+/// responsive harness echoes (tens of ms) precisely because the case this
+/// gate exists for is a harness still busy with its own startup work and
+/// slow to drain stdin. On timeout the Enter is sent anyway — a missing
+/// echo means the submission will likely fail validation and be retried,
+/// not that sending Enter could make anything worse.
+const USAGE_PROBE_ECHO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Fixed PTY size for probe sessions — generous, since there's no live
 /// client to negotiate a real size against.
 const USAGE_PROBE_COLS: u16 = 100;
@@ -57,10 +67,10 @@ const USAGE_PROBE_SUBMIT_ATTEMPTS: u32 = 3;
 /// Last-resort ceiling on one probe attempt's total wall-clock time, in
 /// [`SessionManager::refresh_usage`] — comfortably above the legitimate
 /// worst case (adapter spawn's own 60s request timeout, the 20s startup
-/// wait, up to `USAGE_PROBE_SUBMIT_ATTEMPTS` rounds of a 30s response wait
-/// plus growing backoff between them, ≈176s) so a harness can never be
-/// stuck showing "probing…" indefinitely even if something not covered by
-/// those individual bounds goes wrong.
+/// wait, up to `USAGE_PROBE_SUBMIT_ATTEMPTS` rounds of a 5s echo wait plus
+/// a 30s response wait plus growing backoff between them, ≈191s) so a
+/// harness can never be stuck showing "probing…" indefinitely even if
+/// something not covered by those individual bounds goes wrong.
 const PROBE_HARD_CEILING: Duration = Duration::from_secs(240);
 
 impl SessionManager {
@@ -274,9 +284,10 @@ impl SessionManager {
             }
 
             // Record the current PTY log offset, then send the probe
-            // command as a bracketed paste + separate Enter
-            // (`program_submit_typed_prompt`) — the same delivery the
-            // program Run path uses for these exact harnesses. Plain
+            // command as a bracketed paste + separate Enter — the same
+            // delivery shape the program Run path uses for these exact
+            // harnesses, but with the Enter gated on the paste's echo
+            // rather than a fixed delay (see `submit_probe_command`). Plain
             // `send_input` (ahp `SESSION_INPUT`, "type it and append \n")
             // is NOT equivalent here: claude/codex/antigravity's rich
             // interactive TUIs only treat a real bracketed paste as one
@@ -286,7 +297,7 @@ impl SessionManager {
             // lesson learned once already for the program Run path.
             let before_offset = self.pty_log_len(&id);
             let sent_at_ms = Utc::now().timestamp_millis();
-            if let Err(e) = self.program_submit_typed_prompt(&id, command).await {
+            if let Err(e) = self.submit_probe_command(&id, command, before_offset).await {
                 tracing::warn!(%harness, session = %id, error = %e, "usage probe: submitting command failed");
                 self.cleanup_usage_probe_session(harness, &id).await;
                 return None;
@@ -359,6 +370,77 @@ impl SessionManager {
             captured_at: std::time::Instant::now(),
             captured_at_ms: Utc::now().timestamp_millis(),
         })
+    }
+
+    /// Deliver the probe command as a bracketed paste, wait for the
+    /// harness to *echo* the pasted text back, then send the submit Enter.
+    ///
+    /// The echo gate replaces the fixed post-paste delay
+    /// (`PROGRAM_EXTERNAL_PTY_SUBMIT_DELAY`) the shared
+    /// `program_submit_typed_prompt` helper uses, because a fixed delay
+    /// only separates the paste and the Enter at the *write* end.
+    /// Empirically observed failure (spec 0086): a probe session
+    /// cold-starts its harness, and a harness still busy with its own
+    /// startup work (confirmed live for claude — an MCP-server auth check)
+    /// doesn't drain stdin during the delay, so the paste and the Enter
+    /// accumulate in the PTY buffer and arrive in ONE read. The Enter then
+    /// sits directly after the `ESC[201~` paste-end marker in the same
+    /// input batch and gets treated as part of the paste burst instead of
+    /// a standalone submit keypress — the command lands in the input box,
+    /// visibly typed with the slash-command menu open, and never runs.
+    /// Waiting until the pasted text has observably been rendered proves
+    /// the harness consumed the paste, so the Enter written afterwards
+    /// necessarily arrives in a later read and is parsed as a real
+    /// keypress.
+    ///
+    /// The gate reuses [`capture_shows_command_ran`] as its echo
+    /// detector — the input-box echo of a pasted command is exactly "the
+    /// command's token rendered at a word boundary". That check is only
+    /// meaningful because the probe command is short: claude collapses
+    /// *long* pastes into a `[Pasted text #N]` placeholder that never
+    /// echoes the text itself, which is why this gate lives here and not
+    /// in the shared program-Run delivery path.
+    ///
+    /// `before_offset` is the PTY-log offset recorded just before this
+    /// call, so only output the paste itself produced counts as echo.
+    /// A gate timeout still sends the Enter (matching the old fixed-delay
+    /// behavior as the fallback): a missing echo most likely means the
+    /// attempt will fail validation and be retried with backoff, and an
+    /// Enter can't make that outcome worse.
+    async fn submit_probe_command(
+        &self,
+        id: &str,
+        command: &str,
+        before_offset: u64,
+    ) -> Result<()> {
+        self.pty_input_without_capture(id, program_bracketed_paste_bytes(command))
+            .await?;
+        if !self.wait_for_paste_echo(id, before_offset, command).await {
+            tracing::warn!(
+                session = %id, command,
+                "usage probe: paste echo never appeared within the gate window; sending Enter anyway",
+            );
+        }
+        self.pty_input_without_capture(id, vec![b'\r']).await?;
+        Ok(())
+    }
+
+    /// Poll the PTY bytes appended since `before_offset` until the pasted
+    /// `command`'s echo shows up (`true`) or [`USAGE_PROBE_ECHO_TIMEOUT`]
+    /// elapses (`false`). See [`Self::submit_probe_command`] for why the
+    /// echo — not elapsed time — is the evidence that matters.
+    async fn wait_for_paste_echo(&self, id: &str, before_offset: u64, command: &str) -> bool {
+        let started = tokio::time::Instant::now();
+        loop {
+            let bytes = self.capture_pty_since(id, before_offset).await;
+            if capture_shows_command_ran(&bytes, command) {
+                return true;
+            }
+            if started.elapsed() >= USAGE_PROBE_ECHO_TIMEOUT {
+                return false;
+            }
+            tokio::time::sleep(USAGE_PROBE_ECHO_POLL_INTERVAL).await;
+        }
     }
 
     /// Poll `id`'s `last_pty_at_ms` until it has settled — a PTY update at
@@ -937,6 +1019,21 @@ mod tests {
         // Shape of a real successful claude capture: the command appears
         // in an autocomplete-dropdown help line before the real panel.
         let bytes = b"\x1b[38;2;177;185;249m/usage    Show session cost, plan usage stats";
+        assert!(capture_shows_command_ran(bytes, "/usage"));
+    }
+
+    /// The paste-echo gate (`submit_probe_command`) reuses
+    /// `capture_shows_command_ran` as its echo detector: the input-box
+    /// echo of a freshly pasted command — the token followed by an ANSI
+    /// escape or cursor sequence, before any Enter was sent — must count
+    /// as "echo seen", while pre-echo startup noise must not (covered by
+    /// `capture_shows_command_ran_false_on_raced_startup_screen` below:
+    /// that exact screen shape is what the gate keeps polling through).
+    #[test]
+    fn paste_echo_gate_fires_on_input_box_echo() {
+        // Shape of claude's input box right after a paste: prompt marker,
+        // the pasted command, a styled cursor cell — no submission yet.
+        let bytes = b"\x1b[38;5;250m\xe2\x9d\xaf \x1b[0m/usage\x1b[7m \x1b[0m";
         assert!(capture_shows_command_ran(bytes, "/usage"));
     }
 

@@ -86,6 +86,28 @@ one of these interactive harness TUIs programmatically must deliver input
 the same way, not assume "type it and press enter" is equivalent across
 delivery channels.
 
+The submit keypress must additionally be gated on observed evidence that
+the harness has *consumed* the paste — the pasted text echoing back in
+the harness's rendered output — not on a fixed delay after writing the
+paste. A fixed delay only separates the paste and the keypress at the
+sender: a probe session cold-starts its harness, and a harness still busy
+with its own startup work does not drain its input during the delay, so
+both writes accumulate and arrive in one read, where the keypress sits
+inside the same input batch as the paste and is treated as part of the
+paste burst rather than a submit. The observable symptom is the command
+sitting typed-but-unsubmitted in the input box (slash-command menu open)
+and that screen being captured as if it were a response. Waiting for the
+echo proves the paste was read, so a keypress written afterward
+necessarily arrives in a later read and registers as a real submit. The
+gate is bounded: if the echo never appears within a short window, the
+keypress is sent anyway (equivalent to the old fixed-delay behavior)
+rather than abandoning the attempt — validation and retry handle the
+rest. This gating relies on the probe command being short enough that the
+harness echoes its literal text; harnesses collapse long pastes into a
+placeholder that never echoes the text, which is why the gate belongs to
+the probe's delivery specifically and must not be generalized to
+arbitrary-length prompt delivery (e.g. program runs) as-is.
+
 ### Probe working directory avoids per-directory trust gates
 
 Some harnesses gate a working directory they have not seen before behind
