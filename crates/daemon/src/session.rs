@@ -3970,10 +3970,20 @@ impl SessionManager {
         // Keep archived sessions in their own partition as well: when their
         // disclosure row is expanded, they can still be reordered among
         // themselves without perturbing the active rows above it.
+        //
+        // Forks are hidden from the flat list too: they're user-kind and share
+        // their parent's group_id, but the TUI renders them nested under their
+        // fork parent, never at their own flat position. Fork placement puts
+        // them right after their parent by position, so without this filter a
+        // session below a fork-parent needs 1 + #forks presses to cross it —
+        // every press before the last swaps with an invisible fork row.
         let region: Vec<&SessionSummary> = all_sessions
             .iter()
             .filter(|s| {
-                s.group_id == me.group_id && is_user_session_kind(s) && s.archived == me.archived
+                s.group_id == me.group_id
+                    && is_user_session_kind(s)
+                    && s.archived == me.archived
+                    && s.forked_from.is_none()
             })
             .collect();
         let pos_in_region = region.iter().position(|s| s.id == id).unwrap();
@@ -6188,6 +6198,59 @@ mod tests {
         assert_eq!(b.position, 0);
         assert_eq!(a.position, 20);
         assert_eq!(archived.position, 10);
+    }
+
+    #[tokio::test]
+    async fn move_session_ignores_forks_of_other_sessions_in_reorder_region() {
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+
+        // Forks are user-kind and share their parent's group_id, but the TUI
+        // nests them under their fork parent instead of rendering them at
+        // their flat position. Fork placement puts them right after their
+        // parent, so a session below the fork cluster ("huser-x") that moves
+        // up must swap with the visible parent in ONE step — not burn a press
+        // per invisible fork row in between.
+        mgr.sessions.write().await.insert(
+            "hparent".into(),
+            synthetic_entry("hparent", construct_protocol::SessionKind::User, 10),
+        );
+        mgr.sessions.write().await.insert(
+            "hfork-a".into(),
+            synthetic_fork_entry("hfork-a", "hparent", 11, None).await,
+        );
+        mgr.sessions.write().await.insert(
+            "hfork-b".into(),
+            synthetic_fork_entry("hfork-b", "hparent", 12, None).await,
+        );
+        mgr.sessions.write().await.insert(
+            "huser-x".into(),
+            synthetic_entry("huser-x", construct_protocol::SessionKind::User, 20),
+        );
+
+        let moved = mgr
+            .move_session("huser-x", construct_protocol::MoveDirection::Up)
+            .await
+            .expect("move up");
+        assert!(moved, "crossing the fork-parent is a real move");
+
+        let sessions = mgr.list().await;
+        let parent = sessions.iter().find(|s| s.id == "hparent").unwrap();
+        let fork_a = sessions.iter().find(|s| s.id == "hfork-a").unwrap();
+        let fork_b = sessions.iter().find(|s| s.id == "hfork-b").unwrap();
+        let x = sessions.iter().find(|s| s.id == "huser-x").unwrap();
+        assert_eq!(x.position, 10, "one press crosses the visible fork-parent");
+        assert_eq!(parent.position, 20);
+        assert_eq!(fork_a.position, 11, "hidden fork rows must not move");
+        assert_eq!(fork_b.position, 12, "hidden fork rows must not move");
     }
 
     /// Spec 0073: with a painted background reported, the daemon strips
