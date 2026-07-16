@@ -50,6 +50,11 @@ const IO_TIMEOUT: Duration = Duration::from_secs(5);
 enum Request {
     Copy { data: String, mime: String },
     Paste,
+    /// Read a local file for a drag-drop upload. Only ever sent for a path
+    /// the user pasted/dropped into the TUI *and* explicitly confirmed
+    /// (spec 0098); the agent additionally enforces the extension allowlist
+    /// and size cap.
+    ReadFile { path: String },
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -169,6 +174,31 @@ pub(crate) fn paste(sock: &Path) -> Result<Option<PasteItem>> {
     }))
 }
 
+/// Fetch a local file's bytes for a confirmed drag-drop upload.
+pub(crate) fn read_file(sock: &Path, path: &str) -> Result<PasteItem> {
+    let resp = roundtrip(
+        sock,
+        &Request::ReadFile {
+            path: path.to_string(),
+        },
+    )?;
+    let data = resp.data.context("bridge returned no file data")?;
+    let bytes = decode_b64_capped(&data, MAX_ITEM_BYTES)?;
+    Ok(PasteItem {
+        bytes,
+        mime: resp
+            .mime
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
+        filename: resp.filename,
+    })
+}
+
+/// The system clipboard of the machine this process runs on, read directly
+/// (no bridge socket). Used for the local, non-SSH `C-x v` paste path.
+pub(crate) fn local_clipboard_paste() -> Result<Option<PasteItem>> {
+    SystemClipboard.paste()
+}
+
 fn decode_b64_capped(data: &str, max: usize) -> Result<Vec<u8>> {
     // Base64 expands 3 bytes to 4 chars; reject before decoding so a huge
     // payload never materializes.
@@ -193,6 +223,7 @@ fn decode_b64_capped(data: &str, max: usize) -> Result<Vec<u8>> {
 pub(crate) trait ClipboardBackend: Send + Sync + 'static {
     fn copy(&self, bytes: &[u8], mime: &str) -> Result<()>;
     fn paste(&self) -> Result<Option<PasteItem>>;
+    fn read_file(&self, path: &str) -> Result<PasteItem>;
 }
 
 pub(crate) async fn serve(
@@ -260,25 +291,10 @@ async fn handle_request(req: Request, backend: Arc<dyn ClipboardBackend>) -> Res
                     ok: true,
                     ..Default::default()
                 },
-                Some(item) => {
-                    if item.bytes.len() > MAX_ITEM_BYTES {
-                        anyhow::bail!(
-                            "clipboard item too large ({} bytes)",
-                            item.bytes.len()
-                        );
-                    }
-                    Response {
-                        ok: true,
-                        data: Some(
-                            base64::engine::general_purpose::STANDARD.encode(&item.bytes),
-                        ),
-                        mime: Some(item.mime),
-                        filename: item.filename,
-                        ..Default::default()
-                    }
-                }
+                Some(item) => item_response(item)?,
             })
         }
+        Request::ReadFile { path } => item_response(backend.read_file(&path)?),
     })
     .await;
     match result {
@@ -294,6 +310,19 @@ async fn handle_request(req: Request, backend: Arc<dyn ClipboardBackend>) -> Res
             ..Default::default()
         },
     }
+}
+
+fn item_response(item: PasteItem) -> Result<Response> {
+    if item.bytes.len() > MAX_ITEM_BYTES {
+        anyhow::bail!("clipboard item too large ({} bytes)", item.bytes.len());
+    }
+    Ok(Response {
+        ok: true,
+        data: Some(base64::engine::general_purpose::STANDARD.encode(&item.bytes)),
+        mime: Some(item.mime),
+        filename: item.filename,
+        ..Default::default()
+    })
 }
 
 /// The real system clipboard, via platform tools: `pbcopy`/`pbpaste` on
@@ -353,6 +382,95 @@ impl ClipboardBackend for SystemClipboard {
         }
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no clipboard tool available")))
     }
+
+    fn read_file(&self, path: &str) -> Result<PasteItem> {
+        // ~ expansion happens here, not on the TUI side: the path names a
+        // file on THIS machine, so this machine's $HOME applies.
+        let path = expand_home(path);
+        let path = Path::new(&path);
+        if !uploadable_extension(path) {
+            anyhow::bail!(
+                "unsupported upload type: {} (images and PDFs only)",
+                path.display()
+            );
+        }
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+        if meta.len() as usize > MAX_ITEM_BYTES {
+            anyhow::bail!(
+                "{} is too large ({} bytes, max {})",
+                path.display(),
+                meta.len(),
+                MAX_ITEM_BYTES
+            );
+        }
+        let bytes =
+            std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        Ok(PasteItem {
+            bytes,
+            mime: mime_for_path(path).to_string(),
+            filename: path.file_name().map(|n| n.to_string_lossy().into_owned()),
+        })
+    }
+}
+
+fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var_os("HOME")) {
+        (Some(rest), Some(home)) => Path::new(&home).join(rest).display().to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// Extensions the drag-drop upload accepts, on both ends: the TUI only
+/// offers the upload for these, and the agent refuses anything else. Keeps
+/// the bridge's file access scoped to media a session can consume, not a
+/// general file-fetch channel.
+const UPLOADABLE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "tiff", "tif", "bmp", "heic", "pdf",
+];
+
+fn uploadable_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| UPLOADABLE_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Detect a file dragged onto the terminal: terminals paste the file's
+/// *local* path as text, shell-escaping spaces and specials with
+/// backslashes. Returns the unescaped path when the paste is a single
+/// absolute (or `~/`) path with an uploadable extension — the shape a drop
+/// produces — and None for anything that looks like ordinary pasted text
+/// (including multi-file drops, which arrive space-separated and are not
+/// worth guessing about).
+pub(crate) fn droppable_local_path(text: &str) -> Option<String> {
+    let raw = text.trim();
+    if raw.is_empty() || raw.contains('\n') {
+        return None;
+    }
+    // An unescaped space starts a second token (multi-file drop or plain
+    // prose); escaped spaces (`\ `) are part of the path.
+    let mut unescaped = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(next) => unescaped.push(next),
+                None => return None,
+            }
+        } else if c == ' ' {
+            return None;
+        } else {
+            unescaped.push(c);
+        }
+    }
+    if !(unescaped.starts_with('/') || unescaped.starts_with("~/")) {
+        return None;
+    }
+    uploadable_extension(Path::new(&unescaped)).then_some(unescaped)
 }
 
 fn pipe_to_command(bin: &str, args: &[&str], bytes: &[u8]) -> Result<()> {
@@ -444,7 +562,6 @@ fn macos_clipboard_file() -> Result<Option<PasteItem>> {
     }))
 }
 
-#[cfg(target_os = "macos")]
 fn mime_for_path(path: &Path) -> &'static str {
     match path
         .extension()
@@ -457,6 +574,8 @@ fn mime_for_path(path: &Path) -> &'static str {
         Some("gif") => "image/gif",
         Some("webp") => "image/webp",
         Some("tiff") | Some("tif") => "image/tiff",
+        Some("bmp") => "image/bmp",
+        Some("heic") => "image/heic",
         Some("pdf") => "application/pdf",
         Some("txt") | Some("md") | Some("log") => "text/plain",
         _ => "application/octet-stream",
@@ -746,6 +865,13 @@ mod tests {
         fn paste(&self) -> Result<Option<PasteItem>> {
             Ok(self.paste.clone())
         }
+        fn read_file(&self, path: &str) -> Result<PasteItem> {
+            Ok(PasteItem {
+                bytes: format!("file:{path}").into_bytes(),
+                mime: "image/png".into(),
+                filename: Some("dropped.png".into()),
+            })
+        }
     }
 
     async fn start_bridge(backend: Arc<MockBackend>) -> (tempfile::TempDir, PathBuf) {
@@ -786,6 +912,68 @@ mod tests {
         assert_eq!(item.bytes, vec![1, 2, 3]);
         assert_eq!(item.mime, "image/png");
         assert_eq!(item.filename.as_deref(), Some("shot.png"));
+    }
+
+    #[test]
+    fn droppable_path_accepts_single_escaped_image_path() {
+        assert_eq!(
+            droppable_local_path("/Users/moon/Desktop/Screen\\ Shot.png"),
+            Some("/Users/moon/Desktop/Screen Shot.png".to_string())
+        );
+        assert_eq!(
+            droppable_local_path("~/pics/cat.JPG\n"),
+            Some("~/pics/cat.JPG".to_string())
+        );
+    }
+
+    #[test]
+    fn droppable_path_rejects_prose_multifile_and_unknown_types() {
+        // Ordinary sentence: unescaped spaces.
+        assert_eq!(droppable_local_path("see /tmp/a.png for details"), None);
+        // Multi-file drop: two space-separated paths.
+        assert_eq!(droppable_local_path("/tmp/a.png /tmp/b.png"), None);
+        // Multi-line paste.
+        assert_eq!(droppable_local_path("/tmp/a.png\n/tmp/b.png"), None);
+        // Not an uploadable type (no general file-fetch channel).
+        assert_eq!(droppable_local_path("/etc/passwd"), None);
+        assert_eq!(droppable_local_path("/home/user/.ssh/id_rsa"), None);
+        // Relative path.
+        assert_eq!(droppable_local_path("pics/cat.png"), None);
+        // Trailing lone backslash.
+        assert_eq!(droppable_local_path("/tmp/a.png\\"), None);
+    }
+
+    #[test]
+    fn system_read_file_enforces_extension_allowlist() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"fake-png").unwrap();
+        let item = SystemClipboard.read_file(&img.display().to_string()).unwrap();
+        assert_eq!(item.bytes, b"fake-png");
+        assert_eq!(item.mime, "image/png");
+        assert_eq!(item.filename.as_deref(), Some("shot.png"));
+
+        let secret = dir.path().join("id_rsa");
+        std::fs::write(&secret, b"private").unwrap();
+        assert!(SystemClipboard
+            .read_file(&secret.display().to_string())
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn bridge_reads_files_for_confirmed_drops() {
+        let backend = Arc::new(MockBackend {
+            copied: Mutex::new(None),
+            paste: None,
+        });
+        let (_dir, sock) = start_bridge(backend).await;
+        let item =
+            tokio::task::spawn_blocking(move || read_file(&sock, "/tmp/drop.png"))
+                .await
+                .unwrap()
+                .expect("read_file succeeds");
+        assert_eq!(item.bytes, b"file:/tmp/drop.png");
+        assert_eq!(item.filename.as_deref(), Some("dropped.png"));
     }
 
     #[tokio::test]

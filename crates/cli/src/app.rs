@@ -910,6 +910,16 @@ pub enum MinibufferIntent {
     UpgradeConfirm {
         version: String,
     },
+    /// Confirmation prompt for uploading a local file whose path was
+    /// dropped/pasted into the TUI while an ssh clipboard bridge is attached
+    /// (spec 0098). The explicit confirmation is the security boundary: the
+    /// bridge reads a local file only for a path the user dropped AND
+    /// approved. Single-key dispatch: `y`/Enter uploads, anything else
+    /// cancels.
+    ConfirmLocalFileUpload {
+        session_id: String,
+        path: String,
+    },
     Rename {
         session_id: String,
     },
@@ -4866,6 +4876,39 @@ impl App {
             return;
         }
 
+        // A file dragged onto the terminal window arrives as its *local*
+        // path pasted as text. With an ssh clipboard bridge attached, that
+        // path names a file on the user's machine that the remote host can't
+        // read — offer to upload the bytes instead (spec 0098: an explicit
+        // per-file confirmation gates every local file read). Without a
+        // bridge the path is host-local and the harness handles it natively,
+        // so the paste falls through untouched.
+        if crate::clipboard_bridge::socket_from_env().is_some() {
+            if let Some(path) = crate::clipboard_bridge::droppable_local_path(&text) {
+                if let Some(session_id) =
+                    self.large_text_paste_target().or_else(|| {
+                        (self.focus == PaneFocus::View).then(|| self.selected_id()).flatten()
+                    })
+                {
+                    let name = std::path::Path::new(&path)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    self.minibuffer = Some(Minibuffer {
+                        prompt: format!(
+                            "Upload local file {name} to {}? [y/n] ",
+                            short_id(&session_id)
+                        ),
+                        input: String::new(),
+                        cursor: 0,
+                        intent: MinibufferIntent::ConfirmLocalFileUpload { session_id, path },
+                        error: None,
+                    });
+                    return;
+                }
+            }
+        }
+
         if text.chars().count() >= LARGE_TEXT_PASTE_CHARS {
             if let Some(session_id) = self.large_text_paste_target() {
                 use base64::Engine as _;
@@ -4972,40 +5015,29 @@ impl App {
     /// (`construct ssh`, spec 0098) this fetches the local machine's
     /// pasteboard — text routes through the normal paste pipeline exactly
     /// like a terminal paste, while images/files become session attachments
-    /// whose reference token is pasted (the same flow as an oversized text
-    /// paste). Without a bridge it reads the host clipboard, so the binding
-    /// also works as a plain paste in local sessions.
+    /// (the same flow as an oversized text paste). Without a bridge it reads
+    /// the host clipboard directly — including images — so the binding
+    /// behaves the same in local sessions.
     async fn paste_from_local_clipboard(&mut self) {
-        let item = if let Some(sock) = crate::clipboard_bridge::socket_from_env() {
-            // The bridge client blocks (bounded by its socket timeouts);
-            // hop off the event loop so a slow link can't freeze rendering.
-            match tokio::task::spawn_blocking(move || crate::clipboard_bridge::paste(&sock))
-                .await
-            {
-                Ok(Ok(item)) => item,
-                Ok(Err(e)) => {
-                    self.set_status(format!("bridge paste failed: {e}"));
-                    return;
-                }
-                Err(e) => {
-                    self.set_status(format!("bridge paste failed: {e}"));
-                    return;
-                }
+        // Both reads block (bounded by socket timeouts / clipboard tools);
+        // hop off the event loop so a slow link can't freeze rendering.
+        let read = match crate::clipboard_bridge::socket_from_env() {
+            Some(sock) => {
+                tokio::task::spawn_blocking(move || crate::clipboard_bridge::paste(&sock)).await
             }
-        } else {
-            match tokio::task::spawn_blocking(read_from_clipboard).await {
-                Ok(Ok(text)) if !text.is_empty() => {
-                    Some(crate::clipboard_bridge::PasteItem::text(text))
-                }
-                Ok(Ok(_)) => None,
-                Ok(Err(e)) => {
-                    self.set_status(format!("paste failed: {e}"));
-                    return;
-                }
-                Err(e) => {
-                    self.set_status(format!("paste failed: {e}"));
-                    return;
-                }
+            None => {
+                tokio::task::spawn_blocking(crate::clipboard_bridge::local_clipboard_paste).await
+            }
+        };
+        let item = match read {
+            Ok(Ok(item)) => item,
+            Ok(Err(e)) => {
+                self.set_status(format!("paste failed: {e}"));
+                return;
+            }
+            Err(e) => {
+                self.set_status(format!("paste failed: {e}"));
+                return;
             }
         };
         let Some(item) = item else {
@@ -5019,13 +5051,29 @@ impl App {
         }
         // Prefer the same target the oversized-text paste flow would use
         // (minibuffer intent / captured PTY); from the list, fall back to the
-        // selected session and deliver straight to its PTY, since
-        // `dispatch_paste_text` only routes inside those contexts.
+        // selected session.
         let context_target = self.large_text_paste_target();
         let Some(session_id) = context_target.clone().or_else(|| self.selected_id()) else {
             self.set_status("no session selected for attachment paste".to_string());
             return;
         };
+        self.attach_item_and_paste(session_id, item, context_target.is_some())
+            .await;
+    }
+
+    /// Attach `item` to `session_id` (daemon writes it under the session's
+    /// attachments dir) and paste a pointer to it. Images paste as the bare
+    /// remote path — agent harnesses detect a pasted image path natively
+    /// (claude code shows an `[Image #N]` chip); other types paste the
+    /// `[#file:…]` reference token. `via_context` delivers through the
+    /// normal paste routing (minibuffer / captured PTY); otherwise the text
+    /// is queued straight to the session's PTY.
+    async fn attach_item_and_paste(
+        &mut self,
+        session_id: String,
+        item: crate::clipboard_bridge::PasteItem,
+        via_context: bool,
+    ) {
         use base64::Engine as _;
         let filename = item
             .filename
@@ -5043,10 +5091,15 @@ impl App {
             .await
         {
             Ok(result) => {
-                if context_target.is_some() {
-                    self.dispatch_paste_text(result.reference);
+                let pasted = if item.mime.starts_with("image/") {
+                    result.path
                 } else {
-                    let bytes = self.encode_paste_for_pty(&session_id, result.reference);
+                    result.reference
+                };
+                if via_context {
+                    self.dispatch_paste_text(pasted);
+                } else {
+                    let bytes = self.encode_paste_for_pty(&session_id, pasted);
                     self.queue_pty_input(session_id.clone(), bytes, "pty_input");
                 }
                 self.set_status(format!(
@@ -5057,6 +5110,36 @@ impl App {
             }
             Err(e) => self.set_status(format!("paste attachment failed: {e}")),
         }
+    }
+
+    /// Confirmed drag-drop upload (spec 0098): fetch the dropped file's
+    /// bytes from the local machine through the clipboard bridge and attach
+    /// them to the session. Runs only after the user approved the exact
+    /// path in the confirmation prompt.
+    pub(super) async fn upload_local_file(&mut self, session_id: String, path: String) {
+        let Some(sock) = crate::clipboard_bridge::socket_from_env() else {
+            self.set_status("clipboard bridge is gone; upload cancelled".to_string());
+            return;
+        };
+        let fetch_path = path.clone();
+        let item = match tokio::task::spawn_blocking(move || {
+            crate::clipboard_bridge::read_file(&sock, &fetch_path)
+        })
+        .await
+        {
+            Ok(Ok(item)) => item,
+            Ok(Err(e)) => {
+                self.set_status(format!("upload failed: {e}"));
+                return;
+            }
+            Err(e) => {
+                self.set_status(format!("upload failed: {e}"));
+                return;
+            }
+        };
+        // Deliver straight to the session PTY: the confirm prompt replaced
+        // whatever minibuffer context the drop landed in.
+        self.attach_item_and_paste(session_id, item, false).await;
     }
 
     pub fn start_session_transition(&mut self) {

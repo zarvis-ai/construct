@@ -107,6 +107,36 @@ impl App {
             return;
         }
 
+        // Local-file upload confirmation (a file dropped onto the terminal
+        // while an ssh clipboard bridge is attached, spec 0098): same
+        // single-key dispatch pattern. The explicit `y` is the security
+        // boundary gating the bridge's read of the local file.
+        let upload_intent = match self.minibuffer.as_ref().map(|m| &m.intent) {
+            Some(MinibufferIntent::ConfirmLocalFileUpload { session_id, path }) => {
+                Some((session_id.clone(), path.clone()))
+            }
+            _ => None,
+        };
+        if let Some((session_id, path)) = upload_intent {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.minibuffer = None;
+                    self.upload_local_file(session_id, path).await;
+                }
+                KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.minibuffer = None;
+                    self.set_status("upload cancelled".to_string());
+                }
+                KeyCode::Char('g') if ctrl => {
+                    self.minibuffer = None;
+                    self.set_status("upload cancelled".to_string());
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Upgrade confirmation (clicked from the status-bar "<version>
         // available" notice): same single-key dispatch pattern.
         let upgrade_intent = match self.minibuffer.as_ref().map(|m| &m.intent) {
@@ -627,6 +657,15 @@ impl App {
                     return;
                 }
                 self.start_upgrade(version);
+            }
+            MinibufferIntent::ConfirmLocalFileUpload { session_id, path } => {
+                // Defensive fallback, same as `RestartDaemonConfirm` above.
+                let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
+                if !yes {
+                    self.set_status("upload cancelled".to_string());
+                    return;
+                }
+                self.upload_local_file(session_id, path).await;
             }
             MinibufferIntent::CommandPalette => {
                 let cmd = input.trim();

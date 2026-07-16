@@ -37,6 +37,17 @@ construct provides a first-party clipboard bridge for SSH use:
   only issued in response to a user action in the TUI; the daemon never
   reads the bridge, and the bridge socket belongs to one SSH session, not
   to the daemon or to other clients.
+- Dragging a file onto the terminal pastes the file's local path as text,
+  which is meaningless on the remote host. With a bridge attached, the TUI
+  recognizes that shape and offers to upload the file's bytes instead. The
+  local file read is double-gated: it happens only for a path the user
+  dropped/pasted themselves AND explicitly confirmed per file in the TUI,
+  and both ends restrict it to an allowlist of media types (images,
+  PDF) with a size cap — the bridge must never become a general
+  file-fetch channel.
+- Attachments paste as a pointer the session can act on: images paste as
+  the bare stored path so agent harnesses' native pasted-image detection
+  fires; other types paste the file-reference token.
 
 ## Reason
 
