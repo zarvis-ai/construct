@@ -33,8 +33,8 @@ use tokio::process::{Child, Command};
 use construct_client::Client;
 
 /// One isolated daemon instance + a connected IPC client.
-/// `Drop` kills the daemon (via tokio's `kill_on_drop`) and
-/// cleans up the tempdir (via `TempDir`).
+/// `Drop` gracefully terminates the daemon so it can stop its reconnectable
+/// adapters before cleaning up the tempdir.
 pub struct Daemon {
     /// Holds the tempdir alive for the daemon's lifetime. Public
     /// so tests can read paths under it (e.g. `runtime/remote.json`
@@ -54,6 +54,65 @@ pub struct Daemon {
     /// no separate "connect" step.
     pub client: Arc<Client>,
     child: Child,
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        // Session adapters deliberately survive daemon exits so a production
+        // daemon can restart without interrupting live work. That makes an
+        // abrupt test-daemon kill insufficient cleanup: every adapter (and its
+        // harness child) would be reparented to init after the temporary
+        // reconnect socket disappeared.
+        //
+        // Ask the daemon to follow its normal SIGTERM path, which drains all
+        // adapters, and synchronously wait before TempDir removes their socket
+        // and state directories. Keep kill_on_drop as the final safety net for
+        // a wedged daemon, but do not let it preempt graceful cleanup.
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.start_kill();
+        }
+
+        let graceful_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if Instant::now() < graceful_deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id() {
+            use nix::sys::signal::{kill, Signal};
+            use nix::unistd::Pid;
+
+            // The test daemon starts in its own process group. If graceful
+            // shutdown wedged, kill the whole group so restart-survivable
+            // adapters cannot outlive this final fallback either.
+            let _ = kill(Pid::from_raw(-(pid as i32)), Signal::SIGKILL);
+        }
+        #[cfg(not(unix))]
+        let _ = self.child.start_kill();
+
+        let forced_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < forced_deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Daemon {
@@ -165,6 +224,11 @@ impl Daemon {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // Isolate the daemon and the adapters it spawns so Drop's forced
+        // fallback can clean up the entire tree without touching the test
+        // runner or other concurrently running daemon fixtures.
+        #[cfg(unix)]
+        cmd.process_group(0);
 
         let child = cmd
             .spawn()

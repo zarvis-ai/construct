@@ -15,6 +15,78 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use construct_e2e::{Daemon, Tui};
+#[cfg(unix)]
+use construct_protocol::CreateSessionParams;
+
+// ---------------------------------------------------------------------------
+// 0. Harness teardown
+// ---------------------------------------------------------------------------
+
+/// Dropping the E2E harness must take down reconnectable adapters and their
+/// native children, rather than only killing the daemon and orphaning them.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_drop_reaps_shell_adapter_tree() {
+    let d = Daemon::spawn().await.expect("spawn daemon");
+    let daemon_pid = d.pid().expect("daemon pid");
+    let shell_pid_path = d.dir.path().join("shell.pid");
+    let prompt = format!(
+        "echo $$ > {}; while true; do sleep 1; done",
+        shell_pid_path.display()
+    );
+    let cwd = d.dir.path().to_string_lossy().to_string();
+
+    d.client
+        .create(CreateSessionParams {
+            harness: "shell".into(),
+            cwd,
+            prompt: Some(prompt),
+            model: None,
+            title: Some("teardown probe".into()),
+            mode: None,
+            pty_size: None,
+            worktree: false,
+            env: std::collections::HashMap::new(),
+            args: Vec::new(),
+            kind: Default::default(),
+            parent_session_id: None,
+            group_id: None,
+            position_after_session_id: None,
+            forked_from: None,
+        })
+        .await
+        .expect("create shell session");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !shell_pid_path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "shell did not write its PID within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let shell_pid: u32 = std::fs::read_to_string(&shell_pid_path)
+        .expect("read shell pid")
+        .trim()
+        .parse()
+        .expect("parse shell pid");
+    assert!(
+        pid_alive(shell_pid),
+        "shell PID should be alive before drop"
+    );
+
+    drop(d);
+
+    assert!(!pid_alive(daemon_pid), "daemon survived harness drop");
+    let child_deadline = Instant::now() + Duration::from_secs(2);
+    while pid_alive(shell_pid) && Instant::now() < child_deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !pid_alive(shell_pid),
+        "shell child survived harness drop (PID {shell_pid})"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // 1. Binary reload

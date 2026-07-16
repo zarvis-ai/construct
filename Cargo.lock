@@ -745,6 +745,7 @@ dependencies = [
  "construct-client",
  "construct-protocol",
  "futures",
+ "nix 0.29.0",
  "portable-pty",
  "reqwest",
  "serde_json",
