@@ -951,7 +951,7 @@
     border: 1px solid var(--border);
     border-radius: 24px;
     background: var(--bg-elev);
-    padding: 5px 5px 5px 16px;
+    padding: 5px;
     transition: border-color 120ms ease;
   }
   .composer-box:focus-within {
@@ -962,13 +962,18 @@
     resize: none;
     min-height: 36px;
     max-height: 30vh;
-    padding: 7px 0;
+    padding: 7px 0 7px 6px;
     border: none;
     background: transparent;
     color: var(--fg);
     font: inherit;
     line-height: 1.4;
     outline: none;
+    /* Auto-grow keeps height == content, so a scrollbar is never needed
+       until the 30vh cap; iOS otherwise paints a persistent overlay
+       scrollbar at the right edge while typing. `resetInputHeight`
+       flips this to auto once the cap is hit. */
+    overflow-y: hidden;
     /* iOS: keep font ≥16px to suppress auto-zoom on focus */
     font-size: 16px;
   }
@@ -1005,6 +1010,21 @@
   }
   .composer #enterBtn:hover:not(:disabled) {
     background: color-mix(in srgb, var(--accent) 85%, var(--fg));
+  }
+  /* Attach button (+): opens the file picker; picked files upload as
+     session attachments, same pipeline as paste/drop. */
+  .composer #attachBtn {
+    width: 36px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--fg-dim);
+    font-size: 19px;
+    font-weight: 400;
+    line-height: 1;
+  }
+  .composer #attachBtn:hover:not(:disabled) {
+    background: var(--bg-elev-2);
+    color: var(--fg);
   }
   /* "Type" button — the secondary "type into the PTY without submitting"
      path, shown only for terminal sessions. */
@@ -2429,6 +2449,10 @@
       -->
       <form class="composer" id="composer">
         <div class="composer-box">
+          <button type="button" id="attachBtn" disabled
+            title="Attach a file"
+            aria-label="Attach a file">+</button>
+          <input type="file" id="attachInput" accept="image/*,.pdf" multiple hidden />
           <textarea
             id="input"
             placeholder="Message…"
@@ -2651,6 +2675,8 @@ const composerEl = $("composer");
 const inputEl = $("input");
 const insertBtn = $("insertBtn");
 const enterBtn = $("enterBtn");
+const attachBtn = $("attachBtn");
+const attachInputEl = $("attachInput");
 const toggleListBtn = $("toggleList");
 const terminalWrapEl = $("terminalWrap");
 const terminalEl = $("terminal");
@@ -3428,8 +3454,10 @@ function setComposerEnabled(on) {
   inputEl.hidden = !showComposerControls;
   insertBtn.hidden = !showComposerControls || !terminal;
   enterBtn.hidden = !showComposerControls;
+  attachBtn.hidden = !showComposerControls;
   insertBtn.disabled = !on || blocked;
   enterBtn.disabled = !on || blocked;
+  attachBtn.disabled = !on || blocked;
 }
 
 function connect() {
@@ -10538,9 +10566,36 @@ inputEl.addEventListener("paste", (ev) => {
   handleComposerPaste(ev).catch((e) => appendError(`paste failed: ${e.message}`));
 });
 
+// Attach button: file picker → session attachment → pointer in the
+// composer. Same pipeline as paste/drop; on mobile the picker offers the
+// camera / photo library, which drag-drop and Cmd+V can't reach.
+attachBtn.addEventListener("click", () => {
+  attachInputEl.click();
+});
+
+attachInputEl.addEventListener("change", () => {
+  const files = Array.from(attachInputEl.files || []);
+  attachInputEl.value = "";
+  uploadPickedFiles(files).catch((e) => appendError(`attach failed: ${e.message}`));
+});
+
+async function uploadPickedFiles(files) {
+  if (files.length === 0) return;
+  if (!state.currentId || !state.ws || state.ws.readyState !== 1) return;
+  const refs = [];
+  for (const file of files) refs.push(await attachClipboardFile(file));
+  insertComposerText(refs.join(" "));
+  inputEl.focus();
+}
+
 function resetInputHeight() {
   inputEl.style.height = "auto";
-  inputEl.style.height = Math.min(inputEl.scrollHeight, window.innerHeight * 0.3) + "px";
+  const max = window.innerHeight * 0.3;
+  inputEl.style.height = Math.min(inputEl.scrollHeight, max) + "px";
+  // Scroll only once content exceeds the cap; below it, height ==
+  // content and iOS would otherwise paint a persistent overlay
+  // scrollbar next to the Type/send buttons while typing.
+  inputEl.style.overflowY = inputEl.scrollHeight > max ? "auto" : "hidden";
 }
 
 function resetInputHeightPreservingTerminalScroll() {

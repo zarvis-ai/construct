@@ -1675,6 +1675,65 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(drop_attachment["calls"][0]["params"]["filename"], "drop.png");
     assert_eq!(drop_attachment["calls"][0]["params"]["mime"], "image/png");
 
+    // The composer's attach button (+) feeds picked files through the same
+    // attachment pipeline as paste/drop, and the auto-grow textarea keeps
+    // overflow hidden below the height cap (an exact-fit height otherwise
+    // leaves iOS painting a persistent overlay scrollbar while typing).
+    let attach_button: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const oldRpc = rpc;
+              const oldCurrent = state.currentId;
+              const oldWs = state.ws;
+              const calls = [];
+              rpc = async (method, params) => {
+                calls.push({ method, params });
+                return { path: `/tmp/${params.filename}`, reference: `[#file:/tmp/${params.filename}]` };
+              };
+              state.currentId = 's-attach';
+              state.ws = { readyState: 1 };
+              inputEl.value = '';
+
+              const attachBtnIsButton = attachBtn.tagName === 'BUTTON'
+                && attachBtn.closest('.composer-box') !== null;
+              const pickerAccept = attachInputEl.accept;
+              await uploadPickedFiles([
+                new File([new Uint8Array([1, 2])], 'photo.jpeg', { type: 'image/jpeg' }),
+              ]);
+              const value = inputEl.value;
+
+              inputEl.value = 'a';
+              inputEl.dispatchEvent(new Event('input', { bubbles: true }));
+              await sleep(50);
+              const overflowSmall = inputEl.style.overflowY;
+
+              state.currentId = oldCurrent;
+              state.ws = oldWs;
+              rpc = oldRpc;
+              inputEl.value = '';
+              return { attachBtnIsButton, pickerAccept, value, overflowSmall, calls };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate attach button")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(attach_button["attachBtnIsButton"], true);
+    assert_eq!(attach_button["pickerAccept"], "image/*,.pdf");
+    assert_eq!(attach_button["value"], "/tmp/photo.jpeg");
+    assert_eq!(
+        attach_button["calls"][0]["method"],
+        "session.attach_clipboard"
+    );
+    assert_eq!(
+        attach_button["calls"][0]["params"]["filename"],
+        "photo.jpeg"
+    );
+    assert_eq!(attach_button["calls"][0]["params"]["mime"], "image/jpeg");
+    assert_eq!(attach_button["overflowSmall"], "hidden");
+
     // Regression coverage for mobile terminal scroll containment:
     // when the native keyboard shrinks the visual viewport, scroll
     // gestures starting on xterm must stay inside the terminal rather
