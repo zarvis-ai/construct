@@ -8759,14 +8759,16 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
                     Terminal.app no). In a focused split, Shift+arrow moves
                     focus between panes instead (see focus + view).
 
-  mouse
+  mouse + clipboard
     drag text       select visible TUI text and copy to terminal clipboard
     C-x c           toggle mouse capture off/on for native selection fallback
+    C-x v           paste local clipboard (image/file attaches; via construct ssh)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
                     palette commands: new fork send delete rename program diff border
-                                      theme zoom interrupt refresh harnesses configure help
+                                      theme zoom interrupt refresh harnesses configure
+                                      paste help
     ?               toggle this help
     C-x C-c          quit
 
@@ -8831,14 +8833,16 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
     K / J           move selected session up/down
     Shift-up/down   same when the list is focused and terminal passes Shift
 
-  mouse
+  mouse + clipboard
     drag text       select visible TUI text and copy to terminal clipboard
     C-x c           toggle mouse capture off/on for native selection fallback
+    C-x v           paste local clipboard (image/file attaches; via construct ssh)
 
   global
     :               command palette
                     palette commands: new fork send delete rename program diff border
-                                      theme zoom interrupt refresh harnesses configure help
+                                      theme zoom interrupt refresh harnesses configure
+                                      paste help
     A               cycle approval mode
     ?               toggle this help
     C-x C-c         quit

@@ -4967,6 +4967,98 @@ impl App {
         out
     }
 
+    /// `C-x v` / `/paste`: paste from the clipboard of the machine the user
+    /// is physically at. With an ssh clipboard bridge attached
+    /// (`construct ssh`, spec 0098) this fetches the local machine's
+    /// pasteboard — text routes through the normal paste pipeline exactly
+    /// like a terminal paste, while images/files become session attachments
+    /// whose reference token is pasted (the same flow as an oversized text
+    /// paste). Without a bridge it reads the host clipboard, so the binding
+    /// also works as a plain paste in local sessions.
+    async fn paste_from_local_clipboard(&mut self) {
+        let item = if let Some(sock) = crate::clipboard_bridge::socket_from_env() {
+            // The bridge client blocks (bounded by its socket timeouts);
+            // hop off the event loop so a slow link can't freeze rendering.
+            match tokio::task::spawn_blocking(move || crate::clipboard_bridge::paste(&sock))
+                .await
+            {
+                Ok(Ok(item)) => item,
+                Ok(Err(e)) => {
+                    self.set_status(format!("bridge paste failed: {e}"));
+                    return;
+                }
+                Err(e) => {
+                    self.set_status(format!("bridge paste failed: {e}"));
+                    return;
+                }
+            }
+        } else {
+            match tokio::task::spawn_blocking(read_from_clipboard).await {
+                Ok(Ok(text)) if !text.is_empty() => {
+                    Some(crate::clipboard_bridge::PasteItem::text(text))
+                }
+                Ok(Ok(_)) => None,
+                Ok(Err(e)) => {
+                    self.set_status(format!("paste failed: {e}"));
+                    return;
+                }
+                Err(e) => {
+                    self.set_status(format!("paste failed: {e}"));
+                    return;
+                }
+            }
+        };
+        let Some(item) = item else {
+            self.set_status("clipboard is empty".to_string());
+            return;
+        };
+        if item.is_text() {
+            let text = String::from_utf8_lossy(&item.bytes).into_owned();
+            self.on_paste(text).await;
+            return;
+        }
+        // Prefer the same target the oversized-text paste flow would use
+        // (minibuffer intent / captured PTY); from the list, fall back to the
+        // selected session and deliver straight to its PTY, since
+        // `dispatch_paste_text` only routes inside those contexts.
+        let context_target = self.large_text_paste_target();
+        let Some(session_id) = context_target.clone().or_else(|| self.selected_id()) else {
+            self.set_status("no session selected for attachment paste".to_string());
+            return;
+        };
+        use base64::Engine as _;
+        let filename = item
+            .filename
+            .clone()
+            .unwrap_or_else(|| item.default_filename());
+        let data = base64::engine::general_purpose::STANDARD.encode(&item.bytes);
+        match self
+            .client
+            .attach_clipboard(
+                &session_id,
+                data,
+                Some(filename.clone()),
+                Some(item.mime.clone()),
+            )
+            .await
+        {
+            Ok(result) => {
+                if context_target.is_some() {
+                    self.dispatch_paste_text(result.reference);
+                } else {
+                    let bytes = self.encode_paste_for_pty(&session_id, result.reference);
+                    self.queue_pty_input(session_id.clone(), bytes, "pty_input");
+                }
+                self.set_status(format!(
+                    "attached {filename} ({} KiB) to {}",
+                    item.bytes.len().div_ceil(1024),
+                    short_id(&session_id)
+                ));
+            }
+            Err(e) => self.set_status(format!("paste attachment failed: {e}")),
+        }
+    }
+
     pub fn start_session_transition(&mut self) {
         self.start_window_transition(self.active_window_id);
     }
@@ -10012,6 +10104,9 @@ impl App {
             ToggleMouseCapture => {
                 self.toggle_mouse_capture();
             }
+            PasteLocalClipboard => {
+                self.paste_from_local_clipboard().await;
+            }
             CycleTheme => {
                 self.apply_named_theme(self.theme_name.next());
             }
@@ -10234,6 +10329,9 @@ impl App {
             "interrupt" => self.run_action(KeyAction::Interrupt).await,
             "mouse" | "select" | "selection" => {
                 self.run_action(KeyAction::ToggleMouseCapture).await
+            }
+            "paste" | "paste-clipboard" => {
+                self.run_action(KeyAction::PasteLocalClipboard).await
             }
             "help" | "?" => {
                 self.help_visible = true;
@@ -11255,6 +11353,7 @@ fn open_url(url: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardCopyOutcome {
     Copied,
+    Bridged,
     Requested(Osc52Mode),
 }
 
@@ -11262,6 +11361,7 @@ impl ClipboardCopyOutcome {
     fn status(self, chars: usize) -> String {
         match self {
             Self::Copied => format!("copied {chars} chars"),
+            Self::Bridged => format!("copied {chars} chars to local clipboard (ssh bridge)"),
             Self::Requested(mode) => format!(
                 "sent copy request for {chars} chars via OSC 52 {}",
                 mode.label()
@@ -11271,6 +11371,17 @@ impl ClipboardCopyOutcome {
 }
 
 fn copy_to_clipboard(text: &str) -> Result<ClipboardCopyOutcome> {
+    // An attached ssh clipboard bridge (`construct ssh`, spec 0098) is the
+    // strongest signal of where the user's real clipboard lives — it reaches
+    // terminals OSC 52 can't (macOS Terminal.app) and confirms delivery. On
+    // any bridge failure fall through to the transport-based heuristics.
+    if let Some(sock) = crate::clipboard_bridge::socket_from_env() {
+        if crate::clipboard_bridge::copy(&sock, text.as_bytes(), "text/plain; charset=utf-8")
+            .is_ok()
+        {
+            return Ok(ClipboardCopyOutcome::Bridged);
+        }
+    }
     // `pbcopy` writes to the clipboard of the host construct runs on; OSC 52
     // travels back through the controlling terminal to the clipboard of the
     // machine the user is actually sitting at. Over SSH those differ — pbcopy
@@ -11327,6 +11438,14 @@ fn copy_with_pbcopy(text: &str) -> Result<()> {
 }
 
 fn read_from_clipboard() -> Result<String> {
+    // With an ssh clipboard bridge attached, the host clipboard belongs to
+    // the wrong machine — consult only the bridge (spec 0098).
+    if let Some(sock) = crate::clipboard_bridge::socket_from_env() {
+        let item = crate::clipboard_bridge::paste(&sock)?
+            .filter(crate::clipboard_bridge::PasteItem::is_text)
+            .context("local clipboard has no text")?;
+        return Ok(String::from_utf8_lossy(&item.bytes).into_owned());
+    }
     let output = Command::new("pbpaste").output()?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())

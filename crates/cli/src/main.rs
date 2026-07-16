@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 mod acp;
 mod app;
+mod clipboard_bridge;
 mod keymap;
 mod lineage;
 mod matrix_rain;
@@ -118,6 +119,26 @@ enum Command {
         /// and most-recent activity are kept and the middle is elided.
         #[arg(long, default_value_t = 0)]
         max_seed_bytes: usize,
+    },
+    /// SSH to a host and run `construct` there with a clipboard bridge:
+    /// remote selection copies land on THIS machine's clipboard, and remote
+    /// paste can pull THIS machine's clipboard — including images/files —
+    /// even in terminals without OSC 52 support (e.g. macOS Terminal.app).
+    ///
+    /// Wraps `ssh`: a private Unix socket serving this machine's clipboard
+    /// is reverse-forwarded to the remote host, and `construct` is launched
+    /// there pointed at it via $CONSTRUCT_CLIPBOARD_SOCK. All arguments are
+    /// passed to `ssh` verbatim (flags, destination, config aliases), so do
+    /// not pass a remote command — use --remote-cmd to override the default
+    /// `construct`.
+    Ssh {
+        /// Remote command to run instead of `construct` (still receives
+        /// CONSTRUCT_CLIPBOARD_SOCK via `env`).
+        #[arg(long)]
+        remote_cmd: Option<String>,
+        /// Arguments passed to `ssh` verbatim (flags + destination).
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<OsString>,
     },
     /// Run `construct` as an Agent Client Protocol stdio server.
     Acp {
@@ -641,6 +662,10 @@ async fn main() -> Result<()> {
             restart,
             check,
         } => upgrade::run(version, bin_dir, restart, check, &socket).await,
+        Command::Ssh { remote_cmd, args } => {
+            let code = clipboard_bridge::run_ssh(args, remote_cmd).await?;
+            std::process::exit(code);
+        }
         Command::Acp {
             harness,
             model,
@@ -699,6 +724,7 @@ fn command_allows_upgrade_prompt(command: &Command) -> bool {
         command,
         Command::Daemon { .. }
             | Command::Upgrade { .. }
+            | Command::Ssh { .. }
             | Command::Acp { .. }
             | Command::Program { .. }
             | Command::AskGate

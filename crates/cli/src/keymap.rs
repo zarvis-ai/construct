@@ -118,6 +118,13 @@ pub enum KeyAction {
     /// selection works; agentd mouse interactions are suspended. Bound to
     /// `C-x c` in both profiles.
     ToggleMouseCapture,
+    /// Paste from the clipboard of the machine the user is physically at.
+    /// With an ssh clipboard bridge attached (`construct ssh`, spec 0098)
+    /// this fetches the local machine's pasteboard — text routes like a
+    /// terminal paste, images/files become session attachments. Without a
+    /// bridge it pastes the host clipboard. Bound to `C-x v` in both
+    /// profiles.
+    PasteLocalClipboard,
     /// Cycle the active UI color theme. Click-only for the minibuffer theme
     /// affordance; `/theme` remains the keyboard-facing command.
     CycleTheme,
@@ -370,6 +377,8 @@ fn emacs() -> Keymap {
         (Chord(vec![ctrl('x'), shift('A')]), ToggleAutomode),
         // Give the terminal mouse back for native text selection/copy.
         (Chord(vec![ctrl('x'), ch('c')]), ToggleMouseCapture),
+        // Paste the local machine's clipboard (ssh bridge aware, spec 0098).
+        (Chord(vec![ctrl('x'), ch('v')]), PasteLocalClipboard),
         // Help
         (Chord(vec![ch('?')]), ToggleHelp),
         // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
@@ -491,6 +500,8 @@ fn vim() -> Keymap {
         (Chord(vec![shift('G')]), ScrollBottom),
         (Chord(vec![shift('A')]), ToggleAutomode),
         (Chord(vec![ctrl('x'), ch('c')]), ToggleMouseCapture),
+        // Paste the local machine's clipboard (ssh bridge aware, spec 0098).
+        (Chord(vec![ctrl('x'), ch('v')]), PasteLocalClipboard),
         (Chord(vec![ch('?')]), ToggleHelp),
         // Interactive tutorial (spec 0077). Bare `t` is otherwise unbound in
         // this profile too (vim binds `C-x t` to ToggleView, not bare `t`).
