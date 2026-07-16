@@ -506,6 +506,24 @@
     min-height: 0;
     background: var(--bg);
   }
+  /* Drag-drop attach affordance: covers the session view while a file
+     drag hovers over it. pointer-events stays off so the underlying
+     drag events keep firing on .view itself. */
+  .drop-overlay {
+    position: absolute;
+    inset: 8px;
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px dashed var(--accent);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--bg) 80%, transparent);
+    color: var(--accent);
+    font-size: 15px;
+    pointer-events: none;
+  }
+  .drop-overlay[hidden] { display: none; }
   .transcript {
     flex: 1 1 0;
     min-height: 0;
@@ -2292,6 +2310,7 @@
         Mutual exclusion is via the `hidden` attribute set in
         `enterChatMode` / `enterTerminalMode`.
       -->
+      <div class="drop-overlay" id="dropOverlay" hidden>Drop file to attach</div>
       <div class="transcript" id="transcript"></div>
       <div class="terminal-wrap" id="terminalWrap" hidden>
         <div class="terminal-host" id="terminal"></div>
@@ -10571,6 +10590,58 @@ async function handleComposerPaste(ev) {
   }
 }
 
+// Drag-drop attach: dropping a file anywhere on the session view (transcript,
+// terminal, or composer) uploads it as a session attachment and inserts the
+// pointer into the composer — same pipeline as pasting a file (issue #75).
+// The depth counter tracks nested dragenter/dragleave pairs so the overlay
+// doesn't flicker while the drag crosses child elements.
+const viewEl = document.querySelector(".view");
+const dropOverlayEl = $("dropOverlay");
+let dropDragDepth = 0;
+
+function dragHasFiles(ev) {
+  const types = ev.dataTransfer && ev.dataTransfer.types;
+  return !!types && Array.from(types).includes("Files");
+}
+
+function dropAttachReady() {
+  return !!(state.currentId && state.ws && state.ws.readyState === 1);
+}
+
+viewEl.addEventListener("dragenter", (ev) => {
+  if (!dragHasFiles(ev) || !dropAttachReady()) return;
+  ev.preventDefault();
+  dropDragDepth += 1;
+  dropOverlayEl.hidden = false;
+});
+viewEl.addEventListener("dragover", (ev) => {
+  if (!dragHasFiles(ev) || !dropAttachReady()) return;
+  // preventDefault is what marks the region as a valid drop target.
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = "copy";
+});
+viewEl.addEventListener("dragleave", () => {
+  if (dropDragDepth > 0) dropDragDepth -= 1;
+  if (dropDragDepth === 0) dropOverlayEl.hidden = true;
+});
+viewEl.addEventListener("drop", (ev) => {
+  dropDragDepth = 0;
+  dropOverlayEl.hidden = true;
+  if (!dragHasFiles(ev)) return;
+  ev.preventDefault();
+  handleViewDrop(ev).catch((e) => appendError(`drop failed: ${e.message}`));
+});
+
+async function handleViewDrop(ev) {
+  if (!dropAttachReady()) return;
+  const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
+  if (files.length === 0) return;
+  const refs = [];
+  for (const file of files) refs.push(await attachClipboardFile(file));
+  insertComposerText(refs.join(" "));
+  inputEl.focus();
+}
+
 async function attachClipboardFile(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
   return attachClipboardBytes({
@@ -10587,6 +10658,10 @@ async function attachClipboardBytes({ bytes, filename, mime }) {
     filename,
     mime,
   });
+  // Images point at the bare stored path so agent harnesses' native
+  // pasted-image detection fires (spec 0098); other types keep the
+  // [#file:…] reference token.
+  if (mime && mime.startsWith("image/") && result.path) return result.path;
   return result.reference || `[#file:${result.path}]`;
 }
 

@@ -1588,7 +1588,10 @@ async fn web_client_loads_and_websocket_connects() {
         .expect("json object");
     assert_eq!(paste_attachment["filePrevented"], true);
     assert_eq!(paste_attachment["textPrevented"], true);
-    assert_eq!(paste_attachment["fileValue"], "Look [#file:/tmp/shot.png]");
+    // Images insert the bare stored path (spec 0098: harnesses' native
+    // pasted-image detection keys on a plain path); non-images keep the
+    // [#file:…] reference token.
+    assert_eq!(paste_attachment["fileValue"], "Look /tmp/shot.png");
     assert_eq!(paste_attachment["textValue"], "[#file:/tmp/clipboard.txt]");
     assert_eq!(
         paste_attachment["calls"][0]["method"],
@@ -1614,6 +1617,63 @@ async fn web_client_loads_and_websocket_connects() {
             .unwrap_or_default()
             >= 16 * 1024
     );
+
+    // Dropping a file onto the session view uploads it through the same
+    // attachment pipeline as paste and inserts the pointer into the
+    // composer; the dashed overlay shows during the hover and clears on
+    // drop. Uses a real DataTransfer so `dragHasFiles` sees "Files".
+    let drop_attachment: serde_json::Value = page
+        .evaluate(
+            r#"
+            (async () => {
+              const oldRpc = rpc;
+              const oldCurrent = state.currentId;
+              const oldWs = state.ws;
+              const calls = [];
+              rpc = async (method, params) => {
+                calls.push({ method, params });
+                return { path: `/tmp/${params.filename}`, reference: `[#file:/tmp/${params.filename}]` };
+              };
+              state.currentId = 's-drop';
+              state.ws = { readyState: 1 };
+              inputEl.value = '';
+
+              const dt = new DataTransfer();
+              dt.items.add(new File([new Uint8Array([9, 9, 9])], 'drop.png', { type: 'image/png' }));
+              const view = document.querySelector('.view');
+              view.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true }));
+              const overlayShown = !dropOverlayEl.hidden;
+              view.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true }));
+              // handleViewDrop runs async off the event; give it a beat.
+              for (let i = 0; i < 50 && calls.length === 0; i++) await sleep(10);
+              const overlayHidden = dropOverlayEl.hidden;
+              const value = inputEl.value;
+
+              state.currentId = oldCurrent;
+              state.ws = oldWs;
+              rpc = oldRpc;
+              inputEl.value = '';
+              return { overlayShown, overlayHidden, value, calls };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate drop attachment")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(drop_attachment["overlayShown"], true);
+    assert_eq!(drop_attachment["overlayHidden"], true);
+    assert_eq!(drop_attachment["value"], "/tmp/drop.png");
+    assert_eq!(
+        drop_attachment["calls"][0]["method"],
+        "session.attach_clipboard"
+    );
+    assert_eq!(
+        drop_attachment["calls"][0]["params"]["session_id"],
+        "s-drop"
+    );
+    assert_eq!(drop_attachment["calls"][0]["params"]["filename"], "drop.png");
+    assert_eq!(drop_attachment["calls"][0]["params"]["mime"], "image/png");
 
     // Regression coverage for mobile terminal scroll containment:
     // when the native keyboard shrinks the visual viewport, scroll
