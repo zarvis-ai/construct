@@ -3,7 +3,8 @@
 use crate::app::{
     harness_guidance, smith_method_guidance, App, ConfigureTab, HarnessHit, HintZone,
     ListItem as AppListItem, MainWindowTree, Minibuffer, MinibufferChoiceAction,
-    MinibufferChoiceHit, MinibufferIntent, PaneFocus, ScreenPoint, Selection,
+    MinibufferChoiceHit, MinibufferIntent, PaneFocus, RemoteControlHit,
+    RemoteControlHitAction, ScreenPoint, Selection,
     SessionTitleMenuAction, TextSelectionRange, ViewMode, WindowDividerHit, WindowPaneHit,
     WindowSplitDirection, ZoomMode, CONFIGURE_TABS, PROGRAM_AGENT_COLLAB_CURSOR_TTL_MS,
     PROGRAM_COLLAB_CURSOR_TTL_MS, PROGRAM_CONTENT_PADDING_X, PROGRAM_CONTENT_PADDING_Y,
@@ -15406,12 +15407,15 @@ fn program_chip_span<'a>(
 /// content — wide enough for the QR block, tall enough for the
 /// rows + URL + optional hint. Esc to dismiss (wired in `app.rs`).
 fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
+    // Stale from a prior frame's dialog otherwise — cleared unconditionally so
+    // closing the dialog leaves no phantom clickable zones behind.
+    app.layout.remote_control_hits.clear();
     let Some(popup) = app.remote_control_popup.as_ref() else {
         return;
     };
     let total = f.area();
 
-    let (title, title_color, body_lines, body_w, body_h) = match popup {
+    let (title, title_color, body_lines, body_w, body_h, body_zones) = match popup {
         crate::app::RemoteControlPopup::Choose(c) => {
             render_remote_choose(app, c, total.width, total.height)
         }
@@ -15458,11 +15462,99 @@ fn render_remote_control_popup(f: &mut Frame, app: &mut App) {
     f.render_widget(block, rect);
     let para = Paragraph::new(body_lines).wrap(Wrap { trim: false });
     f.render_widget(para, inner);
+
+    // Register clickable controls in absolute screen coordinates. Body zones
+    // are relative to the composed body's top-left, which lands at `inner`.
+    // Skip registration when the body is wider than `inner` — the paragraph
+    // then soft-wraps and the zones' row math no longer holds; keyboard still
+    // drives everything in that (very narrow terminal) regime.
+    if body_w <= inner.width {
+        for z in body_zones {
+            let zy = inner.y.saturating_add(z.row);
+            let x_start = inner.x.saturating_add(z.x_start);
+            let x_end = inner.x.saturating_add(z.x_end);
+            // Guard against a zone that would fall outside the clipped modal.
+            if zy < inner.y.saturating_add(inner.height)
+                && x_start < inner.x.saturating_add(inner.width)
+            {
+                app.layout.remote_control_hits.push(RemoteControlHit {
+                    x_start,
+                    x_end: x_end.min(inner.x.saturating_add(inner.width)),
+                    y: zy,
+                    action: z.action,
+                });
+            }
+        }
+    }
 }
 
-/// What the popup renderers hand back: title, title colour, body, and
-/// the content's natural width/height so the modal can size to it.
-type RemotePopupBody<'a> = (String, ratatui::style::Color, Vec<Line<'a>>, u16, u16);
+/// A clickable control positioned relative to the top-left of the composed
+/// popup body (before it is offset onto `inner`). `render_remote_control_popup`
+/// translates these into absolute [`RemoteControlHit`]s.
+struct RemoteBodyZone {
+    row: u16,
+    x_start: u16,
+    /// Exclusive end column.
+    x_end: u16,
+    action: RemoteControlHitAction,
+}
+
+/// A clickable control positioned relative to the `info` block a renderer
+/// builds, before [`compose_qr_and_info_z`] offsets it beside / below the QR.
+/// `line` indexes into the `info` vec; the columns are within that line.
+struct RemoteInfoZone {
+    line: usize,
+    x_start: u16,
+    /// Exclusive end column.
+    x_end: u16,
+    action: RemoteControlHitAction,
+}
+
+/// One labeled segment of a footer key-hint line. A segment with an action is
+/// the clickable word (`Enter`, `Esc`, `o`, `←`); the rest is inert prose.
+struct RemoteHintSeg<'a> {
+    text: &'a str,
+    action: Option<RemoteControlHitAction>,
+}
+
+/// Build a single footer hint line from labeled segments, styling the
+/// clickable words distinctly (accent + underline, the same affordance look
+/// the minibuffer choice labels use) and returning their column ranges so the
+/// caller can register them. Columns are relative to the start of the line.
+fn remote_hint_line<'a>(
+    app: &App,
+    segs: &[RemoteHintSeg<'_>],
+) -> (Line<'a>, Vec<(u16, u16, RemoteControlHitAction)>) {
+    let mut spans: Vec<Span> = Vec::with_capacity(segs.len());
+    let mut zones = Vec::new();
+    let mut col: u16 = 0;
+    for seg in segs {
+        let w = UnicodeWidthStr::width(seg.text) as u16;
+        let style = if let Some(action) = seg.action {
+            zones.push((col, col + w, action));
+            Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(app.theme.dim)
+        };
+        spans.push(Span::styled(seg.text.to_string(), style));
+        col += w;
+    }
+    (Line::from(spans), zones)
+}
+
+/// What the popup renderers hand back: title, title colour, body, the
+/// content's natural width/height so the modal can size to it, and the
+/// clickable control zones (body-relative) discovered while composing it.
+type RemotePopupBody<'a> = (
+    String,
+    ratatui::style::Color,
+    Vec<Line<'a>>,
+    u16,
+    u16,
+    Vec<RemoteBodyZone>,
+);
 
 /// Width of the label column in the address block. Keeps the URLs and
 /// credentials aligned in one column the eye can run down.
@@ -15597,12 +15689,28 @@ fn wrapped_lines<'a>(text: &str, style: Style) -> Vec<Line<'a>> {
 /// here, because a QR that has to be scanned is worthless if the thing
 /// explaining it has scrolled away.
 ///
-/// Returns `(lines, width, height)`.
+/// Returns `(lines, width, height)`. Thin zone-less wrapper retained for the
+/// layout tests that predate clickable controls.
+#[cfg(test)]
 fn compose_qr_and_info<'a>(
     qr: &str,
     info: Vec<Line<'a>>,
     area_w: u16,
 ) -> (Vec<Line<'a>>, u16, u16) {
+    let (lines, w, h, _zones) = compose_qr_and_info_z(qr, info, area_w, Vec::new());
+    (lines, w, h)
+}
+
+/// [`compose_qr_and_info`] that also remaps `info`-relative clickable zones
+/// onto the composed body, accounting for the QR's horizontal gap and the
+/// vertical centering offset (side-by-side) or the QR-plus-blank prefix
+/// (stacked). Returns `(lines, width, height, body_zones)`.
+fn compose_qr_and_info_z<'a>(
+    qr: &str,
+    info: Vec<Line<'a>>,
+    area_w: u16,
+    info_zones: Vec<RemoteInfoZone>,
+) -> (Vec<Line<'a>>, u16, u16, Vec<RemoteBodyZone>) {
     let qr_rows: Vec<String> = qr.lines().map(str::to_string).collect();
     let qr_w = qr_rows
         .iter()
@@ -15621,6 +15729,18 @@ fn compose_qr_and_info<'a>(
         // edge reads as if it fell off.
         let offset = (qr_rows.len().saturating_sub(info.len())) / 2;
         let rows = qr_rows.len().max(info.len() + offset);
+        // Info lines land beside the QR: shifted down by `offset` and right by
+        // the QR width plus the gap.
+        let col_shift = qr_w + REMOTE_QR_GAP;
+        let zones = info_zones
+            .into_iter()
+            .map(|z| RemoteBodyZone {
+                row: (offset + z.line) as u16,
+                x_start: col_shift + z.x_start,
+                x_end: col_shift + z.x_end,
+                action: z.action,
+            })
+            .collect();
         let mut out: Vec<Line> = Vec::with_capacity(rows);
         let mut info = info.into_iter();
         for i in 0..rows {
@@ -15640,19 +15760,31 @@ fn compose_qr_and_info<'a>(
         // Anything that didn't fit beside the QR continues below it.
         out.extend(info);
         let height = out.len() as u16;
-        return (out, side_w, height);
+        return (out, side_w, height, zones);
     }
 
     let mut out: Vec<Line> = qr_rows
         .iter()
         .map(|r| Line::from(Span::raw(r.clone())))
         .collect();
+    // Stacked: the QR (when present) sits above a blank spacer, then the info
+    // block. Zones keep their columns and shift down past that prefix.
+    let row_shift = out.len() + usize::from(!out.is_empty());
+    let zones = info_zones
+        .into_iter()
+        .map(|z| RemoteBodyZone {
+            row: (row_shift + z.line) as u16,
+            x_start: z.x_start,
+            x_end: z.x_end,
+            action: z.action,
+        })
+        .collect();
     if !out.is_empty() {
         out.push(Line::raw(""));
     }
     out.extend(info);
     let height = out.len() as u16;
-    (out, qr_w.max(info_w), height)
+    (out, qr_w.max(info_w), height, zones)
 }
 
 /// The dialog's resting state: reachable on the LAN, published nowhere,
@@ -15689,6 +15821,8 @@ fn render_remote_choose<'a>(
     )));
     info.push(Line::raw(""));
 
+    let mut zones: Vec<RemoteInfoZone> = Vec::new();
+
     if c.options.is_empty() {
         info.push(Line::from(Span::styled(
             "(no tunnel providers known)",
@@ -15699,7 +15833,9 @@ fn render_remote_choose<'a>(
         // tunnel is already live. The reason an unavailable one can't be
         // used is spelled out under the row, for the focused button —
         // cramming it into the button would make a row nobody can read.
+        let button_line = info.len();
         let mut spans: Vec<Span> = Vec::new();
+        let mut col: u16 = 0;
         for (i, opt) in c.options.iter().enumerate() {
             let running = c.active == Some(opt.provider);
             let mut style = if opt.available {
@@ -15714,10 +15850,16 @@ fn render_remote_choose<'a>(
                 style = style.add_modifier(Modifier::REVERSED | Modifier::BOLD);
             }
             let dot = if running { " ●" } else { "" };
-            spans.push(Span::styled(
-                format!("[ {}{dot} ]", opt.provider.label()),
-                style,
-            ));
+            let label = format!("[ {}{dot} ]", opt.provider.label());
+            let w = UnicodeWidthStr::width(label.as_str()) as u16;
+            zones.push(RemoteInfoZone {
+                line: button_line,
+                x_start: col,
+                x_end: col + w,
+                action: RemoteControlHitAction::SelectProvider(i),
+            });
+            col += w + 2; // trailing "  " gap between buttons
+            spans.push(Span::styled(label, style));
             spans.push(Span::raw("  "));
         }
         info.push(Line::from(spans));
@@ -15748,27 +15890,53 @@ fn render_remote_choose<'a>(
     info.push(Line::raw(""));
     // With a single provider there is nothing to select between, so the
     // ←/→ hint would be a lie.
-    let keys = if c.options.len() > 1 {
-        "←/→ select · Enter start · Esc close"
+    let hint_line = info.len();
+    let segs: Vec<RemoteHintSeg> = if c.options.len() > 1 {
+        vec![
+            RemoteHintSeg { text: "←/→ select · ", action: None },
+            RemoteHintSeg {
+                text: "Enter",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Enter)),
+            },
+            RemoteHintSeg { text: " start · ", action: None },
+            RemoteHintSeg {
+                text: "Esc",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+            },
+            RemoteHintSeg { text: " close", action: None },
+        ]
     } else {
-        "Enter start · Esc close"
+        vec![
+            RemoteHintSeg {
+                text: "Enter",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Enter)),
+            },
+            RemoteHintSeg { text: " start · ", action: None },
+            RemoteHintSeg {
+                text: "Esc",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+            },
+            RemoteHintSeg { text: " close", action: None },
+        ]
     };
-    info.push(Line::from(Span::styled(
-        keys,
-        Style::default().fg(app.theme.dim),
-    )));
+    let (line, hint_zones) = remote_hint_line(app, &segs);
+    for (x_start, x_end, action) in hint_zones {
+        zones.push(RemoteInfoZone { line: hint_line, x_start, x_end, action });
+    }
+    info.push(line);
 
     // On a short terminal the local-network QR would push the provider row
     // below the clipped modal. Keep local details textual there; the final
     // public tunnel URL still gets its QR in the ready view.
     let qr = if area_h >= 30 { &c.base.qr } else { "" };
-    let (lines, width, height) = compose_qr_and_info(qr, info, area_w);
+    let (lines, width, height, body_zones) = compose_qr_and_info_z(qr, info, area_w, zones);
     (
         " /remote-connect — local network — Esc to close ".to_string(),
         app.theme.info,
         lines,
         width,
         height,
+        body_zones,
     )
 }
 
@@ -15797,20 +15965,45 @@ fn render_remote_name<'a>(
         ),
     ]));
     info.push(Line::raw(""));
+    // Guidance prose and the clickable key hint on separate lines: keeping
+    // `Enter`/`Esc` on their own unwrapped line means their column ranges stay
+    // fixed regardless of how the prose wraps.
     let guidance = if state.pristine {
-        "Type to replace the suggestion · Enter continue · Esc back"
+        "Type to replace the suggestion"
     } else {
-        "Lowercase letters, numbers, hyphens · Enter continue · Esc back"
+        "Lowercase letters, numbers, hyphens"
     };
     info.extend(wrapped_lines(guidance, Style::default().fg(app.theme.dim)));
+    let hint_line = info.len();
+    let (line, hint_zones) = remote_hint_line(
+        app,
+        &[
+            RemoteHintSeg {
+                text: "Enter",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Enter)),
+            },
+            RemoteHintSeg { text: " continue · ", action: None },
+            RemoteHintSeg {
+                text: "Esc",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+            },
+            RemoteHintSeg { text: " back", action: None },
+        ],
+    );
+    let zones: Vec<RemoteInfoZone> = hint_zones
+        .into_iter()
+        .map(|(x_start, x_end, action)| RemoteInfoZone { line: hint_line, x_start, x_end, action })
+        .collect();
+    info.push(line);
 
-    let (lines, width, height) = compose_qr_and_info("", info, area_w);
+    let (lines, width, height, body_zones) = compose_qr_and_info_z("", info, area_w, zones);
     (
         " /remote-connect — tunnel.zarvis.ai — name your tunnel ".to_string(),
         app.theme.info,
         lines,
         width,
         height,
+        body_zones,
     )
 }
 
@@ -15830,21 +16023,51 @@ fn render_remote_starting<'a>(
             .fg(app.theme.warning)
             .add_modifier(Modifier::BOLD),
     )));
+    let mut zones: Vec<RemoteInfoZone> = Vec::new();
     if let Some(auth_url) = p.auth_url.as_deref() {
         info.push(Line::from(Span::styled(
             "Finish signing in in your browser:",
             Style::default().fg(app.theme.text),
         )));
         info.extend(wrapped_lines(auth_url, Style::default().fg(app.theme.accent)));
-        info.push(Line::from(Span::styled(
-            "o open login again · Esc close",
-            Style::default().fg(app.theme.dim),
-        )));
+        let hint_line = info.len();
+        let (line, hint_zones) = remote_hint_line(
+            app,
+            &[
+                RemoteHintSeg {
+                    text: "o",
+                    action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Char('o'))),
+                },
+                RemoteHintSeg { text: " open login again · ", action: None },
+                RemoteHintSeg {
+                    text: "Esc",
+                    action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+                },
+                RemoteHintSeg { text: " close", action: None },
+            ],
+        );
+        for (x_start, x_end, action) in hint_zones {
+            zones.push(RemoteInfoZone { line: hint_line, x_start, x_end, action });
+        }
+        info.push(line);
     } else {
         info.push(Line::from(Span::styled(
             "Opening browser login… The QR updates when the tunnel is ready.",
             Style::default().fg(app.theme.dim),
         )));
+        let hint_line = info.len();
+        let (line, hint_zones) = remote_hint_line(
+            app,
+            &[RemoteHintSeg {
+                text: "Esc",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+            },
+            RemoteHintSeg { text: " close", action: None }],
+        );
+        for (x_start, x_end, action) in hint_zones {
+            zones.push(RemoteInfoZone { line: hint_line, x_start, x_end, action });
+        }
+        info.push(line);
     }
 
     // OAuth is the action the user must take now. A local-network QR is
@@ -15854,13 +16077,14 @@ fn render_remote_starting<'a>(
     } else {
         &p.qr
     };
-    let (lines, width, height) = compose_qr_and_info(qr, info, area_w);
+    let (lines, width, height, body_zones) = compose_qr_and_info_z(qr, info, area_w, zones);
     (
         format!(" /remote-connect — starting {label}… — Esc to close "),
         app.theme.warning,
         lines,
         width,
         height,
+        body_zones,
     )
 }
 
@@ -15883,6 +16107,7 @@ fn render_remote_ok<'a>(
     }
 
     info.push(Line::raw(""));
+    let mut zones: Vec<RemoteInfoZone> = Vec::new();
     // [ back ] then [ stop ], focus reversed. `back` is the safe default,
     // so it leads.
     let button = |label: &str, focused: bool, danger: bool| {
@@ -15897,27 +16122,57 @@ fn render_remote_ok<'a>(
         }
         Span::styled(format!("[ {label} ]"), style)
     };
-    info.push(Line::from(vec![
-        button("back", focus == ReadyButton::Back, false),
-        Span::raw("  "),
-        button("stop", focus == ReadyButton::Stop, true),
-    ]));
+    let button_line = info.len();
+    let back_span = button("back", focus == ReadyButton::Back, false);
+    let stop_span = button("stop", focus == ReadyButton::Stop, true);
+    let back_w = UnicodeWidthStr::width(back_span.content.as_ref()) as u16;
+    let stop_w = UnicodeWidthStr::width(stop_span.content.as_ref()) as u16;
+    zones.push(RemoteInfoZone {
+        line: button_line,
+        x_start: 0,
+        x_end: back_w,
+        action: RemoteControlHitAction::ReadyButton(ReadyButton::Back),
+    });
+    zones.push(RemoteInfoZone {
+        line: button_line,
+        x_start: back_w + 2, // trailing "  " gap
+        x_end: back_w + 2 + stop_w,
+        action: RemoteControlHitAction::ReadyButton(ReadyButton::Stop),
+    });
+    info.push(Line::from(vec![back_span, Span::raw("  "), stop_span]));
     info.push(Line::raw(""));
     let hint = match focus {
         ReadyButton::Back => "Keep the tunnel running and return to the options.",
         ReadyButton::Stop => "Stop the tunnel. The local-network address stays up.",
     };
     info.extend(wrapped_lines(hint, Style::default().fg(app.theme.dim)));
-    info.push(Line::from(Span::styled(
-        "←/→ select · Enter · Esc close",
-        Style::default().fg(app.theme.dim),
-    )));
+    let hint_line = info.len();
+    let (line, hint_zones) = remote_hint_line(
+        app,
+        &[
+            RemoteHintSeg { text: "←/→ select · ", action: None },
+            RemoteHintSeg {
+                text: "Enter",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Enter)),
+            },
+            RemoteHintSeg { text: " · ", action: None },
+            RemoteHintSeg {
+                text: "Esc",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+            },
+            RemoteHintSeg { text: " close", action: None },
+        ],
+    );
+    for (x_start, x_end, action) in hint_zones {
+        zones.push(RemoteInfoZone { line: hint_line, x_start, x_end, action });
+    }
+    info.push(line);
 
     let label = p.provider.label();
     let title = format!(" /remote-connect — {label} ready (public URL) — Esc to close ");
 
-    let (lines, width, height) = compose_qr_and_info(&p.qr, info, area_w);
-    (title, app.theme.success, lines, width, height)
+    let (lines, width, height, body_zones) = compose_qr_and_info_z(&p.qr, info, area_w, zones);
+    (title, app.theme.success, lines, width, height, body_zones)
 }
 
 fn ready_screen_shows_basic_credentials(
@@ -15938,6 +16193,25 @@ fn render_remote_err<'a>(
     let header = format!("Could not start the {label} tunnel:");
     let keys = "← back to options · Esc close";
 
+    // `Left`/`Backspace` walks back to the chooser (see the `Err` arm of
+    // `handle_remote_control_key`), so the "← back to options" hint dispatches
+    // `Left`; "Esc" closes.
+    let (keys_line, keys_zones) = remote_hint_line(
+        app,
+        &[
+            RemoteHintSeg {
+                text: "← back to options",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Left)),
+            },
+            RemoteHintSeg { text: " · ", action: None },
+            RemoteHintSeg {
+                text: "Esc",
+                action: Some(RemoteControlHitAction::Key(crossterm::event::KeyCode::Esc)),
+            },
+            RemoteHintSeg { text: " close", action: None },
+        ],
+    );
+
     let lines: Vec<Line> = vec![
         Line::from(Span::styled(
             header.clone(),
@@ -15951,10 +16225,7 @@ fn render_remote_err<'a>(
             Style::default().fg(app.theme.text),
         )),
         Line::raw(""),
-        Line::from(Span::styled(
-            keys.to_string(),
-            Style::default().fg(app.theme.dim),
-        )),
+        keys_line,
     ];
     let width = message
         .lines()
@@ -15964,12 +16235,20 @@ fn render_remote_err<'a>(
         .max(header.chars().count() as u16)
         .max(keys.chars().count() as u16);
     let height = 4 + message.lines().count() as u16;
+    // The keys hint is always the final rendered row (a multi-line message
+    // expands rows 2.., so key on `height`, not the vec index).
+    let keys_row = height.saturating_sub(1);
+    let body_zones = keys_zones
+        .into_iter()
+        .map(|(x_start, x_end, action)| RemoteBodyZone { row: keys_row, x_start, x_end, action })
+        .collect();
     (
         format!(" /remote-connect — {label} failed — Esc to close "),
         app.theme.danger,
         lines,
         width,
         height,
+        body_zones,
     )
 }
 

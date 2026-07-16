@@ -3190,6 +3190,12 @@ pub struct LayoutSnapshot {
     /// Mouse clicks outside this rect dismiss the modal instead of
     /// falling through to panes underneath it.
     pub modal_area: Option<ratatui::layout::Rect>,
+    /// Clickable controls inside the `/remote-control` dialog (tunnel-type
+    /// buttons, `[ back ]`/`[ stop ]`, and the `Enter`/`Esc`/`o` key hints).
+    /// Populated by `render_remote_control_popup`; empty whenever the dialog
+    /// is closed. Hit-tested inside `handle_left_click`'s modal branch so a
+    /// click on a control dispatches its action instead of being swallowed.
+    pub remote_control_hits: Vec<RemoteControlHit>,
     /// Clickable session-name text in each rendered pane's title bar (one
     /// entry per pane) — click starts an inline rename in place. Refreshed
     /// every frame by `render_detail`.
@@ -3368,6 +3374,39 @@ pub enum MinibufferChoiceAction {
     /// literal string, exactly as if the user had typed it and pressed
     /// Enter.
     Submit(String),
+}
+
+/// A clickable control inside the `/remote-control` dialog — a tunnel-type
+/// button, a `[ back ]`/`[ stop ]` button, or one of the `Enter`/`Esc`/`o`
+/// key hints in the footer. Registered per-frame by `render_remote_control_popup`
+/// (in absolute screen coordinates, after the QR/text composition has placed
+/// the body) and hit-tested inside `handle_left_click`'s modal branch, before
+/// the branch that otherwise swallows every in-dialog click.
+#[derive(Debug, Clone, Copy)]
+pub struct RemoteControlHit {
+    pub x_start: u16,
+    /// Exclusive end column.
+    pub x_end: u16,
+    pub y: u16,
+    pub action: RemoteControlHitAction,
+}
+
+/// How a click on a [`RemoteControlHit`] is dispatched. Every variant routes
+/// through the exact same code a keypress would — `handle_remote_control_key`
+/// or the selection/focus state it mutates — so the click path never grows a
+/// second, divergent decision tree.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteControlHitAction {
+    /// Click a tunnel-type button in the chooser: move the selection onto that
+    /// provider, exactly as an arrow key would. Starting it is a separate
+    /// click on the `Enter` hint, mirroring the keyboard's select-then-start.
+    SelectProvider(usize),
+    /// Click `[ back ]` / `[ stop ]` in the ready view: focus that button and
+    /// act on it, the same as toggling focus and pressing Enter.
+    ReadyButton(ReadyButton),
+    /// Click a key hint (`Enter`, `Esc`, `o`, `←`): synthesize that key and
+    /// feed it through `handle_remote_control_key`.
+    Key(crossterm::event::KeyCode),
 }
 
 fn selection_bounds_for_layout(
@@ -7972,6 +8011,14 @@ impl App {
             && self.dragging_lineage_scrollbar.is_none()
             && self.text_selection.is_none()
             && !card_owns_event
+            // A modal (remote-control dialog, program editor, help, tasks)
+            // paints on top and owns every mouse event over it — forwarding to
+            // the session PTY underneath would let a mouse-grabbing child (e.g.
+            // a full-screen harness) swallow clicks meant for the dialog's
+            // buttons, or a click meant to dismiss the modal. `handle_left_click`
+            // already routes in-modal clicks to the modal and out-of-modal
+            // clicks to dismissal.
+            && self.layout.modal_area.is_none()
             && self.forward_mouse_to_child(&ev)
         {
             return;
@@ -8463,6 +8510,21 @@ impl App {
                 self.dismiss_modal();
                 return;
             } else {
+                // The /remote-control dialog is the one informational modal
+                // with live controls: dispatch a click that lands on one of
+                // its registered buttons / key hints before the swallow below.
+                if self.remote_control_popup.is_some() {
+                    if let Some(action) = self
+                        .layout
+                        .remote_control_hits
+                        .iter()
+                        .find(|h| row == h.y && col >= h.x_start && col < h.x_end)
+                        .map(|h| h.action)
+                    {
+                        self.handle_remote_control_click(action).await;
+                        return;
+                    }
+                }
                 // Other modals are informational/read-only. Clicks inside
                 // them are consumed so they don't focus or activate controls
                 // in panes underneath the modal.
@@ -10605,6 +10667,44 @@ impl App {
         true
     }
 
+    /// Dispatch a click on a `/remote-control` dialog control. Each arm routes
+    /// through the same state and handlers the keyboard uses, so clicking a
+    /// button is indistinguishable from pressing the key it stands for.
+    async fn handle_remote_control_click(&mut self, action: RemoteControlHitAction) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        match action {
+            // Selecting a provider mirrors an arrow key: move the highlight,
+            // nothing more. The `Enter` hint (also clickable) starts it.
+            RemoteControlHitAction::SelectProvider(i) => {
+                if let Some(RemoteControlPopup::Choose(choose)) =
+                    self.remote_control_popup.as_mut()
+                {
+                    if i < choose.options.len() {
+                        choose.selected = i;
+                    }
+                }
+            }
+            // Focus the clicked ready-view button, then act on it — the same
+            // two steps as toggling focus with an arrow and pressing Enter.
+            RemoteControlHitAction::ReadyButton(button) => {
+                if let Some(RemoteControlPopup::Ok { focus, .. }) =
+                    self.remote_control_popup.as_mut()
+                {
+                    *focus = button;
+                }
+                self.handle_remote_control_key(KeyEvent::new(
+                    KeyCode::Enter,
+                    KeyModifiers::empty(),
+                ))
+                .await;
+            }
+            RemoteControlHitAction::Key(code) => {
+                self.handle_remote_control_key(KeyEvent::new(code, KeyModifiers::empty()))
+                    .await;
+            }
+        }
+    }
+
     /// Stop just the tunnel (the dialog's `stop` button), keeping the
     /// LAN listener + password, then return to the chooser showing the
     /// local-network view. Re-selecting the provider afterward starts a
@@ -12338,6 +12438,7 @@ mod tests {
             minibuffer_harness_hits: Vec::new(),
             minibuffer_choice_hits: Vec::new(),
             modal_area: None,
+            remote_control_hits: Vec::new(),
             session_title_name_hits: Vec::new(),
             session_harness_hits: Vec::new(),
             lineage_area: None,
@@ -28396,6 +28497,322 @@ mod tests {
             screen.contains("theme:matrix | ● remote:2 |"),
             "connected client count should render in the same right-side affordance:\n{screen}"
         );
+        server.abort();
+    }
+
+    /// A local-network `RemoteControlOk` with a small QR so the dialog
+    /// composes into its side-by-side layout — the harder coordinate path for
+    /// the click zones to get right.
+    fn remote_ok_fixture(tunnel_ready: bool) -> RemoteControlOk {
+        RemoteControlOk {
+            url: "http://192.168.1.2:9800".into(),
+            qr: (0..10).map(|_| "#".repeat(20)).collect::<Vec<_>>().join("\n"),
+            tunnel_ready,
+            password: "secret".into(),
+            hint: None,
+            provider: construct_protocol::TunnelProvider::None,
+            local_url: "http://127.0.0.1:9800".into(),
+            lan_url: Some("http://192.168.1.2:9800".into()),
+            auth_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_choose_provider_buttons_and_hints_are_clickable() {
+        use construct_protocol::{RemoteProviderInfo, TunnelProvider};
+        use crossterm::event::KeyCode;
+        let (mut app, _dir, server) = empty_app().await;
+
+        let options = vec![
+            RemoteProviderInfo {
+                provider: TunnelProvider::Cloudflare,
+                available: true,
+                detail: None,
+            },
+            RemoteProviderInfo {
+                provider: TunnelProvider::Construct,
+                available: true,
+                detail: None,
+            },
+        ];
+        app.remote_control_popup = Some(RemoteControlPopup::Choose(RemoteControlChoose {
+            base: remote_ok_fixture(false),
+            options,
+            selected: 0,
+            active: None,
+        }));
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw choose");
+
+        // Both tunnel-type buttons plus the Enter / Esc hints registered zones.
+        let provider_zones = app
+            .layout
+            .remote_control_hits
+            .iter()
+            .filter(|h| matches!(h.action, RemoteControlHitAction::SelectProvider(_)))
+            .count();
+        assert_eq!(
+            provider_zones, 2,
+            "both provider buttons should be clickable: {:?}",
+            app.layout.remote_control_hits
+        );
+        assert!(
+            app.layout
+                .remote_control_hits
+                .iter()
+                .any(|h| matches!(h.action, RemoteControlHitAction::Key(KeyCode::Enter))),
+            "Enter hint should be clickable"
+        );
+        assert!(
+            app.layout
+                .remote_control_hits
+                .iter()
+                .any(|h| matches!(h.action, RemoteControlHitAction::Key(KeyCode::Esc))),
+            "Esc hint should be clickable"
+        );
+
+        // The second provider zone's top-left lands exactly on its `[` glyph:
+        // proves the QR/text composition offset is applied to the zone coords.
+        let p1 = app
+            .layout
+            .remote_control_hits
+            .iter()
+            .find(|h| matches!(h.action, RemoteControlHitAction::SelectProvider(1)))
+            .cloned()
+            .expect("provider 1 zone");
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((p1.x_start, p1.y))
+                .map(|c| c.symbol()),
+            Some("["),
+            "provider button zone should start on its bracket"
+        );
+
+        // Clicking a provider button moves the selection there and nothing
+        // more — starting it is the separate Enter click.
+        app.handle_left_click(p1.x_start, p1.y).await;
+        match &app.remote_control_popup {
+            Some(RemoteControlPopup::Choose(c)) => {
+                assert_eq!(c.selected, 1, "clicking provider 1 should select it")
+            }
+            other => panic!("dialog should stay on the chooser, got {other:?}"),
+        }
+
+        // Clicking the Esc hint dismisses the dialog, exactly like the key.
+        let esc = app
+            .layout
+            .remote_control_hits
+            .iter()
+            .find(|h| matches!(h.action, RemoteControlHitAction::Key(KeyCode::Esc)))
+            .cloned()
+            .expect("esc zone");
+        app.handle_left_click(esc.x_start, esc.y).await;
+        assert!(
+            app.remote_control_popup.is_none(),
+            "clicking Esc should close the dialog"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_ready_view_back_stop_and_hints_are_clickable() {
+        use crossterm::event::KeyCode;
+        let (mut app, _dir, server) = empty_app().await;
+
+        let mut ok = remote_ok_fixture(true);
+        ok.provider = construct_protocol::TunnelProvider::Construct;
+        ok.url = "https://quiet-river.tunnel.zarvis.ai".into();
+        app.remote_control_popup = Some(RemoteControlPopup::Ok {
+            ok,
+            focus: ReadyButton::Back,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw ready view");
+
+        let hits = &app.layout.remote_control_hits;
+        assert!(
+            hits.iter().any(|h| matches!(
+                h.action,
+                RemoteControlHitAction::ReadyButton(ReadyButton::Back)
+            )),
+            "[ back ] should be clickable: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| matches!(
+                h.action,
+                RemoteControlHitAction::ReadyButton(ReadyButton::Stop)
+            )),
+            "[ stop ] should be clickable"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| matches!(h.action, RemoteControlHitAction::Key(KeyCode::Enter))),
+            "Enter hint should be clickable"
+        );
+        assert!(
+            hits.iter()
+                .any(|h| matches!(h.action, RemoteControlHitAction::Key(KeyCode::Esc))),
+            "Esc hint should be clickable"
+        );
+
+        // The stop-button zone lands on its `[` glyph — the ready view has no
+        // QR-side offset on this line, so this pins the raw column math too.
+        let stop = hits
+            .iter()
+            .find(|h| matches!(
+                h.action,
+                RemoteControlHitAction::ReadyButton(ReadyButton::Stop)
+            ))
+            .cloned()
+            .expect("stop zone");
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((stop.x_start, stop.y))
+                .map(|c| c.symbol()),
+            Some("["),
+            "stop button zone should start on its bracket"
+        );
+
+        server.abort();
+    }
+
+    /// Closing the dialog clears the click zones, so a stale zone can never
+    /// dispatch against whatever renders next frame.
+    #[tokio::test]
+    async fn remote_control_hits_clear_when_dialog_closes() {
+        use construct_protocol::{RemoteProviderInfo, TunnelProvider};
+        let (mut app, _dir, server) = empty_app().await;
+        app.remote_control_popup = Some(RemoteControlPopup::Choose(RemoteControlChoose {
+            base: remote_ok_fixture(false),
+            options: vec![RemoteProviderInfo {
+                provider: TunnelProvider::Cloudflare,
+                available: true,
+                detail: None,
+            }],
+            selected: 0,
+            active: None,
+        }));
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw open");
+        assert!(
+            !app.layout.remote_control_hits.is_empty(),
+            "open dialog registers zones"
+        );
+
+        app.remote_control_popup = None;
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw closed");
+        assert!(
+            app.layout.remote_control_hits.is_empty(),
+            "closing the dialog clears its click zones"
+        );
+
+        server.abort();
+    }
+
+    /// The dialog is reached from the orchestrator, so it overlays the main
+    /// view — often a session running a full-screen, mouse-grabbing harness.
+    /// A click on a dialog control must reach the dialog, not be forwarded down
+    /// that child's PTY. Regression test for the modal guard on
+    /// `forward_mouse_to_child`.
+    #[tokio::test]
+    async fn dialog_click_is_not_forwarded_to_a_mouse_grabbing_pane_underneath() {
+        use construct_protocol::{RemoteProviderInfo, TunnelProvider};
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, server) = empty_app().await;
+
+        // A selected session whose pane fills the screen and whose child has
+        // turned on mouse tracking (`?1000h`) — exactly what would swallow the
+        // click without the guard.
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        app.sync_active_window_selection();
+        let mut history = crate::pty_render::ItemHistory::new();
+        history.feed_pty(b"\x1b[?1000h");
+        let _ = history.replay(120, 40, 0);
+        assert_ne!(
+            history.mouse_protocol_mode(),
+            vt100::MouseProtocolMode::None,
+            "test premise: the child grabs the mouse"
+        );
+        app.histories.insert("s1".into(), history);
+
+        app.remote_control_popup = Some(RemoteControlPopup::Choose(RemoteControlChoose {
+            base: remote_ok_fixture(false),
+            options: vec![
+                RemoteProviderInfo {
+                    provider: TunnelProvider::Cloudflare,
+                    available: true,
+                    detail: None,
+                },
+                RemoteProviderInfo {
+                    provider: TunnelProvider::Construct,
+                    available: true,
+                    detail: None,
+                },
+            ],
+            selected: 0,
+            active: None,
+        }));
+
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw dialog");
+
+        // Force the pane geometry to blanket the screen and map to the live
+        // session, so the click coordinate unambiguously sits over the
+        // mouse-grabbing child (the render's own panes may be narrower).
+        app.layout.main_window_areas = vec![WindowPaneHit {
+            id: app.active_window_id,
+            area: Rect::new(0, 0, 120, 40),
+            inner_area: Rect::new(0, 0, 120, 40),
+        }];
+
+        let p1 = app
+            .layout
+            .remote_control_hits
+            .iter()
+            .find(|h| matches!(h.action, RemoteControlHitAction::SelectProvider(1)))
+            .cloned()
+            .expect("provider 1 zone");
+
+        let ev = |kind| MouseEvent {
+            kind,
+            column: p1.x_start,
+            row: p1.y,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        app.on_mouse(ev(MouseEventKind::Down(MouseButton::Left))).await;
+        app.on_mouse(ev(MouseEventKind::Up(MouseButton::Left))).await;
+
+        match &app.remote_control_popup {
+            Some(RemoteControlPopup::Choose(c)) => assert_eq!(
+                c.selected, 1,
+                "click over a mouse-grabbing pane must still reach the dialog"
+            ),
+            other => panic!("dialog should stay on the chooser, got {other:?}"),
+        }
+
         server.abort();
     }
 
