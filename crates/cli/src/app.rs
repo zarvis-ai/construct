@@ -27973,6 +27973,18 @@ mod tests {
         app.focus = PaneFocus::List;
         term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
         let bar = app.layout.list_scrollbar.expect("focused scrollbar");
+        assert_eq!(
+            term.backend()
+                .buffer()
+                .cell(ratatui::layout::Position {
+                    x: bar.thumb.x,
+                    y: bar.thumb.y,
+                })
+                .expect("thumb cell")
+                .symbol(),
+            "▕",
+            "the list scrollbar uses a slim right-edge glyph"
+        );
 
         // Clicking near the track's bottom jumps the viewport toward the end.
         app.on_mouse(MouseEvent {
@@ -32412,18 +32424,17 @@ mod tests {
                 .collect()
         };
         let bottom = area.y + area.height - 1;
-        assert_eq!(
-            row_syms(bottom).trim(),
-            "",
-            "the scrollbar row carries no diagram content"
+        assert!(
+            row_syms(bottom).trim().chars().all(|ch| ch == '▁'),
+            "the scrollbar row carries only the slim scrollbar, no diagram content"
         );
         assert!(
             (area.x..area.x + area.width).any(|x| {
                 buf.cell((x, bottom))
-                    .map(|c| c.style().bg.is_some())
+                    .map(|c| c.symbol() == "▁" && c.style().fg.is_some())
                     .unwrap_or(false)
             }),
-            "the bottom row shows the scrollbar tint"
+            "the bottom row shows the slim scrollbar"
         );
         assert_eq!(
             row_syms(bottom - 1).trim(),
@@ -32485,8 +32496,37 @@ mod tests {
 
         app.mouse_pos = Some((area.x + 1, area.y + 1));
         term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
-        assert!(app.layout.lineage_vscrollbar.is_some());
-        assert!(app.layout.lineage_hscrollbar.is_some());
+        let vbar = app
+            .layout
+            .lineage_vscrollbar
+            .expect("vertical scrollbar");
+        let hbar = app
+            .layout
+            .lineage_hscrollbar
+            .expect("horizontal scrollbar");
+        let buffer = term.backend().buffer();
+        assert_eq!(
+            buffer
+                .cell(ratatui::layout::Position {
+                    x: vbar.thumb.x,
+                    y: vbar.thumb.y,
+                })
+                .expect("vertical thumb cell")
+                .symbol(),
+            "▕",
+            "the vertical lineage scrollbar uses a slim right-edge glyph"
+        );
+        assert_eq!(
+            buffer
+                .cell(ratatui::layout::Position {
+                    x: hbar.thumb.x,
+                    y: hbar.thumb.y,
+                })
+                .expect("horizontal thumb cell")
+                .symbol(),
+            "▁",
+            "the horizontal lineage scrollbar uses a slim bottom-edge glyph"
+        );
         assert_eq!(
             app.layout.lineage_area.expect("lineage section").height,
             resting_height,

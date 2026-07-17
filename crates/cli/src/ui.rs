@@ -2213,7 +2213,7 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
     app.layout.list_scroll_offset = visible_start + state.offset();
     app.list_scroll_offset = app.layout.list_scroll_offset;
     // Session rows keep their full width; the scrollbar is an auto-hidden
-    // background tint over the rightmost column, matching lineage. Hovering
+    // slim edge glyph over the rightmost column, matching lineage. Hovering
     // the session-list header or rows reveals it, while lineage/operator
     // hover does not. An active drag keeps its bar alive until mouse-up.
     let list_hover_area = Rect {
@@ -2259,7 +2259,8 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     x,
                     y: list_items_area.y + row as u16,
                 }) {
-                    cell.set_bg(if row >= top && row < top + thumb_h {
+                    cell.set_symbol("▕");
+                    cell.set_fg(if row >= top && row < top + thumb_h {
                         thumb_color
                     } else {
                         track_color
@@ -2642,10 +2643,9 @@ fn render_lineage_section(
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 
-    // Scrollbars when the diagram overflows the viewport — background
-    // tints only (same opacity approximation as the terminal scrollbar),
-    // preserving the diagram glyphs underneath. Vertical along the right
-    // column, horizontal along the bottom row.
+    // Scrollbars when the diagram overflows the viewport — slim edge glyphs
+    // with the same opacity approximation as the terminal scrollbar.
+    // Vertical runs along the right edge; horizontal along the bottom edge.
     let track_color = blend_color(Color::Black, app.theme.text, 0.30);
     let thumb_color = blend_color(Color::Black, app.theme.text, 0.80);
     if show_scrollbars && rows.len() > visible && inner.width > 0 {
@@ -2680,7 +2680,8 @@ fn render_lineage_section(
                 x,
                 y: inner.y + r as u16,
             }) {
-                cell.set_bg(if r >= top && r < top + thumb_h {
+                cell.set_symbol("▕");
+                cell.set_fg(if r >= top && r < top + thumb_h {
                     thumb_color
                 } else {
                     track_color
@@ -2728,7 +2729,8 @@ fn render_lineage_section(
                 x: inner.x + cidx as u16,
                 y,
             }) {
-                cell.set_bg(if cidx >= left && cidx < left + thumb_w {
+                cell.set_symbol("▁");
+                cell.set_fg(if cidx >= left && cidx < left + thumb_w {
                     thumb_color
                 } else {
                     track_color
