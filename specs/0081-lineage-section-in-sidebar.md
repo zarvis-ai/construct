@@ -1,7 +1,7 @@
 # 0081-lineage-section-in-sidebar
 
 Status: accepted
-Date: 2026-07-10
+Date: 2026-07-16
 Area: tui
 Scope: Fork/subagent lineage renders as a collapsible section of the left sidebar — between the session rows and the operator panel — showing the selected session's tree; there is no floating per-pane lineage widget.
 
@@ -28,7 +28,11 @@ scrolls (vertically and horizontally) inside the section instead of
 crowding the list out — and keeps one blank padding row above and below
 the diagram. When the diagram overflows the section's width, the
 horizontal scrollbar gets its own row at the section's bottom (below the
-padding row), so the last diagram row never renders underneath it.
+padding row), so the last diagram row never renders underneath it. Needed
+scrollbars are visible only while the section has active keyboard focus or
+the pointer is anywhere inside the section. The horizontal scrollbar's row
+stays reserved while its bar is hidden, preventing hover from shifting the
+diagram vertically.
 
 The section's header is a one-row horizontal rule carrying its label and
 controls — the same visual furniture as the operator panel's title bar

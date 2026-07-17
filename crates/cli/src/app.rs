@@ -32083,6 +32083,10 @@ mod tests {
         term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
         assert!(app.layout.lineage_h_overflow, "premise: width overflows");
         let area = app.layout.lineage_area.expect("section area");
+        // Hover reveals the otherwise-hidden bar without changing the
+        // section's already-computed geometry.
+        app.mouse_pos = Some((area.x + 1, area.y + 1));
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
         let rows = app.lineage_section_rows("s1");
         assert_eq!(
             area.height as usize,
@@ -32146,6 +32150,48 @@ mod tests {
             app.sessions.push(fork);
         }
         (app, dir, server)
+    }
+
+    #[tokio::test]
+    async fn lineage_scrollbars_show_only_on_focus_or_hover() {
+        let (mut app, _dir, server) = test_app_with_tall_wide_lineage().await;
+        app.select_session("s1".to_string());
+        let backend = ratatui::backend::TestBackend::new(120, 28);
+        let mut term = ratatui::Terminal::new(backend).expect("terminal");
+
+        // At rest, overflow and the horizontal bar's stable reserved row
+        // still exist, but neither scrollbar is visible or interactive.
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(
+            app.layout.lineage_v_overflow && app.layout.lineage_h_overflow,
+            "premise: both axes overflow"
+        );
+        let area = app.layout.lineage_area.expect("lineage section");
+        let resting_height = area.height;
+        assert!(app.layout.lineage_hscroll_hit.is_some());
+        assert!(app.layout.lineage_vscrollbar.is_none());
+        assert!(app.layout.lineage_hscrollbar.is_none());
+
+        app.mouse_pos = Some((area.x + 1, area.y + 1));
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(app.layout.lineage_vscrollbar.is_some());
+        assert!(app.layout.lineage_hscrollbar.is_some());
+        assert_eq!(
+            app.layout.lineage_area.expect("lineage section").height,
+            resting_height,
+            "hover must not shift the diagram"
+        );
+
+        app.mouse_pos = Some((area.x + area.width + 1, area.y));
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(app.layout.lineage_vscrollbar.is_none());
+        assert!(app.layout.lineage_hscrollbar.is_none());
+
+        app.toggle_lineage_focus();
+        term.draw(|f| crate::ui::render(f, &mut app)).expect("draw");
+        assert!(app.layout.lineage_vscrollbar.is_some());
+        assert!(app.layout.lineage_hscrollbar.is_some());
+        server.abort();
     }
 
     #[tokio::test]

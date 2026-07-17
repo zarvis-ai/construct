@@ -2494,6 +2494,14 @@ fn render_lineage_section(
     app.lineage_scroll_x = scroll_x;
     app.layout.lineage_v_overflow = rows.len() > visible;
     app.layout.lineage_h_overflow = h_overflow;
+    // Keep overflow layout stable at rest, but only expose its scrollbars
+    // while the section is actively keyboard-focused or the pointer is
+    // inside it. In particular, the horizontal bar's reserved row remains
+    // part of the section so entering/leaving hover never shifts the diagram.
+    let show_scrollbars = focused
+        || app
+            .mouse_pos
+            .is_some_and(|(mx, my)| contains_rect(rect, mx, my));
 
     // Hit regions for every cell a session owns — box borders and labels,
     // lane bars, branch glyphs, turn-info markers and text — in screen
@@ -2583,7 +2591,7 @@ fn render_lineage_section(
     // column, horizontal along the bottom row.
     let track_color = blend_color(Color::Black, app.theme.text, 0.30);
     let thumb_color = blend_color(Color::Black, app.theme.text, 0.80);
-    if rows.len() > visible && inner.width > 0 {
+    if show_scrollbars && rows.len() > visible && inner.width > 0 {
         let track_h = visible;
         let thumb_h = (track_h * track_h / rows.len().max(1)).clamp(1, track_h);
         let denom = rows.len() - visible;
@@ -2630,6 +2638,8 @@ fn render_lineage_section(
             width: body.width,
             height: 1,
         });
+    }
+    if show_scrollbars && h_overflow && inner.height > 0 {
         let track_w = inner.width as usize;
         let thumb_w = (track_w * track_w / content_w.max(1)).clamp(1, track_w);
         let denom = content_w - track_w;
