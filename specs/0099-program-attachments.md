@@ -12,14 +12,34 @@ Scope: Image and file attachments referenced from a session's program document, 
   bespoke token format. The path points at a file the daemon host can
   read (typically under the session's attachments directory, written by
   the existing clipboard-attachment mechanism).
-- Clients render those links as compact chips — `[Image #N]` / `[File #N]`
-  — with `N` derived from order of appearance **at render time**, never
-  stored. Hovering a chip shows the file's info (name, path, size, type)
-  and, where the client can, a preview.
+- Clients render **image links only** as compact chips; plain file links
+  stay literal text (they have no preview affordance, and collapsing them
+  would hide the path for no benefit). Hovering a chip shows the file's
+  info (name, path, size, type) and, where the client can, a preview.
+  Chips do not require the link to stand alone on its line; an expanded
+  preview renders below the line the link sits in.
+- A chip is **atomic to the cursor**: caret positions inside the link's
+  source map to the chip's boundary, and positions after it measure from
+  the chip's painted width, so the caret and selection always land where
+  the user sees them. The source text itself is untouched — atomicity is
+  a presentation/cursor rule, not an editing restriction.
 - A chip is toggleable between its compact form and an expanded preview.
+  Expansion follows CommonMark/GitHub rendering semantics: the image
+  **replaces** the chip at the link's position in the flow — the chip text
+  is not shown alongside it — and is **left-aligned**, never centered.
+  Text before the link keeps its place; text after the link flows **below
+  the image**, preserving reading order (a terminal's equivalent of the
+  tall HTML line box). Clicking the image collapses back to the chip.
   Expansion state and preview size are **client-local view state**: they
   are never written into the Markdown and never synchronized, so agents
-  and other clients see only the canonical link.
+  and other clients see only the canonical link. A client may persist its
+  own view state (per session) so expansion survives restarts.
+- Expansion state is **per link instance**, not per target path: the same
+  file referenced twice expands independently. Instance identity derives
+  from the link's containing line content (plus duplicate-line ordinal and
+  index within the line) — so ordinary edits elsewhere leave it untouched,
+  breaking a link mid-edit and re-completing it restores its expansion,
+  and editing the line itself resets its instances to chips.
 - Clients expand previews as their architecture allows: a client that
   owns its text rendering may reflow the document around a true inline
   block; a client built on a native text-input surface may anchor the

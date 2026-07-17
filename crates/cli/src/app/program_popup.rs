@@ -31,6 +31,131 @@ impl App {
         }
     }
 
+    /// Path of the TUI's persisted program view state (spec 0099: expansion
+    /// state is client-local; this file makes it survive TUI restarts).
+    fn program_expanded_store_path() -> std::path::PathBuf {
+        construct_protocol::paths::Paths::discover()
+            .state_dir
+            .join("tui-program-expanded.json")
+    }
+
+    /// Seed a freshly opened popup's expansion map from the persisted
+    /// per-session store, loading the store file on first use.
+    pub(super) fn seed_program_expanded(&mut self, popup: &mut ProgramPopup) {
+        if !self.program_expanded_store_loaded {
+            self.program_expanded_store_loaded = true;
+            // Tests exercise the in-memory store only — never the real
+            // user state file.
+            #[cfg(not(test))]
+            {
+                self.program_expanded_store =
+                    std::fs::read_to_string(Self::program_expanded_store_path())
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or_default();
+            }
+        }
+        let Some(saved) = self.program_expanded_store.get(&popup.program.session_id) else {
+            return;
+        };
+        popup.expanded_attachments = saved
+            .iter()
+            .filter_map(|(key, (path, rows))| {
+                let (hash, idx) = key.split_once(':')?;
+                Some((
+                    (hash.parse().ok()?, idx.parse().ok()?),
+                    (path.clone(), *rows),
+                ))
+            })
+            .collect();
+    }
+
+    /// Re-attach expansion state after buffer edits (spec 0099): an entry
+    /// whose line changed migrates to the first unclaimed instance with the
+    /// same target path — so typing after an inlined image keeps it
+    /// expanded. Entries with no surviving same-path instance are kept
+    /// under their old key: breaking a link mid-edit and re-completing it
+    /// then restores the expansion. Cheap no-op while the buffer is
+    /// unchanged; called once per frame for the active popup.
+    pub(crate) fn reconcile_program_expanded(&mut self) {
+        let Some(popup) = self.program_popup.as_mut() else {
+            return;
+        };
+        let buffer_hash = crate::ui::program_line_key(&popup.buffer);
+        if popup.expanded_reconcile_hash == buffer_hash {
+            return;
+        }
+        popup.expanded_reconcile_hash = buffer_hash;
+        if popup.expanded_attachments.is_empty() {
+            return;
+        }
+        let current = crate::ui::program_attachment_instances(&popup.buffer);
+        let current_keys: std::collections::HashSet<_> =
+            current.iter().map(|(key, _)| *key).collect();
+        let (kept, orphans): (Vec<_>, Vec<_>) = popup
+            .expanded_attachments
+            .drain()
+            .partition(|(key, _)| current_keys.contains(key));
+        let mut claimed: std::collections::HashSet<_> =
+            kept.iter().map(|(key, _)| *key).collect();
+        popup.expanded_attachments.extend(kept);
+        let mut migrated = false;
+        for (old_key, (path, rows)) in orphans {
+            match current
+                .iter()
+                .find(|(key, p)| p == &path && !claimed.contains(key))
+            {
+                Some((new_key, _)) => {
+                    claimed.insert(*new_key);
+                    popup.expanded_attachments.insert(*new_key, (path, rows));
+                    migrated = true;
+                }
+                None => {
+                    popup.expanded_attachments.insert(old_key, (path, rows));
+                }
+            }
+        }
+        // Keep the persisted store in step with migrated keys so a TUI
+        // restart right after an edit seeds current keys, not stale ones
+        // (stale keys would still heal through this same migration, but
+        // only while the entry's path survives the session).
+        if migrated {
+            self.persist_program_expanded();
+        }
+    }
+
+    /// Write-through the active popup's expansion map to the per-session
+    /// store and the state file. Best-effort: a failed write only costs
+    /// persistence, never the in-memory state.
+    pub(super) fn persist_program_expanded(&mut self) {
+        let Some(popup) = self.program_popup.as_ref() else {
+            return;
+        };
+        let session_id = popup.program.session_id.clone();
+        let serialized: HashMap<String, (String, u16)> = popup
+            .expanded_attachments
+            .iter()
+            .map(|((hash, idx), entry)| (format!("{hash}:{idx}"), entry.clone()))
+            .collect();
+        if serialized.is_empty() {
+            self.program_expanded_store.remove(&session_id);
+        } else {
+            self.program_expanded_store.insert(session_id, serialized);
+        }
+        // Tests exercise the in-memory store only — never the real user
+        // state file.
+        #[cfg(not(test))]
+        {
+            let path = Self::program_expanded_store_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(json) = serde_json::to_string(&self.program_expanded_store) {
+                let _ = std::fs::write(path, json);
+            }
+        }
+    }
+
     pub(super) async fn open_program_popup(&mut self) {
         let Some(session_id) = self.selected_id() else {
             self.set_status("program: no session selected".to_string());
@@ -55,6 +180,8 @@ impl App {
                 // last hidden, so hide→show is position-preserving rather than
                 // jumping back to the top.
                 self.restore_program_view_state(&mut popup);
+                // Restore persisted image-expansion state (spec 0099).
+                self.seed_program_expanded(&mut popup);
                 self.program_popup = Some(popup);
                 // Opening a program focuses the view pane so its keystrokes are
                 // captured immediately for editing. `C-x o` then hands focus
@@ -163,7 +290,12 @@ impl App {
                         self.program_collaborators
                             .insert(cursor.client_id.clone(), cursor);
                     }
-                    let popup = program_popup_from_document(result.program, result.blocks, now);
+                    let mut popup = program_popup_from_document(result.program, result.blocks, now);
+                    // Restored popups get their persisted image-expansion
+                    // state back too (spec 0099) — without this, a TUI
+                    // restart came back collapsed and the next interaction
+                    // persisted the empty map over the stored one.
+                    self.seed_program_expanded(&mut popup);
                     if selected_id.as_deref() == Some(session_id.as_str()) {
                         self.program_popup = Some(popup);
                     } else {

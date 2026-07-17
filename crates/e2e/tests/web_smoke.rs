@@ -1761,7 +1761,7 @@ async fn web_client_loads_and_websocket_connects() {
               const img = programMdLinkParse('![shot](/a/b/s.png)');
               const spaced = programMdLinkParse('![s](</a/b c/s.png>)');
               const http = programMdLinkParse('[d](https://example.com)');
-              const source = 'x ![shot](</a/b c/s.png>) y [d](https://example.com) z';
+              const source = 'x ![shot](</a/b c/s.png>) y [d](https://example.com) [f](/tmp/n.pdf) z';
               const div = document.createElement('div');
               programFillLine(div, source);
               const chip = div.querySelector('.program-attachment');
@@ -1788,10 +1788,12 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(program_attachments["httpIsNull"], true);
     assert_eq!(
         program_attachments["roundTrip"],
-        "x ![shot](</a/b c/s.png>) y [d](https://example.com) z"
+        "x ![shot](</a/b c/s.png>) y [d](https://example.com) [f](/tmp/n.pdf) z"
     );
     assert_eq!(program_attachments["chipLabel"], "Image: shot");
     assert_eq!(program_attachments["chipIsImage"], true);
+    // Exactly one chip: the image. The http link AND the plain file link
+    // both stay literal text (spec 0099: image links only).
     assert_eq!(program_attachments["httpChipCount"], 1);
 
     // Regression coverage for mobile terminal scroll containment:

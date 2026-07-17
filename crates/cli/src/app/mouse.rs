@@ -37,7 +37,14 @@ impl App {
             || self
                 .layout
                 .program_resize_hit
-                .is_some_and(|hit| Self::rect_contains(hit, col, row)))
+                .is_some_and(|hit| Self::rect_contains(hit, col, row))
+            // Resize grab zone of an expanded inline attachment image
+            // (spec 0099): the persistent handle row plus the row below.
+            || self
+                .layout
+                .program_attachment_resize_zones
+                .iter()
+                .any(|(r, _, _)| Self::rect_contains(*r, col, row)))
         .then_some("↕")
     }
     pub(super) fn selection_bounds_at(&self, col: u16, row: u16) -> Option<ratatui::layout::Rect> {

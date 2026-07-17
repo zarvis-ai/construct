@@ -51,6 +51,32 @@ impl App {
                 _ => return true,
             }
         }
+        // An in-flight inline-image resize (spec 0099) owns the mouse until
+        // release, same as the popup-resize gesture above. Handled here —
+        // not in the generic mouse path — because this handler runs first
+        // and consumes drags over the popup body.
+        if let Some((key, top)) = self.resizing_program_attachment {
+            match ev.kind {
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    let rows = (ev.row.saturating_sub(top).saturating_add(1)).clamp(
+                        crate::ui::PROGRAM_ATTACHMENT_MIN_ROWS,
+                        crate::ui::PROGRAM_ATTACHMENT_MAX_ROWS,
+                    );
+                    if let Some(popup) = self.program_popup.as_mut() {
+                        if let Some(entry) = popup.expanded_attachments.get_mut(&key) {
+                            entry.1 = rows;
+                        }
+                    }
+                    return true;
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.resizing_program_attachment = None;
+                    self.persist_program_expanded();
+                    return true;
+                }
+                _ => return true,
+            }
+        }
         // An in-flight pinned-card drag (spec 0090) owns the mouse until the
         // button releases, wherever the pointer wanders — same rule as every
         // other construct drag gesture.
@@ -360,33 +386,41 @@ impl App {
                 .cloned();
             if let Some(hit) = image_chip {
                 if let Some(popup) = self.program_popup.as_mut() {
-                    if popup.expanded_attachments.remove(&hit.path).is_none() {
-                        popup.expanded_attachments.insert(
-                            hit.path.clone(),
-                            crate::ui::PROGRAM_ATTACHMENT_DEFAULT_ROWS,
-                        );
+                    if popup.expanded_attachments.remove(&hit.key).is_none() {
+                        popup
+                            .expanded_attachments
+                            .insert(
+                                hit.key,
+                                (hit.path.clone(), crate::ui::PROGRAM_ATTACHMENT_DEFAULT_ROWS),
+                            );
                     }
                 }
+                self.persist_program_expanded();
+                return true;
+            }
+            // Resize zone first: it overlaps the image's bottom row, and a
+            // grab must win over collapse there.
+            if let Some((_, key, top)) = self
+                .layout
+                .program_attachment_resize_zones
+                .iter()
+                .find(|(r, _, _)| Self::rect_contains(*r, ev.column, ev.row))
+                .cloned()
+            {
+                self.resizing_program_attachment = Some((key, top));
                 return true;
             }
             let image_rect = self
                 .layout
                 .program_attachment_image_rects
                 .iter()
-                .find(|(r, _)| {
-                    ev.column >= r.x
-                        && ev.column < r.x + r.width
-                        && ev.row >= r.y
-                        && ev.row < r.y + r.height
-                })
+                .find(|(r, _, _)| Self::rect_contains(*r, ev.column, ev.row))
                 .cloned();
-            if let Some((rect, path)) = image_rect {
-                let bottom = rect.y + rect.height.saturating_sub(1);
-                if ev.row == bottom {
-                    self.resizing_program_attachment = Some((path, rect.y));
-                } else if let Some(popup) = self.program_popup.as_mut() {
-                    popup.expanded_attachments.remove(&path);
+            if let Some((_, key, _path)) = image_rect {
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.expanded_attachments.remove(&key);
                 }
+                self.persist_program_expanded();
                 return true;
             }
         }
@@ -2567,6 +2601,15 @@ impl App {
                 } else {
                     row.saturating_add(delta as usize)
                 };
+                // Never land inside an expanded image's rows — hop over the
+                // block in the direction of travel (spec 0099).
+                let target_row = ui::program_skip_attachment_rows(
+                    Some(app),
+                    &popup.buffer,
+                    target_row,
+                    delta > 0,
+                    width,
+                );
                 let cursor = ui::program_visual_to_cursor(
                     Some(app),
                     &popup.buffer,
