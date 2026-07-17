@@ -1093,6 +1093,47 @@ impl Storage {
         Ok(events)
     }
 
+    /// Read up to `n` events whose sequence is strictly less than `before`,
+    /// returning them in chronological order. The scan starts at the file
+    /// tail, so paging just above the live tail touches only nearby history
+    /// instead of walking a multi-GB transcript from its beginning.
+    pub fn read_transcript_before(
+        &self,
+        id: &str,
+        before: u64,
+        n: usize,
+    ) -> Result<Vec<TimestampedEvent>> {
+        if before == 0 || n == 0 {
+            return Ok(Vec::new());
+        }
+        let path = self.transcript_path(id);
+        let Some(mut reader) = BackwardLineReader::open(&path, u64::MAX)? else {
+            return Ok(Vec::new());
+        };
+        let mut events = Vec::with_capacity(n);
+        while let Some(line) = reader.next_line()? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: TimestampedEvent = match serde_json::from_str(&line) {
+                Ok(event) => event,
+                Err(error) => {
+                    tracing::warn!(%id, %error, "skip bad transcript line");
+                    continue;
+                }
+            };
+            if event.seq >= before {
+                continue;
+            }
+            events.push(event);
+            if events.len() >= n {
+                break;
+            }
+        }
+        events.reverse();
+        Ok(events)
+    }
+
     /// Substring search across session name/metadata, stored `program.md`
     /// contents, and transcript history (spec 0076). The file-scanning core
     /// of `session.search`: `SessionManager::search` is a thin async
@@ -1953,6 +1994,37 @@ mod transcript_tail_tests {
         let tail = storage.read_transcript_tail("s1", 0).unwrap();
 
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn before_returns_adjacent_older_page_in_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        for seq in 1..=1000 {
+            storage.append_event("s1", &make_event(seq)).unwrap();
+        }
+
+        let page = storage.read_transcript_before("s1", 501, 100).unwrap();
+
+        assert_eq!(page.len(), 100);
+        assert_eq!(page.first().unwrap().seq, 401);
+        assert_eq!(page.last().unwrap().seq, 500);
+    }
+
+    #[test]
+    fn before_stops_cleanly_at_transcript_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::new(tmp.path().join("data")).unwrap();
+        for seq in 1..=7 {
+            storage.append_event("s1", &make_event(seq)).unwrap();
+        }
+
+        let page = storage.read_transcript_before("s1", 4, 100).unwrap();
+
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 }
 

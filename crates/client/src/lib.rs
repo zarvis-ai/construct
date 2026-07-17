@@ -1162,6 +1162,7 @@ impl Client {
                 session_id: id.to_string(),
                 from,
                 limit,
+                before: None,
                 tail: None,
             },
         )
@@ -1176,6 +1177,7 @@ impl Client {
                 session_id: id.to_string(),
                 from: 0,
                 limit: None,
+                before: None,
                 tail: Some(n),
             },
         )

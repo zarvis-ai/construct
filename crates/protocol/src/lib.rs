@@ -2462,10 +2462,15 @@ pub struct TranscriptParams {
     pub from: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
+    /// Return up to `limit` events immediately before this sequence number.
+    /// Results remain chronological. When set, `from` is ignored. This lets
+    /// readers page upward from a recent tail without scanning or rendering
+    /// the transcript from its beginning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<u64>,
     /// Return the most-recent `tail` events instead of paginating forward
-    /// from `from`. When set, `from` and `limit` are ignored. Used by the
-    /// webui to render the live tail of long histories immediately while it
-    /// background-loads older pages.
+    /// from `from`. When set, `from`, `before`, and `limit` are ignored. Used
+    /// by the webui to render the live tail of long histories immediately.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tail: Option<usize>,
 }

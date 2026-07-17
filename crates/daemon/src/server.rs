@@ -1556,7 +1556,7 @@ async fn dispatch(
     dispatch_entry!(ipc_method::SESSION_TRANSCRIPT, {
         let p = params!(req, TranscriptParams);
         match manager
-            .transcript(&p.session_id, p.from, p.limit, p.tail)
+            .transcript(&p.session_id, p.from, p.limit, p.before, p.tail)
             .await
         {
             Ok(r) => ok!(req, &r),

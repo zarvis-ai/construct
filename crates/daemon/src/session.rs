@@ -2203,6 +2203,7 @@ impl SessionManager {
         id: &str,
         from: u64,
         limit: Option<usize>,
+        before: Option<u64>,
         tail: Option<usize>,
     ) -> Result<TranscriptResult> {
         let entry = self
@@ -2214,6 +2215,13 @@ impl SessionManager {
             // scan) and read only the last `n` events from disk.
             let total = entry.transcript_count.load(Ordering::Relaxed);
             let events = self.storage.read_transcript_tail(id, n)?;
+            return Ok(TranscriptResult { events, total });
+        }
+        if let Some(before) = before {
+            let total = entry.transcript_count.load(Ordering::Relaxed);
+            let events = self
+                .storage
+                .read_transcript_before(id, before, limit.unwrap_or(500))?;
             return Ok(TranscriptResult { events, total });
         }
         self.storage.read_transcript(id, from, limit)
@@ -8196,7 +8204,7 @@ mod tests {
         }
 
         let result = mgr
-            .transcript(id, 0, None, Some(50))
+            .transcript(id, 0, None, None, Some(50))
             .await
             .expect("transcript tail");
 
