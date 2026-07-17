@@ -10882,40 +10882,11 @@ fn render_program_attachment_images(
                 rect
             }
         };
-        // Resize handle marker, centered on the image's bottom edge. Shown
-        // on hover in terminals that report mouse motion; always shown in
-        // terminals that don't (macOS Terminal.app never sends motion, so a
-        // hover-gated cue would simply never appear there). The grab zone
-        // is the marker's row plus the row below, so the drag doesn't
-        // demand single-row aim.
+        // The grab zone spans the image's bottom-edge row plus the row
+        // below, so the resize drag doesn't demand single-row aim. The only
+        // visual affordance is the shared ↕ arrow cursor (paints on hover in
+        // motion-reporting terminals, and at press/drag time everywhere).
         let handle_row = draw.y + draw.height.saturating_sub(1);
-        let hovering = app.mouse_pos.is_some_and(|(mx, my)| {
-            mx >= draw.x
-                && mx < draw.x + draw.width
-                && my >= draw.y
-                && my <= handle_row.saturating_add(1)
-        });
-        let show_marker = !app.mouse_motion_seen || hovering;
-        let marker = " ─ ↕ ─ ";
-        let marker_w = UnicodeWidthStr::width(marker) as u16;
-        if show_marker && draw.width > marker_w {
-            let marker_rect = Rect {
-                x: draw.x + (draw.width - marker_w) / 2,
-                y: handle_row,
-                width: marker_w,
-                height: 1,
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    marker,
-                    Style::default()
-                        .fg(app.theme.text)
-                        .bg(app.theme.inactive_highlight_bg)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                marker_rect.intersection(f.area()),
-            );
-        }
         if active {
             let zone = Rect {
                 x: draw.x,

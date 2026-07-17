@@ -1527,11 +1527,6 @@ pub struct App {
     /// Terminal.app, which ignores `\x1b[?1003h` even though crossterm
     /// requests it).
     pub mouse_pos: Option<(u16, u16)>,
-    /// True once any `MouseEventKind::Moved` has arrived — i.e. this
-    /// terminal DOES forward motion events. Hover-gated affordances (the
-    /// inline-image resize handle) fall back to always-visible while this
-    /// is false, since hover can never trigger there.
-    pub mouse_motion_seen: bool,
     /// When `mouse_pos` last actually changed to a new cell — a genuine
     /// pointer move, as opposed to the content under a stationary pointer
     /// changing (e.g. a click starting a program Run shimmer at the same
@@ -3827,7 +3822,6 @@ async fn run_with_socket_initial_selection(
         session_title_menu: None,
         session_title_rename: None,
         mouse_pos: None,
-        mouse_motion_seen: false,
         mouse_moved_at: None,
         mouse_capture_enabled: true,
         last_program_clip_click: None,
@@ -8231,9 +8225,6 @@ impl App {
             self.mouse_moved_at = Some(Instant::now());
         }
         self.mouse_pos = Some(next_pos);
-        if matches!(ev.kind, MouseEventKind::Moved) {
-            self.mouse_motion_seen = true;
-        }
         if self.help_dismiss_mouse_button.is_some_and(
             |button| matches!(ev.kind, MouseEventKind::Up(released) if released == button),
         ) {
@@ -12992,8 +12983,7 @@ mod tests {
             session_title_menu: None,
             session_title_rename: None,
             mouse_pos: None,
-            mouse_motion_seen: false,
-            mouse_moved_at: None,
+                mouse_moved_at: None,
             mouse_capture_enabled: true,
             last_program_clip_click: None,
             orchestrator_id: None,
@@ -14727,50 +14717,11 @@ mod tests {
         }
         assert!(!chip_label, "expanded chip must paint nothing");
         assert!(
-            handle_marker,
-            "without motion reporting the resize handle always paints \
-             (macOS Terminal.app can never hover)"
+            !handle_marker,
+            "no bottom-edge marker: the shared ↕ arrow cursor (press/drag, \
+             or hover where the terminal reports motion) is the only resize \
+             affordance"
         );
-
-        // In a motion-reporting terminal the marker is hover-gated: hidden
-        // with the pointer elsewhere, shown when it hovers the image.
-        app.mouse_motion_seen = true;
-        app.mouse_pos = Some((0, 39));
-        let backend = ratatui::backend::TestBackend::new(100, 40);
-        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| crate::ui::render(f, &mut app))
-            .expect("draw");
-        let buffer = terminal.backend().buffer().clone();
-        let away = (0..40u16).any(|y| {
-            (0..100u16)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-                .contains("─ ↕ ─")
-        });
-        assert!(!away, "marker hides while the pointer is elsewhere");
-        let (rect, _, _) = app
-            .layout
-            .program_attachment_image_rects
-            .first()
-            .cloned()
-            .expect("image rect");
-        app.mouse_pos = Some((rect.x + 1, rect.y));
-        let backend = ratatui::backend::TestBackend::new(100, 40);
-        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
-        terminal
-            .draw(|f| crate::ui::render(f, &mut app))
-            .expect("draw");
-        let buffer = terminal.backend().buffer().clone();
-        let hovered = (0..40u16).any(|y| {
-            (0..100u16)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-                .contains("─ ↕ ─")
-        });
-        assert!(hovered, "marker shows while the pointer hovers the image");
-        app.mouse_motion_seen = false;
-        app.mouse_pos = None;
         assert!(
             app.layout.program_attachment_hits.is_empty(),
             "no chip hitbox while expanded"
