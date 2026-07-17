@@ -229,6 +229,22 @@ pub struct SessionAttachClipboardResult {
     pub reference: String,
 }
 
+/// Read one file back from a session's attachments directory (spec 0099:
+/// web-client attachment previews). Only bare filenames are accepted — the
+/// method can never read outside the attachments dir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReadAttachmentParams {
+    pub session_id: String,
+    pub filename: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReadAttachmentResult {
+    /// Base64-encoded file bytes.
+    pub data: String,
+    pub mime: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEmitEventParams {
     pub session_id: String,
@@ -903,6 +919,7 @@ pub mod ipc_method {
     pub const SESSION_GET: &str = "session.get";
     pub const SESSION_INPUT: &str = "session.input";
     pub const SESSION_ATTACH_CLIPBOARD: &str = "session.attach_clipboard";
+    pub const SESSION_READ_ATTACHMENT: &str = "session.read_attachment";
     pub const SESSION_PTY_INPUT: &str = "session.pty_input";
     pub const SESSION_PTY_RESIZE: &str = "session.pty_resize";
     pub const SESSION_PTY_REPLAY: &str = "session.pty_replay";

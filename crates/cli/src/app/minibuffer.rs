@@ -112,17 +112,19 @@ impl App {
         // single-key dispatch pattern. The explicit `y` is the security
         // boundary gating the bridge's read of the local file.
         let upload_intent = match self.minibuffer.as_ref().map(|m| &m.intent) {
-            Some(MinibufferIntent::ConfirmLocalFileUpload { session_id, path }) => {
-                Some((session_id.clone(), path.clone()))
-            }
+            Some(MinibufferIntent::ConfirmLocalFileUpload {
+                session_id,
+                path,
+                to_program,
+            }) => Some((session_id.clone(), path.clone(), *to_program)),
             _ => None,
         };
-        if let Some((session_id, path)) = upload_intent {
+        if let Some((session_id, path, to_program)) = upload_intent {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                     self.minibuffer = None;
-                    self.upload_local_file(session_id, path).await;
+                    self.upload_local_file(session_id, path, to_program).await;
                 }
                 KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                     self.minibuffer = None;
@@ -658,14 +660,18 @@ impl App {
                 }
                 self.start_upgrade(version);
             }
-            MinibufferIntent::ConfirmLocalFileUpload { session_id, path } => {
+            MinibufferIntent::ConfirmLocalFileUpload {
+                session_id,
+                path,
+                to_program,
+            } => {
                 // Defensive fallback, same as `RestartDaemonConfirm` above.
                 let yes = matches!(input.trim().to_lowercase().as_str(), "y" | "yes");
                 if !yes {
                     self.set_status("upload cancelled".to_string());
                     return;
                 }
-                self.upload_local_file(session_id, path).await;
+                self.upload_local_file(session_id, path, to_program).await;
             }
             MinibufferIntent::CommandPalette => {
                 let cmd = input.trim();

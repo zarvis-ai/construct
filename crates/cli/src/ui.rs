@@ -10682,6 +10682,8 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_resize_hit = None;
     app.layout.program_smart_clip_anchor = None;
     app.layout.program_clip_hits.clear();
+    app.layout.program_attachment_hits.clear();
+    app.layout.program_attachment_image_rects.clear();
     app.layout.program_pinned_card_rect = None;
     app.layout.program_action_link_hits.clear();
     if app
@@ -10763,6 +10765,229 @@ fn render_program_hover_overlays(
             &overlay.clip_hits,
             now,
         );
+    }
+    render_program_attachment_hover(f, app);
+}
+
+/// Decoded RGBA for a program attachment image, memoized by path + mtime so
+/// an overwritten file re-decodes and a broken/huge one isn't re-read every
+/// frame. Files above the cap are treated as undecodable.
+fn program_attachment_decoded(
+    app: &mut App,
+    path: &str,
+) -> Option<std::sync::Arc<image::RgbaImage>> {
+    const MAX_DECODE_BYTES: u64 = 64 * 1024 * 1024;
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+    if let Some((cached_mtime, img)) = app.attachment_images.get(path) {
+        if *cached_mtime == mtime {
+            return img.clone();
+        }
+    }
+    let decoded = (meta.len() <= MAX_DECODE_BYTES)
+        .then(|| std::fs::read(path).ok())
+        .flatten()
+        .and_then(|bytes| image::load_from_memory(&bytes).ok())
+        .map(|img| std::sync::Arc::new(img.to_rgba8()));
+    app.attachment_images
+        .insert(path.to_string(), (mtime, decoded.clone()));
+    decoded
+}
+
+/// Blit expanded inline attachment images (spec 0099) over the blank rows
+/// their padding reserved, and register their on-screen rects (active
+/// program only) for click-to-collapse and bottom-edge drag-resize.
+fn render_program_attachment_images(
+    f: &mut Frame,
+    app: &mut App,
+    popup: &crate::app::ProgramPopup,
+    scroll_offset: usize,
+    inner: Rect,
+    active: bool,
+) {
+    if app
+        .program_popup
+        .as_ref()
+        .is_none_or(|p| p.expanded_attachments.is_empty())
+        || inner.width == 0
+        || inner.height == 0
+    {
+        return;
+    }
+    let width = inner.width as usize;
+    let viewport_end = scroll_offset.saturating_add(inner.height as usize);
+    // Locate blocks with an immutable pass over the transform, then paint
+    // with the mutable decode/resize caches.
+    let mut blocks: Vec<(String, usize, u16)> = Vec::new();
+    let mut row_base = 0usize;
+    for raw in popup.buffer.lines() {
+        if row_base >= viewport_end {
+            break;
+        }
+        let rendered = program_rendered_line_text(Some(app), raw, width);
+        let rows = program_wrap_row_starts(&rendered, width).len().max(1);
+        if let Some((path, img_rows)) = program_expanded_attachment(Some(app), raw) {
+            // Row 0 keeps the chip; the image starts on the next row.
+            blocks.push((path, row_base + 1, img_rows));
+        }
+        row_base = row_base.saturating_add(rows);
+    }
+    for (path, first_abs, img_rows) in blocks {
+        let last_abs = first_abs + img_rows.max(1) as usize - 1;
+        if last_abs < scroll_offset || first_abs >= viewport_end {
+            continue;
+        }
+        let vis_first = first_abs.max(scroll_offset);
+        let vis_last = last_abs.min(viewport_end.saturating_sub(1));
+        let rect = Rect {
+            x: inner.x,
+            y: inner.y + (vis_first - scroll_offset) as u16,
+            width: inner.width,
+            height: (vis_last + 1 - vis_first) as u16,
+        };
+        match program_attachment_decoded(app, &path) {
+            Some(img) => {
+                let (ow, oh) = blit_scale_dims(img.dimensions(), rect, false);
+                let resized = resized_image(&mut app.image_resize_cache, &img, ow * 2, oh);
+                paint_resized_quadrants(f, rect, &resized, 1.0, (0.0, 1.0));
+            }
+            None => {
+                f.render_widget(
+                    Paragraph::new(format!("cannot preview {path}"))
+                        .style(Style::default().fg(app.theme.danger)),
+                    rect,
+                );
+            }
+        }
+        if active {
+            app.layout
+                .program_attachment_image_rects
+                .push((rect, path));
+        }
+    }
+}
+
+/// Info card shown while the mouse hovers an attachment chip (spec 0099):
+/// filename, path, and size · type — or a missing-file note when the path no
+/// longer resolves. Image attachments add a half-block preview under the
+/// info lines. Anchored above the chip (below when there's no room).
+fn render_program_attachment_hover(f: &mut Frame, app: &mut App) {
+    let Some((mx, my)) = app.mouse_pos else {
+        return;
+    };
+    let Some(hit) = app
+        .layout
+        .program_attachment_hits
+        .iter()
+        .find(|h| h.contains(mx, my))
+        .cloned()
+    else {
+        return;
+    };
+    let preview = if hit.is_image {
+        program_attachment_decoded(app, &hit.path)
+    } else {
+        None
+    };
+    let detail = match std::fs::metadata(&hit.path) {
+        Ok(meta) => format!(
+            "{} · {}",
+            program_attachment_size_label(meta.len()),
+            crate::clipboard_bridge::mime_for_path(std::path::Path::new(&hit.path)),
+        ),
+        Err(_) => "missing file".to_string(),
+    };
+    let name = if hit.name.trim().is_empty() {
+        "attachment"
+    } else {
+        hit.name.trim()
+    };
+    let total = f.area();
+    let max_inner = total.width.saturating_sub(4) as usize;
+    let mut lines: Vec<String> = vec![name.to_string(), hit.path.clone(), detail];
+    for line in &mut lines {
+        if UnicodeWidthStr::width(line.as_str()) > max_inner {
+            let truncated: String = line.chars().take(max_inner.saturating_sub(1)).collect();
+            *line = format!("{truncated}…");
+        }
+    }
+    let inner_w = lines
+        .iter()
+        .map(|l| UnicodeWidthStr::width(l.as_str()))
+        .max()
+        .unwrap_or(0) as u16;
+    // Image previews get a fixed strip under the info lines, sized to a
+    // modest thumbnail; the card never exceeds half the screen height.
+    let preview_rows: u16 = match &preview {
+        Some(_) => 10u16.min(total.height / 2),
+        None => 0,
+    };
+    let w = (inner_w + 4)
+        .max(if preview.is_some() { 44 } else { 0 })
+        .min(total.width);
+    let h = (lines.len() as u16) + 2 + preview_rows;
+    let mut x = mx.min(total.x + total.width.saturating_sub(w));
+    x = x.max(total.x);
+    // Prefer above the chip; fall below when the chip sits near the top.
+    let y = if hit.row >= total.y + h {
+        hit.row - h
+    } else {
+        (hit.row + 1).min(total.y + total.height.saturating_sub(h))
+    };
+    let rect = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border_focused))
+        .padding(ratatui::widgets::Padding::new(1, 1, 0, 0));
+    let content = block.inner(rect);
+    let text: Vec<Line> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let style = if i == 0 {
+                Style::default()
+                    .fg(app.theme.text)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(app.theme.dim)
+            };
+            Line::from(Span::styled(l.clone(), style))
+        })
+        .collect();
+    let info_rows = text.len() as u16;
+    f.render_widget(Paragraph::new(text).block(block), rect);
+    if let Some(img) = preview {
+        let image_area = Rect {
+            x: content.x,
+            y: content.y + info_rows,
+            width: content.width,
+            height: content.height.saturating_sub(info_rows),
+        };
+        if image_area.height > 0 {
+            let (ow, oh) = blit_scale_dims(img.dimensions(), image_area, false);
+            let resized = resized_image(&mut app.image_resize_cache, &img, ow * 2, oh);
+            paint_resized_quadrants(f, image_area, &resized, 1.0, (0.0, 1.0));
+        }
+    }
+}
+
+/// `1023 B` / `4 KiB` / `2.3 MiB` — compact size label for the attachment
+/// hover card.
+fn program_attachment_size_label(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{} KiB", bytes.div_ceil(1024))
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
     }
 }
 
@@ -11599,6 +11824,7 @@ fn render_program_popup_at(
     let mut lines = render_program_markdown_lines(
         app,
         &popup.buffer,
+        inner.width as usize,
         selection,
         search_matches,
         search_selected,
@@ -11717,7 +11943,12 @@ fn render_program_popup_at(
     if active {
         app.layout.program_clip_hits = clip_hits.clone();
         app.layout.program_action_link_hits = action_link_hits;
+        // Attachment chips register hover/click hitboxes only for the active
+        // program, like the click hitboxes above.
+        app.layout.program_attachment_hits =
+            program_attachment_chip_hits(Some(app), &popup.buffer, scroll_offset, inner);
     }
+    render_program_attachment_images(f, app, popup, scroll_offset, inner, active);
     if active && !popup.closing {
         if let Some(pos) =
             program_cursor_position(Some(app), &popup.buffer, popup.cursor, scroll_offset, inner)
@@ -12552,7 +12783,7 @@ fn program_block_visual_rows(
         if i >= end_line {
             break;
         }
-        let (rendered, _clips) = program_rendered_line_with_clips(app, raw);
+        let (rendered, _clips) = program_rendered_line_with_clips(app, raw, width);
         let rows = program_wrap_row_starts(&rendered, width).len().max(1);
         if i >= start_line {
             first.get_or_insert(visual_row_base);
@@ -12587,7 +12818,7 @@ fn program_shimmer_block_at(
     let mut visual_row_base = 0usize;
     let mut source_line = None;
     for (i, raw) in markdown.lines().enumerate() {
-        let (rendered, _clips) = program_rendered_line_with_clips(app, raw);
+        let (rendered, _clips) = program_rendered_line_with_clips(app, raw, width);
         let rows = program_wrap_row_starts(&rendered, width).len();
         let next_base = visual_row_base.saturating_add(rows);
         if target_abs_row >= visual_row_base && target_abs_row < next_base {
@@ -14024,13 +14255,13 @@ pub(crate) fn program_cursor_visual_pos(
     // drifts the moment a line wraps mid-word and compounds for lines below.
     let mut visual_row = 0usize;
     for raw in markdown.lines().take(line) {
-        let text = program_rendered_line_text(app, raw);
+        let text = program_rendered_line_text(app, raw, width);
         visual_row = visual_row.saturating_add(program_wrap_row_starts(&text, width).len());
     }
 
     let cur_raw = markdown.lines().nth(line).unwrap_or("");
     let visual_col = program_visual_col_for_line(app, cur_raw, col);
-    let starts = program_wrap_row_starts(&program_rendered_line_text(app, cur_raw), width);
+    let starts = program_wrap_row_starts(&program_rendered_line_text(app, cur_raw, width), width);
     let (row_in_line, col_in_row) = program_wrap_locate(&starts, visual_col, width);
     let visual_row = visual_row.saturating_add(row_in_line);
     (visual_row, col_in_row)
@@ -14109,7 +14340,7 @@ pub(crate) fn program_visual_to_cursor(
     let mut line_start = 0usize; // char offset of the current line's first char
     let mut owner: Option<(usize, Vec<usize>, &str, usize)> = None;
     for raw in markdown.split('\n') {
-        let rendered = program_rendered_line_text(app, raw);
+        let rendered = program_rendered_line_text(app, raw, width);
         let starts = program_wrap_row_starts(&rendered, width);
         let row_count = starts.len();
         if target_row < rows_before + row_count {
@@ -14408,8 +14639,19 @@ fn program_heading_content(raw: &str) -> Option<(usize, &str)> {
 /// heading markers (painted literally, chips included), the `  • ` list
 /// prefix, the fixed chip text of `:::clip` / `:::` fence lines, and expanded
 /// smart-clip chips — so the cursor's wrap math sees exactly the glyphs (and
-/// their spaces) ratatui wraps.
-fn program_rendered_line_text(app: Option<&App>, raw: &str) -> String {
+/// their spaces) ratatui wraps. `width` is the wrap width, consulted only to
+/// pad expanded inline attachment images (spec 0099) to their block height;
+/// pass 0 from callers that only measure intra-line prefixes.
+fn program_rendered_line_text(app: Option<&App>, raw: &str, width: usize) -> String {
+    let mut out = program_rendered_line_text_unpadded(app, raw);
+    if let Some((_, rows)) = program_expanded_attachment(app, raw) {
+        let pad = program_attachment_pad(&out, width, rows);
+        out.push_str(&pad);
+    }
+    out
+}
+
+fn program_rendered_line_text_unpadded(app: Option<&App>, raw: &str) -> String {
     let trimmed = raw.trim();
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     if trimmed.is_empty() {
@@ -14446,38 +14688,199 @@ fn program_rendered_line_text(app: Option<&App>, raw: &str) -> String {
     }
 }
 
-/// Expand inline smart-clip chips (`@{…}`) in `text` to the ` label ` form the
-/// renderer paints, leaving the surrounding text untouched. The label comes
-/// from the same source as [`program_smart_clip_visual_width`], so the rendered
-/// text and the cursor column stay width-consistent.
+/// A local-file Markdown link found in program text: `![name](path)` for
+/// images, `[name](path)` for other files. Only local paths — absolute, `~/`,
+/// or either wrapped in `<…>` — are recognized (spec 0099); `http(s)` URLs,
+/// `agentd:action/…` links, and anything else stay literal text.
+pub(crate) struct ProgramMdLink<'a> {
+    /// Byte range of the whole link source within the scanned text.
+    pub start: usize,
+    pub end: usize,
+    pub name: &'a str,
+    /// Target path, with any `<…>` wrapping stripped.
+    pub path: &'a str,
+    pub is_image: bool,
+}
+
+pub(crate) fn find_program_md_link(text: &str) -> Option<ProgramMdLink<'_>> {
+    let bytes = text.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = text.get(from..).and_then(|t| t.find('[')) {
+        let bracket = from + rel;
+        from = bracket + 1;
+        let is_image = bracket > 0 && bytes[bracket - 1] == b'!';
+        let start = if is_image { bracket - 1 } else { bracket };
+        let name_start = bracket + 1;
+        let Some(name_len) = text[name_start..].find(']') else {
+            return None;
+        };
+        let name = &text[name_start..name_start + name_len];
+        let after = name_start + name_len + 1;
+        if name.len() > 120 || name.contains('\n') || name.contains('[') {
+            continue;
+        }
+        if !text[after..].starts_with('(') {
+            continue;
+        }
+        let target_start = after + 1;
+        let Some(target_len) = text[target_start..].find(')') else {
+            continue;
+        };
+        let target = &text[target_start..target_start + target_len];
+        if target.len() > 512 || target.contains('\n') {
+            continue;
+        }
+        // Markdown wraps targets containing spaces in angle brackets;
+        // accept both forms and report the bare path.
+        let path = target
+            .strip_prefix('<')
+            .and_then(|t| t.strip_suffix('>'))
+            .unwrap_or(target);
+        if !(path.starts_with('/') || path.starts_with("~/")) {
+            continue;
+        }
+        return Some(ProgramMdLink {
+            start,
+            end: target_start + target_len + 1,
+            name,
+            path,
+            is_image,
+        });
+    }
+    None
+}
+
+/// Chip label for an attachment link: kind + (truncated) name, so the chip
+/// stays informative without needing document-wide numbering.
+pub(crate) fn program_md_link_label(name: &str, is_image: bool) -> String {
+    let name = name.trim();
+    let name = if name.is_empty() { "attachment" } else { name };
+    let shown: String = name.chars().take(24).collect();
+    let ellipsis = if name.chars().count() > 24 { "…" } else { "" };
+    let kind = if is_image { "Image" } else { "File" };
+    format!("{kind}: {shown}{ellipsis}")
+}
+
+/// Default and bounds for an expanded inline attachment image's height, in
+/// body rows (spec 0099). Client-local; drag-resize adjusts within bounds.
+pub(crate) const PROGRAM_ATTACHMENT_DEFAULT_ROWS: u16 = 12;
+pub(crate) const PROGRAM_ATTACHMENT_MIN_ROWS: u16 = 3;
+pub(crate) const PROGRAM_ATTACHMENT_MAX_ROWS: u16 = 40;
+
+/// Expanded inline image state for a source line (spec 0099): when `raw` is a
+/// standalone image link whose path the active program popup has expanded,
+/// returns (path, image rows). The line then renders as its chip row plus
+/// that many image rows — produced by padding the rendered text (see
+/// [`program_attachment_pad`]) so every wrap-math consumer counts the same
+/// height without bespoke cases.
+fn program_expanded_attachment(app: Option<&App>, raw: &str) -> Option<(String, u16)> {
+    let popup = app?.program_popup.as_ref()?;
+    if popup.expanded_attachments.is_empty() {
+        return None;
+    }
+    let trimmed = raw.trim();
+    let link = find_program_md_link(trimmed)?;
+    if !link.is_image || link.start != 0 || link.end != trimmed.len() {
+        return None;
+    }
+    let rows = *popup.expanded_attachments.get(link.path)?;
+    Some((link.path.to_string(), rows))
+}
+
+/// Padding that stretches a rendered line by exactly `rows` extra wrapped
+/// rows at `width` columns (the chip keeps its own row; the image blits over
+/// the padded rows). Each padding unit is one space followed by a
+/// braille-blank (U+2800) run of `width - 1` cells: the space is break
+/// whitespace, and the run — one cell too wide to share any row that
+/// already has content, one cell too narrow to overflow its own — lands on
+/// a row of its own. Braille blank is NOT `char::is_whitespace`, so both
+/// the wrap math and ratatui treat the run as an ordinary word and paint it
+/// as a blank glyph. `rendered` itself is assumed to fit its row (the
+/// popup's 40-cell minimum keeps chip labels comfortably inside).
+fn program_attachment_pad(_rendered: &str, width: usize, rows: u16) -> String {
+    if width < 2 {
+        return String::new();
+    }
+    let unit = format!(" {}", "\u{2800}".repeat(width - 1));
+    unit.repeat(rows as usize)
+}
+
+/// The next inline token — smart clip or attachment link — in `text`, with
+/// its byte offset. The shared scanner keeps the rendered-text, hit-testing,
+/// and painting passes tokenizing identically.
+enum ProgramInlineToken<'a> {
+    /// `@{…}`: the clip body and the full source length in bytes.
+    Clip { raw: &'a str, src_len: usize },
+    Link(ProgramMdLink<'a>),
+}
+
+fn next_program_inline_token(text: &str) -> Option<(usize, ProgramInlineToken<'_>)> {
+    let clip = text.find("@{").and_then(|start| {
+        text[start + 2..].find('}').map(|end| {
+            let raw = &text[start + 2..start + 2 + end];
+            (
+                start,
+                ProgramInlineToken::Clip {
+                    raw,
+                    src_len: end + 3,
+                },
+            )
+        })
+    });
+    let link = find_program_md_link(text).map(|l| (l.start, ProgramInlineToken::Link(l)));
+    match (clip, link) {
+        (Some(c), Some(l)) => Some(if c.0 <= l.0 { c } else { l }),
+        (c, l) => c.or(l),
+    }
+}
+
+/// Expand inline smart-clip chips (`@{…}`) and attachment links (`![…](…)`,
+/// spec 0099) in `text` to the ` label ` form the renderer paints, leaving
+/// the surrounding text untouched. The labels come from the same source as
+/// the painting pass, so the rendered text and the cursor column stay
+/// width-consistent.
 fn program_inline_rendered_text(app: Option<&App>, text: &str) -> String {
     let mut out = String::new();
     let mut rest = text;
-    while let Some(start) = rest.find("@{") {
+    while let Some((start, token)) = next_program_inline_token(rest) {
         out.push_str(&rest[..start]);
-        let after_marker = &rest[start + 2..];
-        let Some(end) = after_marker.find('}') else {
-            out.push_str(&rest[start..]);
-            return out;
+        let (label, src_len) = match token {
+            ProgramInlineToken::Clip { raw, src_len } => {
+                let (_, label) = program_smart_clip_label(app, raw);
+                (label, src_len)
+            }
+            ProgramInlineToken::Link(link) => (
+                program_md_link_label(link.name, link.is_image),
+                link.end - link.start,
+            ),
         };
-        let raw_clip = &after_marker[..end];
-        let (_, label) = program_smart_clip_label(app, raw_clip);
         out.push(' ');
         out.push_str(&label);
         out.push(' ');
-        rest = &after_marker[end + 1..];
+        rest = &rest[start + src_len..];
     }
     out.push_str(rest);
     out
 }
 
-/// One smart-clip located within a rendered program line: its display-column
+/// One inline chip located within a rendered program line: its display-column
 /// `visual_start` (counting collapsed break-whitespace, before word-wrap), its
-/// `visual_width`, and the raw clip body so the kind/id can be resolved.
+/// `visual_width`, and what it stands for.
 struct LineClip {
     visual_start: usize,
     visual_width: usize,
-    raw_clip: String,
+    kind: LineClipKind,
+}
+
+enum LineClipKind {
+    /// `@{…}` smart clip: the raw clip body, so kind/id can be resolved.
+    Smart(String),
+    /// Attachment link chip (spec 0099).
+    Attachment {
+        name: String,
+        path: String,
+        is_image: bool,
+    },
 }
 
 /// Like [`program_inline_rendered_text`] but also reports each smart-clip's
@@ -14495,28 +14898,38 @@ fn program_inline_with_clips(
     let mut clips = Vec::new();
     let mut visual = base;
     let mut rest = text;
-    while let Some(start) = rest.find("@{") {
+    while let Some((start, token)) = next_program_inline_token(rest) {
         let before = &rest[..start];
         out.push_str(before);
         visual += UnicodeWidthStr::width(before);
-        let after_marker = &rest[start + 2..];
-        let Some(end) = after_marker.find('}') else {
-            out.push_str(&rest[start..]);
-            return (out, clips);
+        let (label, kind, src_len) = match token {
+            ProgramInlineToken::Clip { raw, src_len } => {
+                let (_, label) = program_smart_clip_label(app, raw);
+                (label, LineClipKind::Smart(raw.to_string()), src_len)
+            }
+            ProgramInlineToken::Link(link) => (
+                program_md_link_label(link.name, link.is_image),
+                LineClipKind::Attachment {
+                    name: link.name.to_string(),
+                    path: link.path.to_string(),
+                    is_image: link.is_image,
+                },
+                link.end - link.start,
+            ),
         };
-        let raw_clip = &after_marker[..end];
-        let width = program_smart_clip_visual_width(app, raw_clip);
-        let (_, label) = program_smart_clip_label(app, raw_clip);
+        // Chip visual width = padded label width, matching the ` label `
+        // form pushed below and `program_inline_rendered_text`.
+        let width = UnicodeWidthStr::width(label.as_str()) + 2;
         clips.push(LineClip {
             visual_start: visual,
             visual_width: width,
-            raw_clip: raw_clip.to_string(),
+            kind,
         });
         out.push(' ');
         out.push_str(&label);
         out.push(' ');
         visual += width;
-        rest = &after_marker[end + 1..];
+        rest = &rest[start + src_len..];
     }
     out.push_str(rest);
     (out, clips)
@@ -14526,10 +14939,14 @@ fn program_inline_with_clips(
 /// [`program_rendered_line_text`]) paired with the display-column spans of every
 /// smart-clip in it. Computing both from one pass keeps the clip offsets and the
 /// wrapped text perfectly consistent for hit-testing.
-fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Vec<LineClip>) {
+fn program_rendered_line_with_clips(
+    app: Option<&App>,
+    raw: &str,
+    width: usize,
+) -> (String, Vec<LineClip>) {
     let trimmed = raw.trim();
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
-    if trimmed.is_empty() {
+    let (mut text, clips) = if trimmed.is_empty() {
         (String::new(), Vec::new())
     } else if program_heading_content(raw).is_some()
         || trimmed.starts_with(":::clip")
@@ -14538,7 +14955,7 @@ fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Ve
         // Headings paint their source literally (no chip expansion) and clip
         // fence lines paint fixed chip text — neither carries clickable clip
         // spans, so both report the rendered text with no clips.
-        (program_rendered_line_text(app, raw), Vec::new())
+        (program_rendered_line_text_unpadded(app, raw), Vec::new())
     } else if let Some((_, rest)) = program_list_item_content(raw) {
         let (body, clips) = program_inline_with_clips(app, rest, leading + 4);
         (format!("{}  • {body}", " ".repeat(leading)), clips)
@@ -14551,7 +14968,12 @@ fn program_rendered_line_with_clips(app: Option<&App>, raw: &str) -> (String, Ve
         let lead: String = raw.chars().take(leading).collect();
         let (body_text, clips) = program_inline_with_clips(app, body, leading);
         (format!("{lead}{body_text}"), clips)
+    };
+    if let Some((_, rows)) = program_expanded_attachment(app, raw) {
+        let pad = program_attachment_pad(&text, width, rows);
+        text.push_str(&pad);
     }
+    (text, clips)
 }
 
 /// On-screen cell ranges of every session smart-clip in `markdown`, laid out in
@@ -14579,10 +15001,13 @@ pub(crate) fn program_session_clip_hits(
         if visual_row_base >= viewport_end {
             break;
         }
-        let (rendered, clips) = program_rendered_line_with_clips(app, raw);
+        let (rendered, clips) = program_rendered_line_with_clips(app, raw, width);
         let starts = program_wrap_row_starts(&rendered, width);
         for clip in &clips {
-            let (kind, id) = program_smart_clip_target(&clip.raw_clip);
+            let LineClipKind::Smart(raw_clip) = &clip.kind else {
+                continue;
+            };
+            let (kind, id) = program_smart_clip_target(raw_clip);
             if kind != "session" {
                 continue;
             }
@@ -14601,6 +15026,63 @@ pub(crate) fn program_session_clip_hits(
                     col_end,
                     row,
                     session_id: id.to_string(),
+                });
+            }
+        }
+        visual_row_base = visual_row_base.saturating_add(starts.len());
+    }
+    hits
+}
+
+/// On-screen cell ranges of every attachment chip (spec 0099) in `markdown`,
+/// registered through the same wrap-aware geometry as
+/// [`program_session_clip_hits`] so hover resolves correctly under scrolling
+/// and word-wrap.
+pub(crate) fn program_attachment_chip_hits(
+    app: Option<&App>,
+    markdown: &str,
+    scroll_offset: usize,
+    area: Rect,
+) -> Vec<crate::app::ProgramAttachmentHit> {
+    let mut hits = Vec::new();
+    if area.width == 0 || area.height == 0 {
+        return hits;
+    }
+    let width = area.width as usize;
+    let viewport_end = scroll_offset.saturating_add(area.height as usize);
+    let mut visual_row_base = 0usize;
+    for raw in markdown.lines() {
+        if visual_row_base >= viewport_end {
+            break;
+        }
+        let (rendered, clips) = program_rendered_line_with_clips(app, raw, width);
+        let starts = program_wrap_row_starts(&rendered, width);
+        for clip in &clips {
+            let LineClipKind::Attachment {
+                name,
+                path,
+                is_image,
+            } = &clip.kind
+            else {
+                continue;
+            };
+            for (row, col_start, col_end) in program_visual_span_segments(
+                &starts,
+                clip.visual_start,
+                clip.visual_width,
+                width,
+                visual_row_base,
+                scroll_offset,
+                viewport_end,
+                area,
+            ) {
+                hits.push(crate::app::ProgramAttachmentHit {
+                    col_start,
+                    col_end,
+                    row,
+                    name: name.clone(),
+                    path: path.clone(),
+                    is_image: *is_image,
                 });
             }
         }
@@ -14686,7 +15168,7 @@ pub(crate) fn program_action_link_hits(
         if visual_row_base >= viewport_end {
             break;
         }
-        let rendered = program_rendered_line_text(app, raw);
+        let rendered = program_rendered_line_text(app, raw, width);
         let starts = program_wrap_row_starts(&rendered, width);
         for link in scan_agentd_action_links(&rendered) {
             let visual_start = UnicodeWidthStr::width(&rendered[..link.start]);
@@ -14754,7 +15236,7 @@ fn program_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> 
         // 1:1 to the source chars; measure the source column literally and
         // clamp it into the painted width so the caret stays on the line (and
         // end-of-line clicks resolve to the line's last offset).
-        let rendered = program_rendered_line_text(app, raw);
+        let rendered = program_rendered_line_text(app, raw, 0);
         program_prefix_display_width(raw, raw_col)
             .min(UnicodeWidthStr::width(rendered.as_str()))
     } else if let Some((_, rest)) = program_list_item_content(raw) {
@@ -14817,6 +15299,7 @@ fn program_selection_range(popup: &crate::app::ProgramPopup) -> Option<(usize, u
 fn render_program_markdown_lines<'a>(
     app: &App,
     markdown: &'a str,
+    width: usize,
     selection: Option<(usize, usize)>,
     search_matches: Option<&'a [(usize, usize)]>,
     search_selected: Option<usize>,
@@ -14942,7 +15425,7 @@ fn render_program_markdown_lines<'a>(
                 &[],
             )));
         } else {
-            out.push(Line::from(render_program_inline_spans(
+            let mut spans = render_program_inline_spans(
                 app,
                 raw,
                 line_start,
@@ -14951,7 +15434,19 @@ fn render_program_markdown_lines<'a>(
                 search_matches,
                 search_selected,
                 &action_ranges,
-            )));
+            );
+            // Expanded inline attachment (spec 0099): pad the painted line
+            // to the same wrapped height the layout math counts, so the
+            // Paragraph's wrapping keeps subsequent lines aligned; the image
+            // blits over the blank rows afterwards.
+            if let Some((_, rows)) = program_expanded_attachment(Some(app), raw) {
+                let painted: String = spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect();
+                spans.push(Span::raw(program_attachment_pad(&painted, width, rows)));
+            }
+            out.push(Line::from(spans));
         }
         line_start += raw.chars().count() + 1;
     }
@@ -14977,7 +15472,7 @@ pub(crate) fn render_program_markdown_lines_for_test<'a>(
     app: &App,
     markdown: &'a str,
 ) -> Vec<Line<'a>> {
-    render_program_markdown_lines(app, markdown, None, None, None)
+    render_program_markdown_lines(app, markdown, 80, None, None, None)
 }
 
 /// Widget-surface renderer entry point for tests outside this module (the
@@ -15060,8 +15555,8 @@ fn render_program_inline_spans<'a>(
     let mut spans = Vec::new();
     let mut rest = text;
     let mut offset = 0usize;
-    while let Some(start) = rest.find("@{") {
-        let (before, after_start) = rest.split_at(start);
+    while let Some((start, token)) = next_program_inline_token(rest) {
+        let before = &rest[..start];
         if !before.is_empty() {
             spans.extend(program_text_spans(
                 &app.theme,
@@ -15074,40 +15569,41 @@ fn render_program_inline_spans<'a>(
                 action_ranges,
             ));
         }
-        let after_marker = &after_start[2..];
-        let Some(end) = after_marker.find('}') else {
-            spans.extend(program_text_spans(
-                &app.theme,
-                after_start,
-                base + offset + before.chars().count(),
-                base_style,
-                selection,
-                search_matches,
-                search_selected,
-                action_ranges,
-            ));
-            return spans;
-        };
-        let raw_clip = &after_marker[..end];
         let before_chars = before.chars().count();
-        let raw_clip_chars = raw_clip.chars().count();
-        let clip_char_start = base + offset + before_chars;
-        let clip_char_end = clip_char_start + 2 + raw_clip_chars + 1;
-        let clip_match_idx = search_matches.and_then(|matches| {
+        let src_len = match &token {
+            ProgramInlineToken::Clip { src_len, .. } => *src_len,
+            ProgramInlineToken::Link(link) => link.end - link.start,
+        };
+        let src_chars = rest[start..start + src_len].chars().count();
+        let chip_char_start = base + offset + before_chars;
+        let chip_char_end = chip_char_start + src_chars;
+        let chip_match_idx = search_matches.and_then(|matches| {
             matches.iter().enumerate().find_map(|(i, &(ms, me))| {
-                (ms < clip_char_end && me > clip_char_start).then_some(i)
+                (ms < chip_char_end && me > chip_char_start).then_some(i)
             })
         });
-        let clip_is_active_match = clip_match_idx.is_some_and(|idx| search_selected == Some(idx));
-        spans.push(program_smart_clip_span(
-            Some(app),
-            &app.theme,
-            raw_clip,
-            clip_match_idx.is_some(),
-            clip_is_active_match,
-        ));
-        offset += before_chars + 2 + raw_clip_chars + 1;
-        rest = &after_marker[end + 1..];
+        let chip_is_active_match = chip_match_idx.is_some_and(|idx| search_selected == Some(idx));
+        match token {
+            ProgramInlineToken::Clip { raw, .. } => {
+                spans.push(program_smart_clip_span(
+                    Some(app),
+                    &app.theme,
+                    raw,
+                    chip_match_idx.is_some(),
+                    chip_is_active_match,
+                ));
+            }
+            ProgramInlineToken::Link(link) => {
+                spans.push(program_attachment_chip_span(
+                    &app.theme,
+                    &link,
+                    chip_match_idx.is_some(),
+                    chip_is_active_match,
+                ));
+            }
+        }
+        offset += before_chars + src_chars;
+        rest = &rest[start + src_len..];
     }
     if !rest.is_empty() {
         spans.extend(program_text_spans(
@@ -15122,6 +15618,31 @@ fn render_program_inline_spans<'a>(
         ));
     }
     spans
+}
+
+/// Attachment chip painter (spec 0099): the compact `[Image: name]` /
+/// `[File: name]` pill an inline attachment link renders as. Static styling —
+/// liveness/status concepts don't apply to files; the hover card carries the
+/// details.
+fn program_attachment_chip_span(
+    theme: &Theme,
+    link: &ProgramMdLink<'_>,
+    in_match: bool,
+    is_active_match: bool,
+) -> Span<'static> {
+    let label = program_md_link_label(link.name, link.is_image);
+    let bg = if is_active_match || in_match {
+        theme.highlight_bg
+    } else if link.is_image {
+        theme.info
+    } else {
+        theme.inactive_highlight_bg
+    };
+    let style = Style::default()
+        .fg(theme.highlight_fg)
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
+    Span::styled(format!(" {label} "), style)
 }
 
 fn program_text_spans<'a>(
@@ -16417,6 +16938,92 @@ mod remote_popup_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn program_md_link_parses_local_image_and_file_links() {
+        let link = find_program_md_link("see ![shot](/a/b/shot.png) here").expect("image link");
+        assert_eq!(link.name, "shot");
+        assert_eq!(link.path, "/a/b/shot.png");
+        assert!(link.is_image);
+        assert_eq!(&"see ![shot](/a/b/shot.png) here"[link.start..link.end],
+            "![shot](/a/b/shot.png)");
+
+        let link = find_program_md_link("[notes](~/docs/notes.pdf)").expect("file link");
+        assert!(!link.is_image);
+        assert_eq!(link.path, "~/docs/notes.pdf");
+
+        // Angle-bracket targets (paths with spaces) resolve to the bare path.
+        let link =
+            find_program_md_link("![s](</Users/x/App Support/s.png>)").expect("bracketed");
+        assert_eq!(link.path, "/Users/x/App Support/s.png");
+    }
+
+    #[test]
+    fn program_md_link_leaves_non_local_links_literal() {
+        // http(s), agentd action links, empty targets, and plain brackets
+        // must stay literal text (spec 0099).
+        assert!(find_program_md_link("[docs](https://example.com)").is_none());
+        assert!(find_program_md_link("[run](agentd:action/run)").is_none());
+        assert!(find_program_md_link("[not a link] (separate)").is_none());
+        assert!(find_program_md_link("array[0](x)").is_none());
+        // A later valid link after an earlier non-qualifying one still chips.
+        let link = find_program_md_link("[docs](https://x) ![a](/tmp/a.png)").expect("second");
+        assert_eq!(link.path, "/tmp/a.png");
+    }
+
+    #[test]
+    fn program_rendered_text_expands_attachment_links_to_chip_labels() {
+        let rendered =
+            program_inline_rendered_text(None, "before ![shot](/tmp/shot.png) after");
+        assert_eq!(rendered, "before  Image: shot  after");
+
+        let (out, clips) =
+            program_inline_with_clips(None, "x [n](/tmp/n.pdf) y @{session:abc} z", 0);
+        assert_eq!(out, program_inline_rendered_text(None, "x [n](/tmp/n.pdf) y @{session:abc} z"));
+        assert_eq!(clips.len(), 2);
+        let LineClipKind::Attachment { path, is_image, .. } = &clips[0].kind else {
+            panic!("first clip should be the attachment");
+        };
+        assert_eq!(path, "/tmp/n.pdf");
+        assert!(!is_image);
+        assert!(matches!(&clips[1].kind, LineClipKind::Smart(raw) if raw == "session:abc"));
+        // Chip span coordinates: width == padded label width.
+        assert_eq!(clips[0].visual_start, 2);
+        assert_eq!(
+            clips[0].visual_width,
+            UnicodeWidthStr::width(program_md_link_label("n", false).as_str()) + 2
+        );
+    }
+
+    #[test]
+    fn expanded_attachment_padding_yields_exact_row_count() {
+        // Content + padding must wrap to exactly 1 + rows rows — the
+        // invariant every layout consumer relies on (spec 0099) — across
+        // content shapes that hit different word-wrap boundary behaviors.
+        for content in ["x", "xxxxxxxxxx", " Image: shot ", "word and more words"] {
+            for rows in [1u16, 3, 5, 12] {
+                for width in [20usize, 37, 94] {
+                    let pad = program_attachment_pad(content, width, rows);
+                    let line = format!("{content}{pad}");
+                    assert_eq!(
+                        program_wrap_row_starts(&line, width).len(),
+                        rows as usize + 1,
+                        "content={content:?} rows={rows} width={width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn program_md_link_label_truncates_long_names() {
+        assert_eq!(program_md_link_label("shot.png", true), "Image: shot.png");
+        assert_eq!(program_md_link_label("", false), "File: attachment");
+        let long = "a".repeat(40);
+        let label = program_md_link_label(&long, true);
+        assert!(label.ends_with('…'));
+        assert!(label.chars().count() <= 24 + "Image: …".chars().count());
+    }
 
     #[test]
     fn session_list_secondary_labels_use_readable_muted_style() {

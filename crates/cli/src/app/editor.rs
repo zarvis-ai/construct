@@ -345,6 +345,51 @@ impl App {
                 return true;
             }
         }
+        // Clicking an attachment image chip toggles its inline preview
+        // (spec 0099); clicking inside an expanded preview collapses it,
+        // except on the preview's bottom edge, which starts a drag-resize
+        // (tracked in `resizing_program_attachment`, updated in `on_mouse`).
+        // File chips have no toggle — the click falls through to normal
+        // cursor placement; hover already carries their info.
+        if matches!(ev.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let image_chip = self
+                .layout
+                .program_attachment_hits
+                .iter()
+                .find(|h| h.is_image && h.contains(ev.column, ev.row))
+                .cloned();
+            if let Some(hit) = image_chip {
+                if let Some(popup) = self.program_popup.as_mut() {
+                    if popup.expanded_attachments.remove(&hit.path).is_none() {
+                        popup.expanded_attachments.insert(
+                            hit.path.clone(),
+                            crate::ui::PROGRAM_ATTACHMENT_DEFAULT_ROWS,
+                        );
+                    }
+                }
+                return true;
+            }
+            let image_rect = self
+                .layout
+                .program_attachment_image_rects
+                .iter()
+                .find(|(r, _)| {
+                    ev.column >= r.x
+                        && ev.column < r.x + r.width
+                        && ev.row >= r.y
+                        && ev.row < r.y + r.height
+                })
+                .cloned();
+            if let Some((rect, path)) = image_rect {
+                let bottom = rect.y + rect.height.saturating_sub(1);
+                if ev.row == bottom {
+                    self.resizing_program_attachment = Some((path, rect.y));
+                } else if let Some(popup) = self.program_popup.as_mut() {
+                    popup.expanded_attachments.remove(&path);
+                }
+                return true;
+            }
+        }
         // Clicking a session smart-clip: a double-click (within
         // PROGRAM_CLIP_DOUBLE_CLICK_MS, same clip) navigates to the full
         // session view, just like every click did before pinning existed. A

@@ -1829,6 +1829,34 @@
     user-select: all;
     cursor: default;
   }
+  /* Attachment chips (spec 0099): `Image: name` / `File: name`. Image chips
+     read as clickable (they toggle the inline preview). */
+  .program-attachment { cursor: pointer; }
+  .program-attachment.is-image {
+    background: color-mix(in srgb, var(--info, var(--accent)) 16%, transparent);
+    color: var(--info, var(--accent));
+    border-color: color-mix(in srgb, var(--info, var(--accent)) 35%, transparent);
+  }
+  /* Inline preview: lives inside the chip (serialization ignores chip
+     children), reflows the document like any block, and is drag-resizable
+     via the native handle. */
+  .program-attachment-preview {
+    display: block;
+    width: min(420px, 90%);
+    height: 240px;
+    margin: 4px 0;
+    resize: both;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-elev);
+  }
+  .program-attachment-preview img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    display: block;
+  }
   /* Session smart-clip status badge: subtle status-tinted color, driven by
      `data-status` (kept live by programUpdateChipStatuses). "done" has no
      color rule of its own — it keeps the chip's default accent-alt look —
@@ -2367,6 +2395,8 @@
           <span class="program-version" id="programVersion"></span>
           <span class="program-flex"></span>
           <span class="program-msg" id="programMsg" aria-live="polite"></span>
+          <button type="button" id="programAttachBtn" title="Attach a file">Attach</button>
+          <input type="file" id="programAttachInput" accept="image/*,.pdf" multiple hidden />
           <button type="button" id="programFindBtn" title="Find">Find</button>
           <button type="button" id="programRunBtn" title="Run program (Ctrl+Enter) — runs the selection if text is selected">Run</button>
           <span class="program-run-stage" id="programRunStage" aria-live="polite"></span>
@@ -2666,6 +2696,8 @@ const programSaveBtn = $("programSaveBtn");
 const programRunBtn = $("programRunBtn");
 const programRunStageEl = $("programRunStage");
 const programFindBtn = $("programFindBtn");
+const programAttachBtn = $("programAttachBtn");
+const programAttachInputEl = $("programAttachInput");
 const programFindEl = $("programFind");
 const programFindInputEl = $("programFindInput");
 const programFindCountEl = $("programFindCount");
@@ -5123,6 +5155,21 @@ function programLineClipRanges(line) {
 // 0074: one dialect, one tokenizer). Action links overlapping a clip range
 // are ignored (a clip body wins).
 const PROGRAM_ACTION_LINK_RE = /\[([^\]\n]*)\]\(agentd:action\/([^()\s]*)\)/g;
+// Local-file Markdown links (spec 0099): `![name](path)` images and
+// `[name](path)` files whose target is an absolute or `~/` path (optionally
+// `<…>`-wrapped for paths with spaces). Anything else — http(s), agentd:
+// action links — stays literal / handled by its own tokenizer.
+const PROGRAM_MD_LINK_RE = /(!?)\[([^\][\n]{0,120})\]\((<[^)\n]{0,512}>|[^)\n]{0,512})\)/g;
+
+function programMdLinkParse(raw) {
+  const m = /^(!?)\[([^\]\n]*)\]\(([^)\n]*)\)$/.exec(raw);
+  if (!m) return null;
+  let path = m[3];
+  if (path.startsWith("<") && path.endsWith(">")) path = path.slice(1, -1);
+  if (!(path.startsWith("/") || path.startsWith("~/"))) return null;
+  return { isImage: m[1] === "!", name: m[2], path };
+}
+
 function programLineInlineTokens(line) {
   const tokens = programLineClipRanges(line).map(([s, e]) => ({ start: s, end: e, kind: "clip" }));
   PROGRAM_ACTION_LINK_RE.lastIndex = 0;
@@ -5132,6 +5179,14 @@ function programLineInlineTokens(line) {
     const end = m.index + m[0].length;
     if (tokens.some((t) => start < t.end && end > t.start)) continue;
     tokens.push({ start, end, kind: "action" });
+  }
+  PROGRAM_MD_LINK_RE.lastIndex = 0;
+  while ((m = PROGRAM_MD_LINK_RE.exec(line))) {
+    const start = m.index;
+    const end = m.index + m[0].length;
+    if (tokens.some((t) => start < t.end && end > t.start)) continue;
+    if (!programMdLinkParse(line.slice(start, end))) continue;
+    tokens.push({ start, end, kind: "attachment" });
   }
   tokens.sort((a, b) => a.start - b.start);
   return tokens;
@@ -5260,6 +5315,90 @@ function programActionChipEl(raw) {
   span.setAttribute("role", "button");
   span.setAttribute("aria-label", `action ${label}`);
   return span;
+}
+
+// Atomic chip for a local-file Markdown link (spec 0099): renders as
+// `Image: name` / `File: name`, serializes as its exact source via
+// dataset.raw (children are never serialized for .program-clip nodes, so
+// the inline preview below stays pure presentation). Clicking an image
+// chip toggles a true inline preview: an <img> inside the chip, which the
+// contenteditable flow reflows around; CSS `resize` makes it draggable.
+function programAttachmentChipEl(raw) {
+  const span = document.createElement("span");
+  span.className = "program-clip program-attachment";
+  span.setAttribute("contenteditable", "false");
+  span.dataset.raw = raw;
+  const link = programMdLinkParse(raw);
+  const name = ((link && link.name) || "attachment").trim() || "attachment";
+  const shown = name.length > 24 ? `${name.slice(0, 24)}…` : name;
+  const isImage = !!(link && link.isImage);
+  span.dataset.path = (link && link.path) || "";
+  if (isImage) span.classList.add("is-image");
+  const label = document.createElement("span");
+  label.className = "program-attachment-label";
+  label.textContent = `${isImage ? "Image" : "File"}: ${shown}`;
+  span.appendChild(label);
+  span.title = (link && link.path) || raw;
+  return span;
+}
+
+// `data:` URL for a stored session attachment, fetched over the authed
+// WebSocket (session.read_attachment) — never a raw HTTP path, so tunneled
+// remote-control sessions get the same auth story as the rest of the app.
+// Returns null for paths outside a session attachments dir.
+async function programAttachmentDataUrl(path) {
+  const m = /\/sessions\/([^/]+)\/attachments\/([^/]+)$/.exec(path);
+  if (!m) return null;
+  const result = await rpc("session.read_attachment", {
+    session_id: m[1],
+    filename: m[2],
+  });
+  return `data:${result.mime};base64,${result.data}`;
+}
+
+async function programToggleAttachmentPreview(chip) {
+  const existing = chip.querySelector(".program-attachment-preview");
+  if (existing) {
+    existing.remove();
+    return;
+  }
+  if (!chip.classList.contains("is-image")) return;
+  const url = await programAttachmentDataUrl(chip.dataset.path || "");
+  if (!url) {
+    programMsg("preview available for session attachments only");
+    return;
+  }
+  const holder = document.createElement("span");
+  holder.className = "program-attachment-preview";
+  holder.setAttribute("contenteditable", "false");
+  const img = document.createElement("img");
+  img.src = url;
+  img.alt = chip.dataset.path || "attachment preview";
+  holder.appendChild(img);
+  chip.appendChild(holder);
+}
+
+// Attach picked/pasted/dropped files to the program's session and insert
+// their Markdown links at the caret; the input pipeline re-tokenizes them
+// into chips (spec 0099).
+async function programAttachFiles(files) {
+  const sessionId = state.program.mountedId || state.currentId;
+  if (!files.length || !sessionId || !state.ws || state.ws.readyState !== 1) return;
+  const links = [];
+  for (const file of files) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const result = await rpc("session.attach_clipboard", {
+      session_id: sessionId,
+      data: bytesToBase64(bytes),
+      filename: file.name || "attachment",
+      mime: file.type || null,
+    });
+    const target = result.path.includes(" ") ? `<${result.path}>` : result.path;
+    const bang = (file.type || "").startsWith("image/") ? "!" : "";
+    links.push(`${bang}[${file.name || "attachment"}](${target})`);
+  }
+  programInputEl.focus();
+  document.execCommand("insertText", false, links.join(" "));
 }
 
 // Every mounted smart-clip chip across both chip-bearing surfaces — the
@@ -5531,7 +5670,12 @@ function programFillLine(div, text) {
   for (const t of tokens) {
     if (t.start > pos) programAppendLineText(div, text.slice(pos, t.start), pos === 0);
     const raw = text.slice(t.start, t.end);
-    div.appendChild(t.kind === "action" ? programActionChipEl(raw) : programChipEl(raw));
+    const chip = t.kind === "action"
+      ? programActionChipEl(raw)
+      : t.kind === "attachment"
+        ? programAttachmentChipEl(raw)
+        : programChipEl(raw);
+    div.appendChild(chip);
     pos = t.end;
   }
   if (pos < text.length) programAppendLineText(div, text.slice(pos), pos === 0);
@@ -7281,6 +7425,14 @@ function programWireEvents() {
     e.preventDefault();
     dispatchWidgetAction(sessionId, null, chip.dataset.actionId, chip.dataset.actionLabel, false);
   });
+  // Attachment chips (spec 0099): click toggles the inline image preview.
+  programInputEl.addEventListener("click", (e) => {
+    const chip = e.target && e.target.closest ? e.target.closest(".program-attachment") : null;
+    if (!chip || !programInputEl.contains(chip)) return;
+    e.preventDefault();
+    programToggleAttachmentPreview(chip).catch((err) =>
+      programMsg(`preview failed: ${err.message}`, true));
+  });
   programInputEl.addEventListener("click", () => { programUpdateClipMenu(); programUpdateSelectionMenu(); programPublishCursor(); programRenderCursors(); });
   programInputEl.addEventListener("pointerup", () => programUpdateSelectionMenu());
   programInputEl.addEventListener("pointermove", programHandleHoverPointerMove);
@@ -7297,10 +7449,25 @@ function programWireEvents() {
   });
   programInputEl.addEventListener("blur", () => { setTimeout(programCloseClipMenu, 120); });
   // Keep the editor plain text: paste as text/plain, never rich HTML.
+  // Pasted files become session attachments whose Markdown links land at
+  // the caret (spec 0099).
   programInputEl.addEventListener("paste", (e) => {
     e.preventDefault();
+    const files = Array.from((e.clipboardData && e.clipboardData.files) || []);
+    if (files.length > 0) {
+      programAttachFiles(files).catch((err) =>
+        programMsg(`attach failed: ${err.message}`, true));
+      return;
+    }
     const text = (e.clipboardData || window.clipboardData).getData("text/plain");
     if (text) document.execCommand("insertText", false, text);
+  });
+  programAttachBtn.addEventListener("click", () => programAttachInputEl.click());
+  programAttachInputEl.addEventListener("change", () => {
+    const files = Array.from(programAttachInputEl.files || []);
+    programAttachInputEl.value = "";
+    programAttachFiles(files).catch((err) =>
+      programMsg(`attach failed: ${err.message}`, true));
   });
   programSaveBtn.addEventListener("click", () => programSave());
   programRunBtn.addEventListener("click", () => programRun());
@@ -10691,6 +10858,12 @@ async function handleViewDrop(ev) {
   if (!dropAttachReady()) return;
   const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
   if (files.length === 0) return;
+  // With the program view open, a drop attaches into the program document
+  // (Markdown links → chips, spec 0099) rather than the composer.
+  if (programWrapEl && !programWrapEl.hidden) {
+    await programAttachFiles(files);
+    return;
+  }
   const refs = [];
   for (const file of files) refs.push(await attachClipboardFile(file));
   insertComposerText(refs.join(" "));

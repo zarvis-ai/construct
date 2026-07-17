@@ -562,7 +562,7 @@ fn macos_clipboard_file() -> Result<Option<PasteItem>> {
     }))
 }
 
-fn mime_for_path(path: &Path) -> &'static str {
+pub(crate) fn mime_for_path(path: &Path) -> &'static str {
     match path
         .extension()
         .and_then(|e| e.to_str())

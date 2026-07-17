@@ -118,6 +118,30 @@ fn sanitized_file_stem(name: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// MIME for serving a stored attachment back to a client, from its
+/// extension (the inverse of [`extension_for_attachment`]'s common cases).
+fn mime_for_attachment_ext(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("tiff") | Some("tif") => "image/tiff",
+        Some("bmp") => "image/bmp",
+        Some("heic") => "image/heic",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt") | Some("md") | Some("log") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
 fn extension_for_attachment(filename: Option<&str>, mime: Option<&str>, bytes: &[u8]) -> String {
     if let Some(ext) = filename
         .and_then(|f| std::path::Path::new(f).extension())
@@ -3422,6 +3446,50 @@ impl SessionManager {
         Ok(SessionAttachClipboardResult {
             path: path_str,
             reference,
+        })
+    }
+
+    /// Read one file back from a session's attachments dir (spec 0099: web
+    /// attachment previews). `filename` must be a bare name — any path
+    /// separator or traversal component is rejected, so this can never serve
+    /// a file outside the attachments directory.
+    pub async fn read_attachment(
+        &self,
+        p: construct_protocol::SessionReadAttachmentParams,
+    ) -> Result<construct_protocol::SessionReadAttachmentResult> {
+        self.get_entry(&p.session_id)
+            .await
+            .ok_or_else(|| anyhow!("session not found: {}", p.session_id))?;
+        if p.filename.is_empty()
+            || p.filename.contains('/')
+            || p.filename.contains('\\')
+            || p.filename == "."
+            || p.filename == ".."
+        {
+            anyhow::bail!("invalid attachment filename: {}", p.filename);
+        }
+        let path = self
+            .storage
+            .data_dir()
+            .join("sessions")
+            .join(&p.session_id)
+            .join("attachments")
+            .join(&p.filename);
+        let meta = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("attachment not found: {}", p.filename))?;
+        if !meta.is_file() {
+            anyhow::bail!("attachment is not a file: {}", p.filename);
+        }
+        if meta.len() as usize > MAX_CLIPBOARD_ATTACHMENT_BYTES {
+            anyhow::bail!("attachment too large: {} bytes", meta.len());
+        }
+        let bytes = tokio::fs::read(&path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?;
+        Ok(construct_protocol::SessionReadAttachmentResult {
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime: mime_for_attachment_ext(&path),
         })
     }
 
@@ -6901,6 +6969,40 @@ mod tests {
                 .expect("read attachment"),
             b"hello paste"
         );
+
+        // Read-back (spec 0099): the stored file round-trips through
+        // session.read_attachment with its extension-derived MIME…
+        let filename = std::path::Path::new(&result.path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let read = mgr
+            .read_attachment(construct_protocol::SessionReadAttachmentParams {
+                session_id: "spaste".into(),
+                filename,
+            })
+            .await
+            .expect("read attachment back");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(&read.data)
+                .unwrap(),
+            b"hello paste"
+        );
+        assert_eq!(read.mime, "image/png");
+        // …and traversal / separator names are rejected outright.
+        for bad in ["../../etc/passwd", "a/b.png", "..", "", "a\\b.png"] {
+            assert!(
+                mgr.read_attachment(construct_protocol::SessionReadAttachmentParams {
+                    session_id: "spaste".into(),
+                    filename: bad.into(),
+                })
+                .await
+                .is_err(),
+                "filename {bad:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]

@@ -1734,6 +1734,49 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(attach_button["calls"][0]["params"]["mime"], "image/jpeg");
     assert_eq!(attach_button["overflowSmall"], "hidden");
 
+    // Program attachment chips (spec 0099): local-file Markdown links
+    // tokenize into atomic chips that serialize back byte-identically;
+    // http(s) links stay literal text.
+    let program_attachments: serde_json::Value = page
+        .evaluate(
+            r#"
+            (() => {
+              const img = programMdLinkParse('![shot](/a/b/s.png)');
+              const spaced = programMdLinkParse('![s](</a/b c/s.png>)');
+              const http = programMdLinkParse('[d](https://example.com)');
+              const source = 'x ![shot](</a/b c/s.png>) y [d](https://example.com) z';
+              const div = document.createElement('div');
+              programFillLine(div, source);
+              const chip = div.querySelector('.program-attachment');
+              return {
+                imgPath: img && img.path,
+                imgIsImage: img && img.isImage,
+                spacedPath: spaced && spaced.path,
+                httpIsNull: http === null,
+                roundTrip: programSerializeInline(div),
+                chipLabel: chip ? chip.textContent : null,
+                chipIsImage: chip ? chip.classList.contains('is-image') : null,
+                httpChipCount: div.querySelectorAll('.program-attachment').length,
+              };
+            })()
+            "#,
+        )
+        .await
+        .expect("evaluate program attachments")
+        .into_value::<serde_json::Value>()
+        .expect("json object");
+    assert_eq!(program_attachments["imgPath"], "/a/b/s.png");
+    assert_eq!(program_attachments["imgIsImage"], true);
+    assert_eq!(program_attachments["spacedPath"], "/a/b c/s.png");
+    assert_eq!(program_attachments["httpIsNull"], true);
+    assert_eq!(
+        program_attachments["roundTrip"],
+        "x ![shot](</a/b c/s.png>) y [d](https://example.com) z"
+    );
+    assert_eq!(program_attachments["chipLabel"], "Image: shot");
+    assert_eq!(program_attachments["chipIsImage"], true);
+    assert_eq!(program_attachments["httpChipCount"], 1);
+
     // Regression coverage for mobile terminal scroll containment:
     // when the native keyboard shrinks the visual viewport, scroll
     // gestures starting on xterm must stay inside the terminal rather

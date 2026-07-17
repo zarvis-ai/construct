@@ -919,6 +919,10 @@ pub enum MinibufferIntent {
     ConfirmLocalFileUpload {
         session_id: String,
         path: String,
+        /// True when the drop landed on the program editor: the uploaded
+        /// attachment inserts a Markdown link into the program (spec 0099)
+        /// instead of pasting into the session PTY.
+        to_program: bool,
     },
     Rename {
         session_id: String,
@@ -1017,6 +1021,23 @@ pub struct ProgramClipHit {
 }
 
 impl ProgramClipHit {
+    pub fn contains(&self, col: u16, row: u16) -> bool {
+        row == self.row && col >= self.col_start && col < self.col_end
+    }
+}
+
+/// One on-screen segment of a program attachment chip (spec 0099).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramAttachmentHit {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub row: u16,
+    pub name: String,
+    pub path: String,
+    pub is_image: bool,
+}
+
+impl ProgramAttachmentHit {
     pub fn contains(&self, col: u16, row: u16) -> bool {
         row == self.row && col >= self.col_start && col < self.col_end
     }
@@ -1710,6 +1731,14 @@ pub struct App {
     /// Latest browser preview per session, fed by `SessionEvent::BrowserPreview`
     /// and rendered as a top-right overlay in the terminal view.
     pub browser_previews: HashMap<String, BrowserPreviewState>,
+    /// Decoded program-attachment images (spec 0099), keyed by path with the
+    /// file's mtime so an overwritten attachment re-decodes. `None` records a
+    /// failed decode, so a broken file isn't re-read every frame.
+    pub attachment_images:
+        HashMap<String, (std::time::SystemTime, Option<std::sync::Arc<image::RgbaImage>>)>,
+    /// Live drag state for resizing an expanded inline attachment image:
+    /// (attachment path, on-screen row of the image block's top).
+    pub resizing_program_attachment: Option<(String, u16)>,
     /// Adapter/file-backed dynamic UI panels, keyed by session id then panel id.
     /// Actions route back as normal session input.
     pub ui_panels: HashMap<String, HashMap<String, construct_protocol::UiPanel>>,
@@ -2235,6 +2264,10 @@ pub struct ProgramPopup {
     pub selection: Option<ProgramSelection>,
     pub selection_menu: Option<ProgramSelectionMenu>,
     pub smart_clip: Option<ProgramSmartClipSearch>,
+    /// Image links currently expanded inline, keyed by target path → block
+    /// height in body rows. Client-local view state (spec 0099): never
+    /// persisted, synced, or written into the Markdown.
+    pub expanded_attachments: HashMap<String, u16>,
     pub search: Option<ProgramSearch>,
     pub revealed_at: Instant,
     pub hide_after: Instant,
@@ -3284,6 +3317,14 @@ pub struct LayoutSnapshot {
     /// Session smart-clip hitboxes in the active program body from the last
     /// frame. Drives hover-preview and click-to-focus on `@{session:id}` chips.
     pub program_clip_hits: Vec<ProgramClipHit>,
+    /// Attachment-chip hitboxes (`![name](path)` / `[name](path)` rendered as
+    /// `[Image: …]` / `[File: …]`, spec 0099) from the last frame. Drives the
+    /// hover info card.
+    pub program_attachment_hits: Vec<ProgramAttachmentHit>,
+    /// On-screen rects of expanded inline attachment images (spec 0099) from
+    /// the last frame, with their target paths. Click inside collapses; a
+    /// drag starting on the bottom edge resizes.
+    pub program_attachment_image_rects: Vec<(ratatui::layout::Rect, String)>,
     /// Bounds of the pinned clip card (spec 0090) from the last frame, when
     /// one was painted. Clicks inside it are consumed by the card; a left
     /// click landing neither here nor on a session clip dismisses the pin.
@@ -3784,6 +3825,8 @@ async fn run_with_socket_initial_selection(
         agent_statuses: HashMap::new(),
         pending_tool_approvals: HashMap::new(),
         browser_previews: HashMap::new(),
+        attachment_images: HashMap::new(),
+        resizing_program_attachment: None,
         ui_panels: HashMap::new(),
         dynamic_ui_popover_open: None,
         dynamic_ui_selected: persisted
@@ -4866,6 +4909,36 @@ impl App {
             && self.minibuffer.is_none()
             && self.focus == PaneFocus::View
         {
+            // A file dropped onto the program editor over an ssh bridge:
+            // the pasted local path is unreadable here — offer the upload
+            // (spec 0098) and insert an attachment link (spec 0099) on
+            // confirm, instead of pasting a dead path into the doc.
+            if crate::clipboard_bridge::socket_from_env().is_some() {
+                if let Some(path) = crate::clipboard_bridge::droppable_local_path(&text) {
+                    if let Some(session_id) = self
+                        .program_popup
+                        .as_ref()
+                        .map(|p| p.program.session_id.clone())
+                    {
+                        let name = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        self.minibuffer = Some(Minibuffer {
+                            prompt: format!("Upload local file {name} to the program? [y/n] "),
+                            input: String::new(),
+                            cursor: 0,
+                            intent: MinibufferIntent::ConfirmLocalFileUpload {
+                                session_id,
+                                path,
+                                to_program: true,
+                            },
+                            error: None,
+                        });
+                        return;
+                    }
+                }
+            }
             self.insert_program_text(&text);
             // Pasted text can extend (or tear down) the live `@<typeahead>`
             // token backing the `@`→session picker's effective query; keep
@@ -4901,7 +4974,11 @@ impl App {
                         ),
                         input: String::new(),
                         cursor: 0,
-                        intent: MinibufferIntent::ConfirmLocalFileUpload { session_id, path },
+                        intent: MinibufferIntent::ConfirmLocalFileUpload {
+                            session_id,
+                            path,
+                            to_program: false,
+                        },
                         error: None,
                     });
                     return;
@@ -5049,6 +5126,18 @@ impl App {
             self.on_paste(text).await;
             return;
         }
+        // With the program editor focused, a binary paste becomes a program
+        // attachment link (spec 0099) rather than a PTY paste.
+        if self
+            .program_popup
+            .as_ref()
+            .is_some_and(|popup| !popup.terminal_focus)
+            && self.minibuffer.is_none()
+            && self.focus == PaneFocus::View
+        {
+            self.attach_item_to_program(item).await;
+            return;
+        }
         // Prefer the same target the oversized-text paste flow would use
         // (minibuffer intent / captured PTY); from the list, fall back to the
         // selected session.
@@ -5059,6 +5148,56 @@ impl App {
         };
         self.attach_item_and_paste(session_id, item, context_target.is_some())
             .await;
+    }
+
+    /// Attach `item` to the program's session and insert a Markdown link to
+    /// it at the program cursor (spec 0099): `![name](path)` for images,
+    /// `[name](path)` otherwise, with the path `<…>`-wrapped when it
+    /// contains spaces so standard Markdown parsers keep accepting it.
+    async fn attach_item_to_program(&mut self, item: crate::clipboard_bridge::PasteItem) {
+        use base64::Engine as _;
+        let Some(session_id) = self
+            .program_popup
+            .as_ref()
+            .map(|p| p.program.session_id.clone())
+        else {
+            self.set_status("program closed; nothing attached".to_string());
+            return;
+        };
+        let filename = item
+            .filename
+            .clone()
+            .unwrap_or_else(|| item.default_filename());
+        let data = base64::engine::general_purpose::STANDARD.encode(&item.bytes);
+        match self
+            .client
+            .attach_clipboard(
+                &session_id,
+                data,
+                Some(filename.clone()),
+                Some(item.mime.clone()),
+            )
+            .await
+        {
+            Ok(result) => {
+                let target = if result.path.contains(' ') {
+                    format!("<{}>", result.path)
+                } else {
+                    result.path
+                };
+                let link = if item.mime.starts_with("image/") {
+                    format!("![{filename}]({target})")
+                } else {
+                    format!("[{filename}]({target})")
+                };
+                self.insert_program_text(&link);
+                self.set_status(format!(
+                    "attached {filename} ({} KiB) to the program",
+                    item.bytes.len().div_ceil(1024),
+                ));
+            }
+            Err(e) => self.set_status(format!("program attachment failed: {e}")),
+        }
     }
 
     /// Attach `item` to `session_id` (daemon writes it under the session's
@@ -5115,8 +5254,15 @@ impl App {
     /// Confirmed drag-drop upload (spec 0098): fetch the dropped file's
     /// bytes from the local machine through the clipboard bridge and attach
     /// them to the session. Runs only after the user approved the exact
-    /// path in the confirmation prompt.
-    pub(super) async fn upload_local_file(&mut self, session_id: String, path: String) {
+    /// path in the confirmation prompt. With `to_program`, the attachment
+    /// inserts a Markdown link into the program (spec 0099) instead of
+    /// pasting into the PTY.
+    pub(super) async fn upload_local_file(
+        &mut self,
+        session_id: String,
+        path: String,
+        to_program: bool,
+    ) {
         let Some(sock) = crate::clipboard_bridge::socket_from_env() else {
             self.set_status("clipboard bridge is gone; upload cancelled".to_string());
             return;
@@ -5137,6 +5283,14 @@ impl App {
                 return;
             }
         };
+        if to_program {
+            // Falls back to a plain session attachment inside when the
+            // program closed while the confirm prompt was up.
+            if self.program_popup.is_some() {
+                self.attach_item_to_program(item).await;
+                return;
+            }
+        }
         // Deliver straight to the session PTY: the confirm prompt replaced
         // whatever minibuffer context the drop landed in.
         self.attach_item_and_paste(session_id, item, false).await;
@@ -8435,6 +8589,18 @@ impl App {
                 });
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some((path, top)) = self.resizing_program_attachment.clone() {
+                    // Dragging the preview's bottom edge sets the block
+                    // height directly from the cursor row (spec 0099).
+                    let rows = (ev.row.saturating_sub(top).saturating_add(1)).clamp(
+                        crate::ui::PROGRAM_ATTACHMENT_MIN_ROWS,
+                        crate::ui::PROGRAM_ATTACHMENT_MAX_ROWS,
+                    );
+                    if let Some(popup) = self.program_popup.as_mut() {
+                        popup.expanded_attachments.insert(path, rows);
+                    }
+                    return;
+                }
                 if let Some((anchor_col, anchor_w)) = self.resizing_list {
                     // Apply the column delta to the width that was
                     // current at drag start. Works for both grab
@@ -8519,7 +8685,8 @@ impl App {
                     || self.dragging_lineage_scrollbar.is_some()
                     || self.resizing_matrix_rain.is_some()
                     || self.resizing_main_window.is_some()
-                    || self.resizing_lineage.is_some();
+                    || self.resizing_lineage.is_some()
+                    || self.resizing_program_attachment.is_some();
                 self.resizing_list = None;
                 self.resizing_pin_strip = None;
                 self.resizing_orchestrator_panel = None;
@@ -8528,6 +8695,7 @@ impl App {
                 self.resizing_matrix_rain = None;
                 self.resizing_main_window = None;
                 self.resizing_lineage = None;
+                self.resizing_program_attachment = None;
                 if was_resizing {
                     self.text_selection = None;
                     return;
@@ -12173,6 +12341,7 @@ fn program_popup_from_document(
         selection: None,
         selection_menu: None,
         smart_clip: None,
+        expanded_attachments: HashMap::new(),
         search: None,
         revealed_at: now,
         hide_after: now + Duration::from_secs(365 * 24 * 60 * 60),
@@ -12666,6 +12835,8 @@ mod tests {
             program_resize_hit: None,
             program_smart_clip_anchor: None,
             program_clip_hits: Vec::new(),
+            program_attachment_hits: Vec::new(),
+            program_attachment_image_rects: Vec::new(),
             program_pinned_card_rect: None,
             program_action_link_hits: Vec::new(),
             program_template_hits: Vec::new(),
@@ -12826,6 +12997,8 @@ mod tests {
             agent_statuses: HashMap::new(),
             pending_tool_approvals: HashMap::new(),
             browser_previews: HashMap::new(),
+            attachment_images: HashMap::new(),
+            resizing_program_attachment: None,
             ui_panels: HashMap::new(),
             dynamic_ui_popover_open: None,
             dynamic_ui_selected: HashSet::new(),
@@ -13075,6 +13248,7 @@ mod tests {
             selection: None,
             selection_menu: None,
             smart_clip: None,
+            expanded_attachments: HashMap::new(),
             search: None,
             revealed_at: now,
             hide_after: now + Duration::from_secs(60),
@@ -14325,6 +14499,61 @@ mod tests {
             "a slow second click unpins rather than navigating"
         );
         assert_eq!(app.selection.session_id(), Some("s1"), "still no navigation");
+    }
+
+    /// Spec 0099: expanding an inline attachment pads its line to chip row +
+    /// image rows, shifting subsequent lines down by exactly the block
+    /// height in the painter (which proves the wrap math agrees — the
+    /// Paragraph and the row counters share the padded text).
+    #[tokio::test]
+    async fn program_expanded_attachment_shifts_following_lines() {
+        let (mut app, _dir, _server) = empty_app().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let img_path = tmp.path().join("shot.png");
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([10, 20, 30, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode png");
+        std::fs::write(&img_path, buf.into_inner()).expect("write png");
+        let md = format!("alphaword\n![shot]({})\nomegaword", img_path.display());
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup = program_popup_for_test("s1", &md, 0);
+        popup.revealed_at = Instant::now() - Duration::from_secs(10);
+        app.program_popup = Some(popup);
+
+        fn marker_rows(app: &mut App) -> (u16, u16) {
+            let backend = ratatui::backend::TestBackend::new(100, 40);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| crate::ui::render(f, app)).expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            let (mut alpha, mut omega) = (None, None);
+            for y in 0..40u16 {
+                let row: String = (0..100u16).map(|x| buffer[(x, y)].symbol()).collect();
+                if row.contains("alphaword") {
+                    alpha = alpha.or(Some(y));
+                }
+                if row.contains("omegaword") {
+                    omega = omega.or(Some(y));
+                }
+            }
+            (
+                alpha.expect("alpha marker rendered"),
+                omega.expect("omega marker rendered"),
+            )
+        }
+
+        let (a, o) = marker_rows(&mut app);
+        assert_eq!(o - a, 2, "collapsed chip line occupies one row");
+
+        app.program_popup
+            .as_mut()
+            .unwrap()
+            .expanded_attachments
+            .insert(img_path.display().to_string(), 5);
+        let (a, o) = marker_rows(&mut app);
+        assert_eq!(o - a, 7, "expanded image adds exactly its 5 rows");
     }
 
     /// Clicking a different clip while one is pinned switches the pin to it

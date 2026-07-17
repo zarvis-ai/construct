@@ -1234,6 +1234,13 @@ async fn dispatch(
             Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
         }
     });
+    dispatch_entry!(ipc_method::SESSION_READ_ATTACHMENT, {
+        let p = params!(req, construct_protocol::SessionReadAttachmentParams);
+        match manager.read_attachment(p).await {
+            Ok(result) => ok!(req, &result),
+            Err(e) => Response::err(req.id.clone(), ErrorObject::internal(e.to_string())),
+        }
+    });
     dispatch_entry!(ipc_method::SESSION_PTY_INPUT, {
         let p = params!(req, SessionPtyInputParams);
         let bytes = match p.decode() {
