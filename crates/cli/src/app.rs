@@ -4036,6 +4036,19 @@ async fn run_loop(
     socket: std::path::PathBuf,
 ) -> Result<()> {
     let mut input_stream = EventStream::new();
+    // MIDI is a native input peer of crossterm: learned controls dispatch the
+    // exact same actions below, without synthesizing OS keyboard events or
+    // requiring the terminal window to own desktop focus.
+    let (midi_listener, mut midi_rx) = match crate::midi::start_listener() {
+        Ok(Some((listener, rx))) => (Some(listener), Some(rx)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            app.set_status(format!("MIDI disabled: {e}"));
+            (None, None)
+        }
+    };
+    // Keep the backend connection alive for the duration of the event loop.
+    let _midi_listener = midi_listener;
     let mut notifications = app
         .client
         .take_notifications()
@@ -4450,6 +4463,27 @@ async fn run_loop(
                         app.set_status(format!("input error: {e}"));
                     }
                     None => break,
+                }
+            }
+            action = async {
+                match midi_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => futures::future::pending().await,
+                }
+            }, if midi_rx.is_some() => {
+                match action {
+                    Some(crate::midi::MidiAction::Approve) => {
+                        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)).await;
+                    }
+                    Some(crate::midi::MidiAction::Reject) => {
+                        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).await;
+                    }
+                    Some(action) => {
+                        if let Some(key_action) = action.key_action() {
+                            app.run_action(key_action).await;
+                        }
+                    }
+                    None => midi_rx = None,
                 }
             }
             hydrated = hydration_tasks.join_next(), if !hydration_tasks.is_empty() => {

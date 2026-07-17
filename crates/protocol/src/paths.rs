@@ -114,6 +114,10 @@ impl Paths {
         self.config_dir.join("keymap.toml")
     }
 
+    pub fn midi_file(&self) -> PathBuf {
+        self.config_dir.join("midi.toml")
+    }
+
     pub fn sessions_root(&self) -> PathBuf {
         self.data_dir.join("sessions")
     }

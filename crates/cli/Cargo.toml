@@ -55,3 +55,8 @@ bytes = { workspace = true }
 # OSC 11 terminal-background detection (timed poll/read on the tty).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# CoreMIDI-backed native control surfaces. Kept target-specific so Linux
+# release/cross builds do not acquire a system ALSA linkage requirement.
+[target.'cfg(target_os = "macos")'.dependencies]
+midir = { workspace = true }
