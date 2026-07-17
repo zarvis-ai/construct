@@ -3337,6 +3337,9 @@ pub struct LayoutSnapshot {
     /// the last frame, with their target paths. Click inside collapses; a
     /// drag starting on the bottom edge resizes.
     pub program_attachment_image_rects: Vec<(ratatui::layout::Rect, (u64, usize), String)>,
+    /// Fat grab zones for resizing expanded images (bottom-edge row + the
+    /// row below), with the image's top row for the drag's row math.
+    pub program_attachment_resize_zones: Vec<(ratatui::layout::Rect, (u64, usize), u16)>,
     /// Bounds of the pinned clip card (spec 0090) from the last frame, when
     /// one was painted. Clicks inside it are consumed by the card; a left
     /// click landing neither here nor on a session clip dismisses the pin.
@@ -12863,6 +12866,7 @@ mod tests {
             program_clip_hits: Vec::new(),
             program_attachment_hits: Vec::new(),
             program_attachment_image_rects: Vec::new(),
+            program_attachment_resize_zones: Vec::new(),
             program_pinned_card_rect: None,
             program_action_link_hits: Vec::new(),
             program_template_hits: Vec::new(),
@@ -14705,11 +14709,19 @@ mod tests {
             .expect("draw");
         let buffer = terminal.backend().buffer().clone();
         let mut chip_label = false;
+        let mut handle_marker = false;
         for y in 0..40u16 {
             let row: String = (0..100u16).map(|x| buffer[(x, y)].symbol()).collect();
             chip_label |= row.contains("Image: shot");
+            handle_marker |= row.contains("─ ↕ ─");
         }
         assert!(!chip_label, "expanded chip must paint nothing");
+        assert!(
+            handle_marker,
+            "the persistent resize handle paints on the image's bottom edge \
+             (hover affordances never show in terminals without any-motion \
+             mouse reporting, e.g. macOS Terminal.app)"
+        );
         assert!(
             app.layout.program_attachment_hits.is_empty(),
             "no chip hitbox while expanded"

@@ -398,27 +398,29 @@ impl App {
                 self.persist_program_expanded();
                 return true;
             }
+            // Resize zone first: it overlaps the image's bottom row, and a
+            // grab must win over collapse there.
+            if let Some((_, key, top)) = self
+                .layout
+                .program_attachment_resize_zones
+                .iter()
+                .find(|(r, _, _)| Self::rect_contains(*r, ev.column, ev.row))
+                .cloned()
+            {
+                self.resizing_program_attachment = Some((key, top));
+                return true;
+            }
             let image_rect = self
                 .layout
                 .program_attachment_image_rects
                 .iter()
-                .find(|(r, _, _)| {
-                    ev.column >= r.x
-                        && ev.column < r.x + r.width
-                        && ev.row >= r.y
-                        && ev.row < r.y + r.height
-                })
+                .find(|(r, _, _)| Self::rect_contains(*r, ev.column, ev.row))
                 .cloned();
-            if let Some((rect, key, _path)) = image_rect {
-                let bottom = rect.y + rect.height.saturating_sub(1);
-                if ev.row == bottom {
-                    self.resizing_program_attachment = Some((key, rect.y));
-                } else {
-                    if let Some(popup) = self.program_popup.as_mut() {
-                        popup.expanded_attachments.remove(&key);
-                    }
-                    self.persist_program_expanded();
+            if let Some((_, key, _path)) = image_rect {
+                if let Some(popup) = self.program_popup.as_mut() {
+                    popup.expanded_attachments.remove(&key);
                 }
+                self.persist_program_expanded();
                 return true;
             }
         }

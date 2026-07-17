@@ -10687,6 +10687,7 @@ fn render_program_popup(f: &mut Frame, app: &mut App) {
     app.layout.program_clip_hits.clear();
     app.layout.program_attachment_hits.clear();
     app.layout.program_attachment_image_rects.clear();
+    app.layout.program_attachment_resize_zones.clear();
     app.layout.program_pinned_card_rect = None;
     app.layout.program_action_link_hits.clear();
     if app
@@ -10864,17 +10865,13 @@ fn render_program_attachment_images(
             width: inner.width,
             height: (vis_last + 1 - vis_first) as u16,
         };
-        match program_attachment_decoded(app, &path) {
+        let draw = match program_attachment_decoded(app, &path) {
             Some(img) => {
                 let draw = program_attachment_draw_rect(img.dimensions(), rect);
                 let (ow, oh) = blit_scale_dims(img.dimensions(), draw, false);
                 let resized = resized_image(&mut app.image_resize_cache, &img, ow * 2, oh);
                 paint_resized_quadrants(f, draw, &resized, 1.0, (0.0, 1.0));
-                if active {
-                    app.layout
-                        .program_attachment_image_rects
-                        .push((draw, key, path));
-                }
+                draw
             }
             None => {
                 f.render_widget(
@@ -10882,12 +10879,52 @@ fn render_program_attachment_images(
                         .style(Style::default().fg(app.theme.danger)),
                     rect,
                 );
-                if active {
-                    app.layout
-                        .program_attachment_image_rects
-                        .push((rect, key, path));
-                }
+                rect
             }
+        };
+        // Persistent resize handle on the image's bottom edge — hover-only
+        // affordances never show in terminals without any-motion mouse
+        // reporting (macOS Terminal.app), so the cue must always be
+        // painted. The grab zone is the marker's row plus the row below,
+        // so the drag doesn't demand single-row aim.
+        let handle_row = draw.y + draw.height.saturating_sub(1);
+        let marker = " ─ ↕ ─ ";
+        let marker_w = UnicodeWidthStr::width(marker) as u16;
+        if draw.width > marker_w {
+            let marker_rect = Rect {
+                x: draw.x + (draw.width - marker_w) / 2,
+                y: handle_row,
+                width: marker_w,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(app.theme.text)
+                        .bg(app.theme.inactive_highlight_bg)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                marker_rect.intersection(f.area()),
+            );
+        }
+        if active {
+            let zone = Rect {
+                x: draw.x,
+                y: handle_row,
+                width: draw.width,
+                height: if handle_row + 1 < inner.y + inner.height {
+                    2
+                } else {
+                    1
+                },
+            };
+            app.layout
+                .program_attachment_resize_zones
+                .push((zone, key, draw.y));
+            app.layout
+                .program_attachment_image_rects
+                .push((draw, key, path));
         }
     }
 }
