@@ -12,10 +12,17 @@ Scope: Image and file attachments referenced from a session's program document, 
   bespoke token format. The path points at a file the daemon host can
   read (typically under the session's attachments directory, written by
   the existing clipboard-attachment mechanism).
-- Clients render those links as compact chips — `[Image #N]` / `[File #N]`
-  — with `N` derived from order of appearance **at render time**, never
-  stored. Hovering a chip shows the file's info (name, path, size, type)
-  and, where the client can, a preview.
+- Clients render **image links only** as compact chips; plain file links
+  stay literal text (they have no preview affordance, and collapsing them
+  would hide the path for no benefit). Hovering a chip shows the file's
+  info (name, path, size, type) and, where the client can, a preview.
+  Chips do not require the link to stand alone on its line; an expanded
+  preview renders below the line the link sits in.
+- A chip is **atomic to the cursor**: caret positions inside the link's
+  source map to the chip's boundary, and positions after it measure from
+  the chip's painted width, so the caret and selection always land where
+  the user sees them. The source text itself is untouched — atomicity is
+  a presentation/cursor rule, not an editing restriction.
 - A chip is toggleable between its compact form and an expanded preview.
   Expansion state and preview size are **client-local view state**: they
   are never written into the Markdown and never synchronized, so agents

@@ -10829,8 +10829,10 @@ fn render_program_attachment_images(
         let rendered = program_rendered_line_text(Some(app), raw, width);
         let rows = program_wrap_row_starts(&rendered, width).len().max(1);
         if let Some((path, img_rows)) = program_expanded_attachment(Some(app), raw) {
-            // Row 0 keeps the chip; the image starts on the next row.
-            blocks.push((path, row_base + 1, img_rows));
+            // The padding reserves the line's LAST `img_rows` wrapped rows;
+            // the text (chip included) keeps the rows above them.
+            let first = row_base + rows.saturating_sub(img_rows as usize);
+            blocks.push((path, first, img_rows));
         }
         row_base = row_base.saturating_add(rows);
     }
@@ -14739,6 +14741,12 @@ pub(crate) fn find_program_md_link(text: &str) -> Option<ProgramMdLink<'_>> {
         if !(path.starts_with('/') || path.starts_with("~/")) {
             continue;
         }
+        // Images only: plain `[name](path)` file links stay literal text —
+        // they have no preview affordance, and chipping them hid the path
+        // for no benefit.
+        if !is_image {
+            continue;
+        }
         return Some(ProgramMdLink {
             start,
             end: target_start + target_len + 1,
@@ -14778,13 +14786,23 @@ fn program_expanded_attachment(app: Option<&App>, raw: &str) -> Option<(String, 
     if popup.expanded_attachments.is_empty() {
         return None;
     }
+    // Headings and fence lines paint their source literally (no chips), so
+    // they never expand.
     let trimmed = raw.trim();
-    let link = find_program_md_link(trimmed)?;
-    if !link.is_image || link.start != 0 || link.end != trimmed.len() {
+    if program_heading_content(raw).is_some() || trimmed.starts_with(":::clip") || trimmed == ":::"
+    {
         return None;
     }
-    let rows = *popup.expanded_attachments.get(link.path)?;
-    Some((link.path.to_string(), rows))
+    // First expanded image link on the line wins; the block renders below
+    // the line's own wrapped rows wherever the link sits in it.
+    let mut rest = raw;
+    while let Some(link) = find_program_md_link(rest) {
+        if let Some(rows) = popup.expanded_attachments.get(link.path) {
+            return Some((link.path.to_string(), *rows));
+        }
+        rest = &rest[link.end..];
+    }
+    None
 }
 
 /// Padding that stretches a rendered line by exactly `rows` extra wrapped
@@ -15262,7 +15280,11 @@ fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) ->
     let mut visual = 0usize;
     let mut raw = 0usize;
     let mut rest = text;
-    while let Some(start_b) = rest.find("@{") {
+    // Shared tokenizer with the rendered-text/painting passes (spec 0099):
+    // every chip — smart clip or attachment link — is atomic for the cursor.
+    // A raw column strictly inside a chip's source maps to the chip's end,
+    // so the caret can never paint mid-chip.
+    while let Some((start_b, token)) = next_program_inline_token(rest) {
         let before = &rest[..start_b];
         let before_len = before.chars().count();
         if raw_col <= raw + before_len {
@@ -15271,20 +15293,24 @@ fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) ->
         visual += UnicodeWidthStr::width(before);
         raw += before_len;
 
-        let after_marker = &rest[start_b + 2..];
-        let Some(end_b) = after_marker.find('}') else {
-            // Malformed @{ without closing }: treat remainder as plain text.
-            return visual
-                + program_prefix_display_width(&rest[start_b..], raw_col.saturating_sub(raw));
+        let (chip_width, src_len) = match &token {
+            ProgramInlineToken::Clip { raw: raw_clip, src_len } => {
+                (program_smart_clip_visual_width(app, raw_clip), *src_len)
+            }
+            ProgramInlineToken::Link(link) => (
+                UnicodeWidthStr::width(
+                    program_md_link_label(link.name, link.is_image).as_str(),
+                ) + 2,
+                link.end - link.start,
+            ),
         };
-        let raw_clip = &after_marker[..end_b];
-        let clip_len = 2 + raw_clip.chars().count() + 1;
-        if raw_col <= raw + clip_len {
-            return visual + program_smart_clip_visual_width(app, raw_clip);
+        let src_chars = rest[start_b..start_b + src_len].chars().count();
+        if raw_col <= raw + src_chars {
+            return visual + chip_width;
         }
-        visual += program_smart_clip_visual_width(app, raw_clip);
-        raw += clip_len;
-        rest = &after_marker[end_b + 1..];
+        visual += chip_width;
+        raw += src_chars;
+        rest = &rest[start_b + src_len..];
     }
     visual + program_prefix_display_width(rest, raw_col.saturating_sub(raw))
 }
@@ -15391,6 +15417,12 @@ fn render_program_markdown_lines<'a>(
                 search_selected,
                 &action_ranges,
             ));
+            // Expanded inline attachment on a bullet line (spec 0099): same
+            // painted-height padding as the plain-line branch below.
+            if let Some((_, rows)) = program_expanded_attachment(Some(app), raw) {
+                let painted: String = spans.iter().map(|s| s.content.as_ref()).collect();
+                spans.push(Span::raw(program_attachment_pad(&painted, width, rows)));
+            }
             out.push(Line::from(spans));
         } else if let Some(rest) = trimmed.strip_prefix(":::clip") {
             // Every clip fence renders as an inert chip on this surface —
@@ -16940,17 +16972,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn program_md_link_parses_local_image_and_file_links() {
+    fn program_md_link_parses_local_image_links() {
         let link = find_program_md_link("see ![shot](/a/b/shot.png) here").expect("image link");
         assert_eq!(link.name, "shot");
         assert_eq!(link.path, "/a/b/shot.png");
         assert!(link.is_image);
         assert_eq!(&"see ![shot](/a/b/shot.png) here"[link.start..link.end],
             "![shot](/a/b/shot.png)");
-
-        let link = find_program_md_link("[notes](~/docs/notes.pdf)").expect("file link");
-        assert!(!link.is_image);
-        assert_eq!(link.path, "~/docs/notes.pdf");
 
         // Angle-bracket targets (paths with spaces) resolve to the bare path.
         let link =
@@ -16959,9 +16987,10 @@ mod tests {
     }
 
     #[test]
-    fn program_md_link_leaves_non_local_links_literal() {
-        // http(s), agentd action links, empty targets, and plain brackets
-        // must stay literal text (spec 0099).
+    fn program_md_link_leaves_non_image_and_non_local_links_literal() {
+        // Plain file links, http(s), agentd action links, and bracket-only
+        // text all stay literal (spec 0099: image links only chip).
+        assert!(find_program_md_link("[notes](~/docs/notes.pdf)").is_none());
         assert!(find_program_md_link("[docs](https://example.com)").is_none());
         assert!(find_program_md_link("[run](agentd:action/run)").is_none());
         assert!(find_program_md_link("[not a link] (separate)").is_none());
@@ -16978,20 +17007,47 @@ mod tests {
         assert_eq!(rendered, "before  Image: shot  after");
 
         let (out, clips) =
-            program_inline_with_clips(None, "x [n](/tmp/n.pdf) y @{session:abc} z", 0);
-        assert_eq!(out, program_inline_rendered_text(None, "x [n](/tmp/n.pdf) y @{session:abc} z"));
+            program_inline_with_clips(None, "x ![n](/tmp/n.png) y @{session:abc} z", 0);
+        assert_eq!(
+            out,
+            program_inline_rendered_text(None, "x ![n](/tmp/n.png) y @{session:abc} z")
+        );
         assert_eq!(clips.len(), 2);
         let LineClipKind::Attachment { path, is_image, .. } = &clips[0].kind else {
             panic!("first clip should be the attachment");
         };
-        assert_eq!(path, "/tmp/n.pdf");
-        assert!(!is_image);
+        assert_eq!(path, "/tmp/n.png");
+        assert!(is_image);
         assert!(matches!(&clips[1].kind, LineClipKind::Smart(raw) if raw == "session:abc"));
         // Chip span coordinates: width == padded label width.
         assert_eq!(clips[0].visual_start, 2);
         assert_eq!(
             clips[0].visual_width,
-            UnicodeWidthStr::width(program_md_link_label("n", false).as_str()) + 2
+            UnicodeWidthStr::width(program_md_link_label("n", true).as_str()) + 2
+        );
+    }
+
+    /// The chip is atomic to the cursor (spec 0099): raw columns inside the
+    /// link source all map to the chip's end, and columns after it measure
+    /// from the chip's painted width — not the (longer) source width — so
+    /// the caret and selection land where the user sees them.
+    #[test]
+    fn program_visual_col_maps_attachment_chip_atomically() {
+        let raw = "before ![shot](/tmp/s.png) after";
+        let chip_w =
+            UnicodeWidthStr::width(program_md_link_label("shot", true).as_str()) + 2;
+        let link_chars = "![shot](/tmp/s.png)".chars().count();
+        assert_eq!(program_visual_col_for_line(None, raw, 7), 7);
+        for inside in 8..=(7 + link_chars) {
+            assert_eq!(
+                program_visual_col_for_line(None, raw, inside),
+                7 + chip_w,
+                "raw col {inside} should sit at the chip's end"
+            );
+        }
+        assert_eq!(
+            program_visual_col_for_line(None, raw, 7 + link_chars + 3),
+            7 + chip_w + 3
         );
     }
 

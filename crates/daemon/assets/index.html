@@ -5185,7 +5185,10 @@ function programLineInlineTokens(line) {
     const start = m.index;
     const end = m.index + m[0].length;
     if (tokens.some((t) => start < t.end && end > t.start)) continue;
-    if (!programMdLinkParse(line.slice(start, end))) continue;
+    // Images only (spec 0099): plain `[name](path)` file links stay
+    // literal text — no preview affordance, and chipping hid the path.
+    const link = programMdLinkParse(line.slice(start, end));
+    if (!link || !link.isImage) continue;
     tokens.push({ start, end, kind: "attachment" });
   }
   tokens.sort((a, b) => a.start - b.start);
@@ -5325,18 +5328,16 @@ function programActionChipEl(raw) {
 // contenteditable flow reflows around; CSS `resize` makes it draggable.
 function programAttachmentChipEl(raw) {
   const span = document.createElement("span");
-  span.className = "program-clip program-attachment";
+  span.className = "program-clip program-attachment is-image";
   span.setAttribute("contenteditable", "false");
   span.dataset.raw = raw;
   const link = programMdLinkParse(raw);
   const name = ((link && link.name) || "attachment").trim() || "attachment";
   const shown = name.length > 24 ? `${name.slice(0, 24)}…` : name;
-  const isImage = !!(link && link.isImage);
   span.dataset.path = (link && link.path) || "";
-  if (isImage) span.classList.add("is-image");
   const label = document.createElement("span");
   label.className = "program-attachment-label";
-  label.textContent = `${isImage ? "Image" : "File"}: ${shown}`;
+  label.textContent = `Image: ${shown}`;
   span.appendChild(label);
   span.title = (link && link.path) || raw;
   return span;

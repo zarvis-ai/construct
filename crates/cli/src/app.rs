@@ -4938,6 +4938,25 @@ impl App {
                         return;
                     }
                 }
+            } else if let Some(path) = crate::clipboard_bridge::droppable_local_path(&text) {
+                // No bridge: the session is local, so a dropped file's path
+                // is already readable by this host. Insert the Markdown
+                // image link (which chips, spec 0099) instead of a bare path
+                // string the doc can't do anything with.
+                let p = std::path::Path::new(&path);
+                if crate::clipboard_bridge::mime_for_path(p).starts_with("image/") && p.exists() {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.clone());
+                    let target = if path.contains(' ') {
+                        format!("<{path}>")
+                    } else {
+                        path.clone()
+                    };
+                    self.insert_program_text(&format!("![{name}]({target})"));
+                    return;
+                }
             }
             self.insert_program_text(&text);
             // Pasted text can extend (or tear down) the live `@<typeahead>`
@@ -14516,7 +14535,12 @@ mod tests {
             .write_to(&mut buf, image::ImageFormat::Png)
             .expect("encode png");
         std::fs::write(&img_path, buf.into_inner()).expect("write png");
-        let md = format!("alphaword\n![shot]({})\nomegaword", img_path.display());
+        // The image link sits mid-line: expansion must not require a
+        // standalone line (the block renders below the line's own rows).
+        let md = format!(
+            "alphaword\nlead text ![shot]({}) tail\nomegaword",
+            img_path.display()
+        );
         app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
         app.selection = Selection::Session("s1".into());
         let mut popup = program_popup_for_test("s1", &md, 0);
@@ -14554,6 +14578,74 @@ mod tests {
             .insert(img_path.display().to_string(), 5);
         let (a, o) = marker_rows(&mut app);
         assert_eq!(o - a, 7, "expanded image adds exactly its 5 rows");
+    }
+
+    /// Clicking an image chip expands it; clicking it again collapses
+    /// (spec 0099) — end-to-end through render-registered hitboxes and the
+    /// real mouse handler.
+    #[tokio::test]
+    async fn program_attachment_chip_click_toggles_expansion() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup = program_popup_for_test("s1", "note ![shot](/tmp/shot.png) end", 0);
+        popup.revealed_at = Instant::now() - Duration::from_secs(10);
+        app.program_popup = Some(popup);
+
+        fn render_once(app: &mut App) {
+            let backend = ratatui::backend::TestBackend::new(100, 40);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal.draw(|f| crate::ui::render(f, app)).expect("draw");
+        }
+        render_once(&mut app);
+        let hit = app
+            .layout
+            .program_attachment_hits
+            .first()
+            .cloned()
+            .expect("chip hitbox registered");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.col_start,
+            row: hit.row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        };
+        app.handle_program_mouse(&click).await;
+        assert_eq!(
+            app.program_popup
+                .as_ref()
+                .unwrap()
+                .expanded_attachments
+                .get("/tmp/shot.png"),
+            Some(&crate::ui::PROGRAM_ATTACHMENT_DEFAULT_ROWS),
+            "first click expands at the default height"
+        );
+
+        // Re-render so the hitboxes reflect the expanded layout, then click
+        // the chip again: collapse.
+        render_once(&mut app);
+        let hit = app
+            .layout
+            .program_attachment_hits
+            .first()
+            .cloned()
+            .expect("chip hitbox after expansion");
+        app.handle_program_mouse(&MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.col_start,
+            row: hit.row,
+            modifiers: crossterm::event::KeyModifiers::empty(),
+        })
+        .await;
+        assert!(
+            app.program_popup
+                .as_ref()
+                .unwrap()
+                .expanded_attachments
+                .is_empty(),
+            "second click collapses"
+        );
     }
 
     /// Clicking a different clip while one is pinned switches the pin to it
