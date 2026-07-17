@@ -14667,9 +14667,24 @@ mod tests {
             "first click expands at the default height"
         );
 
-        // Re-render so the hitboxes reflect the expanded layout, then click
-        // the chip again: collapse.
-        render_once(&mut app);
+        // Re-render so the hitboxes reflect the expanded layout: the
+        // mid-line chip shrinks to the 1-cell anchor marker (the image
+        // replaces the label, spec 0099); clicking the marker collapses.
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let mut chip_label = false;
+        let mut marker = false;
+        for y in 0..40u16 {
+            let row: String = (0..100u16).map(|x| buffer[(x, y)].symbol()).collect();
+            chip_label |= row.contains("Image: shot");
+            marker |= row.contains('▣');
+        }
+        assert!(!chip_label, "expanded mid-line chip must not show its label");
+        assert!(marker, "expanded mid-line chip shows the anchor marker");
         let hit = app
             .layout
             .program_attachment_hits

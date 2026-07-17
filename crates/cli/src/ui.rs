@@ -14811,6 +14811,23 @@ pub(crate) fn program_md_link_label(name: &str, is_image: bool) -> String {
     format!("{kind}: {shown}{ellipsis}")
 }
 
+/// The label a link chip actually paints, given expansion state: an expanded
+/// image's chip shrinks to a 1-cell anchor marker — the image replaces the
+/// chip (spec 0099); mid-line the marker only marks where the source sits
+/// (and still collapses on click). Standalone lines never reach this (the
+/// whole line is replaced).
+fn program_md_chip_label(app: Option<&App>, link: &ProgramMdLink<'_>) -> String {
+    let expanded = link.is_image
+        && app
+            .and_then(|a| a.program_popup.as_ref())
+            .is_some_and(|p| p.expanded_attachments.contains_key(link.path));
+    if expanded {
+        "▣".to_string()
+    } else {
+        program_md_link_label(link.name, link.is_image)
+    }
+}
+
 /// Default and bounds for an expanded inline attachment image's height, in
 /// body rows (spec 0099). Client-local; drag-resize adjusts within bounds.
 pub(crate) const PROGRAM_ATTACHMENT_DEFAULT_ROWS: u16 = 12;
@@ -14954,7 +14971,7 @@ fn program_inline_rendered_text(app: Option<&App>, text: &str) -> String {
                 (label, src_len)
             }
             ProgramInlineToken::Link(link) => (
-                program_md_link_label(link.name, link.is_image),
+                program_md_chip_label(app, &link),
                 link.end - link.start,
             ),
         };
@@ -15012,7 +15029,7 @@ fn program_inline_with_clips(
                 (label, LineClipKind::Smart(raw.to_string()), src_len)
             }
             ProgramInlineToken::Link(link) => (
-                program_md_link_label(link.name, link.is_image),
+                program_md_chip_label(app, &link),
                 LineClipKind::Attachment {
                     name: link.name.to_string(),
                     path: link.path.to_string(),
@@ -15395,7 +15412,7 @@ fn program_inline_visual_width(app: Option<&App>, text: &str, raw_col: usize) ->
             }
             ProgramInlineToken::Link(link) => (
                 UnicodeWidthStr::width(
-                    program_md_link_label(link.name, link.is_image).as_str(),
+                    program_md_chip_label(app, link).as_str(),
                 ) + 2,
                 link.end - link.start,
             ),
@@ -15732,6 +15749,7 @@ fn render_program_inline_spans<'a>(
             }
             ProgramInlineToken::Link(link) => {
                 spans.push(program_attachment_chip_span(
+                    Some(app),
                     &app.theme,
                     &link,
                     chip_match_idx.is_some(),
@@ -15762,12 +15780,13 @@ fn render_program_inline_spans<'a>(
 /// liveness/status concepts don't apply to files; the hover card carries the
 /// details.
 fn program_attachment_chip_span(
+    app: Option<&App>,
     theme: &Theme,
     link: &ProgramMdLink<'_>,
     in_match: bool,
     is_active_match: bool,
 ) -> Span<'static> {
-    let label = program_md_link_label(link.name, link.is_image);
+    let label = program_md_chip_label(app, link);
     let bg = if is_active_match || in_match {
         theme.highlight_bg
     } else if link.is_image {
@@ -17130,6 +17149,24 @@ mod tests {
             clips[0].visual_width,
             UnicodeWidthStr::width(program_md_link_label("n", true).as_str()) + 2
         );
+    }
+
+    /// While a mid-line image is expanded, its chip shrinks to the 1-cell
+    /// anchor marker — the image (below) replaces the chip's label
+    /// (spec 0099). Verified through the transform, so the painter, wrap
+    /// math, and hit widths all agree.
+    #[test]
+    fn expanded_midline_chip_shrinks_to_anchor_marker() {
+        // No App state → collapsed label.
+        assert_eq!(
+            program_inline_rendered_text(None, "a ![shot](/tmp/s.png) b"),
+            "a  Image: shot  b"
+        );
+        // The pure label fn keeps its collapsed form; expansion-aware
+        // callers go through program_md_chip_label, which needs App state —
+        // exercised end-to-end by the app-level render tests.
+        let link = find_program_md_link("![shot](/tmp/s.png)").expect("link");
+        assert_eq!(program_md_chip_label(None, &link), "Image: shot");
     }
 
     /// The chip is atomic to the cursor (spec 0099): raw columns inside the
