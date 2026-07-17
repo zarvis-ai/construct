@@ -1837,14 +1837,23 @@
     color: var(--info, var(--accent));
     border-color: color-mix(in srgb, var(--info, var(--accent)) 35%, transparent);
   }
+  /* Expanded: the image replaces the chip (GitHub semantic — an image is
+     an inline element rendered at its source position, left-aligned).
+     The label hides and the pill styling drops away. */
+  .program-attachment.is-expanded {
+    background: transparent;
+    border-color: transparent;
+    padding: 0;
+  }
+  .program-attachment.is-expanded .program-attachment-label { display: none; }
   /* Inline preview: lives inside the chip (serialization ignores chip
      children), reflows the document like any block, and is drag-resizable
-     via the native handle. */
+     via the native handle. Left-aligned, never centered. */
   .program-attachment-preview {
     display: block;
     width: min(420px, 90%);
     height: 240px;
-    margin: 4px 0;
+    margin: 2px 0;
     resize: both;
     overflow: hidden;
     border: 1px solid var(--border);
@@ -5361,6 +5370,7 @@ async function programToggleAttachmentPreview(chip) {
   const existing = chip.querySelector(".program-attachment-preview");
   if (existing) {
     existing.remove();
+    chip.classList.remove("is-expanded");
     return;
   }
   if (!chip.classList.contains("is-image")) return;
@@ -5375,8 +5385,13 @@ async function programToggleAttachmentPreview(chip) {
   const img = document.createElement("img");
   img.src = url;
   img.alt = chip.dataset.path || "attachment preview";
+  img.title = chip.dataset.path || "";
   holder.appendChild(img);
   chip.appendChild(holder);
+  // GitHub semantic: the image REPLACES the chip text while expanded
+  // (`.is-expanded` hides the label and strips the pill styling); clicking
+  // the image collapses back to the chip.
+  chip.classList.add("is-expanded");
 }
 
 // Attach picked/pasted/dropped files to the program's session and insert

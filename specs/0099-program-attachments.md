@@ -24,6 +24,12 @@ Scope: Image and file attachments referenced from a session's program document, 
   the user sees them. The source text itself is untouched — atomicity is
   a presentation/cursor rule, not an editing restriction.
 - A chip is toggleable between its compact form and an expanded preview.
+  Expansion follows CommonMark/GitHub rendering semantics: the image
+  **replaces** the chip at the link's position in the flow — the chip text
+  is not shown alongside it — and is **left-aligned**, never centered.
+  Clicking the image collapses back to the chip. A terminal client may
+  keep the chip visible for a mid-text link (a character grid cannot grow
+  one line's height), rendering the image on the rows below instead.
   Expansion state and preview size are **client-local view state**: they
   are never written into the Markdown and never synchronized, so agents
   and other clients see only the canonical link.

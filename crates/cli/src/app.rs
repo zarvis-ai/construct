@@ -14580,6 +14580,51 @@ mod tests {
         assert_eq!(o - a, 7, "expanded image adds exactly its 5 rows");
     }
 
+    /// A standalone image-link line replaced by its expanded image
+    /// (GitHub semantic, spec 0099): the chip disappears — no chip hitbox —
+    /// and the line occupies exactly the image rows.
+    #[tokio::test]
+    async fn program_expanded_standalone_image_replaces_its_line() {
+        let (mut app, _dir, _server) = empty_app().await;
+        app.sessions = vec![summary_with_kind(construct_protocol::SessionKind::User)];
+        app.selection = Selection::Session("s1".into());
+        let mut popup =
+            program_popup_for_test("s1", "alphaword\n![shot](/tmp/shot.png)\nomegaword", 0);
+        popup.revealed_at = Instant::now() - Duration::from_secs(10);
+        popup
+            .expanded_attachments
+            .insert("/tmp/shot.png".to_string(), 5);
+        app.program_popup = Some(popup);
+
+        let backend = ratatui::backend::TestBackend::new(100, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| crate::ui::render(f, &mut app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let (mut alpha, mut omega, mut chip) = (None, None, false);
+        for y in 0..40u16 {
+            let row: String = (0..100u16).map(|x| buffer[(x, y)].symbol()).collect();
+            if row.contains("alphaword") {
+                alpha = alpha.or(Some(y));
+            }
+            if row.contains("omegaword") {
+                omega = omega.or(Some(y));
+            }
+            chip |= row.contains("Image: shot");
+        }
+        assert!(!chip, "the image replaces the chip — no chip text painted");
+        assert!(
+            app.layout.program_attachment_hits.is_empty(),
+            "no chip hitbox on a replaced line"
+        );
+        assert_eq!(
+            omega.expect("omega") - alpha.expect("alpha"),
+            6,
+            "line occupies exactly the 5 image rows (no chip row)"
+        );
+    }
+
     /// Clicking an image chip expands it; clicking it again collapses
     /// (spec 0099) — end-to-end through render-registered hitboxes and the
     /// real mouse handler.

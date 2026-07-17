@@ -10828,11 +10828,12 @@ fn render_program_attachment_images(
         }
         let rendered = program_rendered_line_text(Some(app), raw, width);
         let rows = program_wrap_row_starts(&rendered, width).len().max(1);
-        if let Some((path, img_rows)) = program_expanded_attachment(Some(app), raw) {
-            // The padding reserves the line's LAST `img_rows` wrapped rows;
-            // the text (chip included) keeps the rows above them.
-            let first = row_base + rows.saturating_sub(img_rows as usize);
-            blocks.push((path, first, img_rows));
+        if let Some(exp) = program_expanded_attachment(Some(app), raw) {
+            // The padding reserves the line's LAST `rows` wrapped rows (all
+            // of them when the image replaces the line); the text keeps any
+            // rows above.
+            let first = row_base + rows.saturating_sub(exp.rows as usize);
+            blocks.push((exp.path, first, exp.rows));
         }
         row_base = row_base.saturating_add(rows);
     }
@@ -10851,9 +10852,15 @@ fn render_program_attachment_images(
         };
         match program_attachment_decoded(app, &path) {
             Some(img) => {
-                let (ow, oh) = blit_scale_dims(img.dimensions(), rect, false);
+                let draw = program_attachment_draw_rect(img.dimensions(), rect);
+                let (ow, oh) = blit_scale_dims(img.dimensions(), draw, false);
                 let resized = resized_image(&mut app.image_resize_cache, &img, ow * 2, oh);
-                paint_resized_quadrants(f, rect, &resized, 1.0, (0.0, 1.0));
+                paint_resized_quadrants(f, draw, &resized, 1.0, (0.0, 1.0));
+                if active {
+                    app.layout
+                        .program_attachment_image_rects
+                        .push((draw, path));
+                }
             }
             None => {
                 f.render_widget(
@@ -10861,12 +10868,12 @@ fn render_program_attachment_images(
                         .style(Style::default().fg(app.theme.danger)),
                     rect,
                 );
+                if active {
+                    app.layout
+                        .program_attachment_image_rects
+                        .push((rect, path));
+                }
             }
-        }
-        if active {
-            app.layout
-                .program_attachment_image_rects
-                .push((rect, path));
         }
     }
 }
@@ -10879,16 +10886,47 @@ fn render_program_attachment_hover(f: &mut Frame, app: &mut App) {
     let Some((mx, my)) = app.mouse_pos else {
         return;
     };
-    let Some(hit) = app
+    // Chip hover shows info + thumbnail; hovering an expanded image (which
+    // has no chip on a replaced line) shows the info card only — the image
+    // itself is already on screen.
+    let (hit, over_expanded_image) = match app
         .layout
         .program_attachment_hits
         .iter()
         .find(|h| h.contains(mx, my))
         .cloned()
-    else {
-        return;
+    {
+        Some(hit) => (hit, false),
+        None => {
+            let Some((_, path)) = app
+                .layout
+                .program_attachment_image_rects
+                .iter()
+                .find(|(r, _)| {
+                    mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height
+                })
+                .cloned()
+            else {
+                return;
+            };
+            let name = std::path::Path::new(&path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            (
+                crate::app::ProgramAttachmentHit {
+                    col_start: mx,
+                    col_end: mx + 1,
+                    row: my,
+                    name,
+                    path,
+                    is_image: true,
+                },
+                true,
+            )
+        }
     };
-    let preview = if hit.is_image {
+    let preview = if hit.is_image && !over_expanded_image {
         program_attachment_decoded(app, &hit.path)
     } else {
         None
@@ -14646,8 +14684,12 @@ fn program_heading_content(raw: &str) -> Option<(usize, &str)> {
 /// pass 0 from callers that only measure intra-line prefixes.
 fn program_rendered_line_text(app: Option<&App>, raw: &str, width: usize) -> String {
     let mut out = program_rendered_line_text_unpadded(app, raw);
-    if let Some((_, rows)) = program_expanded_attachment(app, raw) {
-        let pad = program_attachment_pad(&out, width, rows);
+    if let Some(exp) = program_expanded_attachment(app, raw) {
+        if exp.replaces_line {
+            // GitHub semantic: the image IS the line — no chip row.
+            return program_attachment_block_line(width, exp.rows);
+        }
+        let pad = program_attachment_pad(&out, width, exp.rows);
         out.push_str(&pad);
     }
     out
@@ -14781,7 +14823,19 @@ pub(crate) const PROGRAM_ATTACHMENT_MAX_ROWS: u16 = 40;
 /// that many image rows — produced by padding the rendered text (see
 /// [`program_attachment_pad`]) so every wrap-math consumer counts the same
 /// height without bespoke cases.
-fn program_expanded_attachment(app: Option<&App>, raw: &str) -> Option<(String, u16)> {
+/// An expanded inline image on `raw` (spec 0099). `replaces_line` is the
+/// CommonMark/GitHub semantic: when the link is the line's sole content, the
+/// image *replaces* the chip entirely (the line renders as the image alone,
+/// left-aligned). A mid-text link keeps its chip with the image on the rows
+/// below — a terminal grid can't grow one text line's height the way HTML
+/// line-boxes do.
+struct ProgramExpandedAttachment {
+    path: String,
+    rows: u16,
+    replaces_line: bool,
+}
+
+fn program_expanded_attachment(app: Option<&App>, raw: &str) -> Option<ProgramExpandedAttachment> {
     let popup = app?.program_popup.as_ref()?;
     if popup.expanded_attachments.is_empty() {
         return None;
@@ -14793,16 +14847,48 @@ fn program_expanded_attachment(app: Option<&App>, raw: &str) -> Option<(String, 
     {
         return None;
     }
-    // First expanded image link on the line wins; the block renders below
-    // the line's own wrapped rows wherever the link sits in it.
+    // First expanded image link on the line wins.
     let mut rest = raw;
     while let Some(link) = find_program_md_link(rest) {
         if let Some(rows) = popup.expanded_attachments.get(link.path) {
-            return Some((link.path.to_string(), *rows));
+            let replaces_line = find_program_md_link(trimmed)
+                .is_some_and(|only| only.start == 0 && only.end == trimmed.len());
+            return Some(ProgramExpandedAttachment {
+                path: link.path.to_string(),
+                rows: *rows,
+                replaces_line,
+            });
         }
         rest = &rest[link.end..];
     }
     None
+}
+
+/// Shrink an image's reserved rect to its scaled size, anchored at the
+/// LEFT edge (GitHub semantic: images are left-aligned in the flow, never
+/// centered) and the top. `paint_resized_quadrants` center-crops within the
+/// rect it's given, so passing an exact-fit rect eliminates the letterbox
+/// centering.
+fn program_attachment_draw_rect(dims: (u32, u32), rect: Rect) -> Rect {
+    let (ow, oh) = blit_scale_dims(dims, rect, false);
+    Rect {
+        x: rect.x,
+        y: rect.y,
+        width: (ow.min(rect.width as u32)) as u16,
+        height: (oh.div_ceil(2).min(rect.height as u32)) as u16,
+    }
+}
+
+/// Rendered text for a line whose image replaces it entirely: `rows` rows of
+/// braille-blank filler (see [`program_attachment_pad`] for why braille
+/// blank), which the image blits over left-aligned.
+fn program_attachment_block_line(width: usize, rows: u16) -> String {
+    if width < 2 || rows == 0 {
+        return String::new();
+    }
+    let first = "\u{2800}".repeat(width - 1);
+    let unit = format!(" {}", "\u{2800}".repeat(width - 1));
+    format!("{first}{}", unit.repeat(rows.saturating_sub(1) as usize))
 }
 
 /// Padding that stretches a rendered line by exactly `rows` extra wrapped
@@ -14987,8 +15073,13 @@ fn program_rendered_line_with_clips(
         let (body_text, clips) = program_inline_with_clips(app, body, leading);
         (format!("{lead}{body_text}"), clips)
     };
-    if let Some((_, rows)) = program_expanded_attachment(app, raw) {
-        let pad = program_attachment_pad(&text, width, rows);
+    if let Some(exp) = program_expanded_attachment(app, raw) {
+        if exp.replaces_line {
+            // No chip on a replaced line: the image's own rect is the only
+            // interactive surface (click collapses).
+            return (program_attachment_block_line(width, exp.rows), Vec::new());
+        }
+        let pad = program_attachment_pad(&text, width, exp.rows);
         text.push_str(&pad);
     }
     (text, clips)
@@ -15239,6 +15330,11 @@ fn program_line_col(markdown: &str, cursor: usize) -> (usize, usize) {
 }
 
 fn program_visual_col_for_line(app: Option<&App>, raw: &str, raw_col: usize) -> usize {
+    // A line replaced by its expanded image has no text cells; every caret
+    // position parks at the block's top-left.
+    if program_expanded_attachment(app, raw).is_some_and(|exp| exp.replaces_line) {
+        return 0;
+    }
     let leading = raw.chars().take_while(|ch| ch.is_whitespace()).count();
     let col = raw_col.saturating_sub(leading);
     let trimmed = raw.trim();
@@ -15350,7 +15446,16 @@ fn render_program_markdown_lines<'a>(
         } else {
             Vec::new()
         };
-        if trimmed.is_empty() {
+        // A line whose expanded image replaces it entirely (GitHub
+        // semantic, spec 0099) paints as its blank block only — the image
+        // blits over it after the Paragraph renders.
+        let replaced = program_expanded_attachment(Some(app), raw)
+            .filter(|exp| exp.replaces_line);
+        if let Some(exp) = replaced {
+            out.push(Line::from(Span::raw(program_attachment_block_line(
+                width, exp.rows,
+            ))));
+        } else if trimmed.is_empty() {
             out.push(Line::from(""));
         } else if let Some(level) = program_heading_level(trimmed) {
             // Slice the heading text from the raw line (leading indent stripped,
@@ -15419,9 +15524,9 @@ fn render_program_markdown_lines<'a>(
             ));
             // Expanded inline attachment on a bullet line (spec 0099): same
             // painted-height padding as the plain-line branch below.
-            if let Some((_, rows)) = program_expanded_attachment(Some(app), raw) {
+            if let Some(exp) = program_expanded_attachment(Some(app), raw) {
                 let painted: String = spans.iter().map(|s| s.content.as_ref()).collect();
-                spans.push(Span::raw(program_attachment_pad(&painted, width, rows)));
+                spans.push(Span::raw(program_attachment_pad(&painted, width, exp.rows)));
             }
             out.push(Line::from(spans));
         } else if let Some(rest) = trimmed.strip_prefix(":::clip") {
@@ -15471,12 +15576,12 @@ fn render_program_markdown_lines<'a>(
             // to the same wrapped height the layout math counts, so the
             // Paragraph's wrapping keeps subsequent lines aligned; the image
             // blits over the blank rows afterwards.
-            if let Some((_, rows)) = program_expanded_attachment(Some(app), raw) {
+            if let Some(exp) = program_expanded_attachment(Some(app), raw) {
                 let painted: String = spans
                     .iter()
                     .map(|s| s.content.as_ref())
                     .collect();
-                spans.push(Span::raw(program_attachment_pad(&painted, width, rows)));
+                spans.push(Span::raw(program_attachment_pad(&painted, width, exp.rows)));
             }
             out.push(Line::from(spans));
         }
