@@ -9,6 +9,8 @@ Scope: Web clients may choose how to view PTY-backed sessions that have semantic
 
 PTY-backed sessions open in terminal view by default. The web UI may offer a switch from terminal view to chat transcript view only for PTY sessions whose harness emits enough semantic transcript events for chat to be meaningful. Interactive harnesses that maintain native transcript files may watch those transcripts and mirror normalized message/tool/cost events into agentd while keeping the PTY as the interactive surface. Chat transcript view renders semantic transcript events and must not append raw PTY byte-stream events as chat text. Non-PTY sessions remain chat-only.
 
+Long histories hydrate from their recent tail. Older terminal bytes and semantic transcript events load in bounded, adjacent pages only when the reader scrolls near the top of the currently rendered history. Upward pagination must preserve the visible scroll anchor and must not drain the entire history in the background.
+
 ## Reason
 
 Terminal view preserves the live interactive surface for PTY harnesses, while chat transcript view is better for reading structured messages, tool events, and long history. Raw PTY output contains cursor movement, repaint frames, and status spinners that make append-only chat unreadable. Native transcript watchers let Codex, Claude, and Antigravity expose chat-mode history without scraping their terminal output.
@@ -17,7 +19,7 @@ Terminal view preserves the live interactive surface for PTY harnesses, while ch
 
 The selected view is user-facing state and may be remembered by the web client. Returning from chat view to terminal view must refresh or otherwise reconcile the terminal surface so it does not miss PTY or structured events that arrived while chat view was active. Sessions that only produce raw terminal output should remain terminal-only in the web UI.
 
-Returning from terminal view to a previously loaded chat view should reveal the cached transcript without refetching completed history. If chat history is still backfilling, the web client should preserve the reader's viewport, pause work that depends on visible layout while chat is hidden, and resume older-history loading when chat becomes visible again.
+Returning from terminal view to a previously loaded chat view should reveal the cached transcript without refetching its recent tail. Partially loaded history remains partial until the reader scrolls upward again; switching views must not implicitly resume or expand it.
 
 ## Non-Goals
 

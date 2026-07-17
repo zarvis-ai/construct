@@ -345,12 +345,12 @@ async fn web_client_loads_and_websocket_connects() {
         .expect("json value");
     assert_eq!(
         fast_open["replayCalls"][0]["max_bytes"],
-        128 * 1024,
+        64 * 1024,
         "{fast_open:?}"
     );
     assert_eq!(
         fast_open["replayCalls"][1]["max_bytes"],
-        128 * 1024,
+        64 * 1024,
         "{fast_open:?}"
     );
     assert_eq!(
@@ -513,11 +513,9 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(alt_screen_scrollback["secondSplitText"], "A");
     assert_eq!(alt_screen_scrollback["replayCalls"], 1);
 
-    // Chat-history regression: switching a semantic PTY session from chat to
-    // terminal while older transcript pages are still loading must pause that
-    // backfill, then resume it without refetching the tail or moving the chat
-    // viewport. Once the older history is complete, terminal->chat must be an
-    // instant cached reveal.
+    // Chat-history regression: opening and switching views must fetch only the
+    // recent tail. Each scroll to the top requests exactly one adjacent older
+    // page; returning from terminal view must not drain more history.
     let chat_history_toggle: serde_json::Value = page
         .evaluate(
             r#"
@@ -562,10 +560,10 @@ async fn web_client_loads_and_websocket_connects() {
                 for (let i = 0; i < 30 && pendingOlder.length === 0; i++) await tick();
                 if (pendingOlder.length === 0) throw new Error('expected pending older transcript request');
               };
-              const resolveNextOlder = () => {
+              const resolveNextOlder = (start) => {
                 const pending = pendingOlder.shift();
                 if (!pending) throw new Error('expected pending older transcript request');
-                pending.resolve({ events: makeEvents(0, 500), total: 1000 });
+                pending.resolve({ events: makeEvents(start, 500), total: 1500 });
               };
 
               try {
@@ -620,7 +618,7 @@ async fn web_client_loads_and_websocket_connects() {
                     const pending = state.pending.get(msg.id);
                     state.pending.delete(msg.id);
                     if (msg.method === 'session.transcript' && msg.params.tail) {
-                      queueMicrotask(() => pending.resolve({ events: makeEvents(500, 500), total: 1000 }));
+                      queueMicrotask(() => pending.resolve({ events: makeEvents(1000, 500), total: 1500 }));
                     } else if (msg.method === 'session.transcript') {
                       pendingOlder.push({ msg, resolve: pending.resolve });
                     } else {
@@ -631,34 +629,45 @@ async fn web_client_loads_and_websocket_connects() {
 
                 await loadTranscript(id);
                 const pane = transcriptPaneForSession(id);
+                transcriptEl.hidden = false;
+                pane.hidden = false;
                 const messagesAfterTail = renderedMessageCount(pane);
-                pane.scrollTop = pane.scrollHeight;
-                pane._atBottom = true;
-
-                await waitForOlderRequest();
-                await switchCurrentViewMode('terminal');
-                resolveNextOlder();
                 await tick();
-                const messagesWhileTerminal = renderedMessageCount(pane);
-
-                await switchCurrentViewMode('chat');
+                const olderCallsBeforeScroll = calls.filter((c) => c.method === 'session.transcript' && !c.params.tail).length;
+                pane.scrollTop = 0;
+                pane.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }));
                 await waitForOlderRequest();
-                resolveNextOlder();
+                const firstBefore = pendingOlder[0].msg.params.before;
+                resolveNextOlder(500);
                 await tick();
-                const messagesAfterResume = renderedMessageCount(pane);
-                const fromBottomAfterResume = pane.scrollHeight - pane.scrollTop - pane.clientHeight;
-                const historyCompleteAfterResume = pane.dataset.historyComplete;
+                const messagesAfterFirstPage = renderedMessageCount(pane);
+                const scrollTopAfterFirstPage = pane.scrollTop;
+                const olderCallsAfterFirstPage = calls.filter((c) => c.method === 'session.transcript' && !c.params.tail).length;
 
                 await switchCurrentViewMode('terminal');
                 await switchCurrentViewMode('chat');
                 await tick();
+                const olderCallsAfterViewSwitch = calls.filter((c) => c.method === 'session.transcript' && !c.params.tail).length;
+
+                pane.scrollTop = 0;
+                pane.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }));
+                await waitForOlderRequest();
+                const secondBefore = pendingOlder[0].msg.params.before;
+                resolveNextOlder(0);
+                await tick();
+                const messagesAfterSecondPage = renderedMessageCount(pane);
 
                 return {
                   messagesAfterTail,
-                  messagesWhileTerminal,
-                  messagesAfterResume,
-                  fromBottomAfterResume,
-                  historyCompleteAfterResume,
+                  messagesAfterFirstPage,
+                  messagesAfterSecondPage,
+                  scrollTopAfterFirstPage,
+                  olderCallsBeforeScroll,
+                  olderCallsAfterFirstPage,
+                  olderCallsAfterViewSwitch,
+                  firstBefore,
+                  secondBefore,
+                  historyComplete: pane.dataset.historyComplete,
                   tailCalls: calls.filter((c) => c.method === 'session.transcript' && c.params.tail).length,
                   olderCalls: calls.filter((c) => c.method === 'session.transcript' && !c.params.tail).length,
                   pendingOlder: pendingOlder.length,
@@ -702,19 +711,35 @@ async fn web_client_loads_and_websocket_connects() {
         "tail should render first: {chat_history_toggle:?}"
     );
     assert_eq!(
-        chat_history_toggle["messagesWhileTerminal"].as_u64(),
-        Some(500),
-        "hidden terminal mode must not insert older chat rows: {chat_history_toggle:?}"
+        chat_history_toggle["olderCallsBeforeScroll"].as_u64(),
+        Some(0),
+        "opening the tail must not start an older-page request: {chat_history_toggle:?}"
     );
     assert_eq!(
-        chat_history_toggle["messagesAfterResume"].as_u64(),
+        chat_history_toggle["messagesAfterFirstPage"].as_u64(),
         Some(1000),
-        "chat return should resume older history: {chat_history_toggle:?}"
+        "one upward scroll should add one page: {chat_history_toggle:?}"
     );
     assert_eq!(
-        chat_history_toggle["historyCompleteAfterResume"].as_str(),
+        chat_history_toggle["messagesAfterSecondPage"].as_u64(),
+        Some(1500),
+        "a second upward scroll should add the next page: {chat_history_toggle:?}"
+    );
+    assert_eq!(chat_history_toggle["firstBefore"], 1000);
+    assert_eq!(chat_history_toggle["secondBefore"], 500);
+    assert_eq!(chat_history_toggle["olderCallsAfterFirstPage"], 1);
+    assert_eq!(chat_history_toggle["olderCallsAfterViewSwitch"], 1);
+    assert!(
+        chat_history_toggle["scrollTopAfterFirstPage"]
+            .as_f64()
+            .unwrap_or_default()
+            > 100.0,
+        "prepending a page should preserve the old top row in view: {chat_history_toggle:?}"
+    );
+    assert_eq!(
+        chat_history_toggle["historyComplete"].as_str(),
         Some("true"),
-        "history should complete after resumed backfill: {chat_history_toggle:?}"
+        "history should complete after the second explicit page: {chat_history_toggle:?}"
     );
     assert_eq!(
         chat_history_toggle["tailCalls"].as_u64(),
@@ -724,15 +749,7 @@ async fn web_client_loads_and_websocket_connects() {
     assert_eq!(
         chat_history_toggle["olderCalls"].as_u64(),
         Some(2),
-        "one paused older request and one resumed older request expected: {chat_history_toggle:?}"
-    );
-    assert!(
-        chat_history_toggle["fromBottomAfterResume"]
-            .as_f64()
-            .unwrap_or_default()
-            .abs()
-            < 2.0,
-        "viewport should remain at latest message: {chat_history_toggle:?}"
+        "exactly two user-triggered older requests expected: {chat_history_toggle:?}"
     );
     assert_eq!(
         chat_history_toggle["pendingOlder"].as_u64(),
