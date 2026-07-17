@@ -13,10 +13,10 @@ active keyboard focus or the pointer is over the session-list header or rows.
 The scrollbar hides when neither condition is true. Hovering the lineage or
 operator regions below the rows does not reveal the session-list scrollbar.
 
-The scrollbar is an overlay tint: it does not reserve a column, reflow row
-labels, or change the list's geometry when it appears. Its thumb and track are
-mouse-interactive for dragging and jumping, while the existing mouse-wheel and
-keyboard scrolling behavior remains unchanged.
+The scrollbar is a slim right-edge overlay: it does not reserve a column,
+reflow row labels, or change the list's geometry when it appears. Its thumb
+and track retain a full-cell mouse target for dragging and jumping, while the
+existing mouse-wheel and keyboard scrolling behavior remains unchanged.
 
 ## Reason
 
