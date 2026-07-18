@@ -90,6 +90,16 @@ const PTY_QUIESCENCE: Duration = Duration::from_secs(2);
 /// paint+erase pair can never qualify — its two events would need a gap
 /// under the quiescence window spanning at least this window.
 const PTY_BLIP_WINDOW: Duration = Duration::from_secs(2);
+/// Bounds for the post-respawn settle window during which PTY output is
+/// treated as the resumed child repainting old content rather than activity
+/// (spec 0054). The window can't end before [`RESUME_SETTLE_MIN`] — the
+/// resume repaint plus the delayed force-redraw cycle (see
+/// [`RESPAWN_REDRAW_MAX_WAIT`]) must both land inside it — then ends once
+/// output has been quiet for [`PTY_QUIESCENCE`], or unconditionally at
+/// [`RESUME_SETTLE_MAX`] (a child streaming that long past a resume is
+/// genuinely working; its eventual stop deserves the marker).
+const RESUME_SETTLE_MIN: Duration = Duration::from_secs(10);
+const RESUME_SETTLE_MAX: Duration = Duration::from_secs(30);
 const PROGRAM_RUN_MAX_MS: i64 = 10 * 60 * 1000;
 
 const MAX_CLIPBOARD_ATTACHMENT_BYTES: usize = 50 * 1024 * 1024;
@@ -364,6 +374,16 @@ pub struct SessionEntry {
     /// harnesses, filtering out idle housekeeping repaints. Advanced by
     /// [`pty_burst_advance`]. Not persisted — restarts as "no burst".
     pty_burst_start_ms: AtomicI64,
+    /// Epoch ms when a respawn-with-repaint began settling; 0 = not settling.
+    /// A respawned full-screen child redraws its *old* conversation (and the
+    /// post-resume force-redraw cycle repaints it again) — sustained output
+    /// that would otherwise defeat the blip filter and read as genuine unseen
+    /// activity, lighting the `needs_attention` dot on every backgrounded
+    /// session after a daemon restart. While set, PTY output neither marks
+    /// unseen activity nor undoes a quiescence-driven `AwaitingInput`.
+    /// Cleared by the quiescence poll via [`resume_settle_over`]. Not
+    /// persisted. See spec 0054.
+    resume_settling_since_ms: AtomicI64,
     /// Carry-over for OSC 11 background-probe scanning across PTY chunk
     /// boundaries (spec 0073): holds an ambiguous trailing prefix of a query
     /// (≤7 bytes) withheld from the downstream stream until the next chunk
@@ -1479,6 +1499,7 @@ impl SessionManager {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
                 osc11_tail: std::sync::Mutex::new(Vec::new()),
             };
             sessions.insert(s.id.clone(), Arc::new(entry));
@@ -4275,6 +4296,13 @@ impl SessionManager {
         for entry in entries {
             let stale = {
                 let s = entry.summary.read().await;
+                // End a post-respawn settle window once the resume repaint has
+                // gone quiet, so later output counts as activity again. See
+                // spec 0054 and `SessionEntry::resume_settling_since_ms`.
+                let settle_since = entry.resume_settling_since_ms.load(Ordering::Relaxed);
+                if settle_since > 0 && resume_settle_over(settle_since, s.last_pty_at_ms, now_ms) {
+                    entry.resume_settling_since_ms.store(0, Ordering::Relaxed);
+                }
                 harness_uses_quiescence(&s)
                     && s.state == SessionState::Running
                     && s.last_pty_at_ms
@@ -4483,6 +4511,7 @@ impl SessionManager {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+            resume_settling_since_ms: AtomicI64::new(0),
             osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
 
@@ -4798,6 +4827,27 @@ fn harness_uses_quiescence(s: &SessionSummary) -> bool {
 /// rather than an idle housekeeping blip. A gap of [`PTY_QUIESCENCE`] or more
 /// since the previous output starts a new burst: that is the same silence
 /// that flips the session to AwaitingInput, so a burst can't straddle it.
+/// Whether a post-respawn settle window that began at `since_ms` is over
+/// (spec 0054). Never before [`RESUME_SETTLE_MIN`] — the resume repaint and
+/// the delayed force-redraw cycle must both land inside the window. After
+/// that, over once PTY output has been quiet for [`PTY_QUIESCENCE`] (a stale
+/// pre-restart `last_pty_at_ms`, or none at all, counts as quiet — a child
+/// that never repainted has nothing to suppress). Unconditionally over at
+/// [`RESUME_SETTLE_MAX`] so a child streaming continuously past the resume
+/// regains normal activity tracking.
+fn resume_settle_over(since_ms: i64, last_pty_at_ms: Option<i64>, now_ms: i64) -> bool {
+    let elapsed = now_ms.saturating_sub(since_ms);
+    if elapsed >= RESUME_SETTLE_MAX.as_millis() as i64 {
+        return true;
+    }
+    if elapsed < RESUME_SETTLE_MIN.as_millis() as i64 {
+        return false;
+    }
+    last_pty_at_ms.map_or(true, |last| {
+        now_ms.saturating_sub(last) >= PTY_QUIESCENCE.as_millis() as i64
+    })
+}
+
 fn pty_burst_advance(burst_start_ms: i64, prev_pty_at_ms: Option<i64>, now_ms: i64) -> (i64, bool) {
     let new_burst = burst_start_ms <= 0
         || prev_pty_at_ms.map_or(true, |last| {
@@ -5562,6 +5612,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+            resume_settling_since_ms: AtomicI64::new(0),
             osc11_tail: std::sync::Mutex::new(Vec::new()),
         })
     }
@@ -7462,6 +7513,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+            resume_settling_since_ms: AtomicI64::new(0),
             osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
         manager
@@ -7604,6 +7656,7 @@ mod tests {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+            resume_settling_since_ms: AtomicI64::new(0),
             osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
         manager
@@ -7720,6 +7773,55 @@ mod tests {
         }
     }
 
+    /// The post-respawn settle window: never over before RESUME_SETTLE_MIN,
+    /// over once output has been quiet for PTY_QUIESCENCE after that (stale
+    /// pre-restart output or none at all counts as quiet), and always over
+    /// at RESUME_SETTLE_MAX. Spec 0054.
+    #[test]
+    fn resume_settle_window_bounds() {
+        let since: i64 = 10_000_000;
+        let min = RESUME_SETTLE_MIN.as_millis() as i64;
+        let max = RESUME_SETTLE_MAX.as_millis() as i64;
+        let quiet = PTY_QUIESCENCE.as_millis() as i64;
+
+        // Repaint mid-stream inside the minimum window: not over.
+        assert!(!resume_settle_over(since, Some(since + 500), since + 1_000));
+        // Quiet, but the minimum window (which must also cover the delayed
+        // force-redraw repaint) hasn't elapsed: not over.
+        assert!(!resume_settle_over(
+            since,
+            Some(since + 500),
+            since + min - 1
+        ));
+        // Past the minimum and the repaint has gone quiet: over.
+        assert!(resume_settle_over(
+            since,
+            Some(since + min - quiet),
+            since + min
+        ));
+        // Past the minimum but output is still arriving: not over.
+        assert!(!resume_settle_over(
+            since,
+            Some(since + min - 100),
+            since + min
+        ));
+        // A child that never repainted has nothing to suppress: the stale
+        // pre-restart timestamp (or none) reads as quiet at the minimum.
+        assert!(resume_settle_over(since, Some(since - 60_000), since + min));
+        assert!(resume_settle_over(since, None, since + min));
+        // A child streaming continuously past the resume: hard cap.
+        assert!(!resume_settle_over(
+            since,
+            Some(since + max - 100),
+            since + max - 1
+        ));
+        assert!(resume_settle_over(
+            since,
+            Some(since + max - 100),
+            since + max
+        ));
+    }
+
     /// Regression: claude's idle housekeeping — a "Checking for updates"
     /// painted into the status area every 30 minutes and erased half a second
     /// later — must not flip an idle unfocused session to Running, and must
@@ -7763,6 +7865,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
                 osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
@@ -7812,6 +7915,148 @@ mod tests {
         );
     }
 
+    /// Regression: a daemon restart must not light the needs_attention dot on
+    /// every backgrounded session. A respawned full-screen child repaints its
+    /// old conversation — a sustained burst that passes the blip filter — and
+    /// the quiescence sweep then flips the session idle, which used to raise
+    /// the dot with nothing new to see. While the resume settles, repaint
+    /// output must neither count as unseen activity nor undo an idle; once
+    /// the settle window ends, output counts again. Spec 0054.
+    #[tokio::test]
+    async fn marker_ignores_resume_repaint() {
+        use tempfile::tempdir;
+        use tokio::sync::RwLock;
+
+        let tmp = tempdir().expect("tempdir");
+        let storage =
+            Arc::new(crate::storage::Storage::new(tmp.path().join("data")).expect("storage"));
+        let config = Arc::new(crate::config::Config::default());
+        let (mgr, _remote_rx, _restart_rx) =
+            SessionManager::new(storage, config, tmp.path().join("run"))
+                .await
+                .expect("session manager");
+        let manager = Arc::new(mgr);
+
+        let build = |id: &str, state: SessionState| {
+            let mut summary = placement_summary(id, 0, None, construct_protocol::SessionKind::User);
+            summary.harness = "claude".into();
+            summary.has_pty = true;
+            summary.state = state;
+            Arc::new(SessionEntry {
+                id: id.to_string(),
+                summary: RwLock::new(summary),
+                transcript_count: AtomicU64::new(0),
+                adapter: tokio::sync::Mutex::new(None),
+                pty: tokio::sync::Mutex::new(PtyState::default()),
+                deleted: AtomicBool::new(false),
+                archived: AtomicBool::new(false),
+                title_gen_attempted: AtomicBool::new(false),
+                pending_title_prompts: std::sync::Mutex::new(Vec::new()),
+                pty_input_capture: tokio::sync::Mutex::new(PtyInputCapture::default()),
+                pty_input_queue: std::sync::Mutex::new(None),
+                tasks: tokio::sync::Mutex::new(TaskRegistry::default()),
+                pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
+                unseen_activity: AtomicBool::new(false),
+                pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
+                osc11_tail: std::sync::Mutex::new(Vec::new()),
+            })
+        };
+
+        // Two just-respawned sessions; the operator is looking at a third.
+        let resumed = build("resumed-running", SessionState::Running);
+        let idle = build("resumed-idle", SessionState::AwaitingInput);
+        let other = build("other", SessionState::Running);
+        {
+            let mut sessions = manager.sessions.write().await;
+            sessions.insert("resumed-running".into(), resumed.clone());
+            sessions.insert("resumed-idle".into(), idle.clone());
+            sessions.insert("other".into(), other.clone());
+        }
+        manager.mark_seen("other").await.expect("mark_seen other");
+
+        // Respawn opened the settle window, and the resume repaint has
+        // already sustained past the blip window.
+        let now_ms = Utc::now().timestamp_millis();
+        for entry in [&resumed, &idle] {
+            entry
+                .resume_settling_since_ms
+                .store(now_ms, Ordering::Relaxed);
+            entry
+                .pty_burst_start_ms
+                .store(now_ms - 3_000, Ordering::Relaxed);
+            entry.summary.write().await.last_pty_at_ms = Some(now_ms - 100);
+        }
+
+        // More repaint output: no unseen activity, and the idle session must
+        // not flip back to Running.
+        manager
+            .handle_event(&resumed, SessionEvent::pty(b"repaint"))
+            .await;
+        manager
+            .handle_event(&idle, SessionEvent::pty(b"repaint"))
+            .await;
+        assert!(
+            !resumed.unseen_activity.load(Ordering::Relaxed),
+            "a resume repaint must not count as unseen activity",
+        );
+        assert!(!idle.unseen_activity.load(Ordering::Relaxed));
+        assert_eq!(
+            idle.summary.read().await.state,
+            SessionState::AwaitingInput,
+            "a resume repaint must not undo an idle session's AwaitingInput",
+        );
+
+        // The quiescence sweep flips the running one idle → no dot.
+        manager
+            .handle_event(
+                &resumed,
+                SessionEvent::Status {
+                    state: SessionState::AwaitingInput,
+                    detail: None,
+                },
+            )
+            .await;
+        assert!(
+            !resumed.summary.read().await.needs_attention,
+            "going idle after a resume repaint must not light the dot",
+        );
+
+        // Settle window over (the quiescence poll cleared it): a fresh
+        // sustained burst counts again, and the next stop raises the dot.
+        resumed.resume_settling_since_ms.store(0, Ordering::Relaxed);
+        let now_ms = Utc::now().timestamp_millis();
+        resumed
+            .pty_burst_start_ms
+            .store(now_ms - 3_000, Ordering::Relaxed);
+        resumed.summary.write().await.last_pty_at_ms = Some(now_ms - 100);
+        manager
+            .handle_event(&resumed, SessionEvent::pty(b"new turn"))
+            .await;
+        assert!(
+            resumed.unseen_activity.load(Ordering::Relaxed),
+            "post-settle output must count as unseen activity again",
+        );
+        assert_eq!(
+            resumed.summary.read().await.state,
+            SessionState::Running,
+            "post-settle output must undo a quiescence idle again",
+        );
+        manager
+            .handle_event(
+                &resumed,
+                SessionEvent::Status {
+                    state: SessionState::AwaitingInput,
+                    detail: None,
+                },
+            )
+            .await;
+        assert!(
+            resumed.summary.read().await.needs_attention,
+            "a genuine post-settle stop must raise the marker",
+        );
+    }
+
     /// The `needs_attention` marker tracks "this session needs you": raised when
     /// a session with unseen activity leaves `Running` while unfocused, cleared
     /// by `mark_seen` or a return to `Running`, suppressed for the focused
@@ -7852,6 +8097,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
                 osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
@@ -7964,6 +8210,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
                 osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };
@@ -8049,6 +8296,7 @@ mod tests {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
                 osc11_tail: std::sync::Mutex::new(Vec::new()),
             })
         };

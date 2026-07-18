@@ -243,6 +243,7 @@ impl SessionManager {
             pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
             unseen_activity: AtomicBool::new(false),
             pty_burst_start_ms: AtomicI64::new(0),
+            resume_settling_since_ms: AtomicI64::new(0),
             osc11_tail: std::sync::Mutex::new(Vec::new()),
         });
 
@@ -621,6 +622,19 @@ impl SessionManager {
             if let Err(e) = self.storage.truncate_pty_log(id) {
                 tracing::warn!(session = %id, error = ?e, "truncate_pty_log on respawn failed");
             }
+        }
+
+        // The respawned child is about to repaint its old conversation, and
+        // the force-redraw cycle below repaints it again. That output is old
+        // content, not new activity: without a settle window it reads as a
+        // sustained unseen burst, and the quiescence sweep then raises the
+        // needs_attention dot on every backgrounded session after a daemon
+        // restart. The quiescence poll ends the window once the repaint goes
+        // quiet. See spec 0054.
+        if info.capabilities.supports_pty && !info.capabilities.supports_silent_resume {
+            entry
+                .resume_settling_since_ms
+                .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
         }
 
         adapter

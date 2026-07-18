@@ -324,13 +324,22 @@ impl SessionManager {
                 } else {
                     true
                 };
+                // A respawned child repainting its old conversation is not
+                // activity either — while the resume settles, output must
+                // neither mark unseen activity nor undo an idle, or every
+                // daemon restart lights the dot on all backgrounded
+                // sessions. The quiescence poll ends the window. See spec 0054.
+                let settling = entry.resume_settling_since_ms.load(Ordering::Relaxed) > 0;
                 // PTY output the operator isn't looking at is unseen activity — it's
                 // what makes a later idle "need you". Output in the focused session
                 // (their own keystrokes echoing) must not count. See spec 0054.
-                if genuine && !is_focused {
+                if genuine && !settling && !is_focused {
                     entry.unseen_activity.store(true, Ordering::Relaxed);
                 }
-                if genuine && harness_uses_quiescence(&s) && s.state == SessionState::AwaitingInput
+                if genuine
+                    && !settling
+                    && harness_uses_quiescence(&s)
+                    && s.state == SessionState::AwaitingInput
                 {
                     crate::session::set_state_tracked(&mut s, SessionState::Running, now_ms);
                     s.pending_input = false;
@@ -643,6 +652,7 @@ impl SessionManager {
                 pty_client_policy: std::sync::Mutex::new(PtyClientPolicy::default()),
                 unseen_activity: AtomicBool::new(false),
                 pty_burst_start_ms: AtomicI64::new(0),
+                resume_settling_since_ms: AtomicI64::new(0),
                 osc11_tail: std::sync::Mutex::new(Vec::new()),
             });
             if let Err(error) = self.storage.save_summary(&summary) {

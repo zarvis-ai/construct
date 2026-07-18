@@ -52,9 +52,22 @@ on you."
   blips leave the session's state and markers completely untouched; without
   this rule every idle, unfocused session re-raises its marker on each
   housekeeping repaint, showing the operator a dot with nothing new to see.
+- **A resume repaint is not activity.** When the daemon respawns a session
+  whose harness repaints itself on resume (and when the daemon then forces an
+  additional redraw), the child redraws its *old* conversation — sustained
+  output that is byte-wise indistinguishable from a real turn and therefore
+  defeats the blip filter. During a bounded settle window after such a
+  respawn, PTY output neither counts as unseen activity nor undoes a
+  quiescence-driven idle. The window ends once the repaint has gone quiet
+  (never before a minimum long enough to also cover the daemon's delayed
+  forced redraw, and always by a hard cap so a child genuinely streaming
+  through the resume regains normal tracking). Without this rule, every
+  daemon restart raises the marker on every backgrounded session — a fleet
+  of dots with nothing new behind them.
 - **The marker is persisted** and survives daemon and client restarts. On
   restart, sessions that were waiting still show the marker; a reconnecting
-  viewer re-asserts focus so the session it is looking at clears.
+  viewer re-asserts focus so the session it is looking at clears. Restart
+  must only *preserve* markers, never *manufacture* them.
 - **Collapsed ancestors roll up hidden markers.** If a non-archived descendant
   needs attention while its parent session or project is collapsed, the
   collapsed ancestor row shows the blue dot. Expanding the ancestor removes
@@ -101,6 +114,13 @@ daemon, which already tracks last-output time.
 - A housekeeping message that paints and stays (e.g. "update available") does
   not flag either — a single repaint is not a sustained burst. Accepted: the
   marker signals a stop after work, not passive notices.
+- The resume settle window trades a rare miss for restart silence: a session
+  that was genuinely mid-turn at shutdown and finishes within the window
+  after the respawn does not flag on that stop. Accepted — old-content
+  repaints and truly-continuing streams are indistinguishable byte-wise, the
+  repaint case dominates by orders of magnitude, and the miss self-heals on
+  the session's next real turn. A session still streaming past the window's
+  hard cap flags normally when it eventually stops.
 - The "focused session" used to suppress the marker is global to the daemon
   (last switch wins). With multiple simultaneous viewers this is approximate;
   single-operator use is exact. Don't build per-viewer marker state on top of
@@ -129,6 +149,10 @@ daemon, which already tracks last-output time.
 - The daemon restarts while three sessions were waiting → all three still show
   the dot; the session the operator reopens clears as the viewer re-asserts
   focus.
+- The daemon restarts with ten idle, un-marked sessions → each respawned
+  harness repaints its old screen over several seconds and goes quiet →
+  still ten idle, un-marked sessions. No dots appear from the restart
+  itself.
 - An idle coding-assistant session paints "Checking for updates" in its status
   bar every 30 minutes and erases it half a second later → no state change, no
   dot. The same session streaming a real answer for several seconds and then
