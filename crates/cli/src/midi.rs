@@ -182,7 +182,7 @@ impl Default for OpXyAuxConfig {
 }
 
 fn default_op_xy_aux_focused_note_channels() -> Vec<u8> {
-    vec![9, 10]
+    vec![10]
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1421,12 +1421,12 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_aux_existing_config_defaults_focused_note_channels() {
+    fn op_xy_aux_existing_config_defaults_external_midi_note_channel() {
         let config: OpXyAuxConfig = toml::from_str(
             "enabled = true\nchannel = 10\narrow_cc = 2\nscroll_cc = 3\n",
         )
         .unwrap();
-        assert_eq!(config.focused_note_channels, vec![9, 10]);
+        assert_eq!(config.focused_note_channels, vec![10]);
     }
 
     #[test]
@@ -1616,33 +1616,30 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_aux_two_and_three_notes_reuse_controls_for_focused_pane() {
+    fn op_xy_external_midi_notes_reuse_controls_for_focused_pane() {
         let mut profile = op_xy_profile();
         profile.prompt_texts = vec!["focused prompt".into()];
 
-        for channel_status in [0x98, 0x99] {
-            assert_eq!(
-                profile
-                    .focused_event_for(&parse_message(&[channel_status, 56, 100]).unwrap()),
-                Some(OpXyControl::Session(3))
-            );
-            assert_eq!(
-                profile
-                    .focused_event_for(&parse_message(&[channel_status, 48, 100]).unwrap()),
-                Some(OpXyControl::Prompt {
-                    slot: 0,
-                    text: "focused prompt".into(),
-                })
-            );
-            assert_eq!(
-                profile
-                    .focused_event_for(&parse_message(&[channel_status, 60, 100]).unwrap()),
-                Some(OpXyControl::Left)
-            );
-        }
+        assert_eq!(
+            profile.focused_event_for(&parse_message(&[0x99, 56, 100]).unwrap()),
+            Some(OpXyControl::Session(3))
+        );
+        assert_eq!(
+            profile.focused_event_for(&parse_message(&[0x99, 48, 100]).unwrap()),
+            Some(OpXyControl::Prompt {
+                slot: 0,
+                text: "focused prompt".into(),
+            })
+        );
+        assert_eq!(
+            profile.focused_event_for(&parse_message(&[0x99, 60, 100]).unwrap()),
+            Some(OpXyControl::Left)
+        );
 
+        // OP-XY Aux 2 is the internal Punch-In FX track and does not emit
+        // these notes. Channel 9 is deliberately not enabled by default.
         assert!(profile
-            .focused_event_for(&parse_message(&[0x97, 56, 100]).unwrap())
+            .focused_event_for(&parse_message(&[0x98, 56, 100]).unwrap())
             .is_none());
         assert!(profile
             .focused_event_for(&parse_message(&[0x88, 56, 0]).unwrap())

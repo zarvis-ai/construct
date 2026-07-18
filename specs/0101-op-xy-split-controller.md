@@ -27,11 +27,12 @@ without submitting it. Empty or missing prompt slots do nothing. Their notes
 are derived from the learned first-black-key anchor and normalized across pane
 track octaves, so adding prompts does not require relearning the controller.
 
-Auxiliary tracks 2 and 3 reuse every learned black- and white-key meaning but
-address the currently focused split pane instead of a track-selected pane.
-Their note channels are configurable and default to MIDI channels 9 and 10.
-The existing Auxiliary 3 absolute-encoder controls remain independent of this
-note routing.
+The Auxiliary 3 external-MIDI track reuses every learned black- and white-key
+meaning but addresses the currently focused split pane instead of a
+track-selected pane. Its note channels are configurable and default to MIDI
+channel 10. Its existing absolute-encoder controls remain independent of this
+note routing. Auxiliary 2 is reserved for OP-XY's internal Punch-In FX engine
+and does not emit a native MIDI control stream for Construct.
 
 Scene and transport feedback aggregate the eight sessions resolved into
 `[1]`–`[8]` hardware slots independently of TUI focus. Hidden, archived,
