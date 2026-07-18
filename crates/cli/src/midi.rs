@@ -125,8 +125,38 @@ pub struct OpXyConfig {
     /// A sequenced display note that Construct must consume without action.
     pub no_op_note: Option<u8>,
     /// Persistent session ids for controller slots 1 through 8.
+    #[serde(
+        serialize_with = "serialize_session_slots",
+        deserialize_with = "deserialize_session_slots"
+    )]
     pub session_slots: Vec<Option<String>>,
     pub feedback: OpXyFeedbackConfig,
+}
+
+fn serialize_session_slots<S>(
+    slots: &[Option<String>],
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    slots
+        .iter()
+        .map(|slot| slot.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn deserialize_session_slots<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(|slot| (!slot.is_empty()).then_some(slot))
+        .collect())
 }
 
 impl OpXyConfig {
@@ -1075,6 +1105,31 @@ mod tests {
         });
         config.save(&path).unwrap();
         assert_eq!(MidiConfig::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn op_xy_profile_with_empty_slots_round_trips_as_toml() {
+        let config = MidiConfig {
+            device: Some("OP-XY Bluetooth".into()),
+            mappings: Vec::new(),
+            op_xy: Some(OpXyConfig {
+                enabled: true,
+                pane_channels: vec![5, 6, 7, 8],
+                session_notes: vec![54, 56, 58, 61, 63, 66, 68, 70],
+                left_note: Some(72),
+                down_note: Some(74),
+                right_note: Some(76),
+                up_note: Some(73),
+                enter_note: Some(75),
+                no_op_note: Some(71),
+                session_slots: vec![None; 8],
+                feedback: OpXyFeedbackConfig::default(),
+            }),
+        };
+
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        assert!(encoded.contains("session_slots = ["));
+        assert_eq!(toml::from_str::<MidiConfig>(&encoded).unwrap(), config);
     }
 
     #[test]
