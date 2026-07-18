@@ -15,7 +15,10 @@ use anyhow::bail;
 use anyhow::{Context, Result};
 use clap::{Subcommand, ValueEnum};
 #[cfg(target_os = "macos")]
-use midir::{Ignore, MidiInput, MidiInputConnection, MidiInputPort};
+use midir::{
+    Ignore, MidiInput, MidiInputConnection, MidiInputPort, MidiOutput, MidiOutputConnection,
+    MidiOutputPort,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -46,6 +49,125 @@ pub enum MidiCommand {
         #[arg(value_enum)]
         action: MidiAction,
     },
+    /// Learn the dedicated OP-XY split/session controller layout.
+    OpXyLearn {
+        /// Case-insensitive substring of the OP-XY MIDI device name.
+        #[arg(long)]
+        device: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpXyControl {
+    Session(usize),
+    Left,
+    Down,
+    Right,
+    Up,
+    Enter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpXyEvent {
+    /// Zero-based visual pane position: left-to-right, then top-to-bottom.
+    pub pane: usize,
+    pub control: OpXyControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MidiInputEvent {
+    Action(MidiAction),
+    OpXy(OpXyEvent),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeedbackState {
+    Idle,
+    Working,
+    Attention,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OpXyFeedbackConfig {
+    pub enabled: bool,
+    /// Scene numbers are written as the one-based numbers shown by OP-XY.
+    pub working_scene: u8,
+    pub attention_scene_a: u8,
+    pub attention_scene_b: u8,
+    pub clock_bpm: f64,
+}
+
+impl Default for OpXyFeedbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            working_scene: 1,
+            attention_scene_a: 3,
+            attention_scene_b: 4,
+            clock_bpm: 120.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct OpXyConfig {
+    pub enabled: bool,
+    /// One-based MIDI channels corresponding to visual panes 1 through 4.
+    pub pane_channels: Vec<u8>,
+    pub session_notes: Vec<u8>,
+    pub left_note: Option<u8>,
+    pub down_note: Option<u8>,
+    pub right_note: Option<u8>,
+    pub up_note: Option<u8>,
+    pub enter_note: Option<u8>,
+    /// A sequenced display note that Construct must consume without action.
+    pub no_op_note: Option<u8>,
+    /// Persistent session ids for controller slots 1 through 8.
+    pub session_slots: Vec<Option<String>>,
+    pub feedback: OpXyFeedbackConfig,
+}
+
+impl OpXyConfig {
+    fn event_for(&self, message: &MidiMessage) -> Option<OpXyEvent> {
+        if !self.enabled
+            || message.kind != MidiMessageKind::Note
+            || !message.pressed
+            || self.no_op_note == Some(message.number)
+        {
+            return None;
+        }
+        let pane = self
+            .pane_channels
+            .iter()
+            .position(|channel| *channel == message.channel)?;
+        let control = if let Some(slot) = self
+            .session_notes
+            .iter()
+            .position(|note| *note == message.number)
+        {
+            OpXyControl::Session(slot)
+        } else if self.left_note == Some(message.number) {
+            OpXyControl::Left
+        } else if self.down_note == Some(message.number) {
+            OpXyControl::Down
+        } else if self.right_note == Some(message.number) {
+            OpXyControl::Right
+        } else if self.up_note == Some(message.number) {
+            OpXyControl::Up
+        } else if self.enter_note == Some(message.number) {
+            OpXyControl::Enter
+        } else {
+            return None;
+        };
+        Some(OpXyEvent { pane, control })
+    }
+
+    fn normalize(&mut self) {
+        self.session_slots.resize(8, None);
+        self.session_slots.truncate(8);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum, Ord, PartialOrd)]
@@ -216,12 +338,13 @@ impl MidiMapping {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct MidiConfig {
     /// Case-insensitive device-name substring. Learn stores the full name.
     pub device: Option<String>,
     pub mappings: Vec<MidiMapping>,
+    pub op_xy: Option<OpXyConfig>,
 }
 
 impl MidiConfig {
@@ -259,12 +382,17 @@ pub(crate) struct MidiListener {
 #[cfg(not(target_os = "macos"))]
 pub(crate) struct MidiListener;
 
+type MidiEventReceiver = mpsc::UnboundedReceiver<MidiInputEvent>;
+
 #[cfg(target_os = "macos")]
-pub(crate) fn start_listener() -> Result<Option<(MidiListener, mpsc::UnboundedReceiver<MidiAction>)>>
-{
+pub(crate) fn start_listener() -> Result<Option<(MidiListener, MidiEventReceiver)>> {
     let path = Paths::discover().midi_file();
-    let config = MidiConfig::load(&path)?;
-    if config.mappings.is_empty() {
+    let mut config = MidiConfig::load(&path)?;
+    if let Some(op_xy) = config.op_xy.as_mut() {
+        op_xy.normalize();
+    }
+    let op_xy_enabled = config.op_xy.as_ref().is_some_and(|profile| profile.enabled);
+    if config.mappings.is_empty() && !op_xy_enabled {
         return Ok(None);
     }
     let device = config.device.as_deref().context(format!(
@@ -276,6 +404,7 @@ pub(crate) fn start_listener() -> Result<Option<(MidiListener, mpsc::UnboundedRe
     let port = find_port(&input, Some(device))?;
     let port_name = input.port_name(&port).context("read MIDI device name")?;
     let mappings = config.mappings;
+    let op_xy = config.op_xy;
     let (tx, rx) = mpsc::unbounded_channel();
     let connection = input
         .connect(
@@ -285,9 +414,16 @@ pub(crate) fn start_listener() -> Result<Option<(MidiListener, mpsc::UnboundedRe
                 let Some(message) = parse_message(bytes) else {
                     return;
                 };
+                if let Some(event) = op_xy
+                    .as_ref()
+                    .and_then(|profile| profile.event_for(&message))
+                {
+                    let _ = tx.send(MidiInputEvent::OpXy(event));
+                    return;
+                }
                 for mapping in &mappings {
                     if mapping.matches(&message) {
-                        let _ = tx.send(mapping.action);
+                        let _ = tx.send(MidiInputEvent::Action(mapping.action));
                     }
                 }
             },
@@ -304,8 +440,7 @@ pub(crate) fn start_listener() -> Result<Option<(MidiListener, mpsc::UnboundedRe
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn start_listener() -> Result<Option<(MidiListener, mpsc::UnboundedReceiver<MidiAction>)>>
-{
+pub(crate) fn start_listener() -> Result<Option<(MidiListener, MidiEventReceiver)>> {
     anyhow::bail!("native MIDI control is currently supported on macOS")
 }
 
@@ -325,6 +460,7 @@ pub async fn run(command: Option<MidiCommand>) -> Result<()> {
             trigger,
         }) => learn(action, device.as_deref(), trigger),
         Some(MidiCommand::Forget { action }) => forget(action),
+        Some(MidiCommand::OpXyLearn { device }) => op_xy_learn(device.as_deref()),
     }
 }
 
@@ -362,7 +498,6 @@ fn print_mappings() -> Result<()> {
     );
     if config.mappings.is_empty() {
         println!("(no mappings; run `construct midi learn <action>`)");
-        return Ok(());
     }
     for mapping in config.mappings {
         println!(
@@ -370,7 +505,302 @@ fn print_mappings() -> Result<()> {
             mapping.action, mapping.kind, mapping.channel, mapping.number, mapping.trigger
         );
     }
+    if let Some(mut op_xy) = config.op_xy {
+        op_xy.normalize();
+        println!("op-xy: {}", if op_xy.enabled { "enabled" } else { "disabled" });
+        println!("  pane channels: {:?}", op_xy.pane_channels);
+        println!("  session notes: {:?}", op_xy.session_notes);
+        for (index, session) in op_xy.session_slots.iter().enumerate() {
+            println!(
+                "  slot {}: {}",
+                index + 1,
+                session.as_deref().unwrap_or("(unassigned)")
+            );
+        }
+    }
     Ok(())
+}
+
+pub(crate) fn op_xy_slots() -> Result<Vec<Option<String>>> {
+    let mut config = MidiConfig::load(&Paths::discover().midi_file())?;
+    let Some(profile) = config.op_xy.as_mut() else {
+        return Ok(vec![None; 8]);
+    };
+    profile.normalize();
+    Ok(profile.session_slots.clone())
+}
+
+pub(crate) fn assign_op_xy_slot(slot: usize, session_id: Option<String>) -> Result<()> {
+    if slot >= 8 {
+        anyhow::bail!("OP-XY session slot must be 1 through 8");
+    }
+    let path = Paths::discover().midi_file();
+    let mut config = MidiConfig::load(&path)?;
+    let profile = config
+        .op_xy
+        .as_mut()
+        .context("OP-XY profile is not configured; run `construct midi op-xy-learn`")?;
+    profile.normalize();
+    // A session has one physical slot. Reassignment moves it rather than
+    // leaving duplicate controller labels in the TUI.
+    if let Some(id) = session_id.as_deref() {
+        for existing in &mut profile.session_slots {
+            if existing.as_deref() == Some(id) {
+                *existing = None;
+            }
+        }
+    }
+    profile.session_slots[slot] = session_id;
+    config.save(&path)
+}
+
+#[cfg(target_os = "macos")]
+fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
+    let path = Paths::discover().midi_file();
+    let mut config = MidiConfig::load(&path)?;
+    let selector = requested_device
+        .or(config.device.as_deref())
+        .or(Some("OP-XY"));
+    let mut input = MidiInput::new("construct-op-xy-learn").context("initialize MIDI input")?;
+    input.ignore(Ignore::All);
+    let port = find_port(&input, selector)?;
+    let port_name = input.port_name(&port).context("read MIDI device name")?;
+    let (tx, rx) = std_mpsc::channel();
+    let _connection = input
+        .connect(
+            &port,
+            "construct-op-xy-learn",
+            move |_timestamp, bytes, _| {
+                if let Some(message) = parse_message(bytes) {
+                    if message.kind == MidiMessageKind::Note && message.pressed {
+                        let _ = tx.send(message);
+                    }
+                }
+            },
+            (),
+        )
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .with_context(|| format!("connect MIDI device {port_name:?}"))?;
+
+    fn capture(rx: &std_mpsc::Receiver<MidiMessage>, prompt: &str) -> Result<MidiMessage> {
+        eprintln!("{prompt}");
+        let message = rx.recv().context("MIDI learn channel closed")?;
+        eprintln!(
+            "  captured channel {} note {}",
+            message.channel, message.number
+        );
+        Ok(message)
+    }
+
+    eprintln!("listening on {port_name:?}");
+    eprintln!("Use the linked OP-XY Construct template, not Controller Mode.");
+    let first = capture(
+        &rx,
+        "Select track 1 and press the first black session key…",
+    )?;
+    let mut pane_channels = vec![first.channel];
+    for pane in 2..=4 {
+        let message = capture(
+            &rx,
+            &format!("Select track {pane} and press the same first black session key…"),
+        )?;
+        pane_channels.push(message.channel);
+    }
+    let mut session_notes = vec![first.number];
+    eprintln!("Return to track 1.");
+    for slot in 2..=8 {
+        session_notes.push(
+            capture(&rx, &format!("Press black session key {slot}…"))?.number,
+        );
+    }
+    let left_note = capture(&rx, "Press the LEFT arrow key…")?.number;
+    let down_note = capture(&rx, "Press the DOWN arrow key…")?.number;
+    let right_note = capture(&rx, "Press the RIGHT arrow key…")?.number;
+    let up_note = capture(&rx, "Press the UP arrow key…")?.number;
+    let enter_note = capture(&rx, "Press the final black ENTER key…")?.number;
+    let no_op_note = capture(
+        &rx,
+        "Press the white key reserved as the sequencer display no-op…",
+    )?
+    .number;
+
+    let unique_channels: std::collections::HashSet<_> = pane_channels.iter().copied().collect();
+    if unique_channels.len() != 4 {
+        anyhow::bail!(
+            "the four OP-XY tracks did not produce four distinct MIDI channels; check the linked external-track channel settings and learn again"
+        );
+    }
+    let all_notes = session_notes
+        .iter()
+        .copied()
+        .chain([left_note, down_note, right_note, up_note, enter_note, no_op_note]);
+    let unique_notes: std::collections::HashSet<_> = all_notes.clone().collect();
+    if unique_notes.len() != all_notes.count() {
+        anyhow::bail!(
+            "the OP-XY profile captured a key more than once; stop its sequencer and learn again"
+        );
+    }
+
+    let existing_slots = config
+        .op_xy
+        .take()
+        .map(|mut profile| {
+            profile.normalize();
+            profile.session_slots
+        })
+        .unwrap_or_else(|| vec![None; 8]);
+    config.device = Some(port_name);
+    config.op_xy = Some(OpXyConfig {
+        enabled: true,
+        pane_channels,
+        session_notes,
+        left_note: Some(left_note),
+        down_note: Some(down_note),
+        right_note: Some(right_note),
+        up_note: Some(up_note),
+        enter_note: Some(enter_note),
+        no_op_note: Some(no_op_note),
+        session_slots: existing_slots,
+        feedback: OpXyFeedbackConfig::default(),
+    });
+    config.save(&path)?;
+    println!("saved OP-XY controller profile to {}", path.display());
+    println!("assign the selected TUI session with `/midi-slot 1` through `/midi-slot 8`");
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn op_xy_learn(_requested_device: Option<&str>) -> Result<()> {
+    anyhow::bail!("native MIDI control is currently supported on macOS")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct MidiFeedback {
+    tx: std_mpsc::Sender<FeedbackState>,
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct MidiFeedback;
+
+#[cfg(target_os = "macos")]
+impl MidiFeedback {
+    pub(crate) fn update(&self, state: FeedbackState) {
+        let _ = self.tx.send(state);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl MidiFeedback {
+    pub(crate) fn update(&self, _state: FeedbackState) {}
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn start_feedback() -> Result<Option<MidiFeedback>> {
+    let config = MidiConfig::load(&Paths::discover().midi_file())?;
+    let Some(profile) = config.op_xy.filter(|profile| profile.enabled && profile.feedback.enabled)
+    else {
+        return Ok(None);
+    };
+    let device = config.device.as_deref().context("OP-XY profile has no MIDI device")?;
+    let output = MidiOutput::new("construct-op-xy-feedback").context("initialize MIDI output")?;
+    let port = find_output_port(&output, device)?;
+    let port_name = output.port_name(&port).context("read MIDI output name")?;
+    let connection = output
+        .connect(&port, "construct-op-xy-feedback")
+        .map_err(|e| anyhow::anyhow!(e.to_string()))
+        .with_context(|| format!("connect MIDI output {port_name:?}"))?;
+    let (tx, rx) = std_mpsc::channel();
+    std::thread::Builder::new()
+        .name("construct-midi-feedback".into())
+        .spawn(move || feedback_loop(connection, rx, profile.feedback))
+        .context("spawn MIDI feedback thread")?;
+    Ok(Some(MidiFeedback { tx }))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn start_feedback() -> Result<Option<MidiFeedback>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn feedback_loop(
+    mut connection: MidiOutputConnection,
+    rx: std_mpsc::Receiver<FeedbackState>,
+    config: OpXyFeedbackConfig,
+) {
+    let bpm = config.clock_bpm.clamp(20.0, 300.0);
+    let clock_period = std::time::Duration::from_secs_f64(60.0 / bpm / 24.0);
+    let mut state = FeedbackState::Idle;
+    let mut started = false;
+    let mut attention_phase = false;
+    let mut next_attention_flip = std::time::Instant::now();
+    loop {
+        match rx.recv_timeout(if started {
+            clock_period
+        } else {
+            std::time::Duration::from_millis(250)
+        }) {
+            Ok(next) => {
+                if next != state {
+                    state = next;
+                    match state {
+                        FeedbackState::Idle => {
+                            if started {
+                                let _ = connection.send(&[0xFC]);
+                                started = false;
+                            }
+                        }
+                        FeedbackState::Working => {
+                            send_scene(&mut connection, config.working_scene);
+                            if !started {
+                                let _ = connection.send(&[0xFA]);
+                                started = true;
+                            }
+                        }
+                        FeedbackState::Attention => {
+                            attention_phase = false;
+                            send_scene(&mut connection, config.attention_scene_a);
+                            next_attention_flip = std::time::Instant::now()
+                                + std::time::Duration::from_millis(500);
+                            if !started {
+                                let _ = connection.send(&[0xFA]);
+                                started = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                if started {
+                    let _ = connection.send(&[0xFC]);
+                }
+                break;
+            }
+        }
+        if started {
+            let _ = connection.send(&[0xF8]);
+        }
+        if state == FeedbackState::Attention && std::time::Instant::now() >= next_attention_flip {
+            attention_phase = !attention_phase;
+            send_scene(
+                &mut connection,
+                if attention_phase {
+                    config.attention_scene_b
+                } else {
+                    config.attention_scene_a
+                },
+            );
+            next_attention_flip =
+                std::time::Instant::now() + std::time::Duration::from_millis(500);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn send_scene(connection: &mut MidiOutputConnection, one_based_scene: u8) {
+    let value = one_based_scene.clamp(1, 99) - 1;
+    let _ = connection.send(&[0xB0, 85, value]);
 }
 
 #[cfg(target_os = "macos")]
@@ -486,6 +916,30 @@ fn find_port(input: &MidiInput, selector: Option<&str>) -> Result<MidiInputPort>
     bail!("multiple MIDI input devices found; pass `--device <name>`")
 }
 
+#[cfg(target_os = "macos")]
+fn find_output_port(output: &MidiOutput, selector: &str) -> Result<MidiOutputPort> {
+    let needle = selector.to_lowercase();
+    let matches: Vec<_> = output
+        .ports()
+        .into_iter()
+        .filter_map(|port| {
+            let name = output.port_name(&port).ok()?;
+            name.to_lowercase().contains(&needle).then_some((port, name))
+        })
+        .collect();
+    match matches.as_slice() {
+        [(port, _)] => Ok(port.clone()),
+        [] => anyhow::bail!("no MIDI output device matches {selector:?}"),
+        many => anyhow::bail!(
+            "MIDI output selector {selector:?} is ambiguous: {}",
+            many.iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
 fn parse_message(bytes: &[u8]) -> Option<MidiMessage> {
     let (&status, data) = bytes.split_first()?;
     if status < 0x80 || data.len() < 2 {
@@ -592,6 +1046,7 @@ mod tests {
                 trigger: MidiTrigger::Press,
                 action: MidiAction::NewSession,
             }],
+            op_xy: None,
         };
         let encoded = toml::to_string_pretty(&config).unwrap();
         assert!(encoded.contains("device = \"OP-XY\""));
@@ -606,6 +1061,7 @@ mod tests {
         let mut config = MidiConfig {
             device: Some("OP-XY".into()),
             mappings: Vec::new(),
+            op_xy: None,
         };
         config.save(&path).unwrap();
         assert_eq!(MidiConfig::load(&path).unwrap(), config);
@@ -627,6 +1083,66 @@ mod tests {
             assert_eq!(
                 MidiAction::from_str(&action.label(), true).unwrap(),
                 *action
+            );
+        }
+    }
+
+    fn op_xy_profile() -> OpXyConfig {
+        OpXyConfig {
+            enabled: true,
+            pane_channels: vec![13, 14, 15, 16],
+            session_notes: vec![49, 51, 54, 56, 58, 61, 63, 66],
+            left_note: Some(60),
+            down_note: Some(62),
+            right_note: Some(64),
+            up_note: Some(68),
+            enter_note: Some(70),
+            no_op_note: Some(65),
+            session_slots: vec![None; 8],
+            feedback: OpXyFeedbackConfig::default(),
+        }
+    }
+
+    #[test]
+    fn op_xy_maps_channel_to_pane_and_note_to_session_slot() {
+        let profile = op_xy_profile();
+        let message = parse_message(&[0x9e, 56, 100]).unwrap();
+        assert_eq!(
+            profile.event_for(&message),
+            Some(OpXyEvent {
+                pane: 2,
+                control: OpXyControl::Session(3),
+            })
+        );
+    }
+
+    #[test]
+    fn op_xy_ignores_release_no_op_and_unknown_channels() {
+        let profile = op_xy_profile();
+        assert!(profile
+            .event_for(&parse_message(&[0x8c, 49, 0]).unwrap())
+            .is_none());
+        assert!(profile
+            .event_for(&parse_message(&[0x9c, 65, 100]).unwrap())
+            .is_none());
+        assert!(profile
+            .event_for(&parse_message(&[0x90, 49, 100]).unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn op_xy_maps_arrow_and_enter_notes() {
+        let profile = op_xy_profile();
+        for (note, control) in [
+            (60, OpXyControl::Left),
+            (62, OpXyControl::Down),
+            (64, OpXyControl::Right),
+            (68, OpXyControl::Up),
+            (70, OpXyControl::Enter),
+        ] {
+            assert_eq!(
+                profile.event_for(&parse_message(&[0x9f, note, 100]).unwrap()),
+                Some(OpXyEvent { pane: 3, control })
             );
         }
     }

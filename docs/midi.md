@@ -8,7 +8,7 @@ Accessibility permission is involved.
 The first native backend is CoreMIDI on macOS. Other platforms report that the
 feature is unsupported instead of acquiring a system audio-library dependency.
 
-## OP–XY setup
+## Generic OP–XY controller-mode setup
 
 1. Connect the OP–XY over USB-C, or pair it with macOS as a Bluetooth MIDI
    device.
@@ -21,6 +21,70 @@ feature is unsupported instead of acquiring a system audio-library dependency.
    ```sh
    construct midi devices
    ```
+
+## Dedicated OP-XY split controller
+
+Construct also supports an OP-XY project template that stays in Instrument
+mode. Link instrument tracks 1–4 to external-MIDI tracks 5–8 and give those
+external tracks four distinct MIDI channels. The four channels address the
+visible Construct split panes in reading order: left-to-right, then
+top-to-bottom.
+
+Stop the OP-XY sequencer, connect Bluetooth or USB MIDI, then run:
+
+```sh
+construct midi op-xy-learn --device OP-XY
+```
+
+The wizard captures the four pane channels, eight black session keys, four
+arrow keys, Enter, and the white note reserved for sequencer display. The
+result is stored under `[op_xy]` in `midi.toml`; normal learned mappings can
+coexist with it.
+
+In the TUI, select a session and assign it to a black-key slot:
+
+```text
+/midi-slot 1
+/midi-slot 2
+…
+/midi-slot 8
+```
+
+`/midi-slot` shows all assignments and `/midi-slot clear 3` clears one. Slot
+numbers appear before assigned session names in the session list.
+
+Pressing a session key places that session in the pane addressed by the
+current OP-XY track without stealing keyboard focus. An arrow key focuses that
+pane and dispatches the corresponding native TUI arrow. The first Enter press
+focuses an unfocused pane; another Enter press acts on the focused pane.
+
+### Scene feedback
+
+The learned profile enables feedback by default. Construct treats OP-XY scene
+numbers as the one-based numbers shown on the device and sends immediate scene
+changes using CC 85:
+
+- Scene 1 while an assigned session is running.
+- Scenes 3 and 4 alternating when an assigned session needs attention.
+- MIDI Stop when no assigned session is running or needs attention.
+
+While feedback is active Construct sends MIDI Start and a 24-PPQN clock at 120
+BPM so the template's sequencer LEDs animate. These defaults can be edited in
+`midi.toml`:
+
+```toml
+[op_xy.feedback]
+enabled = true
+working_scene = 1
+attention_scene_a = 3
+attention_scene_b = 4
+clock_bpm = 120.0
+```
+
+Scenes store track volume and mute state, so the Construct template should use
+identical volume/mute settings in every feedback scene. Disable MIDI echo on
+the OP-XY, and reserve the learned no-op note exclusively for the display
+patterns.
 
 ## Learn controls
 

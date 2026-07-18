@@ -2026,6 +2026,9 @@ fn render_sessions(f: &mut Frame, area: Rect, app: &mut App) {
                     // and the right-aligned harness.
                     let name_avail = row_w.saturating_sub(prefix_w + 1 + harness_w + marker_w);
                     let mut raw_name = primary_label(s);
+                    if let Some(slot) = app.midi_slot_label(&s.id) {
+                        raw_name = format!("{slot} {raw_name}");
+                    }
                     if s.forked_from.is_none() {
                         let forks = app
                             .sessions
@@ -8838,7 +8841,7 @@ emacs keymap (default; CONSTRUCT_KEYMAP=vim for vim profile)
 
   global
     M-x / C-x x     command palette (C-x x is Meta-free)
-                    palette commands: new fork send delete rename program diff border
+                    palette commands: new fork send delete rename program diff border midi-slot
                                       theme zoom interrupt refresh harnesses configure
                                       paste help
     ?               toggle this help
@@ -8912,7 +8915,7 @@ vim keymap (CONSTRUCT_KEYMAP=vim; unset for emacs profile)
 
   global
     :               command palette
-                    palette commands: new fork send delete rename program diff border
+                    palette commands: new fork send delete rename program diff border midi-slot
                                       theme zoom interrupt refresh harnesses configure
                                       paste help
     A               cycle approval mode

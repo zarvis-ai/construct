@@ -1259,6 +1259,9 @@ pub struct App {
     /// re-send on change. Drives the AskUserQuestion chat-gate.
     last_reported_view: Option<(String, construct_protocol::ClientView)>,
     pub sessions: Vec<SessionSummary>,
+    /// Persistent OP-XY session slots 1–8. The physical black keys select
+    /// these sessions in the pane identified by their MIDI channel.
+    pub midi_session_slots: Vec<Option<String>>,
     pub groups: Vec<GroupSummary>,
     pub selection: Selection,
     pub focus: PaneFocus,
@@ -3727,6 +3730,7 @@ async fn run_with_socket_initial_selection(
         client: client.clone(),
         last_reported_view: None,
         sessions,
+        midi_session_slots: vec![None; 8],
         groups,
         selection: initial_window_sel,
         // Default focus is the view — the selected session is usually
@@ -4066,6 +4070,10 @@ async fn run_loop(
     socket: std::path::PathBuf,
 ) -> Result<()> {
     let mut input_stream = EventStream::new();
+    match crate::midi::op_xy_slots() {
+        Ok(slots) => app.midi_session_slots = slots,
+        Err(e) => app.set_status(format!("MIDI slots unavailable: {e}")),
+    }
     // MIDI is a native input peer of crossterm: learned controls dispatch the
     // exact same actions below, without synthesizing OS keyboard events or
     // requiring the terminal window to own desktop focus.
@@ -4079,6 +4087,13 @@ async fn run_loop(
     };
     // Keep the backend connection alive for the duration of the event loop.
     let _midi_listener = midi_listener;
+    let midi_feedback = match crate::midi::start_feedback() {
+        Ok(feedback) => feedback,
+        Err(e) => {
+            app.set_status(format!("MIDI feedback disabled: {e}"));
+            None
+        }
+    };
     let mut notifications = app
         .client
         .take_notifications()
@@ -4502,16 +4517,19 @@ async fn run_loop(
                 }
             }, if midi_rx.is_some() => {
                 match action {
-                    Some(crate::midi::MidiAction::Approve) => {
+                    Some(crate::midi::MidiInputEvent::Action(crate::midi::MidiAction::Approve)) => {
                         app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)).await;
                     }
-                    Some(crate::midi::MidiAction::Reject) => {
+                    Some(crate::midi::MidiInputEvent::Action(crate::midi::MidiAction::Reject)) => {
                         app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).await;
                     }
-                    Some(action) => {
+                    Some(crate::midi::MidiInputEvent::Action(action)) => {
                         if let Some(key_action) = action.key_action() {
                             app.run_action(key_action).await;
                         }
+                    }
+                    Some(crate::midi::MidiInputEvent::OpXy(event)) => {
+                        app.handle_op_xy_event(event).await;
                     }
                     None => midi_rx = None,
                 }
@@ -4767,6 +4785,9 @@ async fn run_loop(
                 app.update_browser_preview_hover_and_expiry();
                 app.expire_program_runs(Instant::now());
                 app.tutorial_tick(Instant::now());
+                if let Some(feedback) = midi_feedback.as_ref() {
+                    feedback.update(app.op_xy_feedback_state());
+                }
             }
             _ = harness_refresh.tick(), if app.connected
                 && (app.selected_id().is_none() || app.configure_popup.is_some()) => {
@@ -10578,6 +10599,134 @@ impl App {
         }
     }
 
+    fn op_xy_pane_window_id(&self, pane: usize) -> Option<u64> {
+        let mut areas = self.layout.main_window_areas.clone();
+        // OP-XY tracks use the visual reading order promised by the profile:
+        // left-to-right within each row, then top-to-bottom.
+        areas.sort_by_key(|pane| (pane.area.y, pane.area.x));
+        areas
+            .get(pane)
+            .map(|pane| pane.id)
+            .or_else(|| self.leaf_window_ids().get(pane).copied())
+    }
+
+    fn select_op_xy_slot_in_pane(&mut self, pane: usize, slot: usize) {
+        let Some(window_id) = self.op_xy_pane_window_id(pane) else {
+            self.set_status(format!("OP-XY pane {} is not visible", pane + 1));
+            return;
+        };
+        let Some(session_id) = self
+            .midi_session_slots
+            .get(slot)
+            .and_then(|session| session.clone())
+        else {
+            self.set_status(format!("OP-XY session slot {} is unassigned", slot + 1));
+            return;
+        };
+        if !self.sessions.iter().any(|session| session.id == session_id) {
+            self.set_status(format!(
+                "OP-XY session slot {} points to a missing session",
+                slot + 1
+            ));
+            return;
+        }
+
+        let previous_window = self.active_window_id;
+        let previous_focus = self.focus;
+        if window_id != previous_window {
+            self.focus_main_window(window_id);
+        }
+        self.select_session(session_id);
+        if window_id != previous_window {
+            self.focus_main_window(previous_window);
+            self.focus = previous_focus;
+            self.report_focused_sessions();
+        }
+        self.set_status(format!(
+            "OP-XY pane {} → session slot {}",
+            pane + 1,
+            slot + 1
+        ));
+    }
+
+    pub(crate) async fn handle_op_xy_event(&mut self, event: crate::midi::OpXyEvent) {
+        use crate::midi::OpXyControl;
+        match event.control {
+            OpXyControl::Session(slot) => self.select_op_xy_slot_in_pane(event.pane, slot),
+            OpXyControl::Enter => {
+                let Some(window_id) = self.op_xy_pane_window_id(event.pane) else {
+                    self.set_status(format!("OP-XY pane {} is not visible", event.pane + 1));
+                    return;
+                };
+                if self.focus != PaneFocus::View || self.active_window_id != window_id {
+                    self.focus_main_window(window_id);
+                    self.set_status(format!("focus: OP-XY pane {}", event.pane + 1));
+                } else {
+                    self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                        .await;
+                }
+            }
+            control => {
+                let Some(window_id) = self.op_xy_pane_window_id(event.pane) else {
+                    self.set_status(format!("OP-XY pane {} is not visible", event.pane + 1));
+                    return;
+                };
+                if self.focus != PaneFocus::View || self.active_window_id != window_id {
+                    self.focus_main_window(window_id);
+                }
+                let code = match control {
+                    OpXyControl::Left => KeyCode::Left,
+                    OpXyControl::Down => KeyCode::Down,
+                    OpXyControl::Right => KeyCode::Right,
+                    OpXyControl::Up => KeyCode::Up,
+                    OpXyControl::Session(_) | OpXyControl::Enter => unreachable!(),
+                };
+                self.on_key(KeyEvent::new(code, KeyModifiers::NONE)).await;
+            }
+        }
+    }
+
+    pub(crate) fn op_xy_feedback_state(&self) -> crate::midi::FeedbackState {
+        use construct_protocol::SessionState;
+        let assigned: HashSet<&str> = self
+            .midi_session_slots
+            .iter()
+            .filter_map(|session| session.as_deref())
+            .collect();
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .filter(|session| assigned.contains(session.id.as_str()))
+            .collect();
+        if sessions.iter().any(|session| {
+            session.needs_attention
+                || matches!(
+                    session.state,
+                    SessionState::AwaitingInput | SessionState::Errored
+                )
+        }) {
+            crate::midi::FeedbackState::Attention
+        } else if sessions.iter().any(|session| {
+            matches!(session.state, SessionState::Pending | SessionState::Running)
+        }) {
+            crate::midi::FeedbackState::Working
+        } else {
+            crate::midi::FeedbackState::Idle
+        }
+    }
+
+    pub(crate) fn midi_slot_label(&self, session_id: &str) -> Option<String> {
+        let slots: Vec<_> = self
+            .midi_session_slots
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| {
+                (session.as_deref() == Some(session_id)).then(|| (index + 1).to_string())
+            })
+            .collect();
+        (!slots.is_empty()).then(|| format!("[{}]", slots.join(",")))
+    }
+
     /// Execute a slash-style command (`zoom`, `new`, `quit`, ...) with
     /// no LLM involvement. Used both by the orchestrator panel (when
     /// input starts with `/`) and by the static palette (fallback when
@@ -10667,6 +10816,76 @@ impl App {
             }
             "paste" | "paste-clipboard" => {
                 self.run_action(KeyAction::PasteLocalClipboard).await
+            }
+            "midi-slot" | "opxy-slot" => {
+                let parts: Vec<_> = arg.split_whitespace().collect();
+                if parts.is_empty() {
+                    let mapping = self
+                        .midi_session_slots
+                        .iter()
+                        .enumerate()
+                        .map(|(index, session)| {
+                            format!(
+                                "{}:{}",
+                                index + 1,
+                                session
+                                    .as_deref()
+                                    .map(short_id)
+                                    .unwrap_or("—")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    self.set_status(format!("OP-XY slots {mapping}"));
+                } else {
+                    let (clear, raw_slot) = match parts.as_slice() {
+                        ["clear", slot] => (true, *slot),
+                        [slot] => (false, *slot),
+                        _ => {
+                            self.set_status(
+                                "usage: /midi-slot <1-8> | /midi-slot clear <1-8>".into(),
+                            );
+                            return;
+                        }
+                    };
+                    let Ok(one_based) = raw_slot.parse::<usize>() else {
+                        self.set_status("MIDI slot must be a number from 1 through 8".into());
+                        return;
+                    };
+                    if !(1..=8).contains(&one_based) {
+                        self.set_status("MIDI slot must be a number from 1 through 8".into());
+                        return;
+                    }
+                    let slot = one_based - 1;
+                    let session_id = if clear {
+                        None
+                    } else {
+                        let Some(id) = self.selected_id() else {
+                            self.set_status("select a session before assigning a MIDI slot".into());
+                            return;
+                        };
+                        Some(id)
+                    };
+                    match crate::midi::assign_op_xy_slot(slot, session_id.clone()) {
+                        Ok(()) => {
+                            if let Some(id) = session_id.as_deref() {
+                                for existing in &mut self.midi_session_slots {
+                                    if existing.as_deref() == Some(id) {
+                                        *existing = None;
+                                    }
+                                }
+                            }
+                            self.midi_session_slots.resize(8, None);
+                            self.midi_session_slots[slot] = session_id;
+                            self.set_status(if clear {
+                                format!("cleared OP-XY session slot {one_based}")
+                            } else {
+                                format!("assigned selected session to OP-XY slot {one_based}")
+                            });
+                        }
+                        Err(e) => self.set_status(format!("MIDI slot failed: {e}")),
+                    }
+                }
             }
             "help" | "?" => {
                 self.help_visible = true;
@@ -12781,7 +13000,7 @@ mod tests {
             .expect("run_loop should contain a tokio::select!");
         // Bound the search to the run_loop region so the arm strings
         // quoted in this very test (far below) can't be matched.
-        let body = &src[select_at..(select_at + 8000).min(src.len())];
+        let body = &src[select_at..(select_at + 12_000).min(src.len())];
         let biased = body
             .find("biased;")
             .expect("the event-loop select! must be `biased;` so a ready keystroke wins ties");
@@ -12958,6 +13177,7 @@ mod tests {
             client,
             last_reported_view: None,
             sessions,
+            midi_session_slots: vec![None; 8],
             groups: Vec::new(),
             selection: Selection::Session("s1".into()),
             focus: PaneFocus::View,

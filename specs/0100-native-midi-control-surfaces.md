@@ -47,8 +47,9 @@ positions.
   may map to different actions.
 - MIDI clock, active sensing, SysEx, and unsupported message kinds never become
   TUI actions.
-- Device output and status-light feedback are outside this decision; this is
-  an input contract.
+- Device output and status-light feedback are outside this generic input
+  contract. Dedicated profiles may define feedback separately, as the OP-XY
+  profile does in spec 0101.
 
 ## Non-Goals
 
