@@ -27,7 +27,9 @@ represents work in progress, and Scene 2 with running transport represents the
 blue attention-dot state for a non-terminal session. Terminal state takes
 precedence over a stale attention marker. List focus or any other absence of a
 view-focused session is idle. Construct supplies MIDI real-time transport and
-clock while the focused session is running or needs attention.
+clock while the focused session is running or needs attention. Focus, session
+state, and attention-marker changes update feedback as part of handling the
+event that changed them; feedback must not depend on an animation timer.
 
 ## Reason
 

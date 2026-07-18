@@ -4777,9 +4777,6 @@ async fn run_loop(
                 app.update_browser_preview_hover_and_expiry();
                 app.expire_program_runs(Instant::now());
                 app.tutorial_tick(Instant::now());
-                if let Some(feedback) = midi_feedback.as_ref() {
-                    feedback.update(app.op_xy_feedback_state());
-                }
             }
             _ = harness_refresh.tick(), if app.connected
                 && (app.selected_id().is_none() || app.configure_popup.is_some()) => {
@@ -4792,6 +4789,14 @@ async fn run_loop(
             _ = lineage_refresh.tick(), if app.connected && app.lineage_focused && app.focus == PaneFocus::List => {
                 app.refresh_sessions().await;
             }
+        }
+        // Publish after every handled event rather than only from the
+        // low-priority animation tick. A sustained notification stream can
+        // intentionally win over that tick in the biased select above, but a
+        // focused session's state and attention marker must reach OP-XY as
+        // soon as the notification that changed them has been applied.
+        if let Some(feedback) = midi_feedback.as_ref() {
+            feedback.update(app.op_xy_feedback_state());
         }
     }
     Ok(())

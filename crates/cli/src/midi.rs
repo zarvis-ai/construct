@@ -628,6 +628,7 @@ fn op_xy_learn(_requested_device: Option<&str>) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub(crate) struct MidiFeedback {
     tx: std_mpsc::Sender<FeedbackState>,
+    last_state: std::cell::Cell<FeedbackState>,
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -636,7 +637,9 @@ pub(crate) struct MidiFeedback;
 #[cfg(target_os = "macos")]
 impl MidiFeedback {
     pub(crate) fn update(&self, state: FeedbackState) {
-        let _ = self.tx.send(state);
+        if self.last_state.replace(state) != state {
+            let _ = self.tx.send(state);
+        }
     }
 }
 
@@ -665,7 +668,10 @@ pub(crate) fn start_feedback() -> Result<Option<MidiFeedback>> {
         .name("construct-midi-feedback".into())
         .spawn(move || feedback_loop(connection, rx, profile.feedback))
         .context("spawn MIDI feedback thread")?;
-    Ok(Some(MidiFeedback { tx }))
+    Ok(Some(MidiFeedback {
+        tx,
+        last_state: std::cell::Cell::new(FeedbackState::Idle),
+    }))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1033,6 +1039,27 @@ mod tests {
 
         let encoded = toml::to_string_pretty(&config).unwrap();
         assert_eq!(toml::from_str::<MidiConfig>(&encoded).unwrap(), config);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn feedback_sender_publishes_only_state_transitions() {
+        let (tx, rx) = std_mpsc::channel();
+        let feedback = MidiFeedback {
+            tx,
+            last_state: std::cell::Cell::new(FeedbackState::Idle),
+        };
+
+        feedback.update(FeedbackState::Idle);
+        assert!(rx.try_recv().is_err());
+
+        feedback.update(FeedbackState::Working);
+        assert_eq!(rx.try_recv().unwrap(), FeedbackState::Working);
+        feedback.update(FeedbackState::Working);
+        assert!(rx.try_recv().is_err());
+
+        feedback.update(FeedbackState::Attention);
+        assert_eq!(rx.try_recv().unwrap(), FeedbackState::Attention);
     }
 
     #[test]
