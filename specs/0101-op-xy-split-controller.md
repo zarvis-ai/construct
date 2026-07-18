@@ -9,7 +9,8 @@ Scope: An OP-XY Instrument-mode template controls four Construct split panes and
 
 Construct supports an opt-in OP-XY profile alongside generic learned MIDI
 mappings. Four learned MIDI channels address visible split panes in visual
-reading order. Eight learned notes select persistent session slots in the
+reading order. Each pane track also has a learned first-key anchor so differing
+track octaves normalize to one physical-key layout. Eight learned notes select
 addressed pane; learned arrow and Enter notes dispatch native TUI input to that
 pane. A reserved sequencer-display note is always consumed as a no-op.
 

@@ -116,6 +116,8 @@ pub struct OpXyConfig {
     pub enabled: bool,
     /// One-based MIDI channels corresponding to visual panes 1 through 4.
     pub pane_channels: Vec<u8>,
+    /// First black-key note on each pane track, used to normalize track octaves.
+    pub pane_anchor_notes: Vec<u8>,
     pub session_notes: Vec<u8>,
     pub left_note: Option<u8>,
     pub down_note: Option<u8>,
@@ -129,32 +131,40 @@ pub struct OpXyConfig {
 
 impl OpXyConfig {
     fn event_for(&self, message: &MidiMessage) -> Option<OpXyEvent> {
-        if !self.enabled
-            || message.kind != MidiMessageKind::Note
-            || !message.pressed
-            || self.no_op_note == Some(message.number)
-        {
+        if !self.enabled || message.kind != MidiMessageKind::Note || !message.pressed {
             return None;
         }
         let pane = self
             .pane_channels
             .iter()
             .position(|channel| *channel == message.channel)?;
+        let reference_anchor = self.session_notes.first().copied()?;
+        let pane_anchor = self
+            .pane_anchor_notes
+            .get(pane)
+            .copied()
+            .unwrap_or(reference_anchor);
+        let normalized_note = i16::from(message.number) + i16::from(reference_anchor)
+            - i16::from(pane_anchor);
+        let normalized_note = u8::try_from(normalized_note).ok().filter(|note| *note <= 127)?;
+        if self.no_op_note == Some(normalized_note) {
+            return None;
+        }
         let control = if let Some(slot) = self
             .session_notes
             .iter()
-            .position(|note| *note == message.number)
+            .position(|note| *note == normalized_note)
         {
             OpXyControl::Session(slot)
-        } else if self.left_note == Some(message.number) {
+        } else if self.left_note == Some(normalized_note) {
             OpXyControl::Left
-        } else if self.down_note == Some(message.number) {
+        } else if self.down_note == Some(normalized_note) {
             OpXyControl::Down
-        } else if self.right_note == Some(message.number) {
+        } else if self.right_note == Some(normalized_note) {
             OpXyControl::Right
-        } else if self.up_note == Some(message.number) {
+        } else if self.up_note == Some(normalized_note) {
             OpXyControl::Up
-        } else if self.enter_note == Some(message.number) {
+        } else if self.enter_note == Some(normalized_note) {
             OpXyControl::Enter
         } else {
             return None;
@@ -548,12 +558,14 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
         "Select track 1 and press the first black session key…",
     )?;
     let mut pane_channels = vec![first.channel];
+    let mut pane_anchor_notes = vec![first.number];
     for pane in 2..=4 {
         let message = capture(
             &rx,
             &format!("Select track {pane} and press the same first black session key…"),
         )?;
         pane_channels.push(message.channel);
+        pane_anchor_notes.push(message.number);
     }
     let mut session_notes = vec![first.number];
     eprintln!("Return to track 1.");
@@ -594,6 +606,7 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
     config.op_xy = Some(OpXyConfig {
         enabled: true,
         pane_channels,
+        pane_anchor_notes,
         session_notes,
         left_note: Some(left_note),
         down_note: Some(down_note),
@@ -1025,6 +1038,7 @@ mod tests {
             op_xy: Some(OpXyConfig {
                 enabled: true,
                 pane_channels: vec![5, 6, 7, 8],
+                pane_anchor_notes: vec![54, 42, 30, 54],
                 session_notes: vec![54, 56, 58, 61, 63, 66, 68, 70],
                 left_note: Some(72),
                 down_note: Some(74),
@@ -1054,6 +1068,7 @@ mod tests {
         OpXyConfig {
             enabled: true,
             pane_channels: vec![13, 14, 15, 16],
+            pane_anchor_notes: vec![49; 4],
             session_notes: vec![49, 51, 54, 56, 58, 61, 63, 66],
             left_note: Some(60),
             down_note: Some(62),
@@ -1076,6 +1091,24 @@ mod tests {
                 control: OpXyControl::Session(3),
             })
         );
+    }
+
+    #[test]
+    fn op_xy_normalizes_each_pane_tracks_octave() {
+        let mut profile = op_xy_profile();
+        profile.pane_channels = vec![5, 6, 7, 8];
+        profile.pane_anchor_notes = vec![54, 42, 30, 54];
+        profile.session_notes = vec![54, 56, 58, 61, 63, 66, 68, 70];
+
+        for (status, note, pane) in [(0x94, 56, 0), (0x95, 44, 1), (0x96, 32, 2), (0x97, 56, 3)] {
+            assert_eq!(
+                profile.event_for(&parse_message(&[status, note, 100]).unwrap()),
+                Some(OpXyEvent {
+                    pane,
+                    control: OpXyControl::Session(1),
+                })
+            );
+        }
     }
 
     #[test]

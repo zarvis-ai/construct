@@ -36,10 +36,11 @@ Stop the OP-XY sequencer, connect Bluetooth or USB MIDI, then run:
 construct midi op-xy-learn --device OP-XY
 ```
 
-The wizard captures the four pane channels, eight black session keys, four
-arrow keys, Enter, and the white note reserved for sequencer display. The
-result is stored under `[op_xy]` in `midi.toml`; normal learned mappings can
-coexist with it.
+The wizard captures each pane track's channel and first-key anchor, eight black
+session keys, four arrow keys, Enter, and the white note reserved for sequencer
+display. Per-track anchors normalize octave differences between linked OP-XY
+tracks. The result is stored under `[op_xy]` in `midi.toml`; normal learned
+mappings can coexist with it.
 
 Prefix a session title with its black-key slot number:
 
