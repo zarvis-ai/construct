@@ -504,6 +504,17 @@ where
         }
     }
 
+    // Stop the session before draining it, and close the inbox so loops that
+    // only end on channel-close notice. The PTY session task in particular
+    // never finishes on its own: without an explicit Stop its child survives
+    // until process exit closes the PTY master (SIGHUP), which burns the full
+    // drain timeout below and leaves the child alive well past the daemon's
+    // shutdown ack — long enough for teardown races (and flaky e2e reaps).
+    // try_send, not send: a wedged session task with a full inbox must not
+    // block exit — the drain timeout below still bounds that case.
+    if let Some(tx) = inbox_tx.take() {
+        let _ = tx.try_send(AdapterInboxMsg::Stop);
+    }
     if let Some(h) = session_handle.take() {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
     }
@@ -1062,6 +1073,12 @@ where
         }
     }
 
+    // Same stop-before-drain as `run_reconnectable`: end the session (killing
+    // a PTY child) and close the inbox so the drain below returns promptly
+    // instead of always burning its timeout.
+    if let Some(tx) = inbox_tx.take() {
+        let _ = tx.try_send(AdapterInboxMsg::Stop);
+    }
     if let Some(h) = session_handle.take() {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
     }
@@ -1247,6 +1264,83 @@ mod tests {
         let inner = result.expect("adapter task panicked");
         inner.expect("adapter returned Err");
         // daemon_side dropped here; not relied on for exit.
+        drop(daemon_side);
+    }
+
+    /// Regression: `SHUTDOWN` must actively stop the running session before
+    /// draining it. A PTY-style session only ends when told to stop (its
+    /// child lives until killed); without the stop-before-drain, the
+    /// post-loop drain always burned its full timeout and the harness child
+    /// outlived the daemon's shutdown ack by seconds — the
+    /// `daemon_drop_reaps_shell_adapter_tree` e2e flake.
+    #[tokio::test]
+    async fn shutdown_stops_session_before_drain() {
+        let (mut daemon_side, adapter_side) = tokio::io::duplex(8192);
+        let adapter_reader = BufReader::new(adapter_side);
+        let (stopped_tx, stopped_rx) = oneshot::channel::<bool>();
+
+        let handler = move |_params: SessionStartParams, mut ctx: AdapterContext| async move {
+            // Mimic a PTY session: run until explicitly stopped (or the
+            // inbox closes), like a shell child that lives until killed.
+            // Report *how* the loop ended: only an explicit Stop counts as
+            // the runtime actively stopping the session.
+            let got_stop = loop {
+                match ctx.inbox.recv().await {
+                    Some(AdapterInboxMsg::Stop) => break true,
+                    None => break false,
+                    Some(_) => {}
+                }
+            };
+            let _ = stopped_tx.send(got_stop);
+        };
+
+        let adapter_task = tokio::spawn(async move {
+            run_with_io(test_metadata(), handler, adapter_reader, tokio::io::sink()).await
+        });
+
+        let initialize = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": ahp_method::INITIALIZE,
+            "params": {
+                "protocol_version": "1",
+                "client_info": {"name": "test", "version": "0"},
+            },
+        });
+        let session_start = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": ahp_method::SESSION_START,
+            "params": {
+                "session_id": "s_test",
+                "cwd": "/",
+            },
+        });
+        let shutdown = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": ahp_method::SHUTDOWN,
+            "params": {},
+        });
+        for v in [&initialize, &session_start, &shutdown] {
+            let mut buf = serde_json::to_string(v).unwrap();
+            buf.push('\n');
+            daemon_side.write_all(buf.as_bytes()).await.unwrap();
+        }
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), adapter_task)
+            .await
+            .expect("adapter did not exit after SHUTDOWN");
+        result.expect("adapter task panicked").expect("adapter Err");
+        let got_stop = tokio::time::timeout(std::time::Duration::from_secs(1), stopped_rx)
+            .await
+            .expect("session handler did not finish")
+            .expect("stopped channel dropped");
+        assert!(
+            got_stop,
+            "SHUTDOWN must deliver Stop to the session before draining — \
+             ending it via inbox-close means the drain timeout was burned",
+        );
         drop(daemon_side);
     }
 

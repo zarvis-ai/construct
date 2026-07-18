@@ -210,6 +210,19 @@ impl Daemon {
         };
 
         let mut cmd = Command::new(&binary_path);
+        // Hermetic env: the test process may itself be running inside a
+        // construct session (developing agentd from agentd), whose
+        // session-scoped CONSTRUCT_* vars would leak through the daemon into
+        // the adapters it spawns and change their behavior — an inherited
+        // CONSTRUCT_RESUME=1 makes the shell adapter silently discard every
+        // one-shot prompt, failing any test that runs a command in a shell
+        // session. Strip all inherited CONSTRUCT_* first; the harness then
+        // sets the ones the fixture actually needs.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("CONSTRUCT_") {
+                cmd.env_remove(key);
+            }
+        }
         cmd.env("CONSTRUCT_RUNTIME_DIR", &runtime_dir)
             .env("CONSTRUCT_STATE_DIR", &state_dir)
             .env("CONSTRUCT_DATA_DIR", &data_dir)
