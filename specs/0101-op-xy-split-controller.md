@@ -13,10 +13,12 @@ reading order. Eight learned notes select persistent session slots in the
 addressed pane; learned arrow and Enter notes dispatch native TUI input to that
 pane. A reserved sequencer-display note is always consumed as a no-op.
 
-Session-slot assignment is a TUI operation and persists in the MIDI
-configuration. Selecting a slot changes the addressed pane without taking
-focus. Enter focuses an unfocused addressed pane before it can dispatch Enter
-to that pane.
+Session titles beginning with `[1]` through `[8]` assign those sessions to the
+corresponding hardware slots. If multiple titles claim one slot, the session
+with the latest activity wins; creation time breaks the absence of activity,
+and session id makes exact ties deterministic. Selecting a slot changes the
+addressed pane without taking focus. Enter focuses an unfocused addressed pane
+before it can dispatch Enter to that pane.
 
 Feedback is global rather than per-pane. Assigned-session state drives
 preconfigured OP-XY scenes: a working scene while any assigned session runs,
@@ -43,7 +45,7 @@ depending on proprietary SysEx.
   learned rather than hard-coded.
 - Pane numbering follows current visual geometry, not split-tree creation
   order.
-- Missing panes and stale session slots produce visible status messages and do
+- Missing panes and unresolved session slots produce visible status messages and do
   not retarget another pane or session.
 - Scene feedback takes ownership of OP-XY transport and incoming clock while
   assigned Construct work is active.

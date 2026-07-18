@@ -41,18 +41,17 @@ arrow keys, Enter, and the white note reserved for sequencer display. The
 result is stored under `[op_xy]` in `midi.toml`; normal learned mappings can
 coexist with it.
 
-In the TUI, select a session and assign it to a black-key slot:
+Prefix a session title with its black-key slot number:
 
 ```text
-/opxy-slot 1
-/opxy-slot 2
-…
-/opxy-slot 8
+[1] primary implementation
+[2] test runner
+[8] documentation
 ```
 
-`/opxy-slot` shows all assignments and `/opxy-slot clear 3` clears one. The
-older descriptive spelling `/midi-slot` is also accepted as an alias. Slot
-numbers appear before assigned session names in the session list.
+Construct detects `[1]` through `[8]` at the beginning of session titles. If
+multiple sessions claim the same number, the one with the latest activity is
+selected.
 
 Pressing a session key places that session in the pane addressed by the
 current OP-XY track without stealing keyboard focus. An arrow key focuses that

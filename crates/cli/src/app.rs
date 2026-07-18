@@ -1259,9 +1259,6 @@ pub struct App {
     /// re-send on change. Drives the AskUserQuestion chat-gate.
     last_reported_view: Option<(String, construct_protocol::ClientView)>,
     pub sessions: Vec<SessionSummary>,
-    /// Persistent OP-XY session slots 1–8. The physical black keys select
-    /// these sessions in the pane identified by their MIDI channel.
-    pub midi_session_slots: Vec<Option<String>>,
     pub groups: Vec<GroupSummary>,
     pub selection: Selection,
     pub focus: PaneFocus,
@@ -3730,7 +3727,6 @@ async fn run_with_socket_initial_selection(
         client: client.clone(),
         last_reported_view: None,
         sessions,
-        midi_session_slots: vec![None; 8],
         groups,
         selection: initial_window_sel,
         // Default focus is the view — the selected session is usually
@@ -4070,10 +4066,6 @@ async fn run_loop(
     socket: std::path::PathBuf,
 ) -> Result<()> {
     let mut input_stream = EventStream::new();
-    match crate::midi::op_xy_slots() {
-        Ok(slots) => app.midi_session_slots = slots,
-        Err(e) => app.set_status(format!("MIDI slots unavailable: {e}")),
-    }
     // MIDI is a native input peer of crossterm: learned controls dispatch the
     // exact same actions below, without synthesizing OS keyboard events or
     // requiring the terminal window to own desktop focus.
@@ -4803,6 +4795,53 @@ async fn run_loop(
         }
     }
     Ok(())
+}
+
+fn op_xy_slot_from_title(title: &str) -> Option<usize> {
+    let rest = title.strip_prefix('[')?;
+    let (number, suffix) = rest.split_once(']')?;
+    if suffix
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
+    }
+    let one_based = number.parse::<usize>().ok()?;
+    if (1..=8).contains(&one_based) {
+        Some(one_based - 1)
+    } else {
+        None
+    }
+}
+
+fn op_xy_session_activity(session: &SessionSummary) -> &chrono::DateTime<chrono::Utc> {
+    session.last_event_at.as_ref().unwrap_or(&session.created_at)
+}
+
+fn named_op_xy_session_slots(sessions: &[SessionSummary]) -> Vec<Option<String>> {
+    let mut matches: Vec<Option<&SessionSummary>> = vec![None; 8];
+    for session in sessions {
+        let Some(slot) = session
+            .title
+            .as_deref()
+            .and_then(op_xy_slot_from_title)
+        else {
+            continue;
+        };
+        if matches[slot].is_none_or(|current| {
+            op_xy_session_activity(session)
+                .cmp(op_xy_session_activity(current))
+                .then_with(|| session.id.cmp(&current.id))
+                .is_gt()
+        }) {
+            matches[slot] = Some(session);
+        }
+    }
+    matches
+        .into_iter()
+        .map(|session| session.map(|session| session.id.clone()))
+        .collect()
 }
 
 impl App {
@@ -10615,11 +10654,7 @@ impl App {
             self.set_status(format!("OP-XY pane {} is not visible", pane + 1));
             return;
         };
-        let Some(session_id) = self
-            .midi_session_slots
-            .get(slot)
-            .and_then(|session| session.clone())
-        else {
+        let Some(session_id) = self.resolved_op_xy_session_slots()[slot].clone() else {
             self.set_status(format!("OP-XY session slot {} is unassigned", slot + 1));
             return;
         };
@@ -10688,15 +10723,15 @@ impl App {
 
     pub(crate) fn op_xy_feedback_state(&self) -> crate::midi::FeedbackState {
         use construct_protocol::SessionState;
-        let assigned: HashSet<&str> = self
-            .midi_session_slots
-            .iter()
-            .filter_map(|session| session.as_deref())
+        let assigned: HashSet<String> = self
+            .resolved_op_xy_session_slots()
+            .into_iter()
+            .flatten()
             .collect();
         let sessions: Vec<_> = self
             .sessions
             .iter()
-            .filter(|session| assigned.contains(session.id.as_str()))
+            .filter(|session| assigned.contains(&session.id))
             .collect();
         if sessions.iter().any(|session| {
             session.needs_attention
@@ -10715,16 +10750,8 @@ impl App {
         }
     }
 
-    pub(crate) fn midi_slot_label(&self, session_id: &str) -> Option<String> {
-        let slots: Vec<_> = self
-            .midi_session_slots
-            .iter()
-            .enumerate()
-            .filter_map(|(index, session)| {
-                (session.as_deref() == Some(session_id)).then(|| (index + 1).to_string())
-            })
-            .collect();
-        (!slots.is_empty()).then(|| format!("[{}]", slots.join(",")))
+    fn resolved_op_xy_session_slots(&self) -> Vec<Option<String>> {
+        named_op_xy_session_slots(&self.sessions)
     }
 
     /// Execute a slash-style command (`zoom`, `new`, `quit`, ...) with
@@ -10816,76 +10843,6 @@ impl App {
             }
             "paste" | "paste-clipboard" => {
                 self.run_action(KeyAction::PasteLocalClipboard).await
-            }
-            "midi-slot" | "opxy-slot" => {
-                let parts: Vec<_> = arg.split_whitespace().collect();
-                if parts.is_empty() {
-                    let mapping = self
-                        .midi_session_slots
-                        .iter()
-                        .enumerate()
-                        .map(|(index, session)| {
-                            format!(
-                                "{}:{}",
-                                index + 1,
-                                session
-                                    .as_deref()
-                                    .map(short_id)
-                                    .unwrap_or("—")
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    self.set_status(format!("OP-XY slots {mapping}"));
-                } else {
-                    let (clear, raw_slot) = match parts.as_slice() {
-                        ["clear", slot] => (true, *slot),
-                        [slot] => (false, *slot),
-                        _ => {
-                            self.set_status(
-                                "usage: /opxy-slot <1-8> | /opxy-slot clear <1-8>".into(),
-                            );
-                            return;
-                        }
-                    };
-                    let Ok(one_based) = raw_slot.parse::<usize>() else {
-                        self.set_status("MIDI slot must be a number from 1 through 8".into());
-                        return;
-                    };
-                    if !(1..=8).contains(&one_based) {
-                        self.set_status("MIDI slot must be a number from 1 through 8".into());
-                        return;
-                    }
-                    let slot = one_based - 1;
-                    let session_id = if clear {
-                        None
-                    } else {
-                        let Some(id) = self.selected_id() else {
-                            self.set_status("select a session before assigning a MIDI slot".into());
-                            return;
-                        };
-                        Some(id)
-                    };
-                    match crate::midi::assign_op_xy_slot(slot, session_id.clone()) {
-                        Ok(()) => {
-                            if let Some(id) = session_id.as_deref() {
-                                for existing in &mut self.midi_session_slots {
-                                    if existing.as_deref() == Some(id) {
-                                        *existing = None;
-                                    }
-                                }
-                            }
-                            self.midi_session_slots.resize(8, None);
-                            self.midi_session_slots[slot] = session_id;
-                            self.set_status(if clear {
-                                format!("cleared OP-XY session slot {one_based}")
-                            } else {
-                                format!("assigned selected session to OP-XY slot {one_based}")
-                            });
-                        }
-                        Err(e) => self.set_status(format!("MIDI slot failed: {e}")),
-                    }
-                }
             }
             "help" | "?" => {
                 self.help_visible = true;
@@ -13177,7 +13134,6 @@ mod tests {
             client,
             last_reported_view: None,
             sessions,
-            midi_session_slots: vec![None; 8],
             groups: Vec::new(),
             selection: Selection::Session("s1".into()),
             focus: PaneFocus::View,
@@ -13506,6 +13462,42 @@ mod tests {
             needs_attention: false,
             forked_from: None,
             merge: None,
+        }
+    }
+
+    #[test]
+    fn op_xy_title_slots_prefer_the_most_recent_activity() {
+        let base = chrono::Utc::now();
+        let mut older = summary_with_kind(construct_protocol::SessionKind::User);
+        older.id = "older".into();
+        older.title = Some("[3] older session".into());
+        older.created_at = base;
+        older.last_event_at = Some(base + chrono::Duration::seconds(1));
+
+        let mut newer = summary_with_kind(construct_protocol::SessionKind::User);
+        newer.id = "newer".into();
+        newer.title = Some("[3] newer session".into());
+        newer.created_at = base;
+        newer.last_event_at = Some(base + chrono::Duration::seconds(2));
+
+        let slots = named_op_xy_session_slots(&[newer.clone(), older]);
+        assert_eq!(slots[2].as_deref(), Some("newer"));
+
+        newer.title = Some("[3]not a slot prefix".into());
+        assert!(named_op_xy_session_slots(&[newer])[2].is_none());
+    }
+
+    #[test]
+    fn op_xy_title_slots_accept_only_one_through_eight() {
+        for (title, expected) in [
+            ("[1] primary", Some(0)),
+            ("[8] documentation", Some(7)),
+            ("[0] invalid", None),
+            ("[9] invalid", None),
+            ("[2]invalid", None),
+            ("session [2]", None),
+        ] {
+            assert_eq!(op_xy_slot_from_title(title), expected, "{title}");
         }
     }
 

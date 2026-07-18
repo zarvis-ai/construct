@@ -124,39 +124,7 @@ pub struct OpXyConfig {
     pub enter_note: Option<u8>,
     /// A sequenced display note that Construct must consume without action.
     pub no_op_note: Option<u8>,
-    /// Persistent session ids for controller slots 1 through 8.
-    #[serde(
-        serialize_with = "serialize_session_slots",
-        deserialize_with = "deserialize_session_slots"
-    )]
-    pub session_slots: Vec<Option<String>>,
     pub feedback: OpXyFeedbackConfig,
-}
-
-fn serialize_session_slots<S>(
-    slots: &[Option<String>],
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error>
-where
-    S: serde::Serializer,
-{
-    slots
-        .iter()
-        .map(|slot| slot.as_deref().unwrap_or_default())
-        .collect::<Vec<_>>()
-        .serialize(serializer)
-}
-
-fn deserialize_session_slots<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<Option<String>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Vec::<String>::deserialize(deserializer)?
-        .into_iter()
-        .map(|slot| (!slot.is_empty()).then_some(slot))
-        .collect())
 }
 
 impl OpXyConfig {
@@ -192,11 +160,6 @@ impl OpXyConfig {
             return None;
         };
         Some(OpXyEvent { pane, control })
-    }
-
-    fn normalize(&mut self) {
-        self.session_slots.resize(8, None);
-        self.session_slots.truncate(8);
     }
 }
 
@@ -417,10 +380,7 @@ type MidiEventReceiver = mpsc::UnboundedReceiver<MidiInputEvent>;
 #[cfg(target_os = "macos")]
 pub(crate) fn start_listener() -> Result<Option<(MidiListener, MidiEventReceiver)>> {
     let path = Paths::discover().midi_file();
-    let mut config = MidiConfig::load(&path)?;
-    if let Some(op_xy) = config.op_xy.as_mut() {
-        op_xy.normalize();
-    }
+    let config = MidiConfig::load(&path)?;
     let op_xy_enabled = config.op_xy.as_ref().is_some_and(|profile| profile.enabled);
     if config.mappings.is_empty() && !op_xy_enabled {
         return Ok(None);
@@ -535,53 +495,12 @@ fn print_mappings() -> Result<()> {
             mapping.action, mapping.kind, mapping.channel, mapping.number, mapping.trigger
         );
     }
-    if let Some(mut op_xy) = config.op_xy {
-        op_xy.normalize();
+    if let Some(op_xy) = config.op_xy {
         println!("op-xy: {}", if op_xy.enabled { "enabled" } else { "disabled" });
         println!("  pane channels: {:?}", op_xy.pane_channels);
         println!("  session notes: {:?}", op_xy.session_notes);
-        for (index, session) in op_xy.session_slots.iter().enumerate() {
-            println!(
-                "  slot {}: {}",
-                index + 1,
-                session.as_deref().unwrap_or("(unassigned)")
-            );
-        }
     }
     Ok(())
-}
-
-pub(crate) fn op_xy_slots() -> Result<Vec<Option<String>>> {
-    let mut config = MidiConfig::load(&Paths::discover().midi_file())?;
-    let Some(profile) = config.op_xy.as_mut() else {
-        return Ok(vec![None; 8]);
-    };
-    profile.normalize();
-    Ok(profile.session_slots.clone())
-}
-
-pub(crate) fn assign_op_xy_slot(slot: usize, session_id: Option<String>) -> Result<()> {
-    if slot >= 8 {
-        anyhow::bail!("OP-XY session slot must be 1 through 8");
-    }
-    let path = Paths::discover().midi_file();
-    let mut config = MidiConfig::load(&path)?;
-    let profile = config
-        .op_xy
-        .as_mut()
-        .context("OP-XY profile is not configured; run `construct midi op-xy-learn`")?;
-    profile.normalize();
-    // A session has one physical slot. Reassignment moves it rather than
-    // leaving duplicate controller labels in the TUI.
-    if let Some(id) = session_id.as_deref() {
-        for existing in &mut profile.session_slots {
-            if existing.as_deref() == Some(id) {
-                *existing = None;
-            }
-        }
-    }
-    profile.session_slots[slot] = session_id;
-    config.save(&path)
 }
 
 #[cfg(target_os = "macos")]
@@ -671,14 +590,6 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
         );
     }
 
-    let existing_slots = config
-        .op_xy
-        .take()
-        .map(|mut profile| {
-            profile.normalize();
-            profile.session_slots
-        })
-        .unwrap_or_else(|| vec![None; 8]);
     config.device = Some(port_name);
     config.op_xy = Some(OpXyConfig {
         enabled: true,
@@ -690,12 +601,11 @@ fn op_xy_learn(requested_device: Option<&str>) -> Result<()> {
         up_note: Some(up_note),
         enter_note: Some(enter_note),
         no_op_note: Some(no_op_note),
-        session_slots: existing_slots,
         feedback: OpXyFeedbackConfig::default(),
     });
     config.save(&path)?;
     println!("saved OP-XY controller profile to {}", path.display());
-    println!("assign the selected TUI session with `/opxy-slot 1` through `/opxy-slot 8`");
+    println!("prefix session titles with `[1]` through `[8]` to assign controller slots");
     Ok(())
 }
 
@@ -1108,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn op_xy_profile_with_empty_slots_round_trips_as_toml() {
+    fn op_xy_profile_round_trips_as_toml() {
         let config = MidiConfig {
             device: Some("OP-XY Bluetooth".into()),
             mappings: Vec::new(),
@@ -1122,13 +1032,11 @@ mod tests {
                 up_note: Some(73),
                 enter_note: Some(75),
                 no_op_note: Some(71),
-                session_slots: vec![None; 8],
                 feedback: OpXyFeedbackConfig::default(),
             }),
         };
 
         let encoded = toml::to_string_pretty(&config).unwrap();
-        assert!(encoded.contains("session_slots = ["));
         assert_eq!(toml::from_str::<MidiConfig>(&encoded).unwrap(), config);
     }
 
@@ -1153,7 +1061,6 @@ mod tests {
             up_note: Some(68),
             enter_note: Some(70),
             no_op_note: Some(65),
-            session_slots: vec![None; 8],
             feedback: OpXyFeedbackConfig::default(),
         }
     }
