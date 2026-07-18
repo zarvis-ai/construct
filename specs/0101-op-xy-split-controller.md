@@ -1,7 +1,7 @@
 # 0101-op-xy-split-controller
 
 Status: accepted
-Date: 2026-07-17
+Date: 2026-07-18
 Area: tui
 Scope: An OP-XY Instrument-mode template selects eight sessions, places them in four split panes, and receives status feedback.
 
@@ -75,7 +75,16 @@ Auxiliary track 3 supplies generic, focus-sensitive navigation on MIDI channel
 to scroll up/down. Each encoder's first received value calibrates its independent
 position without producing an action. Subsequent messages produce one action
 in the shortest direction around the 0–127 range, so boundary crossings do not
-reverse the control unexpectedly. CC 0 and CC 1 remain unassigned.
+reverse the control unexpectedly.
+
+OP-XY Bank Select and Program Change provide the same focus-sensitive
+navigation on session channels 1–8 and Auxiliary 3 channel 10. Bank Select CC
+0 maps increasing/decreasing values to Down/Up. Program Change maps
+increasing/decreasing program numbers to focused-surface scroll down/up. Bank
+and Program positions calibrate independently per channel, so the first message
+for either control on a track establishes its baseline without acting. The
+participating channels and Bank Select CC are configurable; changes retain the
+shortest-direction boundary behavior used by the Aux 3 encoders.
 
 Bluetooth feedback traffic is bounded: animation is at most five packets per
 second, with all mixer-volume and session-track synth-parameter messages for a
