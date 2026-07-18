@@ -88,9 +88,15 @@ for either control on a track establishes its baseline without acting. The
 participating channels and Bank Select CC are configurable; changes retain the
 shortest-direction boundary behavior used by the Aux 3 encoders.
 
-Bluetooth feedback traffic is bounded: animation is at most five packets per
-second, with all mixer-volume and session-track synth-parameter messages for a
-frame batched into one packet.
+Bluetooth feedback traffic is bounded by decoded CC work, not just packet
+count. Animation dynamically slows as more mixer tracks and synth parameters
+are visible so it emits at most sixteen CC messages per second; all messages
+for a frame remain batched into one packet. State updates queued while the
+transport is busy are coalesced to the newest snapshot so stale scene,
+transport, mixer, and synth states are never replayed after backpressure clears.
+Failed global scene or transport sends retain their desired state and retry at
+a bounded two-second interval; a transient CoreMIDI error must not permanently
+freeze global feedback.
 Construct does not stream MIDI clock because OP-XY can start its sequencer from
 its internal clock, and sustained clock plus per-track packets can lock its BLE
 receive path until the device is power-cycled.

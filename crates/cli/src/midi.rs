@@ -975,53 +975,58 @@ pub(crate) fn start_feedback() -> Result<Option<MidiFeedback>> {
     Ok(None)
 }
 
+const FEEDBACK_MIN_FRAME_PERIOD: std::time::Duration =
+    std::time::Duration::from_millis(200);
+const FEEDBACK_MAX_CC_MESSAGES_PER_SECOND: u32 = 16;
+const FEEDBACK_RETRY_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn feedback_activity_message_count(snapshot: FeedbackSnapshot) -> u32 {
+    (snapshot.active_slots | snapshot.attention_slots).count_ones()
+        + (snapshot.active_tracks | snapshot.attention_tracks).count_ones()
+            * u32::from(SPLIT_ACTIVITY_PARAMETER_COUNT)
+}
+
+fn feedback_frame_period(snapshot: FeedbackSnapshot) -> std::time::Duration {
+    let messages = feedback_activity_message_count(snapshot);
+    if messages == 0 {
+        return std::time::Duration::from_millis(250);
+    }
+    let budget_period = std::time::Duration::from_secs_f64(
+        f64::from(messages) / f64::from(FEEDBACK_MAX_CC_MESSAGES_PER_SECOND),
+    );
+    budget_period.max(FEEDBACK_MIN_FRAME_PERIOD)
+}
+
 #[cfg(target_os = "macos")]
 fn feedback_loop(
     mut connection: MidiOutputConnection,
     rx: std_mpsc::Receiver<FeedbackSnapshot>,
     config: OpXyFeedbackConfig,
 ) {
-    const VOLUME_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(200);
     // CC 7 is 0–127. Active work moves gently through 25–40%; attention
     // performs a two-stage damped bounce through 30–70%.
     const ACTIVE_MOTION: [u8; 8] = [32, 38, 45, 51, 45, 38, 34, 32];
     const ATTENTION_BOUNCE: [u8; 8] = [38, 62, 89, 58, 38, 56, 44, 38];
     let mut snapshot = FeedbackSnapshot::default();
-    let mut started = false;
+    let mut transport_started = None;
+    let mut sent_fleet = None;
+    let mut next_fleet_retry = std::time::Instant::now();
     let mut volume_frame = 0usize;
     let mut next_volume_frame = std::time::Instant::now();
-    send_scene(&mut connection, config.normal_scene);
-    let _ = connection.send(&[0xFC]);
     send_slot_volumes(&mut connection, u8::MAX, 0);
     send_pane_parameters(&mut connection, 0b0000_1111, config.track_activity_cc, 0);
     loop {
-        let any_activity = snapshot.active_slots
-            | snapshot.attention_slots
-            | snapshot.active_tracks
-            | snapshot.attention_tracks;
-        let timeout = if any_activity != 0 {
-            VOLUME_FRAME_PERIOD
-        } else {
-            std::time::Duration::from_millis(250)
-        };
+        let timeout = feedback_frame_period(snapshot);
         match rx.recv_timeout(timeout) {
-            Ok(next) => {
+            Ok(mut next) => {
+                // If CoreMIDI briefly blocks behind the Bluetooth transport,
+                // apply only the newest fleet state once it becomes writable.
+                while let Ok(newer) = rx.try_recv() {
+                    next = newer;
+                }
                 if next.fleet != snapshot.fleet {
-                    let scene = if next.fleet.needs_attention() {
-                        config.attention_scene
-                    } else {
-                        config.normal_scene
-                    };
-                    send_scene(&mut connection, scene);
-                    if next.fleet.is_active() {
-                        if !started {
-                            let _ = connection.send(&[0xFA]);
-                            started = true;
-                        }
-                    } else {
-                        let _ = connection.send(&[0xFC]);
-                        started = false;
-                    }
+                    sent_fleet = None;
+                    next_fleet_retry = std::time::Instant::now();
                 }
                 if next.active_slots != snapshot.active_slots
                     || next.attention_slots != snapshot.attention_slots
@@ -1057,6 +1062,18 @@ fn feedback_loop(
             }
         }
         let now = std::time::Instant::now();
+        if sent_fleet != Some(snapshot.fleet) && now >= next_fleet_retry {
+            if send_fleet_state(
+                &mut connection,
+                snapshot.fleet,
+                &mut transport_started,
+                &config,
+            ) {
+                sent_fleet = Some(snapshot.fleet);
+            } else {
+                next_fleet_retry = now + FEEDBACK_RETRY_PERIOD;
+            }
+        }
         let any_activity = snapshot.active_slots
             | snapshot.attention_slots
             | snapshot.active_tracks
@@ -1073,7 +1090,7 @@ fn feedback_loop(
                 ATTENTION_BOUNCE[volume_frame],
             );
             volume_frame = (volume_frame + 1) % ACTIVE_MOTION.len();
-            next_volume_frame = now + VOLUME_FRAME_PERIOD;
+            next_volume_frame = now + feedback_frame_period(snapshot);
         }
     }
 }
@@ -1218,9 +1235,38 @@ fn send_activity_frame(
 }
 
 #[cfg(target_os = "macos")]
-fn send_scene(connection: &mut MidiOutputConnection, one_based_scene: u8) {
+fn send_fleet_state(
+    connection: &mut MidiOutputConnection,
+    fleet: FeedbackState,
+    transport_started: &mut Option<bool>,
+    config: &OpXyFeedbackConfig,
+) -> bool {
+    let scene = if fleet.needs_attention() {
+        config.attention_scene
+    } else {
+        config.normal_scene
+    };
+    let scene_sent = send_scene(connection, scene);
+    let should_start = fleet.is_active();
+    let transport_sent = if *transport_started == Some(should_start) {
+        true
+    } else {
+        let status = if should_start { 0xFA } else { 0xFC };
+        match connection.send(&[status]) {
+            Ok(()) => {
+                *transport_started = Some(should_start);
+                true
+            }
+            Err(_) => false,
+        }
+    };
+    scene_sent && transport_sent
+}
+
+#[cfg(target_os = "macos")]
+fn send_scene(connection: &mut MidiOutputConnection, one_based_scene: u8) -> bool {
     let value = one_based_scene.clamp(1, 99) - 1;
-    let _ = connection.send(&[0xB0, 85, value]);
+    connection.send(&[0xB0, 85, value]).is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -1741,6 +1787,49 @@ mod tests {
             assert_eq!(state.is_active(), active, "{state:?}");
             assert_eq!(state.needs_attention(), attention, "{state:?}");
         }
+    }
+
+    #[test]
+    fn feedback_frame_rate_caps_decoded_cc_message_throughput() {
+        let idle = FeedbackSnapshot::default();
+        assert_eq!(feedback_activity_message_count(idle), 0);
+        assert_eq!(
+            feedback_frame_period(idle),
+            std::time::Duration::from_millis(250)
+        );
+
+        let one_mixer_track = FeedbackSnapshot {
+            active_slots: 0b0000_0001,
+            ..idle
+        };
+        assert_eq!(feedback_activity_message_count(one_mixer_track), 1);
+        assert_eq!(
+            feedback_frame_period(one_mixer_track),
+            FEEDBACK_MIN_FRAME_PERIOD
+        );
+
+        let one_session_and_synth_track = FeedbackSnapshot {
+            active_slots: 0b0000_0001,
+            active_tracks: 0b0000_0001,
+            ..idle
+        };
+        assert_eq!(feedback_activity_message_count(one_session_and_synth_track), 5);
+        assert_eq!(
+            feedback_frame_period(one_session_and_synth_track),
+            std::time::Duration::from_millis(312)
+                + std::time::Duration::from_micros(500)
+        );
+
+        let all_tracks = FeedbackSnapshot {
+            active_slots: u8::MAX,
+            active_tracks: 0b0000_1111,
+            ..idle
+        };
+        assert_eq!(feedback_activity_message_count(all_tracks), 24);
+        assert_eq!(
+            feedback_frame_period(all_tracks),
+            std::time::Duration::from_millis(1500)
+        );
     }
 
     #[test]

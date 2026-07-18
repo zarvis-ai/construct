@@ -180,9 +180,14 @@ All four primary synth parameters move together. Their default targets are CC
 template uses a different engine or preferred visual controls.
 
 Construct sends MIDI Start/Stop for transport but deliberately leaves timing to
-the OP-XY's internal clock. Animation updates are limited to five batched packets
-per second. Avoiding a continuous external clock and batching all animated
-track volumes keeps Bluetooth MIDI traffic low enough for long-running use.
+the OP-XY's internal clock. Animation dynamically slows as more mixer tracks
+and synth parameters are active, with a ceiling of sixteen decoded CC messages
+per second. Frames remain batched, and queued state changes are coalesced to the
+newest state if Bluetooth applies backpressure. Avoiding a continuous external
+clock and bounding the actual parameter workload keeps Bluetooth MIDI traffic
+low enough for long-running use. If CoreMIDI reports a failed scene or
+transport send, Construct retains that desired global state and retries every
+two seconds until it succeeds.
 Scene defaults can be edited in `midi.toml`:
 
 ```toml
