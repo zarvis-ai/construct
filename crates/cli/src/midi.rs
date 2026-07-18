@@ -112,7 +112,6 @@ pub struct OpXyFeedbackConfig {
     /// Scene numbers are written as the one-based numbers shown by OP-XY.
     pub normal_scene: u8,
     pub attention_scene: u8,
-    pub clock_bpm: f64,
 }
 
 impl Default for OpXyFeedbackConfig {
@@ -121,7 +120,6 @@ impl Default for OpXyFeedbackConfig {
             enabled: true,
             normal_scene: 1,
             attention_scene: 2,
-            clock_bpm: 120.0,
         }
     }
 }
@@ -703,17 +701,11 @@ fn feedback_loop(
     rx: std_mpsc::Receiver<FeedbackSnapshot>,
     config: OpXyFeedbackConfig,
 ) {
-    const VOLUME_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(75);
+    const VOLUME_FRAME_PERIOD: std::time::Duration = std::time::Duration::from_millis(200);
     // CC 7 is 0–127. Active work moves gently through 25–40%; attention
     // performs a two-stage damped bounce through 30–70%.
-    const ACTIVE_MOTION: [u8; 16] = [
-        32, 35, 39, 43, 47, 50, 51, 50, 47, 43, 39, 35, 32, 34, 37, 40,
-    ];
-    const ATTENTION_BOUNCE: [u8; 16] = [
-        38, 52, 68, 82, 89, 78, 61, 45, 38, 47, 56, 61, 54, 46, 40, 38,
-    ];
-    let bpm = config.clock_bpm.clamp(20.0, 300.0);
-    let clock_period = std::time::Duration::from_secs_f64(60.0 / bpm / 24.0);
+    const ACTIVE_MOTION: [u8; 8] = [32, 38, 45, 51, 45, 38, 34, 32];
+    const ATTENTION_BOUNCE: [u8; 8] = [38, 62, 89, 58, 38, 56, 44, 38];
     let mut snapshot = FeedbackSnapshot::default();
     let mut started = false;
     let mut volume_frame = 0usize;
@@ -722,9 +714,7 @@ fn feedback_loop(
     let _ = connection.send(&[0xFC]);
     send_slot_volumes(&mut connection, u8::MAX, 0);
     loop {
-        let timeout = if started {
-            clock_period
-        } else if snapshot.active_slots | snapshot.attention_slots != 0 {
+        let timeout = if snapshot.active_slots | snapshot.attention_slots != 0 {
             VOLUME_FRAME_PERIOD
         } else {
             std::time::Duration::from_millis(250)
@@ -772,9 +762,6 @@ fn feedback_loop(
                 break;
             }
         }
-        if started {
-            let _ = connection.send(&[0xF8]);
-        }
         let now = std::time::Instant::now();
         if snapshot.active_slots | snapshot.attention_slots != 0 && now >= next_volume_frame {
             send_activity_volumes(
@@ -794,25 +781,33 @@ fn track_volume_message(slot: usize, value: u8) -> Option<[u8; 3]> {
     (slot < 8).then_some([0xB0 | slot as u8, 7, value.min(127)])
 }
 
-#[cfg(target_os = "macos")]
-fn send_slot_volumes(connection: &mut MidiOutputConnection, slots: u8, value: u8) {
+fn slot_volume_packet(slots: u8, value: u8) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(slots.count_ones() as usize * 3);
     for slot in 0..8 {
         if slots & (1 << slot) != 0 {
             if let Some(message) = track_volume_message(slot, value) {
-                let _ = connection.send(&message);
+                packet.extend_from_slice(&message);
             }
         }
     }
+    packet
 }
 
 #[cfg(target_os = "macos")]
-fn send_activity_volumes(
-    connection: &mut MidiOutputConnection,
+fn send_slot_volumes(connection: &mut MidiOutputConnection, slots: u8, value: u8) {
+    let packet = slot_volume_packet(slots, value);
+    if !packet.is_empty() {
+        let _ = connection.send(&packet);
+    }
+}
+
+fn activity_volume_packet(
     active_slots: u8,
     attention_slots: u8,
     active_value: u8,
     attention_value: u8,
-) {
+) -> Vec<u8> {
+    let mut packet = Vec::with_capacity((active_slots | attention_slots).count_ones() as usize * 3);
     for slot in 0..8 {
         let bit = 1 << slot;
         let value = if attention_slots & bit != 0 {
@@ -823,8 +818,28 @@ fn send_activity_volumes(
             None
         };
         if let Some(message) = value.and_then(|value| track_volume_message(slot, value)) {
-            let _ = connection.send(&message);
+            packet.extend_from_slice(&message);
         }
+    }
+    packet
+}
+
+#[cfg(target_os = "macos")]
+fn send_activity_volumes(
+    connection: &mut MidiOutputConnection,
+    active_slots: u8,
+    attention_slots: u8,
+    active_value: u8,
+    attention_value: u8,
+) {
+    let packet = activity_volume_packet(
+        active_slots,
+        attention_slots,
+        active_value,
+        attention_value,
+    );
+    if !packet.is_empty() {
+        let _ = connection.send(&packet);
     }
 }
 
@@ -1168,6 +1183,14 @@ mod tests {
         assert_eq!(track_volume_message(0, 127), Some([0xB0, 7, 127]));
         assert_eq!(track_volume_message(7, 64), Some([0xB7, 7, 64]));
         assert_eq!(track_volume_message(8, 64), None);
+        assert_eq!(
+            slot_volume_packet(0b1000_0001, 64),
+            vec![0xB0, 7, 64, 0xB7, 7, 64]
+        );
+        assert_eq!(
+            activity_volume_packet(0b0000_0011, 0b0000_0010, 40, 70),
+            vec![0xB0, 7, 40, 0xB1, 7, 70]
+        );
     }
 
     #[test]

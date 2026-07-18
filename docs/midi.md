@@ -65,10 +65,10 @@ The learned profile enables feedback by default. Construct treats OP-XY scene
 numbers as the one-based numbers shown on the device and sends immediate scene
 changes using CC 85:
 
-- Scene 1 with MIDI Start and clock while the focused session is running.
+- Scene 1 with MIDI Start while the focused session is running.
 - Scene 1 with MIDI Stop for a completed, idle, paused, awaiting-input, or
   errored focused session, and whenever focus is outside a session view.
-- Scene 2 with MIDI Start and clock while a non-terminal focused session has
+- Scene 2 with MIDI Start while a non-terminal focused session has
   the blue attention dot.
 
 The OP-XY mixer provides an eight-session activity overview independently of
@@ -83,16 +83,17 @@ the focused-session scene. Mixer tracks 1–8 correspond to title slots
 Multiple active and attention slots animate together. Exiting Construct resets
 all eight track volumes to zero.
 
-While feedback is active Construct sends MIDI Start and a 24-PPQN clock at 120
-BPM so the template's sequencer LEDs animate. These defaults can be edited in
-`midi.toml`:
+Construct sends MIDI Start/Stop for transport but deliberately leaves timing to
+the OP-XY's internal clock. Mixer updates are limited to five batched packets
+per second. Avoiding a continuous external clock and batching all animated
+track volumes keeps Bluetooth MIDI traffic low enough for long-running use.
+Scene defaults can be edited in `midi.toml`:
 
 ```toml
 [op_xy.feedback]
 enabled = true
 normal_scene = 1
 attention_scene = 2
-clock_bpm = 120.0
 ```
 
 Scenes store track volume and mute state, so the Construct template should use

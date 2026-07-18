@@ -26,8 +26,9 @@ transport represents terminal or idle state, Scene 1 with running transport
 represents work in progress, and Scene 2 with running transport represents the
 blue attention-dot state for a non-terminal session. Terminal state takes
 precedence over a stale attention marker. List focus or any other absence of a
-view-focused session is idle. Construct supplies MIDI real-time transport and
-clock while the focused session is running or needs attention. Focus, session
+view-focused session is idle. Construct supplies MIDI real-time Start/Stop
+transport while the focused session is running or needs attention, while
+OP-XY retains its internal clock. Focus, session
 state, and attention-marker changes update feedback as part of handling the
 event that changed them; feedback must not depend on an animation timer.
 
@@ -37,6 +38,12 @@ volume zero. Pending and running slots move gently between 25% and 40%. A blue
 attention marker takes precedence and animates that slot with a damped bounce
 between 30% and 70%. Simultaneous active and attention slots animate together.
 Feedback shutdown resets all eight volumes to zero.
+
+Bluetooth feedback traffic is bounded: mixer animation is at most five packets
+per second, with all track-volume messages for a frame batched into one packet.
+Construct does not stream MIDI clock because OP-XY can start its sequencer from
+its internal clock, and sustained clock plus per-track packets can lock its BLE
+receive path until the device is power-cycled.
 
 ## Reason
 
