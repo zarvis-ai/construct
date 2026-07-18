@@ -10,6 +10,7 @@ mod clipboard_bridge;
 mod keymap;
 mod lineage;
 mod matrix_rain;
+mod midi;
 mod mouse_forward;
 mod pty_render;
 mod text_util;
@@ -58,6 +59,11 @@ enum Command {
     Harnesses,
     /// List sessions.
     List,
+    /// Configure a native MIDI control surface for the TUI.
+    Midi {
+        #[command(subcommand)]
+        command: Option<midi::MidiCommand>,
+    },
     /// Search session names, program contents, and transcript history.
     Search {
         query: String,
@@ -452,6 +458,7 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Midi { command } => midi::run(command).await,
         Command::Search {
             query,
             limit,

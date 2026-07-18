@@ -93,6 +93,10 @@ Use `?` for help and `M-x` for the command palette. From the TUI you can create
 sessions, switch between agents, send input, inspect diffs, and interrupt or stop
 work without leaving the flow.
 
+MIDI controllers can drive those same native TUI actions without keyboard
+emulation. See [MIDI control surfaces](docs/midi.md) for device discovery and
+the `construct midi learn` workflow, including OP–XY setup.
+
 To run the daemon explicitly instead (e.g. on a server, or under a process
 supervisor):
 

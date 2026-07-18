@@ -4066,6 +4066,26 @@ async fn run_loop(
     socket: std::path::PathBuf,
 ) -> Result<()> {
     let mut input_stream = EventStream::new();
+    // MIDI is a native input peer of crossterm: learned controls dispatch the
+    // exact same actions below, without synthesizing OS keyboard events or
+    // requiring the terminal window to own desktop focus.
+    let (midi_listener, mut midi_rx) = match crate::midi::start_listener() {
+        Ok(Some((listener, rx))) => (Some(listener), Some(rx)),
+        Ok(None) => (None, None),
+        Err(e) => {
+            app.set_status(format!("MIDI disabled: {e}"));
+            (None, None)
+        }
+    };
+    // Keep the backend connection alive for the duration of the event loop.
+    let _midi_listener = midi_listener;
+    let midi_feedback = match crate::midi::start_feedback() {
+        Ok(feedback) => feedback,
+        Err(e) => {
+            app.set_status(format!("MIDI feedback disabled: {e}"));
+            None
+        }
+    };
     let mut notifications = app
         .client
         .take_notifications()
@@ -4482,6 +4502,33 @@ async fn run_loop(
                     None => break,
                 }
             }
+            action = async {
+                match midi_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => futures::future::pending().await,
+                }
+            }, if midi_rx.is_some() => {
+                match action {
+                    Some(crate::midi::MidiInputEvent::Action(crate::midi::MidiAction::Approve)) => {
+                        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)).await;
+                    }
+                    Some(crate::midi::MidiInputEvent::Action(crate::midi::MidiAction::Reject)) => {
+                        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)).await;
+                    }
+                    Some(crate::midi::MidiInputEvent::Action(action)) => {
+                        if let Some(key_action) = action.key_action() {
+                            app.run_action(key_action).await;
+                        }
+                    }
+                    Some(crate::midi::MidiInputEvent::OpXy(event)) => {
+                        app.handle_op_xy_event(event).await;
+                    }
+                    Some(crate::midi::MidiInputEvent::OpXyAux(control)) => {
+                        app.handle_op_xy_aux_control(control).await;
+                    }
+                    None => midi_rx = None,
+                }
+            }
             hydrated = hydration_tasks.join_next(), if !hydration_tasks.is_empty() => {
                 match hydrated {
                     Some(Ok((id, Ok(h)))) => {
@@ -4746,8 +4793,120 @@ async fn run_loop(
                 app.refresh_sessions().await;
             }
         }
+        // Publish after every handled event rather than only from the
+        // low-priority animation tick. A sustained notification stream can
+        // intentionally win over that tick in the biased select above, but a
+        // aggregate session state and attention markers must reach OP-XY as
+        // soon as the notification that changed them has been applied.
+        if let Some(feedback) = midi_feedback.as_ref() {
+            feedback.update(app.op_xy_feedback_snapshot());
+        }
     }
     Ok(())
+}
+
+fn op_xy_slot_from_title(title: &str) -> Option<usize> {
+    let rest = title.strip_prefix('[')?;
+    let (number, suffix) = rest.split_once(']')?;
+    if suffix
+        .chars()
+        .next()
+        .is_some_and(|character| !character.is_whitespace())
+    {
+        return None;
+    }
+    let one_based = number.parse::<usize>().ok()?;
+    if (1..=8).contains(&one_based) {
+        Some(one_based - 1)
+    } else {
+        None
+    }
+}
+
+fn op_xy_session_activity(session: &SessionSummary) -> &chrono::DateTime<chrono::Utc> {
+    session.last_event_at.as_ref().unwrap_or(&session.created_at)
+}
+
+fn named_op_xy_session_slots(sessions: &[SessionSummary]) -> Vec<Option<String>> {
+    let mut matches: Vec<Option<&SessionSummary>> = vec![None; 8];
+    for session in sessions {
+        let Some(slot) = session
+            .title
+            .as_deref()
+            .and_then(op_xy_slot_from_title)
+        else {
+            continue;
+        };
+        if matches[slot].is_none_or(|current| {
+            op_xy_session_activity(session)
+                .cmp(op_xy_session_activity(current))
+                .then_with(|| session.id.cmp(&current.id))
+                .is_gt()
+        }) {
+            matches[slot] = Some(session);
+        }
+    }
+    matches
+        .into_iter()
+        .map(|session| session.map(|session| session.id.clone()))
+        .collect()
+}
+
+fn op_xy_session_feedback_state(session: Option<&SessionSummary>) -> crate::midi::FeedbackState {
+    use construct_protocol::SessionState;
+    let Some(session) = session else {
+        return crate::midi::FeedbackState::Idle;
+    };
+    if session.state.is_terminal() {
+        crate::midi::FeedbackState::Idle
+    } else if session.needs_attention {
+        crate::midi::FeedbackState::Attention
+    } else if matches!(session.state, SessionState::Pending | SessionState::Running) {
+        crate::midi::FeedbackState::Working
+    } else {
+        crate::midi::FeedbackState::Idle
+    }
+}
+
+fn op_xy_slot_feedback_state(active_slots: u8, attention_slots: u8) -> crate::midi::FeedbackState {
+    if attention_slots != 0 {
+        crate::midi::FeedbackState::Attention
+    } else if active_slots != 0 {
+        crate::midi::FeedbackState::Working
+    } else {
+        crate::midi::FeedbackState::Idle
+    }
+}
+
+fn op_xy_slot_state_masks(
+    sessions: &[SessionSummary],
+    slots: &[Option<String>],
+) -> (u8, u8) {
+    use construct_protocol::SessionState;
+    slots.iter().take(8).enumerate().fold(
+        (0u8, 0u8),
+        |(active, attention), (slot, session_id)| {
+            let Some(session) = session_id
+                .as_ref()
+                .and_then(|session_id| sessions.iter().find(|session| session.id == *session_id))
+            else {
+                return (active, attention);
+            };
+            let bit = 1 << slot;
+            (
+                if matches!(session.state, SessionState::Pending | SessionState::Running) {
+                    active | bit
+                } else {
+                    active
+                },
+                if session.needs_attention {
+                    attention | bit
+                } else {
+                    attention
+                },
+            )
+        },
+    )
 }
 
 impl App {
@@ -10544,6 +10703,140 @@ impl App {
         }
     }
 
+    fn op_xy_pane_window_id(&self, pane: usize) -> Option<u64> {
+        let mut areas = self.layout.main_window_areas.clone();
+        // OP-XY tracks use the visual reading order promised by the profile:
+        // left-to-right within each row, then top-to-bottom.
+        areas.sort_by_key(|pane| (pane.area.y, pane.area.x));
+        areas
+            .get(pane)
+            .map(|pane| pane.id)
+            .or_else(|| self.leaf_window_ids().get(pane).copied())
+    }
+
+    fn select_op_xy_slot_in_pane(&mut self, pane: usize, slot: usize) {
+        let Some(window_id) = self.op_xy_pane_window_id(pane) else {
+            self.set_status(format!("OP-XY pane {} is not visible", pane + 1));
+            return;
+        };
+        let Some(session_id) = self.resolved_op_xy_session_slots()[slot].clone() else {
+            self.set_status(format!("OP-XY session slot {} is unassigned", slot + 1));
+            return;
+        };
+        if !self.sessions.iter().any(|session| session.id == session_id) {
+            self.set_status(format!(
+                "OP-XY session slot {} points to a missing session",
+                slot + 1
+            ));
+            return;
+        }
+
+        if self.focus != PaneFocus::View || self.active_window_id != window_id {
+            self.focus_main_window(window_id);
+        }
+        self.select_session(session_id);
+        self.set_status(format!(
+            "OP-XY pane {} → session slot {}",
+            pane + 1,
+            slot + 1
+        ));
+    }
+
+    pub(crate) async fn handle_op_xy_event(&mut self, event: crate::midi::OpXyEvent) {
+        use crate::midi::OpXyControl;
+        let Some(window_id) = self.op_xy_pane_window_id(event.pane) else {
+            self.set_status(format!("OP-XY pane {} is not visible", event.pane + 1));
+            return;
+        };
+        if self.focus != PaneFocus::View || self.active_window_id != window_id {
+            self.focus_main_window(window_id);
+        }
+        match event.control {
+            OpXyControl::Session(slot) => self.select_op_xy_slot_in_pane(event.pane, slot),
+            OpXyControl::Prompt { slot, text } => {
+                let Some(session_id) = self
+                    .selection_for_window(window_id)
+                    .and_then(|selection| selection.session_id().map(str::to_owned))
+                else {
+                    self.set_status(format!(
+                        "OP-XY pane {} has no session for prompt {}",
+                        event.pane + 1,
+                        slot + 1
+                    ));
+                    return;
+                };
+                self.set_scrollback_for_window(Some(window_id), 0);
+                let bytes = self.encode_paste_for_pty(&session_id, text);
+                self.queue_pty_input(session_id, bytes, "OP-XY prompt pty_input");
+                self.set_status(format!(
+                    "OP-XY pane {} inserted prompt {}",
+                    event.pane + 1,
+                    slot + 1
+                ));
+            }
+            OpXyControl::Enter => {
+                self.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                    .await;
+            }
+            control => {
+                let code = match control {
+                    OpXyControl::Left => KeyCode::Left,
+                    OpXyControl::Down => KeyCode::Down,
+                    OpXyControl::Right => KeyCode::Right,
+                    OpXyControl::Up => KeyCode::Up,
+                    OpXyControl::Session(_)
+                    | OpXyControl::Prompt { .. }
+                    | OpXyControl::Enter => unreachable!(),
+                };
+                self.on_key(KeyEvent::new(code, KeyModifiers::NONE)).await;
+            }
+        }
+    }
+
+    pub(crate) async fn handle_op_xy_aux_control(
+        &mut self,
+        control: crate::midi::OpXyAuxControl,
+    ) {
+        use crate::midi::OpXyAuxControl;
+        match control {
+            OpXyAuxControl::Up => {
+                self.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                    .await;
+            }
+            OpXyAuxControl::Down => {
+                self.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                    .await;
+            }
+            OpXyAuxControl::ScrollUp => self.run_action(KeyAction::ScrollUp).await,
+            OpXyAuxControl::ScrollDown => self.run_action(KeyAction::ScrollDown).await,
+        }
+    }
+
+    pub(crate) fn op_xy_feedback_snapshot(&self) -> crate::midi::FeedbackSnapshot {
+        let slots = self.resolved_op_xy_session_slots();
+        let (active_slots, attention_slots) = op_xy_slot_state_masks(&self.sessions, &slots);
+        let pane_sessions = (0..4)
+            .map(|pane| {
+                let window_id = self.op_xy_pane_window_id(pane)?;
+                self.selection_for_window(window_id)
+                    .and_then(|selection| selection.session_id().map(str::to_owned))
+            })
+            .collect::<Vec<_>>();
+        let (active_panes, attention_panes) =
+            op_xy_slot_state_masks(&self.sessions, &pane_sessions);
+        crate::midi::FeedbackSnapshot {
+            fleet: op_xy_slot_feedback_state(active_slots, attention_slots),
+            active_slots,
+            attention_slots,
+            active_panes: active_panes & 0b0000_1111,
+            attention_panes: attention_panes & 0b0000_1111,
+        }
+    }
+
+    fn resolved_op_xy_session_slots(&self) -> Vec<Option<String>> {
+        named_op_xy_session_slots(&self.sessions)
+    }
+
     /// Execute a slash-style command (`zoom`, `new`, `quit`, ...) with
     /// no LLM involvement. Used both by the orchestrator panel (when
     /// input starts with `/`) and by the static palette (fallback when
@@ -12747,7 +13040,7 @@ mod tests {
             .expect("run_loop should contain a tokio::select!");
         // Bound the search to the run_loop region so the arm strings
         // quoted in this very test (far below) can't be matched.
-        let body = &src[select_at..(select_at + 8000).min(src.len())];
+        let body = &src[select_at..(select_at + 12_000).min(src.len())];
         let biased = body
             .find("biased;")
             .expect("the event-loop select! must be `biased;` so a ready keystroke wins ties");
@@ -13253,6 +13546,121 @@ mod tests {
             forked_from: None,
             merge: None,
         }
+    }
+
+    #[test]
+    fn op_xy_title_slots_prefer_the_most_recent_activity() {
+        let base = chrono::Utc::now();
+        let mut older = summary_with_kind(construct_protocol::SessionKind::User);
+        older.id = "older".into();
+        older.title = Some("[3] older session".into());
+        older.created_at = base;
+        older.last_event_at = Some(base + chrono::Duration::seconds(1));
+
+        let mut newer = summary_with_kind(construct_protocol::SessionKind::User);
+        newer.id = "newer".into();
+        newer.title = Some("[3] newer session".into());
+        newer.created_at = base;
+        newer.last_event_at = Some(base + chrono::Duration::seconds(2));
+
+        let slots = named_op_xy_session_slots(&[newer.clone(), older]);
+        assert_eq!(slots[2].as_deref(), Some("newer"));
+
+        newer.title = Some("[3]not a slot prefix".into());
+        assert!(named_op_xy_session_slots(&[newer])[2].is_none());
+    }
+
+    #[test]
+    fn op_xy_title_slots_accept_only_one_through_eight() {
+        for (title, expected) in [
+            ("[1] primary", Some(0)),
+            ("[8] documentation", Some(7)),
+            ("[0] invalid", None),
+            ("[9] invalid", None),
+            ("[2]invalid", None),
+            ("session [2]", None),
+        ] {
+            assert_eq!(op_xy_slot_from_title(title), expected, "{title}");
+        }
+    }
+
+    #[test]
+    fn op_xy_feedback_classifies_individual_session_state() {
+        let mut session = summary_with_kind(construct_protocol::SessionKind::User);
+        session.state = construct_protocol::SessionState::Running;
+        assert_eq!(
+            op_xy_session_feedback_state(Some(&session)),
+            crate::midi::FeedbackState::Working
+        );
+
+        session.needs_attention = true;
+        assert_eq!(
+            op_xy_session_feedback_state(Some(&session)),
+            crate::midi::FeedbackState::Attention
+        );
+
+        session.needs_attention = false;
+        session.state = construct_protocol::SessionState::Errored;
+        assert_eq!(
+            op_xy_session_feedback_state(Some(&session)),
+            crate::midi::FeedbackState::Idle
+        );
+        session.needs_attention = true;
+        assert_eq!(
+            op_xy_session_feedback_state(Some(&session)),
+            crate::midi::FeedbackState::Idle,
+            "terminal state takes precedence over a stale attention marker"
+        );
+        assert_eq!(
+            op_xy_session_feedback_state(None),
+            crate::midi::FeedbackState::Idle
+        );
+    }
+
+    #[test]
+    fn op_xy_feedback_aggregates_assigned_slots_with_attention_precedence() {
+        assert_eq!(
+            op_xy_slot_feedback_state(0, 0),
+            crate::midi::FeedbackState::Idle
+        );
+        assert_eq!(
+            op_xy_slot_feedback_state(0b0000_0100, 0),
+            crate::midi::FeedbackState::Working
+        );
+        assert_eq!(
+            op_xy_slot_feedback_state(0b0000_0100, 0b1000_0000),
+            crate::midi::FeedbackState::Attention
+        );
+    }
+
+    #[test]
+    fn op_xy_volume_slots_follow_named_session_activity_and_attention() {
+        let mut first = summary_with_kind(construct_protocol::SessionKind::User);
+        first.id = "first".into();
+        first.state = construct_protocol::SessionState::AwaitingInput;
+        first.needs_attention = true;
+        let mut eighth = summary_with_kind(construct_protocol::SessionKind::User);
+        eighth.id = "eighth".into();
+        eighth.state = construct_protocol::SessionState::Errored;
+        eighth.needs_attention = true;
+        let mut quiet = summary_with_kind(construct_protocol::SessionKind::User);
+        quiet.id = "quiet".into();
+        quiet.state = construct_protocol::SessionState::Running;
+
+        let slots = vec![
+            Some(first.id.clone()),
+            Some(quiet.id.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(eighth.id.clone()),
+        ];
+        assert_eq!(
+            op_xy_slot_state_masks(&[first, eighth, quiet], &slots),
+            (0b0000_0010, 0b1000_0001)
+        );
     }
 
     #[test]
